@@ -3,10 +3,16 @@
 All notable changes to movate. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased] — v0.4 in progress
+## [0.4.0] — 2026-05-08
 
-Observability + regression-detection loop. Each item below ships incrementally
-to `main`; v0.4 will be tagged once `movate run --replay <run-id>` lands.
+Observability + regression-detection. Closes both halves of the
+"something changed; what?" loop: `eval --baseline` flags aggregate
+score regressions; `run --replay` lets you re-execute the exact recorded
+input against the current code. Plus a full tracing stack — Langfuse,
+OTel, fan-out — and trace replay for post-mortem reconstruction.
+
+**89 new tests this release** (288 unit + 3 smoke = 291 total). `ruff
+format`, `ruff check`, `mypy src` (strict) all clean.
 
 ### Added — Tracing backends
 
@@ -58,7 +64,7 @@ to `main`; v0.4 will be tagged once `movate run --replay <run-id>` lands.
   Workflow replay deferred; single-agent debug covers the 80% case.
   14 tests in `tests/test_run_replay.py`.
 
-[Unreleased]: https://github.com/movate/movate-cli/compare/v0.3.1...HEAD
+[0.4.0]: https://github.com/movate/movate-cli/releases/tag/v0.4.0
 
 ## [0.3.1] — 2026-05-09
 
