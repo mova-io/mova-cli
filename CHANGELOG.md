@@ -3,6 +3,32 @@
 All notable changes to movate. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/).
 
+## [0.3.1] — 2026-05-09
+
+Patch release. Fixes a `RunRecord` double-save bug in `WorkflowRunner` that
+would have inflated per-workflow cost / latency reports by ~2×. Surfaced by
+a throwaway IR→LangGraph prototype (now deleted; findings preserved in
+[docs/v0.3-langgraph-prototype.md](docs/v0.3-langgraph-prototype.md)).
+
+### Fixed
+
+- `Executor.execute(...)` now accepts `workflow_run_id` + `node_id` kwargs
+  and stamps them onto the persisted `RunRecord`. `WorkflowRunner` no
+  longer saves a second copy with a fresh UUID after every node.
+- `WorkflowRunner._stamp_workflow_link` deleted. Per-node summaries are
+  still synthesized in-memory for the `WorkflowResult.runs` view; on
+  failure the runner persists a single `ERROR`-status row so
+  `list_runs(workflow_run_id=…)` joins remain complete.
+
+### Added
+
+- [docs/v0.3-langgraph-prototype.md](docs/v0.3-langgraph-prototype.md) —
+  four findings from the IR-vs-LangGraph seam check. Locks in the v1.1
+  compiler design (`merge_dicts` state reducer, HITL via checkpointer,
+  parallel-fan-out enum redundancy).
+
+[0.3.1]: https://github.com/movate/movate-cli/releases/tag/v0.3.1
+
 ## [0.3.0] — 2026-05-09
 
 Sequential workflows: declarative `workflow.yaml` → IR → runner. Linear
