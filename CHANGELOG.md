@@ -3,7 +3,25 @@
 All notable changes to movate. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] — 2026-05-09
+
+**movate is now a service.** v0.5 takes the framework from "library +
+local CLI" through queue → auth → HTTP → worker → Postgres, in five
+incremental stages:
+
+| stage | what shipped |
+|---|---|
+| 1 | Job queue data layer (`JobRecord` + `jobs` table + claim semantics) |
+| 2 | API key auth crypto + storage + `movate auth create-key | list-keys | revoke-key` |
+| 3a | FastAPI runtime with `/healthz`, `POST /run`, `GET /jobs/{id}` + auth middleware |
+| 3b | Agent registry + `GET /agents` + `movate serve` (uvicorn binding) |
+| 4 | Worker claim loop + `movate worker` — climactic deliverable; movate stops being a queue and becomes a runtime |
+| 5 | PostgresProvider port — production-ready storage with `SELECT ... FOR UPDATE SKIP LOCKED` for true worker parallelism |
+
+**121 new tests across the release** (412 unit + 3 smoke when PG is
+configured; 391/3 without). End-to-end binary smoke validated against
+both backends: `movate serve` + `movate worker` in two real processes,
+job lifecycles QUEUED → RUNNING → SUCCESS in ~12-100ms.
 
 ### Added — PostgresProvider (v0.5 stage 5)
 
@@ -250,7 +268,7 @@ between two real processes.
   [docs/ci-eval-gate.md](docs/ci-eval-gate.md). Six new tests cover
   load, write, mutual exclusion, missing/malformed JSON.
 
-[Unreleased]: https://github.com/jeremyyuAWS/movate-cli/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.5.0
 
 ## [0.4.0] — 2026-05-08
 
