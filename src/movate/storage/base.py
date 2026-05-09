@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from movate.core.models import EvalRecord, FailureRecord, RunRecord
+from movate.core.models import (
+    EvalRecord,
+    FailureRecord,
+    RunRecord,
+    WorkflowRunRecord,
+)
 
 
 class StorageProvider(Protocol):
@@ -22,12 +27,15 @@ class StorageProvider(Protocol):
 
     async def save_eval(self, e: EvalRecord) -> None: ...
 
+    async def save_workflow_run(self, w: WorkflowRunRecord) -> None: ...
+
     async def list_runs(
         self,
         *,
         agent: str | None = None,
         tenant_id: str | None = None,
         status: str | None = None,
+        workflow_run_id: str | None = None,
         limit: int = 20,
     ) -> list[RunRecord]: ...
 
@@ -37,5 +45,12 @@ class StorageProvider(Protocol):
         agent: str | None = None,
         limit: int = 20,
     ) -> list[EvalRecord]: ...
+
+    async def list_workflow_runs(
+        self,
+        *,
+        workflow: str | None = None,
+        limit: int = 20,
+    ) -> list[WorkflowRunRecord]: ...
 
     async def close(self) -> None: ...

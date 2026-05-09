@@ -26,10 +26,10 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ## 🎯 Top 10 highest-leverage shortlist
 
-**Live-API smoke shipped this session** — 3 new tests (157 total: 154 unit + 3 smoke). `pytest -m smoke` runs an OpenAI direct-provider call, an Anthropic direct-provider call, and a full executor + default-template + real-OpenAI round-trip. Each test is independently gated on the relevant API key plus a top-level `MOVATE_SMOKE=1` switch. CI excludes the marker; `bash scripts/smoke.sh` runs them locally before tagging.
+**v0.3 workflow CLI — stage 3 shipped this session** — 9 new tests (196 unit + 3 smoke = 199 total). `movate run`, `movate validate`, `movate show` all auto-detect workflow vs agent by presence of `workflow.yaml`. Workflow `validate` exits 0/2 with topology summary; workflow `show` prints Rich tables + ASCII chain + a Mermaid `flowchart LR` block (paste into a PR for a live diagram); workflow `run` parses `initial_state` from JSON / file / stdin, runs through the executor, prints per-node summary + `final_state` JSON. End-to-end verified.
 
-1. [ ] **Tag v0.2 release** `[MED] [v0.2] [next] [≤1h]` — release notes auto-pulled from the v0.2 "shipped" sections of this file. Run smoke against both providers before tagging.
-2. [ ] **workflow.yaml + sequential compiler IR** `[HIGH] [v0.3] [next] [1w]` — biggest design lock-in decision in the project.
+1. [ ] **Throwaway IR→LangGraph prototype** `[HIGH] [v0.3] [next] [≤1d]` — write it, prove the seam, **delete it** until v1.1. Mitigates the #1 risk in the implementation roadmap.
+2. [ ] **Tag v0.3 release** `[MED] [v0.3] [next] [≤1h]` — release notes from v0.3 "shipped" sections; bump to 0.3.0.
 3. [ ] **Eval baseline diff (`movate eval --baseline <eval-id>`)** `[HIGH] [v0.4] [2-3d]` — already half-built since `EvalRecord` is persisted.
 4. [ ] **Langfuse tracer wired** `[HIGH] [v0.4] [≤1d]` — single biggest visibility win.
 5. [ ] **Trace replay (`movate trace replay`)** `[HIGH] [v0.4] [2-3d]` — drops debug time on a real prod issue from hours to minutes.
@@ -114,14 +114,14 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ## 3. Sequential workflows (Phase 3 / v0.3)
 
-- [ ] **`workflow.yaml` Pydantic spec** `[HIGH] [v0.3] [≤1d]` — `kind: Workflow`, `nodes`, `edges`, `state_schema`, `entrypoint`.
-- [ ] **`WorkflowGraph` IR (internal)** `[HIGH] [v0.3] [2-3d]` — design must subsume conditional / parallel / HITL even though v0.3 only emits linear DAGs. **Spend extra hours on this** — the LangGraph swap-in (v1.1) bills against it.
-- [ ] **Sequential compiler with strict validation** `[HIGH] [v0.3] [2-3d]` — single source, single sink, rejects branches/cycles with clear errors pointing at the offending edge.
-- [ ] **Workflow runner — typed `WorkflowState` plumbing** `[HIGH] [v0.3] [2-3d]` — Pydantic state passed node→node; per-node output validates against next-node input contract.
-- [ ] **Per-node `RunRecord` linked by `workflow_run_id`** `[HIGH] [v0.3] [≤1d]` — observability requires this from day one.
-- [ ] **Partial-failure preservation** `[HIGH] [v0.3] [≤1d]` — fail at node 2 → state from node 1 persists; replay-able.
-- [ ] **`movate run <workflow>` extension** `[HIGH] [v0.3] [≤1d]` — auto-detect workflow vs agent path.
-- [ ] **`movate show workflow` topology render (ASCII / Mermaid)** `[MED] [v0.3] [≤1d]` — engineers learn workflows by seeing them.
+- [x] **`workflow.yaml` Pydantic spec** `[HIGH] [v0.3] [done]` — [src/movate/core/workflow/spec.py](src/movate/core/workflow/spec.py): `WorkflowSpec`, `NodeSpec`, `EdgeSpec`. `kind: Workflow`, `state_schema`, `entrypoint`, `nodes`, `edges`, semver+name validators.
+- [x] **`WorkflowGraph` IR (internal)** `[HIGH] [v0.3] [done]` — [src/movate/core/workflow/ir.py](src/movate/core/workflow/ir.py): `WorkflowGraph`, `WorkflowNode`, `WorkflowEdge`, `NodeType` (AGENT, TOOL, HUMAN, FUNCTION, SUB_WORKFLOW), `EdgeKind` (SEQUENTIAL, CONDITIONAL, PARALLEL_FAN_OUT, PARALLEL_FAN_IN). Helpers: `successors`, `predecessors`, `sources`, `sinks`, `is_linear`, `topological_order`. Future-aware enums let v1.1's LangGraph compiler reuse the same IR without a schema break.
+- [x] **Sequential compiler with strict validation** `[HIGH] [v0.3] [done]` — [src/movate/core/workflow/compiler.py](src/movate/core/workflow/compiler.py). Two-pass: `compile_workflow` (structural — duplicates, dangling edges, self-loops, cycles, orphans, state-schema validation) + `validate_linear` (v0.3 phase gate — rejects branches, joins, conditional edges, non-agent node types with phase-aware error messages). 27 tests in [tests/test_workflow.py](tests/test_workflow.py).
+- [x] **Workflow runner — typed `WorkflowState` plumbing** `[HIGH] [v0.3] [done]` — [src/movate/core/workflow/runner.py](src/movate/core/workflow/runner.py). State projected onto each node's input schema; output shallow-merged back. State validated against `state_schema` at entry. 6 tests in [tests/test_workflow_runner.py](tests/test_workflow_runner.py).
+- [x] **Per-node `RunRecord` linked by `workflow_run_id`** `[HIGH] [v0.3] [done]` — `RunRecord.workflow_run_id` + `node_id` fields; new `workflow_runs` sqlite table + `WorkflowRunRecord`; `list_runs(workflow_run_id=…)` filter; idempotent `ALTER` migrations.
+- [x] **Partial-failure preservation** `[HIGH] [v0.3] [done]` — runner stops at the failing node, returns the pre-merge state, marks workflow `ERROR` with `error_node_id`. Per-node `RunRecord`s up to and including the failure are persisted.
+- [x] **`movate run <workflow>` extension** `[HIGH] [v0.3] [done]` — `is_workflow_path()` auto-detect in [src/movate/cli/_workflow_path.py](src/movate/cli/_workflow_path.py); `cli/run.py`, `cli/validate.py`, `cli/show.py` all dispatch.
+- [x] **`movate show workflow` topology render (ASCII / Mermaid)** `[MED] [v0.3] [done]` — Rich header + nodes table, ASCII chain (`first → second → third`), Mermaid `flowchart LR` block ready for PR descriptions. 9 tests in [tests/test_cli_workflow.py](tests/test_cli_workflow.py).
 - [ ] **`--node-trace` flag** `[MED] [v0.3] [≤2h]` — surface intermediate states on stdout for debugging.
 - [ ] **`workflow.yaml: runtime: <homegrown|langgraph>` field (parsed but warns on `langgraph`)** `[MED] [v0.3] [≤1h]` — future-proofs the YAML so v1.1 adds zero schema churn.
 - [ ] **Throwaway IR→LangGraph prototype** `[HIGH] [v0.3] [1d]` — write it, prove the seam, **delete it** until v1.1. Mitigates the #1 risk in the plan.

@@ -21,6 +21,8 @@ from movate.core.models import (
     JudgeMethod,
     Metrics,
     RunRecord,
+    WorkflowRunRecord,
+    WorkflowStatus,
 )
 
 _SCHEMA = """
@@ -39,10 +41,14 @@ CREATE TABLE IF NOT EXISTS runs (
     output           TEXT,
     metrics          TEXT NOT NULL,
     error            TEXT,
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    workflow_run_id  TEXT,
+    node_id          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_agent_created
     ON runs(agent, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_workflow_run
+    ON runs(workflow_run_id) WHERE workflow_run_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS failures (
     failure_id   TEXT PRIMARY KEY,
@@ -74,7 +80,29 @@ CREATE TABLE IF NOT EXISTS evals (
 );
 CREATE INDEX IF NOT EXISTS idx_evals_agent_created
     ON evals(agent, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    workflow_run_id   TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL,
+    workflow          TEXT NOT NULL,
+    workflow_version  TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    initial_state     TEXT NOT NULL,
+    final_state       TEXT,
+    error_node_id     TEXT,
+    error             TEXT,
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow_created
+    ON workflow_runs(workflow, created_at DESC);
 """
+
+# Lightweight migrations applied after `executescript(_SCHEMA)`. Each is
+# wrapped in a try/except for the "duplicate column" error so reruns are safe.
+_MIGRATIONS = [
+    "ALTER TABLE runs ADD COLUMN workflow_run_id TEXT",
+    "ALTER TABLE runs ADD COLUMN node_id TEXT",
+]
 
 
 class SqliteProvider:
@@ -89,6 +117,15 @@ class SqliteProvider:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        # Idempotent column additions for upgraders. ALTER TABLE in sqlite
+        # raises OperationalError("duplicate column name") on re-run; swallow
+        # only that and re-raise everything else.
+        for stmt in _MIGRATIONS:
+            try:
+                await self._conn.execute(stmt)
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column name" not in str(exc):
+                    raise
         await self._conn.commit()
 
     @property
@@ -98,8 +135,18 @@ class SqliteProvider:
         return self._conn
 
     async def save_run(self, run: RunRecord) -> None:
+        # Use named columns rather than positional VALUES so column order in
+        # the schema can drift without breaking inserts (and so lightweight
+        # ALTER-added columns work).
         await self._db.execute(
-            "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO runs (
+                run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
+                provider, provider_version, pricing_version, status,
+                input, output, metrics, error, created_at,
+                workflow_run_id, node_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 run.run_id,
                 run.job_id,
@@ -116,6 +163,8 @@ class SqliteProvider:
                 run.metrics.model_dump_json(),
                 run.error.model_dump_json() if run.error else None,
                 run.created_at.isoformat(),
+                run.workflow_run_id,
+                run.node_id,
             ),
         )
         await self._db.commit()
@@ -142,6 +191,7 @@ class SqliteProvider:
         agent: str | None = None,
         tenant_id: str | None = None,
         status: str | None = None,
+        workflow_run_id: str | None = None,
         limit: int = 20,
     ) -> list[RunRecord]:
         clauses: list[str] = []
@@ -155,6 +205,9 @@ class SqliteProvider:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if workflow_run_id:
+            clauses.append("workflow_run_id = ?")
+            params.append(workflow_run_id)
         sql = "SELECT * FROM runs"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -207,6 +260,50 @@ class SqliteProvider:
             rows = await cur.fetchall()
         return [_row_to_eval(r) for r in rows]
 
+    async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO workflow_runs (
+                workflow_run_id, tenant_id, workflow, workflow_version,
+                status, initial_state, final_state, error_node_id, error,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                w.workflow_run_id,
+                w.tenant_id,
+                w.workflow,
+                w.workflow_version,
+                w.status.value,
+                json.dumps(w.initial_state),
+                json.dumps(w.final_state) if w.final_state is not None else None,
+                w.error_node_id,
+                w.error.model_dump_json() if w.error else None,
+                w.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def list_workflow_runs(
+        self,
+        *,
+        workflow: str | None = None,
+        limit: int = 20,
+    ) -> list[WorkflowRunRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if workflow:
+            clauses.append("workflow = ?")
+            params.append(workflow)
+        sql = "SELECT * FROM workflow_runs"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_run(r) for r in rows]
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
@@ -234,6 +331,7 @@ def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
 
 
 def _row_to_run(row: aiosqlite.Row) -> RunRecord:
+    keys = row.keys() if hasattr(row, "keys") else []
     return RunRecord(
         run_id=row["run_id"],
         job_id=row["job_id"],
@@ -248,6 +346,23 @@ def _row_to_run(row: aiosqlite.Row) -> RunRecord:
         input=json.loads(row["input"]),
         output=json.loads(row["output"]) if row["output"] else None,
         metrics=Metrics.model_validate_json(row["metrics"]),
+        error=ErrorInfo.model_validate_json(row["error"]) if row["error"] else None,
+        created_at=datetime.fromisoformat(row["created_at"]),
+        workflow_run_id=row["workflow_run_id"] if "workflow_run_id" in keys else None,
+        node_id=row["node_id"] if "node_id" in keys else None,
+    )
+
+
+def _row_to_workflow_run(row: aiosqlite.Row) -> WorkflowRunRecord:
+    return WorkflowRunRecord(
+        workflow_run_id=row["workflow_run_id"],
+        tenant_id=row["tenant_id"],
+        workflow=row["workflow"],
+        workflow_version=row["workflow_version"],
+        status=WorkflowStatus(row["status"]),
+        initial_state=json.loads(row["initial_state"]),
+        final_state=json.loads(row["final_state"]) if row["final_state"] else None,
+        error_node_id=row["error_node_id"],
         error=ErrorInfo.model_validate_json(row["error"]) if row["error"] else None,
         created_at=datetime.fromisoformat(row["created_at"]),
     )

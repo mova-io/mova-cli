@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -56,6 +56,8 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML",
     "types-jsonschema",
+    "build>=1.5.0",
+    "twine>=6.2.0",
 ]
 
 [project.scripts]
@@ -63,10 +65,10 @@ movate = "movate.cli.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/movate"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/movate/templates" = "movate/templates"
-"src/movate/providers/pricing.yaml" = "movate/providers/pricing.yaml"
+# Note: ``packages`` already includes every file under ``src/movate/`` (data
+# and Python alike) because each subdir we ship has an ``__init__.py`` that
+# makes it a real package. No ``force-include`` needed — earlier versions of
+# this file had one and it produced duplicate-name warnings at build time.
 
 [tool.uv]
 package = true
@@ -83,6 +85,9 @@ ignore = ["PLR0913", "PLR0915"]
 [tool.ruff.lint.per-file-ignores]
 # Typer's idiomatic pattern uses function-call defaults (`typer.Option(...)`); B008 misfires there.
 "src/movate/cli/*.py" = ["B008"]
+# Compiler is naturally branch-heavy (one branch per validation rule) — splitting it
+# into helpers fights readability without reducing total complexity.
+"src/movate/core/workflow/compiler.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 

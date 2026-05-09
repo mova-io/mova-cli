@@ -3,6 +3,45 @@
 All notable changes to movate. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-05-09
+
+Sequential workflows: declarative `workflow.yaml` → IR → runner. Linear
+chains of agent nodes only in v0.3; the IR is forward-aware (`NodeType` /
+`EdgeKind` enums include conditional, parallel, HITL, sub-workflow variants)
+so v1.1's LangGraph compiler can target it without a schema break.
+
+**42 new tests** (196 unit + 3 smoke = 199 total). `ruff format`,
+`ruff check`, `mypy src` (strict) all clean.
+
+### Added — Workflow IR + compiler
+
+- `WorkflowSpec` Pydantic model for `workflow.yaml` ([src/movate/core/workflow/spec.py](src/movate/core/workflow/spec.py)) — `kind: Workflow`, `state_schema`, `entrypoint`, `nodes`, `edges`. Node `type` constrained to `Literal["agent"]` so typos fail at parse time.
+- `WorkflowGraph` IR ([src/movate/core/workflow/ir.py](src/movate/core/workflow/ir.py)) — nodes, edges, topology helpers (`successors`, `predecessors`, `sources`, `sinks`, `is_linear`, `topological_order`). Future-aware enums: `NodeType` ∈ {AGENT, TOOL, HUMAN, FUNCTION, SUB_WORKFLOW}, `EdgeKind` ∈ {SEQUENTIAL, CONDITIONAL, PARALLEL_FAN_OUT, PARALLEL_FAN_IN}.
+- Two-pass compiler ([src/movate/core/workflow/compiler.py](src/movate/core/workflow/compiler.py)):
+  - `compile_workflow(spec, dir)` — structural validation: duplicate ids, dangling edges, self-loops, cycles, orphan reachability, state-schema parsing.
+  - `validate_linear(graph)` — v0.3 phase gate. Rejects branches, joins, conditional edges, non-agent node types with phase-aware error messages naming when each feature lands.
+
+### Added — Workflow runner + storage
+
+- `WorkflowRunner` ([src/movate/core/workflow/runner.py](src/movate/core/workflow/runner.py)) walks the IR in topological order. State plumbing: initial state validated against `state_schema`; per node, state is *projected* onto the agent's input schema (keys in `properties` only) and the agent's output is shallow-merged back. Mid-pipeline failures stop the run, retain the pre-merge state, and stamp the failed `node_id`.
+- `WorkflowStatus` enum + `WorkflowRunRecord` Pydantic. `RunRecord` extended with optional `workflow_run_id` + `node_id` so per-node history joins back to the parent run.
+- New sqlite `workflow_runs` table + idempotent `ALTER TABLE runs ADD COLUMN` migrations for existing v0.2 DBs.
+- `InMemoryStorage` (in `movate.testing`) updated to match the new protocol.
+
+### Added — Workflow CLI integration
+
+- `is_workflow_path()` auto-detects workflow vs agent by presence of `workflow.yaml`.
+- `movate validate <path>` — workflow branch prints topology chain, exits 0/2.
+- `movate show <path>` — workflow branch renders Rich tables + ASCII chain + Mermaid `flowchart LR` block (paste into a PR for a live diagram).
+- `movate run <path>` — workflow branch parses `INPUT` as JSON / file / stdin (no auto-wrap), executes through `WorkflowRunner`, prints per-node summary + `final_state`. `--output {table|json}`.
+
+### Architecture decisions locked
+
+- **IR is the contract; validators are policy.** The IR's enum members include v1.1+ variants. The compiler validators decide which variants are allowed *per phase*. v1.1 swaps `validate_linear` for `validate_dag` (and adds a `LangGraphCompiler` emitting LangGraph from the same `WorkflowGraph`) without touching the IR or the structural compiler.
+- **State plumbing v0.3 = projection + shallow merge.** Explicit `inputs:` / `outputs:` mappings deferred to v0.4 when real workflows demand finer control.
+
+[0.3.0]: https://github.com/movate/movate-cli/releases/tag/v0.3.0
+
 ## [0.2.0] — 2026-05-08
 
 First tagged release. Single-agent loop is production-ready; eval + bench

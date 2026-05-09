@@ -208,7 +208,12 @@ def _now() -> datetime:
 
 
 class RunRecord(BaseModel):
-    """Persisted record of an agent execution."""
+    """Persisted record of an agent execution.
+
+    When a run is part of a workflow, ``workflow_run_id`` links it back to
+    the parent :class:`WorkflowRunRecord`. Standalone (non-workflow) runs
+    leave the field ``None``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -227,6 +232,9 @@ class RunRecord(BaseModel):
     metrics: Metrics
     error: ErrorInfo | None = None
     created_at: datetime = Field(default_factory=_now)
+    workflow_run_id: str | None = None
+    node_id: str | None = None
+    """For workflow runs, the id of the workflow node that produced this run."""
 
 
 class FailureRecord(BaseModel):
@@ -266,6 +274,33 @@ class JudgeConfig(BaseModel):
     @classmethod
     def _strip_rubric(cls, v: str | None) -> str | None:
         return v.strip() if v else v
+
+
+class WorkflowStatus(StrEnum):
+    SUCCESS = "success"
+    ERROR = "error"
+    """Terminal: at least one node failed; partial state retained."""
+
+
+class WorkflowRunRecord(BaseModel):
+    """Persisted record of one workflow execution.
+
+    Each child agent run carries this id in its ``workflow_run_id`` field;
+    join on that to reconstruct the timeline.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_run_id: str
+    tenant_id: str
+    workflow: str
+    workflow_version: str
+    status: WorkflowStatus
+    initial_state: dict[str, Any]
+    final_state: dict[str, Any] | None = None
+    error_node_id: str | None = None
+    error: ErrorInfo | None = None
+    created_at: datetime = Field(default_factory=_now)
 
 
 class EvalRecord(BaseModel):

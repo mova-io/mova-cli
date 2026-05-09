@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from movate.core.models import EvalRecord, FailureRecord, RunRecord
+from movate.core.models import (
+    EvalRecord,
+    FailureRecord,
+    RunRecord,
+    WorkflowRunRecord,
+)
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -31,6 +36,7 @@ class InMemoryStorage:
         self.runs: list[RunRecord] = []
         self.failures: list[FailureRecord] = []
         self.evals: list[EvalRecord] = []
+        self.workflow_runs: list[WorkflowRunRecord] = []
 
     async def init(self) -> None:
         return None
@@ -44,12 +50,16 @@ class InMemoryStorage:
     async def save_eval(self, e: EvalRecord) -> None:
         self.evals.append(e)
 
+    async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
+        self.workflow_runs.append(w)
+
     async def list_runs(
         self,
         *,
         agent: str | None = None,
         tenant_id: str | None = None,
         status: str | None = None,
+        workflow_run_id: str | None = None,
         limit: int = 20,
     ) -> list[RunRecord]:
         rows = self.runs
@@ -59,12 +69,25 @@ class InMemoryStorage:
             rows = [r for r in rows if r.tenant_id == tenant_id]
         if status:
             rows = [r for r in rows if r.status.value == status]
+        if workflow_run_id:
+            rows = [r for r in rows if r.workflow_run_id == workflow_run_id]
         return list(rows)[:limit]
 
     async def list_evals(self, *, agent: str | None = None, limit: int = 20) -> list[EvalRecord]:
         rows = self.evals
         if agent:
             rows = [e for e in rows if e.agent == agent]
+        return list(rows)[:limit]
+
+    async def list_workflow_runs(
+        self,
+        *,
+        workflow: str | None = None,
+        limit: int = 20,
+    ) -> list[WorkflowRunRecord]:
+        rows = self.workflow_runs
+        if workflow:
+            rows = [w for w in rows if w.workflow == workflow]
         return list(rows)[:limit]
 
     async def close(self) -> None:
