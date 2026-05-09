@@ -3,6 +3,45 @@
 All notable changes to movate. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased] — v0.4 in progress
+
+Observability + regression-detection loop. Each item below ships incrementally
+to `main`; v0.4 will be tagged once `movate run --replay <run-id>` lands.
+
+### Added — Tracing backends
+
+- **LangfuseTracer** (`tracing/langfuse.py`) — wraps the Langfuse v2 SDK
+  behind our `Tracer` Protocol. Optional dep (`pip install movate[langfuse]`).
+  Fail-soft: tracer errors never break a run.
+- **OtelTracer** (`tracing/otel.py`) — OTLP-HTTP exporter; span hierarchy
+  workflow → node → provider call. Optional dep (`movate[otel]`). Lazy import.
+- **CompositeTracer** (`tracing/composite.py`) — fan-out to N delegate
+  tracers with per-delegate `SpanCtx` mapping; one bad backend can't kill
+  siblings. Each delegate call wrapped in try/except.
+
+### Added — Trace replay
+
+- **`movate trace replay <id>`** (`cli/trace.py` + `core/replay.py`) —
+  auto-detects agent vs workflow run by id, renders Rich tables (status,
+  agent/workflow, latency, cost, tokens, error) plus per-node breakdown
+  and initial/final state for workflows. `-v` shows full input/output JSON;
+  `-o json` is pipe-friendly for diffs. New `get_run(run_id)` and
+  `get_workflow_run(id)` lookups on `StorageProvider`.
+
+### Added — Eval baseline diff
+
+- **`movate eval --baseline <eval-id>`** (`core/baseline.py` + `cli/eval.py`)
+  — closes the regression-detection loop. Diffs current eval vs a stored
+  `EvalRecord` (mean_score, pass_rate, sample_count, cost). Renders a Rich
+  diff table after the main eval output; `-o json` includes a `baseline`
+  block. Exits 1 on regression past `--regression-tolerance` (default 0.0,
+  strict). Asserts agent identity matches across baseline ↔ current.
+  New `get_eval(eval_id)` storage method. 21 tests in `tests/test_baseline.py`.
+- Per-case diff deferred to v0.4.1+ when datasets are big enough that
+  aggregate isn't enough.
+
+[Unreleased]: https://github.com/movate/movate-cli/compare/v0.3.1...HEAD
+
 ## [0.3.1] — 2026-05-09
 
 Patch release. Fixes a `RunRecord` double-save bug in `WorkflowRunner` that

@@ -275,6 +275,13 @@ class SqliteProvider:
             row = await cur.fetchone()
         return _row_to_workflow_run(row) if row else None
 
+    async def get_eval(self, eval_id: str) -> EvalRecord | None:
+        async with self._db.execute(
+            "SELECT * FROM evals WHERE eval_id = ? LIMIT 1", (eval_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_eval(row) if row else None
+
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         await self._db.execute(
             """

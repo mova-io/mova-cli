@@ -62,6 +62,9 @@ class InMemoryStorage:
             None,
         )
 
+    async def get_eval(self, eval_id: str) -> EvalRecord | None:
+        return next((e for e in self.evals if e.eval_id == eval_id), None)
+
     async def list_runs(
         self,
         *,

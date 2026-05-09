@@ -26,17 +26,16 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ## 🎯 Top 10 highest-leverage shortlist
 
-**v0.4 trace replay shipped this session** — 19 new tests (253 unit + 3 smoke = 256 total). `movate trace replay <id>` auto-detects agent vs workflow run by id and renders Rich tables (status, agent/workflow, latency, cost, tokens, error) plus per-node breakdown + initial/final state for workflows. `-v` shows full input/output JSON, `-o json` is pipe-friendly. Storage gained `get_run(run_id)` + `get_workflow_run(id)` lookups. (Also this session: v0.4 OTel + composite tracers, v0.4 Langfuse, v0.3.1 patch tag, v0.3 IR/runner/CLI.)
+**v0.4 baseline diff shipped this session** — 21 new tests (274 unit + 3 smoke = 277 total). `movate eval --baseline <eval-id>` diffs current scores vs a stored `EvalRecord` (mean_score, pass_rate, sample_count, cost), renders a Rich diff table after the eval output, includes a `baseline` block in `-o json`, and exits 1 on regression past `--regression-tolerance` (default 0.0). Closes the regression-detection loop alongside trace replay. Storage gained `get_eval(eval_id)`. (Also this session: v0.4 trace replay + OTel/composite/Langfuse tracers, v0.3.1 patch, v0.3 IR/runner/CLI.)
 
-1. [ ] **Eval baseline diff (`movate eval --baseline <eval-id>`)** `[HIGH] [v0.4] [next] [2-3d]` — already half-built since `EvalRecord` is persisted.
-2. [ ] **`movate run --replay <run-id>`** `[HIGH] [v0.4] [next] [≤1d]` — re-run an exact recorded input against the current agent; single best regression-debug tool.
-3. [ ] **Tag v0.4 release** `[MED] [v0.4] [≤1h]` — once baseline diff + run-replay land, cut the tag.
-5. [ ] **GH Actions eval-gate workflow** `[HIGH] [v1.0] [≤1d]` — closes the loop on "evals are mandatory."
-6. [ ] **PostgresProvider + FastAPI runtime** `[HIGH] [v0.5] [1w]` — turns movate from a CLI into a service.
-7. [ ] **API key issuance + tenant isolation audit** `[HIGH] [v0.5] [2-3d]` — security-critical for multi-tenant.
-8. [ ] **Bicep + GH-Actions deploy.yml** `[HIGH] [v1.0] [4-6d]` — turn `git push release/*` into an ACA deploy.
-9. [ ] **Model policy enforcement** `[HIGH] [v1.0] [2-3d]` — `policies/model_policy.yaml` enforced at executor entry.
-10. [ ] **More templates as customer engagements demand** `[MED] [post-v0.4]` — extractor, RAG, function-caller; trivial to add now that the registry exists.
+1. [ ] **`movate run --replay <run-id>`** `[HIGH] [v0.4] [next] [≤1d]` — re-run an exact recorded input against the current agent; single best regression-debug tool.
+2. [ ] **Tag v0.4 release** `[MED] [v0.4] [≤1h]` — once run-replay lands, cut the tag.
+3. [ ] **GH Actions eval-gate workflow** `[HIGH] [v1.0] [≤1d]` — closes the loop on "evals are mandatory."
+4. [ ] **PostgresProvider + FastAPI runtime** `[HIGH] [v0.5] [1w]` — turns movate from a CLI into a service.
+5. [ ] **API key issuance + tenant isolation audit** `[HIGH] [v0.5] [2-3d]` — security-critical for multi-tenant.
+6. [ ] **Bicep + GH-Actions deploy.yml** `[HIGH] [v1.0] [4-6d]` — turn `git push release/*` into an ACA deploy.
+7. [ ] **Model policy enforcement** `[HIGH] [v1.0] [2-3d]` — `policies/model_policy.yaml` enforced at executor entry.
+8. [ ] **More templates as customer engagements demand** `[MED] [post-v0.4]` — extractor, RAG, function-caller; trivial to add now that the registry exists.
 
 ---
 
@@ -139,7 +138,7 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 - [x] **Composite tracer (multi-fanout)** `[MED] [v0.4] [done]` — `CompositeTracer` in [src/movate/tracing/composite.py](src/movate/tracing/composite.py). Per-span mapping back to per-delegate `SpanCtx`s so end/event/attribute fan-out. Each delegate wrapped in try/except — one bad backend can't kill siblings. 26 tests in [tests/test_tracing_otel.py](tests/test_tracing_otel.py) covering OtelTracer + CompositeTracer + all dispatch paths.
 - [x] **`movate trace replay <run-id>`** `[HIGH] [v0.4] [done]` — `core/replay.py` (engine) + `cli/trace.py` (rendering). Auto-detects agent vs workflow id, renders Rich tables + per-node breakdown for workflows, `--verbose` shows full input/output bodies, `--output json` is pipe-friendly. New `get_run(run_id)` + `get_workflow_run(id)` storage methods. 19 tests in [tests/test_replay.py](tests/test_replay.py) + [tests/test_cli_trace.py](tests/test_cli_trace.py).
 - [ ] **`movate logs <run-id> --tail`** `[MED] [v0.4] [≤1d]` — read sqlite + tracer events, render Rich timeline.
-- [ ] **Drift baseline (`movate eval --baseline <eval-id>`)** `[HIGH] [v0.4] [2-3d]` — diff today's scores vs a stored baseline; flags regressions per case.
+- [x] **Drift baseline (`movate eval --baseline <eval-id>`)** `[HIGH] [v0.4] [done]` — `core/baseline.py` (`BaselineDiff` math, regression-detection) + `cli/eval.py` (`--baseline`, `--regression-tolerance`). Diffs mean_score, pass_rate, sample_count, cost; renders Rich diff table after eval output; includes `baseline` block in `-o json`; exits 1 on regression past tolerance. New `get_eval(eval_id)` storage method. 21 tests in [tests/test_baseline.py](tests/test_baseline.py). Per-case diff deferred to v0.4.1+ when datasets demand it.
 - [ ] **Span attributes — token-level cost breakdown** `[MED] [v0.4] [≤2h]` — `cost_usd`, `pricing_version`, `cached_input_tokens` per provider call.
 - [ ] **Privacy: redact prompt/output spans by config** `[MED] [v0.4] [≤1d]` — `tracer.redact_io: true` for tenants with PII.
 - [ ] **Cost dashboards (Langfuse-side)** `[LOW] [v0.4] [—]` — delegated to Langfuse; just confirm dashboard exists.

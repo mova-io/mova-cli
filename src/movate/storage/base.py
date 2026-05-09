@@ -35,6 +35,9 @@ class StorageProvider(Protocol):
     async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRunRecord | None:
         """Exact lookup by workflow_run_id. Returns ``None`` if no match."""
 
+    async def get_eval(self, eval_id: str) -> EvalRecord | None:
+        """Exact lookup by eval_id. Returns ``None`` if no match."""
+
     async def list_runs(
         self,
         *,
