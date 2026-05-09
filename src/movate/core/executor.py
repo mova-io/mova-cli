@@ -191,6 +191,7 @@ class Executor:
 
             response = RunResponse(
                 status="success",
+                run_id=run_id,
                 data=output,
                 human_readable=_extract_human_readable(output),
                 trace_id=span.trace_id,
@@ -320,6 +321,7 @@ class Executor:
 
         return RunResponse(
             status=status,  # type: ignore[arg-type]
+            run_id=run_id,
             data={},
             human_readable=f"**Error**: {err}",
             trace_id=span.trace_id,

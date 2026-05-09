@@ -51,12 +51,10 @@ def test_doctor_runs() -> None:
     "command",
     [
         ["logs", "x"],
-        # `serve` was a stub through v0.4; v0.5 stage 3b replaced it with a
-        # real uvicorn binding, so it can't appear in this list — invoking
-        # it would actually spin up an HTTP server and block forever.
-        # Stage 3b's coverage lives in tests/test_runtime_app.py via
-        # TestClient + a real-binary smoke walked through manually.
-        ["worker"],
+        # `serve` (v0.5 stage 3b) and `worker` (v0.5 stage 4) both used
+        # to be stubs; both have been replaced with real loops that
+        # block forever, so neither can appear here. Their coverage
+        # lives in tests/test_runtime_*.py + manual real-binary smoke.
         ["deploy", "dev"],
     ],
 )

@@ -183,6 +183,10 @@ class RunResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["success", "error", "safety_blocked"]
+    run_id: str = ""
+    """The run_id of the persisted ``RunRecord`` (v0.5+). Empty on
+    pre-v0.5 callers that don't populate it; the worker reads this
+    to set ``JobRecord.result_run_id`` after dispatching a job."""
     data: dict[str, Any] = Field(default_factory=dict)
     human_readable: str = ""
     trace_id: str = ""

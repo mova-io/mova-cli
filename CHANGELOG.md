@@ -5,6 +5,53 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Worker claim loop + `movate worker` (v0.5 stage 4)
+
+**movate is now a runtime, not just a queue.** The full HTTP →
+queue → claim → execute → terminal-state lifecycle works end-to-end
+between two real processes.
+
+- **`runtime/dispatch.py`** — `WorkerDispatch.execute_job(job) →
+  DispatchOutcome`. Pure logic, no async loop. Agent + workflow
+  paths; unknown target / executor crash both → terminal ERROR with
+  structured error info. The split keeps tests deterministic
+  (assert each branch with one call) and makes the loop trivial.
+- **`runtime/worker.py`** — `Worker.run_one_cycle()` (deterministic;
+  one claim+dispatch+update; tests call this directly) and
+  `Worker.run_forever(stop_event)` (CLI loop, sleeps the configured
+  poll interval when the queue is empty, exits promptly on event
+  set even mid-poll). Never crashes on a single bad job: dispatch
+  errors and storage update failures both get logged and the loop
+  continues.
+- **`runtime/registry.scan_workflows(path)`** — mirrors
+  `scan_agents`. Returns name → `WorkflowGraph`; one broken
+  workflow.yaml warns and skips rather than crashing startup.
+- **`movate worker`** CLI replaces the stub. Flags: `--tenant-id`
+  (drain a single tenant; default is all), `--agents-path` (env:
+  `MOVATE_AGENTS_PATH`), `--workflows-path` (env:
+  `MOVATE_WORKFLOWS_PATH`), `--poll-interval`, `--mock`. Registers
+  SIGINT/SIGTERM handlers that flip the stop event so in-flight
+  jobs finish before exit.
+- **`RunResponse` gained `run_id`** — populated by `Executor.execute`
+  for both success and error paths. The worker reads it to mirror
+  into `JobRecord.result_run_id`. Backwards compatible: empty
+  string default.
+- **`runtime/worker.WorkerConfig`** — `poll_interval_seconds` and
+  optional `tenant_id`. Workers without a `tenant_id` drain all
+  queues (operator/dev mode); tenant-bound workers are the
+  production pattern.
+- **End-to-end binary smoke** validated: scaffold an agent, start
+  `movate serve --port 8766` and `movate worker --mock` in
+  separate processes, mint a key, POST /run → 202 queued, poll
+  /jobs/{id} → `status: success`, `result_run_id` matches the
+  persisted `RunRecord.run_id`, total lifecycle ~112ms (claim
+  ~106ms after submission, completed ~6ms after claim).
+- 10 new tests across dispatch (agent success/error/unknown,
+  workflow with real one-node yaml on disk, executor crash →
+  internal error) and worker (claim/empty, drain one job, unknown
+  target → ERROR, tenant scoping, run_forever exits on stop event
+  even with long poll interval).
+
 ### Added — Agent registry + `movate serve` (v0.5 stage 3b)
 
 - **`runtime/registry.py`** — `scan_agents(root)` walks one level
