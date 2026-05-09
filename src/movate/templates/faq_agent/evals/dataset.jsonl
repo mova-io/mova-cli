@@ -1,0 +1,3 @@
+{"input": {"question": "What is the capital of France?"}, "expected": {"answer": "Paris.", "confidence": 1.0}}
+{"input": {"question": "Who wrote Hamlet?"}, "expected": {"answer": "William Shakespeare.", "confidence": 1.0}}
+{"input": {"question": "Will it rain tomorrow in Tokyo?"}, "expected": {"answer": "I don't know.", "confidence": 0.0}}

@@ -1,0 +1,2 @@
+{"input": {"text": "The quick brown fox jumps over the lazy dog on a sunny afternoon. Birds chirped overhead and a gentle breeze carried the scent of wildflowers across the meadow.", "max_words": 12}, "expected": {"summary": "A fox jumps over a sleeping dog on a sunny afternoon.", "word_count": 11}}
+{"input": {"text": "Movate is a declarative agent platform: define agents in YAML, run them locally or in production, and gate releases on evals.", "max_words": 10}, "expected": {"summary": "Movate is a declarative YAML platform for AI agents.", "word_count": 9}}

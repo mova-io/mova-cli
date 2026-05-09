@@ -1,0 +1,20 @@
+# LLM-as-judge config for the FAQ template. Rename to ``judge.yaml`` to enable.
+#
+# Exact-match scoring will not work here — answer wording varies by run.
+# This rubric scores semantic correctness instead.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for factual correctness
+  and brevity. Penalize hallucinated facts.
+    1.0 = factually correct AND ≤ 2 sentences
+    0.5 = factually correct but verbose, OR partially correct
+    0.0 = wrong, hallucinated, or unsafe
+
+threshold: 0.7

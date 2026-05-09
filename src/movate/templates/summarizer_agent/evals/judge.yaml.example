@@ -1,0 +1,18 @@
+# LLM-as-judge for the summarizer template. Rename to ``judge.yaml`` to enable.
+# Exact-match scoring will fail because summaries vary in wording.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual summary against the expected summary on three dimensions:
+    * Faithfulness: does it stay within the source text? (no hallucinations)
+    * Coverage: does it preserve the key facts of the source?
+    * Brevity: is the word_count within the requested max_words?
+  1.0 = strong on all three. 0.5 = weak on one. 0.0 = hallucinated or far over budget.
+
+threshold: 0.7

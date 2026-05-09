@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["text", "max_words"],
+  "properties": {
+    "text": { "type": "string", "minLength": 1 },
+    "max_words": { "type": "integer", "minimum": 5, "maximum": 500 }
+  }
+}

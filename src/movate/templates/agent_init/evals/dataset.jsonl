@@ -1,0 +1,2 @@
+{"input": {"text": "hello"}, "expected": {"message": "Hello!"}}
+{"input": {"text": "what's 2+2?"}, "expected": {"message": "4"}}

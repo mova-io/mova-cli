@@ -1,0 +1,16 @@
+agents_dir: ./agents
+workflows_dir: ./workflows
+
+bench:
+  models:
+    - openai/gpt-4o-mini-2024-07-18
+    - openai/gpt-4o-2024-08-06
+    - anthropic/claude-haiku-4-5-20251001
+    - anthropic/claude-sonnet-4-6
+  judges:
+    - openai/gpt-4o-2024-08-06
+    - anthropic/claude-sonnet-4-6
+  runs: 5
+
+eval:
+  gate: 0.7

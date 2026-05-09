@@ -1,0 +1,3 @@
+{"input": {"text": "I loved this movie, the acting was superb!", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "positive"}}
+{"input": {"text": "Terrible service. Will never come back.", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "negative"}}
+{"input": {"text": "It was okay, nothing special.", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "neutral"}}

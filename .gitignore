@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# movate runtime
+~/.movate/
+.movate/
+*.db
+*.db-journal
+local.db
+
+# Build artifacts
+*.whl
+*.tar.gz
+
+# uv: lockfile IS committed; cache is not
+.uv-cache/
+# uv.lock  ← do NOT ignore; commit for reproducibility

@@ -1,0 +1,36 @@
+version: "2026.05.01"
+last_verified: "2026-05-08"
+models:
+  # OpenAI
+  openai/gpt-4o-2024-08-06:
+    input_per_1k: 0.0025
+    output_per_1k: 0.0100
+    cached_input_per_1k: 0.00125
+  openai/gpt-4o-mini-2024-07-18:
+    input_per_1k: 0.00015
+    output_per_1k: 0.00060
+    cached_input_per_1k: 0.000075
+  openai/o1-2024-12-17:
+    input_per_1k: 0.0150
+    output_per_1k: 0.0600
+    cached_input_per_1k: 0.0075
+
+  # Azure OpenAI (slight markup vs first-party)
+  azure/gpt-4o-2024-08-06:
+    input_per_1k: 0.00275
+    output_per_1k: 0.0110
+    cached_input_per_1k: 0.001375
+
+  # Anthropic
+  anthropic/claude-opus-4-6:
+    input_per_1k: 0.0150
+    output_per_1k: 0.0750
+    cached_input_per_1k: 0.0015
+  anthropic/claude-sonnet-4-6:
+    input_per_1k: 0.0030
+    output_per_1k: 0.0150
+    cached_input_per_1k: 0.0003
+  anthropic/claude-haiku-4-5-20251001:
+    input_per_1k: 0.00080
+    output_per_1k: 0.0040
+    cached_input_per_1k: 0.00008

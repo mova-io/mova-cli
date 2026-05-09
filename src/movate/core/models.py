@@ -1,0 +1,294 @@
+"""Pydantic models for the movate runtime.
+
+Includes the agent specification (parsed from agent.yaml), request/response
+contracts, and persisted records.
+
+v0.1 deliberately drops MDK fields that belong to later phases:
+
+  * ``workflow`` (Phase 3 — sequential workflows)
+  * ``skills``   (Phase 7 — skills/tools)
+  * ``tools``    (Phase 7 — tools)
+
+They will be re-added with proper validation when their phase ships.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+API_VERSION = "movate/v1"
+SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+# ---------------------------------------------------------------------------
+# Agent specification (mirrors agent.yaml)
+# ---------------------------------------------------------------------------
+
+
+class ModelFallback(BaseModel):
+    """A fallback target the executor tries after the primary fails."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(..., description="LiteLLM model string, e.g. 'openai/gpt-4o-mini'")
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelConfig(BaseModel):
+    """Provider + params. ``provider`` is a LiteLLM model string.
+
+    Examples:
+
+        provider: openai/gpt-4o-mini-2024-07-18
+        provider: azure/gpt-4.1
+        provider: anthropic/claude-sonnet-4-6
+
+    Floating tags (``latest``, ``stable``) are rejected at parse time so a
+    silent provider rotation can't change a deployed agent's behavior.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    fallback: list[ModelFallback] = Field(default_factory=list)
+
+    @field_validator("provider")
+    @classmethod
+    def _reject_floating_tags(cls, v: str) -> str:
+        if "/" not in v:
+            raise ValueError(
+                f"provider {v!r} must be a LiteLLM model string in '<provider>/<model>' form"
+            )
+        _, model = v.split("/", 1)
+        floating = {"latest", "stable", "newest"}
+        if model.lower() in floating or model.endswith("-latest"):
+            raise ValueError(f"floating model tag rejected: {v!r}; pin to a dated revision")
+        return v
+
+
+class SchemaPaths(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: str
+    output: str
+
+
+class EvalConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str | None = None
+    judge: str | None = None
+
+
+class Timeouts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    call_ms: int = Field(default=30_000, ge=1)
+    total_ms: int = Field(default=60_000, ge=1)
+
+
+class Budget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_cost_usd_per_run: float = Field(default=1.0, ge=0)
+
+
+class AgentSpec(BaseModel):
+    """Parsed ``agent.yaml`` contents (api_version: movate/v1, kind: Agent)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    api_version: Literal["movate/v1"] = Field(..., alias="api_version")
+    kind: Literal["Agent"] = "Agent"
+
+    name: str = Field(..., min_length=1, max_length=128)
+    version: str
+    description: str = ""
+    owner: str = ""
+
+    model: ModelConfig
+    prompt: str  # path relative to agent dir
+    schemas: SchemaPaths = Field(..., alias="schema")
+
+    evals: EvalConfig = Field(default_factory=EvalConfig)
+    timeouts: Timeouts = Field(default_factory=Timeouts)
+    budget: Budget = Field(default_factory=Budget)
+    tags: list[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$", v):
+            raise ValueError(f"agent name {v!r} must be lowercase alphanumeric with hyphens")
+        return v
+
+    @field_validator("version")
+    @classmethod
+    def _validate_semver(cls, v: str) -> str:
+        if not SEMVER_RE.match(v):
+            raise ValueError(f"agent version {v!r} must be semver (MAJOR.MINOR.PATCH)")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Runtime request / response contract
+# ---------------------------------------------------------------------------
+
+
+class RunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    input: dict[str, Any]
+    session_id: str | None = None
+    request_id: str = Field(default_factory=lambda: str(uuid4()))
+
+
+class TokenUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: int = 0
+    output: int = 0
+    cached_input: int = 0
+
+
+class Metrics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latency_ms: int = 0
+    tokens: TokenUsage = Field(default_factory=TokenUsage)
+    cost_usd: float = 0.0
+    provider: str = ""
+    pricing_version: str = ""
+
+
+class ErrorInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    message: str
+    retryable: bool = False
+
+
+class RunResponse(BaseModel):
+    """Strict output contract — every agent run returns this shape."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["success", "error", "safety_blocked"]
+    data: dict[str, Any] = Field(default_factory=dict)
+    human_readable: str = ""
+    trace_id: str = ""
+    metrics: Metrics = Field(default_factory=Metrics)
+    error: ErrorInfo | None = None
+
+
+# ---------------------------------------------------------------------------
+# Persisted records
+# ---------------------------------------------------------------------------
+
+
+class JobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCESS = "success"
+    ERROR = "error"
+    SAFETY_BLOCKED = "safety_blocked"
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+class RunRecord(BaseModel):
+    """Persisted record of an agent execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    job_id: str
+    tenant_id: str
+    agent: str
+    agent_version: str
+    prompt_hash: str
+    provider: str
+    provider_version: str
+    pricing_version: str
+    status: JobStatus
+    input: dict[str, Any]
+    output: dict[str, Any] | None = None
+    metrics: Metrics
+    error: ErrorInfo | None = None
+    created_at: datetime = Field(default_factory=_now)
+
+
+class FailureRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failure_id: str
+    run_id: str | None
+    tenant_id: str
+    agent: str
+    failure_type: str
+    message: str
+    retryable: bool
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
+# Judge config (parsed from agent's evals/judge.yaml)
+# ---------------------------------------------------------------------------
+
+
+class JudgeMethod(StrEnum):
+    EXACT = "exact"
+    LLM_JUDGE = "llm_judge"
+
+
+class JudgeConfig(BaseModel):
+    """Eval scoring config. Cross-family enforcement happens at eval time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: JudgeMethod = JudgeMethod.EXACT
+    model: ModelConfig | None = None
+    rubric: str | None = None
+    threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+    @field_validator("rubric")
+    @classmethod
+    def _strip_rubric(cls, v: str | None) -> str | None:
+        return v.strip() if v else v
+
+
+class EvalRecord(BaseModel):
+    """Persisted summary of one eval run (one dataset, one agent version, N cases)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    eval_id: str
+    tenant_id: str
+    agent: str
+    agent_version: str
+    dataset_hash: str
+    judge_method: JudgeMethod
+    judge_provider: str | None
+    runs_per_case: int
+    gate_mode: str
+    threshold: float
+    mean_score: float
+    pass_rate: float
+    sample_count: int
+    total_cost_usd: float
+    created_at: datetime = Field(default_factory=_now)
+
+
+# Forward ref resolution
+ModelConfig.model_rebuild()
