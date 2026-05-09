@@ -382,5 +382,45 @@ class JobRecord(BaseModel):
     completed_at: datetime | None = None
 
 
+# ---------------------------------------------------------------------------
+# API keys (v0.5+)
+# ---------------------------------------------------------------------------
+
+
+class ApiKeyEnv(StrEnum):
+    """Hard-separated environments. ``live`` keys MUST NOT work on
+    test infra and vice versa — checked at parse time before any DB hit."""
+
+    LIVE = "live"
+    TEST = "test"
+
+
+class ApiKeyRecord(BaseModel):
+    """Persisted half of an API key pair.
+
+    The *plaintext* secret is never stored — only the hash + salt. The
+    full key string is shown to the user once at mint time and
+    permanently irrecoverable after that.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    """13-char base32 random id; doubles as the table primary key."""
+    tenant_id: str
+    env: ApiKeyEnv
+    secret_hash: str
+    """SHA-256 hex digest of ``salt || secret``."""
+    salt: str
+    """16 bytes URL-safe base64. Per-key, prevents rainbow tables."""
+    label: str | None = None
+    """Optional human-readable note (e.g. ``"ci-bot"``, ``"backfill-script"``)."""
+    created_at: datetime = Field(default_factory=_now)
+    last_used_at: datetime | None = None
+    """Updated async on every successful verify; useful for "stale key" cleanup."""
+    revoked_at: datetime | None = None
+    """Set by ``movate auth revoke <key-id>``. ``None`` = active."""
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

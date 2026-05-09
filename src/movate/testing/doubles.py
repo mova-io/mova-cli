@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from movate.core.models import (
+    ApiKeyRecord,
     EvalRecord,
     FailureRecord,
     JobRecord,
@@ -41,6 +42,7 @@ class InMemoryStorage:
         self.evals: list[EvalRecord] = []
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
+        self.api_keys: list[ApiKeyRecord] = []
 
     async def init(self) -> None:
         return None
@@ -181,6 +183,44 @@ class InMemoryStorage:
                 )
                 return
         raise ValueError(f"no job found for id {job_id!r}")
+
+    # ------------------------------------------------------------------
+    # API keys (v0.5 stage 2)
+    # ------------------------------------------------------------------
+
+    async def save_api_key(self, key: ApiKeyRecord) -> None:
+        if any(k.key_id == key.key_id for k in self.api_keys):
+            raise ValueError(f"duplicate key_id {key.key_id!r}")
+        self.api_keys.append(key)
+
+    async def get_api_key(self, key_id: str) -> ApiKeyRecord | None:
+        return next((k for k in self.api_keys if k.key_id == key_id), None)
+
+    async def list_api_keys(
+        self,
+        *,
+        tenant_id: str | None = None,
+        include_revoked: bool = False,
+    ) -> list[ApiKeyRecord]:
+        rows = self.api_keys
+        if tenant_id is not None:
+            rows = [k for k in rows if k.tenant_id == tenant_id]
+        if not include_revoked:
+            rows = [k for k in rows if k.revoked_at is None]
+        return sorted(rows, key=lambda k: k.created_at, reverse=True)
+
+    async def revoke_api_key(self, key_id: str) -> None:
+        for i, k in enumerate(self.api_keys):
+            if k.key_id == key_id and k.revoked_at is None:
+                self.api_keys[i] = k.model_copy(update={"revoked_at": datetime.now(UTC)})
+                return
+        # Idempotent — silently no-op on missing or already-revoked.
+
+    async def touch_api_key(self, key_id: str) -> None:
+        for i, k in enumerate(self.api_keys):
+            if k.key_id == key_id:
+                self.api_keys[i] = k.model_copy(update={"last_used_at": datetime.now(UTC)})
+                return
 
     async def close(self) -> None:
         return None

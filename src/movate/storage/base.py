@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from movate.core.models import (
+    ApiKeyRecord,
     EvalRecord,
     FailureRecord,
     JobRecord,
@@ -114,6 +115,42 @@ class StorageProvider(Protocol):
         ``QUEUED`` and ``RUNNING`` are reserved for the lifecycle helpers
         (``save_job``, ``claim_next_job``). Sets ``completed_at = now()``
         as a side effect.
+        """
+
+    # ------------------------------------------------------------------
+    # API keys (v0.5 stage 2)
+    # ------------------------------------------------------------------
+
+    async def save_api_key(self, key: ApiKeyRecord) -> None:
+        """Persist a freshly-minted ApiKeyRecord (no plaintext secret)."""
+
+    async def get_api_key(self, key_id: str) -> ApiKeyRecord | None:
+        """Exact lookup by key_id. Returns ``None`` if no match.
+
+        The HTTP middleware uses this to resolve the presented key into
+        a record for verification.
+        """
+
+    async def list_api_keys(
+        self,
+        *,
+        tenant_id: str | None = None,
+        include_revoked: bool = False,
+    ) -> list[ApiKeyRecord]:
+        """List keys for the management UI. Defaults to active keys only.
+
+        ``tenant_id=None`` returns keys across all tenants — operator-only,
+        never exposed on the HTTP API.
+        """
+
+    async def revoke_api_key(self, key_id: str) -> None:
+        """Set ``revoked_at`` to now. Idempotent — re-revoking is a no-op."""
+
+    async def touch_api_key(self, key_id: str) -> None:
+        """Bump ``last_used_at``.
+
+        Called fire-and-forget after a successful verify; failure to
+        touch must not fail the request.
         """
 
     async def close(self) -> None: ...

@@ -14,6 +14,8 @@ from pathlib import Path
 import aiosqlite
 
 from movate.core.models import (
+    ApiKeyEnv,
+    ApiKeyRecord,
     ErrorInfo,
     EvalRecord,
     FailureRecord,
@@ -145,6 +147,27 @@ _MIGRATIONS = [
     # Tenant-scoped listing for the `/jobs` endpoint and `movate worker`
     # filtering.
     ("CREATE INDEX IF NOT EXISTS idx_jobs_tenant_created ON jobs(tenant_id, created_at DESC)"),
+    # v0.5 stage 2: API keys.
+    """
+    CREATE TABLE IF NOT EXISTS api_keys (
+        key_id        TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        env           TEXT NOT NULL,
+        secret_hash   TEXT NOT NULL,
+        salt          TEXT NOT NULL,
+        label         TEXT,
+        created_at    TEXT NOT NULL,
+        last_used_at  TEXT,
+        revoked_at    TEXT
+    )
+    """,
+    # Active-keys-by-tenant lookup for `movate auth list` and audit reports.
+    # Partial index over WHERE revoked_at IS NULL keeps it tight as the table
+    # grows with revocations.
+    (
+        "CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active "
+        "ON api_keys(tenant_id) WHERE revoked_at IS NULL"
+    ),
 ]
 
 
@@ -504,6 +527,76 @@ class SqliteProvider:
         )
         await self._db.commit()
 
+    # ------------------------------------------------------------------
+    # API keys (v0.5 stage 2)
+    # ------------------------------------------------------------------
+
+    async def save_api_key(self, key: ApiKeyRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO api_keys (
+                key_id, tenant_id, env, secret_hash, salt, label,
+                created_at, last_used_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key.key_id,
+                key.tenant_id,
+                key.env.value,
+                key.secret_hash,
+                key.salt,
+                key.label,
+                key.created_at.isoformat(),
+                key.last_used_at.isoformat() if key.last_used_at else None,
+                key.revoked_at.isoformat() if key.revoked_at else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_api_key(self, key_id: str) -> ApiKeyRecord | None:
+        async with self._db.execute("SELECT * FROM api_keys WHERE key_id = ?", (key_id,)) as cur:
+            row = await cur.fetchone()
+        return _row_to_api_key(row) if row else None
+
+    async def list_api_keys(
+        self,
+        *,
+        tenant_id: str | None = None,
+        include_revoked: bool = False,
+    ) -> list[ApiKeyRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if not include_revoked:
+            clauses.append("revoked_at IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM api_keys {where} ORDER BY created_at DESC"
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_api_key(r) for r in rows]
+
+    async def revoke_api_key(self, key_id: str) -> None:
+        """Set ``revoked_at`` on a key. Idempotent — re-revoking is a no-op."""
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL",
+            (now, key_id),
+        )
+        await self._db.commit()
+
+    async def touch_api_key(self, key_id: str) -> None:
+        """Bump ``last_used_at``. Called fire-and-forget after a successful
+        verify; failure to touch must not fail the request, so callers
+        wrap this in ``asyncio.create_task`` and ignore exceptions."""
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "UPDATE api_keys SET last_used_at = ? WHERE key_id = ?",
+            (now, key_id),
+        )
+        await self._db.commit()
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
@@ -582,4 +675,18 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         created_at=datetime.fromisoformat(row["created_at"]),
         claimed_at=datetime.fromisoformat(row["claimed_at"]) if row["claimed_at"] else None,
         completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+    )
+
+
+def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
+    return ApiKeyRecord(
+        key_id=row["key_id"],
+        tenant_id=row["tenant_id"],
+        env=ApiKeyEnv(row["env"]),
+        secret_hash=row["secret_hash"],
+        salt=row["salt"],
+        label=row["label"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        last_used_at=datetime.fromisoformat(row["last_used_at"]) if row["last_used_at"] else None,
+        revoked_at=datetime.fromisoformat(row["revoked_at"]) if row["revoked_at"] else None,
     )

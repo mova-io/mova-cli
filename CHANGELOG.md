@@ -5,6 +5,38 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — API key auth (v0.5 stage 2)
+
+- **`core/auth.py`** — pure crypto, no I/O. `mint_api_key` produces a
+  `mvt_<env>_<tenant_prefix>_<key_id>_<secret>` string with 256 bits
+  of entropy in the secret. `parse_api_key` validates shape via regex
+  (rejects malformed / wrong env / wrong tenant prefix length).
+  `hash_secret` uses SHA-256 of `salt || secret`; `verify_secret` is
+  constant-time via `hmac.compare_digest`. `check_record` is the
+  decision tree for verification — returns `None` on success or a
+  `VerificationFailure(reason=...)` for not_found / revoked /
+  tenant_mismatch / env_mismatch / bad_secret. Each branch is unit
+  tested in isolation.
+- **`ApiKeyEnv` enum** — `live` | `test`, hard separation enforced at
+  parse time before any DB hit. **`ApiKeyRecord`** Pydantic model
+  carries `secret_hash`, `salt`, `created_at`, `last_used_at`,
+  `revoked_at`, optional `label`. The plaintext secret is never
+  stored.
+- **`api_keys` table** added via SQLite migrations (idempotent). One
+  partial index: `WHERE revoked_at IS NULL` — keeps `list_api_keys`
+  fast as the table grows with revocations. Storage methods
+  (`save_api_key`, `get_api_key`, `list_api_keys`, `revoke_api_key`
+  idempotent, `touch_api_key` for last-used bump) on the Protocol +
+  both backends.
+- **`movate auth create-key | list-keys | revoke-key`** CLI surface.
+  `create-key` prints the full key once on stdout (pipe into a
+  vault) with a "save this now" warning on stderr. `--quiet`
+  inverts the output streams for shell capture (`KEY=$(... --quiet)`).
+  `list-keys` defaults to active keys; `--include-revoked` shows the
+  full audit history. End-to-end smoked against the real binary
+  with `MOVATE_DB=/tmp/...`: mint → list → revoke → list.
+- 37 tests across pure crypto / storage round-trip / CLI integration.
+
 ### Added — Job queue data layer (v0.5 stage 1)
 
 - **`JobRecord` + `JobKind`** in `core/models.py` — queue entry with

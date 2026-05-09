@@ -26,12 +26,11 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ## 🎯 Top 10 highest-leverage shortlist
 
-**v0.5 stage 1 shipped this session** — 25 new tests (321 unit + 3 smoke = 324 total). Job queue data layer: `JobKind` enum, `JobRecord` Pydantic model, `jobs` table on SQLite with partial index over the queue head, plus `save_job`/`get_job`/`list_jobs`/`claim_next_job`/`update_job` on the `StorageProvider` Protocol with implementations in both `SqliteProvider` and `InMemoryStorage`. Claim semantics: FIFO oldest-first, status guard (only QUEUED rows ever claimed), tenant scoping, atomic `BEGIN IMMEDIATE` so two worker connections can't double-dispatch a job. Design decisions locked in [docs/v0.5-design.md](docs/v0.5-design.md). Foundation for FastAPI runtime + worker which land next.
+**v0.5 stage 2 shipped this session** — 37 new tests (358 unit + 3 smoke = 361 total). API key auth crypto + storage + CLI. `core/auth.py` (pure crypto: `mint_api_key`, `parse_api_key`, `verify_secret`, `check_record` with branch coverage for not_found / revoked / tenant_mismatch / env_mismatch / bad_secret); `ApiKeyEnv`/`ApiKeyRecord` model; `api_keys` table with partial index `WHERE revoked_at IS NULL`; storage methods (`save_api_key`, `get_api_key`, `list_api_keys`, `revoke_api_key` idempotent, `touch_api_key` for last-used bump). CLI: `movate auth create-key | list-keys | revoke-key` (interactive + `--quiet` scripting modes). End-to-end smoked against the real binary: mint → list (active) → revoke → list (include-revoked). HTTP middleware that consumes these primitives lands in stage 3.
 
-1. [ ] **v0.5 stage 2: API keys + auth crypto** `[HIGH] [v0.5] [next] [≤2d]` — `core/auth.py` (mint/verify/revoke), `api_keys` schema, tenant-scoped storage methods. Pure data layer; HTTP middleware lands with FastAPI in stage 3.
-2. [ ] **v0.5 stage 3: FastAPI runtime + `movate serve`** `[HIGH] [v0.5] [≤3d]` — `/healthz`, `/agents`, `/run`, `/jobs/{id}` with auth middleware in front.
-3. [ ] **v0.5 stage 4: worker claim loop + `movate worker`** `[HIGH] [v0.5] [≤2d]` — drain the queue, dispatch agent vs workflow by `JobKind`.
-4. [ ] **v0.5 stage 5: PostgresProvider port** `[HIGH] [v0.5] [≤2d]` — same conformance suite, switches to `SELECT ... FOR UPDATE SKIP LOCKED` for the claim path.
+1. [ ] **v0.5 stage 3: FastAPI runtime + `movate serve`** `[HIGH] [v0.5] [next] [≤3d]` — `/healthz`, `/agents`, `/run`, `/jobs/{id}` with auth middleware in front. The middleware composes `parse_api_key` → `storage.get_api_key` → `check_record` (already shipped).
+2. [ ] **v0.5 stage 4: worker claim loop + `movate worker`** `[HIGH] [v0.5] [≤2d]` — drain the queue, dispatch agent vs workflow by `JobKind`.
+3. [ ] **v0.5 stage 5: PostgresProvider port** `[HIGH] [v0.5] [≤2d]` — same conformance suite, switches to `SELECT ... FOR UPDATE SKIP LOCKED` for the claim path.
 3. [ ] **Bicep + GH-Actions deploy.yml** `[HIGH] [v1.0] [4-6d]` — turn `git push release/*` into an ACA deploy.
 4. [ ] **Model policy enforcement** `[HIGH] [v1.0] [2-3d]` — `policies/model_policy.yaml` enforced at executor entry.
 5. [ ] **More templates as customer engagements demand** `[MED] [post-v0.4]` — extractor, RAG, function-caller; trivial to add now that the registry exists.
