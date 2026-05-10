@@ -34,6 +34,7 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
+.claude/
 
 # movate runtime
 ~/.movate/
@@ -49,3 +50,11 @@ local.db
 # uv: lockfile IS committed; cache is not
 .uv-cache/
 # uv.lock  ← do NOT ignore; commit for reproducibility
+
+# Bicep — compiled ARM templates are derived; only the source is committed.
+# Real parameter files (with KV references / live env values) are env-specific
+# and never committed; only the .example template is tracked.
+infra/azure/main.json
+infra/azure/**/*.json
+infra/azure/*.bicepparam
+!infra/azure/main.bicepparam.example

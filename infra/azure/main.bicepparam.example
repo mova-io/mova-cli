@@ -1,0 +1,58 @@
+// Example parameter file for infra/azure/main.bicep.
+//
+// COPY this to a NON-committed file (e.g. main.dev.bicepparam) before
+// deploying. The .gitignore at the repo root excludes
+// *.bicepparam EXCEPT main.bicepparam.example.
+//
+// To deploy:
+//   1. Pre-create the resource group:
+//        az group create -n movate-dev-rg -l eastus2
+//   2. Pre-populate Key Vault secrets (chicken-and-egg note below).
+//   3. Run the deployment with this param file:
+//        az deployment group create \
+//            -g movate-dev-rg \
+//            -f infra/azure/main.bicep \
+//            -p main.dev.bicepparam
+//
+// Chicken-and-egg note: the deployment provisions Key Vault, but the
+// Container Apps reference secrets that must exist in KV at deploy
+// time. Two options:
+//   A. Two-pass deploy: first pass creates KV + Postgres + ACR + Logs;
+//      operator populates secrets; second pass deploys the Container
+//      Apps. Cleaner but more steps.
+//   B. Pre-create KV by hand, then run the full deploy (Bicep is
+//      idempotent on KV).
+// Stage 2 (`movate deploy` CLI) automates option A.
+
+using './main.bicep'
+
+// REQUIRED — these have no defaults.
+param env = 'dev'
+param image = 'movate:0.5.0'
+
+// REQUIRED — sourced from Key Vault using `getSecret`. Replace the
+// vault name + secret name with your real values. Or for a one-off
+// dev deploy you can pass a literal; just NEVER commit a literal.
+//
+// Example using a Key Vault reference (recommended):
+//
+//   param postgresAdminPassword = az.getSecret(
+//     '<subscriptionId>',
+//     'movate-bootstrap-rg',     // RG that holds the bootstrap KV
+//     'movate-bootstrap-kv',     // name of the bootstrap KV
+//     'pg-admin-password'        // secret name
+//   )
+//
+// Replace this dummy literal before deploying for real:
+param postgresAdminPassword = 'ReplaceMeBeforeDeployment-ChangeMe!'
+
+// OPTIONAL — defaults to resourceGroup().location if omitted.
+param location = 'eastus2'
+
+// OPTIONAL — common tags. Add your own as needed (cost center, owner, ...).
+param tags = {
+  application: 'movate'
+  environment: 'dev'
+  managedBy: 'bicep'
+  owner: 'platform-team'
+}

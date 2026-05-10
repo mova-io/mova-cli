@@ -5,6 +5,67 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Azure Bicep IaC (v1.0 stage 1)
+
+**Foundation for `git push release/* → ACA-deployed service`.** Stage 1
+provisions; stages 2-4 (deploy CLI, model policy, tenant isolation
+audit) close the v1.0 loop.
+
+- **`infra/azure/main.bicep`** orchestrator at `resourceGroup` scope.
+  Per-env defaults (dev/staging/prod) drive SKU tiers, replica
+  counts, and retention without parameter sprawl.
+- **`infra/azure/modules/`** — seven focused modules, each with
+  `@description` on every param and `output` for what the next
+  module needs:
+  * `loganalytics.bicep` — workspace + retention
+  * `acr.bicep` — registry (Basic for dev, Standard for prod)
+  * `keyvault.bicep` — RBAC mode, soft-delete + purge protection
+  * `postgres.bicep` — Flex Server + database + Azure-services
+    firewall rule
+  * `containerapp-env.bicep` — ACA Environment wired to Log
+    Analytics; prod adds a Dedicated workload profile alongside
+    Consumption
+  * `containerapp-api.bicep` — `movate serve` with external
+    ingress, /healthz liveness + readiness probes, KV secret refs
+    via system-assigned managed identity
+  * `containerapp-worker.bicep` — `movate worker` with no ingress;
+    CPU-utilization scale rule (v1.1 will swap to a KEDA Postgres
+    scaler keyed on queue depth)
+- **Role assignments at top level** (not inside modules) — keeps the
+  dependency edges from ACA managed identity → ACR (AcrPull) and
+  ACA managed identity → Key Vault (Key Vault Secrets User) explicit
+  in `main.bicep` where the assignee + scope cross module boundaries.
+- **`infra/azure/main.bicepparam.example`** — parameter template with
+  inline guidance on the Key Vault chicken-and-egg (Container Apps
+  reference secrets that must exist in KV at deploy time; two-pass
+  or bootstrap-vault options documented).
+- **`Dockerfile`** — multi-stage Python 3.11 + uv build with two
+  final targets sharing the same base layers: `runtime` (CMD =
+  `movate serve`) and `worker` (CMD = `movate worker`). Non-root
+  user, baked default tracer = `stdout` (Log Analytics captures it
+  via the ACA Env), `MOVATE_AGENTS_PATH=/app/agents`.
+- **`.dockerignore`** — excludes tests, docs, build artifacts, dev
+  DBs, and `infra/` from the image context. Smaller, faster builds;
+  zero risk of leaking secrets.
+- **CI `bicep` job** — installs the Bicep CLI and runs
+  `bicep build infra/azure/main.bicep` + `bicep lint` on every PR.
+  No Azure subscription needed; catches syntax errors / unknown
+  resource types / param mismatches before an operator hits them.
+- **Operator walkthrough** at
+  [infra/azure/README.md](infra/azure/README.md) — end-to-end
+  recipe from `az login` to verified `/healthz`, including the
+  KV-secret-population dance and the first `movate auth create-key`
+  call against the deployed DB.
+
+Design decisions (naming convention, region default, per-env SKU
+choices, secret strategy, no-VNet-in-v1.0) locked in
+[docs/v1.0-azure-design.md](docs/v1.0-azure-design.md).
+
+**Out of scope for stage 1** (lands later): `movate deploy` CLI
+binding `az acr build` + `az containerapp update`, GH Actions
+deploy.yml, custom domain + TLS, VNet integration, multi-region
+failover.
+
 ### Added — Progress UI for long-running CLI ops
 
 The dev team's intuition for "is this still working?" is now backed

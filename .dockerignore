@@ -1,0 +1,61 @@
+# What NOT to ship in the image. Equivalent of .gitignore but for
+# `docker build` — smaller images, faster builds, no accidental secrets.
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+*.tar.gz
+
+# Virtual envs (image creates its own)
+.venv/
+venv/
+env/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Tests aren't shipped (use deps for runtime; tests stay in repo)
+tests/
+
+# Local dev artifacts
+.movate/
+*.db
+*.db-journal
+local.db
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Git + CI metadata never goes in the image
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Bicep + ARM aren't runtime artifacts
+infra/
+
+# Docs are reference, not runtime — keep the image lean
+docs/
+*.md
+!README.md
+
+# Compiled Bicep templates / parameter files (also gitignored)
+*.bicepparam
+!main.bicepparam.example

@@ -89,3 +89,31 @@ jobs:
         uses: docker://rhysd/actionlint:latest
         with:
           args: -color
+
+  # Bicep validation — compiles infra/azure/main.bicep on every PR so
+  # syntax errors / unknown resource types / param mismatches get caught
+  # before an operator tries to az deployment group create. No Azure
+  # subscription needed; `bicep build` is fully local.
+  bicep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: |
+          curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          bicep --version
+
+      - name: Bicep build (main + all modules transitively)
+        # `bicep build` compiles the entry point and every module it
+        # references; one invocation covers the whole tree. Errors
+        # fail the job; warnings (no-unnecessary-dependson, etc.) are
+        # informational.
+        run: bicep build infra/azure/main.bicep --outdir /tmp/bicep-out
+
+      - name: Bicep lint
+        # `bicep lint` runs the linter ruleset (no-unused-params,
+        # secure-secrets-in-params, etc.) and fails on errors.
+        run: bicep lint infra/azure/main.bicep
