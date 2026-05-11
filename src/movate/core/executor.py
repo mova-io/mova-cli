@@ -28,6 +28,7 @@ from movate.core.failures import (
     MovateError,
     PolicyViolationError,
     SchemaError,
+    TenantBudgetExceededError,
 )
 from movate.core.loader import AgentBundle
 from movate.core.models import (
@@ -120,6 +121,12 @@ class Executor:
 
         started = time.monotonic()
         try:
+            # Tenant-budget check FIRST — if the tenant's monthly cap
+            # is breached, no run should fire (not even a doomed one).
+            # Cheap PK lookup + a single SUM aggregate; the index on
+            # (tenant_id, created_at) is the perf path.
+            await self._check_tenant_budget()
+
             # Policy check happens BEFORE schema validation and prompt
             # rendering — a denied model shouldn't get to bill latency
             # or trigger any side effects. ``check_model`` is also
@@ -255,6 +262,35 @@ class Executor:
                 job_id=job_id,
                 started=started,
                 err=exc.last_error,
+            )
+
+    async def _check_tenant_budget(self) -> None:
+        """Abort the run if the tenant has hit its monthly cap.
+
+        Reads :meth:`StorageProvider.get_tenant_budget` (PK lookup —
+        cheap). If no row exists for this tenant or
+        ``monthly_usd_limit`` is ``None``, returns immediately (the
+        default-unlimited case, backwards compatible with every
+        pre-budget deployment).
+
+        Race window: under high concurrency two requests can both
+        observe "under budget" simultaneously and both succeed,
+        pushing combined cost over the cap. The overrun is bounded
+        by the in-flight call count — not catastrophic, but
+        operators should set the cap slightly below the hard cost
+        ceiling they actually want to enforce.
+        """
+        budget = await self._storage.get_tenant_budget(self._tenant_id)
+        if budget is None or budget.monthly_usd_limit is None:
+            return
+        current = await self._storage.sum_tenant_cost_current_month(self._tenant_id)
+        if current >= budget.monthly_usd_limit:
+            raise TenantBudgetExceededError(
+                f"tenant {self._tenant_id!r} has spent ${current:.2f} of "
+                f"${budget.monthly_usd_limit:.2f} this month; runs are paused. "
+                f"Operator can raise the budget with "
+                f"`movate tenants set-budget {self._tenant_id} --monthly-usd <new>` "
+                f"or wait for next-month rollover."
             )
 
     def _enforce_policy(

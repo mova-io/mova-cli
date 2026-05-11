@@ -39,6 +39,7 @@ from movate.core.models import (
     JudgeMethod,
     Metrics,
     RunRecord,
+    TenantBudget,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -147,6 +148,20 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_created
 CREATE INDEX IF NOT EXISTS idx_jobs_retry_at
     ON jobs(tenant_id, next_retry_at)
     WHERE status = 'queued' AND next_retry_at IS NOT NULL;
+
+-- Per-tenant monthly cost ceiling. Absent row = unlimited.
+CREATE TABLE IF NOT EXISTS tenant_budgets (
+    tenant_id          TEXT PRIMARY KEY,
+    monthly_usd_limit  DOUBLE PRECISION,
+    created_at         TIMESTAMPTZ NOT NULL,
+    updated_at         TIMESTAMPTZ NOT NULL
+);
+-- Cover the per-tenant current-month aggregation. Without this,
+-- SUM(metrics->>'cost_usd') WHERE tenant_id=$1 AND created_at>=$2 is
+-- a Seq Scan over the full runs table; with it, an index range scan
+-- bounded to the month's rows for that tenant.
+CREATE INDEX IF NOT EXISTS idx_runs_tenant_created
+    ON runs(tenant_id, created_at);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id        TEXT PRIMARY KEY,
@@ -694,6 +709,73 @@ class PostgresProvider:
             key_id,
             tenant_id,
         )
+
+    # ------------------------------------------------------------------
+    # Tenant budgets (post-v1.0)
+    # ------------------------------------------------------------------
+
+    async def get_tenant_budget(self, tenant_id: str) -> TenantBudget | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM tenant_budgets WHERE tenant_id = $1", tenant_id
+        )
+        if row is None:
+            return None
+        return TenantBudget(
+            tenant_id=row["tenant_id"],
+            monthly_usd_limit=row["monthly_usd_limit"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def upsert_tenant_budget(self, budget: TenantBudget) -> None:
+        # ``ON CONFLICT ... DO UPDATE`` preserves created_at on
+        # updates — operators see "first set" vs "last touched"
+        # separately.
+        now = datetime.now(UTC)
+        await self._db.execute(
+            """
+            INSERT INTO tenant_budgets (
+                tenant_id, monthly_usd_limit, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4)
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                monthly_usd_limit = EXCLUDED.monthly_usd_limit,
+                updated_at = EXCLUDED.updated_at
+            """,
+            budget.tenant_id,
+            budget.monthly_usd_limit,
+            budget.created_at,
+            now,
+        )
+
+    async def list_tenant_budgets(self) -> list[TenantBudget]:
+        rows = await self._db.fetch("SELECT * FROM tenant_budgets ORDER BY created_at")
+        return [
+            TenantBudget(
+                tenant_id=r["tenant_id"],
+                monthly_usd_limit=r["monthly_usd_limit"],
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
+
+    async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
+        # ``date_trunc('month', now() at time zone 'utc')`` returns the
+        # 1st-of-month UTC. The ``metrics->>'cost_usd'`` extraction is
+        # JSONB-aware — postgres treats this as a typed real cast.
+        # COALESCE keeps the no-runs-yet case as 0.0.
+        result = await self._db.fetchval(
+            """
+            SELECT COALESCE(SUM(
+                (metrics->>'cost_usd')::DOUBLE PRECISION
+            ), 0.0)
+            FROM runs
+            WHERE tenant_id = $1
+              AND created_at >= date_trunc('month', NOW() AT TIME ZONE 'utc')
+            """,
+            tenant_id,
+        )
+        return float(result or 0.0)
 
 
 # ---------------------------------------------------------------------------

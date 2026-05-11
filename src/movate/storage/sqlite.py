@@ -25,6 +25,7 @@ from movate.core.models import (
     JudgeMethod,
     Metrics,
     RunRecord,
+    TenantBudget,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -171,6 +172,22 @@ _MIGRATIONS = [
     # post-v1.0: per-job email notification. SMS deferred — needs
     # regulatory + phone-number provisioning out of band of code.
     "ALTER TABLE jobs ADD COLUMN notify_email TEXT",
+    # post-v1.0: per-tenant monthly cost ceiling. One row per tenant;
+    # absent row = unlimited (the default, backwards-compatible with
+    # v0.x). Executor queries this on every run entry → PK lookup is
+    # the perf path.
+    """
+    CREATE TABLE IF NOT EXISTS tenant_budgets (
+        tenant_id          TEXT PRIMARY KEY,
+        monthly_usd_limit  REAL,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+    )
+    """,
+    # Cover the per-tenant current-month aggregation. Without this,
+    # SUM(metrics.cost_usd) WHERE tenant_id=? AND created_at>=? is a
+    # table scan; with it, an index range scan over month-of-rows.
+    ("CREATE INDEX IF NOT EXISTS idx_runs_tenant_created ON runs(tenant_id, created_at)"),
     # post-v1.0: job-level retry policy. attempt_count tracks how
     # many times we've dispatched; next_retry_at lets the claim path
     # skip a job until its backoff has elapsed. NOT NULL DEFAULT 0
@@ -723,6 +740,82 @@ class SqliteProvider:
         )
         await self._db.commit()
 
+    # ------------------------------------------------------------------
+    # Tenant budgets (post-v1.0)
+    # ------------------------------------------------------------------
+
+    async def get_tenant_budget(self, tenant_id: str) -> TenantBudget | None:
+        async with self._db.execute(
+            "SELECT * FROM tenant_budgets WHERE tenant_id = ?",
+            (tenant_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return TenantBudget(
+            tenant_id=row["tenant_id"],
+            monthly_usd_limit=row["monthly_usd_limit"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    async def upsert_tenant_budget(self, budget: TenantBudget) -> None:
+        # ``INSERT ... ON CONFLICT`` preserves the original created_at
+        # on updates — operators see "when was this tenant first
+        # given a budget?" separately from "when did we last change
+        # the limit?". updated_at refreshes either way.
+        now_iso = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            """
+            INSERT INTO tenant_budgets (
+                tenant_id, monthly_usd_limit, created_at, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(tenant_id) DO UPDATE SET
+                monthly_usd_limit = excluded.monthly_usd_limit,
+                updated_at = excluded.updated_at
+            """,
+            (
+                budget.tenant_id,
+                budget.monthly_usd_limit,
+                budget.created_at.isoformat(),
+                now_iso,
+            ),
+        )
+        await self._db.commit()
+
+    async def list_tenant_budgets(self) -> list[TenantBudget]:
+        async with self._db.execute("SELECT * FROM tenant_budgets ORDER BY created_at") as cur:
+            rows = await cur.fetchall()
+        return [
+            TenantBudget(
+                tenant_id=r["tenant_id"],
+                monthly_usd_limit=r["monthly_usd_limit"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                updated_at=datetime.fromisoformat(r["updated_at"]),
+            )
+            for r in rows
+        ]
+
+    async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
+        # First-of-the-month UTC. We do this in Python so the SQL
+        # stays portable (sqlite's date functions are quirky); the
+        # index on (tenant_id, created_at) covers the lookup either way.
+        month_start = _first_of_month_utc().isoformat()
+        async with self._db.execute(
+            """
+            SELECT COALESCE(SUM(
+                CAST(json_extract(metrics, '$.cost_usd') AS REAL)
+            ), 0.0) AS total
+            FROM runs
+            WHERE tenant_id = ? AND created_at >= ?
+            """,
+            (tenant_id, month_start),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return 0.0
+        return float(row["total"] or 0.0)
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
@@ -825,3 +918,16 @@ def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
         last_used_at=datetime.fromisoformat(row["last_used_at"]) if row["last_used_at"] else None,
         revoked_at=datetime.fromisoformat(row["revoked_at"]) if row["revoked_at"] else None,
     )
+
+
+def _first_of_month_utc() -> datetime:
+    """Midnight UTC on the 1st of the current month.
+
+    The boundary for ``sum_tenant_cost_current_month``. The postgres
+    backend has its own equivalent in :mod:`movate.storage.postgres`
+    so the two implementations stay in lockstep on month-boundary
+    semantics (operator's local time treating Jan 1 UTC as start of
+    January).
+    """
+    now = datetime.now(UTC)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)

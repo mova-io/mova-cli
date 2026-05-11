@@ -33,6 +33,7 @@ from movate.core.models import (
     JobRecord,
     JobStatus,
     RunRecord,
+    TenantBudget,
     WorkflowRunRecord,
 )
 
@@ -248,6 +249,40 @@ class StorageProvider(Protocol):
         in depth — the auth middleware has already cross-checked the
         record's tenant matches the presented key, but the storage
         layer enforces it independently.
+        """
+
+    # ------------------------------------------------------------------
+    # Tenant budgets (post-v1.0)
+    # ------------------------------------------------------------------
+
+    async def get_tenant_budget(self, tenant_id: str) -> TenantBudget | None:
+        """Return the budget row for ``tenant_id``, or ``None`` if no
+        budget is set (= unlimited).
+
+        Read on every ``Executor.execute`` entry, so implementations
+        should be cheap (PK lookup; sub-millisecond).
+        """
+
+    async def upsert_tenant_budget(self, budget: TenantBudget) -> None:
+        """Insert-or-update the row for ``budget.tenant_id``.
+
+        Sets ``updated_at = now()`` server-side so the operator can see
+        when a limit was last touched. ``created_at`` is preserved on
+        update — only changes on the first insert for a tenant.
+        """
+
+    async def list_tenant_budgets(self) -> list[TenantBudget]:
+        """List all configured tenant budgets, oldest-first. Operator
+        tooling only — never exposed on the HTTP API."""
+
+    async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
+        """Sum ``runs.metrics.cost_usd`` for ``tenant_id`` for the
+        current calendar month (UTC). 0.0 if no runs.
+
+        ``Executor`` calls this at the top of every run to check
+        against the budget; the cost-drift + per-run budget checks
+        later in execute() are independent of this. Index on
+        ``(tenant_id, created_at)`` is the perf path.
         """
 
     async def close(self) -> None: ...

@@ -21,6 +21,7 @@ class FailureType(StrEnum):
     CONTENT_FILTER = "content_filter"
     COST_BUDGET_EXCEEDED = "cost_budget_exceeded"
     POLICY_VIOLATION = "policy_violation"
+    TENANT_BUDGET_EXCEEDED = "tenant_budget_exceeded"
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,11 @@ DEFAULT_RETRY: dict[FailureType, RetryRule] = {
     # policy-checked, so falling back to another denied model would
     # just hit the same wall).
     FailureType.POLICY_VIOLATION: RetryRule(1, (), fallback_on_exhaust=False),
+    # Tenant-budget breaches don't recover by retrying or falling back
+    # to a cheaper model — the tenant's monthly cap is the cap. The
+    # operator un-pauses by raising the budget or waiting for month
+    # rollover. No retry, no fallback.
+    FailureType.TENANT_BUDGET_EXCEEDED: RetryRule(1, (), fallback_on_exhaust=False),
 }
 
 
@@ -123,4 +129,25 @@ class PolicyViolationError(MovateError):
     """
 
     failure_type = FailureType.POLICY_VIOLATION
+    retryable = False
+
+
+class TenantBudgetExceededError(MovateError):
+    """A tenant has spent past its monthly budget; runs are paused.
+
+    Raised at :meth:`Executor.execute` entry when the tenant's
+    current-month cost (summed across all ``RunRecord.metrics.cost_usd``)
+    meets or exceeds its ``TenantBudget.monthly_usd_limit``.
+
+    Operator un-pauses by either:
+
+    * Raising the budget — ``movate tenants set-budget <id>
+      --monthly-usd <new>``.
+    * Waiting for the next calendar month — the next request after
+      00:00 UTC on the 1st sees fresh spend = 0.
+    * Clearing the budget — ``movate tenants clear-budget <id>``
+      removes the limit (effectively "unlimited").
+    """
+
+    failure_type = FailureType.TENANT_BUDGET_EXCEEDED
     retryable = False

@@ -5,6 +5,90 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Per-tenant monthly cost ceiling (v1.0)
+
+**Closes the runaway-cost gap.** Before this, a misbehaving agent or a
+customer's prompt that loops through tool calls could rack up
+hundreds of dollars before anyone noticed. Now each tenant gets a
+monthly USD cap; runs auto-pause when current-month spend hits the
+limit; operators triage via the new `movate tenants` CLI.
+
+- **`TenantBudget`** Pydantic model — one row per tenant with
+  `monthly_usd_limit: float | None` (None = explicitly unlimited).
+  Absent row = unlimited by default (v0.x-compat — no policy
+  change for projects that don't opt in).
+- **`tenant_budgets` table** added to sqlite + postgres + InMemoryStorage.
+  Sqlite via idempotent `CREATE TABLE IF NOT EXISTS` migration;
+  postgres natively idempotent; new partial index
+  `idx_runs_tenant_created` covers the current-month aggregation
+  so the `SUM(metrics->>'cost_usd')` is an index range scan, not a
+  table scan.
+- **`StorageProvider` gained four methods** (Protocol + all three
+  backends):
+  * `get_tenant_budget(tenant_id) -> TenantBudget | None` — PK
+    lookup; sub-millisecond.
+  * `upsert_tenant_budget(budget)` — preserves `created_at` on
+    update, refreshes `updated_at` server-side so operators see
+    "first set" and "last touched" separately.
+  * `list_tenant_budgets() -> list[TenantBudget]` — operator only.
+  * `sum_tenant_cost_current_month(tenant_id) -> float` — sums
+    `runs.metrics.cost_usd` for rows created since the 1st of
+    the current calendar month (UTC). 0.0 if no runs.
+- **`Executor._check_tenant_budget`** runs FIRST at execute() entry
+  (before the model-policy check + schema validation). No provider
+  call fires if budget is breached — zero cost incurred on the
+  aborted run. Failure persisted to the `failures` table with
+  `tenant_budget_exceeded` type for audit.
+- **Self-fixing error message** — surfaces both numbers + the exact
+  CLI command to fix it (matches v1.0 stages 3/4 pattern):
+  > "tenant 'abc' has spent $5.00 of $1.00 this month; runs are
+  > paused. Operator can raise the budget with `movate tenants
+  > set-budget abc --monthly-usd <new>` or wait for next-month
+  > rollover."
+- **`TenantBudgetExceededError`** + `FailureType.TENANT_BUDGET_EXCEEDED`
+  + entry in `DEFAULT_RETRY` (no retry, no fallback — a cheaper
+  model wouldn't help; the cap is the cap).
+- **`movate tenants` CLI** with four subcommands:
+  * `set-budget <tenant> --monthly-usd <amount>` — set or update.
+  * `clear-budget <tenant>` — sets `monthly_usd_limit = NULL`
+    (row stays for audit history; cap becomes unlimited).
+  * `show <tenant>` — Rich table with budget, spent this month,
+    remaining, color-coded status (green / yellow ≥80% / red
+    when paused), audit timestamps.
+  * `list` — every configured budget oldest-first with the same
+    status column.
+- 24 new tests in `tests/test_tenant_budget.py` covering: storage
+  round-trip (no-row default, upsert preserves `created_at`,
+  clear-via-None, list ordering, sum-zero-when-empty, sum-only-
+  this-month-and-this-tenant), executor enforcement (no-row
+  allows, None-limit allows, spend-meets-budget blocks before
+  provider call, operator pointer in error message, under-budget
+  proceeds), and CLI integration (set persists + show reads back,
+  clear flips to unlimited, show for unknown tenant reports
+  no-row, list enumerates with color status, set rejects
+  negative).
+
+**Race window:** under high concurrency two simultaneous runs can
+both observe "under budget" and both succeed, pushing combined cost
+past the cap. The overrun is bounded by the in-flight call count
+(typically <10 for a single tenant). Operators should set the cap
+slightly below the hard ceiling they actually want to enforce.
+Stronger guarantees (SELECT FOR UPDATE on the budget row + a
+ledger table) lands post-v1.0 if a customer asks.
+
+**Operator workflow when a budget is breached:**
+
+```
+$ movate tenants show <tenant-id>
+# → paused (over budget). spent $523.40 of $500.00.
+
+$ movate tenants set-budget <tenant-id> --monthly-usd 1000
+# → budget raised; next run for this tenant proceeds.
+
+# OR: wait for the 1st of next month — sum_tenant_cost_current_month
+# returns 0 again, the tenant un-pauses automatically.
+```
+
 ### Changed — Worker autoscaling: CPU → KEDA Postgres queue-depth (post-v1.0)
 
 **Leading-indicator scaling.** Before this, the worker Container App

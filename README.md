@@ -52,6 +52,7 @@ that v1.0 builds on.
 | Liveness + readiness probes for ACA | `GET /healthz` (cheap) + `GET /ready` (deep checks) | ✓ post-v1.0 |
 | Per-API-key rate limiting | `movate serve --rate-limit-per-minute 60` | ✓ post-v1.0 |
 | Worker autoscaling on queue depth | KEDA postgresql scaler in `containerapp-worker.bicep` | ✓ post-v1.0 |
+| Per-tenant monthly cost ceiling | `movate tenants set-budget <id> --monthly-usd 500` | ✓ post-v1.0 |
 | Model policy enforcement | `movate.yaml: policy:` (allowed_providers, deny_models, max cost) | ✓ v1.0 stage 3 |
 
 ## Prerequisites

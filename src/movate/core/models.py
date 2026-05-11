@@ -218,6 +218,36 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+class TenantBudget(BaseModel):
+    """Monthly cost ceiling per tenant.
+
+    ``Executor.execute`` queries this at the top of every run; if the
+    tenant's current-month cost (sum of ``RunRecord.metrics.cost_usd``
+    for runs created since the 1st of the month UTC) meets or exceeds
+    ``monthly_usd_limit``, the run is aborted with
+    :class:`TenantBudgetExceededError`.
+
+    A tenant with no row in the ``tenant_budgets`` table is
+    **unlimited** by default — backwards compatible with v0.x where
+    there was no budget enforcement. Operators opt in per-tenant via
+    ``movate tenants set-budget``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    monthly_usd_limit: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Monthly cost ceiling in USD. ``None`` means unlimited (the row "
+            "exists for the audit trail but enforces no cap)."
+        ),
+    )
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+
+
 class RunRecord(BaseModel):
     """Persisted record of an agent execution.
 

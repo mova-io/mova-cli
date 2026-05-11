@@ -17,6 +17,7 @@ from movate.core.models import (
     JobRecord,
     JobStatus,
     RunRecord,
+    TenantBudget,
     WorkflowRunRecord,
 )
 from movate.providers.base import (
@@ -43,6 +44,7 @@ class InMemoryStorage:
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
         self.api_keys: list[ApiKeyRecord] = []
+        self.tenant_budgets: dict[str, TenantBudget] = {}
 
     async def init(self) -> None:
         return None
@@ -296,6 +298,39 @@ class InMemoryStorage:
             if k.key_id == key_id and k.tenant_id == tenant_id:
                 self.api_keys[i] = k.model_copy(update={"last_used_at": datetime.now(UTC)})
                 return
+
+    # ------------------------------------------------------------------
+    # Tenant budgets (post-v1.0)
+    # ------------------------------------------------------------------
+
+    async def get_tenant_budget(self, tenant_id: str) -> TenantBudget | None:
+        return self.tenant_budgets.get(tenant_id)
+
+    async def upsert_tenant_budget(self, budget: TenantBudget) -> None:
+        # Preserve created_at on update (mirrors sqlite/postgres
+        # ``ON CONFLICT DO UPDATE`` semantics).
+        existing = self.tenant_budgets.get(budget.tenant_id)
+        if existing is not None:
+            self.tenant_budgets[budget.tenant_id] = budget.model_copy(
+                update={"created_at": existing.created_at, "updated_at": datetime.now(UTC)}
+            )
+        else:
+            self.tenant_budgets[budget.tenant_id] = budget
+
+    async def list_tenant_budgets(self) -> list[TenantBudget]:
+        return sorted(self.tenant_budgets.values(), key=lambda b: b.created_at)
+
+    async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
+        now = datetime.now(UTC)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        total = 0.0
+        for run in self.runs:
+            if run.tenant_id != tenant_id:
+                continue
+            if run.created_at < month_start:
+                continue
+            total += run.metrics.cost_usd
+        return total
 
     async def close(self) -> None:
         return None
