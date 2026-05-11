@@ -33,6 +33,7 @@ stderr = Console(stderr=True)
 NEVER be silenced (--quiet doesn't suppress these on purpose)."""
 
 _quiet: bool = False
+_global_target: str | None = None
 
 
 def set_quiet(value: bool) -> None:
@@ -47,6 +48,30 @@ def is_quiet() -> bool:
     branching behaviour beyond a simple suppress (e.g. drop a
     spinner when quiet)."""
     return _quiet
+
+
+def set_global_target(value: str | None) -> None:
+    """Set the process-wide default deployment target. Called from the
+    top-level Typer callback when ``movate -t <name>`` (or the
+    ``MOVATE_TARGET`` env var) is set. Per-command ``--target`` flags
+    still win — this is the fallback when none is given."""
+    global _global_target
+    _global_target = value
+
+
+def get_global_target() -> str | None:
+    """Read the process-wide default deployment target, or ``None``.
+
+    The intended call site is in remote commands' resolve-target
+    helper:
+
+      effective = per_command_target or get_global_target()
+      target_name, cfg = resolve_target(effective)
+
+    ``resolve_target(None)`` falls back to the config's active
+    target, so an unset global means "use the active target" — same
+    behaviour as before this option existed."""
+    return _global_target
 
 
 def hint(message: str) -> None:
@@ -64,4 +89,11 @@ def hint(message: str) -> None:
     stderr.print(message)
 
 
-__all__ = ["hint", "is_quiet", "set_quiet", "stderr"]
+__all__ = [
+    "get_global_target",
+    "hint",
+    "is_quiet",
+    "set_global_target",
+    "set_quiet",
+    "stderr",
+]

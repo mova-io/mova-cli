@@ -21,8 +21,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.cli._console import hint
+from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.models import JobRecord, JobStatus
 from movate.core.notify import build_dispatcher
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch

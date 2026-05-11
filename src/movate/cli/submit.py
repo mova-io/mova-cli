@@ -32,7 +32,7 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._completion import complete_agent_name
-from movate.cli._console import hint
+from movate.cli._console import get_global_target, hint
 from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
@@ -134,7 +134,11 @@ def submit(
     payload = _coerce_input(raw)
 
     try:
-        target_name, target_cfg = resolve_target(target)
+        # Per-command --target wins; otherwise fall through to the
+        # process-wide default set by `movate -t <name>` or the
+        # MOVATE_TARGET env var; otherwise resolve_target(None) uses
+        # the active config target.
+        target_name, target_cfg = resolve_target(target or get_global_target())
         token = resolve_bearer_token(target_cfg)
     except UserConfigError as exc:
         err.print(f"[red]✗[/red] {exc}")

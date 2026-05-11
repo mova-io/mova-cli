@@ -85,6 +85,10 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 [tool.ruff.lint.per-file-ignores]
 # Typer's idiomatic pattern uses function-call defaults (`typer.Option(...)`); B008 misfires there.
 "src/movate/cli/*.py" = ["B008"]
+# CLI process state (--quiet flag, global --target) is intentionally module-scope —
+# the top-level Typer callback writes it once on startup, every command reads it. A
+# class wrapper would just push the same single instance through every signature.
+"src/movate/cli/_console.py" = ["B008", "PLW0603"]
 # FastAPI's idiomatic pattern is identical (`Depends(...)` as a default); same exemption.
 "src/movate/runtime/*.py" = ["B008"]
 # Compiler is naturally branch-heavy (one branch per validation rule) — splitting it

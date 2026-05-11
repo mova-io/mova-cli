@@ -83,6 +83,18 @@ def _main(
         "-q",
         help="Suppress INFO logging; print only warnings and errors.",
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        envvar="MOVATE_TARGET",
+        help=(
+            "Default deployment target for remote commands "
+            "(submit, jobs *). Overridden by a per-command --target. "
+            "Falls back to MOVATE_TARGET env var, then to the active "
+            "config target."
+        ),
+    ),
     version: bool = typer.Option(
         False,
         "--version",
@@ -107,6 +119,9 @@ def _main(
     # poll with..." line that's friendly interactively but a nuisance
     # when piping). Error / warning prints stay on regardless.
     _console.set_quiet(quiet)
+    # Stash the global --target / MOVATE_TARGET so remote subcommands
+    # can fall back to it when their own --target wasn't passed.
+    _console.set_global_target(target)
 
 
 # ----- Develop --------------------------------------------------------------

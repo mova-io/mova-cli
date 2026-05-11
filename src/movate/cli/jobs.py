@@ -19,7 +19,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from movate.cli._console import hint
+from movate.cli._console import get_global_target, hint
 from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
@@ -228,9 +228,15 @@ async def _fetch_list(*, target: str | None, status: JobStatus | None, limit: in
 
 
 def _build_client(target: str | None) -> MovateClient:
-    """Resolve target name → MovateClient. Exits cleanly on config errors."""
+    """Resolve target name → MovateClient. Exits cleanly on config errors.
+
+    Precedence (highest wins):
+      1. Per-command ``--target`` flag (the ``target`` arg here).
+      2. Top-level ``movate -t <name>`` / ``MOVATE_TARGET`` env var
+         (via :func:`get_global_target`).
+      3. Active config target (``resolve_target(None)`` default)."""
     try:
-        _, target_cfg = resolve_target(target)
+        _, target_cfg = resolve_target(target or get_global_target())
         token = resolve_bearer_token(target_cfg)
     except UserConfigError as exc:
         err.print(f"[red]✗[/red] {exc}")
