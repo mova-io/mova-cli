@@ -1,0 +1,111 @@
+# Schema + topology validation gate. Distinct from ``agents.yml`` (which
+# also runs evals + requires provider keys) — this workflow is the cheap,
+# fast, always-runs check that catches structural breakage in agents and
+# workflows BEFORE the eval gate even fires.
+#
+# Why a separate workflow:
+#
+#   * No model calls. No API keys. No provider secrets. Runs in <60s.
+#   * Validates BOTH agents (agents/*/agent.yaml) AND workflows
+#     (workflows/*/workflow.yaml) — agents.yml only covers agents.
+#   * Failures here surface as a focused PR check labelled "validate-all"
+#     so reviewers know it's a contract problem (schema / lint / topology)
+#     rather than a model-behavior regression.
+#   * Serves as a template for consumer repos that want a fast PR gate
+#     without committing to the eval-gate pattern at examples/ci/eval-gate.yml.
+#
+# `find` rather than hardcoding agent/workflow names so adding a new
+# agent under agents/<name>/ or workflow under workflows/<name>/ is
+# automatic — no CI edits needed.
+
+name: validate
+
+on:
+  pull_request:
+    paths:
+      - "agents/**"
+      - "workflows/**"
+      - "movate.yaml"
+      # Framework changes can break agent/workflow loading. Catch here
+      # before agents.yml burns time on evals.
+      - "src/movate/**"
+      - ".github/workflows/validate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agents/**"
+      - "workflows/**"
+      - "movate.yaml"
+
+jobs:
+  validate-all:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Sync deps
+        # --dev for movate itself; no --all-extras because we don't run
+        # any provider call here — pure Pydantic + Jinja + JSON-schema work.
+        run: uv sync --dev
+
+      - name: Validate every agent
+        id: agents
+        run: |
+          set -e
+          found=0
+          for agent in agents/*/; do
+            if [ -f "$agent/agent.yaml" ]; then
+              found=$((found + 1))
+              echo "::group::validate $agent"
+              uv run movate validate "$agent" --strict
+              echo "::endgroup::"
+            fi
+          done
+          echo "count=$found" >> "$GITHUB_OUTPUT"
+          echo "::notice::validated $found agent(s)"
+
+      - name: Validate every workflow
+        id: workflows
+        run: |
+          set -e
+          found=0
+          for wf in workflows/*/; do
+            if [ -f "$wf/workflow.yaml" ]; then
+              found=$((found + 1))
+              echo "::group::validate $wf"
+              uv run movate validate "$wf" --strict
+              echo "::endgroup::"
+            fi
+          done
+          echo "count=$found" >> "$GITHUB_OUTPUT"
+          echo "::notice::validated $found workflow(s)"
+
+      - name: Summary
+        # GH Actions truncates step output in the PR check card; the
+        # job summary surfaces "we ran N validations" so reviewers see
+        # at a glance whether anything was actually checked.
+        run: |
+          {
+            echo "## validate gate"
+            echo ""
+            echo "| target | count |"
+            echo "|---|---|"
+            echo "| agents | ${{ steps.agents.outputs.count }} |"
+            echo "| workflows | ${{ steps.workflows.outputs.count }} |"
+            echo ""
+            if [ "${{ steps.agents.outputs.count }}" = "0" ] && [ "${{ steps.workflows.outputs.count }}" = "0" ]; then
+              echo "_No agents or workflows found — gate ran a no-op._"
+              echo "_This is fine in a fresh repo; ensure agents/<name>/agent.yaml or workflows/<name>/workflow.yaml exists before relying on this gate._"
+            else
+              echo "_All validations passed under \`--strict\` (lint warnings promoted to errors)._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
