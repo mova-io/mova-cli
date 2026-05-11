@@ -46,6 +46,8 @@ that v1.0 builds on.
 | Azure deploy (Bicep IaC) | `infra/azure/main.bicep` (manual `az deployment`) | ✓ v1.0 stage 1 |
 | One-command deploy to ACA | `movate deploy --target <name>` | ✓ v1.0 stage 2 |
 | Auto-deploy on push to release/* | `.github/workflows/deploy.yml` (federated OIDC) | ✓ v1.0 stage 2 |
+| Azure preflight diagnostic | `movate doctor --target <name>` | ✓ v1.0 |
+| Azure bootstrap (RG + SP + federated cred) | `scripts/azure-bootstrap.sh <env>` | ✓ v1.0 |
 | Model policy enforcement | `movate.yaml: policy:` (allowed_providers, deny_models, max cost) | ✓ v1.0 stage 3 |
 
 ## Prerequisites

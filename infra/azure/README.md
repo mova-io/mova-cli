@@ -4,6 +4,11 @@ End-to-end recipe for getting movate running on Azure. Covers a fresh
 deployment from zero; for incremental updates (new image, scale
 changes), skip to the [Update flow](#update-flow) section.
 
+**For the abbreviated runbook with the automated identity + RG
+bootstrap, see [docs/azure-bootstrap.md](../../docs/azure-bootstrap.md)
+— this README is the Bicep deep-dive; the bootstrap doc is the
+8-step "from zero to auto-deploy" path.**
+
 Architecture, naming, SKU choices: see [docs/v1.0-azure-design.md](../../docs/v1.0-azure-design.md).
 
 ## Prerequisites

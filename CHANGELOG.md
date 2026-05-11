@@ -5,6 +5,44 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Azure deploy onboarding (`scripts/azure-bootstrap.sh` + `movate doctor --target`)
+
+**Closes the manual-toil gap between "you have an Azure subscription"
+and "`git push release/<env>` deploys."** v1.0 stages 1-4 shipped the
+deploy code path; this is the operator runbook + tooling that makes
+the first deploy painless.
+
+- **`scripts/azure-bootstrap.sh <env>`** — idempotent one-shot per-env
+  setup. Creates the resource group, the service principal for
+  GitHub Actions, the federated OIDC credential pinning to
+  `refs/heads/release/<env>`, and the Contributor / AcrPush role
+  assignments. Defers AcrPush if the ACR doesn't exist yet (Bicep
+  creates it) with a warning; re-running after Bicep locks it in.
+  Prints the values to paste into the GitHub Environment secrets —
+  the manual UI step that genuinely can't be scripted. Safe to
+  re-run after fixing a typo or to re-print the secrets list.
+- **`movate doctor --target <name>`** extends the existing
+  environment-check command with an Azure preflight section: walks
+  `az` installed → logged in → subscription match → resource group
+  → ACR → both Container Apps → `/healthz`. Each row reports the
+  finding + an operator pointer (`run scripts/azure-bootstrap.sh`,
+  `az account set --subscription ...`, etc.) so failures are
+  self-fixing. First thing to run when `movate deploy` is acting up.
+- **`docs/azure-bootstrap.md`** — 8-step end-to-end runbook from
+  "you have a subscription" to "auto-deploy via release/*". Spells
+  out what's automated (the two new tools), what isn't (sub
+  provisioning, GitHub Environment UI, the Key Vault chicken-and-egg
+  on first Bicep run), cost expectations per env, and a
+  troubleshooting table indexed on symptom.
+- 10 new tests in `tests/test_doctor_azure.py` covering: no `az` on
+  PATH short-circuits, no `az login` short-circuits, missing Azure
+  config on target short-circuits, subscription mismatch
+  short-circuits, missing RG with bootstrap pointer, happy-path
+  every-layer green with image tag surfaced, `/healthz` unreachable
+  reported distinctly from missing, and CLI integration
+  (`movate doctor` unchanged when no `--target`, `--target` renders
+  the Azure table, unknown target reports cleanly without crashing).
+
 ### Security — Tenant isolation audit (v1.0 stage 4)
 
 **Closes the v1.0 deploy loop.** Every storage read / mutate path that
