@@ -1,0 +1,17 @@
+{
+  "eval_id": "a1901b4e-4871-4ef6-b2cf-723c1f322f19",
+  "tenant_id": "local",
+  "agent": "case-reasoner",
+  "agent_version": "0.1.0",
+  "dataset_hash": "38330aa12cc02968d6851fe79fd00406dd2941d735d8ad15ff82b7e2bc81f780",
+  "judge_method": "llm_judge",
+  "judge_provider": "anthropic/claude-haiku-4-5-20251001",
+  "runs_per_case": 1,
+  "gate_mode": "mean",
+  "threshold": 0.7,
+  "mean_score": 0.0,
+  "pass_rate": 0.0,
+  "sample_count": 4,
+  "total_cost_usd": 0.0,
+  "created_at": "2026-05-11T17:36:56.102478Z"
+}

@@ -1,0 +1,17 @@
+{
+  "eval_id": "13de10ea-8d97-4973-a105-f415f64b113c",
+  "tenant_id": "local",
+  "agent": "faq-agent",
+  "agent_version": "0.1.0",
+  "dataset_hash": "bb6fdce3caa73a50c2c43993dbf46539becbccc105abf239e662f6de4309c667",
+  "judge_method": "exact",
+  "judge_provider": null,
+  "runs_per_case": 1,
+  "gate_mode": "mean",
+  "threshold": 0.7,
+  "mean_score": 0.0,
+  "pass_rate": 0.0,
+  "sample_count": 3,
+  "total_cost_usd": 0.0,
+  "created_at": "2026-05-11T17:36:54.537392Z"
+}
