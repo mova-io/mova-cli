@@ -19,6 +19,13 @@ env/
 .env.*
 !.env.example
 
+# Personal scratch notes (operator-authored, not source-controlled).
+# Add the file pattern explicitly so `git add -A` won't sweep them up.
+*-feedback.md
+*-notes.md
+NOTES.md
+SCRATCH.md
+
 # Tooling
 .ruff_cache/
 .mypy_cache/
