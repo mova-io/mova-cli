@@ -122,6 +122,7 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
         nodes=nodes,
         edges=edges,
         workflow_dir=workflow_dir,
+        runtime=spec.runtime.value,
     )
 
     # 5. Cycle detection — fail fast at compile time.

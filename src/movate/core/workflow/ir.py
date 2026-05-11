@@ -91,6 +91,13 @@ class WorkflowGraph:
     """Directory containing the source ``workflow.yaml``. Used by the runner
     to resolve any relative paths the compiler couldn't pre-resolve."""
 
+    runtime: str = "homegrown"
+    """Which compiler the runner should use. Mirrors
+    :class:`movate.core.workflow.spec.WorkflowRuntime` (kept as a plain
+    string here to avoid the IR taking a Pydantic dep). Possible values:
+    ``"homegrown"`` (default; walks the IR directly) or ``"langgraph"``
+    (compiles onto a LangGraph StateGraph)."""
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ topology

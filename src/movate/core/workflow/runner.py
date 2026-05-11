@@ -112,6 +112,28 @@ class WorkflowRunner:
         *,
         workflow_run_id: str | None = None,
     ) -> WorkflowResult:
+        # Dispatch: workflow.yaml's `runtime` field selects the compiler.
+        # `homegrown` keeps the existing linear walker below; `langgraph`
+        # delegates to the alternative compiler in `compilers/langgraph.py`.
+        # The two paths return the same WorkflowResult shape so callers
+        # (CLI, replay, storage queries) don't branch on runtime.
+        if graph.runtime == "langgraph":
+            # Local import: compilers/langgraph.py back-imports runner
+            # symbols (WorkflowResult, _summarize_run) so module-level
+            # import here would cycle.
+            from movate.core.workflow.compilers.langgraph import (  # noqa: PLC0415 — circular
+                run_via_langgraph,
+            )
+
+            return await run_via_langgraph(
+                graph,
+                initial_state,
+                executor=self._executor,
+                storage=self._storage,
+                tenant_id=self._tenant_id,
+                workflow_run_id=workflow_run_id,
+            )
+
         wf_id = workflow_run_id or str(uuid4())
         started = time.monotonic()
 

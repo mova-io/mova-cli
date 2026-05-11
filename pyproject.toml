@@ -55,6 +55,9 @@ openai = [
 langchain = [
     "langchain-core>=0.3,<1",
 ]
+langgraph = [
+    "langgraph>=1.0,<2",
+]
 
 [dependency-groups]
 dev = [

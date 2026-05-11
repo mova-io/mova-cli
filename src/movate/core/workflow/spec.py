@@ -17,6 +17,7 @@ Later phases relax these via separate validator passes.
 from __future__ import annotations
 
 import re
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
@@ -24,6 +25,29 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+class WorkflowRuntime(StrEnum):
+    """Which compiler the workflow runner uses to execute this graph.
+
+    * ``homegrown`` (default) — movate's own topology walker
+      (:class:`movate.core.workflow.runner.WorkflowRunner`). Covers linear
+      DAGs end-to-end with our retry / fallback / cost / tracing /
+      tenant-isolation guarantees. The v0.3 default; no extra dep.
+    * ``langgraph`` — compile the graph onto a LangGraph ``StateGraph``
+      and run via ``CompiledStateGraph.invoke()``. Required-extra:
+      ``uv pip install 'movate-cli[langgraph]'``. Unlocks conditional
+      edges, parallel fan-out, HITL pause/resume, and the LangGraph
+      checkpointer ecosystem when those features ship in v1.1.x.
+
+    Linear AGENT workflows run equivalently under either runtime —
+    same RunRecord shape, same cost, same WorkflowRunRecord. The
+    ``runtime`` field is the seam: operators flip it per-workflow when
+    they need a v1.1 feature, without breaking the v0.3 path.
+    """
+
+    HOMEGROWN = "homegrown"
+    LANGGRAPH = "langgraph"
 
 
 class WorkflowSpecLoadError(Exception):
@@ -78,6 +102,18 @@ class WorkflowSpec(BaseModel):
     version: str
     description: str = ""
     owner: str = ""
+
+    runtime: WorkflowRuntime = Field(
+        default=WorkflowRuntime.HOMEGROWN,
+        description=(
+            "Which compiler the runner uses. Defaults to `homegrown` "
+            "(movate's own topology walker). Set to `langgraph` to "
+            "compile onto a LangGraph StateGraph instead — required for "
+            "conditional edges, parallel fan-out, HITL, and checkpointer "
+            "features that land in v1.1.x. Linear AGENT workflows behave "
+            "equivalently under either runtime."
+        ),
+    )
 
     state_schema: str = Field(
         ..., description="Path to a JSON Schema file, relative to workflow.yaml"

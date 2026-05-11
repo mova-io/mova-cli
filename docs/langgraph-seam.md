@@ -1,7 +1,9 @@
-# LangGraph seam — findings from the v0.3 IR prototype
+# LangGraph seam — IR findings and v1.1 design plan
 
-**Status:** risk-mitigation spike. Not on the v1.0 critical path. Read
-this when v1.1 starts.
+**Status:** linear AGENT case shipped behind `workflow.yaml: runtime:
+langgraph` (see [`src/movate/core/workflow/compilers/langgraph.py`](../src/movate/core/workflow/compilers/langgraph.py)).
+Sections below describe the **next** v1.1 additions — conditional /
+parallel / HITL — that the prototype foreshadowed.
 
 ## Why this doc exists
 
@@ -14,10 +16,11 @@ called out **workflow-IR design lock-in** as the #1 risk for v1.1:
 > only emits linear DAGs. Build a throwaway IR→LangGraph prototype to
 > validate the seam, then delete until v1.1.
 
-This doc records what we learned by **actually running**
-[`scripts/langgraph_prototype.py`](../scripts/langgraph_prototype.py)
-against LangGraph 1.1.10. The prototype itself is scratch code; this
-doc is the asset that survives.
+The spike ran. The seam held. This doc captured the findings; the
+linear case then shipped as production code at
+[`src/movate/core/workflow/compilers/langgraph.py`](../src/movate/core/workflow/compilers/langgraph.py).
+The remaining v1.1 work below extends that compiler in additive
+strokes.
 
 ## TL;DR
 
@@ -252,24 +255,48 @@ documented best practice.
 
 ---
 
-## What to do at v1.1
+## What's already done (linear case, shipped)
+
+- [x] `workflow.yaml: runtime: <homegrown | langgraph>` field. Default
+      `homegrown`; opt-in to `langgraph` per workflow.
+- [x] `src/movate/core/workflow/compilers/langgraph.py` — the linear
+      compiler. AGENT nodes wrap `Executor.execute` so retry / fallback
+      / cost / tracing / tenant isolation compose with LangGraph's
+      node-fn lifecycle.
+- [x] `WorkflowRunner.run` dispatches on `graph.runtime`. Same
+      `WorkflowResult` shape under either path; callers don't branch.
+- [x] Equivalence tests
+      ([`tests/test_workflow_langgraph.py`](../tests/test_workflow_langgraph.py))
+      cover happy path, partial-failure short-circuit, initial-state
+      rejection, capability gate, and the missing-dep install-hint path.
+- [x] Spike (`scripts/langgraph_prototype.py`) deleted.
+
+## What to do at v1.1 (additive on the linear compiler)
 
 1. Re-read this doc.
-2. Add the additive IR fields described in §A–§F.
-3. Build `src/movate/core/workflow/compilers/langgraph.py`, modelled on
-   `scripts/langgraph_prototype.py` but production-quality (real
-   sandbox for conditions; real reducer registry; real resume API).
-4. Add `workflow.yaml: runtime: <homegrown | langgraph>` field. Default
-   to `homegrown` for backwards compatibility; opt in to `langgraph` per
-   workflow.
-5. **Delete `scripts/langgraph_prototype.py`.** Its job is done.
+2. Add the additive IR fields described in §A–§F above.
+3. Extend the existing compiler at
+   `src/movate/core/workflow/compilers/langgraph.py`:
+   - Loosen `can_compile`'s linear/AGENT-only assertion as each
+     feature lands. Each rejection branch becomes a "compile this
+     construct" branch.
+   - Wire `add_conditional_edges` (§B). Plug a real expression sandbox
+     in for `condition:` evaluation — do NOT use `eval`.
+   - Materialise a `TypedDict` from `state_schema` with reducers from
+     the `x-movate-reducer` annotation (§A). Switch parallel branches
+     to delta-only returns.
+   - Add `interrupt_before` for HUMAN nodes + checkpointer injection
+     based on `WorkflowSpec.checkpointer` (§D-§E).
+4. Add per-feature equivalence tests against the homegrown runner where
+   the homegrown runner supports the construct, or against a frozen
+   golden output where it doesn't.
 
 ## Provenance
 
 - Built against LangGraph 1.1.10 (current as of 2026-05-11).
 - LangGraph API has been stable since 0.2.x for the constructs we use
-  here (`StateGraph`, `add_conditional_edges`, `interrupt_before`,
-  `update_state`, `MemorySaver`). A 2.0 release would warrant re-running
-  the prototype.
-- Prototype: [`scripts/langgraph_prototype.py`](../scripts/langgraph_prototype.py).
-  Re-run via `uv pip install langgraph && uv run python scripts/langgraph_prototype.py`.
+  (`StateGraph`, `add_conditional_edges`, `interrupt_before`,
+  `update_state`, `MemorySaver`). A 2.0 release would warrant a
+  re-validation pass through the shipped compiler + this doc.
+- Production compiler: [`src/movate/core/workflow/compilers/langgraph.py`](../src/movate/core/workflow/compilers/langgraph.py).
+- Equivalence tests: [`tests/test_workflow_langgraph.py`](../tests/test_workflow_langgraph.py).
