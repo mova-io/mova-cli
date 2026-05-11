@@ -98,3 +98,30 @@ def test_phase2plus_stub_commands_exit_nonzero(command: list[str]) -> None:
     """Commands not yet implemented exit with code 2 + a clear message."""
     result = runner.invoke(app, command)
     assert result.exit_code == STUB_EXIT_CODE
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["pricing", "-o", "foo"],
+        ["jobs", "show", "any-id", "-o", "yaml"],
+        ["run", "/tmp/x", "hi", "-o", "table"],  # `table` is invalid for `run`
+        ["bench", "/tmp/x", "hi", "-o", "html"],
+    ],
+)
+def test_invalid_output_format_rejected_at_parse_time(command: list[str]) -> None:
+    """``--output`` is now an Enum option on every command. Invalid values
+    must be rejected at parse time (exit 2, "Invalid value for '--output'")
+    rather than silently falling through to the default branch the way
+    the old stringly-typed implementation did.
+
+    Each command in the parametrize set picks a value that isn't in its
+    own choice subset — including the cross-set case (`run` doesn't
+    accept `table`, since `Run` is ``json | text`` only). That keeps the
+    sub-enums honest."""
+    result = runner.invoke(app, command)
+    assert result.exit_code == 2
+    # `runner` here is a default CliRunner (no mix_stderr=False), so
+    # stdout already contains stderr — no separate .stderr to read.
+    assert "Invalid value" in result.stdout or "--output" in result.stdout

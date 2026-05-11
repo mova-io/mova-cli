@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import TableJson
 from movate.providers.pricing import load_pricing
 
 console = Console()
@@ -21,7 +22,9 @@ err_console = Console(stderr=True)
 
 
 def pricing(
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
     provider_prefix: str = typer.Option(
         None,
         "--provider",

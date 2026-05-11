@@ -18,6 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import Report
 from movate.cli._progress import progress_bar
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.bench import BenchEngine, BenchSummary, ModelBenchResult
@@ -73,7 +74,7 @@ def bench(
     mock: bool = typer.Option(
         False, "--mock", help="Use the deterministic MockProvider (no API keys)."
     ),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json | markdown"),
+    output_format: Report = typer.Option(Report.TABLE, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Benchmark an agent across multiple models (cost / latency / quality).
 
@@ -235,10 +236,10 @@ async def _run_bench(
     runs: int,
     gate_mode: str,
     mock: bool,
-    output_format: str,
+    output_format: Report,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
-    show_progress = output_format == "table" and not mock
+    show_progress = output_format == Report.TABLE and not mock
     try:
         try:
             with _maybe_bench_progress(show_progress, total=len(providers)) as on_model:
@@ -258,9 +259,9 @@ async def _run_bench(
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
-    if output_format == "json":
+    if output_format == Report.JSON:
         _emit_json(summary)
-    elif output_format == "markdown":
+    elif output_format == Report.MARKDOWN:
         print(render_bench_markdown(summary))
     else:
         _emit_table(summary)

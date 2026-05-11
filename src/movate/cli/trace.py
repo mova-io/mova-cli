@@ -15,6 +15,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import TableJson
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.models import RunRecord, WorkflowRunRecord
 from movate.core.replay import (
@@ -39,7 +40,9 @@ err_console = Console(stderr=True)
 @trace_app.command("replay")
 def replay(
     run_id: str = typer.Argument(..., help="Run id or workflow_run_id."),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Show full input/output bodies (no truncation)."
     ),
@@ -60,7 +63,7 @@ def replay(
     asyncio.run(_run_replay(run_id, output_format=output_format, verbose=verbose))
 
 
-async def _run_replay(run_id: str, *, output_format: str, verbose: bool) -> None:
+async def _run_replay(run_id: str, *, output_format: TableJson, verbose: bool) -> None:
     rt = await build_local_runtime(mock=True)  # mock=True: no API keys needed
     try:
         try:
@@ -71,7 +74,7 @@ async def _run_replay(run_id: str, *, output_format: str, verbose: bool) -> None
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
-    if output_format == "json":
+    if output_format == TableJson.JSON:
         print(render_replay_json(replay_data))
         return
 

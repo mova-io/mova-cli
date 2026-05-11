@@ -18,6 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
 from movate.core.models import JobStatus
@@ -43,7 +44,9 @@ jobs_app = typer.Typer(
 def show(
     job_id: str = typer.Argument(..., help="Job id from `movate submit`."),
     target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
 ) -> None:
     """Show the current state of one job."""
     view = asyncio.run(_fetch_one(job_id=job_id, target=target))
@@ -61,7 +64,9 @@ def wait(
     target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
     timeout: float = typer.Option(300.0, "--timeout", help="Max seconds; exits 124 if exceeded."),
     poll_interval: float = typer.Option(1.0, "--poll-interval", help="Seconds between polls."),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
 ) -> None:
     """Block on a job until it reaches a terminal state.
 
@@ -81,11 +86,13 @@ def wait(
 @jobs_app.command("list-agents")
 def list_agents(
     target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
 ) -> None:
     """List agents registered on the target runtime."""
     listing = asyncio.run(_fetch_agents(target=target))
-    if output_format == "json":
+    if output_format == TableJson.JSON:
         stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
         return
     if not listing.agents:
@@ -163,8 +170,8 @@ def _build_client(target: str | None) -> MovateClient:
 # ---------------------------------------------------------------------------
 
 
-def _emit(view: JobView, *, output_format: str) -> None:
-    if output_format == "json":
+def _emit(view: JobView, *, output_format: TableJson) -> None:
+    if output_format == TableJson.JSON:
         stdout.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
         return
 

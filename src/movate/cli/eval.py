@@ -17,6 +17,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import Report
 from movate.cli._progress import progress_bar
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.baseline import BaselineDiff, compute_baseline_diff, format_delta
@@ -73,7 +74,7 @@ def eval_(
         "--regression-tolerance",
         help="Allowable score drop vs baseline before flagging a regression (0.0-1.0).",
     ),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json | markdown"),
+    output_format: Report = typer.Option(Report.TABLE, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
 
@@ -131,7 +132,7 @@ async def _run_eval(
     baseline_file: Path | None = None,
     output_baseline: Path | None = None,
     regression_tolerance: float = 0.0,
-    output_format: str = "table",
+    output_format: Report = Report.TABLE,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     baseline_record: EvalRecord | None = None
@@ -140,7 +141,7 @@ async def _run_eval(
         # machine-readable formats so JSON / Markdown stay clean if a
         # user accidentally redirects stderr too. Mock mode is fast
         # enough that progress just adds noise — also off.
-        show_progress = output_format == "table" and not mock
+        show_progress = output_format == Report.TABLE and not mock
 
         with _maybe_eval_progress(show_progress) as on_case:
             engine = EvalEngine(
@@ -181,7 +182,7 @@ async def _run_eval(
     if baseline_record is not None:
         diff = compute_baseline_diff(baseline_record, record)
 
-    if output_format == "json":
+    if output_format == Report.JSON:
         _emit_json(
             summary,
             record=record,
@@ -191,7 +192,7 @@ async def _run_eval(
             diff=diff,
             regression_tolerance=regression_tolerance,
         )
-    elif output_format == "markdown":
+    elif output_format == Report.MARKDOWN:
         print(render_eval_markdown(summary, gate=gate))
     else:
         _emit_table(

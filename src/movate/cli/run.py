@@ -20,6 +20,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import Run
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.cli._workflow_path import is_workflow_path
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
@@ -70,7 +71,7 @@ def run(
     mock: bool = typer.Option(
         False, "--mock", help="Use the deterministic MockProvider (no API keys; for smoke tests)."
     ),
-    output_format: str = typer.Option("json", "--output", "-o", help="json | text"),
+    output_format: Run = typer.Option(Run.JSON, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Run an agent or workflow against the given input.
 
@@ -119,7 +120,7 @@ def run(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_agent(path: Path, raw: str | None, *, mock: bool, output_format: str) -> None:
+def _dispatch_agent(path: Path, raw: str | None, *, mock: bool, output_format: Run) -> None:
     try:
         bundle = load_agent(path)
     except AgentLoadError as exc:
@@ -176,7 +177,7 @@ def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
 
 
 async def _run_local_agent(
-    bundle: AgentBundle, payload: dict[str, Any], *, output_format: str, mock: bool
+    bundle: AgentBundle, payload: dict[str, Any], *, output_format: Run, mock: bool
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     try:
@@ -185,7 +186,7 @@ async def _run_local_agent(
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
-    if output_format == "text":
+    if output_format == Run.TEXT:
         sys.stdout.write(response.human_readable + "\n")
     else:
         sys.stdout.write(response.model_dump_json(indent=2) + "\n")
@@ -199,7 +200,7 @@ async def _run_local_agent(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_workflow(path: Path, raw: str | None, *, mock: bool, output_format: str) -> None:
+def _dispatch_workflow(path: Path, raw: str | None, *, mock: bool, output_format: Run) -> None:
     try:
         spec, parent = load_workflow_spec(path)
     except WorkflowSpecLoadError as exc:
@@ -245,7 +246,7 @@ async def _run_local_workflow(
     graph: WorkflowGraph,
     initial_state: dict[str, Any],
     *,
-    output_format: str,
+    output_format: Run,
     mock: bool,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
@@ -259,7 +260,7 @@ async def _run_local_workflow(
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
-    if output_format == "json":
+    if output_format == Run.JSON:
         _emit_workflow_json(result)
     else:
         _emit_workflow_text(result)
@@ -341,7 +342,7 @@ def _status_badge(result: WorkflowResult) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_replay(path: Path, run_id: str, *, mock: bool, output_format: str) -> None:
+def _dispatch_replay(path: Path, run_id: str, *, mock: bool, output_format: Run) -> None:
     try:
         bundle = load_agent(path)
     except AgentLoadError as exc:
@@ -355,7 +356,7 @@ async def _run_replay(
     bundle: AgentBundle,
     run_id: str,
     *,
-    output_format: str,
+    output_format: Run,
     mock: bool,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
@@ -373,7 +374,7 @@ async def _run_replay(
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
-    if output_format == "text":
+    if output_format == Run.TEXT:
         _emit_replay_text(diff)
     else:
         sys.stdout.write(json.dumps(render_replay_json(diff), indent=2, default=str) + "\n")

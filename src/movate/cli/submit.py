@@ -31,6 +31,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
 from movate.core.models import JobKind, JobStatus
@@ -102,7 +103,9 @@ def submit(
             "(MOVATE_SMTP_HOST + creds) or it falls back to logging only."
         ),
     ),
-    output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
 ) -> None:
     """Queue a job at a deployed runtime and (optionally) wait for completion.
 
@@ -173,7 +176,7 @@ async def _submit(
     poll_interval: float,
     notify: bool,
     notify_email: str | None,
-    output_format: str,
+    output_format: TableJson,
 ) -> None:
     async with MovateClient(base_url=base_url, api_key=token) as client:
         try:
@@ -250,9 +253,9 @@ def _emit_terminal(
     view: JobView,
     *,
     run: RunView | None,
-    output_format: str,
+    output_format: TableJson,
 ) -> None:
-    if output_format == "json":
+    if output_format == TableJson.JSON:
         # JSON mode: callers want a single parsable object. Wrap job
         # + run so they can pick either; ``run`` is null when the job
         # didn't produce one (e.g. dispatch-time failure before the
