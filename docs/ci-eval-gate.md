@@ -95,6 +95,50 @@ env:
 A common setup runs `--mock` on every PR (fast, free) and the real-model
 eval nightly on `main` (slow, costs money).
 
+The shipped `agents.yml` workflow auto-selects between mock and real
+based on whether the secrets are populated. No YAML changes needed
+when you're ready to flip — just add the secrets.
+
+### Scoring method: which judge for which agent
+
+Three options live in `evals/judge.yaml` — pick the cheapest that
+catches your regression class:
+
+| `method:`       | When to use                                              | API keys   | Cost   |
+|-----------------|----------------------------------------------------------|------------|--------|
+| `exact`         | Finite-label classifier, deterministic output keys       | None       | $0     |
+| `subset_match`  | Agent output is richer than the pinned dataset fields    | None       | $0     |
+| `llm_judge`     | Open-ended natural-language output, quality dimensions   | Both¹      | ~$0.01/case |
+
+¹ The judge must run on a different provider family than the agent —
+cross-family enforcement at eval time. With OpenAI agent + Anthropic
+judge (or vice versa) you need both keys.
+
+`subset_match` is the sweet spot when your dataset's `expected` only
+pins a subset of the agent's output (e.g.,
+`expected: {"tone": "positive"}` for an agent that outputs
+`{headline, body, next_steps, tone}`). It scores 1.0 iff every
+expected key/value appears in the actual output; extras are tolerated.
+No LLM call.
+
+**Upgrade path** when you're ready for richer scoring:
+
+1. Pick a judge model on a different family than your agent
+   (e.g., agent on OpenAI → judge on `anthropic/claude-haiku-4-5`).
+2. Add the judge's API key to repo secrets.
+3. Edit `evals/judge.yaml` — set `method: llm_judge`, uncomment the
+   `model:` and `rubric:` blocks.
+4. Regenerate the baseline so it reflects the new scoring shape:
+
+    ```bash
+    movate eval ./agents/my-agent \
+      --output-baseline .movate/my-agent/baseline.json
+    git commit -am "eval: upgrade my-agent to llm_judge"
+    ```
+
+5. The next CI run uses real-LLM judge scoring against the new baseline.
+   Bump `--regression-tolerance` to ~`0.05` to absorb sampling variance.
+
 ### Refreshing the baseline
 
 The `refresh-baseline` job in the example workflow auto-commits a new

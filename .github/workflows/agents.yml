@@ -2,16 +2,27 @@
 # because operators want a SEPARATE PR check that says "every agent in
 # this repo validates + scores against its committed baseline."
 #
-# Originally this workflow used a per-agent matrix with shell-glue. The
-# matrix moved into the ``movate ci eval`` command so the YAML stays a
-# one-liner — the command iterates over every agent in agents_dir, runs
-# each through the eval engine, gates against committed baselines, and
-# appends a markdown summary to $GITHUB_STEP_SUMMARY for PR visibility.
+# The eval step auto-selects between mock-mode and real-LLM based on
+# what's available in repo secrets:
 #
-# Mock-mode keeps the gate hermetic — no API keys, $0 cost, deterministic
-# scoring. For real-LLM eval (which IS what you want for an actual
-# customer-facing agent), look at ``.github/workflows/eval-gate.example.yml``
-# and wire your provider keys via repo secrets.
+#   * No OPENAI_API_KEY / ANTHROPIC_API_KEY secrets set → mock mode.
+#     Hermetic, $0, deterministic. Score gate is "did anything crash"
+#     and "schema regressions" — limited but useful.
+#
+#   * Both keys set → real-LLM. The case-reasoner judge.yaml stays on
+#     subset_match by default (no keys needed for scoring), but the
+#     AGENT call goes through real providers and the baseline reflects
+#     real model output.
+#
+# To enable real-LLM:
+#   1. Settings → Secrets and variables → Actions
+#   2. Add OPENAI_API_KEY and ANTHROPIC_API_KEY as repo secrets.
+#   3. Regenerate baselines:
+#      OPENAI_API_KEY=$KEY ANTHROPIC_API_KEY=$KEY \
+#        movate eval agents/case-reasoner \
+#          --output-baseline .movate/case-reasoner/baseline.json
+#   4. Commit the refreshed baseline. The next PR run uses real-LLM
+#      scoring against it.
 
 name: agents
 
@@ -32,6 +43,15 @@ on:
 jobs:
   validate-and-eval:
     runs-on: ubuntu-latest
+
+    # Repo secrets are passed in unconditionally. Empty values are fine —
+    # the eval step decides whether to run mock or real-LLM based on
+    # whether the keys are populated. Setting them at the job level
+    # (rather than the step) means the keys are also available to
+    # ``movate validate`` for the runtime-availability probe.
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
     steps:
       - uses: actions/checkout@v4
@@ -63,13 +83,35 @@ jobs:
             fi
           done
 
-      - name: Eval every agent (gated against committed baselines)
-        # `movate ci eval` discovers all agents, runs each through the
-        # eval engine, gates on per-agent baselines at
-        # .movate/<agent>/baseline.json. The same command works locally
-        # for pre-flight: `movate ci eval --mock` before pushing.
+      - name: Decide eval mode
+        id: eval_mode
+        # Real-LLM mode requires BOTH keys (case-reasoner falls back
+        # across families) — partial config falls through to mock so
+        # CI never crashes on a missing key.
+        run: |
+          if [ -n "$OPENAI_API_KEY" ] && [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "mode=real" >> "$GITHUB_OUTPUT"
+            echo "::notice::eval mode: real-LLM (both provider keys present)"
+          else
+            echo "mode=mock" >> "$GITHUB_OUTPUT"
+            echo "::notice::eval mode: mock (provider keys not in secrets — see agents.yml docstring to enable real-LLM)"
+          fi
+
+      - name: Eval every agent — mock mode
+        if: steps.eval_mode.outputs.mode == 'mock'
         run: |
           uv run movate ci eval \
             --mock \
             --regression-tolerance 0.0 \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
+      - name: Eval every agent — real-LLM mode
+        if: steps.eval_mode.outputs.mode == 'real'
+        # Note: NO ``--mock``. Tolerance is loosened to 0.05 because
+        # real-LLM scoring on llm_judge rubrics has natural variance
+        # — even with temperature 0.0 the same prompt can score 0.95
+        # vs 1.0 across runs depending on judge-model build dates.
+        run: |
+          uv run movate ci eval \
+            --regression-tolerance 0.05 \
             --summary-file "$GITHUB_STEP_SUMMARY"
