@@ -36,9 +36,20 @@ htmlcov/
 .DS_Store
 .claude/
 
-# movate runtime
+# movate runtime — local sqlite, runs cache, etc.
 ~/.movate/
-.movate/
+# Ignore everything inside .movate/ EXCEPT eval baselines, which are
+# version-controlled so CI can gate against them. The dance is:
+#   .movate/*        ignore top-level entries (logs, sqlite)
+#   !.movate/*/      but allow subdirectories to be traversed
+#   .movate/*/*      ignore everything inside those subdirs
+#   !.../baseline.json … except the baseline file
+# (Git's rule: you can't un-ignore a file inside an ignored directory,
+# so we ignore at the file level, not the directory level.)
+.movate/*
+!.movate/*/
+.movate/*/*
+!.movate/*/baseline.json
 *.db
 *.db-journal
 local.db
