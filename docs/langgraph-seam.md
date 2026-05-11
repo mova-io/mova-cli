@@ -1,0 +1,275 @@
+# LangGraph seam — findings from the v0.3 IR prototype
+
+**Status:** risk-mitigation spike. Not on the v1.0 critical path. Read
+this when v1.1 starts.
+
+## Why this doc exists
+
+The [implementation roadmap](../../.claude/plans/want-to-take-inspiration-stateful-swan.md)
+called out **workflow-IR design lock-in** as the #1 risk for v1.1:
+
+> A bad IR makes Phase 7's LangGraph swap-in painful. *Mitigation:* before
+> writing the IR, sketch what LangGraph nodes / HITL / conditional /
+> parallel constructs need; design IR to subsume them even though v0.3
+> only emits linear DAGs. Build a throwaway IR→LangGraph prototype to
+> validate the seam, then delete until v1.1.
+
+This doc records what we learned by **actually running**
+[`scripts/langgraph_prototype.py`](../scripts/langgraph_prototype.py)
+against LangGraph 1.1.10. The prototype itself is scratch code; this
+doc is the asset that survives.
+
+## TL;DR
+
+**The v0.3 IR is fundamentally sound.** Every v1.1 LangGraph construct
+maps onto the existing `NodeType` / `EdgeKind` enums and `WorkflowNode` /
+`WorkflowEdge` dataclasses **without a breaking change**. The IR needs
+only *additive* fields to be production-grade for v1.1.
+
+We validated four mappings end-to-end:
+
+| # | Mapping | Status | IR additions needed |
+|---|---|---|---|
+| 1 | Linear (v0.3) — `AGENT` + `SEQUENTIAL` | ✅ runs as-is | None |
+| 2 | Conditional — `CONDITIONAL` edges | ✅ runs | Condition DSL syntax + default-branch convention |
+| 3 | Parallel — `PARALLEL_FAN_OUT/IN` | ✅ runs | State-schema reducer annotations + node-output convention (deltas vs full) |
+| 4 | HITL — `HUMAN` nodes | ✅ runs | Resume-payload schema + checkpointer config |
+
+No `NodeType` or `EdgeKind` variants need to be added or renamed. No
+field on the existing dataclasses needs to change type or be removed.
+Everything below is additive.
+
+---
+
+## What the prototype proved works
+
+### 1. Linear (v0.3) — direct mapping
+
+Trivial. `AGENT` node → `graph.add_node(id, runner_fn)`. `SEQUENTIAL` edge
+→ `graph.add_edge(from, to)`. Source → `START`, sink → `END`.
+
+The only consideration: LangGraph's `StateGraph(dict)` (untyped state)
+replaces state on each step rather than shallow-merging. v0.3 doesn't hit
+this because our homegrown runner merges explicitly; v1.1 should
+materialise a `TypedDict` from the workflow's `state_schema` so
+LangGraph's per-key shallow merge kicks in automatically.
+
+### 2. Conditional (v1.1) — works with a router fn
+
+`add_conditional_edges(source, router_fn, target_map)`. Multiple
+`CONDITIONAL` edges out of one node compile into one router fn that
+returns the first matching branch's target id.
+
+### 3. Parallel (v1.1) — runs concurrently with a reducer
+
+Multiple `PARALLEL_FAN_OUT` edges from one source → LangGraph runs them
+in parallel by default. `PARALLEL_FAN_IN` is implicit (multiple edges
+into one sink → LangGraph awaits all). Any state key written by parallel
+branches needs an explicit reducer (e.g. `Annotated[list, operator.add]`)
+or LangGraph raises `InvalidUpdateError`.
+
+### 4. HITL (v1.1) — `interrupt_before` + checkpointer
+
+`graph.compile(checkpointer=..., interrupt_before=[human_id_1, ...])`.
+External system invokes with `config={"configurable": {"thread_id": ...}}`
+to identify the run, calls `graph.update_state(config, {human_payload})`
+to merge the response, then `graph.invoke(None, config)` to continue
+from the checkpoint.
+
+---
+
+## Recommended IR additions for v1.1
+
+Each below is **non-breaking** — add the field, default it to the v0.3
+semantic, and the existing runner / compiler keep working.
+
+### A. State-schema reducer annotations
+
+**Problem:** `state_schema: dict[str, Any]` today is plain JSON Schema.
+LangGraph needs per-key reducer hints for any field that parallel
+branches write.
+
+**Recommendation:** extend the schema with a `x-movate-reducer` annotation:
+
+```yaml
+state_schema:
+  type: object
+  properties:
+    history:
+      type: array
+      items: {type: string}
+      x-movate-reducer: append      # → operator.add
+    seen_urls:
+      type: array
+      items: {type: string}
+      x-movate-reducer: union       # → set-merge
+    score:
+      type: number
+      x-movate-reducer: max         # → max()
+```
+
+Compiler maps named reducers to LangGraph-compatible callables. Keys
+without an annotation default to "replace" (LangGraph's standard
+shallow-merge). Reject unknown reducer names at compile time.
+
+**Implementation note:** validate-time check that any key written by a
+node downstream of a `PARALLEL_FAN_OUT` edge HAS a reducer. Without it,
+the workflow silently picks one branch's value and drops the others.
+
+### B. Conditional-edge DSL
+
+**Problem:** `WorkflowEdge.condition: str | None` is unconstrained today.
+The prototype used Python `eval` against state, which is a
+code-injection vector in production.
+
+**Recommendation:** define a small subset of JSONPath + comparison
+operators for `condition`. Cheap to validate, no sandbox-escape surface,
+matches operator expectations from YAML config.
+
+```yaml
+edges:
+  - from: classify
+    to: needs_review
+    kind: conditional
+    condition: "$.score < 0.7"
+  - from: classify
+    to: auto_approve
+    kind: conditional
+    condition: "$.score >= 0.7 && $.confidence > 0.9"
+  - from: classify
+    to: fallback
+    kind: conditional
+    condition: null        # explicit "else" — see (C)
+```
+
+Parse at compile time into an AST. Evaluate against state at runtime.
+Supported expressions:
+
+- `$.<path>` — JSONPath against state
+- `==`, `!=`, `<`, `<=`, `>`, `>=`
+- `&&`, `||`, `!`
+- string / number / boolean / null literals
+- `in [...]` for set membership
+
+Defer regex, arithmetic, function calls until a user asks.
+
+### C. Default-branch convention for conditional fan-out
+
+**Problem:** if no `CONDITIONAL` edge matches, the prototype raised. In
+production we want a deterministic "else" path.
+
+**Recommendation:** require the LAST conditional edge from a node to
+have `condition: null` (interpreted as "always matches"). Compiler
+enforces this at validation: a node with conditional outbounds must have
+exactly one null-condition edge, and it must be last in the `edges:`
+list.
+
+Alternative considered: add `WorkflowNode.default_target: str | None`.
+Rejected because it duplicates information that's already in the edges
+and creates an extra place for config drift.
+
+### D. HUMAN node resume payload schema
+
+**Problem:** `WorkflowNode.metadata: dict[str, Any]` is a stash; HUMAN
+nodes need a typed contract for what the external resume payload looks
+like.
+
+**Recommendation:** formalise as a typed field on `WorkflowNode` *when
+type is HUMAN*. The simplest form is a JSON Schema:
+
+```python
+@dataclass
+class WorkflowNode:
+    ...
+    resume_payload_schema: dict[str, Any] | None = None
+    """JSON Schema for the payload an external system must supply to
+    resume a HUMAN node. Required when type is HUMAN; ignored otherwise.
+    Validated at compile time; runner validates resume input against it
+    before calling `graph.update_state`."""
+```
+
+Compiler validates `type == HUMAN ⇒ resume_payload_schema is not None`.
+
+### E. Workflow-level checkpointer config
+
+**Problem:** HITL workflows require a LangGraph checkpointer (memory for
+tests, postgres for production). The IR has no field for this today.
+
+**Recommendation:** add a top-level workflow YAML field with a
+movate-provided enum:
+
+```yaml
+checkpointer: postgres     # one of: memory | sqlite | postgres
+```
+
+The compiler injects an appropriate `BaseCheckpointSaver` at
+`graph.compile(checkpointer=...)`. Default: `memory` if no HUMAN nodes,
+else require explicit choice.
+
+Postgres backend reuses our existing connection pool — checkpoint storage
+becomes a new set of tables in the same schema.
+
+### F. Node output convention: deltas vs full state
+
+**Problem (subtle):** for parallel branches with a reducer, nodes MUST
+return deltas (just their contribution) — returning full state
+double-counts the upstream state. For sequential nodes with no reducer,
+returning either delta or full state works.
+
+**Recommendation:** standardise on **deltas only** across all node types.
+The runner wrapper around `Executor.execute()` projects state → input,
+calls executor, returns ONLY the output keys. The state schema's
+reducers (defaulting to "replace" for unannotated keys) handle merging.
+
+This makes parallel nodes work without special casing, makes node
+behaviour identical across topologies, and matches LangGraph's
+documented best practice.
+
+---
+
+## Open questions for v1.1
+
+1. **Workflow checkpoint isolation per tenant.** Multi-tenant safety:
+   how do we ensure tenant A can't resume tenant B's HITL workflow? The
+   answer is probably "checkpoint key includes `tenant_id` and resume
+   API enforces match" — but worth designing before code lands.
+2. **Resume idempotency.** What happens if the human submits the same
+   resume payload twice? LangGraph's checkpoint logic should make this
+   safe (the workflow is at a single point in the topology), but worth
+   a test.
+3. **Long-running HITL TTLs.** Postgres checkpoints accumulate. Need a
+   sweep job that drops workflow runs that have been paused for > N
+   days. New `WorkflowConfig.hitl_timeout` field.
+4. **Sub-workflow state mapping.** SUB_WORKFLOW nodes (v1.2) need a
+   declared projection: which parent-state keys feed into the child,
+   and how does the child's output merge back. The IR doesn't have a
+   field for this yet — defer to v1.2 design.
+5. **Streaming output.** LangGraph supports streaming intermediate node
+   outputs. Useful for interactive UIs at the v0.5 server layer. Not on
+   the v1.1 critical path but consider whether `Executor` should expose
+   an async-iterator variant in parallel with the existing
+   request-response shape.
+
+---
+
+## What to do at v1.1
+
+1. Re-read this doc.
+2. Add the additive IR fields described in §A–§F.
+3. Build `src/movate/core/workflow/compilers/langgraph.py`, modelled on
+   `scripts/langgraph_prototype.py` but production-quality (real
+   sandbox for conditions; real reducer registry; real resume API).
+4. Add `workflow.yaml: runtime: <homegrown | langgraph>` field. Default
+   to `homegrown` for backwards compatibility; opt in to `langgraph` per
+   workflow.
+5. **Delete `scripts/langgraph_prototype.py`.** Its job is done.
+
+## Provenance
+
+- Built against LangGraph 1.1.10 (current as of 2026-05-11).
+- LangGraph API has been stable since 0.2.x for the constructs we use
+  here (`StateGraph`, `add_conditional_edges`, `interrupt_before`,
+  `update_state`, `MemorySaver`). A 2.0 release would warrant re-running
+  the prototype.
+- Prototype: [`scripts/langgraph_prototype.py`](../scripts/langgraph_prototype.py).
+  Re-run via `uv pip install langgraph && uv run python scripts/langgraph_prototype.py`.
