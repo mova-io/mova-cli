@@ -1,10 +1,45 @@
 # movate
 
-Declarative platform for building, evaluating, and deploying AI agents and workflows.
+**Azure-native control plane for enterprise AI agents and workflows.**
+
+Declarative `agent.yaml` contracts, eval-gated CI, multi-tenant
+runtime, Bicep-driven Azure deploys, and the governance hooks
+(policies, budgets, tenant isolation, lifecycle states) that regulated
+deployments need. Single CLI; pick what you use.
 
 **Internal Movate framework.** Proprietary; private artifact distribution
 only — see [RELEASING.md](RELEASING.md). Public PyPI is intentionally
 not used.
+
+## What it is — and what it isn't
+
+movate sits **between** three categories:
+
+* **Agent frameworks** (LangGraph, CrewAI) — *they* solve agent
+  composition; *we* embed them or replace them under a unified runtime.
+* **AI dev-loop tools** (LangSmith, Braintrust) — *they* solve evals
+  + observability; *we* include those AND wire them into the deploy
+  pipeline as gates.
+* **Enterprise orchestration** (Temporal, Kubernetes, Terraform) —
+  *they* solve scheduling + infra; *we* sit on top of those, agent-
+  aware.
+
+The lane is **AI-workflow governance + GitOps for agents**, not "better
+LangGraph." Concretely that means:
+
+| If you want | movate is | Use instead |
+|---|---|---|
+| Type-safe agent contracts, eval-gated CI, policy enforcement, Azure deploys | the right tool | — |
+| Drag-and-drop agent builder, no-code | wrong tool | a no-code platform |
+| Multi-cloud control plane (AWS + GCP + Azure) | wrong tool | Kubernetes + a generic orchestrator |
+| Stateless prompt playground | overkill | a Jupyter notebook |
+
+We're **Azure-native by design**, not by accident — Movate's customer
+base runs on Azure and shipping one cloud well beats shipping three
+poorly. Storage providers (sqlite / Postgres) and LLM providers
+(OpenAI / Anthropic / Azure / others via LiteLLM) ARE pluggable; the
+infra layer (ACR + Container Apps + Postgres Flex + Key Vault) is
+deliberately Azure-shaped.
 
 ## Status
 
