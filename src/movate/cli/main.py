@@ -109,31 +109,24 @@ def _main(
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
-app.command(
-    "watch",
-    rich_help_panel=PANEL_DEVELOP,
-    help="Re-run validate on every save (TDD-style hot-reload).",
-)(watch_cmd.watch)
+# NOTE: do NOT pass `help=` here — Typer/Click then ignores the function's
+# docstring, which is where each command's [bold]Examples:[/bold] block
+# lives. The docstring's first line becomes the panel summary; the full
+# docstring becomes `movate <cmd> --help`. Anything you'd put in `help=`
+# belongs in the docstring instead.
+app.command("watch", rich_help_panel=PANEL_DEVELOP)(watch_cmd.watch)
 
 # ----- Run & evaluate -------------------------------------------------------
 
 app.command("run", rich_help_panel=PANEL_RUN)(run_cmd.run)
-app.command(
-    "bench",
-    rich_help_panel=PANEL_RUN,
-    help="Benchmark an agent across multiple models (cost / latency / quality).",
-)(bench_cmd.bench)
+app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 
 # ----- Remote (talk to a deployed runtime) ----------------------------------
 
-app.command(
-    "submit",
-    rich_help_panel=PANEL_RUN,
-    help="Queue a job at a deployed runtime (see `movate config add-target`).",
-)(submit_cmd.submit)
+app.command("submit", rich_help_panel=PANEL_RUN)(submit_cmd.submit)
 app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------

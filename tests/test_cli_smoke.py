@@ -27,6 +27,42 @@ def test_help_renders() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("command", "expected_example"),
+    [
+        # Each tuple is (subcommand, a substring that ONLY appears in
+        # that command's docstring Examples block). If someone wraps
+        # the command with `help="..."` in main.py the docstring stops
+        # rendering — and these substrings disappear from `--help`.
+        # That's exactly the regression we're guarding against.
+        ("run", "movate run ./faq-agent"),
+        ("bench", "movate bench ./faq-agent"),
+        ("submit", "movate submit faq-agent"),
+        ("watch", "movate watch ./agents/faq-agent"),
+    ],
+)
+def test_subcommand_help_renders_docstring_examples(command: str, expected_example: str) -> None:
+    """Every command's --help should surface the Examples block from
+    its docstring.
+
+    Background: Typer/Click only uses the function's docstring when
+    `app.command(...)` is called WITHOUT a `help=` override. Passing
+    `help="short one-liner"` silently replaces the entire help with
+    that string, dropping the carefully-written Examples blocks. We
+    hit this in v0.5 — `movate submit --help` was missing its 12 lines
+    of examples for weeks because `main.py` overrode `help=`. This
+    test fails loudly if anyone re-introduces an override that strips
+    a docstring."""
+    result = runner.invoke(app, [command, "--help"])
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    assert expected_example in result.stdout, (
+        f"`movate {command} --help` is missing its docstring examples — "
+        f"someone likely re-added a `help=` override in main.py that's "
+        f"shadowing the function's docstring."
+    )
+
+
+@pytest.mark.unit
 def test_version_flag() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
