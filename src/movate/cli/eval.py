@@ -17,6 +17,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._completion import complete_agent_path
 from movate.cli._output import Report
 from movate.cli._progress import progress_bar
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
@@ -32,7 +33,11 @@ err_console = Console(stderr=True)
 
 
 def eval_(
-    path: Path = typer.Argument(..., help="Path to agent directory."),
+    path: Path = typer.Argument(
+        ...,
+        help="Path to agent directory.",
+        shell_complete=complete_agent_path,
+    ),
     gate: float = typer.Option(0.7, "--gate", help="Per-case score required to pass (0.0-1.0)."),
     gate_mode: str = typer.Option(
         "mean",

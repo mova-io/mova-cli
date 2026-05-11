@@ -31,6 +31,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._completion import complete_agent_name
 from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
@@ -53,6 +54,7 @@ def submit(
             "Agent or workflow name registered on the target runtime "
             "(see `movate jobs list-agents`)."
         ),
+        shell_complete=complete_agent_name,
     ),
     input_arg: str = typer.Argument(
         None,

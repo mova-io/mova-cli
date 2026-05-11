@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
+from movate.cli._completion import complete_agent_path
 from movate.cli._workflow_path import is_workflow_path
 from movate.core.loader import AgentLoadError, load_agent
 from movate.core.workflow import (
@@ -25,7 +26,11 @@ console = Console()
 
 
 def show(
-    path: Path = typer.Argument(..., help="Path to an agent or workflow directory."),
+    path: Path = typer.Argument(
+        ...,
+        help="Path to an agent or workflow directory.",
+        shell_complete=complete_agent_path,
+    ),
 ) -> None:
     """Show the resolved spec for an agent or workflow."""
     if is_workflow_path(path):

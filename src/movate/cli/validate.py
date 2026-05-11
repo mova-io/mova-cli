@@ -11,6 +11,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from movate.cli._completion import complete_agent_path
 from movate.cli._workflow_path import is_workflow_path
 from movate.core.config import load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
@@ -29,7 +30,11 @@ console = Console()
 
 
 def validate(
-    path: Path = typer.Argument(..., help="Path to an agent or workflow directory."),
+    path: Path = typer.Argument(
+        ...,
+        help="Path to an agent or workflow directory.",
+        shell_complete=complete_agent_path,
+    ),
     strict: bool = typer.Option(
         False,
         "--strict",

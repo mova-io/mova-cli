@@ -20,6 +20,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._completion import complete_agent_path
 from movate.cli._output import Run
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.cli._workflow_path import is_workflow_path
@@ -47,7 +48,11 @@ console = Console(stderr=True)
 
 
 def run(
-    path: Path = typer.Argument(..., help="Path to an agent or workflow directory."),
+    path: Path = typer.Argument(
+        ...,
+        help="Path to an agent or workflow directory.",
+        shell_complete=complete_agent_path,
+    ),
     input_arg: str = typer.Argument(
         None,
         metavar="INPUT",

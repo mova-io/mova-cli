@@ -18,6 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._completion import complete_agent_path
 from movate.cli._output import Report
 from movate.cli._progress import progress_bar
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
@@ -33,7 +34,11 @@ err_console = Console(stderr=True)
 
 
 def bench(
-    path: Path = typer.Argument(..., help="Path to agent directory."),
+    path: Path = typer.Argument(
+        ...,
+        help="Path to agent directory.",
+        shell_complete=complete_agent_path,
+    ),
     input_arg: str = typer.Argument(
         None,
         metavar="INPUT",
