@@ -364,6 +364,31 @@ def test_cli_submit_rejects_unknown_kind(cli_env) -> None:
 
 
 @pytest.mark.unit
+def test_cli_submit_accepts_long_inline_json(cli_env) -> None:
+    """A JSON input >255 chars on the CLI used to crash with
+    ``OSError: [Errno 63] File name too long`` because the
+    file-or-JSON detection called ``Path(arg).is_file()`` first and
+    macOS's ``stat()`` rejects oversized path strings.
+
+    The fix is to peek at the first non-whitespace char: if it's
+    ``{`` or ``[`` the arg is JSON and the file check is skipped.
+
+    Build an input string clearly over the 255-char NAME_MAX boundary
+    so the regression is real even on filesystems with shorter limits.
+    """
+    import json  # noqa: PLC0415
+
+    big_input = {
+        "text": "hi",
+        "padding": "x" * 300,  # forces total JSON well past 255 chars
+    }
+    result = runner.invoke(cli_app, ["submit", "alpha", json.dumps(big_input)])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "queued"
+
+
+@pytest.mark.unit
 def test_cli_submit_wait_returns_terminal(cli_env) -> None:
     """--wait mode polls until terminal.
 

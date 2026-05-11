@@ -331,12 +331,40 @@ def _desktop_notify(view: JobView, *, target_name: str) -> None:
 def _coerce_input(arg: str) -> dict[str, Any]:
     """Stdin / file / JSON-object. No string-auto-wrap here — the
     agent's input schema lives on the server side, not on the client,
-    so we can't safely auto-wrap; callers pass explicit JSON."""
+    so we can't safely auto-wrap; callers pass explicit JSON.
+
+    Detection order:
+
+    1. ``-`` → stdin
+    2. Looks like a JSON literal (starts with ``{`` or ``[``) → parse as JSON
+    3. ``Path(arg).is_file()`` → read the file and parse
+
+    The JSON-shape check comes BEFORE the file check because realistic
+    inputs (>255 chars) cause ``Path.is_file()`` to raise
+    ``OSError: [Errno 63] File name too long`` on macOS/Linux — the OS
+    rejects the stat() before is_file can return False. The leading-char
+    check is cheap, unambiguous (no filename starts with ``{`` or ``[``
+    on any sane FS), and lets us short-circuit before touching the
+    filesystem.
+    """
     if arg == "-":
         return _ensure_dict(json.loads(sys.stdin.read()))
-    p = Path(arg)
-    if p.is_file():
-        return _ensure_dict(json.loads(p.read_text()))
+    stripped = arg.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            return _ensure_dict(json.loads(arg))
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"input looks like JSON but failed to parse: {exc}") from exc
+    # File-path branch. Wrap is_file() in a try/except because OS-level
+    # name-length errors are not the caller's fault and shouldn't crash
+    # the CLI — just treat the arg as JSON and let json.loads fail loud
+    # if it's actually neither.
+    try:
+        is_file = Path(arg).is_file()
+    except OSError:
+        is_file = False
+    if is_file:
+        return _ensure_dict(json.loads(Path(arg).read_text()))
     try:
         parsed = json.loads(arg)
     except json.JSONDecodeError as exc:
