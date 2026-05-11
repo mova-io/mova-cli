@@ -189,3 +189,119 @@ def test_chat_eof_terminates_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyP
     result = runner.invoke(cli_app, ["chat", str(agent_dir), "--mock"], input="")
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "chat ended" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Conversation memory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_chat_advertises_memory_status_in_banner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The banner should tell the operator whether memory is on or off
+    — there's no other visible signal during a session."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"reply": "ok"}')
+    agent_dir = _scaffold_chat_agent(tmp_path / "chat-demo")
+    runner = CliRunner(mix_stderr=False)
+
+    # Default: memory on.
+    on = runner.invoke(cli_app, ["chat", str(agent_dir), "--mock"], input=":q\n")
+    assert on.exit_code == 0
+    assert "memory on" in on.stderr
+
+    # --no-memory: stays off.
+    off = runner.invoke(cli_app, ["chat", str(agent_dir), "--mock", "--no-memory"], input=":q\n")
+    assert off.exit_code == 0
+    assert "memory off" in off.stderr
+
+
+@pytest.mark.unit
+def test_chat_passes_history_to_executor_when_memory_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turn 2's executor invocation should receive turn 1's
+    user/assistant pair as history. We intercept executor.execute()
+    to capture the kwargs and assert the history shape."""
+    from movate.core.executor import Executor  # noqa: PLC0415
+    from movate.providers.base import Message  # noqa: PLC0415
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"reply": "echo"}')
+    agent_dir = _scaffold_chat_agent(tmp_path / "chat-demo")
+
+    captured_histories: list[list[Message] | None] = []
+    real_execute = Executor.execute
+
+    async def spy_execute(self, bundle, request, **kwargs):  # type: ignore[no-untyped-def]
+        # Copy the history list at capture time — chat mutates it
+        # in-place across turns, so storing the reference would have
+        # every captured slot point at the FINAL state.
+        h = kwargs.get("history")
+        captured_histories.append(list(h) if h is not None else None)
+        return await real_execute(self, bundle, request, **kwargs)
+
+    monkeypatch.setattr(Executor, "execute", spy_execute)
+
+    runner = CliRunner(mix_stderr=False)
+    result = runner.invoke(
+        cli_app,
+        ["chat", str(agent_dir), "--mock"],
+        input="first message\nsecond message\n:q\n",
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+    # Two turns dispatched.
+    assert len(captured_histories) == 2
+    # Turn 1: empty history (memory is on, but no prior turns).
+    assert captured_histories[0] == []
+    # Turn 2: turn 1's user+assistant pair as history.
+    turn2_history = captured_histories[1]
+    assert turn2_history is not None
+    assert len(turn2_history) == 2
+    assert turn2_history[0].role == "user"
+    assert turn2_history[0].content == "first message"
+    assert turn2_history[1].role == "assistant"
+    # Assistant content is response.human_readable if available, else
+    # JSON-encoded response.data. The chat-demo agent's output uses
+    # `reply` (not one of the executor's recognised human-readable
+    # keys), so we get the JSON fallback — but either way it must
+    # contain the model's actual response text.
+    assert "echo" in turn2_history[1].content
+
+
+@pytest.mark.unit
+def test_chat_does_not_pass_history_under_no_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--no-memory`` passes ``history=None`` (not ``[]``) — proves
+    each turn is truly independent at the executor level. None vs []
+    is a meaningful distinction: None = "didn't opt in"; [] = "first
+    turn"."""
+    from movate.core.executor import Executor  # noqa: PLC0415
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"reply": "ok"}')
+    agent_dir = _scaffold_chat_agent(tmp_path / "chat-demo")
+
+    captured_histories: list[object] = []
+    real_execute = Executor.execute
+
+    async def spy_execute(self, bundle, request, **kwargs):  # type: ignore[no-untyped-def]
+        captured_histories.append(kwargs.get("history"))
+        return await real_execute(self, bundle, request, **kwargs)
+
+    monkeypatch.setattr(Executor, "execute", spy_execute)
+
+    runner = CliRunner(mix_stderr=False)
+    result = runner.invoke(
+        cli_app,
+        ["chat", str(agent_dir), "--mock", "--no-memory"],
+        input="hello\nfollow-up\n:q\n",
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(captured_histories) == 2
+    # Both calls saw None — no opt-in, no history.
+    assert captured_histories == [None, None]

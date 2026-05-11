@@ -113,6 +113,7 @@ class Executor:
         workflow_run_id: str | None = None,
         node_id: str | None = None,
         on_token: Callable[[str], None] | None = None,
+        history: list[Message] | None = None,
     ) -> RunResponse:
         """Execute one agent against one input.
 
@@ -133,7 +134,16 @@ class Executor:
         as a non-streaming run; ``on_token`` only adds an observation
         callback. Streaming inherits retries + fallback identically
         to one-shot calls (a stream that exhausts retries falls
-        through to the next provider in the chain)."""
+        through to the next provider in the chain).
+
+        ``history`` is an optional list of prior conversation messages
+        (user/assistant pairs from previous turns) — prepended to the
+        provider call so multi-turn agents see context. The CURRENT
+        request's input still goes through prompt rendering + input
+        schema validation the same as a one-shot run; history is purely
+        conversational context the model uses for continuity.
+        ``movate chat`` is the primary caller; one-shot ``movate run``
+        invocations leave it ``None``."""
         job_id = job_id or str(uuid4())
         run_id = str(uuid4())
         spec = bundle.spec
@@ -216,9 +226,17 @@ class Executor:
             last_error: MovateError | None = None
 
             for provider_str, params in chain:
+                # Prepend conversation history (chat memory) before the
+                # newly-rendered current turn. History entries are passed
+                # through as-is; the renderer only sees the current
+                # request.input (history isn't fed to the Jinja template).
+                conversation: list[Message] = [
+                    *(history or []),
+                    Message(role="user", content=rendered),
+                ]
                 req = CompletionRequest(
                     provider=provider_str,
-                    messages=[Message(role="user", content=rendered)],
+                    messages=conversation,
                     params=params,
                 )
 

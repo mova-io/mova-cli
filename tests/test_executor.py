@@ -447,6 +447,76 @@ async def test_executor_enforces_runtime_policy_at_execute_time(
 
 
 @pytest.mark.unit
+async def test_executor_prepends_history_to_provider_messages(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """``execute(history=[...])`` should prepend the history to the
+    Messages list passed to the provider. The CURRENT turn's rendered
+    prompt comes after history as the final user message.
+
+    This is the seam ``movate chat`` uses for conversation memory."""
+    from movate.providers.base import (  # noqa: PLC0415
+        BaseLLMProvider,
+        CompletionResponse,
+    )
+    from movate.providers.base import (
+        Message as ProviderMessage,
+    )
+
+    captured_messages: list[ProviderMessage] = []
+
+    class CapturingProvider(BaseLLMProvider):
+        name = "capture"
+        version = "0.0.1"
+
+        async def complete(self, request: CompletionRequest) -> CompletionResponse:
+            captured_messages.extend(request.messages)
+            return CompletionResponse(
+                text='{"message": "ok"}',
+                tokens=TokenUsage(input=5, output=3),
+            )
+
+        async def stream(self, request):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+        async def embed(self, text, *, model):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    executor = Executor(
+        provider=CapturingProvider(),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+    )
+
+    history = [
+        ProviderMessage(role="user", content="first turn"),
+        ProviderMessage(role="assistant", content="first reply"),
+    ]
+    await executor.execute(
+        bundle,
+        RunRequest(agent="demo", input={"text": "second turn"}),
+        history=history,
+    )
+
+    # 3 messages reached the provider: 2 history + 1 current rendered prompt.
+    assert len(captured_messages) == 3
+    assert captured_messages[0].role == "user"
+    assert captured_messages[0].content == "first turn"
+    assert captured_messages[1].role == "assistant"
+    assert captured_messages[1].content == "first reply"
+    # The last message is the current turn's rendered prompt. The
+    # default template renders `echo {{ input.text }}` → its content
+    # includes "second turn" from the request.input.
+    assert captured_messages[2].role == "user"
+    assert "second turn" in captured_messages[2].content
+
+
+@pytest.mark.unit
 async def test_executor_runtime_policy_permissive_by_default(
     tmp_path: Path,
     pricing: PricingTable,

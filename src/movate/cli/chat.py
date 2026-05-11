@@ -46,6 +46,7 @@ from movate.cli._console import error, hint
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import RunRequest, RunResponse
+from movate.providers.base import Message
 
 stdout = Console()
 err = Console(stderr=True)
@@ -64,6 +65,11 @@ def chat(
         "--no-stream",
         help="Disable streaming (wait for the full response, then render).",
     ),
+    no_memory: bool = typer.Option(
+        False,
+        "--no-memory",
+        help="Disable conversation memory — each turn runs as a fresh one-shot.",
+    ),
     mock: bool = typer.Option(
         False,
         "--mock",
@@ -78,14 +84,23 @@ def chat(
       $ movate chat ./agents/faq-agent
       you> what is movate?
       ✦ movate is a declarative platform for AI agents and workflows...
+      you> what's the alternative?
+      ✦ Compared to writing agents in raw LangChain, movate gives you...
       you> :q
+
+    Conversation memory is ON by default — each turn sees the prior
+    user/assistant exchange so follow-ups like "what's the alternative?"
+    resolve correctly. Pass ``--no-memory`` to make every turn
+    independent (useful when iterating on a prompt and you DON'T want
+    context bleeding between attempts).
 
     Each turn runs through the full executor (input validation,
     schema check, persistence) — exactly like ``movate run`` — so
     every message persists to local sqlite for ``movate trace replay``.
 
-    [dim]Conversation memory across turns lands in a follow-up
-    (Tier-2 #10). Today every turn is independent.[/dim]
+    [dim]Memory is in-process only — it lives for the duration of one
+    chat session and is dropped on exit. Persisted conversations across
+    sessions are a follow-up.[/dim]
     """
     try:
         bundle = load_agent(path)
@@ -108,6 +123,7 @@ def chat(
             input_field=input_field,
             stream=not no_stream,
             mock=mock,
+            memory=not no_memory,
         )
     )
 
@@ -123,12 +139,19 @@ async def _chat_loop(
     input_field: str,
     stream: bool,
     mock: bool,
+    memory: bool,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
+    # Conversation history: a flat list of Messages alternating user/assistant.
+    # Built up across turns and passed to executor.execute(history=...) so the
+    # model sees prior context. Empty when --no-memory; we still track it for
+    # the assistant's reply but never pass it.
+    history: list[Message] = []
     try:
+        mem_status = "memory on" if memory else "memory off"
         hint(
             f"[dim]chat: {bundle.spec.name} v{bundle.spec.version} "
-            f"({'mock' if mock else bundle.spec.model.provider})  "
+            f"({'mock' if mock else bundle.spec.model.provider}, {mem_status})  "
             f"— Ctrl-C, Ctrl-D, or :q to exit[/dim]"
         )
         while True:
@@ -150,7 +173,12 @@ async def _chat_loop(
             on_token = _streaming_callback() if stream and not mock else None
 
             try:
-                response = await rt.executor.execute(bundle, request, on_token=on_token)
+                response = await rt.executor.execute(
+                    bundle,
+                    request,
+                    on_token=on_token,
+                    history=history if memory else None,
+                )
             except Exception as exc:
                 # REPL keeps going on any error — broad catch is
                 # deliberate so a bad turn doesn't kill the session.
@@ -161,6 +189,17 @@ async def _chat_loop(
                 continue
 
             _render_turn(response, streamed=on_token is not None)
+            # Append this turn's user message + assistant response to
+            # history so the next turn sees context. Only when memory
+            # is on — if disabled, history stays empty.
+            if memory and response.status == "success":
+                history.append(Message(role="user", content=stripped))
+                history.append(
+                    Message(
+                        role="assistant",
+                        content=_assistant_content(response),
+                    )
+                )
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
@@ -230,6 +269,22 @@ def _compact_json(response: RunResponse) -> str:
     if response.error is not None:
         payload["error"] = {"type": response.error.type, "message": response.error.message}
     return json.dumps(payload)
+
+
+def _assistant_content(response: RunResponse) -> str:
+    """Best-effort assistant content to thread into conversation history.
+
+    First choice: ``response.human_readable`` if the executor was able
+    to extract one (agents whose output schema has ``message`` /
+    ``summary`` / ``human_readable`` keys land here). Otherwise fall
+    back to the JSON-encoded ``response.data`` so the model still sees
+    something coherent in the next turn — better than an empty
+    assistant message that breaks conversation continuity."""
+    if response.human_readable:
+        return response.human_readable
+    import json  # noqa: PLC0415
+
+    return json.dumps(response.data or {})
 
 
 __all__ = ["chat"]
