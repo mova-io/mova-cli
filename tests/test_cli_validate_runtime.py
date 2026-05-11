@@ -51,10 +51,14 @@ def test_validate_accepts_explicit_litellm_runtime(tmp_path: Path) -> None:
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "runtime",
-    [AgentRuntime.NATIVE_ANTHROPIC, AgentRuntime.NATIVE_OPENAI, AgentRuntime.LANGCHAIN],
+    # Only the still-unwired runtimes belong here. NATIVE_ANTHROPIC was
+    # added in Tier-2 #6 — when this build has the ``anthropic`` extra
+    # installed (the default dev env does), declaring it should now
+    # PASS validate, not fail. See test_validate_accepts_native_anthropic_when_installed.
+    [AgentRuntime.NATIVE_OPENAI, AgentRuntime.LANGCHAIN],
 )
 def test_validate_rejects_unwired_runtime(tmp_path: Path, runtime: AgentRuntime) -> None:
-    """Native + LangChain runtimes don't ship adapters in v0.5.
+    """Native_openai + LangChain don't ship adapters yet (Tier-2 #7 / #8).
     Declaring them in agent.yaml should fail validate with a clear
     message naming the unwired runtime and listing what IS available."""
     agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
@@ -63,8 +67,21 @@ def test_validate_rejects_unwired_runtime(tmp_path: Path, runtime: AgentRuntime)
     assert result.exit_code == 2, result.stdout + result.stderr
     assert "unsupported runtime" in result.stdout
     assert runtime.value in result.stdout
-    # The "what IS available" line names litellm.
+    # The "what IS available" line names litellm at minimum.
     assert "litellm" in result.stdout
+
+
+@pytest.mark.unit
+def test_validate_accepts_native_anthropic_when_installed(tmp_path: Path) -> None:
+    """Once the ``anthropic`` extra is installed (Tier-2 #6 landed),
+    ``runtime: native_anthropic`` should pass validate — same code
+    path as the LiteLLM happy case."""
+    pytest.importorskip("anthropic")
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    _set_runtime(agent_dir, AgentRuntime.NATIVE_ANTHROPIC)
+    result = runner.invoke(cli_app, ["validate", str(agent_dir)])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "runtime:     native_anthropic" in result.stdout
 
 
 @pytest.mark.unit

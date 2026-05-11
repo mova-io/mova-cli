@@ -12,8 +12,8 @@ from __future__ import annotations
 import pytest
 
 from movate.core.models import AgentRuntime
-from movate.providers.registry import ProviderRegistry, UnregisteredRuntimeError
 from movate.providers.mock import MockProvider
+from movate.providers.registry import ProviderRegistry, UnregisteredRuntimeError
 
 
 @pytest.fixture

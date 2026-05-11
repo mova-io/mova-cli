@@ -46,6 +46,9 @@ dev = [
     "types-PyYAML",
     "types-jsonschema",
 ]
+anthropic = [
+    "anthropic>=0.40,<1",
+]
 
 [dependency-groups]
 dev = [
@@ -99,6 +102,11 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # Each branch is a distinct concern; folding into helpers would scatter the
 # read order. PLR0912 is the wrong rule for this shape.
 "src/movate/core/executor.py" = ["PLR0912"]
+# _validate_agent runs the full set of pre-flight checks in a linear pipeline:
+# runtime availability, project policy, prompt linter, cost forecast, then
+# success rendering. Same justification as executor.py — pipeline shape doesn't
+# benefit from helper extraction.
+"src/movate/cli/validate.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 

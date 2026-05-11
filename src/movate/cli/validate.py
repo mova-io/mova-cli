@@ -27,9 +27,24 @@ from movate.core.workflow import (
 from movate.core.workflow.spec import WorkflowSpecLoadError
 from movate.providers.pricing import load_pricing
 
-# Single source of truth for "which runtimes does this build ship?".
-# Updated when each native adapter lands (Tier-2 #6/#7/#8).
-_AVAILABLE_RUNTIMES: frozenset[AgentRuntime] = frozenset({AgentRuntime.LITELLM})
+
+def _available_runtimes() -> frozenset[AgentRuntime]:
+    """Which runtimes this install can actually execute.
+
+    LiteLLM is always available (core dep). Native-SDK adapters are
+    optional extras — we probe their package import to decide whether
+    to mark the runtime available. Probed each call rather than at
+    import time so a user who pip-installs ``movate-cli[anthropic]``
+    after first run sees the new runtime immediately."""
+    available: set[AgentRuntime] = {AgentRuntime.LITELLM}
+    try:
+        import anthropic  # noqa: F401, PLC0415
+
+        available.add(AgentRuntime.NATIVE_ANTHROPIC)
+    except ImportError:
+        pass
+    return frozenset(available)
+
 
 console = Console()
 
@@ -72,17 +87,27 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     # v0.5 which only ships LiteLLM). Fail fast HERE so the operator
     # learns before any execute attempt — same exit-2 semantics as a
     # bad policy or a bad schema.
-    if spec.runtime not in _AVAILABLE_RUNTIMES:
+    available = _available_runtimes()
+    if spec.runtime not in available:
         console.print(
             f"[red]✗ unsupported runtime:[/red] agent {spec.name!r} "
             f"declares [bold]runtime: {spec.runtime.value}[/bold], but "
-            f"this movate build only ships: "
-            f"{sorted(r.value for r in _AVAILABLE_RUNTIMES)}."
+            f"this install only ships: "
+            f"{sorted(r.value for r in available)}."
         )
-        console.print(
-            "[dim]  Native-SDK (anthropic / openai) and LangChain runtimes "
-            "land in v0.6 — see Tier-2 #6/#7/#8 in the high-priority list.[/dim]"
-        )
+        # Hint how to enable the missing runtime.
+        if spec.runtime == AgentRuntime.NATIVE_ANTHROPIC:
+            console.print("[dim]  Install with: uv add 'movate-cli[anthropic]'[/dim]")
+        elif spec.runtime == AgentRuntime.NATIVE_OPENAI:
+            console.print(
+                "[dim]  The native OpenAI adapter lands as Tier-2 #7 "
+                "(install hint will appear here once shipped).[/dim]"
+            )
+        elif spec.runtime == AgentRuntime.LANGCHAIN:
+            console.print(
+                "[dim]  The LangChain adapter lands as Tier-2 #8 "
+                "(install hint will appear here once shipped).[/dim]"
+            )
         raise typer.Exit(code=2)
 
     # Project-wide model policy. ``check_agent`` returns an empty list

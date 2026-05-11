@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 from movate.core.config import load_project_config
 from movate.core.executor import Executor
+from movate.core.models import AgentRuntime
 from movate.providers.base import BaseLLMProvider
 from movate.providers.litellm import LiteLLMProvider
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import load_pricing
+from movate.providers.registry import ProviderRegistry
 from movate.storage import StorageProvider, build_storage
 from movate.tracing import Tracer, build_tracer
 
@@ -25,12 +27,36 @@ class LocalRuntime:
     tracer: Tracer
 
 
+def _try_register_native_adapters(registry: ProviderRegistry, *, mock: bool) -> None:
+    """Opportunistically register optional native-SDK adapters.
+
+    Each adapter is gated by an ``[optional-dependency]`` extra
+    (``anthropic``, ``openai``, ``langchain``) — if the extra isn't
+    installed, the import fails and we silently skip registration.
+    The user's agent.yaml will then fail at ``movate validate`` with
+    "runtime not registered" instead of a cryptic ImportError mid-run.
+
+    ``mock=True`` short-circuits everything to the MockProvider so
+    smoke tests / offline dev never hit real SDKs."""
+    if mock:
+        return  # MockProvider is wired for every runtime via the registry default
+    try:
+        from movate.providers.anthropic import AnthropicProvider  # noqa: PLC0415
+
+        registry.register(AgentRuntime.NATIVE_ANTHROPIC, AnthropicProvider())
+    except ImportError:
+        pass
+
+
 async def build_local_runtime(*, mock: bool) -> LocalRuntime:
     """Construct the local runtime for a CLI invocation.
 
-    Storage: SQLite at ``~/.movate/local.db`` (Postgres lands v0.5).
-    Tracer: stdout-on-stderr (Langfuse + OTel land v0.4).
-    Provider: ``MockProvider`` if ``mock=True``, else ``LiteLLMProvider``.
+    Storage: SQLite at ``~/.movate/local.db``.
+    Tracer: stdout-on-stderr (Langfuse + OTel land via env opt-in).
+    Providers: a :class:`ProviderRegistry` with LiteLLM wired by default
+    plus any native-SDK adapters whose extras are installed. ``mock=True``
+    swaps every runtime for :class:`MockProvider` so offline dev / tests
+    don't need real API keys.
     """
     storage = build_storage()
     await storage.init()
@@ -42,9 +68,18 @@ async def build_local_runtime(*, mock: bool) -> LocalRuntime:
     project_cfg = load_project_config()
 
     provider: BaseLLMProvider = MockProvider() if mock else LiteLLMProvider()
+    registry = ProviderRegistry(default_litellm=provider)
+    if mock:
+        # Under --mock, register the mock for every known runtime so
+        # an agent with `runtime: native_anthropic` still smoke-tests
+        # against the deterministic mock response.
+        for rt in AgentRuntime:
+            registry.register(rt, provider)
+    else:
+        _try_register_native_adapters(registry, mock=mock)
 
     executor = Executor(
-        provider=provider,
+        registry=registry,
         pricing=pricing,
         storage=storage,
         tracer=tracer,
