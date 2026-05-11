@@ -23,6 +23,7 @@ path is enforced by ``check_record``, not the storage method.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from movate.core.models import (
@@ -160,15 +161,35 @@ class StorageProvider(Protocol):
     ) -> None:
         """Transition a claimed job to a terminal status, scoped to ``tenant_id``.
 
-        ``status`` must be one of ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED``;
-        ``QUEUED`` and ``RUNNING`` are reserved for the lifecycle helpers
-        (``save_job``, ``claim_next_job``). Sets ``completed_at = now()``
-        as a side effect.
+        ``status`` must be one of ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED``
+        / ``DEAD_LETTER``; ``QUEUED`` and ``RUNNING`` are reserved for the
+        lifecycle helpers (``save_job``, ``claim_next_job``, ``requeue_job``).
+        Sets ``completed_at = now()`` as a side effect.
 
         The ``tenant_id`` filter on WHERE is the SQL-layer enforcement
         that prevents a misconfigured worker (or a direct storage call
         from a buggy path) from mutating another tenant's job. Silently
         no-op if no row matches both id + tenant.
+        """
+
+    async def requeue_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        next_retry_at: datetime,
+        attempt_count: int,
+    ) -> None:
+        """Re-queue a ``RUNNING`` job after a transient failure.
+
+        Sets status back to ``QUEUED``, clears ``claimed_at``, bumps
+        ``attempt_count``, and stamps ``next_retry_at`` so the claim
+        path skips this row until backoff elapses.
+
+        The worker calls this instead of ``update_job`` when the
+        dispatch outcome reports a retryable error AND the retry
+        budget isn't exhausted (see :mod:`movate.core.job_retry`).
+        Tenant-scoped in WHERE; silently no-ops on mismatch.
         """
 
     # ------------------------------------------------------------------

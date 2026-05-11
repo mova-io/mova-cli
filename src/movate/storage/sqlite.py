@@ -171,6 +171,24 @@ _MIGRATIONS = [
     # post-v1.0: per-job email notification. SMS deferred — needs
     # regulatory + phone-number provisioning out of band of code.
     "ALTER TABLE jobs ADD COLUMN notify_email TEXT",
+    # post-v1.0: job-level retry policy. attempt_count tracks how
+    # many times we've dispatched; next_retry_at lets the claim path
+    # skip a job until its backoff has elapsed. NOT NULL DEFAULT 0
+    # so existing rows from before this migration get a sensible
+    # value (they've been "dispatched" some implicit number of times
+    # but for retry purposes a fresh attempt budget is fine).
+    "ALTER TABLE jobs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN next_retry_at TEXT",
+    # Update the queue-head index to include next_retry_at so the claim
+    # path can skip jobs whose retry hasn't yet elapsed without a table
+    # scan. Use a separate index — keeps the original tight for jobs
+    # that don't have a retry pending (next_retry_at IS NULL, the
+    # common case).
+    (
+        "CREATE INDEX IF NOT EXISTS idx_jobs_retry_at "
+        "ON jobs(tenant_id, next_retry_at) "
+        "WHERE status = 'queued' AND next_retry_at IS NOT NULL"
+    ),
 ]
 
 
@@ -420,8 +438,8 @@ class SqliteProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notify_email, attempt_count, next_retry_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -437,6 +455,8 @@ class SqliteProvider:
                 job.claimed_at.isoformat() if job.claimed_at else None,
                 job.completed_at.isoformat() if job.completed_at else None,
                 job.notify_email,
+                job.attempt_count,
+                job.next_retry_at.isoformat() if job.next_retry_at else None,
             ),
         )
         await self._db.commit()
@@ -499,12 +519,22 @@ class SqliteProvider:
         # access too, where aiosqlite's queue offers nothing).
         await self._db.execute("BEGIN IMMEDIATE")
         try:
+            now_iso = datetime.now(UTC).isoformat()
+            # Retry-aware claim: skip jobs whose next_retry_at is in the
+            # future. The `next_retry_at IS NULL` branch is the common
+            # case (fresh jobs, jobs that have never failed); the
+            # `<= now` branch is for re-queued jobs whose backoff has
+            # elapsed.
             tenant_clause = "AND tenant_id = ?" if tenant_id is not None else ""
-            params: tuple[object, ...] = (tenant_id,) if tenant_id is not None else ()
+            params: tuple[object, ...] = (now_iso,)
+            if tenant_id is not None:
+                params = (now_iso, tenant_id)
             async with self._db.execute(
                 f"""
                 SELECT * FROM jobs
-                WHERE status = 'queued' {tenant_clause}
+                WHERE status = 'queued'
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  {tenant_clause}
                 ORDER BY created_at
                 LIMIT 1
                 """,
@@ -515,10 +545,9 @@ class SqliteProvider:
                 await self._db.commit()
                 return None
 
-            now = datetime.now(UTC).isoformat()
             await self._db.execute(
                 "UPDATE jobs SET status = 'running', claimed_at = ? WHERE job_id = ?",
-                (now, row["job_id"]),
+                (now_iso, row["job_id"]),
             )
             await self._db.commit()
         except Exception:
@@ -541,10 +570,15 @@ class SqliteProvider:
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
     ) -> None:
-        if status not in (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.SAFETY_BLOCKED):
+        if status not in (
+            JobStatus.SUCCESS,
+            JobStatus.ERROR,
+            JobStatus.SAFETY_BLOCKED,
+            JobStatus.DEAD_LETTER,
+        ):
             raise ValueError(
                 f"update_job only accepts terminal statuses; got {status!r}. "
-                f"Use save_job/claim_next_job for QUEUED/RUNNING transitions."
+                f"Use save_job/claim_next_job/requeue_job for non-terminal transitions."
             )
         now = datetime.now(UTC).isoformat()
         # tenant_id in WHERE: even a misconfigured worker can't mutate
@@ -561,6 +595,42 @@ class SqliteProvider:
                 result_run_id,
                 json.dumps(error) if error else None,
                 now,
+                job_id,
+                tenant_id,
+            ),
+        )
+        await self._db.commit()
+
+    async def requeue_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        next_retry_at: datetime,
+        attempt_count: int,
+    ) -> None:
+        """Transition a ``RUNNING`` job back to ``QUEUED`` for a retry.
+
+        The job sits in the queue but ``claim_next_job`` won't pick
+        it up until ``now >= next_retry_at`` — that's how exponential
+        backoff is enforced. ``claimed_at`` is cleared so the next
+        claim records the new attempt cleanly.
+
+        Tenant-scoped in WHERE (defense in depth — same rationale as
+        ``update_job``). Silently no-ops on tenant mismatch.
+        """
+        await self._db.execute(
+            """
+            UPDATE jobs
+            SET status = 'queued',
+                claimed_at = NULL,
+                attempt_count = ?,
+                next_retry_at = ?
+            WHERE job_id = ? AND tenant_id = ?
+            """,
+            (
+                attempt_count,
+                next_retry_at.isoformat(),
                 job_id,
                 tenant_id,
             ),
@@ -725,6 +795,14 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         claimed_at=datetime.fromisoformat(row["claimed_at"]) if row["claimed_at"] else None,
         completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
         notify_email=row["notify_email"],
+        # Defensive: rows from pre-retry-migration schemas could
+        # theoretically lack the column on a fresh open. aiosqlite.Row
+        # KeyError on missing column, so we use bracket access only —
+        # the migrations have run by the time we get here.
+        attempt_count=row["attempt_count"],
+        next_retry_at=(
+            datetime.fromisoformat(row["next_retry_at"]) if row["next_retry_at"] else None
+        ),
     )
 
 

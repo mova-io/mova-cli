@@ -5,6 +5,84 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Job retry policy with exponential backoff + dead-letter (post-v1.0)
+
+**Closes the production-readiness reliability gap.** Before this, every
+``ERROR`` was terminal — a single transient blip (network, provider 5xx,
+rate-limit) killed the job permanently. Now transient failures re-queue
+with exponential backoff, persistent failures stay terminal, and jobs
+that exhaust their retry budget land in ``DEAD_LETTER`` for operator
+triage.
+
+- **`JobStatus.DEAD_LETTER`** — new terminal status. Distinct from
+  ``ERROR`` ("failed once, won't retry") — ``DEAD_LETTER`` means "we
+  tried N times and gave up." Operators triage with
+  ``movate jobs list --status dead_letter`` (already works via the
+  existing ``list_jobs`` filter).
+- **`core/job_retry.py`** — pure policy module:
+  * ``JobRetryPolicy`` dataclass (max_attempts, base_seconds, factor,
+    cap_seconds, jitter). Default = 3 attempts (initial + 2 retries),
+    5s base, 3x factor, 5min cap, ±25% jitter.
+  * ``should_retry(retryable, attempt_count)`` → bool. The retry
+    decision.
+  * ``compute_next_retry_at(attempt_count)`` → datetime. Exponential
+    backoff with jitter; floors at 0 so jitter can't schedule a
+    retry in the past.
+  * ``is_exhausted(attempt_count)`` → bool. Distinguishes
+    "retryable-but-budget-spent" (→ ``DEAD_LETTER``) from
+    "not retryable at all" (→ ``ERROR``).
+- **`JobRecord` schema additions:** ``attempt_count: int = 0`` and
+  ``next_retry_at: datetime | None = None``. Sqlite via idempotent
+  ``ALTER TABLE … ADD COLUMN``; postgres via ``ADD COLUMN IF NOT
+  EXISTS``. Existing rows from before this migration get default
+  values (attempt_count=0, next_retry_at=NULL) so they're treated as
+  fresh jobs with a full retry budget — safe default.
+- **`StorageProvider.requeue_job(job_id, *, tenant_id, next_retry_at,
+  attempt_count)`** — new Protocol method. Flips ``RUNNING`` →
+  ``QUEUED``, clears ``claimed_at``, stamps the new
+  attempt_count + next_retry_at. Tenant-scoped in WHERE (v1.0 stage 4
+  defense-in-depth). Implemented in all three backends.
+- **`claim_next_job` is retry-aware** — sqlite + postgres + memory
+  now skip rows whose ``next_retry_at`` is in the future. The
+  ``next_retry_at IS NULL`` branch is the common case (fresh jobs);
+  ``<= now`` covers re-queued jobs whose backoff has elapsed. New
+  partial index ``idx_jobs_retry_at`` on both backends keeps the
+  filter cheap.
+- **`update_job` accepts ``DEAD_LETTER``** as a terminal status
+  (previously only ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED``).
+- **Worker integration:** new ``_resolve_outcome(job, outcome)``
+  helper centralizes the three-way decision (retry / dead-letter /
+  terminal-error). After dispatch, the worker calls either
+  ``requeue_job`` (with the new attempt_count + computed
+  next_retry_at) or ``update_job`` (with the resolved final status).
+  Notifications are SKIPPED on the retry path — the run isn't done
+  yet; the dispatcher fires only when the job lands in a true
+  terminal status (avoids spam on flaky jobs).
+- **`WorkerConfig.retry_policy`** — workers can override the default
+  policy. Set ``max_attempts=1`` for the strict "fail fast" mode
+  (every retryable error → ``DEAD_LETTER`` immediately).
+- 23 new tests across `tests/test_job_retry.py` covering: pure-math
+  edge cases (retryable=False short-circuit, budget boundary,
+  jitter band, never-in-past floor), storage round-trip
+  parametrized over memory + sqlite + postgres (requeue_job,
+  claim respects next_retry_at, claim picks up after retry elapsed,
+  update_job accepts DEAD_LETTER, save_job persists retry fields),
+  and worker integration (requeues transient, keeps non-retryable
+  terminal, dead-letters at budget exhaustion, 3-attempt
+  fail-fail-succeed happy path, max_attempts=1 disables retries,
+  notifier skipped on retry path but fires on DEAD_LETTER).
+
+**Operator triage flow:** when a job lands in DEAD_LETTER, the
+``error`` field on the ``JobRecord`` carries the structured error
+info from the LAST attempt (type, message, retryable=true), the
+``attempt_count`` shows how many times we tried, and
+``completed_at`` is set. The standard ``movate jobs show <id>``
+displays all of this. Operators investigate the root cause, fix
+the underlying issue (e.g. bump a provider quota), and either
+manually re-queue (post-v1.1) or accept the loss.
+
+Total: **555 passing** (532 → 555, +23 retry tests).
+
 ### Added — Azure deploy onboarding (`scripts/azure-bootstrap.sh` + `movate doctor --target`)
 
 **Closes the manual-toil gap between "you have an Azure subscription"

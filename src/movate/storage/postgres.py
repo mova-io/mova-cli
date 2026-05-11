@@ -127,15 +127,26 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at    TIMESTAMPTZ NOT NULL,
     claimed_at    TIMESTAMPTZ,
     completed_at  TIMESTAMPTZ,
-    notify_email  TEXT
+    notify_email  TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ
 );
--- Upgrade path for PG instances created pre-notify_email. PG natively
+-- Upgrade paths for PG instances created on older schemas. PG natively
 -- supports ADD COLUMN IF NOT EXISTS so this is idempotent on every init.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS notify_email TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_jobs_queue_head
     ON jobs(tenant_id, created_at) WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_created
     ON jobs(tenant_id, created_at DESC);
+-- Retry-aware claim path: lets `claim_next_job` skip jobs whose
+-- next_retry_at hasn't elapsed without a table scan. Common-case
+-- (next_retry_at IS NULL, never-failed) bypasses this index via the
+-- existing idx_jobs_queue_head.
+CREATE INDEX IF NOT EXISTS idx_jobs_retry_at
+    ON jobs(tenant_id, next_retry_at)
+    WHERE status = 'queued' AND next_retry_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id        TEXT PRIMARY KEY,
@@ -443,8 +454,8 @@ class PostgresProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                notify_email, attempt_count, next_retry_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             """,
             job.job_id,
             job.tenant_id,
@@ -459,6 +470,8 @@ class PostgresProvider:
             job.claimed_at,
             job.completed_at,
             job.notify_email,
+            job.attempt_count,
+            job.next_retry_at,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -499,12 +512,23 @@ class PostgresProvider:
         the next queued one). No global serialization, no retries.
         """
         async with self._db.acquire() as conn, conn.transaction():
-            tenant_clause = "AND tenant_id = $1" if tenant_id else ""
-            params = (tenant_id,) if tenant_id else ()
+            now = datetime.now(UTC)
+            # Retry-aware claim: skip rows whose next_retry_at is in
+            # the future. The `next_retry_at IS NULL` branch is the
+            # common case (fresh jobs); `<= now` covers re-queued jobs
+            # whose backoff has elapsed.
+            if tenant_id:
+                tenant_clause = "AND tenant_id = $2"
+                params: tuple[Any, ...] = (now, tenant_id)
+            else:
+                tenant_clause = ""
+                params = (now,)
             row = await conn.fetchrow(
                 f"""
                 SELECT * FROM jobs
-                WHERE status = 'queued' {tenant_clause}
+                WHERE status = 'queued'
+                  AND (next_retry_at IS NULL OR next_retry_at <= $1)
+                  {tenant_clause}
                 ORDER BY created_at
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -514,7 +538,7 @@ class PostgresProvider:
             if row is None:
                 return None
 
-            now = datetime.now(UTC)
+            # Reuse the `now` we computed for the claim-window filter.
             await conn.execute(
                 """
                 UPDATE jobs SET status = 'running', claimed_at = $1
@@ -539,10 +563,15 @@ class PostgresProvider:
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
     ) -> None:
-        if status not in (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.SAFETY_BLOCKED):
+        if status not in (
+            JobStatus.SUCCESS,
+            JobStatus.ERROR,
+            JobStatus.SAFETY_BLOCKED,
+            JobStatus.DEAD_LETTER,
+        ):
             raise ValueError(
                 f"update_job only accepts terminal statuses; got {status!r}. "
-                f"Use save_job/claim_next_job for QUEUED/RUNNING transitions."
+                f"Use save_job/claim_next_job/requeue_job for non-terminal transitions."
             )
         # tenant_id in WHERE: even a misconfigured worker can't mutate
         # another tenant's job. Silently no-ops on tenant mismatch.
@@ -556,6 +585,36 @@ class PostgresProvider:
             result_run_id,
             error,
             datetime.now(UTC),
+            job_id,
+            tenant_id,
+        )
+
+    async def requeue_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        next_retry_at: datetime,
+        attempt_count: int,
+    ) -> None:
+        """Re-queue a ``RUNNING`` job for a retry after a transient failure.
+
+        Sets status back to ``QUEUED``, clears ``claimed_at`` (so the
+        next claim records a fresh attempt), bumps ``attempt_count``,
+        and sets ``next_retry_at`` so the claim path skips this row
+        until backoff elapses.
+        """
+        await self._db.execute(
+            """
+            UPDATE jobs
+            SET status = 'queued',
+                claimed_at = NULL,
+                attempt_count = $1,
+                next_retry_at = $2
+            WHERE job_id = $3 AND tenant_id = $4
+            """,
+            attempt_count,
+            next_retry_at,
             job_id,
             tenant_id,
         )
@@ -708,6 +767,8 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         claimed_at=row["claimed_at"],
         completed_at=row["completed_at"],
         notify_email=row["notify_email"],
+        attempt_count=row["attempt_count"],
+        next_retry_at=row["next_retry_at"],
     )
 
 

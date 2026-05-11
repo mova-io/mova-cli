@@ -205,6 +205,13 @@ class JobStatus(StrEnum):
     SUCCESS = "success"
     ERROR = "error"
     SAFETY_BLOCKED = "safety_blocked"
+    DEAD_LETTER = "dead_letter"
+    """Terminal: the job exhausted its retry budget on transient errors.
+
+    Distinct from ``ERROR`` (which is "failed once, won't retry") —
+    ``DEAD_LETTER`` is "we tried N times and gave up." Operators
+    triage with ``movate jobs list --status dead_letter``.
+    """
 
 
 def _now() -> datetime:
@@ -356,8 +363,11 @@ class JobRecord(BaseModel):
 
     * ``QUEUED`` (just inserted, waiting for a worker)
     * ``RUNNING`` (claimed by a worker, ``claimed_at`` set)
-    * ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED`` (terminal,
-      ``completed_at`` and (for success) ``result_run_id`` set)
+    * ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED`` / ``DEAD_LETTER``
+      (terminal, ``completed_at`` and (for success) ``result_run_id`` set)
+    * ``QUEUED`` again — re-queue after a transient failure
+      (``attempt_count`` incremented, ``next_retry_at`` set in the
+      future; ``claim_next_job`` skips until then)
 
     Re-uses :class:`JobStatus` (defined for ``RunRecord``) so the queue
     and the produced run share a single status vocabulary.
@@ -391,6 +401,18 @@ class JobRecord(BaseModel):
     deliver never re-queues the job. SMS notifications are deferred
     to a future release (phone-number provisioning + regulatory
     approval are out of band of code)."""
+    attempt_count: int = Field(default=0, ge=0)
+    """Number of times this job has been dispatched. Starts at 0 on
+    insert; incremented every time the worker re-queues after a
+    transient failure (``RUNNING`` → ``QUEUED``). When it reaches
+    the per-job retry budget, the job lands in ``DEAD_LETTER``
+    instead of going back to ``QUEUED``."""
+    next_retry_at: datetime | None = None
+    """When set, ``claim_next_job`` must skip this row until
+    ``now() >= next_retry_at``. ``None`` (the common case for fresh
+    jobs and jobs that don't need retry) means "claim immediately."
+    Set when the worker re-queues a transient failure; the value is
+    ``now + backoff(attempt_count)`` from the retry policy."""
 
 
 # ---------------------------------------------------------------------------

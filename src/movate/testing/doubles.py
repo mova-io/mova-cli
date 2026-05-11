@@ -168,20 +168,24 @@ class InMemoryStorage:
         so the SELECT-then-UPDATE pair here is atomic by construction —
         no lock needed. The Sqlite/Postgres providers carry the actual
         concurrency story; this double exists to test calling code.
+
+        Retry-aware: skips jobs whose ``next_retry_at`` is in the
+        future. Matches the sqlite/postgres claim semantics.
         """
+        now = datetime.now(UTC)
         candidates = [
             j
             for j in self.jobs
-            if j.status == JobStatus.QUEUED and (tenant_id is None or j.tenant_id == tenant_id)
+            if j.status == JobStatus.QUEUED
+            and (tenant_id is None or j.tenant_id == tenant_id)
+            and (j.next_retry_at is None or j.next_retry_at <= now)
         ]
         if not candidates:
             return None
         oldest = min(candidates, key=lambda j: j.created_at)
         # Mutate via Pydantic.copy so we don't lose `extra="forbid"` enforcement.
         idx = self.jobs.index(oldest)
-        claimed = oldest.model_copy(
-            update={"status": JobStatus.RUNNING, "claimed_at": datetime.now(UTC)}
-        )
+        claimed = oldest.model_copy(update={"status": JobStatus.RUNNING, "claimed_at": now})
         self.jobs[idx] = claimed
         return claimed
 
@@ -194,7 +198,12 @@ class InMemoryStorage:
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
     ) -> None:
-        if status not in (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.SAFETY_BLOCKED):
+        if status not in (
+            JobStatus.SUCCESS,
+            JobStatus.ERROR,
+            JobStatus.SAFETY_BLOCKED,
+            JobStatus.DEAD_LETTER,
+        ):
             raise ValueError(f"update_job only accepts terminal statuses; got {status!r}")
         for i, j in enumerate(self.jobs):
             if j.job_id == job_id and j.tenant_id == tenant_id:
@@ -213,6 +222,34 @@ class InMemoryStorage:
         # behavior where the WHERE clause filters out the row. (We
         # used to raise on "no job found"; that left a side channel
         # for cross-tenant id probing.)
+        return
+
+    async def requeue_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        next_retry_at: datetime,
+        attempt_count: int,
+    ) -> None:
+        """Re-queue a job for retry after a transient failure.
+
+        Matches the storage Protocol — flips RUNNING → QUEUED, clears
+        claimed_at, stamps the new attempt_count + next_retry_at.
+        Silently no-ops on tenant mismatch (same rationale as
+        update_job).
+        """
+        for i, j in enumerate(self.jobs):
+            if j.job_id == job_id and j.tenant_id == tenant_id:
+                self.jobs[i] = j.model_copy(
+                    update={
+                        "status": JobStatus.QUEUED,
+                        "claimed_at": None,
+                        "attempt_count": attempt_count,
+                        "next_retry_at": next_retry_at,
+                    }
+                )
+                return
         return
 
     # ------------------------------------------------------------------

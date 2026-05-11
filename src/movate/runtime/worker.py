@@ -28,6 +28,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from movate.core.job_retry import (
+    DEFAULT_POLICY,
+    JobRetryPolicy,
+    compute_next_retry_at,
+    is_exhausted,
+    should_retry,
+)
 from movate.core.models import (
     ErrorInfo,
     JobKind,
@@ -52,6 +59,12 @@ class WorkerConfig:
     """If set, only claim jobs for this tenant. ``None`` drains all
     tenants (operator/dev mode). The HTTP layer never sees this knob —
     workers are configured by the operator."""
+
+    retry_policy: JobRetryPolicy = DEFAULT_POLICY
+    """Retry policy applied to transient failures. Default: 3 total
+    attempts (initial + 2 retries), 5s base, 3x factor, 5min cap,
+    ±25% jitter. Set ``max_attempts=1`` to disable retries entirely
+    (every retryable error → ``DEAD_LETTER``)."""
 
 
 class Worker:
@@ -112,26 +125,54 @@ class Worker:
                 ).model_dump(),
             )
 
-        # Even if the storage update fails, the loop should continue.
+        # Decide retry vs terminal BEFORE writing back to storage.
+        # The decision is a pure function of the outcome's retryable
+        # flag + the job's current attempt_count; centralizing it
+        # here keeps the worker loop's three branches obvious.
+        final_status, final_action = self._resolve_outcome(job, outcome)
+
+        # Even if the storage write fails, the loop should continue.
         # The job will appear stuck in RUNNING; an operator can
         # requeue or update manually. The job's tenant_id is the SQL
         # filter that prevents a misconfigured worker from mutating
         # another tenant's job — even if `claim_next_job` were called
         # without a tenant scope (operator drain mode), this guarantees
-        # the update only ever lands on the row we just claimed.
+        # the write only ever lands on the row we just claimed.
         try:
-            await self._storage.update_job(
-                job.job_id,
-                tenant_id=job.tenant_id,
-                status=outcome.status,
-                result_run_id=outcome.result_run_id,
-                error=outcome.error,
-            )
+            if final_action == "retry":
+                # Transient failure with retry budget left → re-queue.
+                next_attempt = job.attempt_count + 1
+                next_retry_at = compute_next_retry_at(
+                    attempt_count=next_attempt,
+                    policy=self._config.retry_policy,
+                )
+                await self._storage.requeue_job(
+                    job.job_id,
+                    tenant_id=job.tenant_id,
+                    next_retry_at=next_retry_at,
+                    attempt_count=next_attempt,
+                )
+                logger.info(
+                    "worker_requeued job_id=%s attempt=%d next_retry_at=%s reason=%s",
+                    job.job_id,
+                    next_attempt,
+                    next_retry_at.isoformat(),
+                    (outcome.error or {}).get("type", "unknown"),
+                )
+            else:
+                # Terminal — SUCCESS / SAFETY_BLOCKED / ERROR / DEAD_LETTER.
+                await self._storage.update_job(
+                    job.job_id,
+                    tenant_id=job.tenant_id,
+                    status=final_status,
+                    result_run_id=outcome.result_run_id,
+                    error=outcome.error,
+                )
         except Exception:
             logger.exception(
                 "worker_update_failed job_id=%s status=%s — job stuck in RUNNING",
                 job.job_id,
-                outcome.status.value,
+                final_status.value,
             )
 
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -140,21 +181,35 @@ class Worker:
             job.job_id,
             job.kind.value,
             job.target,
-            outcome.status.value,
+            final_status.value,
             duration_ms,
         )
         if self._on_job_complete is not None:
             # Decorative; never sink the worker on a buggy callback.
+            # We pass an outcome reflecting the FINAL status (which
+            # may be DEAD_LETTER even if the dispatch reported ERROR)
+            # so the UI sees what was actually persisted.
             try:
-                self._on_job_complete(job, outcome, duration_ms)
+                final_outcome = (
+                    outcome
+                    if outcome.status == final_status
+                    else DispatchOutcome(
+                        status=final_status,
+                        result_run_id=outcome.result_run_id,
+                        error=outcome.error,
+                    )
+                )
+                self._on_job_complete(job, final_outcome, duration_ms)
             except Exception:
                 logger.warning("on_job_complete callback raised", exc_info=True)
 
         # Fire-and-await notification AFTER the update has committed.
-        # The dispatcher's contract is "never raise"; we still wrap to
-        # belt-and-suspender any future implementation that slips and
-        # raises something the worker shouldn't die on.
-        if self._notifier is not None and job.notify_email:
+        # Re-queued jobs DON'T notify — the run isn't done yet; the
+        # notification fires when the retry eventually lands a true
+        # terminal status. The dispatcher's contract is "never raise";
+        # we still wrap to belt-and-suspender any future implementation
+        # that slips and raises something the worker shouldn't die on.
+        if final_action == "terminal" and self._notifier is not None and job.notify_email:
             try:
                 # Use the post-update view so the email reflects the
                 # terminal status, not the RUNNING snapshot we have here.
@@ -169,6 +224,41 @@ class Worker:
                     exc_info=True,
                 )
         return job
+
+    def _resolve_outcome(self, job: JobRecord, outcome: DispatchOutcome) -> tuple[JobStatus, str]:
+        """Decide what to do with a dispatch outcome.
+
+        Returns ``(final_status, action)`` where:
+
+        * ``action == "retry"`` → caller calls ``requeue_job``;
+          ``final_status`` is ``QUEUED`` (informational; not persisted
+          via update_job).
+        * ``action == "terminal"`` → caller calls ``update_job`` with
+          ``final_status``. May be the original outcome status
+          (SUCCESS / SAFETY_BLOCKED / ERROR) or ``DEAD_LETTER`` if a
+          retryable failure exhausted its budget.
+        """
+        # Success and safety-blocked are always terminal; nothing to retry.
+        if outcome.status in (JobStatus.SUCCESS, JobStatus.SAFETY_BLOCKED):
+            return outcome.status, "terminal"
+
+        # The outcome is ERROR. Check whether it's retryable + within budget.
+        retryable = bool((outcome.error or {}).get("retryable", False))
+        if should_retry(
+            retryable=retryable,
+            attempt_count=job.attempt_count,
+            policy=self._config.retry_policy,
+        ):
+            return JobStatus.QUEUED, "retry"
+
+        # Either not retryable, or retryable-but-exhausted. Distinguish
+        # the two so operators triaging dead-letters know "we tried"
+        # vs "this was always going to fail."
+        if retryable and is_exhausted(
+            attempt_count=job.attempt_count, policy=self._config.retry_policy
+        ):
+            return JobStatus.DEAD_LETTER, "terminal"
+        return JobStatus.ERROR, "terminal"
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         """Loop until ``stop_event`` is set. Sleeps when the queue is empty.
