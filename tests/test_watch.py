@@ -17,6 +17,7 @@ works.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -29,6 +30,16 @@ from movate.cli.watch import _compute_watched_paths, dispatch_once
 from movate.testing import scaffold_agent
 
 runner = CliRunner(mix_stderr=False)
+
+# Rich injects ANSI style codes mid-token (e.g. `--\x1b[33mpoll\x1b[0m-interval`)
+# in some CI environments, which breaks literal substring assertions on flag
+# names. Strip ANSI codes before checking so the test is robust against Rich
+# coloring decisions across terminal widths and platforms.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +124,11 @@ def test_dispatch_once_strict_promotes_warnings(tmp_path: Path) -> None:
 def test_cli_watch_help_renders() -> None:
     r = runner.invoke(cli_app, ["watch", "--help"])
     assert r.exit_code == 0
-    assert "hot-reload" in r.stdout.lower() or "validate" in r.stdout.lower()
+    plain = _strip_ansi(r.stdout)
+    assert "hot-reload" in plain.lower() or "validate" in plain.lower()
     # Flags surface in --help so operators can discover them.
-    assert "--poll-interval" in r.stdout
-    assert "--strict" in r.stdout
+    assert "--poll-interval" in plain
+    assert "--strict" in plain
 
 
 # ---------------------------------------------------------------------------
