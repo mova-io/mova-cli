@@ -1,5 +1,5 @@
 {
-  "eval_id": "da5c2023-1fa5-4b0e-b4e4-8efec25e4358",
+  "eval_id": "99965334-ff48-47a8-8a10-cceb37538cc0",
   "tenant_id": "local",
   "agent": "case-reasoner",
   "agent_version": "0.1.0",
@@ -9,9 +9,9 @@
   "runs_per_case": 1,
   "gate_mode": "mean",
   "threshold": 0.7,
-  "mean_score": 0.0,
-  "pass_rate": 0.0,
+  "mean_score": 1.0,
+  "pass_rate": 1.0,
   "sample_count": 4,
-  "total_cost_usd": 0.0,
-  "created_at": "2026-05-11T19:20:46.413870Z"
+  "total_cost_usd": 0.000718,
+  "created_at": "2026-05-11T19:33:42.883842Z"
 }
