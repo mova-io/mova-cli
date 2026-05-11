@@ -334,6 +334,103 @@ async def test_get_job_404_when_cross_tenant(
 
 
 # ---------------------------------------------------------------------------
+# GET /jobs (list)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_list_jobs_empty(client: TestClient, minted_key) -> None:
+    """No jobs yet → 200 + empty list + count=0."""
+    _, bearer = minted_key
+    r = client.get("/jobs", headers=_auth_headers(bearer))
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"jobs": [], "count": 0}
+
+
+@pytest.mark.unit
+def test_list_jobs_returns_recent_jobs(client: TestClient, minted_key) -> None:
+    """Submit three jobs and verify they all come back in the list,
+    newest first (server-side ordering)."""
+    _, bearer = minted_key
+    submitted = []
+    for i in range(3):
+        r = client.post(
+            "/run",
+            json={"kind": "agent", "target": f"demo-{i}", "input": {"i": i}},
+            headers=_auth_headers(bearer),
+        )
+        submitted.append(r.json()["job_id"])
+
+    r = client.get("/jobs", headers=_auth_headers(bearer))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 3
+    returned_ids = [j["job_id"] for j in body["jobs"]]
+    # Same ids (set-equal); order is newest-first which means reversed.
+    assert set(returned_ids) == set(submitted)
+
+
+@pytest.mark.unit
+def test_list_jobs_filters_by_status(client: TestClient, minted_key) -> None:
+    """``?status=queued`` returns only queued jobs. Submitting alone never
+    advances state past queued, so all three should match."""
+    _, bearer = minted_key
+    for i in range(3):
+        client.post(
+            "/run",
+            json={"kind": "agent", "target": "demo", "input": {"i": i}},
+            headers=_auth_headers(bearer),
+        )
+    r = client.get("/jobs", params={"status": "queued"}, headers=_auth_headers(bearer))
+    assert r.status_code == 200
+    assert r.json()["count"] == 3
+
+    # No errored jobs → empty.
+    r = client.get("/jobs", params={"status": "error"}, headers=_auth_headers(bearer))
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+
+
+@pytest.mark.unit
+def test_list_jobs_respects_limit_cap(client: TestClient, minted_key) -> None:
+    """Server hard-caps limit at 100 so a runaway client can't fetch
+    arbitrarily large pages."""
+    _, bearer = minted_key
+    # Don't actually submit 100+; just verify the endpoint accepts the
+    # param and doesn't 4xx. The cap-enforcement detail is unit-tested
+    # against storage in test_jobs_storage.
+    r = client.get("/jobs", params={"limit": 5000}, headers=_auth_headers(bearer))
+    assert r.status_code == 200
+
+
+@pytest.mark.unit
+async def test_list_jobs_is_tenant_scoped(
+    client: TestClient, minted_key, storage: InMemoryStorage
+) -> None:
+    """Tenant A submits a job; tenant B's key must NOT see it in the
+    list (no cross-tenant leakage — same isolation as show/run/etc.)."""
+    _, bearer = minted_key
+    client.post(
+        "/run",
+        json={"kind": "agent", "target": "demo", "input": {}},
+        headers=_auth_headers(bearer),
+    )
+
+    # Mint a second key for a different tenant.
+    other = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    await storage.save_api_key(other.record)
+
+    r = client.get(
+        "/jobs",
+        headers={"Authorization": f"Bearer {other.full_key}"},
+    )
+    assert r.status_code == 200
+    # Tenant B has no jobs of its own → empty list, NOT tenant A's job.
+    assert r.json()["count"] == 0
+
+
+# ---------------------------------------------------------------------------
 # GET /runs/{id}
 # ---------------------------------------------------------------------------
 

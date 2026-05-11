@@ -34,6 +34,7 @@ from movate.runtime.schemas import (
     AgentListView,
     AgentView,
     HealthView,
+    JobListView,
     JobView,
     ReadyView,
     RunAccepted,
@@ -215,6 +216,30 @@ def build_app(
     # ------------------------------------------------------------------
     # GET /jobs/{id} — poll
     # ------------------------------------------------------------------
+    @app.get("/jobs", response_model=JobListView, tags=["jobs"])
+    async def list_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        status: JobStatus | None = None,
+        limit: int = 20,
+    ) -> JobListView:
+        """Return this tenant's recent jobs, newest first.
+
+        Always tenant-scoped — there's no cross-tenant variant on
+        this endpoint. ``status`` filters to one terminal/transient
+        state; omit for "all states". ``limit`` is hard-capped at 100
+        to keep the response bounded; deeper history goes through
+        ``movate logs`` against the local sqlite (operator path)."""
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_jobs(
+            tenant_id=ctx.tenant_id,
+            status=status,
+            limit=capped_limit,
+        )
+        views = [JobView.from_record(r) for r in records]
+        return JobListView(jobs=views, count=len(views))
+
     @app.get("/jobs/{job_id}", response_model=JobView, tags=["jobs"])
     async def get_job(
         job_id: str,

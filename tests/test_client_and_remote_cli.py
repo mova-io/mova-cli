@@ -113,6 +113,32 @@ async def test_client_get_job_unknown_id_404(auth_pair) -> None:
 
 
 @pytest.mark.unit
+async def test_client_list_jobs_round_trip(auth_pair) -> None:
+    """Submit two jobs, list them back, verify both appear."""
+    _, app, key, _ = auth_pair
+    async with _client_for(app, key) as client:
+        a = await client.submit_job(kind=JobKind.AGENT, target="alpha", input={"i": 1})
+        b = await client.submit_job(kind=JobKind.AGENT, target="beta", input={"i": 2})
+        listing = await client.list_jobs()
+    assert listing.count == 2
+    ids = {j.job_id for j in listing.jobs}
+    assert ids == {a.job_id, b.job_id}
+
+
+@pytest.mark.unit
+async def test_client_list_jobs_status_filter(auth_pair) -> None:
+    """``status=queued`` returns only queued; ``status=error`` returns none
+    when nothing has errored."""
+    _, app, key, _ = auth_pair
+    async with _client_for(app, key) as client:
+        await client.submit_job(kind=JobKind.AGENT, target="alpha", input={})
+        queued = await client.list_jobs(status=JobStatus.QUEUED)
+        errored = await client.list_jobs(status=JobStatus.ERROR)
+    assert queued.count == 1
+    assert errored.count == 0
+
+
+@pytest.mark.unit
 async def test_client_get_run_round_trip(auth_pair) -> None:
     """End-to-end: client.get_run() fetches a persisted run and returns
     its ``output`` — the field ``JobView`` deliberately omits."""
@@ -515,6 +541,50 @@ def test_cli_jobs_show_unknown_id_404(cli_env) -> None:
     # exit_code follows the HTTP class: 4xx → 4.
     assert result.exit_code == 4
     assert "fetch failed" in result.stderr
+
+
+@pytest.mark.unit
+def test_cli_jobs_list_empty(cli_env) -> None:
+    """`movate jobs list` with no jobs prints the empty-list hint and exits 0."""
+    result = runner.invoke(cli_app, ["jobs", "list", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    import json  # noqa: PLC0415
+
+    payload = json.loads(result.stdout)
+    assert payload == {"jobs": [], "count": 0}
+
+
+@pytest.mark.unit
+def test_cli_jobs_list_returns_submitted_jobs(cli_env) -> None:
+    """Submit one job, then `movate jobs list` returns it in the page."""
+    import json  # noqa: PLC0415
+
+    submit = runner.invoke(cli_app, ["submit", "alpha", "{}"])
+    assert submit.exit_code == 0
+    job_id = json.loads(submit.stdout)["job_id"]
+
+    result = runner.invoke(cli_app, ["jobs", "list", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["jobs"][0]["job_id"] == job_id
+
+
+@pytest.mark.unit
+def test_cli_jobs_list_status_filter(cli_env) -> None:
+    """`--status error` returns zero jobs when none have failed; rejects
+    invalid status values at parse time."""
+    import json  # noqa: PLC0415
+
+    runner.invoke(cli_app, ["submit", "alpha", "{}"])
+
+    ok = runner.invoke(cli_app, ["jobs", "list", "--status", "error", "--output", "json"])
+    assert ok.exit_code == 0
+    assert json.loads(ok.stdout)["count"] == 0
+
+    bad = runner.invoke(cli_app, ["jobs", "list", "--status", "broken"])
+    assert bad.exit_code == 2
+    assert "Invalid value" in (bad.stdout + bad.stderr)
 
 
 @pytest.mark.unit

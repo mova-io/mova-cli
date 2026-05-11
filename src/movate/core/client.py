@@ -22,6 +22,7 @@ from movate.core.models import JobKind, JobStatus
 from movate.runtime.schemas import (
     AgentListView,
     HealthView,
+    JobListView,
     JobView,
     RunAccepted,
     RunSubmission,
@@ -127,6 +128,24 @@ class MovateClient:
         r = await self._client.get(f"/jobs/{job_id}")
         self._raise_for_status(r)
         return JobView.model_validate(r.json())
+
+    async def list_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+        limit: int = 20,
+    ) -> JobListView:
+        """``GET /jobs`` — paginated list of this tenant's jobs.
+
+        ``status`` filters to one state (e.g. ``ERROR`` to triage
+        failures); omit for all states. ``limit`` is hard-capped at
+        100 server-side."""
+        params: dict[str, str | int] = {"limit": limit}
+        if status is not None:
+            params["status"] = status.value
+        r = await self._client.get("/jobs", params=params)
+        self._raise_for_status(r)
+        return JobListView.model_validate(r.json())
 
     async def get_run(self, run_id: str) -> RunView:
         """``GET /runs/{id}`` — full run record including ``output``.

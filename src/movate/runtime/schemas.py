@@ -147,6 +147,21 @@ class RunView(BaseModel):
         )
 
 
+class JobListView(BaseModel):
+    """``GET /jobs`` response — envelope around a page of JobViews.
+
+    Envelope (rather than a bare list) so we can grow the response in
+    a backwards-compatible way: paging cursors, total counts, filter
+    echoes. Right now ``count`` is the page size returned — useful for
+    a quick sanity check without re-counting on the client.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    jobs: list[JobView]
+    count: int
+
+
 class HealthView(BaseModel):
     """``GET /healthz`` response — boring on purpose."""
 
@@ -210,6 +225,7 @@ __all__ = [
     "AgentListView",
     "AgentView",
     "HealthView",
+    "JobListView",
     "JobView",
     "ReadyView",
     "RunAccepted",
