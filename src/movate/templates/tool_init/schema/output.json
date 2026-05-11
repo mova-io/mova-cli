@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "__TOOL_NAME__ output",
+  "description": "TODO: describe the shape your handler returns. Strict: extra fields will be rejected by the runtime before they reach the model.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result"],
+  "properties": {
+    "result": {
+      "type": "string",
+      "description": "TODO: replace with the real output field(s)."
+    }
+  }
+}

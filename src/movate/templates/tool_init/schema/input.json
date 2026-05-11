@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "__TOOL_NAME__ input",
+  "description": "TODO: describe each field. The model sees this schema verbatim when deciding whether to call the tool.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query"],
+  "properties": {
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "description": "TODO: replace with the real input field(s) your tool needs."
+    }
+  }
+}

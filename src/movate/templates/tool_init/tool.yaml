@@ -1,0 +1,17 @@
+api_version: movate/v1
+kind: Tool
+name: __TOOL_NAME__
+version: 0.1.0
+description: |
+  TODO: one sentence describing what this tool does. Operators read
+  this in `movate tools list` (when the registry lands) and agents
+  feed it to the model as the tool-use description.
+
+handler: ./handler.py
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+# Future fields (placeholder — runtime lands as Tier-2 #9):
+#   permissions: []    # e.g. ['net.outbound', 'fs.read'] for sandboxing
+#   timeout_seconds: 30
