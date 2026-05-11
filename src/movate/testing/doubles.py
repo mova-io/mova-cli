@@ -59,17 +59,29 @@ class InMemoryStorage:
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         self.workflow_runs.append(w)
 
-    async def get_run(self, run_id: str) -> RunRecord | None:
-        return next((r for r in self.runs if r.run_id == run_id), None)
-
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRunRecord | None:
+    async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
         return next(
-            (w for w in self.workflow_runs if w.workflow_run_id == workflow_run_id),
+            (r for r in self.runs if r.run_id == run_id and r.tenant_id == tenant_id),
             None,
         )
 
-    async def get_eval(self, eval_id: str) -> EvalRecord | None:
-        return next((e for e in self.evals if e.eval_id == eval_id), None)
+    async def get_workflow_run(
+        self, workflow_run_id: str, *, tenant_id: str
+    ) -> WorkflowRunRecord | None:
+        return next(
+            (
+                w
+                for w in self.workflow_runs
+                if w.workflow_run_id == workflow_run_id and w.tenant_id == tenant_id
+            ),
+            None,
+        )
+
+    async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
+        return next(
+            (e for e in self.evals if e.eval_id == eval_id and e.tenant_id == tenant_id),
+            None,
+        )
 
     async def list_runs(
         self,
@@ -91,8 +103,16 @@ class InMemoryStorage:
             rows = [r for r in rows if r.workflow_run_id == workflow_run_id]
         return list(rows)[:limit]
 
-    async def list_evals(self, *, agent: str | None = None, limit: int = 20) -> list[EvalRecord]:
+    async def list_evals(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[EvalRecord]:
         rows = self.evals
+        if tenant_id is not None:
+            rows = [e for e in rows if e.tenant_id == tenant_id]
         if agent:
             rows = [e for e in rows if e.agent == agent]
         return list(rows)[:limit]
@@ -100,10 +120,13 @@ class InMemoryStorage:
     async def list_workflow_runs(
         self,
         *,
+        tenant_id: str | None = None,
         workflow: str | None = None,
         limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         rows = self.workflow_runs
+        if tenant_id is not None:
+            rows = [w for w in rows if w.tenant_id == tenant_id]
         if workflow:
             rows = [w for w in rows if w.workflow == workflow]
         return list(rows)[:limit]
@@ -117,8 +140,11 @@ class InMemoryStorage:
             raise ValueError(f"duplicate job_id {job.job_id!r}")
         self.jobs.append(job)
 
-    async def get_job(self, job_id: str) -> JobRecord | None:
-        return next((j for j in self.jobs if j.job_id == job_id), None)
+    async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
+        return next(
+            (j for j in self.jobs if j.job_id == job_id and j.tenant_id == tenant_id),
+            None,
+        )
 
     async def list_jobs(
         self,
@@ -163,6 +189,7 @@ class InMemoryStorage:
         self,
         job_id: str,
         *,
+        tenant_id: str,
         status: JobStatus,
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
@@ -170,7 +197,7 @@ class InMemoryStorage:
         if status not in (JobStatus.SUCCESS, JobStatus.ERROR, JobStatus.SAFETY_BLOCKED):
             raise ValueError(f"update_job only accepts terminal statuses; got {status!r}")
         for i, j in enumerate(self.jobs):
-            if j.job_id == job_id:
+            if j.job_id == job_id and j.tenant_id == tenant_id:
                 from movate.core.models import ErrorInfo  # noqa: PLC0415
 
                 self.jobs[i] = j.model_copy(
@@ -182,7 +209,11 @@ class InMemoryStorage:
                     }
                 )
                 return
-        raise ValueError(f"no job found for id {job_id!r}")
+        # Silently no-op on tenant mismatch — matches sqlite/postgres
+        # behavior where the WHERE clause filters out the row. (We
+        # used to raise on "no job found"; that left a side channel
+        # for cross-tenant id probing.)
+        return
 
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)
@@ -209,16 +240,17 @@ class InMemoryStorage:
             rows = [k for k in rows if k.revoked_at is None]
         return sorted(rows, key=lambda k: k.created_at, reverse=True)
 
-    async def revoke_api_key(self, key_id: str) -> None:
+    async def revoke_api_key(self, key_id: str, *, tenant_id: str) -> None:
         for i, k in enumerate(self.api_keys):
-            if k.key_id == key_id and k.revoked_at is None:
+            if k.key_id == key_id and k.tenant_id == tenant_id and k.revoked_at is None:
                 self.api_keys[i] = k.model_copy(update={"revoked_at": datetime.now(UTC)})
                 return
-        # Idempotent — silently no-op on missing or already-revoked.
+        # Idempotent + tenant-scoped: silently no-op on missing,
+        # cross-tenant, or already-revoked.
 
-    async def touch_api_key(self, key_id: str) -> None:
+    async def touch_api_key(self, key_id: str, *, tenant_id: str) -> None:
         for i, k in enumerate(self.api_keys):
-            if k.key_id == key_id:
+            if k.key_id == key_id and k.tenant_id == tenant_id:
                 self.api_keys[i] = k.model_copy(update={"last_used_at": datetime.now(UTC)})
                 return
 

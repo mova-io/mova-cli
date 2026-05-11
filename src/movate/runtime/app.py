@@ -145,13 +145,13 @@ def build_app(
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
     ) -> JobView:
-        """Return job state. Tenant-scoped: cross-tenant lookups 404,
-        not 403 — leaking 403 vs 404 lets a caller probe whether a
-        job_id exists in another tenant. ``not_found`` is the safe
-        unified response."""
+        """Return job state. Tenant-scoped at the SQL layer
+        (``get_job(..., tenant_id=...)`` filters in WHERE) so a
+        cross-tenant lookup returns ``None`` and we 404 — never 403,
+        which would leak the existence of the id."""
         store: StorageProvider = request.app.state.storage
-        record = await store.get_job(job_id)
-        if record is None or record.tenant_id != ctx.tenant_id:
+        record = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        if record is None:
             raise not_found("job", job_id)
         return JobView.from_record(record)
 

@@ -98,14 +98,20 @@ async def replay_agent_run(
     executor: Executor,
     bundle: AgentBundle,
     run_id: str,
+    tenant_id: str = "local",
 ) -> AgentReplayDiff:
     """Look up ``run_id`` in storage and re-run its input through ``bundle``.
 
     The current agent's *bundle* is used end-to-end — the prompt
     template, model config, schemas, and pricing all come from disk
     (whatever the engineer last edited). Only the input is pinned.
+
+    ``tenant_id`` defaults to ``"local"`` for local CLI use. Server-side
+    callers must pass the authenticated tenant so cross-tenant
+    ``run_id`` probes return ``ReplayMismatchError`` rather than
+    leaking the existence of another tenant's run.
     """
-    record = await storage.get_run(run_id)
+    record = await storage.get_run(run_id, tenant_id=tenant_id)
     if record is None:
         raise ReplayMismatchError(
             f"no run found for id {run_id!r}; check `movate logs` or your storage path"

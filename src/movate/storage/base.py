@@ -3,6 +3,22 @@
 v0.1 surface is intentionally narrow: runs + failures, plus list_runs for
 ``movate logs``. Jobs / API keys / evals join in v0.2 and v0.5 as their
 phases ship.
+
+**Tenant isolation (v1.0 stage 4).** Every read of a single record by id
+takes a mandatory ``tenant_id`` kwarg and filters by it server-side, so a
+caller authenticated as tenant A can never read tenant B's data even by
+guessing ids. List methods that omit ``tenant_id`` reserve cross-tenant
+reads for operator tooling (``movate worker --tenant-id=None`` drain
+mode) — never exposed on the HTTP API. Mutating methods on per-tenant
+rows (``update_job``, ``revoke_api_key``, ``touch_api_key``) likewise
+require ``tenant_id`` so the WHERE clause stops cross-tenant writes at
+the SQL layer, not just at the HTTP layer.
+
+The one exception is ``get_api_key(key_id)`` — the auth middleware
+parses the full ``mvt_<env>_<tenant>_<keyid>_<secret>`` key before
+lookup and cross-checks the record's ``tenant_id`` against the
+presented tenant prefix in ``check_record``. Tenant isolation on this
+path is enforced by ``check_record``, not the storage method.
 """
 
 from __future__ import annotations
@@ -32,14 +48,29 @@ class StorageProvider(Protocol):
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None: ...
 
-    async def get_run(self, run_id: str) -> RunRecord | None:
-        """Exact lookup by run_id. Returns ``None`` if no match."""
+    async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
+        """Exact lookup by run_id, scoped to ``tenant_id``.
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRunRecord | None:
-        """Exact lookup by workflow_run_id. Returns ``None`` if no match."""
+        Returns ``None`` if no match OR if the run exists but belongs to
+        a different tenant — same return shape either way so a caller
+        can't probe for the existence of other tenants' runs.
+        """
 
-    async def get_eval(self, eval_id: str) -> EvalRecord | None:
-        """Exact lookup by eval_id. Returns ``None`` if no match."""
+    async def get_workflow_run(
+        self, workflow_run_id: str, *, tenant_id: str
+    ) -> WorkflowRunRecord | None:
+        """Exact lookup by workflow_run_id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the workflow run belongs to
+        a different tenant.
+        """
+
+    async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
+        """Exact lookup by eval_id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the eval belongs to a
+        different tenant.
+        """
 
     async def list_runs(
         self,
@@ -54,16 +85,28 @@ class StorageProvider(Protocol):
     async def list_evals(
         self,
         *,
+        tenant_id: str | None = None,
         agent: str | None = None,
         limit: int = 20,
-    ) -> list[EvalRecord]: ...
+    ) -> list[EvalRecord]:
+        """List evals newest-first, optionally filtered.
+
+        ``tenant_id=None`` returns evals across all tenants — operator
+        tooling only; never exposed on the HTTP API.
+        """
 
     async def list_workflow_runs(
         self,
         *,
+        tenant_id: str | None = None,
         workflow: str | None = None,
         limit: int = 20,
-    ) -> list[WorkflowRunRecord]: ...
+    ) -> list[WorkflowRunRecord]:
+        """List workflow runs newest-first, optionally filtered.
+
+        ``tenant_id=None`` returns runs across all tenants — operator
+        tooling only; never exposed on the HTTP API.
+        """
 
     # ------------------------------------------------------------------
     # Job queue (v0.5)
@@ -72,8 +115,13 @@ class StorageProvider(Protocol):
     async def save_job(self, job: JobRecord) -> None:
         """Insert a brand-new ``QUEUED`` job. Errors on duplicate ``job_id``."""
 
-    async def get_job(self, job_id: str) -> JobRecord | None:
-        """Exact lookup by job_id. Returns ``None`` if no match."""
+    async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
+        """Exact lookup by job_id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the job belongs to a
+        different tenant — same return shape either way so a caller
+        can't probe for the existence of other tenants' jobs.
+        """
 
     async def list_jobs(
         self,
@@ -105,16 +153,22 @@ class StorageProvider(Protocol):
         self,
         job_id: str,
         *,
+        tenant_id: str,
         status: JobStatus,
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
     ) -> None:
-        """Transition a claimed job to a terminal status.
+        """Transition a claimed job to a terminal status, scoped to ``tenant_id``.
 
         ``status`` must be one of ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED``;
         ``QUEUED`` and ``RUNNING`` are reserved for the lifecycle helpers
         (``save_job``, ``claim_next_job``). Sets ``completed_at = now()``
         as a side effect.
+
+        The ``tenant_id`` filter on WHERE is the SQL-layer enforcement
+        that prevents a misconfigured worker (or a direct storage call
+        from a buggy path) from mutating another tenant's job. Silently
+        no-op if no row matches both id + tenant.
         """
 
     # ------------------------------------------------------------------
@@ -143,14 +197,22 @@ class StorageProvider(Protocol):
         never exposed on the HTTP API.
         """
 
-    async def revoke_api_key(self, key_id: str) -> None:
-        """Set ``revoked_at`` to now. Idempotent — re-revoking is a no-op."""
+    async def revoke_api_key(self, key_id: str, *, tenant_id: str) -> None:
+        """Set ``revoked_at`` to now, scoped to ``tenant_id``.
 
-    async def touch_api_key(self, key_id: str) -> None:
-        """Bump ``last_used_at``.
+        Idempotent — re-revoking is a no-op. The ``tenant_id`` filter
+        on WHERE prevents a tenant from revoking another tenant's keys
+        by guessing key ids.
+        """
+
+    async def touch_api_key(self, key_id: str, *, tenant_id: str) -> None:
+        """Bump ``last_used_at``, scoped to ``tenant_id``.
 
         Called fire-and-forget after a successful verify; failure to
-        touch must not fail the request.
+        touch must not fail the request. The tenant filter is defense
+        in depth — the auth middleware has already cross-checked the
+        record's tenant matches the presented key, but the storage
+        layer enforces it independently.
         """
 
     async def close(self) -> None: ...

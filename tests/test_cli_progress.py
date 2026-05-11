@@ -167,7 +167,7 @@ async def test_worker_swallows_callback_exceptions() -> None:
     # The job still landed in a terminal state.
     assert handled is not None
     assert callback_fired
-    final = await storage.get_job("j1")
+    final = await storage.get_job("j1", tenant_id="t1")
     assert final is not None
     assert final.status == JobStatus.ERROR
 

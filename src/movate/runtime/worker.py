@@ -114,10 +114,15 @@ class Worker:
 
         # Even if the storage update fails, the loop should continue.
         # The job will appear stuck in RUNNING; an operator can
-        # requeue or update manually.
+        # requeue or update manually. The job's tenant_id is the SQL
+        # filter that prevents a misconfigured worker from mutating
+        # another tenant's job — even if `claim_next_job` were called
+        # without a tenant scope (operator drain mode), this guarantees
+        # the update only ever lands on the row we just claimed.
         try:
             await self._storage.update_job(
                 job.job_id,
+                tenant_id=job.tenant_id,
                 status=outcome.status,
                 result_run_id=outcome.result_run_id,
                 error=outcome.error,
@@ -153,7 +158,7 @@ class Worker:
             try:
                 # Use the post-update view so the email reflects the
                 # terminal status, not the RUNNING snapshot we have here.
-                terminal_view = await self._storage.get_job(job.job_id)
+                terminal_view = await self._storage.get_job(job.job_id, tenant_id=job.tenant_id)
                 if terminal_view is not None:
                     await self._notifier.notify_terminal(terminal_view)
             except Exception:

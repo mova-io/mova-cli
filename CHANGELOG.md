@@ -5,6 +5,65 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Security — Tenant isolation audit (v1.0 stage 4)
+
+**Closes the v1.0 deploy loop.** Every storage read / mutate path that
+touches per-tenant rows now filters by ``tenant_id`` at the SQL layer.
+Even if a future HTTP handler forgets the cross-tenant check (or a
+buggy worker is misconfigured), the storage backend enforces tenant
+boundary in the WHERE clause — defense in depth.
+
+**Audit findings (now fixed):**
+
+* ``get_run`` / ``get_workflow_run`` / ``get_eval`` / ``get_job`` —
+  previously did SELECT by id only. Now require ``tenant_id`` kwarg
+  and add ``AND tenant_id = ?`` to the WHERE clause. Cross-tenant
+  lookups return ``None`` (NOT ``403`` — leaking 403 vs 404 lets a
+  caller probe whether an id exists in another tenant).
+* ``update_job`` — previously updated by ``job_id`` only. Now scoped
+  to ``tenant_id`` so even a misconfigured worker can't mutate
+  another tenant's job. Silently no-ops on tenant mismatch.
+* ``revoke_api_key`` / ``touch_api_key`` — previously mutated by
+  ``key_id`` only. Now require ``tenant_id``. A tenant who learns
+  another tenant's key_id (8-char random suffix) still can't revoke
+  it or pollute its ``last_used_at`` audit trail.
+* ``list_evals`` / ``list_workflow_runs`` — previously took no
+  ``tenant_id`` param. Now accept an optional ``tenant_id`` filter
+  that the HTTP layer will pass; ``tenant_id=None`` remains the
+  operator drain-mode path, never exposed on HTTP.
+
+**Surface that already enforced (verified, no changes needed):**
+
+* ``list_runs`` / ``list_jobs`` / ``list_api_keys`` / ``claim_next_job``
+  already filtered by ``tenant_id``.
+* ``get_api_key`` looks up by ``key_id`` without a tenant filter — by
+  design. The auth middleware's ``check_record`` cross-checks the
+  presented key's tenant prefix against ``record.tenant_id`` before
+  the request proceeds; that's the boundary, not the storage method.
+
+**Call sites updated:** HTTP ``GET /jobs/{id}`` handler, auth middleware
+``touch_api_key`` (now passes tenant from the verified record), worker
+``update_job`` + ``get_job`` (passes the claimed job's tenant), CLI
+``movate auth revoke-key`` (looks up the key first to derive its
+tenant for operator-friendly UX), local trace replay (defaults to
+``tenant_id="local"`` matching the CLI Executor's tenant stamp).
+
+**Test:** new ``tests/test_tenant_isolation.py`` — 15 cases
+parametrized over memory + sqlite + postgres backends (45 invocations
+when PG configured). Each populates parallel rows in two tenants
+(``alpha``, ``beta``) then sweeps every cross-tenant read path
+asserting Beta can never see Alpha's ids and vice versa, plus a
+combined sweep covering all 5 tables at once so any future schema
+addition that forgets the filter fails this test.
+
+Total: **522 passing** (492 → 522, +30 from isolation tests). All
+existing tests pass after threading the new ``tenant_id`` kwarg
+through ~25 call sites in the test suite.
+
+**v1.0 is now feature-complete.** Stages 1 (Bicep IaC), 2 (``movate
+deploy`` + GH Actions), 3 (model policy enforcement), and 4 (tenant
+isolation audit) all done.
+
 ### Added — Model policy enforcement (v1.0 stage 3)
 
 **Production-grade governance for which providers / models / cost

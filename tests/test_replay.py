@@ -107,7 +107,7 @@ async def test_in_memory_storage_get_run_returns_existing() -> None:
     target = _make_run()
     await s.save_run(target)
     await s.save_run(_make_run())  # noise
-    got = await s.get_run(target.run_id)
+    got = await s.get_run(target.run_id, tenant_id="local")
     assert got is not None
     assert got.run_id == target.run_id
 
@@ -116,7 +116,7 @@ async def test_in_memory_storage_get_run_returns_existing() -> None:
 async def test_in_memory_storage_get_run_returns_none_for_missing() -> None:
     s = InMemoryStorage()
     await s.init()
-    assert await s.get_run("does-not-exist") is None
+    assert await s.get_run("does-not-exist", tenant_id="local") is None
 
 
 @pytest.mark.unit
@@ -125,7 +125,7 @@ async def test_in_memory_storage_get_workflow_run_returns_existing() -> None:
     await s.init()
     target = _make_workflow_run()
     await s.save_workflow_run(target)
-    got = await s.get_workflow_run(target.workflow_run_id)
+    got = await s.get_workflow_run(target.workflow_run_id, tenant_id="local")
     assert got is not None
     assert got.workflow_run_id == target.workflow_run_id
 
@@ -139,7 +139,7 @@ async def test_sqlite_storage_get_run_round_trip(tmp_path) -> None:
     await db.init()
     r = _make_run(workflow_run_id="wf-123", node_id="first")
     await db.save_run(r)
-    got = await db.get_run(r.run_id)
+    got = await db.get_run(r.run_id, tenant_id="local")
     assert got is not None
     assert got.run_id == r.run_id
     assert got.workflow_run_id == "wf-123"

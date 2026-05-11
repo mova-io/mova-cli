@@ -252,8 +252,14 @@ class PostgresProvider:
             run.node_id,
         )
 
-    async def get_run(self, run_id: str) -> RunRecord | None:
-        row = await self._db.fetchrow("SELECT * FROM runs WHERE run_id = $1", run_id)
+    async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
+        # tenant_id in WHERE is the SQL-layer enforcement; a caller can't
+        # read another tenant's run even by guessing the run_id.
+        row = await self._db.fetchrow(
+            "SELECT * FROM runs WHERE run_id = $1 AND tenant_id = $2",
+            run_id,
+            tenant_id,
+        )
         return _row_to_run(row) if row else None
 
     async def list_runs(
@@ -341,13 +347,26 @@ class PostgresProvider:
             e.created_at,
         )
 
-    async def get_eval(self, eval_id: str) -> EvalRecord | None:
-        row = await self._db.fetchrow("SELECT * FROM evals WHERE eval_id = $1", eval_id)
+    async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM evals WHERE eval_id = $1 AND tenant_id = $2",
+            eval_id,
+            tenant_id,
+        )
         return _row_to_eval(row) if row else None
 
-    async def list_evals(self, *, agent: str | None = None, limit: int = 20) -> list[EvalRecord]:
+    async def list_evals(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[EvalRecord]:
         clauses: list[str] = []
         params: list[Any] = []
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
         if agent is not None:
             params.append(agent)
             clauses.append(f"agent = ${len(params)}")
@@ -382,17 +401,28 @@ class PostgresProvider:
             w.created_at,
         )
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRunRecord | None:
+    async def get_workflow_run(
+        self, workflow_run_id: str, *, tenant_id: str
+    ) -> WorkflowRunRecord | None:
         row = await self._db.fetchrow(
-            "SELECT * FROM workflow_runs WHERE workflow_run_id = $1", workflow_run_id
+            "SELECT * FROM workflow_runs WHERE workflow_run_id = $1 AND tenant_id = $2",
+            workflow_run_id,
+            tenant_id,
         )
         return _row_to_workflow_run(row) if row else None
 
     async def list_workflow_runs(
-        self, *, workflow: str | None = None, limit: int = 20
+        self,
+        *,
+        tenant_id: str | None = None,
+        workflow: str | None = None,
+        limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         clauses: list[str] = []
         params: list[Any] = []
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
         if workflow is not None:
             params.append(workflow)
             clauses.append(f"workflow = ${len(params)}")
@@ -431,8 +461,12 @@ class PostgresProvider:
             job.notify_email,
         )
 
-    async def get_job(self, job_id: str) -> JobRecord | None:
-        row = await self._db.fetchrow("SELECT * FROM jobs WHERE job_id = $1", job_id)
+    async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM jobs WHERE job_id = $1 AND tenant_id = $2",
+            job_id,
+            tenant_id,
+        )
         return _row_to_job(row) if row else None
 
     async def list_jobs(
@@ -500,6 +534,7 @@ class PostgresProvider:
         self,
         job_id: str,
         *,
+        tenant_id: str,
         status: JobStatus,
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
@@ -509,17 +544,20 @@ class PostgresProvider:
                 f"update_job only accepts terminal statuses; got {status!r}. "
                 f"Use save_job/claim_next_job for QUEUED/RUNNING transitions."
             )
+        # tenant_id in WHERE: even a misconfigured worker can't mutate
+        # another tenant's job. Silently no-ops on tenant mismatch.
         await self._db.execute(
             """
             UPDATE jobs
             SET status = $1, result_run_id = $2, error = $3, completed_at = $4
-            WHERE job_id = $5
+            WHERE job_id = $5 AND tenant_id = $6
             """,
             status.value,
             result_run_id,
             error,
             datetime.now(UTC),
             job_id,
+            tenant_id,
         )
 
     # ------------------------------------------------------------------
@@ -567,21 +605,28 @@ class PostgresProvider:
         rows = await self._db.fetch(sql, *params)
         return [_row_to_api_key(r) for r in rows]
 
-    async def revoke_api_key(self, key_id: str) -> None:
+    async def revoke_api_key(self, key_id: str, *, tenant_id: str) -> None:
+        # tenant_id in WHERE: a tenant can only revoke its own keys
+        # even if it discovers another tenant's key_id.
         await self._db.execute(
             """
             UPDATE api_keys SET revoked_at = $1
-            WHERE key_id = $2 AND revoked_at IS NULL
+            WHERE key_id = $2 AND tenant_id = $3 AND revoked_at IS NULL
             """,
             datetime.now(UTC),
             key_id,
+            tenant_id,
         )
 
-    async def touch_api_key(self, key_id: str) -> None:
+    async def touch_api_key(self, key_id: str, *, tenant_id: str) -> None:
+        # tenant_id is defense in depth — the auth path already
+        # cross-checks the presented key's tenant prefix against the
+        # looked-up record. The storage layer enforces independently.
         await self._db.execute(
-            "UPDATE api_keys SET last_used_at = $1 WHERE key_id = $2",
+            "UPDATE api_keys SET last_used_at = $1 WHERE key_id = $2 AND tenant_id = $3",
             datetime.now(UTC),
             key_id,
+            tenant_id,
         )
 
 

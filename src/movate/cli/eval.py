@@ -407,7 +407,10 @@ async def _resolve_storage_baseline(
     """
     if baseline_id is None:
         return None
-    record = await storage.get_eval(baseline_id)
+    # Local CLI flow — Executor stamps tenant_id="local" on every run.
+    # Server-side use (when this lands behind HTTP) will pass the
+    # authenticated tenant.
+    record = await storage.get_eval(baseline_id, tenant_id="local")
     if record is None:
         err_console.print(f"[red]✗[/red] baseline eval id {baseline_id!r} not found in storage")
         raise typer.Exit(code=2) from None

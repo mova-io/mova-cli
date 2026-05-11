@@ -173,6 +173,15 @@ async def _revoke(key_id: str) -> None:
     storage = build_storage()
     await storage.init()
     try:
-        await storage.revoke_api_key(key_id)
+        # `revoke_api_key` is tenant-scoped at the storage layer (v1.0
+        # stage 4). The CLI is operator-only, so we look up the key
+        # first to derive its tenant_id, then revoke. This keeps the
+        # operator UX (just paste the key_id) while preserving the
+        # SQL-layer filter that blocks an HTTP-level cross-tenant
+        # revoke attack.
+        record = await storage.get_api_key(key_id)
+        if record is None:
+            return  # idempotent — silent no-op on missing
+        await storage.revoke_api_key(key_id, tenant_id=record.tenant_id)
     finally:
         await storage.close()

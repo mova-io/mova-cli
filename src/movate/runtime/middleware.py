@@ -101,7 +101,11 @@ def make_auth_dependency(
         # the latency cost of awaiting is negligible vs the cost
         # of a flaky service.
         assert record is not None
-        await _safe_touch(storage, record.key_id)
+        # ``check_record`` has already cross-checked the presented key's
+        # tenant prefix matches the record's tenant_id, so we pass
+        # ``record.tenant_id`` to touch_api_key with confidence — the
+        # WHERE clause is defense in depth, not the primary check.
+        await _safe_touch(storage, record.key_id, record.tenant_id)
 
         return AuthContext(
             tenant_id=record.tenant_id,
@@ -112,7 +116,7 @@ def make_auth_dependency(
     return auth_dependency
 
 
-async def _safe_touch(storage: StorageProvider, key_id: str) -> None:
+async def _safe_touch(storage: StorageProvider, key_id: str, tenant_id: str) -> None:
     """``touch_api_key`` wrapped so a write failure can't crash the loop.
 
     The fire-and-forget task is detached from the request lifecycle, so
@@ -121,7 +125,7 @@ async def _safe_touch(storage: StorageProvider, key_id: str) -> None:
     asyncio default handler.
     """
     try:
-        await storage.touch_api_key(key_id)
+        await storage.touch_api_key(key_id, tenant_id=tenant_id)
     except Exception:
         # Really do want to swallow everything — fire-and-forget contract.
         logger.warning("touch_api_key failed for %s", key_id, exc_info=True)

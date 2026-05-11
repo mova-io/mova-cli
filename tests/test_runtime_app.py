@@ -133,7 +133,7 @@ async def test_run_with_revoked_key_returns_401(
 ) -> None:
     minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
     await storage.save_api_key(minted.record)
-    await storage.revoke_api_key(minted.record.key_id)
+    await storage.revoke_api_key(minted.record.key_id, tenant_id=minted.record.tenant_id)
 
     r = client.post(
         "/run",
@@ -162,7 +162,7 @@ async def test_run_queues_agent_job(client: TestClient, minted_key, storage) -> 
     job_id = body["job_id"]
 
     # Verify the persisted record carries the tenant + key attribution.
-    saved = await storage.get_job(job_id)
+    saved = await storage.get_job(job_id, tenant_id=minted.record.tenant_id)
     assert saved is not None
     assert saved.tenant_id == minted.record.tenant_id
     assert saved.api_key_id == minted.record.key_id

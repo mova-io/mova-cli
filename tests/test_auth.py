@@ -221,7 +221,7 @@ async def test_list_api_keys_filters_by_tenant_and_revoked(storage) -> None:
     for m in (a_active, a_revoked, b):
         await storage.save_api_key(m.record)
 
-    await storage.revoke_api_key(a_revoked.record.key_id)
+    await storage.revoke_api_key(a_revoked.record.key_id, tenant_id=a_active.record.tenant_id)
 
     # Default: tenant a, active only.
     rows = await storage.list_api_keys(tenant_id=a_active.record.tenant_id)
@@ -237,7 +237,7 @@ async def test_revoke_api_key_sets_revoked_at(storage) -> None:
     minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
     await storage.save_api_key(minted.record)
 
-    await storage.revoke_api_key(minted.record.key_id)
+    await storage.revoke_api_key(minted.record.key_id, tenant_id=minted.record.tenant_id)
     got = await storage.get_api_key(minted.record.key_id)
     assert got is not None
     assert got.revoked_at is not None
@@ -252,11 +252,12 @@ async def test_revoke_is_idempotent(storage) -> None:
     minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
     await storage.save_api_key(minted.record)
 
-    await storage.revoke_api_key(minted.record.key_id)
+    await storage.revoke_api_key(minted.record.key_id, tenant_id=minted.record.tenant_id)
     first_revoke_time = (await storage.get_api_key(minted.record.key_id)).revoked_at
     assert first_revoke_time is not None
 
-    await storage.revoke_api_key(minted.record.key_id)  # second call
+    # second call
+    await storage.revoke_api_key(minted.record.key_id, tenant_id=minted.record.tenant_id)
     second = await storage.get_api_key(minted.record.key_id)
     assert second is not None
     # revoked_at preserved (not overwritten with a fresh now() on re-revoke).
@@ -266,7 +267,8 @@ async def test_revoke_is_idempotent(storage) -> None:
 @pytest.mark.unit
 async def test_revoke_missing_key_is_noop(storage) -> None:
     """No exception when the key was never registered — middleware retry safety."""
-    await storage.revoke_api_key("never-existed")  # must not raise
+    # Pass an arbitrary tenant_id; the row doesn't exist regardless.
+    await storage.revoke_api_key("never-existed", tenant_id="any-tenant")  # must not raise
 
 
 @pytest.mark.unit
@@ -275,7 +277,7 @@ async def test_touch_api_key_updates_last_used(storage) -> None:
     await storage.save_api_key(minted.record)
     assert minted.record.last_used_at is None
 
-    await storage.touch_api_key(minted.record.key_id)
+    await storage.touch_api_key(minted.record.key_id, tenant_id=minted.record.tenant_id)
     got = await storage.get_api_key(minted.record.key_id)
     assert got is not None
     assert got.last_used_at is not None
@@ -300,7 +302,7 @@ async def test_full_verify_path_against_storage(storage) -> None:
     assert failure is None
 
     # And after revocation, the same key fails.
-    await storage.revoke_api_key(parsed.key_id)
+    await storage.revoke_api_key(parsed.key_id, tenant_id=tenant_id)
     record2 = await storage.get_api_key(parsed.key_id)
     failure2 = check_record(parsed, record2)
     assert failure2 == VerificationFailure(reason="revoked")

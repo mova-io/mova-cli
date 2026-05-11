@@ -62,7 +62,7 @@ def _make_job(
 async def test_save_and_get_job(storage) -> None:
     j = _make_job()
     await storage.save_job(j)
-    got = await storage.get_job(j.job_id)
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
     assert got is not None
     assert got.job_id == j.job_id
     assert got.kind == JobKind.AGENT
@@ -72,7 +72,7 @@ async def test_save_and_get_job(storage) -> None:
 
 @pytest.mark.unit
 async def test_get_job_returns_none_for_missing(storage) -> None:
-    assert await storage.get_job("ghost") is None
+    assert await storage.get_job("ghost", tenant_id="tenant-a") is None
 
 
 @pytest.mark.unit
@@ -163,7 +163,7 @@ async def test_claim_persists_running_state(storage) -> None:
     j = _make_job()
     await storage.save_job(j)
     await storage.claim_next_job()
-    refetched = await storage.get_job(j.job_id)
+    refetched = await storage.get_job(j.job_id, tenant_id="tenant-a")
     assert refetched is not None
     assert refetched.status == JobStatus.RUNNING
     assert refetched.claimed_at is not None
@@ -180,8 +180,10 @@ async def test_update_job_to_success(storage) -> None:
     await storage.save_job(j)
     await storage.claim_next_job()
 
-    await storage.update_job(j.job_id, status=JobStatus.SUCCESS, result_run_id="run-xyz")
-    got = await storage.get_job(j.job_id)
+    await storage.update_job(
+        j.job_id, tenant_id="tenant-a", status=JobStatus.SUCCESS, result_run_id="run-xyz"
+    )
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
     assert got is not None
     assert got.status == JobStatus.SUCCESS
     assert got.result_run_id == "run-xyz"
@@ -195,8 +197,10 @@ async def test_update_job_to_error_persists_error_info(storage) -> None:
     await storage.claim_next_job()
 
     err = ErrorInfo(type="provider_error", message="boom", retryable=False)
-    await storage.update_job(j.job_id, status=JobStatus.ERROR, error=err.model_dump())
-    got = await storage.get_job(j.job_id)
+    await storage.update_job(
+        j.job_id, tenant_id="tenant-a", status=JobStatus.ERROR, error=err.model_dump()
+    )
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
     assert got is not None
     assert got.status == JobStatus.ERROR
     assert got.error is not None
@@ -212,9 +216,9 @@ async def test_update_job_rejects_non_terminal_status(storage) -> None:
     j = _make_job()
     await storage.save_job(j)
     with pytest.raises(ValueError, match="terminal"):
-        await storage.update_job(j.job_id, status=JobStatus.QUEUED)
+        await storage.update_job(j.job_id, tenant_id="tenant-a", status=JobStatus.QUEUED)
     with pytest.raises(ValueError, match="terminal"):
-        await storage.update_job(j.job_id, status=JobStatus.RUNNING)
+        await storage.update_job(j.job_id, tenant_id="tenant-a", status=JobStatus.RUNNING)
 
 
 # ---------------------------------------------------------------------------

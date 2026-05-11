@@ -301,7 +301,7 @@ async def test_worker_run_one_cycle_drains_one_job(
     assert handled is not None
     assert handled.job_id == job.job_id
 
-    final = await storage.get_job(job.job_id)
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
     assert final is not None
     assert final.status == JobStatus.SUCCESS
     assert final.result_run_id is not None
@@ -323,7 +323,7 @@ async def test_worker_records_error_on_unknown_target() -> None:
     worker = Worker(storage=storage, dispatch=dispatch)
     await worker.run_one_cycle()
 
-    final = await storage.get_job(job.job_id)
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
     assert final is not None
     assert final.status == JobStatus.ERROR
     assert final.error is not None
@@ -353,7 +353,7 @@ async def test_worker_respects_tenant_scoping() -> None:
     assert handled.tenant_id == "tenant-a"
 
     # tenant-b's job is still queued.
-    b_after = await storage.get_job(b.job_id)
+    b_after = await storage.get_job(b.job_id, tenant_id="tenant-b")
     assert b_after is not None
     assert b_after.status == JobStatus.QUEUED
 

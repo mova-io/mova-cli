@@ -72,7 +72,7 @@ async def test_in_memory_storage_get_eval_returns_existing() -> None:
     await s.save_eval(target)
     await s.save_eval(_make_eval())  # noise
 
-    got = await s.get_eval(target.eval_id)
+    got = await s.get_eval(target.eval_id, tenant_id="local")
     assert got is not None
     assert got.eval_id == target.eval_id
 
@@ -81,7 +81,7 @@ async def test_in_memory_storage_get_eval_returns_existing() -> None:
 async def test_in_memory_storage_get_eval_returns_none_for_missing() -> None:
     s = InMemoryStorage()
     await s.init()
-    assert await s.get_eval("ghost") is None
+    assert await s.get_eval("ghost", tenant_id="local") is None
 
 
 @pytest.mark.unit
@@ -90,7 +90,7 @@ async def test_sqlite_storage_get_eval_round_trip(tmp_path: Path) -> None:
     await db.init()
     target = _make_eval()
     await db.save_eval(target)
-    got = await db.get_eval(target.eval_id)
+    got = await db.get_eval(target.eval_id, tenant_id="local")
     assert got is not None
     assert got.eval_id == target.eval_id
     assert got.mean_score == pytest.approx(target.mean_score)

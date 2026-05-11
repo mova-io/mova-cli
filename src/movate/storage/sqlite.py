@@ -312,11 +312,15 @@ class SqliteProvider:
     async def list_evals(
         self,
         *,
+        tenant_id: str | None = None,
         agent: str | None = None,
         limit: int = 20,
     ) -> list[EvalRecord]:
         clauses: list[str] = []
         params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
         if agent:
             clauses.append("agent = ?")
             params.append(agent)
@@ -329,24 +333,30 @@ class SqliteProvider:
             rows = await cur.fetchall()
         return [_row_to_eval(r) for r in rows]
 
-    async def get_run(self, run_id: str) -> RunRecord | None:
+    async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
+        # tenant_id in WHERE is the SQL-layer enforcement; a caller can't
+        # read another tenant's run even by guessing the run_id.
         async with self._db.execute(
-            "SELECT * FROM runs WHERE run_id = ? LIMIT 1", (run_id,)
+            "SELECT * FROM runs WHERE run_id = ? AND tenant_id = ? LIMIT 1",
+            (run_id, tenant_id),
         ) as cur:
             row = await cur.fetchone()
         return _row_to_run(row) if row else None
 
-    async def get_workflow_run(self, workflow_run_id: str) -> WorkflowRunRecord | None:
+    async def get_workflow_run(
+        self, workflow_run_id: str, *, tenant_id: str
+    ) -> WorkflowRunRecord | None:
         async with self._db.execute(
-            "SELECT * FROM workflow_runs WHERE workflow_run_id = ? LIMIT 1",
-            (workflow_run_id,),
+            "SELECT * FROM workflow_runs WHERE workflow_run_id = ? AND tenant_id = ? LIMIT 1",
+            (workflow_run_id, tenant_id),
         ) as cur:
             row = await cur.fetchone()
         return _row_to_workflow_run(row) if row else None
 
-    async def get_eval(self, eval_id: str) -> EvalRecord | None:
+    async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
         async with self._db.execute(
-            "SELECT * FROM evals WHERE eval_id = ? LIMIT 1", (eval_id,)
+            "SELECT * FROM evals WHERE eval_id = ? AND tenant_id = ? LIMIT 1",
+            (eval_id, tenant_id),
         ) as cur:
             row = await cur.fetchone()
         return _row_to_eval(row) if row else None
@@ -378,11 +388,15 @@ class SqliteProvider:
     async def list_workflow_runs(
         self,
         *,
+        tenant_id: str | None = None,
         workflow: str | None = None,
         limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         clauses: list[str] = []
         params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
         if workflow:
             clauses.append("workflow = ?")
             params.append(workflow)
@@ -427,7 +441,19 @@ class SqliteProvider:
         )
         await self._db.commit()
 
-    async def get_job(self, job_id: str) -> JobRecord | None:
+    async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
+        async with self._db.execute(
+            "SELECT * FROM jobs WHERE job_id = ? AND tenant_id = ?",
+            (job_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_job(row) if row else None
+
+    # claim_next_job needs to re-fetch the just-claimed row by id (the
+    # caller's tenant matches by construction), so we use this small
+    # internal helper that bypasses the tenant filter. It's safe because
+    # we just inserted the row id in claim_next_job's own transaction.
+    async def _get_job_unchecked(self, job_id: str) -> JobRecord | None:
         async with self._db.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)) as cur:
             row = await cur.fetchone()
         return _row_to_job(row) if row else None
@@ -500,12 +526,17 @@ class SqliteProvider:
             raise
 
         # Re-fetch so the returned record reflects the updated columns.
-        return await self.get_job(row["job_id"])
+        # _get_job_unchecked since we just claimed this row inside our
+        # own transaction; the caller's tenant matches by construction
+        # (claim_next_job either filtered by tenant_id or was the
+        # operator drain-all path).
+        return await self._get_job_unchecked(row["job_id"])
 
     async def update_job(
         self,
         job_id: str,
         *,
+        tenant_id: str,
         status: JobStatus,
         result_run_id: str | None = None,
         error: dict[str, object] | None = None,
@@ -516,11 +547,14 @@ class SqliteProvider:
                 f"Use save_job/claim_next_job for QUEUED/RUNNING transitions."
             )
         now = datetime.now(UTC).isoformat()
+        # tenant_id in WHERE: even a misconfigured worker can't mutate
+        # another tenant's job. Silently no-ops on tenant mismatch
+        # (matches the "404 not 403" cross-tenant probe defense).
         await self._db.execute(
             """
             UPDATE jobs
             SET status = ?, result_run_id = ?, error = ?, completed_at = ?
-            WHERE job_id = ?
+            WHERE job_id = ? AND tenant_id = ?
             """,
             (
                 status.value,
@@ -528,6 +562,7 @@ class SqliteProvider:
                 json.dumps(error) if error else None,
                 now,
                 job_id,
+                tenant_id,
             ),
         )
         await self._db.commit()
@@ -582,23 +617,32 @@ class SqliteProvider:
             rows = await cur.fetchall()
         return [_row_to_api_key(r) for r in rows]
 
-    async def revoke_api_key(self, key_id: str) -> None:
-        """Set ``revoked_at`` on a key. Idempotent — re-revoking is a no-op."""
+    async def revoke_api_key(self, key_id: str, *, tenant_id: str) -> None:
+        """Set ``revoked_at`` on a key. Idempotent — re-revoking is a no-op.
+
+        ``tenant_id`` in WHERE: a tenant can only revoke its own keys
+        even if it discovers another tenant's key_id (8-char random
+        suffix; not high-entropy but still secret-ish).
+        """
         now = datetime.now(UTC).isoformat()
         await self._db.execute(
-            "UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL",
-            (now, key_id),
+            "UPDATE api_keys SET revoked_at = ? "
+            "WHERE key_id = ? AND tenant_id = ? AND revoked_at IS NULL",
+            (now, key_id, tenant_id),
         )
         await self._db.commit()
 
-    async def touch_api_key(self, key_id: str) -> None:
-        """Bump ``last_used_at``. Called fire-and-forget after a successful
-        verify; failure to touch must not fail the request, so callers
-        wrap this in ``asyncio.create_task`` and ignore exceptions."""
+    async def touch_api_key(self, key_id: str, *, tenant_id: str) -> None:
+        """Bump ``last_used_at``. Called inline after a successful verify;
+        failure to touch must not fail the request (caller swallows
+        exceptions). ``tenant_id`` is defense in depth — the auth path
+        already cross-checks the presented key's tenant prefix against
+        the looked-up record, but the storage layer enforces it
+        independently."""
         now = datetime.now(UTC).isoformat()
         await self._db.execute(
-            "UPDATE api_keys SET last_used_at = ? WHERE key_id = ?",
-            (now, key_id),
+            "UPDATE api_keys SET last_used_at = ? WHERE key_id = ? AND tenant_id = ?",
+            (now, key_id, tenant_id),
         )
         await self._db.commit()
 

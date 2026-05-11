@@ -345,7 +345,7 @@ async def test_worker_swallows_notifier_exception(
     assert any("notify_dispatcher_raised" in r.message for r in caplog.records)
     # Job still landed in a terminal state — the notification failure
     # didn't bubble up and corrupt the worker.
-    final = await storage.get_job(job.job_id)
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
     assert final is not None
     assert final.status == JobStatus.ERROR
 
@@ -365,13 +365,13 @@ async def test_storage_round_trip_preserves_notify_email() -> None:
     original = _make_job(notify_email="ops@example.com", status=JobStatus.QUEUED)
     await storage.save_job(original)
 
-    got = await storage.get_job(original.job_id)
+    got = await storage.get_job(original.job_id, tenant_id="tenant-a")
     assert got is not None
     assert got.notify_email == "ops@example.com"
 
     # And jobs without an email round-trip with None.
     silent = _make_job(notify_email=None, status=JobStatus.QUEUED)
     await storage.save_job(silent)
-    got_silent = await storage.get_job(silent.job_id)
+    got_silent = await storage.get_job(silent.job_id, tenant_id="tenant-a")
     assert got_silent is not None
     assert got_silent.notify_email is None

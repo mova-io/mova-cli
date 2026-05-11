@@ -18,6 +18,7 @@ path end-to-end without subprocess gymnastics.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -131,7 +132,7 @@ async def test_client_wait_for_terminal_polls_until_status_changes(auth_pair) ->
     """Drive the poll loop: submit, then flip the job to SUCCESS via
     the storage backdoor, and verify wait_for_terminal returns
     promptly with the final view."""
-    storage, app, key, _ = auth_pair
+    storage, app, key, tenant_id = auth_pair
     async with _client_for(app, key) as client:
         accepted = await client.submit_job(kind=JobKind.AGENT, target="alpha", input={})
 
@@ -139,6 +140,7 @@ async def test_client_wait_for_terminal_polls_until_status_changes(auth_pair) ->
         await storage.claim_next_job()
         await storage.update_job(
             accepted.job_id,
+            tenant_id=tenant_id,
             status=JobStatus.SUCCESS,
             result_run_id="r-1",
         )
@@ -154,7 +156,7 @@ async def test_client_wait_for_terminal_polls_until_status_changes(auth_pair) ->
 async def test_client_wait_for_terminal_timeout(auth_pair) -> None:
     """A queued job that never advances triggers a TimeoutError after
     the configured budget."""
-    storage, app, key, _ = auth_pair
+    storage, app, key, tenant_id = auth_pair
     async with _client_for(app, key) as client:
         accepted = await client.submit_job(kind=JobKind.AGENT, target="alpha", input={})
         with pytest.raises(TimeoutError):
@@ -163,7 +165,7 @@ async def test_client_wait_for_terminal_timeout(auth_pair) -> None:
             )
         # Storage shows the job still queued — wait_for_terminal
         # never advances state, only observes it.
-        rec = await storage.get_job(accepted.job_id)
+        rec = await storage.get_job(accepted.job_id, tenant_id=tenant_id)
         assert rec is not None
         assert rec.status == JobStatus.QUEUED
 
@@ -320,7 +322,17 @@ async def cli_env(tmp_path: Path, monkeypatch):
     globals()["_test_transport"] = transport
     monkeypatch.setattr(MovateClient, "__init__", _patched_init)
 
-    return storage
+    # Return a small struct so tests that need to peek into storage can
+    # pass the same tenant_id the auth path will stamp on submitted jobs.
+    return _CliEnv(storage=storage, tenant_id=tenant_id)
+
+
+@dataclass
+class _CliEnv:
+    """Fixture handle for ``cli_env`` tests."""
+
+    storage: InMemoryStorage
+    tenant_id: str
 
 
 @pytest.mark.unit
@@ -364,7 +376,8 @@ def test_cli_submit_wait_returns_terminal(cli_env) -> None:
     import asyncio  # noqa: PLC0415
     import json  # noqa: PLC0415
 
-    storage = cli_env
+    storage = cli_env.storage
+    tenant_id = cli_env.tenant_id
 
     submit = runner.invoke(cli_app, ["submit", "alpha", "{}"])
     assert submit.exit_code == 0, submit.stdout + submit.stderr
@@ -374,7 +387,9 @@ def test_cli_submit_wait_returns_terminal(cli_env) -> None:
     # block to avoid nested loops).
     async def _flip() -> None:
         await storage.claim_next_job()
-        await storage.update_job(job_id, status=JobStatus.SUCCESS, result_run_id="r-1")
+        await storage.update_job(
+            job_id, tenant_id=tenant_id, status=JobStatus.SUCCESS, result_run_id="r-1"
+        )
 
     asyncio.run(_flip())
 

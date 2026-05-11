@@ -68,18 +68,28 @@ class Replay:
 # ---------------------------------------------------------------------------
 
 
-async def load_replay(storage: StorageProvider, identifier: str) -> Replay:
+async def load_replay(
+    storage: StorageProvider, identifier: str, *, tenant_id: str = "local"
+) -> Replay:
     """Resolve ``identifier`` to a :class:`Replay`. Tries run then workflow.
 
     Raises :class:`ReplayNotFoundError` if neither matches.
+
+    ``tenant_id`` defaults to ``"local"`` (the tenant the local CLI
+    Executor stamps on every run via ``cli/_runtime.py``). A server-side
+    caller — once we expose trace replay over HTTP — must pass the
+    authenticated tenant so cross-tenant id probes return
+    ``ReplayNotFoundError`` rather than someone else's run.
     """
-    run = await storage.get_run(identifier)
+    run = await storage.get_run(identifier, tenant_id=tenant_id)
     if run is not None:
         return Replay(kind="agent", run=run)
 
-    wf = await storage.get_workflow_run(identifier)
+    wf = await storage.get_workflow_run(identifier, tenant_id=tenant_id)
     if wf is not None:
-        children = await storage.list_runs(workflow_run_id=identifier, limit=1000)
+        children = await storage.list_runs(
+            workflow_run_id=identifier, tenant_id=tenant_id, limit=1000
+        )
         # Sort by created_at ascending for chronological order.
         children_sorted = sorted(children, key=lambda r: r.created_at)
         return Replay(kind="workflow", workflow=wf, children=children_sorted)
