@@ -17,6 +17,7 @@ from movate.core.failures import (
 )
 from movate.core.loader import load_agent
 from movate.core.models import (
+    AgentRuntime,
     JobStatus,
     ModelConfig,
     RunRequest,
@@ -29,6 +30,7 @@ from movate.providers.base import (
 )
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import PricingTable, load_pricing
+from movate.providers.registry import ProviderRegistry
 from movate.testing import InMemoryStorage, NullTracer, scaffold_agent
 
 # ---------------------------------------------------------------------------
@@ -203,6 +205,118 @@ async def test_executor_streaming_off_by_default_uses_complete(
     await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
     assert CountingMock.complete_calls == 1
     assert CountingMock.stream_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Provider registry dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_executor_dispatches_via_registry_when_runtime_registered(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """An agent declaring ``runtime: native_anthropic`` should be
+    dispatched to the registered provider for that runtime — proves
+    the registry seam works end-to-end when an adapter is wired."""
+    import yaml  # noqa: PLC0415
+
+    bundle_dir = _scaffold(tmp_path / "anthropic-demo")
+    # Promote the agent to runtime: native_anthropic.
+    yaml_path = bundle_dir / "agent.yaml"
+    spec_dict = yaml.safe_load(yaml_path.read_text())
+    spec_dict["runtime"] = AgentRuntime.NATIVE_ANTHROPIC.value
+    yaml_path.write_text(yaml.safe_dump(spec_dict))
+
+    bundle = load_agent(bundle_dir)
+    assert bundle.spec.runtime == AgentRuntime.NATIVE_ANTHROPIC
+
+    # Build a registry with a distinct stub for the anthropic runtime
+    # so we can verify dispatch picked the right one.
+    litellm_stub = MockProvider(response='{"message": "from litellm"}')
+    anthropic_stub = MockProvider(response='{"message": "from anthropic"}')
+    registry = ProviderRegistry(default_litellm=litellm_stub)
+    registry.register(AgentRuntime.NATIVE_ANTHROPIC, anthropic_stub)
+
+    executor = Executor(
+        registry=registry,
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+    )
+    response = await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+    assert response.status == "success"
+    # The anthropic stub answered — not the litellm one.
+    assert response.data == {"message": "from anthropic"}
+
+
+@pytest.mark.unit
+async def test_executor_rejects_unregistered_runtime_at_execute_time(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """If an agent's ``runtime:`` field doesn't have a registered
+    provider (the v0.5 baseline for native_anthropic / native_openai /
+    langchain), the executor surfaces a schema_error — same exit shape
+    as a bad input schema. Retries don't help here, so failing fast is
+    the right call."""
+    import yaml  # noqa: PLC0415
+
+    bundle_dir = _scaffold(tmp_path / "unwired")
+    yaml_path = bundle_dir / "agent.yaml"
+    spec_dict = yaml.safe_load(yaml_path.read_text())
+    spec_dict["runtime"] = AgentRuntime.LANGCHAIN.value
+    yaml_path.write_text(yaml.safe_dump(spec_dict))
+
+    bundle = load_agent(bundle_dir)
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+    )
+    response = await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+    assert response.status == "error"
+    assert response.error is not None
+    assert response.error.type == "schema_error"
+    # The error message names the missing runtime so the operator can
+    # tell what's not wired.
+    assert "langchain" in response.error.message
+
+
+@pytest.mark.unit
+def test_executor_requires_provider_or_registry(
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """At least one of ``provider=`` or ``registry=`` must be passed —
+    construct-time validation prevents the "no provider wired" footgun."""
+    with pytest.raises(ValueError, match="provider= or registry="):
+        Executor(pricing=pricing, storage=storage, tracer=tracer)
+
+
+@pytest.mark.unit
+def test_executor_rejects_both_provider_and_registry(
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """Passing BOTH is ambiguous — which one wins? Reject construction
+    so the caller picks one explicitly."""
+    with pytest.raises(ValueError, match="not both"):
+        Executor(
+            provider=MockProvider(),
+            registry=ProviderRegistry(default_litellm=MockProvider()),
+            pricing=pricing,
+            storage=storage,
+            tracer=tracer,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,16 @@ version: 0.1.0
 description: A new movate agent
 owner: ""
 
+# runtime selects which execution path movate uses to talk to the model.
+# Default is `litellm` (provider-portable via LiteLLM). Uncomment one of
+# the others when their adapters ship (v0.6+):
+#
+#   runtime: native_anthropic   # direct anthropic SDK — tool-use, MCP, etc.
+#   runtime: native_openai      # direct openai SDK — structured outputs, etc.
+#   runtime: langchain          # delegate to a LangChain Runnable entry-point
+#
+# runtime: litellm
+
 model:
   provider: openai/gpt-4o-mini-2024-07-18
   params:

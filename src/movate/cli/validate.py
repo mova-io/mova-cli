@@ -16,6 +16,7 @@ from movate.cli._workflow_path import is_workflow_path
 from movate.core.config import load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
 from movate.core.loader import AgentLoadError, load_agent
+from movate.core.models import AgentRuntime
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
@@ -25,6 +26,10 @@ from movate.core.workflow import (
 )
 from movate.core.workflow.spec import WorkflowSpecLoadError
 from movate.providers.pricing import load_pricing
+
+# Single source of truth for "which runtimes does this build ship?".
+# Updated when each native adapter lands (Tier-2 #6/#7/#8).
+_AVAILABLE_RUNTIMES: frozenset[AgentRuntime] = frozenset({AgentRuntime.LITELLM})
 
 console = Console()
 
@@ -62,6 +67,24 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
 
     spec = bundle.spec
 
+    # Runtime-availability check. Reject agents that declare a runtime
+    # this build doesn't wire (e.g. `runtime: native_anthropic` against
+    # v0.5 which only ships LiteLLM). Fail fast HERE so the operator
+    # learns before any execute attempt — same exit-2 semantics as a
+    # bad policy or a bad schema.
+    if spec.runtime not in _AVAILABLE_RUNTIMES:
+        console.print(
+            f"[red]✗ unsupported runtime:[/red] agent {spec.name!r} "
+            f"declares [bold]runtime: {spec.runtime.value}[/bold], but "
+            f"this movate build only ships: "
+            f"{sorted(r.value for r in _AVAILABLE_RUNTIMES)}."
+        )
+        console.print(
+            "[dim]  Native-SDK (anthropic / openai) and LangChain runtimes "
+            "land in v0.6 — see Tier-2 #6/#7/#8 in the high-priority list.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
     # Project-wide model policy. ``check_agent`` returns an empty list
     # if the project has no policy or the agent is compliant. Reported
     # AFTER the load succeeds so the operator gets both the load error
@@ -90,6 +113,7 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
 
     console.print(f"[green]✓[/green] {spec.name} [dim]v{spec.version}[/dim] [dim](agent)[/dim]")
     console.print(f"  api_version: {spec.api_version}")
+    console.print(f"  runtime:     {spec.runtime.value}")
     console.print(f"  provider:    {spec.model.provider}")
     console.print(f"  prompt:      {bundle.prompt_hash[:12]}…")
     if spec.model.fallback:

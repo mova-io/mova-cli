@@ -100,6 +100,45 @@ class Budget(BaseModel):
     max_cost_usd_per_run: float = Field(default=1.0, ge=0)
 
 
+class AgentRuntime(StrEnum):
+    """Which execution path the agent uses to talk to the model.
+
+    All runtimes return the same persisted shape (``RunRecord`` /
+    ``Metrics`` / ``ErrorInfo``) — the field only selects which SDK
+    or framework gets the actual API call.
+
+    * ``litellm`` (default) — calls
+      :class:`movate.providers.litellm.LiteLLMProvider`. Provider
+      portability across model families. The agent's ``model.provider``
+      is a LiteLLM model string (``openai/gpt-4o-mini-2024-07-18``).
+
+    * ``native_anthropic`` — calls the official ``anthropic`` Python
+      SDK directly. Unlocks tool-use, computer-use, prompt caching,
+      thinking blocks, vision, and the MCP-server ecosystem. The
+      agent's ``model.provider`` is a bare Anthropic model id
+      (``claude-sonnet-4-6``). [v0.6 — not yet wired.]
+
+    * ``native_openai`` — calls the official ``openai`` Python SDK
+      directly. Unlocks Assistants API, strict structured outputs
+      via ``response_format``, vision-with-tools, parallel
+      function-calling. The agent's ``model.provider`` is a bare
+      OpenAI model id (``gpt-4o-mini-2024-07-18``). [v0.6 — not yet
+      wired.]
+
+    * ``langchain`` — the agent's ``model.provider`` is an import
+      path to a Python entry-point returning a LangChain
+      ``Runnable``; movate invokes it with the validated input.
+      Unlocks LCEL composition, LangSmith tracing, and any other
+      LangChain feature inside a movate-managed shell (auth,
+      persistence, deploy, eval). [v0.6 — not yet wired.]
+    """
+
+    LITELLM = "litellm"
+    NATIVE_ANTHROPIC = "native_anthropic"
+    NATIVE_OPENAI = "native_openai"
+    LANGCHAIN = "langchain"
+
+
 class AgentSpec(BaseModel):
     """Parsed ``agent.yaml`` contents (api_version: movate/v1, kind: Agent)."""
 
@@ -112,6 +151,18 @@ class AgentSpec(BaseModel):
     version: str
     description: str = ""
     owner: str = ""
+
+    runtime: AgentRuntime = Field(
+        default=AgentRuntime.LITELLM,
+        description=(
+            "Execution path used to invoke the model. Defaults to "
+            "``litellm`` (provider-portable via LiteLLM). Set to "
+            "``native_anthropic`` / ``native_openai`` to use the "
+            "official SDK directly (unlocks tool-use, structured "
+            "outputs, etc.) or ``langchain`` to delegate to a "
+            "LangChain Runnable."
+        ),
+    )
 
     model: ModelConfig
     prompt: str  # path relative to agent dir

@@ -52,6 +52,7 @@ from movate.providers.base import (
     Message,
 )
 from movate.providers.pricing import PricingTable
+from movate.providers.registry import ProviderRegistry, UnregisteredRuntimeError
 from movate.storage.base import StorageProvider
 from movate.tracing.base import SpanCtx, Tracer
 
@@ -64,14 +65,30 @@ class Executor:
     def __init__(
         self,
         *,
-        provider: BaseLLMProvider,
+        provider: BaseLLMProvider | None = None,
+        registry: ProviderRegistry | None = None,
         pricing: PricingTable,
         storage: StorageProvider,
         tracer: Tracer,
         tenant_id: str = "local",
         policy: ModelPolicy | None = None,
     ) -> None:
-        self._provider = provider
+        """One of ``provider`` (legacy single-runtime) OR ``registry``
+        (multi-runtime, v0.6+) must be set. Passing ``provider`` is
+        equivalent to ``registry=ProviderRegistry(default_litellm=provider)``
+        and is preserved so the existing 100+ test sites keep working
+        unchanged. New code passes ``registry=`` so it can wire up
+        native-SDK adapters alongside LiteLLM."""
+        if provider is None and registry is None:
+            raise ValueError("Executor needs either provider= or registry=")
+        if provider is not None and registry is not None:
+            raise ValueError("pass either provider= OR registry=, not both")
+        if registry is not None:
+            self._registry = registry
+        else:
+            # mypy: provider is not None here (one of the two must be set).
+            assert provider is not None
+            self._registry = ProviderRegistry(default_litellm=provider)
         self._pricing = pricing
         self._storage = storage
         self._tracer = tracer
@@ -132,8 +149,20 @@ class Executor:
 
         started = time.monotonic()
         try:
-            # Tenant-budget check FIRST — if the tenant's monthly cap
-            # is breached, no run should fire (not even a doomed one).
+            # Runtime dispatch FIRST — if the agent declared a runtime
+            # we don't have an adapter for (native_anthropic /
+            # native_openai / langchain in v0.5), fail fast with a clear
+            # message before doing any side effects or budget checks.
+            try:
+                provider_for_run = self._registry.get(spec.runtime)
+            except UnregisteredRuntimeError as exc:
+                # SchemaError is the closest fit in our taxonomy — the
+                # YAML declares a runtime that doesn't exist in this
+                # build. Retries won't help.
+                raise SchemaError(str(exc)) from exc
+
+            # Tenant-budget check — if the tenant's monthly cap is
+            # breached, no run should fire (not even a doomed one).
             # Cheap PK lookup + a single SUM aggregate; the index on
             # (tenant_id, created_at) is the perf path.
             await self._check_tenant_budget()
@@ -181,12 +210,12 @@ class Executor:
 
                 async def _invoke(req: CompletionRequest = req) -> CompletionResponse:
                     if on_token is None:
-                        return await self._provider.complete(req)
+                        return await provider_for_run.complete(req)
                     # Stream path. Accumulate chunks into a single
                     # CompletionResponse so everything below this
                     # (schema validation, cost calc, persistence) sees
                     # the same shape regardless of streaming.
-                    return await self._invoke_streaming(req, on_token)
+                    return await self._invoke_streaming(provider_for_run, req, on_token)
 
                 try:
                     completion = await run_with_retries(_invoke)
@@ -283,6 +312,7 @@ class Executor:
 
     async def _invoke_streaming(
         self,
+        provider: BaseLLMProvider,
         req: CompletionRequest,
         on_token: Callable[[str], None],
     ) -> CompletionResponse:
@@ -294,11 +324,15 @@ class Executor:
         If a stream ends without ever delivering usage stats — older
         providers, mis-configured proxies — we fall through with
         zeros. Cost accounting then reads zero, which is wrong but
-        survivable; the cost-drift check downstream will flag it."""
+        survivable; the cost-drift check downstream will flag it.
+
+        Takes ``provider`` explicitly (rather than via ``self``) so
+        the executor can dispatch per-agent across multiple
+        registered providers — see :class:`ProviderRegistry`."""
         text_parts: list[str] = []
         final_tokens: TokenUsage | None = None
         raw: dict[str, Any] = {}
-        async for chunk in self._provider.stream(req):
+        async for chunk in provider.stream(req):
             if chunk.text:
                 text_parts.append(chunk.text)
                 on_token(chunk.text)
@@ -430,7 +464,10 @@ class Executor:
             agent_version=bundle.spec.version,
             prompt_hash=bundle.prompt_hash,
             provider=chosen_provider,
-            provider_version=self._provider.version,
+            # provider_version stamps which adapter class produced this
+            # run — look up via the registry so multi-runtime executors
+            # record the right version per agent.
+            provider_version=self._registry.get(bundle.spec.runtime).version,
             pricing_version=self._pricing.version,
             status=JobStatus.SUCCESS,
             input=request.input,

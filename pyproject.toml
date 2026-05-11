@@ -94,6 +94,11 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # Compiler is naturally branch-heavy (one branch per validation rule) — splitting it
 # into helpers fights readability without reducing total complexity.
 "src/movate/core/workflow/compiler.py" = ["PLR0912"]
+# Executor.execute is the linear pipeline (validate → render → call → validate → record)
+# with branches for retries, fallback, schema errors, policy, runtime dispatch.
+# Each branch is a distinct concern; folding into helpers would scatter the
+# read order. PLR0912 is the wrong rule for this shape.
+"src/movate/core/executor.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 
