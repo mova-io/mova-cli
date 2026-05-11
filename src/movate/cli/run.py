@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from jsonschema import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -25,6 +26,7 @@ from movate.cli._completion import complete_agent_path
 from movate.cli._output import Run
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.cli._workflow_path import is_workflow_path
+from movate.core.cost_forecast import estimate_call_cost
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import RunRequest, WorkflowStatus
 from movate.core.run_replay import (
@@ -44,6 +46,7 @@ from movate.core.workflow import (
     validate_linear,
 )
 from movate.core.workflow.spec import WorkflowSpecLoadError
+from movate.providers.pricing import load_pricing
 
 console = Console(stderr=True)
 
@@ -86,6 +89,16 @@ def run(
             "this flag only adds a live preview. Workflow + replay modes ignore it."
         ),
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Render the prompt + show the cost estimate, BUT make no provider "
+            "call. Catches schema mismatches, Jinja errors, and surprise costs "
+            "before they hit the model. Agent-only; workflows refer to "
+            "`movate show <workflow>` for topology + state-schema rendering."
+        ),
+    ),
     output_format: Run = typer.Option(Run.JSON, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Run an agent or workflow against the given input.
@@ -112,6 +125,21 @@ def run(
       [dim]# Initial state from a file[/dim]
       $ movate run ./returns-workflow --input initial_state.json
     """
+    if dry_run:
+        if replay_id is not None or stream:
+            console.print(
+                "[red]✗[/red] --dry-run is mutually exclusive with --replay and --stream"
+            )
+            raise typer.Exit(code=2)
+        if is_workflow_path(path):
+            console.print(
+                "[red]✗[/red] --dry-run supports agents only; "
+                "use `movate show <workflow>` for topology + state-schema rendering"
+            )
+            raise typer.Exit(code=2)
+        _dispatch_dry_run(path, input_flag or input_arg, output_format=output_format)
+        return
+
     if replay_id is not None:
         if input_arg is not None or input_flag is not None:
             console.print(
@@ -258,6 +286,133 @@ def _streaming_callback() -> Callable[[str], None]:
         sys.stderr.flush()
 
     return _emit
+
+
+# ---------------------------------------------------------------------------
+# Dry-run — render prompt + cost estimate, NO provider call
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_dry_run(
+    path: Path,
+    raw: str | None,
+    *,
+    output_format: Run,
+) -> None:
+    """Render what `movate run` WOULD send to the provider, exit 0.
+
+    Catches three classes of bug before they hit a real model:
+      * Schema mismatches — input validator runs even in dry-run.
+      * Jinja template errors — prompt is rendered with the supplied input.
+      * Surprise costs — token estimate + price (when in pricing table).
+
+    No SQLite write, no tracer span, no provider construction. Pure
+    load → validate → render → forecast.
+    """
+    try:
+        bundle = load_agent(path)
+    except AgentLoadError as exc:
+        console.print(f"[red]✗ load failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    if raw is None:
+        console.print("[red]✗ provide input as a positional arg or via --input[/red]")
+        raise typer.Exit(code=2)
+
+    try:
+        payload = _coerce_agent_input(raw, bundle)
+    except typer.BadParameter as exc:
+        console.print(f"[red]✗ input error:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    try:
+        bundle.input_validator.validate(payload)
+    except ValidationError as exc:
+        console.print(f"[red]✗ input failed schema validation:[/red] {exc.message}")
+        raise typer.Exit(code=2) from None
+
+    try:
+        messages = bundle.render_messages(payload)
+    except Exception as exc:
+        # StrictUndefined → UndefinedError; we surface as exit 2.
+        console.print(f"[red]✗ prompt render failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    rendered_chars = sum(len(m.get("content", "")) for m in messages)
+    pricing = load_pricing()
+    estimate = estimate_call_cost(bundle, rendered_chars=rendered_chars, pricing=pricing)
+
+    if output_format == Run.JSON:
+        _emit_dry_run_json(bundle, payload, messages, estimate)
+    else:
+        _emit_dry_run_text(bundle, payload, messages, estimate)
+
+
+def _emit_dry_run_text(
+    bundle: AgentBundle,
+    payload: dict[str, Any],
+    messages: list[dict[str, str]],
+    estimate: Any,  # CallEstimate; loose-typed to dodge an import in the type sig
+) -> None:
+    out = Console()  # stdout — dry-run output IS the payload, like agent JSON output
+    out.print()
+    out.rule(f"[bold]dry-run[/bold] · {bundle.spec.name} v{bundle.spec.version}")
+    out.print(f"  [dim]model:[/dim]     {bundle.spec.model.provider}")
+    if bundle.spec.model.fallback:
+        chain = ", ".join(f.provider for f in bundle.spec.model.fallback)
+        out.print(f"  [dim]fallback:[/dim]  {chain}")
+    out.print(f"  [dim]input:[/dim]     {json.dumps(payload)}")
+    out.print()
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        out.rule(f"[bold]{role}[/bold]")
+        # Use plain print (not console.print) so prompt content isn't
+        # re-interpreted as Rich markup — operators write prompts that
+        # include `[brackets]` legitimately.
+        out.print(content, markup=False, highlight=False)
+
+    out.print()
+    out.rule("[bold]estimate[/bold]")
+    out.print(f"  input:   ~{estimate.input_chars} chars (~{estimate.input_tokens} tokens)")
+    out.print(f"  output:  ≤{estimate.output_tokens_budget} tokens (max_tokens budget)")
+    if estimate.cost_per_call_usd is not None:
+        out.print(
+            f"  cost:    ~${estimate.cost_per_call_usd:.6f} per call "
+            f"[dim]({estimate.model_provider})[/dim]"
+        )
+    else:
+        out.print(
+            f"  cost:    [dim]not in pricing table for {estimate.model_provider}[/dim]"
+        )
+    out.print()
+    out.print("[green]✓ dry-run — no provider calls were made.[/green]")
+    out.print()
+
+
+def _emit_dry_run_json(
+    bundle: AgentBundle,
+    payload: dict[str, Any],
+    messages: list[dict[str, str]],
+    estimate: Any,
+) -> None:
+    payload_out = {
+        "dry_run": True,
+        "agent": bundle.spec.name,
+        "version": bundle.spec.version,
+        "model": bundle.spec.model.provider,
+        "fallback": [f.provider for f in bundle.spec.model.fallback],
+        "input": payload,
+        "messages": messages,
+        "estimate": {
+            "input_chars": estimate.input_chars,
+            "input_tokens": estimate.input_tokens,
+            "output_tokens_budget": estimate.output_tokens_budget,
+            "cost_per_call_usd": estimate.cost_per_call_usd,
+        },
+    }
+    sys.stdout.write(json.dumps(payload_out, indent=2) + "\n")
 
 
 # ---------------------------------------------------------------------------

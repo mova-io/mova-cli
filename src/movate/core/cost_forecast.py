@@ -144,6 +144,58 @@ def estimate_eval_cost(bundle: AgentBundle, *, pricing: PricingTable) -> CostFor
     )
 
 
+@dataclass(frozen=True)
+class CallEstimate:
+    """One forecast for ONE rendered prompt — the ``movate run --dry-run``
+    shape. Same token math as :class:`CostForecast` but scoped to a single
+    call rather than averaging across an eval dataset."""
+
+    model_provider: str
+    input_chars: int
+    input_tokens: int
+    output_tokens_budget: int
+    cost_per_call_usd: float | None
+    """``None`` when the model isn't in the pricing table (custom provider
+    etc.) — the call still goes through; we just can't price it ahead of
+    time."""
+
+
+def estimate_call_cost(
+    bundle: AgentBundle,
+    *,
+    rendered_chars: int,
+    pricing: PricingTable,
+) -> CallEstimate:
+    """Forecast for a single agent call with a known rendered prompt size.
+
+    Mirrors :func:`estimate_eval_cost`'s math but takes a pre-computed
+    character count instead of re-rendering a whole dataset. Returns a
+    populated :class:`CallEstimate`; the cost field is ``None`` rather
+    than raising when the model isn't priced.
+    """
+    output_tokens = _output_token_budget(bundle)
+    input_tokens = int(rendered_chars / _CHARS_PER_TOKEN)
+
+    prices = pricing.models.get(bundle.spec.model.provider)
+    cost: float | None
+    if prices is None:
+        cost = None
+    else:
+        cost = round(
+            input_tokens / 1000.0 * prices.input_per_1k
+            + output_tokens / 1000.0 * prices.output_per_1k,
+            6,
+        )
+
+    return CallEstimate(
+        model_provider=bundle.spec.model.provider,
+        input_chars=rendered_chars,
+        input_tokens=input_tokens,
+        output_tokens_budget=output_tokens,
+        cost_per_call_usd=cost,
+    )
+
+
 def _output_token_budget(bundle: AgentBundle) -> int:
     """``model.params.max_tokens`` if set, else a 500-token default.
 
@@ -163,4 +215,4 @@ def _output_token_budget(bundle: AgentBundle) -> int:
         return _DEFAULT_OUTPUT_TOKENS
 
 
-__all__ = ["CostForecast", "estimate_eval_cost"]
+__all__ = ["CallEstimate", "CostForecast", "estimate_call_cost", "estimate_eval_cost"]
