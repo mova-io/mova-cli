@@ -36,16 +36,46 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 **v0.5.0 tagged + released this session.** [GitHub Release](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.5.0) with wheel + sdist attached (per RELEASING.md Option A). README capability matrix flipped from staged → shipped for HTTP runtime / worker / Postgres. Service-mode quickstart added to README so the v0.5 surface is discoverable. CI gained a `postgres` job using GHA's `services:` block (Postgres 16 container) — the parametrized storage conformance suite now runs against PG on every PR, closing the "regression only caught when a dev sets MOVATE_PG_TEST_URL locally" gap.
 
-1. [x] **v1.0 stage 1: Bicep IaC for Azure** `[HIGH] [v1.0] [done]` — ACA + Postgres Flex + ACR + Key Vault + Log Analytics. Modular `infra/azure/modules/*.bicep`; `main.bicep` orchestrator + role assignments. Multi-stage `Dockerfile` (runtime + worker). CI runs `bicep build` + `bicep lint` on every PR. Operator walkthrough at [infra/azure/README.md](infra/azure/README.md).
-2. [ ] **v1.0 stage 2: `movate deploy` CLI + GH-Actions deploy.yml** `[HIGH] [v1.0] [next] [2-3d]` — `git push release/*` builds image, pushes to ACR, updates ACA revision.
-3. [ ] **v1.0 stage 3: Model policy enforcement** `[HIGH] [v1.0] [2-3d]` — `policies/model_policy.yaml` enforced at executor entry; allowed providers, deny-list, max cost per run, fallback chain.
-4. [ ] **v1.0 stage 4: Tenant isolation audit** `[HIGH] [v1.0] [1-2d]` — walk every storage entry point + assert tenant_id filter is applied; add a fuzz test that mints two tenants and confirms cross-tenant queries return empty.
-5. [ ] **First Azure deployment validation** `[HIGH] [v1.0] [≤1d]` — operator runs the walkthrough against a real subscription; surface any IAM / region / SKU surprises that local Bicep compile can't catch.
-6. [x] **Server-side email notifications** `[MED] [post-v1.0] [done]` — `notify_email` column on `jobs` (sqlite + postgres, idempotent migrations); `NotificationDispatcher` Protocol with `ConsoleBackend` (dev default) + `SmtpEmailBackend` (production); `build_dispatcher()` env-driven backend selection (no `MOVATE_SMTP_HOST` → console; set → SMTP). Vendor-agnostic via SMTP — works with ACS Email, SendGrid, Mailgun, SES, Gmail. CLI: `movate submit ... --notify-email <addr>` threads through `MovateClient.submit_job` → wire schema → worker. Worker fires-and-awaits on terminal; failure logs but never re-queues. 14 tests covering backend selection, SMTP path with faked smtplib, worker integration, swallowed-exception contract.
-7. [ ] **Server-side SMS notifications** `[LOW] [post-v1.0] [2-3w infra + 2-3d code]` — adds `notify_sms` column + Twilio/ACS SMS backend. **Blocked on Movate business setup**: phone-number provisioning, A2P 10DLC registration for US numbers, sender ID approval in other regions. Code is the small part; the carrier-registration takes weeks. Skip until there's a customer specifically asking for SMS.
-3. [ ] **Bicep + GH-Actions deploy.yml** `[HIGH] [v1.0] [4-6d]` — turn `git push release/*` into an ACA deploy.
-4. [ ] **Model policy enforcement** `[HIGH] [v1.0] [2-3d]` — `policies/model_policy.yaml` enforced at executor entry.
-5. [ ] **More templates as customer engagements demand** `[MED] [post-v0.4]` — extractor, RAG, function-caller; trivial to add now that the registry exists.
+### Group A — Close the v1.0 deploy loop (highest leverage)
+
+The Bicep is shipped; what's missing is the **one-command deploy** that
+turns a code change into a running revision. Until this lands, every
+deploy is a manual `az acr build && az containerapp update` chain.
+
+1. [x] **v1.0 stage 1: Bicep IaC for Azure** `[HIGH] [v1.0] [done]` — modular `infra/azure/modules/*.bicep`; CI runs `bicep build` + `bicep lint` on every PR. Operator walkthrough at [infra/azure/README.md](infra/azure/README.md).
+2. [ ] **v1.0 stage 2: `movate deploy` CLI + GH-Actions deploy.yml** `[HIGH] [v1.0] [next] [2-3d]` — `git push release/*` builds image, pushes to ACR, updates both ACA revisions. Replaces the stub `cli/deploy.py`. End-to-end smoke: push tag, see new version on `curl /healthz`.
+3. [ ] **First Azure deployment validation** `[HIGH] [v1.0] [≤1d code, blocked on subscription access]` — operator runs the walkthrough against a real subscription; surface any IAM / region / SKU surprises that local Bicep compile can't catch.
+4. [ ] **v1.0 stage 3: Model policy enforcement** `[HIGH] [v1.0] [2-3d]` — `policies/model_policy.yaml` enforced at executor entry; allowed providers, deny-list, max cost per run, fallback chain. Production blocker for customer-facing deployments.
+5. [ ] **v1.0 stage 4: Tenant isolation audit** `[HIGH] [v1.0] [1-2d]` — walk every storage entry point + assert tenant_id filter is applied; add a fuzz test that mints two tenants and confirms cross-tenant queries return empty.
+
+### Group B — Scale the worker (production-readiness for real load)
+
+The runtime works for one user at a time. To handle bursty multi-tenant
+load, the worker needs to scale on **queue depth** (not CPU), retry
+transient failures, and bound runaway clients.
+
+6. [ ] **KEDA Postgres scaler for worker autoscaling** `[HIGH] [post-v1.0] [≤1d]` — replace the current CPU-utilization scale rule in `containerapp-worker.bicep` with a KEDA scaler keyed on `SELECT COUNT(*) FROM jobs WHERE status='queued' AND (tenant_id = '<scope>' OR tenant_id IS NULL)`. CPU is a lagging indicator (queue is already deep by the time CPU rises); queue depth is the leading one. ACA supports KEDA scalers natively. Code-side: add the scaler spec to the worker Bicep + bake the connection-string env var into the worker container's KEDA trigger metadata.
+7. [ ] **Job retry policy with exponential backoff + dead-letter** `[HIGH] [post-v1.0] [1-2d]` — currently every ERROR is terminal. Production needs: transient errors (network blip, provider 5xx) re-queue with exponential backoff + jitter; max retries (configurable per agent, default 3); persistent-failures land in a `DEAD_LETTER` status so operators can triage without losing the input. Schema: `attempt_count` + `next_retry_at` columns on `jobs`. Worker: `claim_next_job` picks rows where `next_retry_at IS NULL OR next_retry_at < NOW()`. Reuses `core/retry.py` `RetryableError` concept that's already in the codebase for in-process retries.
+8. [ ] **Rate limiting per API key** `[MED] [post-v1.0] [1-2d]` — currently a misbehaving client can flood `POST /run`. Add a leaky-bucket counter keyed on `api_key_id` (in-process for v1.x, Redis for v1.1 once multi-replica API needs shared state). Default: 60 req/min per key. 429 response with `Retry-After` header on overflow.
+9. [ ] **`/ready` endpoint with deep checks** `[MED] [post-v1.0] [≤1d]` — `/healthz` returns 200 unconditionally (lightweight liveness; ACA's livenessProbe uses it). `/ready` checks DB connectivity + agent registry non-empty + tracer reachable; ACA's readinessProbe gates traffic on it. Avoids serving 500s during a Postgres restart window.
+
+### Group C — SMS notifications (parallel code + business work)
+
+The email notifications shipped this session (item 11). SMS is broken
+out so you can prioritize the code + business work independently.
+
+10. [x] **Server-side email notifications** `[MED] [post-v1.0] [done]` — `notify_email` column + `NotificationDispatcher` Protocol + Console/SMTP backends + worker hook + CLI `--notify-email`. Vendor-agnostic via SMTP.
+11. [ ] **SMS-1: vendor decision (Twilio vs Azure Communication Services SMS)** `[MED] [post-v1.0] [≤2h ops]` — pricing comparison: Twilio US SMS ~$0.0079/msg + $1.15/mo phone number; ACS SMS ~$0.0075/msg + $1/mo, integrates with KV + RBAC. Decision criteria: existing Movate Twilio account? cost sensitivity? Azure-native preference? **Output: locked vendor name in `docs/v1.0-azure-design.md`.**
+12. [ ] **SMS-2: code path** `[MED] [post-v1.0] [~2d, post vendor pick]` — mirrors the email path: `notify_sms` column on `jobs` (sqlite + postgres idempotent migrations), `JobRecord` + `RunSubmission` + `JobView` carry it, CLI `movate submit ... --notify-sms +14155551212`, `SmsBackend` Protocol, `TwilioSmsBackend` or `AcsSmsBackend` depending on SMS-1, E.164 validation (regex + `phonenumbers` lib), `build_dispatcher()` composes email + SMS dispatchers if both env-configured. Tests via the same faked-vendor pattern used for SMTP.
+13. [ ] **SMS-3: infra (phone-number resource + KV secrets)** `[MED] [post-v1.0] [≤0.5d, post vendor pick]` — if ACS picked: add `Microsoft.Communication/PhoneNumbers` to Bicep with E.911 address + KV secret for `ACS_CONNECTION_STRING`. If Twilio picked: just KV secrets for `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` + `TWILIO_FROM_NUMBER`. ACA worker container gets the env-var wiring.
+14. [ ] **SMS-4: business setup (A2P 10DLC + sender ID approval)** `[BLOCKING] [post-v1.0] [2-3 WEEKS ops time, not code]` — **register Movate's brand + use case with The Campaign Registry (US A2P 10DLC)**; submit sender ID applications for non-US regions where customers exist. Carrier filtering can take 1-2 weeks AFTER registration approval. Should start **NOW in parallel** with code work if SMS is a real product need — code can ship and sit idle until the phone number is live; the carrier path can't be sped up. Cost: ~$50 one-time brand registration + ~$10/campaign vetting fee.
+15. [ ] **SMS-5: real-SMS smoke test** `[LOW] [post-v1.0] [≤0.5d, post SMS-4 approval]` — submit a job with `--notify-sms <ops-phone>`, watch the SMS land. Out-of-pocket: ~$0.01 per smoke.
+
+### Group D — Polish + nice-to-haves
+
+16. [ ] **Workflow replay** `[LOW] [post-v1.0]` — `movate run --replay <workflow-run-id>`. Single-agent replay already covers 80% of debug cases; defer until a customer asks.
+17. [ ] **More templates as customer engagements demand** `[MED] [post-v1.0]` — extractor, RAG, function-caller; trivial to add now that the registry exists.
+18. [ ] **HTTP streaming for `POST /run?wait=true`** `[LOW] [post-v1.0]` — server-sent events for long jobs so the client streams instead of polling. Useful for interactive UIs; not needed for the current batch / dev-team workflows.
 
 ---
 
