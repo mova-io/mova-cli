@@ -1,0 +1,50 @@
+# LLM-as-judge config for the case-reasoner agent.
+#
+# Exact-match doesn't work here: the dataset's `expected` only carries
+# the target `tone`, not the full output shape — the agent produces
+# headline + body + next_steps + tone, and we want to score whether
+# the WHOLE output respects the rules in prompt.md (no internal terms
+# leaked, tone matches the decision, body length sane, next_steps
+# imperative).
+#
+# Cross-family: the agent runs on OpenAI (gpt-4o-mini); the judge runs
+# on Anthropic (claude-haiku-4-5). The eval engine refuses to let a
+# provider judge itself.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-haiku-4-5-20251001
+  params:
+    temperature: 0.0
+    max_tokens: 512
+
+rubric: |
+  Score the agent's output against the rules and expected tone.
+
+  Pass criteria (score 1.0):
+    1. `tone` exactly equals the expected tone.
+    2. NO internal terms leak into headline or body. Specifically NONE of:
+       "risk_score", "severity", "indicator", rule codes (e.g.
+       "tampered_serial", "low_resolution_invoice"), "the model",
+       "AI", "automated system", "decision engine", numeric confidence
+       values.
+    3. headline is ≤ 80 chars and matches the decision (success
+       confirmation for auto_approve / matter-of-fact for auto_reject /
+       "need a closer look" for human_review).
+    4. body is 2-4 sentences AND personalises with customer_name if
+       present (e.g. "Hi Maya,") AND references product_summary
+       naturally if present.
+    5. next_steps is 1-4 imperative phrases the customer can do now.
+
+  Partial credit (score 0.5):
+    Minor violation — e.g. tone right but body slightly verbose, OR
+    body misses customer_name personalisation, OR a next_step is
+    phrased as a statement rather than imperative.
+
+  Fail (score 0.0):
+    Tone mismatch, OR any internal term leaked, OR headline accusatory
+    on auto_reject, OR body cites no specific findings on auto_reject,
+    OR > 4 next_steps.
+
+threshold: 0.7
