@@ -21,6 +21,7 @@ from movate.cli import _console  # noqa: E402
 from movate.cli import bench as bench_cmd  # noqa: E402
 from movate.cli import chat as chat_cmd  # noqa: E402
 from movate.cli import deploy as deploy_cmd  # noqa: E402
+from movate.cli import diff as diff_cmd  # noqa: E402
 from movate.cli import doctor as doctor_cmd  # noqa: E402
 from movate.cli import eval as eval_cmd  # noqa: E402
 from movate.cli import init as init_cmd  # noqa: E402
@@ -133,6 +134,7 @@ app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
+app.command("diff", rich_help_panel=PANEL_DEVELOP)(diff_cmd.diff)
 # NOTE: do NOT pass `help=` here — Typer/Click then ignores the function's
 # docstring, which is where each command's [bold]Examples:[/bold] block
 # lives. The docstring's first line becomes the panel summary; the full
