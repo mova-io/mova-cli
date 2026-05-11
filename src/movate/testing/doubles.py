@@ -7,6 +7,7 @@ satisfy mypy strict against ``StorageProvider`` / ``Tracer`` /
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -24,6 +25,7 @@ from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
     CompletionResponse,
+    StreamChunk,
 )
 from movate.tracing.base import SpanCtx, Tracer
 
@@ -403,8 +405,17 @@ class JudgeStubProvider(BaseLLMProvider):
             )
         return CompletionResponse(text=self._agent_response)
 
-    async def stream(self, request: CompletionRequest) -> Any:  # pragma: no cover
-        raise NotImplementedError
+    async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        """Stream by yielding the same response as :meth:`complete`
+        in two slices, so tests that exercise the executor's
+        streaming branch see ≥ 1 mid-stream chunk plus a final
+        usage chunk."""
+        resp = await self.complete(request)
+        # Mid-stream chunk: the whole text in one slice.
+        yield StreamChunk(text=resp.text)
+        # Final chunk: zero text, populated tokens (mirrors LiteLLM
+        # include_usage=True behaviour).
+        yield StreamChunk(text="", tokens=resp.tokens)
 
     async def embed(self, text: str, *, model: str) -> list[float]:  # pragma: no cover
         raise NotImplementedError

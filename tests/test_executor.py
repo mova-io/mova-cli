@@ -122,6 +122,90 @@ async def test_executor_happy_path(
 
 
 # ---------------------------------------------------------------------------
+# Streaming (executor.execute with on_token callback)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_executor_streaming_invokes_callback_with_chunks(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """When ``on_token`` is set, the executor uses ``provider.stream()``
+    and surfaces every text delta via the callback. The accumulated
+    response is still schema-validated and persisted normally —
+    streaming is purely an observation channel."""
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    executor = Executor(
+        provider=MockProvider(response='{"message": "hello world"}'),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+    )
+
+    chunks: list[str] = []
+
+    response = await executor.execute(
+        bundle,
+        RunRequest(agent="demo", input={"text": "hi"}),
+        on_token=chunks.append,
+    )
+
+    # Callback fired at least once with content (mock yields 10-char
+    # slices, so for "{\"message\": \"hello world\"}" we'd expect ≥ 2).
+    assert len(chunks) >= 1
+    # Concatenated chunks form the final response text.
+    assert "".join(chunks) == '{"message": "hello world"}'
+    # Same success path as non-streaming.
+    assert response.status == "success"
+    assert response.data == {"message": "hello world"}
+    # Same persistence (RunRecord saved).
+    assert len(storage.runs) == 1
+    # Cost still accounted (tokens come from the final usage-only
+    # stream chunk; if that path broke, cost would be 0).
+    assert response.metrics.cost_usd > 0
+
+
+@pytest.mark.unit
+async def test_executor_streaming_off_by_default_uses_complete(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """Without ``on_token``, the executor uses ``provider.complete()``
+    — proves we didn't accidentally tip the default path into the
+    streaming branch."""
+
+    class CountingMock(MockProvider):
+        complete_calls = 0
+        stream_calls = 0
+
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            CountingMock.complete_calls += 1
+            return await super().complete(request)
+
+        async def stream(self, request):  # type: ignore[no-untyped-def]
+            CountingMock.stream_calls += 1
+            async for chunk in super().stream(request):
+                yield chunk
+
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    executor = Executor(
+        provider=CountingMock(response='{"message": "hi"}'),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+    )
+
+    await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+    assert CountingMock.complete_calls == 1
+    assert CountingMock.stream_calls == 0
+
+
+# ---------------------------------------------------------------------------
 # Schema failures
 # ---------------------------------------------------------------------------
 

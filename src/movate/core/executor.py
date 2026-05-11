@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
@@ -89,6 +90,7 @@ class Executor:
         model_override: ModelConfig | None = None,
         workflow_run_id: str | None = None,
         node_id: str | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> RunResponse:
         """Execute one agent against one input.
 
@@ -100,7 +102,16 @@ class Executor:
         :class:`RunRecord` when the executor is invoked from a
         :class:`movate.core.workflow.WorkflowRunner` — keeps the runner from
         having to re-save the same run with a workflow link patched on.
-        """
+
+        ``on_token`` opts into streaming. When set, the executor calls
+        ``provider.stream()`` and invokes the callback with each text
+        delta as it arrives — useful for ``movate run --stream`` to
+        render tokens live in the terminal. The accumulated text is
+        still schema-validated, persisted, and returned the same way
+        as a non-streaming run; ``on_token`` only adds an observation
+        callback. Streaming inherits retries + fallback identically
+        to one-shot calls (a stream that exhausts retries falls
+        through to the next provider in the chain)."""
         job_id = job_id or str(uuid4())
         run_id = str(uuid4())
         spec = bundle.spec
@@ -169,7 +180,13 @@ class Executor:
                 )
 
                 async def _invoke(req: CompletionRequest = req) -> CompletionResponse:
-                    return await self._provider.complete(req)
+                    if on_token is None:
+                        return await self._provider.complete(req)
+                    # Stream path. Accumulate chunks into a single
+                    # CompletionResponse so everything below this
+                    # (schema validation, cost calc, persistence) sees
+                    # the same shape regardless of streaming.
+                    return await self._invoke_streaming(req, on_token)
 
                 try:
                     completion = await run_with_retries(_invoke)
@@ -263,6 +280,39 @@ class Executor:
                 started=started,
                 err=exc.last_error,
             )
+
+    async def _invoke_streaming(
+        self,
+        req: CompletionRequest,
+        on_token: Callable[[str], None],
+    ) -> CompletionResponse:
+        """Drive ``provider.stream()`` and accumulate into a single
+        :class:`CompletionResponse`.
+
+        Token totals come from the LAST chunk in the stream (providers
+        return them via ``stream_options={'include_usage': True}``).
+        If a stream ends without ever delivering usage stats — older
+        providers, mis-configured proxies — we fall through with
+        zeros. Cost accounting then reads zero, which is wrong but
+        survivable; the cost-drift check downstream will flag it."""
+        text_parts: list[str] = []
+        final_tokens: TokenUsage | None = None
+        raw: dict[str, Any] = {}
+        async for chunk in self._provider.stream(req):
+            if chunk.text:
+                text_parts.append(chunk.text)
+                on_token(chunk.text)
+            if chunk.tokens is not None:
+                final_tokens = chunk.tokens
+            if chunk.raw:
+                # Last write wins — adapters that forward provider
+                # metadata typically only stamp it on the final chunk.
+                raw.update(chunk.raw)
+        return CompletionResponse(
+            text="".join(text_parts),
+            tokens=final_tokens or TokenUsage(),
+            raw=raw,
+        )
 
     async def _check_tenant_budget(self) -> None:
         """Abort the run if the tenant has hit its monthly cap.

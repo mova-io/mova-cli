@@ -14,9 +14,15 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import AsyncIterator
 
 from movate.core.models import TokenUsage
-from movate.providers.base import BaseLLMProvider, CompletionRequest, CompletionResponse
+from movate.providers.base import (
+    BaseLLMProvider,
+    CompletionRequest,
+    CompletionResponse,
+    StreamChunk,
+)
 
 _DEFAULT_RESPONSE = '{"message": "mock response"}'
 _DEFAULT_JUDGE_RESPONSE = '{"score": 0.5, "rationale": "mock judge"}'
@@ -55,8 +61,27 @@ class MockProvider(BaseLLMProvider):
             raw={"mock": True, "provider": request.provider},
         )
 
-    async def stream(self, request: CompletionRequest) -> object:  # pragma: no cover
-        raise NotImplementedError
+    async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
+        """Deterministic streaming for tests: chunk the canned response
+        into ~10-char slices, then emit a final usage-only chunk so
+        cost accounting downstream sees real numbers."""
+        body = request.messages[0].content if request.messages else ""
+        text = self._judge_response if "Rubric:" in body else self._response
+        prompt_chars = sum(len(m.content) for m in request.messages)
+        # Yield in small slices so test code observing the chunks
+        # actually sees a stream (more than one chunk).
+        slice_size = 10
+        for i in range(0, len(text), slice_size):
+            yield StreamChunk(text=text[i : i + slice_size])
+        # Final chunk: zero text, populated tokens (mirrors LiteLLM's
+        # include_usage=True behaviour).
+        yield StreamChunk(
+            text="",
+            tokens=TokenUsage(
+                input=max(1, prompt_chars // 4),
+                output=max(1, len(text) // 4),
+            ),
+        )
 
     async def embed(self, text: str, *, model: str) -> list[float]:  # pragma: no cover
         raise NotImplementedError

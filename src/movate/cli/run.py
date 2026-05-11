@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,15 @@ def run(
     mock: bool = typer.Option(
         False, "--mock", help="Use the deterministic MockProvider (no API keys; for smoke tests)."
     ),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help=(
+            "Render model tokens to stderr as they arrive (preview). "
+            "Final output is still schema-validated + persisted normally; "
+            "this flag only adds a live preview. Workflow + replay modes ignore it."
+        ),
+    ),
     output_format: Run = typer.Option(Run.JSON, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Run an agent or workflow against the given input.
@@ -84,6 +94,9 @@ def run(
 
       [dim]# Plain string — auto-wraps to the agent's single required string field[/dim]
       $ movate run ./faq-agent "What is movate?"
+
+      [dim]# See tokens as they arrive (dev-loop preview)[/dim]
+      $ movate run ./faq-agent "hi" --stream
 
       [dim]# Mock mode (no API calls)[/dim]
       $ movate run ./faq-agent "hello" --mock
@@ -115,9 +128,18 @@ def run(
         return
 
     if is_workflow_path(path):
+        if stream:
+            # Workflows are multi-step; streaming one node's tokens
+            # interleaved with another's would be confusing. Out of scope
+            # for v0.5 — surface the limitation explicitly rather than
+            # silently ignoring the flag.
+            console.print("[red]✗[/red] --stream supports agents only; workflow streaming is TBD")
+            raise typer.Exit(code=2)
         _dispatch_workflow(path, input_flag or input_arg, mock=mock, output_format=output_format)
     else:
-        _dispatch_agent(path, input_flag or input_arg, mock=mock, output_format=output_format)
+        _dispatch_agent(
+            path, input_flag or input_arg, mock=mock, stream=stream, output_format=output_format
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +147,14 @@ def run(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_agent(path: Path, raw: str | None, *, mock: bool, output_format: Run) -> None:
+def _dispatch_agent(
+    path: Path,
+    raw: str | None,
+    *,
+    mock: bool,
+    stream: bool,
+    output_format: Run,
+) -> None:
     try:
         bundle = load_agent(path)
     except AgentLoadError as exc:
@@ -137,7 +166,9 @@ def _dispatch_agent(path: Path, raw: str | None, *, mock: bool, output_format: R
         raise typer.Exit(code=2)
     payload = _coerce_agent_input(raw, bundle)
 
-    asyncio.run(_run_local_agent(bundle, payload, output_format=output_format, mock=mock))
+    asyncio.run(
+        _run_local_agent(bundle, payload, output_format=output_format, mock=mock, stream=stream)
+    )
 
 
 def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
@@ -182,12 +213,26 @@ def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
 
 
 async def _run_local_agent(
-    bundle: AgentBundle, payload: dict[str, Any], *, output_format: Run, mock: bool
+    bundle: AgentBundle,
+    payload: dict[str, Any],
+    *,
+    output_format: Run,
+    mock: bool,
+    stream: bool = False,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     try:
         request = RunRequest(agent=bundle.spec.name, input=payload)
-        response = await rt.executor.execute(bundle, request)
+        # Streaming preview goes to stderr so it doesn't poison stdout
+        # (which carries the schema-validated final JSON). The MockProvider
+        # has no real stream path, so silently skip streaming under --mock.
+        on_token = _streaming_callback() if stream and not mock else None
+        response = await rt.executor.execute(bundle, request, on_token=on_token)
+        if on_token is not None:
+            # End the streamed preview with a newline so the JSON output
+            # below starts on its own line.
+            sys.stderr.write("\n")
+            sys.stderr.flush()
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
@@ -198,6 +243,21 @@ async def _run_local_agent(
 
     if response.status == "error":
         raise typer.Exit(code=1)
+
+
+def _streaming_callback() -> Callable[[str], None]:
+    """Return a token callback that writes each chunk to stderr,
+    unbuffered, so the preview reads as a live stream.
+
+    Lives here (not in _console.py) because it touches sys.stderr
+    directly rather than going through Rich — Rich would buffer and
+    apply markup, which is wrong for incremental tokens."""
+
+    def _emit(text: str) -> None:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+    return _emit
 
 
 # ---------------------------------------------------------------------------

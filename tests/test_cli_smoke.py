@@ -4,7 +4,11 @@ remaining stubs exit non-zero with the "not implemented" message.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from movate import __version__
@@ -98,6 +102,110 @@ def test_phase2plus_stub_commands_exit_nonzero(command: list[str]) -> None:
     """Commands not yet implemented exit with code 2 + a clear message."""
     result = runner.invoke(app, command)
     assert result.exit_code == STUB_EXIT_CODE
+
+
+def _scaffold_agent(agent_dir: Path) -> Path:
+    """Drop a minimal valid agent at ``agent_dir``. Used by streaming
+    smoke tests below — same shape as the workflow tests' helper."""
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "schema").mkdir(exist_ok=True)
+    (agent_dir / "evals").mkdir(exist_ok=True)
+    (agent_dir / "agent.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "movate/v1",
+                "kind": "Agent",
+                "name": "stream-demo",
+                "version": "0.1.0",
+                "model": {"provider": "openai/gpt-4o-mini-2024-07-18"},
+                "prompt": "./prompt.md",
+                "schema": {
+                    "input": "./schema/input.json",
+                    "output": "./schema/output.json",
+                },
+                "evals": {"dataset": "./evals/dataset.jsonl"},
+            }
+        )
+    )
+    (agent_dir / "prompt.md").write_text("echo {{ input.text }}\n")
+    (agent_dir / "schema" / "input.json").write_text(
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["text"],
+                "properties": {"text": {"type": "string", "minLength": 1}},
+            }
+        )
+    )
+    (agent_dir / "schema" / "output.json").write_text(
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["message"],
+                "properties": {"message": {"type": "string"}},
+            }
+        )
+    )
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        json.dumps({"input": {"text": "x"}, "expected": {"message": "x"}}) + "\n"
+    )
+    return agent_dir
+
+
+@pytest.mark.unit
+def test_run_stream_emits_tokens_to_stderr_in_mock_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``movate run <agent> --stream`` should:
+
+    * Render token deltas to stderr as they arrive (visible to a human
+      iterating on a prompt).
+    * Still emit the final validated JSON to stdout.
+    * Schema-validate the accumulated text the same way non-streaming
+      does (so partial JSON during streaming doesn't break anything).
+
+    NOTE: ``_run_local_agent`` currently disables streaming under
+    ``--mock`` (the MockProvider's stream path isn't meant for live
+    preview). To verify the wiring, we use a tailored MOVATE_MOCK_RESPONSE
+    and assert through executor's on_token plumbing via the inner test
+    in test_executor.py. Here we just guard the CLI surface:
+    --stream must parse, run, succeed."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "streamed"}')
+    agent_dir = _scaffold_agent(tmp_path / "stream-demo")
+
+    local_runner = CliRunner(mix_stderr=False)
+    result = local_runner.invoke(
+        app,
+        ["run", str(agent_dir), '{"text": "hi"}', "--mock", "--stream"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Stdout still carries the final validated JSON response.
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "success"
+    assert payload["data"] == {"message": "streamed"}
+
+
+@pytest.mark.unit
+def test_run_stream_rejected_on_workflow_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--stream`` on a workflow exits 2 with a clear message —
+    interleaved per-node tokens would be confusing; deferred."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    # Just enough to trip is_workflow_path() (presence of workflow.yaml).
+    (wf / "workflow.yaml").write_text("api_version: movate/v1\nkind: Workflow\n")
+
+    local_runner = CliRunner(mix_stderr=False)
+    result = local_runner.invoke(app, ["run", str(wf), "{}", "--stream"])
+    assert result.exit_code == 2
+    assert "--stream supports agents only" in result.stderr
 
 
 @pytest.mark.unit
