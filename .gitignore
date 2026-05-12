@@ -36,6 +36,13 @@ htmlcov/
 .DS_Store
 .claude/
 
+# Office app lock files (PowerPoint / Word open the .pptx and leaves ~$ siblings)
+~$*
+
+# User scratch — local-only experiment dirs + notes
+my-sandisk-agent/
+*-feedback.md
+
 # movate runtime
 ~/.movate/
 .movate/
