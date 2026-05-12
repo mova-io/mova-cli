@@ -162,6 +162,17 @@ var caeName = 'movate-${env}-cae'
 var apiName = 'movate-${env}-api'
 var workerName = 'movate-${env}-worker'
 var acsName = 'movate-${env}-acs${sfx}'
+// User-assigned identities for the api + worker apps. Pre-created at
+// this level (before the api/worker modules) so role assignments can be
+// granted to their principalIds BEFORE the apps exist. Avoids the
+// chicken-and-egg deadlock that system-assigned identities trip on a
+// cold deploy: app create waits for revision provisioning, revision
+// provisioning needs AcrPull + KV Secrets User, those roles wait for
+// the app's MI principalId, which doesn't exist until the app + its
+// revision are up. With UAIs, the principalId exists immediately, role
+// assignments land first, and the app's first revision comes up clean.
+var apiUaiName = 'movate-${env}-api-mi'
+var workerUaiName = 'movate-${env}-worker-mi'
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -244,6 +255,24 @@ module cae 'modules/containerapp-env.bicep' = {
   // also creates an implicit edge.
 }
 
+// User-assigned managed identities for the api + worker apps.
+// Created UNCONDITIONALLY (even on the infra-only first pass) — they
+// cost nothing, they're idempotent across deploys, and pre-staging
+// them lets us grant their role assignments early without waiting for
+// the apps to exist. See the `apiUaiName` var doc above for the
+// deadlock rationale.
+resource apiUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: apiUaiName
+  location: location
+  tags: tags
+}
+
+resource workerUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: workerUaiName
+  location: location
+  tags: tags
+}
+
 // Both Container Apps are gated on ``enableApiWorker`` so a fresh
 // deployment can run "infra-only" first, the operator populates KV
 // secrets, then the second pass deploys the apps. See param doc above.
@@ -264,6 +293,7 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     maxReplicas: apiMaxReplicas
     cpu: apiCpu
     memory: apiMemory
+    userAssignedIdentityId: apiUai.id
     tags: tags
   }
 }
@@ -300,6 +330,7 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     // alerts ("ping me when my job's done"); operator-wide trigger.
     enableTelegram: enableTelegram
     telegramChatId: telegramChatId
+    userAssignedIdentityId: workerUai.id
     tags: tags
   }
 }
@@ -332,51 +363,54 @@ resource kvResource 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 }
 
 // Role-assignment `name` must be a GUID derivable from inputs known at
-// deployment START. We can't use ``api.outputs.principalId`` here
-// (BCP120) — Bicep needs the name expanded before the api module's
-// outputs are known. Instead, build the GUID from static names + the
-// role id; the LIVE principalId still flows into ``properties.principalId``.
+// deployment START. We build it from the scope id + the UAI name +
+// the role id — all static. The LIVE UAI principalId (available
+// IMMEDIATELY because the UAI is a top-level resource, not nested in
+// a module that's gated on enableApiWorker) flows into the
+// `properties.principalId` field.
+//
+// Critically: these role assignments are NOT gated on enableApiWorker.
+// They reference the UAIs (which always exist) so they can land on
+// pass 1 — that's the whole point of the UAI conversion. When pass 2
+// flips enableApiWorker=true, the Container Apps come up with their
+// MI permissions already granted; the initial revision pulls the
+// image + reads KV without waiting on chicken-and-egg.
 
-// Role assignments are also gated on enableApiWorker — they
-// reference api/worker module outputs that don't exist when the apps
-// are skipped. The second-pass deploy creates the assignments on the
-// same RG; idempotent if they already exist.
-
-resource apiAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableApiWorker) {
+resource apiAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: acrResource
-  name: guid(acrResource.id, apiName, acrPullRoleId)
+  name: guid(acrResource.id, apiUaiName, acrPullRoleId)
   properties: {
-    principalId: api!.outputs.principalId
+    principalId: apiUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
   }
 }
 
-resource workerAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableApiWorker) {
+resource workerAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: acrResource
-  name: guid(acrResource.id, workerName, acrPullRoleId)
+  name: guid(acrResource.id, workerUaiName, acrPullRoleId)
   properties: {
-    principalId: worker!.outputs.principalId
+    principalId: workerUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
   }
 }
 
-resource apiKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableApiWorker) {
+resource apiKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: kvResource
-  name: guid(kvResource.id, apiName, kvSecretsUserRoleId)
+  name: guid(kvResource.id, apiUaiName, kvSecretsUserRoleId)
   properties: {
-    principalId: api!.outputs.principalId
+    principalId: apiUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
   }
 }
 
-resource workerKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableApiWorker) {
+resource workerKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: kvResource
-  name: guid(kvResource.id, workerName, kvSecretsUserRoleId)
+  name: guid(kvResource.id, workerUaiName, kvSecretsUserRoleId)
   properties: {
-    principalId: worker!.outputs.principalId
+    principalId: workerUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
   }

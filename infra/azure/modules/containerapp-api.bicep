@@ -47,6 +47,17 @@ param cpu string = '0.5'
 @description('Memory per replica (e.g. 1.0Gi).')
 param memory string = '1.0Gi'
 
+@description('''
+Resource id of the user-assigned managed identity this app authenticates
+as. Pre-created at the main.bicep top level so role assignments
+(AcrPull on ACR, "Key Vault Secrets User" on KV) can be created BEFORE
+the app exists — breaks the chicken-and-egg deadlock where a system-
+assigned MI's principalId only materializes after revision creation,
+but revision creation needs the role assignments to already exist
+to pull the image / read KV secrets.
+''')
+param userAssignedIdentityId string
+
 @description('Common tags.')
 param tags object = {}
 
@@ -55,9 +66,14 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
   location: location
   tags: tags
   identity: {
-    // System-assigned identity → used to pull from ACR + read KV secrets.
-    // Role assignments live in main.bicep so this module stays focused.
-    type: 'SystemAssigned'
+    // User-assigned identity → pre-created at the main.bicep level so
+    // role assignments are in place BEFORE this app's first revision
+    // tries to pull from ACR / read KV. See userAssignedIdentityId
+    // param doc above for the deadlock rationale.
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${userAssignedIdentityId}': {}
+    }
   }
   properties: {
     environmentId: environmentId
@@ -74,9 +90,11 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
       registries: [
         {
           server: acrLoginServer
-          // Identity-based pull. Empty username/passwordSecretRef +
-          // identity='system' tells ACA to use the system-assigned MI.
-          identity: 'system'
+          // Identity-based pull. `identity` is the user-assigned MI's
+          // resource id (pre-created at main.bicep top level). ACA uses
+          // that MI to pull the image — AcrPull role assignment lives
+          // on the MI, not on this app's runtime identity.
+          identity: userAssignedIdentityId
         }
       ]
       // Key Vault references — secrets land in env vars without ever
@@ -87,27 +105,27 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'pg-password'
           keyVaultUrl: '${keyVaultUri}secrets/pg-admin-password'
-          identity: 'system'
+          identity: userAssignedIdentityId
         }
         {
           name: 'openai-api-key'
           keyVaultUrl: '${keyVaultUri}secrets/openai-api-key'
-          identity: 'system'
+          identity: userAssignedIdentityId
         }
         {
           name: 'anthropic-api-key'
           keyVaultUrl: '${keyVaultUri}secrets/anthropic-api-key'
-          identity: 'system'
+          identity: userAssignedIdentityId
         }
         {
           name: 'langfuse-secret-key'
           keyVaultUrl: '${keyVaultUri}secrets/langfuse-secret-key'
-          identity: 'system'
+          identity: userAssignedIdentityId
         }
         {
           name: 'langfuse-public-key'
           keyVaultUrl: '${keyVaultUri}secrets/langfuse-public-key'
-          identity: 'system'
+          identity: userAssignedIdentityId
         }
       ]
     }
@@ -221,8 +239,12 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
 }
 
 output apiName string = api.name
-output principalId string = api.identity.principalId
 output fqdn string = api.properties.configuration.ingress.fqdn
 output appResourceId string = api.id
-@description('ACR id passthrough — main.bicep needs both this and the API principalId together for the role assignment.')
+@description('ACR id passthrough — main.bicep needs both this and the user-assigned MI principalId together for the role assignment.')
 output acrResourceIdEcho string = acrResourceId
+// Note: there is intentionally no principalId output here. With the
+// UserAssigned identity model, ``api.identity.principalId`` is empty —
+// the meaningful principalId lives on the UAI resource in main.bicep,
+// which is also where role assignments live. Consumers that need the
+// principalId should reference the UAI directly.

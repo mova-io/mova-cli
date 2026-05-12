@@ -28,6 +28,7 @@ from typing import Protocol
 
 from movate.core.models import (
     ApiKeyRecord,
+    BenchRecord,
     EvalRecord,
     FailureRecord,
     JobRecord,
@@ -109,6 +110,31 @@ class StorageProvider(Protocol):
 
         ``tenant_id=None`` returns evals across all tenants — operator
         tooling only; never exposed on the HTTP API.
+        """
+
+    async def save_bench(self, b: BenchRecord) -> None:
+        """Persist one bench-run summary. Sister to :meth:`save_eval`."""
+
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        """Exact lookup by ``bench_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` on missing-id OR cross-tenant — same response
+        shape so callers can't distinguish "doesn't exist" from "exists
+        under a different tenant." Same tenant-leak hygiene as
+        :meth:`get_eval`.
+        """
+
+    async def list_benches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        """List bench records newest-first, optionally filtered.
+
+        ``tenant_id=None`` returns records across all tenants —
+        operator tooling only; never exposed on the HTTP API.
         """
 
     async def list_workflow_runs(

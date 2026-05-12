@@ -16,6 +16,8 @@ import aiosqlite
 from movate.core.models import (
     ApiKeyEnv,
     ApiKeyRecord,
+    BenchModelRow,
+    BenchRecord,
     ErrorInfo,
     EvalRecord,
     FailureRecord,
@@ -88,6 +90,27 @@ CREATE TABLE IF NOT EXISTS evals (
 );
 CREATE INDEX IF NOT EXISTS idx_evals_agent_created
     ON evals(agent, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS bench_records (
+    bench_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    agent_version   TEXT NOT NULL,
+    input_hash      TEXT NOT NULL,
+    judge_method    TEXT,
+    judge_provider  TEXT,
+    rubric          TEXT,
+    runs_per_model  INTEGER NOT NULL,
+    gate_mode       TEXT NOT NULL,
+    total_cost_usd  REAL NOT NULL,
+    models          TEXT NOT NULL,  -- JSON array of BenchModelRow
+    created_at      TEXT NOT NULL
+);
+-- Trend / baseline lookups filter by tenant + agent first, then sort
+-- by created_at desc to fetch the most recent. Without this index the
+-- bench dashboard would table-scan every row in the tenant.
+CREATE INDEX IF NOT EXISTS idx_bench_records_tenant_agent_created
+    ON bench_records(tenant_id, agent, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_run_id   TEXT PRIMARY KEY,
@@ -403,6 +426,65 @@ class SqliteProvider:
         ) as cur:
             row = await cur.fetchone()
         return _row_to_eval(row) if row else None
+
+    async def save_bench(self, b: BenchRecord) -> None:
+        await self._db.execute(
+            "INSERT INTO bench_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                b.bench_id,
+                b.tenant_id,
+                b.agent,
+                b.agent_version,
+                b.input_hash,
+                b.judge_method.value if b.judge_method else None,
+                b.judge_provider,
+                b.rubric,
+                b.runs_per_model,
+                b.gate_mode,
+                b.total_cost_usd,
+                # Per-model rows stored as a JSON array. Pydantic's
+                # model_dump emits enums + datetimes natively but we
+                # don't have either nested here — plain dicts of
+                # primitives, safe to json.dumps directly.
+                json.dumps([m.model_dump() for m in b.models]),
+                b.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        # Same tenant-scoped lookup pattern as get_eval — caller can't
+        # read another tenant's record even by guessing the bench_id.
+        async with self._db.execute(
+            "SELECT * FROM bench_records WHERE bench_id = ? AND tenant_id = ? LIMIT 1",
+            (bench_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_bench(row) if row else None
+
+    async def list_benches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if agent:
+            clauses.append("agent = ?")
+            params.append(agent)
+        sql = "SELECT * FROM bench_records"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_bench(r) for r in rows]
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         await self._db.execute(
@@ -840,6 +922,24 @@ def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
         pass_rate=row["pass_rate"],
         sample_count=row["sample_count"],
         total_cost_usd=row["total_cost_usd"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_bench(row: aiosqlite.Row) -> BenchRecord:
+    return BenchRecord(
+        bench_id=row["bench_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        agent_version=row["agent_version"],
+        input_hash=row["input_hash"],
+        judge_method=JudgeMethod(row["judge_method"]) if row["judge_method"] else None,
+        judge_provider=row["judge_provider"],
+        rubric=row["rubric"],
+        runs_per_model=row["runs_per_model"],
+        gate_mode=row["gate_mode"],
+        total_cost_usd=row["total_cost_usd"],
+        models=[BenchModelRow(**m) for m in json.loads(row["models"])],
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 

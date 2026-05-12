@@ -21,10 +21,11 @@ from rich.table import Table
 from movate.cli._progress import progress_bar
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.bench import BenchEngine, BenchSummary, ModelBenchResult
+from movate.core.bench_baseline import BenchBaselineDiff
 from movate.core.config import load_project_config
 from movate.core.eval import EvalConfigError, load_judge_config
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
-from movate.core.models import JudgeConfig, JudgeMethod, ModelConfig
+from movate.core.models import BenchRecord, JudgeConfig, JudgeMethod, ModelConfig
 from movate.core.reporters import render_bench_markdown
 
 console = Console()
@@ -74,6 +75,25 @@ def bench(
         False, "--mock", help="Use the deterministic MockProvider (no API keys)."
     ),
     output_format: str = typer.Option("table", "--output", "-o", help="table | json | markdown"),
+    baseline: str = typer.Option(
+        None,
+        "--baseline",
+        help=(
+            "Diff this run against a stored BenchRecord. Pass a bench_id from "
+            "a prior `movate bench` output. Surfaces per-model score/cost/latency "
+            "deltas; exits 1 if any model's score regressed past --regression-tolerance."
+        ),
+    ),
+    regression_tolerance: float = typer.Option(
+        0.0,
+        "--regression-tolerance",
+        min=0.0,
+        max=1.0,
+        help=(
+            "Allowable score drop vs baseline before flagging a regression (0.0-1.0). "
+            "Default 0.0: any drop is a regression. ~0.05 is sensible for noisy LLM judges."
+        ),
+    ),
 ) -> None:
     """Benchmark an agent across multiple models (cost / latency / quality).
 
@@ -129,6 +149,8 @@ def bench(
             gate_mode=gate_mode,
             mock=mock,
             output_format=output_format,
+            baseline_id=baseline,
+            regression_tolerance=regression_tolerance,
         )
     )
 
@@ -225,7 +247,7 @@ def _ensure_dict(value: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def _run_bench(
+async def _run_bench(  # noqa: PLR0912 — orchestrator, branches are CLI mode dispatch
     bundle: AgentBundle,
     *,
     payload: dict[str, Any],
@@ -236,9 +258,12 @@ async def _run_bench(
     gate_mode: str,
     mock: bool,
     output_format: str,
+    baseline_id: str | None = None,
+    regression_tolerance: float = 0.0,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     show_progress = output_format == "table" and not mock
+    record: BenchRecord | None = None
     try:
         try:
             with _maybe_bench_progress(show_progress, total=len(providers)) as on_model:
@@ -255,15 +280,65 @@ async def _run_bench(
         except EvalConfigError as exc:
             err_console.print(f"[red]✗ bench config error:[/red] {exc}")
             raise typer.Exit(code=2) from None
+
+        # Persist a BenchRecord with the aggregated per-model rows + total cost.
+        # Mirrors `movate eval`'s save-by-default behavior — gives operators
+        # ``movate bench --baseline <id>`` for drift tracking without a flag.
+        # Save failures shouldn't sink the bench's user-facing output, so
+        # wrap it; the summary's still emitted via the existing renderer.
+        try:
+            record = summary.to_record(
+                judge_method=judge.method if judge else None,
+            )
+            await rt.storage.save_bench(record)
+        except Exception:
+            err_console.print(
+                "[dim]warn: failed to persist BenchRecord; bench output unchanged[/dim]"
+            )
+            record = None
+
+        # Baseline lookup happens here too — same storage handle, same
+        # tenant scope (defaults to ``local`` on a local-runtime bench;
+        # the HTTP-served path wires the real tenant_id).
+        baseline_record: BenchRecord | None = None
+        if baseline_id is not None:
+            baseline_record = await rt.storage.get_bench(baseline_id, tenant_id="local")
+            if baseline_record is None:
+                err_console.print(
+                    f"[yellow]warn: --baseline {baseline_id} not found "
+                    f"(or wrong tenant); skipping diff[/yellow]"
+                )
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
     if output_format == "json":
-        _emit_json(summary)
+        _emit_json(summary, bench_id=record.bench_id if record else None)
     elif output_format == "markdown":
         print(render_bench_markdown(summary))
+        if record is not None:
+            err_console.print(f"[dim]saved as bench_id={record.bench_id}[/dim]")
     else:
         _emit_table(summary)
+        if record is not None:
+            err_console.print(
+                f"[dim]saved as bench_id=[/dim][cyan]{record.bench_id}[/cyan]"
+                f" [dim](baseline this run: --baseline {record.bench_id})[/dim]"
+            )
+
+    # Baseline diff — only when both --baseline resolved AND the current
+    # bench got persisted (we need ``record`` to compute deltas).
+    if baseline_record is not None and record is not None:
+        from movate.core.bench_baseline import compute_bench_baseline_diff  # noqa: PLC0415
+
+        try:
+            diff = compute_bench_baseline_diff(baseline_record, record)
+        except ValueError as exc:
+            err_console.print(f"[yellow]warn: --baseline diff skipped: {exc}[/yellow]")
+        else:
+            _emit_baseline_diff(diff, tolerance=regression_tolerance)
+            if diff.is_regression(tolerance=regression_tolerance):
+                # Non-zero exit so CI can branch. Mirrors the eval flow.
+                raise typer.Exit(code=1)
 
 
 def _emit_table(summary: BenchSummary) -> None:
@@ -318,8 +393,8 @@ def _emit_table(summary: BenchSummary) -> None:
         )
 
 
-def _emit_json(summary: BenchSummary) -> None:
-    payload = {
+def _emit_json(summary: BenchSummary, *, bench_id: str | None = None) -> None:
+    payload: dict[str, Any] = {
         "agent": summary.agent,
         "agent_version": summary.agent_version,
         "input": summary.input,
@@ -328,6 +403,10 @@ def _emit_json(summary: BenchSummary) -> None:
         "gate_mode": summary.gate_mode,
         "models": [_model_to_json(m, summary.gate_mode) for m in summary.models],
     }
+    # Include bench_id when persistence succeeded so `-o json` callers
+    # (CI, scripts) can capture it for later --baseline use.
+    if bench_id is not None:
+        payload["bench_id"] = bench_id
     print(json.dumps(payload, indent=2))
 
 
@@ -348,6 +427,97 @@ def _model_to_json(m: ModelBenchResult, gate_mode: str) -> dict[str, Any]:
 
 def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _emit_baseline_diff(
+    diff: BenchBaselineDiff,
+    *,
+    tolerance: float,
+) -> None:
+    """Rich-render a per-model bench baseline diff. Stderr-only so the
+    primary bench output (stdout JSON / markdown / table) stays
+    pipe-friendly."""
+    # Header — baseline meta + warnings.
+    head = Table(title="Baseline diff", show_header=False)
+    head.add_column("field", style="dim")
+    head.add_column("value")
+    head.add_row("baseline_id", diff.baseline.bench_id)
+    head.add_row("current_id", diff.current.bench_id)
+    head.add_row("baseline_age", f"{int(diff.baseline_age_seconds)}s")
+    if diff.input_changed:
+        head.add_row(
+            "input",
+            "[yellow]CHANGED[/yellow] — baseline ran against a different input (comparison weaker)",
+        )
+    head.add_row("total cost Δ", _format_cost_delta(diff.total_cost_delta))
+    err_console.print(head)
+
+    # Per-model deltas.
+    if diff.matched:
+        rows = Table(title="Per-model deltas", show_header=True, header_style="bold")
+        rows.add_column("model")
+        rows.add_column("score Δ")
+        rows.add_column("cost/run Δ")
+        rows.add_column("p50 ms Δ")
+        rows.add_column("p95 ms Δ")
+        rows.add_column("flag")
+        for m in diff.matched:
+            flag = "[red]REGRESSION[/red]" if m.is_regression(tolerance=tolerance) else ""
+            rows.add_row(
+                m.provider,
+                _format_score_cell(m.score_delta, tolerance=tolerance),
+                _format_cost_delta(m.cost_mean_delta),
+                _format_ms_delta(m.latency_p50_delta),
+                _format_ms_delta(m.latency_p95_delta),
+                flag,
+            )
+        err_console.print(rows)
+
+    # Added / removed models — operator might want to extend the
+    # baseline or accept the divergence.
+    if diff.added or diff.removed:
+        meta = Table(title="Model set drift", show_header=False)
+        meta.add_column("field", style="dim")
+        meta.add_column("value")
+        if diff.added:
+            meta.add_row("added", ", ".join(diff.added))
+        if diff.removed:
+            meta.add_row("removed", ", ".join(diff.removed))
+        err_console.print(meta)
+
+    # Final one-liner — CI-grep-friendly.
+    regs = diff.regressing_models(tolerance=tolerance)
+    if regs:
+        err_console.print(
+            f"[red]✗ REGRESSION on {len(regs)} model(s) (tolerance ±{tolerance:.2f})[/red]"
+        )
+    else:
+        err_console.print(f"[green]✓ no regression past tolerance ±{tolerance:.2f}[/green]")
+
+
+def _format_score_cell(delta: float | None, *, tolerance: float) -> str:
+    """Color a per-model score delta. Red on regression past tolerance,
+    green on positive delta, dim/plain otherwise."""
+    if delta is None:
+        return "[dim]—[/dim]"
+    if delta < -tolerance:
+        return f"[red]{delta:+.4f}[/red]"
+    if delta > 0:
+        return f"[green]{delta:+.4f}[/green]"
+    return f"{delta:+.4f}"
+
+
+def _format_cost_delta(delta: float) -> str:
+    # Positive cost delta = bench got more expensive (bad). No coloring
+    # by default because cost regression isn't a gate.
+    if delta == 0:
+        return f"${delta:+.6f}"
+    return f"${delta:+.6f}"
+
+
+def _format_ms_delta(delta: int) -> str:
+    # Same shape as cost; latency went up = positive delta.
+    return f"{delta:+d}"
 
 
 @contextmanager

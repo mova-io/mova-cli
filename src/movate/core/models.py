@@ -366,6 +366,76 @@ class EvalRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class BenchModelRow(BaseModel):
+    """Per-model aggregate row inside a :class:`BenchRecord`.
+
+    One row per provider/model that `movate bench` exercised. Field
+    semantics mirror the live ``ModelBenchResult`` properties on the
+    bench engine — same numbers, persisted instead of recomputed.
+
+    ``score`` is ``None`` when no judge was configured for the bench
+    OR when the judge was skipped for this provider (e.g. cross-family
+    enforcement). ``skipped_reason`` carries the human-readable
+    explanation in that case; ``skipped_score`` is the boolean — both
+    distinguish "no judge at all" (``score=None``, ``skipped_score=False``)
+    from "judge skipped for cross-family reasons" (``score=None``,
+    ``skipped_score=True``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    successful_runs: int
+    error_count: int
+    cost_total_usd: float
+    cost_mean_usd: float
+    latency_p50_ms: int
+    latency_p95_ms: int
+    score: float | None = None
+    skipped_reason: str | None = None
+    skipped_score: bool = False
+
+
+class BenchRecord(BaseModel):
+    """Persisted summary of one bench run (one input, one agent version, N models).
+
+    Sister to :class:`EvalRecord` but for the bench surface. Eval is
+    dataset * runs across ONE provider; bench is ONE input * runs
+    across N providers. Both shapes serve as drift-tracking anchors —
+    ``movate bench --baseline <id>`` diffs current scores / costs /
+    latencies against a stored baseline the same way
+    ``movate eval --baseline`` does.
+
+    ``input_hash`` is sha256 of the canonical JSON of the input dict
+    (sorted keys, no whitespace). Lets you spot when a baseline diff
+    was computed against a different input — without storing the full
+    input in the row (PII consideration on shared envs).
+
+    ``judge_method`` is optional because bench can run with no judge at
+    all (cost/latency-only comparison). When ``None``, all per-model
+    ``score`` fields are also ``None``.
+
+    The ``models`` field is JSON-serialized in the storage row — sqlite
+    uses TEXT + json.loads on read, postgres uses JSONB natively.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bench_id: str
+    tenant_id: str
+    agent: str
+    agent_version: str
+    input_hash: str
+    judge_method: JudgeMethod | None = None
+    judge_provider: str | None = None
+    rubric: str | None = None
+    runs_per_model: int
+    gate_mode: str
+    total_cost_usd: float
+    models: list[BenchModelRow] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_now)
+
+
 # ---------------------------------------------------------------------------
 # Job queue (v0.5+)
 #
