@@ -214,6 +214,7 @@ class BenchEngine:
         judge: JudgeConfig | None = None,
         rubric: str | None = None,
         on_model_complete: Callable[[int, int, ModelBenchResult], None] | None = None,
+        on_model_start: Callable[[int, int, str], None] | None = None,
     ) -> None:
         if runs_per_model < 1:
             raise EvalConfigError("runs_per_model must be >= 1")
@@ -233,6 +234,13 @@ class BenchEngine:
         after each model finishes; CLI uses it to drive a Rich
         progress bar without coupling the engine to UI."""
 
+        self._on_model_start = on_model_start
+        """Optional progress hook: ``(index, total, provider_str)``.
+        Fires BEFORE each model's run loop begins, so the CLI's
+        progress bar can show what's currently in flight rather than
+        only what last completed. Without this, a 3-model bench with
+        ~30s/model shows 30s of dead air before the first advance."""
+
     async def run(
         self,
         bundle: AgentBundle,
@@ -244,7 +252,11 @@ class BenchEngine:
             raise EvalConfigError("bench requires at least one --model")
 
         results: list[ModelBenchResult] = []
-        for prov in providers:
+        for idx, prov in enumerate(providers):
+            if self._on_model_start is not None:
+                # Decorative; never sink the bench on a buggy callback.
+                with contextlib.suppress(Exception):
+                    self._on_model_start(idx, len(providers), prov)
             judge_skipped = False
             if self._judge and self._judge.method == JudgeMethod.LLM_JUDGE:
                 try:

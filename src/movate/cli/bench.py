@@ -11,6 +11,7 @@ import json
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -266,7 +267,7 @@ async def _run_bench(  # noqa: PLR0912 — orchestrator, branches are CLI mode d
     record: BenchRecord | None = None
     try:
         try:
-            with _maybe_bench_progress(show_progress, total=len(providers)) as on_model:
+            with _maybe_bench_progress(show_progress, total=len(providers)) as callbacks:
                 engine = BenchEngine(
                     executor=rt.executor,
                     provider=rt.provider,
@@ -274,7 +275,8 @@ async def _run_bench(  # noqa: PLR0912 — orchestrator, branches are CLI mode d
                     gate_mode=gate_mode,
                     judge=judge,
                     rubric=rubric,
-                    on_model_complete=on_model,
+                    on_model_start=callbacks.on_start if callbacks else None,
+                    on_model_complete=callbacks.on_complete if callbacks else None,
                 )
                 summary = await engine.run(bundle, input_payload=payload, providers=providers)
         except EvalConfigError as exc:
@@ -520,11 +522,22 @@ def _format_ms_delta(delta: int) -> str:
     return f"{delta:+d}"
 
 
+@dataclass
+class _BenchCallbacks:
+    on_start: Callable[[int, int, str], None]
+    on_complete: Callable[[int, int, ModelBenchResult], None]
+
+
 @contextmanager
 def _maybe_bench_progress(
     enabled: bool, *, total: int
-) -> Iterator[Callable[[int, int, ModelBenchResult], None] | None]:
-    """Yield a callback for ``BenchEngine.on_model_complete``.
+) -> Iterator[_BenchCallbacks | None]:
+    """Yield paired callbacks for ``BenchEngine``'s start + complete hooks.
+
+    Two-hook design: ``on_start`` updates the description to show what's
+    *currently running* (no dead air while a model thinks for 30s);
+    ``on_complete`` advances the bar by one when it finishes. Without
+    ``on_start``, a 3-model bench showed no movement for the first 30s.
 
     Suppressed when not rendering for humans (json/markdown) or in
     mock mode (where the per-model loop is fast enough that a bar is
@@ -536,10 +549,15 @@ def _maybe_bench_progress(
 
     with progress_bar(description="models", total=total) as advance:
 
-        def on_model(done: int, total_in_cb: int, result: ModelBenchResult) -> None:
-            _ = (done, total_in_cb)
-            # Append the just-finished model name so the bar shows
-            # progress + which model was last evaluated.
-            advance(suffix=f" — {result.provider}")
+        def on_start(idx: int, _total: int, provider: str) -> None:
+            # Live indicator of what's in flight — no advance yet, just
+            # the description swap so the user sees "currently testing
+            # openai/gpt-4o-mini" while the call is in progress.
+            advance(amount=0, suffix=f" — testing {provider}")
 
-        yield on_model
+        def on_complete(_done: int, _total: int, result: ModelBenchResult) -> None:
+            # Advance one tick now that the model finished. Suffix shows
+            # the model that just completed.
+            advance(suffix=f" — finished {result.provider}")
+
+        yield _BenchCallbacks(on_start=on_start, on_complete=on_complete)
