@@ -48,6 +48,7 @@ from typing import Protocol
 
 from movate.core.models import JobRecord
 from movate.core.notify_sms import build_sms_backend
+from movate.core.notify_telegram import build_telegram_backend
 
 logger = logging.getLogger(__name__)
 
@@ -265,16 +266,17 @@ def build_dispatcher() -> NotificationDispatcher:
     channel for each terminal job.
 
     Each channel's backend is selected by its own env-driven factory
-    (:func:`build_email_backend`, :func:`build_sms_backend`) so adding
-    a third channel later (Slack, PagerDuty, etc.) is a one-line change
-    here.
+    (:func:`build_email_backend`, :func:`build_sms_backend`,
+    :func:`build_telegram_backend`) so adding a fourth channel later
+    (Slack, PagerDuty, etc.) is a one-line change here.
 
     Idempotent + side-effect-free. Each worker startup calls this once;
     the worker holds the result for its lifetime.
     """
     email_backend = build_email_backend()
     sms_backend = build_sms_backend()
-    return MultiDispatcher([email_backend, sms_backend])
+    telegram_backend = build_telegram_backend()
+    return MultiDispatcher([email_backend, sms_backend, telegram_backend])
 
 
 # ---------------------------------------------------------------------------

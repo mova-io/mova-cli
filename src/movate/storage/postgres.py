@@ -30,6 +30,8 @@ import asyncpg
 from movate.core.models import (
     ApiKeyEnv,
     ApiKeyRecord,
+    BenchModelRow,
+    BenchRecord,
     ErrorInfo,
     EvalRecord,
     FailureRecord,
@@ -99,6 +101,24 @@ CREATE TABLE IF NOT EXISTS evals (
 );
 CREATE INDEX IF NOT EXISTS idx_evals_agent_created
     ON evals(agent, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS bench_records (
+    bench_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    agent_version   TEXT NOT NULL,
+    input_hash      TEXT NOT NULL,
+    judge_method    TEXT,
+    judge_provider  TEXT,
+    rubric          TEXT,
+    runs_per_model  INTEGER NOT NULL,
+    gate_mode       TEXT NOT NULL,
+    total_cost_usd  DOUBLE PRECISION NOT NULL,
+    models          JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_records_tenant_agent_created
+    ON bench_records(tenant_id, agent, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_run_id   TEXT PRIMARY KEY,
@@ -410,6 +430,64 @@ class PostgresProvider:
         sql = f"SELECT * FROM evals {where} ORDER BY created_at DESC LIMIT ${len(params)}"
         rows = await self._db.fetch(sql, *params)
         return [_row_to_eval(r) for r in rows]
+
+    async def save_bench(self, b: BenchRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO bench_records (
+                bench_id, tenant_id, agent, agent_version, input_hash,
+                judge_method, judge_provider, rubric, runs_per_model,
+                gate_mode, total_cost_usd, models, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13
+            )
+            """,
+            b.bench_id,
+            b.tenant_id,
+            b.agent,
+            b.agent_version,
+            b.input_hash,
+            b.judge_method.value if b.judge_method else None,
+            b.judge_provider,
+            b.rubric,
+            b.runs_per_model,
+            b.gate_mode,
+            b.total_cost_usd,
+            # asyncpg serializes JSONB from a Python str/bytes — easier
+            # than registering a custom codec. The ::jsonb cast in the
+            # SQL converts the TEXT param to JSONB at insert time.
+            json.dumps([m.model_dump() for m in b.models]),
+            b.created_at,
+        )
+
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM bench_records WHERE bench_id = $1 AND tenant_id = $2",
+            bench_id,
+            tenant_id,
+        )
+        return _row_to_bench(row) if row else None
+
+    async def list_benches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
+        if agent is not None:
+            params.append(agent)
+            clauses.append(f"agent = ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        sql = f"SELECT * FROM bench_records {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_bench(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Workflow runs
@@ -825,6 +903,30 @@ def _row_to_eval(row: asyncpg.Record) -> EvalRecord:
         pass_rate=row["pass_rate"],
         sample_count=row["sample_count"],
         total_cost_usd=row["total_cost_usd"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
+    # JSONB column comes back as either a str (driver default) or a
+    # parsed object depending on the asyncpg version + codec setup.
+    # Handle both: parse if str, use as-is if already a list.
+    models_raw = row["models"]
+    if isinstance(models_raw, str):
+        models_raw = json.loads(models_raw)
+    return BenchRecord(
+        bench_id=row["bench_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        agent_version=row["agent_version"],
+        input_hash=row["input_hash"],
+        judge_method=JudgeMethod(row["judge_method"]) if row["judge_method"] else None,
+        judge_provider=row["judge_provider"],
+        rubric=row["rubric"],
+        runs_per_model=row["runs_per_model"],
+        gate_mode=row["gate_mode"],
+        total_cost_usd=row["total_cost_usd"],
+        models=[BenchModelRow(**m) for m in models_raw],
         created_at=row["created_at"],
     )
 

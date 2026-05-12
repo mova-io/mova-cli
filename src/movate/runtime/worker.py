@@ -206,15 +206,21 @@ class Worker:
         # Fire-and-await notification AFTER the update has committed.
         # Re-queued jobs DON'T notify — the run isn't done yet; the
         # notification fires when the retry eventually lands a true
-        # terminal status. The dispatcher's contract is "never raise";
-        # we still wrap to belt-and-suspender any future implementation
-        # that slips and raises something the worker shouldn't die on.
-        # Either channel set means we have something to notify — the
-        # composite dispatcher's per-channel backends each early-return
-        # for channels the job didn't address, so it's safe to call
-        # unconditionally as long as at least one channel is requested.
-        notify_requested = bool(job.notify_email or job.notify_sms)
-        if final_action == "terminal" and self._notifier is not None and notify_requested:
+        # terminal status.
+        #
+        # We invoke the dispatcher on EVERY terminal job. Each composed
+        # backend decides for itself whether the job is in scope:
+        #   * Email: fires only if ``job.notify_email`` is set (per-job opt-in)
+        #   * SMS: fires only if ``job.notify_sms`` is set (per-job opt-in)
+        #   * Telegram: fires on every terminal job when its env config
+        #     is present (operator-wide alert pattern — different shape
+        #     from the per-job channels because it's the same human
+        #     across all jobs)
+        #   * Console fallbacks (when env not configured): log only
+        #
+        # The dispatcher contract is "never raise"; we still wrap to
+        # belt-and-suspender any future implementation that breaks it.
+        if final_action == "terminal" and self._notifier is not None:
             try:
                 # Use the post-update view so the notification reflects
                 # the terminal status, not the RUNNING snapshot we have

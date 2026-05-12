@@ -234,7 +234,7 @@ For ad-hoc deploys (e.g. emergency rollback), use the
 | `az acr build` says "AcrPush not granted" | Stage 3 deferred AcrPush because ACR didn't exist yet | Re-run `ACR_NAME_OVERRIDE=<actual-acr-name> scripts/azure-bootstrap.sh <env>` |
 | Bicep deploy fails with `VaultAlreadyExists` / `AlreadyInUse` / `ServerNameAlreadyExists` | Default resource names (`movate-<env>-kv`, `movate<env>acr`, `movate-<env>-pg`) collide with another Azure tenant — these live in Azure-wide global namespaces | Set `nameSuffix = '<2-6-char-tag>'` in your bicepparam (e.g. your initials, org slug). The Bicep template appends it to KV / ACR / Postgres / ACS names. Then re-run the deploy with the new ACR name: `ACR_NAME_OVERRIDE=movate<env>acr<suffix> scripts/azure-bootstrap.sh <env>` for the SP's AcrPush role. |
 | Bicep deploy fails: `ResourceProviderNotRegistered` for `Microsoft.App` | First time deploying ACA in this subscription | `az provider register -n Microsoft.App --wait` (takes 1-15 min) then re-run the deploy |
-| Container Apps stuck in `provisioningState: InProgress`, `/healthz` returns "Container App stopped" 404 page | ACA's revision creation deadlocked: the apps' managed identities don't yet have AcrPull on the ACR or KV Secrets User on the KV (Bicep tries to grant them top-level but it races) | Out-of-band assign roles to the MIs: `az role assignment create --assignee <api-mi-principalId> --role AcrPull --scope <acr-id>` (and the same for worker + KV with role "Key Vault Secrets User"); then `az containerapp update -g <rg> -n movate-<env>-api --revision-suffix retry1` to nudge a new revision. Repeat for the worker. |
+| Container Apps stuck in `provisioningState: InProgress`, `/healthz` returns "Container App stopped" 404 page | Historical: ACA's revision creation could deadlock when the apps' system-assigned managed identities didn't yet have AcrPull on the ACR or KV Secrets User on the KV. **Fixed in the current Bicep** by switching to user-assigned managed identities created at the `main.bicep` top level — role assignments land before the apps exist. If you DID hit this on an old deploy, the workaround is: out-of-band `az role assignment create --assignee <mi-principalId> --role AcrPull --scope <acr-id>` (same for KV with `Key Vault Secrets User`), then `az containerapp update -g <rg> -n movate-<env>-api --revision-suffix retry1`. Re-deploy with the current Bicep to permanently move to UAIs. |
 | GH Actions deploy: "AADSTS70021: No matching federated identity record" | Branch name doesn't match `release/<env>` pattern | Check the branch name, or re-create the federated credential with the right `subject` |
 | `movate doctor --target prod` shows "subscription match: missing" | Logged in to a different sub locally | `az account set --subscription <id>` |
 | GH workflow can't find the Environment | Environment name doesn't match the branch suffix | Create / rename the GH Environment to match `release/<env>` |
@@ -254,6 +254,67 @@ Steady-state idle cost per env (no traffic, min replicas = 0/0):
 
 These are bounds; actual cost scales with traffic. Confirm budget
 with your finance lead before deploying prod.
+
+## Optional: Telegram alerts for personal dev-loop notifications
+
+Telegram is the **recommended channel for personal operator alerts** —
+"ping me when my submitted job finishes." Free, no regulatory hurdles,
+~5 min setup. Use ACS SMS (next section) for customer-facing surfaces;
+Telegram for your own dev loop.
+
+Unlike SMS (per-job opt-in via `--notify-sms`), Telegram is
+**operator-wide**: when configured on the worker, it pings on every
+terminal job. That's the natural shape for the "alert me on everything
+I submit" use case.
+
+**One-time setup (~5 min):**
+
+1. On your phone: open Telegram, search for `@BotFather`, send
+   `/newbot`, give it a name (e.g. `movate-jeremy-dev`). BotFather
+   replies with a token like `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`.
+2. Search for your new bot in Telegram, open the chat, send `/start`.
+   This activates the chat for the bot to message you.
+3. In your browser, open `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+   Find the `"chat":{"id": ...}` value — that's your `chat_id`.
+
+**Two-pass deploy (worker reads token from KV; chat_id is non-secret):**
+
+```bash
+# Pass A — wire the env. In your bicepparam:
+#   param enableTelegram = true
+#   param telegramChatId = '987654321'   # the chat.id from step 3
+
+# Paste the bot token into KV (silenced so it doesn't echo):
+az keyvault secret set --vault-name movate-<env>-kv-<suffix> \
+    --name telegram-bot-token \
+    --value "<paste-token-here>" > /dev/null
+
+# Pass B — re-deploy. The worker comes up with MOVATE_TELEGRAM_*
+# env vars set; build_telegram_backend() picks TelegramBackend.
+az deployment group create \
+    -g movate-<env>-rg \
+    -f infra/azure/main.bicep \
+    -p infra/azure/main.<env>.bicepparam
+```
+
+**Test it:** submit a job (`movate submit <agent> '{"text":"hi"}'`).
+The worker will Telegram you when it lands terminal (~few seconds for
+a `--mock` agent). The notification looks like:
+
+> ✅ **movate** agent/`faq-agent` — **success**
+> elapsed: 423ms
+> run: `5fdb30de`
+
+**Rotating the token:** `BotFather` → `/revoke` the current token,
+`/token` to mint a new one, then re-run the `az keyvault secret set`
+command above. Worker picks up the new token on next restart (ACA
+restarts revisions automatically on KV secret rotation if KV
+auto-rotation is wired — otherwise: `az containerapp revision restart
+-g <rg> -n movate-<env>-worker --revision <name>`).
+
+**Cost:** $0. No per-message charge, no monthly fee, no regulatory
+registration. Telegram's free Bot API is rate-limited at 30 messages
+per second to the same chat — far above any realistic job volume.
 
 ## Optional: SMS notifications via Azure Communication Services
 

@@ -86,6 +86,37 @@ during the provisioning pass before the number is purchased.
 ''')
 param acsFromNumber string = ''
 
+@description('''
+Wire Telegram operator-alert env vars into the worker. When true, the
+worker gets:
+  - MOVATE_TELEGRAM_BOT_TOKEN from KV secret ``telegram-bot-token``
+  - MOVATE_TELEGRAM_CHAT_ID from the ``telegramChatId`` param below
+Both must be set together; python build_telegram_backend() refuses
+partial config. Unlike SMS (per-job opt-in), Telegram is operator-wide:
+it pings on every terminal job — designed for personal dev-loop
+alerts ("my job's done").
+''')
+param enableTelegram bool = false
+
+@description('''
+Telegram chat_id the worker pings on every terminal job. Non-secret;
+lives alongside ``image`` in the bicepparam. Numeric string (e.g.
+``987654321``). Get it from
+https://api.telegram.org/bot<TOKEN>/getUpdates after sending /start to
+your bot. Empty string disables the env var even when
+``enableTelegram`` is true.
+''')
+param telegramChatId string = ''
+
+@description('''
+Resource id of the user-assigned managed identity this worker
+authenticates as. Pre-created at main.bicep top level so the role
+assignments (AcrPull, KV Secrets User) are in place BEFORE the worker's
+first revision tries to pull the image / read KV. Breaks the chicken-
+and-egg deadlock that system-assigned identities trip on a cold deploy.
+''')
+param userAssignedIdentityId string
+
 @description('Common tags.')
 param tags object = {}
 
@@ -94,7 +125,10 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
   location: location
   tags: tags
   identity: {
-    type: 'SystemAssigned'
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${userAssignedIdentityId}': {}
+    }
   }
   properties: {
     environmentId: environmentId
@@ -105,7 +139,11 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
       registries: [
         {
           server: acrLoginServer
-          identity: 'system'
+          // ACR pull via the user-assigned MI. AcrPull role lives on the
+          // UAI (granted in main.bicep before this app is created) — so
+          // the first revision can pull without hitting the deadlock that
+          // bit us under SystemAssigned identity.
+          identity: userAssignedIdentityId
         }
       ]
       secrets: concat(
@@ -113,7 +151,7 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
           {
             name: 'pg-password'
             keyVaultUrl: '${keyVaultUri}secrets/pg-admin-password'
-            identity: 'system'
+            identity: userAssignedIdentityId
           }
           {
             // Full libpq connection string for the KEDA postgresql
@@ -127,27 +165,27 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
             //              password=$PG_PASSWORD dbname=$PG_DB sslmode=require"
             name: 'pg-connection-string'
             keyVaultUrl: '${keyVaultUri}secrets/pg-connection-string'
-            identity: 'system'
+            identity: userAssignedIdentityId
           }
           {
             name: 'openai-api-key'
             keyVaultUrl: '${keyVaultUri}secrets/openai-api-key'
-            identity: 'system'
+            identity: userAssignedIdentityId
           }
           {
             name: 'anthropic-api-key'
             keyVaultUrl: '${keyVaultUri}secrets/anthropic-api-key'
-            identity: 'system'
+            identity: userAssignedIdentityId
           }
           {
             name: 'langfuse-secret-key'
             keyVaultUrl: '${keyVaultUri}secrets/langfuse-secret-key'
-            identity: 'system'
+            identity: userAssignedIdentityId
           }
           {
             name: 'langfuse-public-key'
             keyVaultUrl: '${keyVaultUri}secrets/langfuse-public-key'
-            identity: 'system'
+            identity: userAssignedIdentityId
           }
         ],
         // SMS connection string — only wired when enableSms is true.
@@ -158,7 +196,19 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               {
                 name: 'acs-connection-string'
                 keyVaultUrl: '${keyVaultUri}secrets/acs-connection-string'
-                identity: 'system'
+                identity: userAssignedIdentityId
+              }
+            ]
+          : [],
+        // Telegram bot token — only wired when enableTelegram is true.
+        // Operator pastes the bot token (from @BotFather) into KV under
+        // this exact name once: az keyvault secret set --name telegram-bot-token
+        enableTelegram
+          ? [
+              {
+                name: 'telegram-bot-token'
+                keyVaultUrl: '${keyVaultUri}secrets/telegram-bot-token'
+                identity: userAssignedIdentityId
               }
             ]
           : []
@@ -229,6 +279,22 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
                     value: acsFromNumber
                   }
                 ]
+              : [],
+            // Telegram env wiring — only when enableTelegram AND chat_id
+            // is populated. Same two-phase pattern as SMS: operator can
+            // flip the flag during provisioning before they've grabbed
+            // their chat_id from @BotFather's getUpdates URL.
+            enableTelegram && !empty(telegramChatId)
+              ? [
+                  {
+                    name: 'MOVATE_TELEGRAM_BOT_TOKEN'
+                    secretRef: 'telegram-bot-token'
+                  }
+                  {
+                    name: 'MOVATE_TELEGRAM_CHAT_ID'
+                    value: telegramChatId
+                  }
+                ]
               : []
           )
         }
@@ -265,6 +331,9 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
 }
 
 output workerName string = worker.name
-output principalId string = worker.identity.principalId
 output appResourceId string = worker.id
 output acrResourceIdEcho string = acrResourceId
+// Note: no principalId output. With the UserAssigned identity model,
+// ``worker.identity.principalId`` is empty — the meaningful principalId
+// lives on the UAI resource in main.bicep, alongside its role
+// assignments. Consumers should reference the UAI directly.

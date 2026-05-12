@@ -375,6 +375,54 @@ async def test_cost_drift_logs_event(
 
 
 @pytest.mark.unit
+async def test_executor_mirrors_cost_and_token_attrs_onto_span(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """Every successful run sets ``cost_usd``, ``pricing_version``,
+    ``chosen_provider``, and per-token ``tokens.input`` / ``tokens.output``
+    / ``tokens.cached_input`` on the agent.execute span — so Langfuse
+    / OTel consumers can build cost dashboards by filtering on those
+    attrs without joining back to RunRecord.
+
+    The values match what's persisted on the RunRecord; the storage
+    row is canonical if anything drifts."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    executor = Executor(
+        provider=MockProvider(response='{"message": "hi"}'),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+    )
+
+    response = await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+    assert response.status == "success"
+
+    # Filter attribute calls down to the agent.execute span only —
+    # provider-level spans might add their own attrs later.
+    attrs = {k: v for (span_name, k, v) in tracer.attribute_calls if span_name == "agent.execute"}
+
+    # All six required attrs are present.
+    assert "cost_usd" in attrs
+    assert "pricing_version" in attrs
+    assert "chosen_provider" in attrs
+    assert "tokens.input" in attrs
+    assert "tokens.output" in attrs
+    assert "tokens.cached_input" in attrs
+
+    # Values match the persisted RunRecord (storage is canonical).
+    assert attrs["cost_usd"] == response.metrics.cost_usd
+    assert attrs["pricing_version"] == response.metrics.pricing_version
+    assert attrs["chosen_provider"] == response.metrics.provider
+    assert attrs["tokens.input"] == response.metrics.tokens.input
+    assert attrs["tokens.output"] == response.metrics.tokens.output
+    assert attrs["tokens.cached_input"] == response.metrics.tokens.cached_input
+
+
+@pytest.mark.unit
 def test_typed_failure_types_distinct() -> None:
     assert SchemaError("x").__class__ is not RateLimitError("y").__class__
     assert isinstance(SchemaError("x"), MovateError)

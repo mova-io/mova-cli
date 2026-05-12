@@ -33,6 +33,8 @@ import pytest
 from movate.core.auth import mint_api_key
 from movate.core.models import (
     ApiKeyEnv,
+    BenchModelRow,
+    BenchRecord,
     EvalRecord,
     FailureRecord,
     JobKind,
@@ -103,6 +105,34 @@ def _eval(*, tenant_id: str, eval_id: str | None = None) -> EvalRecord:
     )
 
 
+def _bench(*, tenant_id: str, bench_id: str | None = None) -> BenchRecord:
+    return BenchRecord(
+        bench_id=bench_id or uuid4().hex,
+        tenant_id=tenant_id,
+        agent="x-agent",
+        agent_version="0.1.0",
+        input_hash="a1b2c3d4e5f60718",
+        judge_method=None,
+        judge_provider=None,
+        rubric=None,
+        runs_per_model=1,
+        gate_mode="mean",
+        total_cost_usd=0.0009,
+        models=[
+            BenchModelRow(
+                provider="openai/gpt-4o-mini-2024-07-18",
+                successful_runs=1,
+                error_count=0,
+                cost_total_usd=0.0009,
+                cost_mean_usd=0.0009,
+                latency_p50_ms=400,
+                latency_p95_ms=500,
+                score=None,
+            ),
+        ],
+    )
+
+
 def _job(*, tenant_id: str, job_id: str | None = None) -> JobRecord:
     return JobRecord(
         job_id=job_id or uuid4().hex,
@@ -170,6 +200,26 @@ async def test_get_eval_returns_none_for_other_tenants_row(storage) -> None:
     assert (await storage.get_eval(a.eval_id, tenant_id=ALPHA)) is not None
     assert (await storage.get_eval(a.eval_id, tenant_id=BETA)) is None
     assert (await storage.get_eval(b.eval_id, tenant_id=BETA)) is not None
+
+
+# ---------------------------------------------------------------------------
+# get_bench — same tenant-isolation contract as get_eval. The bench
+# table is added alongside evals as a peer trend-tracking surface; we
+# enforce identical cross-tenant semantics (None on cross-tenant
+# lookup; never leak existence).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_get_bench_returns_none_for_other_tenants_row(storage) -> None:
+    a = _bench(tenant_id=ALPHA)
+    b = _bench(tenant_id=BETA)
+    await storage.save_bench(a)
+    await storage.save_bench(b)
+
+    assert (await storage.get_bench(a.bench_id, tenant_id=ALPHA)) is not None
+    assert (await storage.get_bench(a.bench_id, tenant_id=BETA)) is None
+    assert (await storage.get_bench(b.bench_id, tenant_id=BETA)) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +379,26 @@ async def test_list_evals_filters_by_tenant(storage) -> None:
     # Operator drain mode (tenant_id=None) sees everything.
     rows_all = await storage.list_evals()
     assert {e.eval_id for e in rows_all} == {a.eval_id, b.eval_id}
+
+
+@pytest.mark.unit
+async def test_list_benches_filters_by_tenant(storage) -> None:
+    """``list_benches`` mirrors ``list_evals``'s tenant-isolation
+    contract — same v1.0 stage 4 guarantee applied to the bench
+    surface added in this PR."""
+    a = _bench(tenant_id=ALPHA)
+    b = _bench(tenant_id=BETA)
+    await storage.save_bench(a)
+    await storage.save_bench(b)
+
+    rows = await storage.list_benches(tenant_id=ALPHA)
+    assert {r.bench_id for r in rows} == {a.bench_id}
+    rows = await storage.list_benches(tenant_id=BETA)
+    assert {r.bench_id for r in rows} == {b.bench_id}
+
+    # Operator drain mode (tenant_id=None) sees everything.
+    rows_all = await storage.list_benches()
+    assert {r.bench_id for r in rows_all} == {a.bench_id, b.bench_id}
 
 
 @pytest.mark.unit

@@ -31,6 +31,8 @@ from movate.core.eval import (
     assert_cross_family,
 )
 from movate.core.models import (
+    BenchModelRow,
+    BenchRecord,
     JudgeConfig,
     JudgeMethod,
     ModelConfig,
@@ -137,6 +139,68 @@ class BenchSummary:
     runs_per_model: int
     gate_mode: str
     models: list[ModelBenchResult] = field(default_factory=list)
+
+    @property
+    def total_cost_usd(self) -> float:
+        """Sum of every run's cost across every model. Six decimals,
+        matching the existing per-row ``cost_total_usd`` precision."""
+        return round(sum(m.cost_total_usd for m in self.models), 6)
+
+    def to_record(
+        self,
+        *,
+        tenant_id: str = "local",
+        judge_method: JudgeMethod | None = None,
+    ) -> BenchRecord:
+        """Convert this live summary into a persistable :class:`BenchRecord`.
+
+        ``judge_method`` is passed in (rather than read off the summary)
+        because BenchSummary doesn't carry the method — only the
+        ``judge_provider``. The CLI knows whether a judge was
+        configured; pass ``JudgeMethod.LLM_JUDGE`` or
+        ``JudgeMethod.EXACT_MATCH`` when one was set, ``None`` when
+        bench ran with cost/latency only.
+
+        The input dict is hashed (sorted JSON → sha256, first 16 hex
+        chars) rather than stored — bench inputs may contain customer
+        data on shared envs, and the hash is enough to detect "baseline
+        was computed against a different input."
+        """
+        import hashlib  # noqa: PLC0415 — local; only used here
+
+        canonical = json.dumps(self.input, sort_keys=True, separators=(",", ":"))
+        input_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+        from uuid import uuid4  # noqa: PLC0415 — local; only used here
+
+        return BenchRecord(
+            bench_id=str(uuid4()),
+            tenant_id=tenant_id,
+            agent=self.agent,
+            agent_version=self.agent_version,
+            input_hash=input_hash,
+            judge_method=judge_method,
+            judge_provider=self.judge_provider,
+            rubric=self.rubric,
+            runs_per_model=self.runs_per_model,
+            gate_mode=self.gate_mode,
+            total_cost_usd=self.total_cost_usd,
+            models=[
+                BenchModelRow(
+                    provider=m.provider,
+                    successful_runs=len(m.successful_runs),
+                    error_count=m.error_count,
+                    cost_total_usd=m.cost_total_usd,
+                    cost_mean_usd=m.cost_mean_usd,
+                    latency_p50_ms=m.latency_p50_ms,
+                    latency_p95_ms=m.latency_p95_ms,
+                    score=m.aggregated_score(self.gate_mode),
+                    skipped_reason=m.skipped_reason,
+                    skipped_score=m.skipped_score,
+                )
+                for m in self.models
+            ],
+        )
 
 
 class BenchEngine:

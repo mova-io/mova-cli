@@ -12,6 +12,7 @@ from typing import Any
 
 from movate.core.models import (
     ApiKeyRecord,
+    BenchRecord,
     EvalRecord,
     FailureRecord,
     JobRecord,
@@ -41,6 +42,7 @@ class InMemoryStorage:
         self.runs: list[RunRecord] = []
         self.failures: list[FailureRecord] = []
         self.evals: list[EvalRecord] = []
+        self.benches: list[BenchRecord] = []
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
         self.api_keys: list[ApiKeyRecord] = []
@@ -123,6 +125,31 @@ class InMemoryStorage:
             rows = [e for e in rows if e.tenant_id == tenant_id]
         if agent:
             rows = [e for e in rows if e.agent == agent]
+        return list(rows)[:limit]
+
+    async def save_bench(self, b: BenchRecord) -> None:
+        self.benches.append(b)
+
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        return next(
+            (b for b in self.benches if b.bench_id == bench_id and b.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_benches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        rows = self.benches
+        if tenant_id is not None:
+            rows = [b for b in rows if b.tenant_id == tenant_id]
+        if agent:
+            rows = [b for b in rows if b.agent == agent]
+        # Newest-first matches the SQL ORDER BY in sqlite/postgres.
+        rows = sorted(rows, key=lambda b: b.created_at, reverse=True)
         return list(rows)[:limit]
 
     async def list_workflow_runs(
@@ -348,6 +375,13 @@ class NullTracer(Tracer):
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
         self.ended_status: list[str] = []
+        # Per-set_attribute log: ``(span_name, key, value)`` tuples.
+        # Lets tests assert on cost mirroring, pricing_version stamping,
+        # etc. without keeping span references around. Spans are also
+        # mutated in-place via ``span.attributes``, but that mutation
+        # is invisible to callers who don't hold the SpanCtx — this
+        # list is the operator-friendly view.
+        self.attribute_calls: list[tuple[str, str, Any]] = []
 
     def start_span(
         self,
@@ -370,6 +404,7 @@ class NullTracer(Tracer):
 
     def set_attribute(self, span: SpanCtx, key: str, value: Any) -> None:
         span.attributes[key] = value
+        self.attribute_calls.append((span.name, key, value))
 
 
 class JudgeStubProvider(BaseLLMProvider):

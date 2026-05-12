@@ -274,3 +274,81 @@ async def test_latency_stats_reasonable(
     m = summary.models[0]
     assert m.latency_p50_ms >= 0
     assert m.latency_p95_ms >= m.latency_p50_ms
+
+
+# ---------------------------------------------------------------------------
+# BenchSummary.to_record() — Pydantic conversion for persistence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_to_record_collapses_summary_to_per_model_rows(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """``BenchSummary.to_record()`` returns a BenchRecord whose
+    ``models`` list mirrors the live ``ModelBenchResult`` aggregates
+    (successful_runs, cost_total/mean, latency p50/p95, score),
+    plus a populated ``total_cost_usd`` rolled up across models."""
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    provider = MockProvider(response='{"message": "ok"}')
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = BenchEngine(executor=executor, provider=provider, runs_per_model=2)
+    summary = await engine.run(
+        bundle,
+        input_payload={"text": "hi"},
+        providers=[
+            "openai/gpt-4o-mini-2024-07-18",
+            "anthropic/claude-haiku-4-5-20251001",
+        ],
+    )
+
+    record = summary.to_record(tenant_id="tenant-a")
+    assert record.agent == bundle.spec.name
+    assert record.tenant_id == "tenant-a"
+    assert record.judge_method is None  # no judge configured
+    assert record.judge_provider is None
+    assert record.runs_per_model == 2
+    # input_hash is deterministic for stable inputs
+    assert len(record.input_hash) == 16
+    # Per-model rows mirror live aggregates
+    assert len(record.models) == 2
+    for live, persisted in zip(summary.models, record.models, strict=True):
+        assert persisted.provider == live.provider
+        assert persisted.successful_runs == len(live.successful_runs)
+        assert persisted.error_count == live.error_count
+        assert persisted.cost_total_usd == live.cost_total_usd
+        assert persisted.cost_mean_usd == live.cost_mean_usd
+        assert persisted.latency_p50_ms == live.latency_p50_ms
+        assert persisted.latency_p95_ms == live.latency_p95_ms
+    # total cost rolls up across all models
+    assert record.total_cost_usd == pytest.approx(sum(m.cost_total_usd for m in summary.models))
+
+
+@pytest.mark.unit
+async def test_to_record_input_hash_stable_across_runs(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """Two benches over the same input dict → same input_hash; different
+    inputs → different hashes. Lets ``--baseline`` callers detect when
+    they're comparing against a different input."""
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    provider = MockProvider(response='{"message": "ok"}')
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = BenchEngine(executor=executor, provider=provider, runs_per_model=1)
+
+    s1 = await engine.run(
+        bundle, input_payload={"text": "abc"}, providers=["openai/gpt-4o-mini-2024-07-18"]
+    )
+    s2 = await engine.run(
+        bundle, input_payload={"text": "abc"}, providers=["openai/gpt-4o-mini-2024-07-18"]
+    )
+    s3 = await engine.run(
+        bundle, input_payload={"text": "xyz"}, providers=["openai/gpt-4o-mini-2024-07-18"]
+    )
+
+    h1 = s1.to_record().input_hash
+    h2 = s2.to_record().input_hash
+    h3 = s3.to_record().input_hash
+
+    assert h1 == h2  # same input → same hash
+    assert h1 != h3  # different input → different hash

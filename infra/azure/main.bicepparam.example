@@ -91,3 +91,19 @@ param tags = {
 // `acsFromNumber` is non-empty.
 param enableSms = false
 param acsFromNumber = ''
+
+// OPTIONAL — Telegram operator alerts. Pings you on every terminal job
+// via a Telegram bot. Free, no regulatory hurdles, ~5 min setup. Two
+// steps after flipping enableTelegram = true:
+//   1. @BotFather → /newbot → save the token (~30s)
+//   2. /start your bot, then visit
+//      https://api.telegram.org/bot<TOKEN>/getUpdates → grab `chat.id`
+//      (numeric) and set `telegramChatId` below
+// Operator pastes the token into KV once:
+//   az keyvault secret set --vault-name <kv> --name telegram-bot-token \
+//       --value "<token>" > /dev/null
+// Setup runbook in docs/azure-bootstrap.md → "Optional: Telegram alerts".
+// The worker gets MOVATE_TELEGRAM_* env vars only when BOTH
+// `enableTelegram` is true AND `telegramChatId` is non-empty.
+param enableTelegram = false
+param telegramChatId = ''

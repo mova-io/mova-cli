@@ -31,6 +31,7 @@ _PG_TABLES = (
     "runs",
     "failures",
     "evals",
+    "bench_records",
     "workflow_runs",
     "jobs",
     "api_keys",

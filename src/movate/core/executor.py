@@ -197,6 +197,18 @@ class Executor:
             cost = self._pricing.cost_for(provider=chosen_provider, tokens=completion.tokens)
             self._check_cost_drift(span, completion, cost)
 
+            # Mirror per-call metrics onto the span so Langfuse / OTel
+            # consumers can build cost dashboards + filter by pricing
+            # version without joining back to the RunRecord table. The
+            # span carries the SAME numbers persisted on the RunRecord —
+            # if these drift, the storage row is canonical.
+            self._tracer.set_attribute(span, "cost_usd", cost)
+            self._tracer.set_attribute(span, "pricing_version", self._pricing.version)
+            self._tracer.set_attribute(span, "chosen_provider", chosen_provider)
+            self._tracer.set_attribute(span, "tokens.input", completion.tokens.input)
+            self._tracer.set_attribute(span, "tokens.output", completion.tokens.output)
+            self._tracer.set_attribute(span, "tokens.cached_input", completion.tokens.cached_input)
+
             # The effective ceiling is the MIN of the agent's declared
             # budget and the project policy's ceiling. Project policy
             # never relaxes — it can only tighten. If a project sets no

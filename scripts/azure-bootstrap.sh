@@ -38,6 +38,11 @@ if [ $# -ne 1 ]; then
 fi
 
 ENV="$1"
+# Pre-compute the uppercase form so the trailing "Next steps" heredoc
+# can reference it portably. Bash 4+'s ``${ENV^^}`` expansion fails
+# on macOS's stock bash 3.2 with "bad substitution"; ``tr`` is in
+# every POSIX environment.
+ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]')
 REGION="${AZURE_REGION:-eastus2}"
 RG="movate-${ENV}-rg"
 ACR="${ACR_NAME_OVERRIDE:-movate${ENV}acr}"
@@ -247,7 +252,7 @@ cat <<EOF
            --scope ${ACR_SCOPE}
 
   4. Then test the deploy path locally:
-       export MOVATE_${ENV^^}_KEY="<the mvt_live_... key>"
+       export MOVATE_${ENV_UPPER}_KEY="<the mvt_live_... key>"
        movate config add-target ${ENV} \\
            --url <RUNTIME_URL> --key-env MOVATE_${ENV^^}_KEY \\
            --azure-subscription ${SUB_ID} \\

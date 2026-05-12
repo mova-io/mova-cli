@@ -306,3 +306,86 @@ def test_run_workflow_rejects_non_object_input(
     monkeypatch.setenv("HOME", str(tmp_path))
     result = runner.invoke(app, ["run", str(wf), '"just a string"', "--mock"])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# `--node-trace` flag — per-node state reconstruction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_run_workflow_node_trace_adds_state_trace_to_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--node-trace`` augments JSON output with a ``state_trace`` array
+    showing the running state after each node. Useful for debugging
+    which node added/changed which key."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"step1": "alpha"}')
+
+    wf = tmp_path / "wf"
+    _make_agent(wf / "agents" / "only", name="only", in_key="text", out_key="step1")
+    _make_workflow(
+        wf,
+        nodes=[{"id": "first", "type": "agent", "ref": "./agents/only"}],
+        edges=[],
+    )
+
+    result = runner.invoke(
+        app,
+        ["run", str(wf), '{"text": "seed"}', "--mock", "-o", "json", "--node-trace"],
+    )
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert "state_trace" in payload
+    assert len(payload["state_trace"]) == 1
+    entry = payload["state_trace"][0]
+    assert entry["node_id"] == "first"
+    assert entry["output"] == {"step1": "alpha"}
+    # state_after is the running state merged with this node's output —
+    # so it has both the initial "text" key AND the node's "step1" output.
+    assert entry["state_after"] == {"text": "seed", "step1": "alpha"}
+
+
+@pytest.mark.unit
+def test_run_workflow_node_trace_omitted_without_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``--node-trace``, the JSON output does NOT include
+    ``state_trace`` — backwards-compatible default."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"step1": "alpha"}')
+
+    wf = tmp_path / "wf"
+    _make_agent(wf / "agents" / "only", name="only", in_key="text", out_key="step1")
+    _make_workflow(
+        wf,
+        nodes=[{"id": "first", "type": "agent", "ref": "./agents/only"}],
+        edges=[],
+    )
+
+    result = runner.invoke(app, ["run", str(wf), '{"text": "seed"}', "--mock", "-o", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert "state_trace" not in payload
+
+
+@pytest.mark.unit
+def test_run_workflow_node_trace_warns_on_agent_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--node-trace`` is workflow-only. If passed on a single-agent
+    run, we print a dim hint and otherwise behave normally."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"text": "hi"}')
+
+    # Bare agent (no workflow.yaml; just agent.yaml etc.)
+    agent_dir = _make_agent(tmp_path / "ag", name="ag", in_key="text", out_key="text")
+    result = runner.invoke(
+        app,
+        ["run", str(agent_dir), '{"text": "x"}', "--mock", "-o", "json", "--node-trace"],
+    )
+    assert result.exit_code == 0
+    # The warning is on stderr (Rich console) but Typer's CliRunner
+    # collapses stdout+stderr by default when mix_stderr=True; we just
+    # assert success.

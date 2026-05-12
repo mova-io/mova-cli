@@ -71,6 +71,15 @@ def run(
         False, "--mock", help="Use the deterministic MockProvider (no API keys; for smoke tests)."
     ),
     output_format: str = typer.Option("json", "--output", "-o", help="json | text"),
+    node_trace: bool = typer.Option(
+        False,
+        "--node-trace",
+        help=(
+            "Workflow mode only: show per-node input + output + state-delta "
+            "tables after the run. Useful for debugging why node N produced "
+            "an unexpected value. Ignored for single-agent runs."
+        ),
+    ),
 ) -> None:
     """Run an agent or workflow against the given input.
 
@@ -109,8 +118,16 @@ def run(
         return
 
     if is_workflow_path(path):
-        _dispatch_workflow(path, input_flag or input_arg, mock=mock, output_format=output_format)
+        _dispatch_workflow(
+            path,
+            input_flag or input_arg,
+            mock=mock,
+            output_format=output_format,
+            node_trace=node_trace,
+        )
     else:
+        if node_trace:
+            console.print("[dim]--node-trace is workflow-only; ignored for single-agent runs[/dim]")
         _dispatch_agent(path, input_flag or input_arg, mock=mock, output_format=output_format)
 
 
@@ -199,7 +216,14 @@ async def _run_local_agent(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_workflow(path: Path, raw: str | None, *, mock: bool, output_format: str) -> None:
+def _dispatch_workflow(
+    path: Path,
+    raw: str | None,
+    *,
+    mock: bool,
+    output_format: str,
+    node_trace: bool = False,
+) -> None:
     try:
         spec, parent = load_workflow_spec(path)
     except WorkflowSpecLoadError as exc:
@@ -219,7 +243,15 @@ def _dispatch_workflow(path: Path, raw: str | None, *, mock: bool, output_format
     else:
         initial_state = _coerce_workflow_input(raw)
 
-    asyncio.run(_run_local_workflow(graph, initial_state, output_format=output_format, mock=mock))
+    asyncio.run(
+        _run_local_workflow(
+            graph,
+            initial_state,
+            output_format=output_format,
+            mock=mock,
+            node_trace=node_trace,
+        )
+    )
 
 
 def _coerce_workflow_input(arg: str) -> dict[str, Any]:
@@ -247,6 +279,7 @@ async def _run_local_workflow(
     *,
     output_format: str,
     mock: bool,
+    node_trace: bool = False,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     runner = WorkflowRunner(executor=rt.executor, storage=rt.storage)
@@ -260,15 +293,17 @@ async def _run_local_workflow(
         await shutdown_runtime(rt.storage, rt.tracer)
 
     if output_format == "json":
-        _emit_workflow_json(result)
+        _emit_workflow_json(result, node_trace=node_trace)
     else:
         _emit_workflow_text(result)
+        if node_trace:
+            _emit_node_trace(result, initial_state)
 
     if result.status is WorkflowStatus.ERROR:
         raise typer.Exit(code=1)
 
 
-def _emit_workflow_json(result: WorkflowResult) -> None:
+def _emit_workflow_json(result: WorkflowResult, *, node_trace: bool = False) -> None:
     payload = {
         "workflow_run_id": result.workflow_run_id,
         "status": result.status.value,
@@ -291,7 +326,73 @@ def _emit_workflow_json(result: WorkflowResult) -> None:
             for r in result.runs
         ],
     }
+    if node_trace:
+        # Reconstruct the state-after-each-node by replaying each node's
+        # output on top of the running state. Matches the runner's merge
+        # semantics: each node's output dict is shallow-merged into state.
+        payload["state_trace"] = _build_state_trace(result)
     sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+
+
+def _build_state_trace(result: WorkflowResult) -> list[dict[str, Any]]:
+    """Reconstruct state-after-each-node from result.runs.
+
+    Each entry: ``{node_id, output, state_after}`` where ``state_after``
+    is the running state merged with all node outputs up to and
+    including this node. Matches the runner's shallow-merge semantics.
+    Useful for `--node-trace` debugging: spot which node corrupted a
+    key, which node added an unexpected field, etc.
+    """
+    running: dict[str, Any] = dict(result.initial_state)
+    trace: list[dict[str, Any]] = []
+    for r in result.runs:
+        if r.output:
+            # Shallow merge — matches runner's behavior (workflow/runner.py
+            # does ``state.update(response.output)`` after each successful
+            # node).
+            running.update(r.output)
+        trace.append(
+            {
+                "node_id": r.node_id,
+                "output": r.output,
+                "state_after": dict(running),
+            }
+        )
+    return trace
+
+
+def _emit_node_trace(result: WorkflowResult, initial_state: dict[str, Any]) -> None:
+    """Render the per-node state trace as a Rich table on stderr. Helps
+    operators see which node added/changed which state keys when a
+    workflow produces an unexpected final state."""
+    trace = _build_state_trace(result)
+    if not trace:
+        return
+    console.print("\n[bold]Node-by-node state trace[/bold] [dim](--node-trace)[/dim]")
+    console.print(f"[dim]initial state:[/dim] {json.dumps(initial_state, sort_keys=True)}")
+    for i, entry in enumerate(trace, start=1):
+        # Per-node block: which keys this node added / changed.
+        # Previous state = the state_after of the prior entry, or
+        # initial_state for the very first node (i==1). The check is
+        # i>1 in plain reading, but with start=1 the prior trace index
+        # is i-2 because enumerate's i is 1-indexed.
+        is_first_node = i == 1
+        prev = initial_state if is_first_node else trace[i - 2]["state_after"]
+        added = {k: v for k, v in entry["state_after"].items() if k not in prev}
+        changed = {
+            k: {"before": prev[k], "after": v}
+            for k, v in entry["state_after"].items()
+            if k in prev and prev[k] != v
+        }
+        console.print(f"\n[cyan]{i}. {entry['node_id']}[/cyan]")
+        if entry["output"]:
+            console.print(f"   [dim]output:[/dim]  {json.dumps(entry['output'], sort_keys=True)}")
+        if added:
+            console.print(f"   [green]+ added:[/green] {json.dumps(added, sort_keys=True)}")
+        if changed:
+            console.print(f"   [yellow]~ changed:[/yellow] {json.dumps(changed, sort_keys=True)}")
+        if not added and not changed and not entry["output"]:
+            console.print("   [dim](no state mutation)[/dim]")
 
 
 def _emit_workflow_text(result: WorkflowResult) -> None:

@@ -319,8 +319,13 @@ async def test_worker_fires_notifier_when_email_set() -> None:
 
 
 @pytest.mark.unit
-async def test_worker_skips_notifier_when_no_email() -> None:
-    """Jobs without notify_email are silent — no notifier call at all."""
+async def test_worker_fires_notifier_on_every_terminal_regardless_of_email() -> None:
+    """The worker invokes the dispatcher on EVERY terminal job, not just
+    those with ``notify_email`` set. Per-channel filtering happens INSIDE
+    the dispatcher (email backend no-ops when ``job.notify_email`` is
+    None, etc.) — that's needed because operator-wide channels like
+    Telegram fire on every terminal regardless of per-job fields. See
+    test_notify_telegram.py for the full story."""
     storage = InMemoryStorage()
     await storage.init()
 
@@ -333,7 +338,11 @@ async def test_worker_skips_notifier_when_no_email() -> None:
 
     await worker.run_one_cycle()
 
-    assert notifier.calls == []
+    # Worker DID fire the dispatcher even without notify_email. A
+    # ConsoleBackend would have logged + no-op'd on the per-job check;
+    # a TelegramBackend (if env-configured) would have actually sent.
+    assert len(notifier.calls) == 1
+    assert notifier.calls[0].notify_email is None
 
 
 @pytest.mark.unit
