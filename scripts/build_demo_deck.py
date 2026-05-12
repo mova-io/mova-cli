@@ -321,6 +321,156 @@ movate config list-targets""",
     )
 
     # ──────────────────────────────────────────────────────────────
+    # Reference — Anatomy of a movate agent
+    #
+    # Five slides explaining what each file in the canonical layout
+    # does, before the audience hits a real agent.yaml in Part 1.
+    # Pedagogical, not technical: WHY each piece exists, WHAT it does,
+    # one concrete example. New presenters can lean on these slides as
+    # the "schema 101" segment.
+    # ──────────────────────────────────────────────────────────────
+    add_section(prs, "Reference", "Anatomy of a movate agent")
+
+    # Agent layout overview — annotated tree
+    add_code_slide(
+        prs,
+        title="The canonical agent layout",
+        subtitle="Four files. Each one does one job. Movate enforces the contract between them.",
+        code="""agents/my-agent/
+├── agent.yaml          ← the contract: name, model, schema refs, budget
+├── prompt.md           ← the instruction template (with {{input.x}} vars)
+├── schema/
+│   ├── input.json      ← JSON Schema — what callers must send
+│   └── output.json     ← JSON Schema — what the model must return
+└── evals/
+    ├── dataset.jsonl   ← test cases (one per line)
+    └── judge.yaml      ← how to score: exact match or LLM-as-judge""",
+        explanation=[
+            "**Separation of concerns** — the YAML is a contract, the prompt is plain English, the schemas are types, the evals are the safety net. Each piece is independently version-controlled and review-able.",
+            "**`movate init my-agent` scaffolds all of this** — you don't write it from a blank page. Templates: `faq`, `classifier`, `extractor`, `chatbot`.",
+            "**`movate validate` checks all five together** — schema parses? prompt linter clean? policy compliant? cost forecast under cap?",
+        ],
+        footer="The next four slides explain each file in detail.",
+    )
+
+    # agent.yaml — the contract
+    add_code_slide(
+        prs,
+        title="agent.yaml — the contract",
+        subtitle="Identity, model choice, schema references, budget cap. Validated by Pydantic.",
+        code="""api_version: movate/v1     # YAML schema version
+name: faq-agent             # used in run records, logs, deploys
+version: 0.1.0              # semver — bump triggers re-eval gate
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18    # LiteLLM-style
+  params:
+    temperature: 0.2
+    max_tokens: 1024
+  fallback:                                    # optional retry chain
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md                            # path to instructions
+schema:
+  input: ./schema/input.json                   # JSON Schema for input
+  output: ./schema/output.json                 # JSON Schema for output
+
+budget:
+  max_cost_usd_per_run: 0.05    # safety net — hard cap per call""",
+        explanation=[
+            "**Provider string is LiteLLM format** (`<vendor>/<model>`). Switching from OpenAI to Anthropic = one line. No code change.",
+            "**Fallback chain** — if the primary errors (rate limit, timeout, content filter), executor automatically retries on the fallback. Both rows in your run record.",
+            "**Budget cap is per-run, not per-month** — protects against pathological inputs that produce 50k-token answers. Combined with the project-level cost ceiling in `movate.yaml`.",
+        ],
+    )
+
+    # prompt.md — the instruction template
+    add_code_slide(
+        prs,
+        title="prompt.md — the instruction template",
+        subtitle="Plain Markdown with Jinja2 placeholders. Diff-reviewable, version-controlled.",
+        code="""You are a helpful FAQ assistant for Movate.
+
+Answer the user's question using the knowledge base below. If the
+answer isn't in the KB, say so honestly — don't make up facts.
+
+## Knowledge base
+- Movate is a digital engineering services company.
+- We provide consulting, managed services, and AI/ML solutions.
+- Headquartered in Plano, TX. Founded 2002.
+
+## User question
+{{ input.question }}
+
+## Response format
+Respond with JSON matching this schema:
+  { "answer": "<your answer>", "confident": true | false }""",
+        explanation=[
+            "**Jinja2 substitution** — `{{ input.<field> }}` pulls values from the validated request input. Refs to fields not in the input schema fail at `movate validate`.",
+            "**Linter rules** — empty prompt, missing JSON instruction, undeclared input refs, tiny prompt. Runs on every save (`movate watch`) and in CI.",
+            "**Prompt hash is persisted in every RunRecord** — proves exactly which prompt version produced each result. Critical for incident replay.",
+        ],
+    )
+
+    # schema/ folder — input + output JSON Schemas
+    add_code_slide(
+        prs,
+        title="schema/ — input + output contracts",
+        subtitle="JSON Schema (draft 2020-12). Pydantic validates at request + response time.",
+        code="""# schema/input.json — what callers must send
+{
+  "type": "object",
+  "properties": {
+    "question": { "type": "string", "minLength": 1 }
+  },
+  "required": ["question"],
+  "additionalProperties": false
+}
+
+# schema/output.json — what the model must return
+{
+  "type": "object",
+  "properties": {
+    "answer":    { "type": "string" },
+    "confident": { "type": "boolean" }
+  },
+  "required": ["answer", "confident"],
+  "additionalProperties": false
+}""",
+        explanation=[
+            "**Input schema rejects bad calls before any LLM spend** — missing `question`? `additionalProperties: false`? 422 at the door, $0.00 cost.",
+            "**Output schema is the safety net** — model returned `{ \"answr\": ... }` (typo)? Executor catches it, retries (per `model.fallback`), and if retries exhausted records a typed `SchemaError` failure.",
+            "**Enums in output = guarantees**. The classifier agent uses `\"classification\": { \"enum\": [\"services\", \"cli\"] }` — the model literally cannot return a third option without a hard validation fail.",
+        ],
+    )
+
+    # evals/ folder — dataset + judge
+    add_code_slide(
+        prs,
+        title="evals/ — the quality net",
+        subtitle="Test cases + scoring method. Gateable in CI; baseline-diffable across versions.",
+        code="""# evals/dataset.jsonl — one test case per line
+{"input": {"question": "What does Movate do?"}, "expected": {"confident": true}}
+{"input": {"question": "Where is HQ?"}, "expected": {"confident": true}}
+{"input": {"question": "What is quantum chromodynamics?"}, "expected": {"confident": false}}
+# ...30 cases total
+
+# evals/judge.yaml — how each case is scored
+method: llm_judge                  # or `exact_match` for deterministic outputs
+model:
+  provider: anthropic/claude-haiku-4-5-20251001   # judge != tested family
+rubric: |
+  Score the answer 0.0-1.0. Full credit if the answer is factually
+  accurate AND the `confident` field correctly reflects whether the
+  KB had the answer. Half credit if accurate but mis-confident.""",
+        explanation=[
+            "**Exact match** for classifiers + extractors (deterministic outputs). **LLM-as-judge** for free-form prose. Cross-family enforcement: judge model ≠ tested model's vendor (prevents same-family bias).",
+            "**`movate eval --gate 0.9`** → exit 1 if pass rate < 90%. CI-gateable. `--gate-mode mean|min|p10` for different risk profiles.",
+            "**`movate eval --baseline <id>`** → diffs scores against a stored eval. Drift detection: regression past `--regression-tolerance` fails CI. Same pattern works for `movate bench --baseline`.",
+        ],
+    )
+
+    # ──────────────────────────────────────────────────────────────
     # 6 — Section: Build the agents
     add_section(prs, "Part 1", "Build the three agents")
 
