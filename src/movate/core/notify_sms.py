@@ -123,9 +123,7 @@ class AcsSmsBackend:
         # Local import keeps the SDK out of base movate's import tree —
         # operators without the SDK installed never hit this line because
         # build_sms_backend() returns ConsoleSmsBackend before touching us.
-        from azure.communication.sms import (  # type: ignore[import-not-found]  # noqa: PLC0415
-            SmsClient,
-        )
+        from azure.communication.sms import SmsClient  # noqa: PLC0415
 
         self._sms_client = SmsClient.from_connection_string(self._connection_string)
         return self._sms_client
@@ -227,7 +225,7 @@ def build_sms_backend() -> ConsoleSmsBackend | AcsSmsBackend:
 
     # SDK presence check — soft dep, see docstring.
     try:
-        import azure.communication.sms  # type: ignore[import-not-found]  # noqa: F401, PLC0415
+        import azure.communication.sms  # noqa: F401, PLC0415
     except ImportError:
         logger.warning(
             "notify_sms_sdk_missing: MOVATE_ACS_* env is set but the "
