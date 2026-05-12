@@ -90,35 +90,34 @@ class LangGraphCompileError(Exception):
 
 
 def can_compile(graph: WorkflowGraph) -> tuple[bool, str | None]:
-    """Return ``(supported, reason)`` for the v1.0 compiler.
+    """Return ``(supported, reason)`` for the v1.1 compiler.
 
     Used by the runner to surface a clean error before attempting the
     compile, rather than letting the build fail halfway through.
     Returning ``(False, reason)`` carries the operator-facing message
     explaining WHY this graph can't go through LangGraph yet — usually
-    pointing at the v1.1 feature that would unlock it.
+    pointing at the v1.1.x feature that would unlock it.
+
+    Currently supported: AGENT nodes + SEQUENTIAL/CONDITIONAL edges.
+    Rejected: TOOL/HUMAN/FUNCTION/SUB_WORKFLOW nodes (v1.1.x) and
+    PARALLEL_FAN_OUT/PARALLEL_FAN_IN edges (v1.1.x). Conditional edges
+    must follow the structural rules enforced by ``validate_conditional``.
     """
-    if not graph.is_linear():
-        return (
-            False,
-            "langgraph runtime currently supports linear workflows only — "
-            "conditional / parallel topologies land in v1.1 (see "
-            "docs/langgraph-seam.md).",
-        )
     for nid, node in graph.nodes.items():
         if node.type is not NodeType.AGENT:
             return (
                 False,
                 f"node {nid!r} has type {node.type.value!r}; langgraph compiler "
                 "currently handles AGENT nodes only. TOOL / HUMAN / FUNCTION / "
-                "SUB_WORKFLOW support lands in v1.1.",
+                "SUB_WORKFLOW support lands in v1.1.x.",
             )
     for e in graph.edges:
-        if e.kind is not EdgeKind.SEQUENTIAL:
+        if e.kind in (EdgeKind.PARALLEL_FAN_OUT, EdgeKind.PARALLEL_FAN_IN):
             return (
                 False,
                 f"edge {e.from_id}→{e.to_id} has kind {e.kind.value!r}; "
-                "langgraph compiler currently handles SEQUENTIAL edges only.",
+                "langgraph compiler currently handles SEQUENTIAL and CONDITIONAL "
+                "edges only. Parallel fan-out / fan-in land in v1.1.x.",
             )
     return (True, None)
 
@@ -149,7 +148,7 @@ def import_langgraph() -> tuple[Any, Any, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def run_via_langgraph(
+async def run_via_langgraph(  # noqa: PLR0912 — single orchestrator; splitting fragments it
     graph: WorkflowGraph,
     initial_state: dict[str, Any],
     *,
@@ -270,8 +269,23 @@ async def run_via_langgraph(
         state_graph.add_node(nid, _make_node_fn(nid))
 
     state_graph.add_edge(START, graph.entrypoint)
+
+    # Group outbound edges by source so we can decide per source whether
+    # to emit unconditional `add_edge` or conditional routing. The
+    # validator (validate_conditional) guarantees no mixed kinds per
+    # source, an exactly-one default for conditional fan-outs, and the
+    # default appears LAST.
+    by_source: dict[str, list[Any]] = {}
     for edge in graph.edges:
-        state_graph.add_edge(edge.from_id, edge.to_id)
+        by_source.setdefault(edge.from_id, []).append(edge)
+
+    for src, outbound in by_source.items():
+        if outbound and outbound[0].kind is EdgeKind.CONDITIONAL:
+            _wire_conditional_fan_out(state_graph, src, outbound)
+        else:
+            for e in outbound:
+                state_graph.add_edge(e.from_id, e.to_id)
+
     for sink in graph.sinks():
         state_graph.add_edge(sink, END)
 
@@ -351,6 +365,59 @@ async def run_via_langgraph(
         started_at=started,
         finished_at=finished,
     )
+
+
+def _wire_conditional_fan_out(
+    state_graph: Any,
+    src: str,
+    outbound: list[Any],
+) -> None:
+    """Emit a LangGraph ``add_conditional_edges`` call for the conditional
+    edges leaving ``src``.
+
+    Pre-conditions enforced by :func:`validate_conditional`:
+
+    * All edges in ``outbound`` are ``EdgeKind.CONDITIONAL``.
+    * Exactly one has ``condition is None`` (the explicit default).
+    * The default is the LAST element in ``outbound``.
+    * Every non-default has a parseable ``condition``.
+
+    We pre-parse each condition at compile time so the runtime router fn
+    only does a quick truthiness check per branch — no parsing on the
+    hot path.
+    """
+    from movate.core.workflow.condition_dsl import parse_condition  # noqa: PLC0415
+
+    # Pre-compile (parse) every non-default branch's expression. The
+    # default branch is the last entry; capture its target separately.
+    branches: list[tuple[Any, str]] = []  # [(CompiledCondition, target_node_id)]
+    default_target: str | None = None
+    for e in outbound:
+        if e.when_is_default():
+            default_target = e.to_id
+        else:
+            assert e.condition is not None  # validator guaranteed
+            branches.append((parse_condition(e.condition), e.to_id))
+    assert default_target is not None  # validator guaranteed
+
+    def router(state: dict[str, Any]) -> str:
+        # Walk the conditional branches in YAML order; first truthy wins.
+        # Mirrors the human reading of the YAML — operators see the same
+        # priority order on paper as the runtime applies.
+        for cond, target in branches:
+            if cond.evaluate(state):
+                return target
+        # default_target is set above (validator guarantees `when: null`
+        # default exists for every conditional fan-out); the asserts after
+        # the loop narrow the type for mypy.
+        assert default_target is not None
+        return default_target
+
+    # `path_map` lets us return target node ids directly (rather than
+    # arbitrary keys that LangGraph then maps to nodes). Identity map.
+    targets = {e.to_id for e in outbound}
+    path_map = {t: t for t in targets}
+    state_graph.add_conditional_edges(src, router, path_map)
 
 
 def _project_state(state: dict[str, Any], bundle: AgentBundle) -> dict[str, Any]:

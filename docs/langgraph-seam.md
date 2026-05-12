@@ -279,6 +279,21 @@ documented best practice.
       (`CheckpointerError` raised today with operator-facing pointer).
       14 tests in
       [`tests/test_workflow_checkpointer.py`](../tests/test_workflow_checkpointer.py).
+- [x] **Conditional edges + JSONPath-like DSL** (Tier 2 #5). New
+      `kind: conditional` / `when: <expr>` fields on `EdgeSpec`; YAML
+      validator catches `kind: sequential` + `when:` at parse time.
+      Hand-rolled recursive-descent parser at
+      [`src/movate/core/workflow/condition_dsl.py`](../src/movate/core/workflow/condition_dsl.py)
+      — no `eval`, no third-party dep. Supports comparisons (`==`,
+      `!=`, `<`, `<=`, `>`, `>=`), boolean ops (`&&`, `||`, `!`),
+      `in [...]` membership, nested JSONPath (`$.user.score`), short-
+      circuit semantics, parentheses. New `validate_conditional` +
+      `validate_for_runtime` dispatcher in the compiler so callers
+      pick the right validator from `graph.runtime`. The langgraph
+      compiler emits `add_conditional_edges` with a router fn that
+      walks branches in YAML order; explicit `when: null` default
+      required and enforced as last edge per source. 47 tests in
+      [`tests/test_workflow_conditional.py`](../tests/test_workflow_conditional.py).
 
 ## What to do at v1.1 (additive on the linear compiler)
 

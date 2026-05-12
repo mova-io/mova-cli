@@ -23,7 +23,7 @@ from movate.core.workflow import (
     WorkflowCompileError,
     compile_workflow,
     load_workflow_spec,
-    validate_linear,
+    validate_for_runtime,
 )
 from movate.core.workflow.spec import WorkflowSpecLoadError
 from movate.providers.pricing import load_pricing
@@ -243,7 +243,7 @@ def _validate_workflow(path: Path) -> None:
         raise typer.Exit(code=2) from None
     try:
         graph = compile_workflow(spec, parent)
-        validate_linear(graph)
+        validate_for_runtime(graph)
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None

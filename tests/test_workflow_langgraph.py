@@ -242,20 +242,20 @@ def test_can_compile_rejects_non_agent_nodes(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_can_compile_rejects_non_sequential_edges(tmp_path: Path) -> None:
-    """Either the linearity check or the per-edge kind check trips
-    — both reject. The reason should reference linear or conditional;
-    operators reading it should understand why it failed without
-    digging into source."""
+def test_can_compile_rejects_parallel_edges(tmp_path: Path) -> None:
+    """Parallel fan-out / fan-in aren't supported yet; the compiler
+    refuses them with a v1.1.x pointer. Conditional edges are NOW
+    supported (this PR) and tested separately under
+    ``test_workflow_conditional.py``."""
     yaml_path = _scaffold_two_step(tmp_path, runtime="langgraph")
     spec, parent = load_workflow_spec(yaml_path)
     graph = compile_workflow(spec, parent)
-    graph.edges = [WorkflowEdge(from_id="first", to_id="second", kind=EdgeKind.CONDITIONAL)]
+    graph.edges = [WorkflowEdge(from_id="first", to_id="second", kind=EdgeKind.PARALLEL_FAN_OUT)]
     ok, reason = can_compile(graph)
     assert not ok
     assert reason is not None
     lower = reason.lower()
-    assert "linear" in lower or "sequential" in lower or "conditional" in lower
+    assert "parallel" in lower or "fan" in lower
 
 
 # ---------------------------------------------------------------------------

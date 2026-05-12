@@ -60,12 +60,19 @@ class WorkflowEdge:
     to_id: str
     kind: EdgeKind = EdgeKind.SEQUENTIAL
     condition: str | None = None
-    """For ``kind == CONDITIONAL``, an expression evaluated against the
-    workflow state at runtime. Format reserved (likely a small subset of
-    JSONPath); not parsed in v0.3 because v0.3 forbids conditional edges.
-    """
+    """For ``kind == CONDITIONAL``, an expression in the condition DSL
+    (see :mod:`movate.core.workflow.condition_dsl`). ``None`` on a
+    conditional edge means "default" / "else" — exactly one per source
+    is required (enforced by :func:`validate_conditional`)."""
 
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def when_is_default(self) -> bool:
+        """True iff this is the explicit-default branch of a conditional
+        fan-out — i.e. a conditional edge with ``condition is None``.
+        Sequential edges always return False (they're unconditional but
+        not "defaults")."""
+        return self.kind is EdgeKind.CONDITIONAL and self.condition is None
 
 
 @dataclass

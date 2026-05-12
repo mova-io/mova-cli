@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -77,17 +84,65 @@ class NodeSpec(BaseModel):
         return v
 
 
+class EdgeKindYaml(StrEnum):
+    """Mirrors :class:`movate.core.workflow.ir.EdgeKind` at the YAML
+    surface. Only ``sequential`` and ``conditional`` are accepted today;
+    parallel kinds land with v1.1's fan-out work."""
+
+    SEQUENTIAL = "sequential"
+    CONDITIONAL = "conditional"
+
+
 class EdgeSpec(BaseModel):
     """One workflow edge as written in YAML.
 
-    v0.3 edges are unconditional sequential transitions. ``when:`` and
-    parallel-fan kinds are explicitly out of scope until v1.1.
+    Two shapes are supported in v1.1:
+
+    * ``kind: sequential`` (default) — unconditional A→B transition.
+    * ``kind: conditional`` — fires only when ``when:`` is truthy. The
+      LAST conditional edge from a given source must have ``when: null``
+      to act as the default (compiler enforces). See
+      :mod:`movate.core.workflow.condition_dsl` for the expression syntax.
+
+    Parallel fan-out / fan-in are explicitly out of scope until a later
+    PR (see BACKLOG.md "Tier 2 follow-up: determinism implementation" §6).
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     from_id: str = Field(..., alias="from")
     to_id: str = Field(..., alias="to")
+    kind: EdgeKindYaml = Field(
+        default=EdgeKindYaml.SEQUENTIAL,
+        description=(
+            "Edge kind. `sequential` (default) is an unconditional "
+            "transition. `conditional` fires only when `when:` evaluates "
+            "truthy at runtime."
+        ),
+    )
+    when: str | None = Field(
+        default=None,
+        description=(
+            "Expression in the condition DSL "
+            '(`$.field < 0.7`, `$.a in ["x", "y"]`, etc.). Required '
+            "when `kind: conditional` except on the explicit-default edge "
+            "(the LAST conditional edge from a source must have `when: null`). "
+            "Ignored for `kind: sequential`."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_kind_and_when(self) -> EdgeSpec:
+        """Cross-field: sequential edges can't carry ``when``; conditional
+        edges with no ``when`` are the explicit default (the compiler
+        enforces exactly-one-default per source separately)."""
+        if self.kind is EdgeKindYaml.SEQUENTIAL and self.when is not None:
+            raise ValueError(
+                f"edge {self.from_id}→{self.to_id} has kind: sequential but "
+                f"declares `when:`; set `kind: conditional` or remove the "
+                f"`when:` clause."
+            )
+        return self
 
 
 class WorkflowSpec(BaseModel):

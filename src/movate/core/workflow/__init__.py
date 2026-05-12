@@ -14,6 +14,8 @@ permissive-later.
 from movate.core.workflow.compiler import (
     WorkflowCompileError,
     compile_workflow,
+    validate_conditional,
+    validate_for_runtime,
     validate_linear,
 )
 from movate.core.workflow.ir import (
@@ -43,5 +45,7 @@ __all__ = [
     "WorkflowSpec",
     "compile_workflow",
     "load_workflow_spec",
+    "validate_conditional",
+    "validate_for_runtime",
     "validate_linear",
 ]

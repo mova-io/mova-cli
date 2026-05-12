@@ -20,6 +20,10 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from movate.core.workflow.condition_dsl import (
+    ConditionParseError,
+    parse_condition,
+)
 from movate.core.workflow.ir import (
     EdgeKind,
     NodeType,
@@ -90,11 +94,23 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
             )
         if es.from_id == es.to_id:
             raise WorkflowCompileError(f"self-loop on node {es.from_id!r} not allowed")
+        # Map YAML edge kind → IR edge kind. Validate the condition DSL
+        # syntax at compile time so bad expressions fail workflow load
+        # rather than first-routing-decision-at-runtime.
+        ir_kind = EdgeKind.CONDITIONAL if es.kind.value == "conditional" else EdgeKind.SEQUENTIAL
+        if ir_kind is EdgeKind.CONDITIONAL and es.when is not None:
+            try:
+                parse_condition(es.when)
+            except ConditionParseError as exc:
+                raise WorkflowCompileError(
+                    f"edge {es.from_id!r}→{es.to_id!r} condition failed to parse: {exc}"
+                ) from exc
         edges.append(
             WorkflowEdge(
                 from_id=es.from_id,
                 to_id=es.to_id,
-                kind=EdgeKind.SEQUENTIAL,
+                kind=ir_kind,
+                condition=es.when,
             )
         )
 
@@ -224,3 +240,110 @@ def validate_linear(graph: WorkflowGraph) -> None:
             f"v0.3 workflows must have exactly one sink node; got {len(sinks)}: "
             f"{', '.join(sinks) or '(none)'}"
         )
+
+
+def validate_for_runtime(graph: WorkflowGraph) -> None:
+    """Pick the right semantic validator for the workflow's declared runtime.
+
+    Callers (CLI dispatch, registry, the eval gate) should prefer this
+    over reaching for :func:`validate_linear` directly — that way a
+    workflow opted into ``runtime: langgraph`` gets the looser
+    (conditional-aware) validator without each call site needing to
+    branch on ``graph.runtime``."""
+    if graph.runtime == "langgraph":
+        validate_conditional(graph)
+    else:
+        validate_linear(graph)
+
+
+def validate_conditional(graph: WorkflowGraph) -> None:
+    """v1.1 LangGraph-runtime gate. Allows conditional edges; enforces
+    the structural rules the compiler uses to emit a clean routing
+    function.
+
+    Layered on top of (not in place of) :func:`validate_linear`: callers
+    using ``runtime: langgraph`` skip the linear validator and run this
+    one instead. Future v1.1.x validators (parallel, HITL) add their
+    own checks on top.
+
+    Rules checked here:
+
+    * Per source node, edges are EITHER all sequential OR all conditional
+      — never mixed. Mixed semantics would force the compiler to
+      synthesize a synthetic branch, which the IR doesn't model.
+    * When a source has conditional edges, exactly ONE must have
+      ``when: null`` (the explicit default / "else" branch). The
+      default must be the LAST conditional edge in the YAML order so
+      its position is unambiguous when operators read the source.
+    * AGENT nodes only (TOOL / HUMAN / FUNCTION / SUB_WORKFLOW are
+      v1.1.x+). Same rule as ``validate_linear``.
+    * Parallel fan kinds remain rejected.
+    """
+    # AGENT-only — same rule as linear; v1.1.x adds TOOL/HUMAN/etc.
+    bad_types = sorted(n.id for n in graph.nodes.values() if n.type is not NodeType.AGENT)
+    if bad_types:
+        raise WorkflowCompileError(
+            f"langgraph runtime currently supports only type=agent nodes; "
+            f"offenders: {', '.join(bad_types)}. "
+            f"TOOL / HUMAN / FUNCTION / SUB_WORKFLOW land in v1.1.x."
+        )
+
+    # Parallel kinds still rejected.
+    parallel = [
+        e for e in graph.edges if e.kind in (EdgeKind.PARALLEL_FAN_OUT, EdgeKind.PARALLEL_FAN_IN)
+    ]
+    if parallel:
+        raise WorkflowCompileError(
+            f"langgraph runtime currently supports SEQUENTIAL and CONDITIONAL "
+            f"edges only; got {len(parallel)} parallel edges. "
+            f"Parallel fan-out / fan-in land in v1.1.x (see docs/langgraph-seam.md §A)."
+        )
+
+    # Per-source rules. Group outbound edges by source preserving YAML order.
+    by_source: dict[str, list[WorkflowEdge]] = {}
+    for e in graph.edges:
+        by_source.setdefault(e.from_id, []).append(e)
+
+    for src, outbound in by_source.items():
+        kinds = {e.kind for e in outbound}
+        # No mixing.
+        if EdgeKind.CONDITIONAL in kinds and EdgeKind.SEQUENTIAL in kinds:
+            raise WorkflowCompileError(
+                f"node {src!r} mixes sequential and conditional edges; "
+                f"a source must use one kind exclusively. Convert the "
+                f"sequential edges to conditional (with `when:` clauses + "
+                f"a `when: null` default) or remove the conditionals."
+            )
+
+        if EdgeKind.CONDITIONAL not in kinds:
+            continue
+
+        # All-conditional path: enforce exactly-one-default-and-it's-last.
+        defaults = [i for i, e in enumerate(outbound) if e.when_is_default()]
+        if len(defaults) == 0:
+            raise WorkflowCompileError(
+                f"node {src!r} has conditional edges but no default "
+                f"(`when: null`); add a last edge with `when: null` so "
+                f"the workflow has a deterministic fallback when no "
+                f"condition matches."
+            )
+        if len(defaults) > 1:
+            raise WorkflowCompileError(
+                f"node {src!r} has {len(defaults)} conditional edges with "
+                f"`when: null`; exactly one default is allowed per source."
+            )
+        if defaults[0] != len(outbound) - 1:
+            raise WorkflowCompileError(
+                f"node {src!r}'s default conditional edge (`when: null`) "
+                f"must appear LAST in the edges list (currently at "
+                f"position {defaults[0]} of {len(outbound)})."
+            )
+
+        # Every NON-default conditional must have a `when:` clause.
+        for e in outbound[:-1]:
+            if e.condition is None:
+                raise WorkflowCompileError(
+                    f"conditional edge {e.from_id!r}→{e.to_id!r} is missing "
+                    f"its `when:` clause. Only the LAST conditional edge "
+                    f"per source may have `when: null` (the default branch)."
+                )
