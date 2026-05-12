@@ -216,9 +216,7 @@ class _Parser:
     # or_expr ::= and_expr ('||' and_expr)*
     def _or_expr(self) -> Any:
         left = self._and_expr()
-        while (
-            (tok := self._peek()) is not None and tok.kind == "OP" and tok.value == "||"
-        ):
+        while (tok := self._peek()) is not None and tok.kind == "OP" and tok.value == "||":
             self._pos += 1
             right = self._and_expr()
             left = _BoolOp(op="||", left=left, right=right)
@@ -227,9 +225,7 @@ class _Parser:
     # and_expr ::= not_expr ('&&' not_expr)*
     def _and_expr(self) -> Any:
         left = self._not_expr()
-        while (
-            (tok := self._peek()) is not None and tok.kind == "OP" and tok.value == "&&"
-        ):
+        while (tok := self._peek()) is not None and tok.kind == "OP" and tok.value == "&&":
             self._pos += 1
             right = self._not_expr()
             left = _BoolOp(op="&&", left=left, right=right)
