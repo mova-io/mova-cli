@@ -22,7 +22,7 @@ from rich.console import Console
 
 # NOTE: ``uvicorn``, ``fastapi``, and the runtime app are imported lazily
 # inside ``serve()`` so the rest of the CLI works even when the optional
-# ``[serve]`` extra is not installed. Without lazy imports, ``movate
+# ``[runtime]`` extra is not installed. Without lazy imports, ``movate
 # --help`` would crash with ``ModuleNotFoundError: uvicorn``.
 
 err = Console(stderr=True)
@@ -30,9 +30,9 @@ err = Console(stderr=True)
 
 def _missing_extra_hint() -> str:
     return (
-        "[red]✗[/red] the [bold]serve[/bold] command needs the optional `serve` extra.\n"
-        "  install: [dim]uv tool install --editable '.[serve]'[/dim] "
-        "(or [dim]pip install 'movate-cli[serve]'[/dim])"
+        "[red]✗[/red] the [bold]serve[/bold] command needs the optional `runtime` extra.\n"
+        "  install: [dim]uv tool install --editable '.[runtime]' --force[/dim] "
+        "(or [dim]pip install 'movate-cli[runtime]'[/dim])"
     )
 
 
