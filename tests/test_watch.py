@@ -111,7 +111,11 @@ def test_dispatch_once_strict_promotes_warnings(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_cli_watch_help_renders() -> None:
-    r = runner.invoke(cli_app, ["watch", "--help"])
+    # Pin COLUMNS wide so Typer/Rich don't truncate the option table
+    # (CI runners default to a narrow terminal width, which collapses
+    # the help body to an empty Rich panel and makes flag-existence
+    # assertions flake).
+    r = runner.invoke(cli_app, ["watch", "--help"], env={"COLUMNS": "120"})
     assert r.exit_code == 0
     assert "hot-reload" in r.stdout.lower() or "validate" in r.stdout.lower()
     # Flags surface in --help so operators can discover them.
