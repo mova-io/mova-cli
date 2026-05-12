@@ -12,9 +12,16 @@ import logging
 
 import typer
 from dotenv import load_dotenv
+from rich.traceback import install as _install_rich_traceback
 
 # Load .env from cwd (or any parent). Existing env vars take precedence.
 load_dotenv()
+
+# Pretty tracebacks on any unhandled exception. ``show_locals=False`` keeps
+# the output compact (and avoids dumping API keys / model strings into a
+# crash report). ``suppress=[typer]`` hides the typer wrapper frames so
+# the failing user code is on top.
+_install_rich_traceback(show_locals=False, suppress=[typer], width=None)
 
 from movate import __version__  # noqa: E402
 from movate.cli import bench as bench_cmd  # noqa: E402

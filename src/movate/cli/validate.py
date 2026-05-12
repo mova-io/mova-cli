@@ -9,12 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import typer
-from rich import box
 from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 
+from movate.cli._theme import kv_table, ok_badge, success_panel
 from movate.cli._workflow_path import is_workflow_path
 from movate.core.config import load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
@@ -133,15 +130,7 @@ def _render_agent_summary(
     Tokens preserved verbatim for assertion-based tests:
     ``eval cost``, ``clean``, ``compliant`` (only when policy active).
     """
-    table = Table(
-        show_header=False,
-        box=None,
-        padding=(0, 2),
-        pad_edge=False,
-    )
-    table.add_column(style="dim", no_wrap=True, justify="right")
-    table.add_column(no_wrap=False)
-
+    table = kv_table()
     table.add_row("api", spec.api_version)
     table.add_row("provider", spec.model.provider)
     if spec.model.fallback:
@@ -154,9 +143,9 @@ def _render_agent_summary(
     # tests asserting on "clean" / "compliant" keep matching.
     badges: list[str] = []
     if lint_active:
-        badges.append("[green]✓[/green] lint clean" if lint_clean else "[yellow]![/yellow] lint")
+        badges.append(ok_badge("lint clean") if lint_clean else "[yellow]![/yellow] lint")
     if policy_active:
-        badges.append("[green]✓[/green] policy compliant")
+        badges.append(ok_badge("policy compliant"))
     if badges:
         table.add_row("checks", "   ".join(badges))
 
@@ -169,22 +158,7 @@ def _render_agent_summary(
             f"~{forecast.output_tokens_per_call}out tokens)[/dim]",
         )
 
-    title = Text.assemble(
-        ("✓ ", "bold green"),
-        (spec.name, "bold"),
-        ("  v", "dim"),
-        (spec.version, "dim"),
-        ("  ·  agent", "dim"),
-    )
-    panel = Panel(
-        table,
-        title=title,
-        title_align="left",
-        border_style="green",
-        box=box.ROUNDED,
-        padding=(1, 2),
-    )
-    console.print(panel)
+    console.print(success_panel(table, name=spec.name, version=spec.version, kind="agent"))
 
 
 def _render_lint_issues(issues: list[LintIssue]) -> None:
@@ -221,9 +195,7 @@ def _validate_workflow(path: Path) -> None:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
 
-    table = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
-    table.add_column(style="dim", no_wrap=True, justify="right")
-    table.add_column(no_wrap=False)
+    table = kv_table()
     table.add_row("api", spec.api_version)
     table.add_row("entrypoint", graph.entrypoint)
     table.add_row("nodes", str(len(graph.nodes)))
@@ -231,20 +203,6 @@ def _validate_workflow(path: Path) -> None:
     chain = " → ".join(graph.topological_order())
     table.add_row("topology", chain)
 
-    title = Text.assemble(
-        ("✓ ", "bold green"),
-        (graph.name, "bold"),
-        ("  v", "dim"),
-        (graph.version, "dim"),
-        ("  ·  workflow", "dim"),
-    )
     console.print(
-        Panel(
-            table,
-            title=title,
-            title_align="left",
-            border_style="green",
-            box=box.ROUNDED,
-            padding=(1, 2),
-        )
+        success_panel(table, name=graph.name, version=graph.version, kind="workflow")
     )
