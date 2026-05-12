@@ -33,10 +33,10 @@ We validated four mappings end-to-end:
 
 | # | Mapping | Status | IR additions needed |
 |---|---|---|---|
-| 1 | Linear (v0.3) — `AGENT` + `SEQUENTIAL` | ✅ runs as-is | None |
-| 2 | Conditional — `CONDITIONAL` edges | ✅ runs | Condition DSL syntax + default-branch convention |
-| 3 | Parallel — `PARALLEL_FAN_OUT/IN` | ✅ runs | State-schema reducer annotations + node-output convention (deltas vs full) |
-| 4 | HITL — `HUMAN` nodes | ✅ runs | Resume-payload schema + checkpointer config |
+| 1 | Linear (v0.3) — `AGENT` + `SEQUENTIAL` | ✅ shipped (v1.0) | None |
+| 2 | Conditional — `CONDITIONAL` edges | ✅ shipped (v1.1) | Condition DSL syntax + default-branch convention |
+| 3 | Parallel — `PARALLEL_FAN_OUT/IN` | ✅ shipped (v1.1) | State-schema reducer annotations + node-output convention (deltas vs full) |
+| 4 | HITL — `HUMAN` nodes | ✅ shipped (v1.1) | Resume-payload schema + checkpointer config |
 
 No `NodeType` or `EdgeKind` variants need to be added or renamed. No
 field on the existing dataclasses needs to change type or be removed.
@@ -171,14 +171,13 @@ Alternative considered: add `WorkflowNode.default_target: str | None`.
 Rejected because it duplicates information that's already in the edges
 and creates an extra place for config drift.
 
-### D. HUMAN node resume payload schema
+### D. HUMAN node resume payload schema  ✅ shipped
 
 **Problem:** `WorkflowNode.metadata: dict[str, Any]` is a stash; HUMAN
 nodes need a typed contract for what the external resume payload looks
 like.
 
-**Recommendation:** formalise as a typed field on `WorkflowNode` *when
-type is HUMAN*. The simplest form is a JSON Schema:
+**Shipped:** typed field on `WorkflowNode` and `NodeSpec`:
 
 ```python
 @dataclass
@@ -187,30 +186,32 @@ class WorkflowNode:
     resume_payload_schema: dict[str, Any] | None = None
     """JSON Schema for the payload an external system must supply to
     resume a HUMAN node. Required when type is HUMAN; ignored otherwise.
-    Validated at compile time; runner validates resume input against it
-    before calling `graph.update_state`."""
+    Validated at YAML parse time via Pydantic model_validator; resume.py
+    validates the resume input against it (Draft 2020-12) before calling
+    `graph.aupdate_state`."""
 ```
 
-Compiler validates `type == HUMAN ⇒ resume_payload_schema is not None`.
+YAML-time validation: `type == HUMAN ⇒ resume_payload_schema is not None`
+(otherwise `WorkflowSpecLoadError`). Runtime validation: bad payload →
+`ResumeError` before LangGraph is even touched.
 
-### E. Workflow-level checkpointer config
+### E. Workflow-level checkpointer config  ✅ shipped
 
-**Problem:** HITL workflows require a LangGraph checkpointer (memory for
-tests, postgres for production). The IR has no field for this today.
-
-**Recommendation:** add a top-level workflow YAML field with a
-movate-provided enum:
+**Shipped:** top-level workflow YAML field with a movate-provided enum:
 
 ```yaml
 checkpointer: postgres     # one of: memory | sqlite | postgres
 ```
 
-The compiler injects an appropriate `BaseCheckpointSaver` at
-`graph.compile(checkpointer=...)`. Default: `memory` if no HUMAN nodes,
-else require explicit choice.
+The compiler injects a `TenantNamespacedCheckpointer` wrapping LangGraph's
+`BaseCheckpointSaver` at `graph.compile(checkpointer=...)`. Tenant
+namespacing prefixes every `thread_id` with `tenant_id::` so cross-tenant
+threads stay invisible. HUMAN-node workflows MUST declare a checkpointer
+or compile fails with an actionable pointer.
 
-Postgres backend reuses our existing connection pool — checkpoint storage
-becomes a new set of tables in the same schema.
+SQLite persists at `~/.movate/checkpoints.db` (override via
+`MOVATE_CHECKPOINT_DB`); Postgres uses `MOVATE_CHECKPOINT_PG_DSN` (or
+`MOVATE_DB_URL` as fallback).
 
 ### F. Node output convention: deltas vs full state
 
