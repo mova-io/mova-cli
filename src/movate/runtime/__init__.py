@@ -19,9 +19,34 @@ schema migration, and vice versa.
 
 from __future__ import annotations
 
-from movate.runtime.app import build_app
-from movate.runtime.middleware import AuthContext
+from typing import TYPE_CHECKING, Any
+
+# Lazy re-exports via PEP 562 ``__getattr__``. Importing
+# ``movate.runtime.app`` pulls FastAPI; importing
+# ``movate.runtime.middleware`` does not. Pre-lazy, even ``movate
+# --help`` would crash if the ``[serve]`` extra wasn't installed
+# because the CLI transitively imported this module (via worker's
+# ``from movate.runtime.dispatch import …``, whose package init
+# ran ``from movate.runtime.app import build_app``).
+#
+# The public API is unchanged: ``from movate.runtime import build_app``
+# still works, but the import only fires when the attribute is
+# accessed — i.e. when the operator actually runs ``movate serve``.
+
+if TYPE_CHECKING:  # pragma: no cover - type-checker only
+    from movate.runtime.app import build_app
+    from movate.runtime.middleware import AuthContext
 
 __all__ = ["AuthContext", "build_app"]
-"""``AuthContext`` re-exported here so handlers can ``from movate.runtime
-import AuthContext`` rather than reaching into ``runtime.middleware``."""
+
+
+def __getattr__(name: str) -> Any:
+    if name == "build_app":
+        from movate.runtime.app import build_app  # noqa: PLC0415
+
+        return build_app
+    if name == "AuthContext":
+        from movate.runtime.middleware import AuthContext  # noqa: PLC0415
+
+        return AuthContext
+    raise AttributeError(f"module 'movate.runtime' has no attribute {name!r}")

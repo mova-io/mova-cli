@@ -18,14 +18,22 @@ import asyncio
 from pathlib import Path
 
 import typer
-import uvicorn
 from rich.console import Console
 
-from movate.runtime.app import build_app
-from movate.runtime.registry import scan_agents
-from movate.storage import build_storage
+# NOTE: ``uvicorn``, ``fastapi``, and the runtime app are imported lazily
+# inside ``serve()`` so the rest of the CLI works even when the optional
+# ``[serve]`` extra is not installed. Without lazy imports, ``movate
+# --help`` would crash with ``ModuleNotFoundError: uvicorn``.
 
 err = Console(stderr=True)
+
+
+def _missing_extra_hint() -> str:
+    return (
+        "[red]✗[/red] the [bold]serve[/bold] command needs the optional `serve` extra.\n"
+        "  install: [dim]uv tool install --editable '.[serve]'[/dim] "
+        "(or [dim]pip install 'movate-cli[serve]'[/dim])"
+    )
 
 
 def serve(
@@ -70,6 +78,17 @@ def serve(
       [dim]# Disable rate limiting (single-tenant dev)[/dim]
       $ movate serve --rate-limit-per-minute 0
     """
+    try:
+        # Lazy import — see module-level NOTE. Defers ~uvicorn + fastapi
+        # ~0.5s startup and lets the CLI launch even without the extra.
+        import uvicorn  # noqa: PLC0415, F401 — imported for early failure detection
+        from movate.runtime.app import build_app  # noqa: PLC0415, F401
+        from movate.runtime.registry import scan_agents  # noqa: PLC0415, F401
+        from movate.storage import build_storage  # noqa: PLC0415, F401
+    except ImportError:
+        err.print(_missing_extra_hint())
+        raise typer.Exit(code=2) from None
+
     asyncio.run(
         _run_serve(
             host=host,
@@ -99,6 +118,13 @@ async def _run_serve(
     first request. Running uvicorn via ``Server.serve()`` inside
     this async function keeps everything on one loop.
     """
+    # Imports already validated by ``serve()`` before we get here.
+    import uvicorn  # noqa: PLC0415
+
+    from movate.runtime.app import build_app  # noqa: PLC0415
+    from movate.runtime.registry import scan_agents  # noqa: PLC0415
+    from movate.storage import build_storage  # noqa: PLC0415
+
     storage = build_storage()
     await storage.init()
 

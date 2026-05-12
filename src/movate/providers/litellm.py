@@ -17,9 +17,6 @@ from __future__ import annotations
 import logging
 from typing import Any, cast
 
-import litellm
-from litellm import exceptions as lle
-
 from movate.core.failures import (
     AuthError,
     ContentFilterError,
@@ -34,8 +31,26 @@ from movate.providers.base import BaseLLMProvider, CompletionRequest, Completion
 
 log = logging.getLogger(__name__)
 
-# LiteLLM emits a noisy startup log line by default; quiet it.
-litellm.suppress_debug_info = True
+# Lazy import: ``import litellm`` is ~1-2s cold because litellm eagerly
+# loads every provider subpackage at import time. Deferring it keeps
+# ``movate --help`` / ``--version`` snappy; the first real call to
+# ``complete()`` pays the cost (and caches the module reference).
+_litellm: Any = None
+_lle: Any = None
+
+
+def _load_litellm() -> tuple[Any, Any]:
+    """Import + initialize litellm on first use. Idempotent."""
+    global _litellm, _lle
+    if _litellm is None:
+        import litellm as _ll  # noqa: PLC0415 — intentional lazy import
+        from litellm import exceptions as _lle_mod  # noqa: PLC0415
+
+        # LiteLLM emits a noisy startup log line by default; quiet it.
+        _ll.suppress_debug_info = True
+        _litellm = _ll
+        _lle = _lle_mod
+    return _litellm, _lle
 
 
 class LiteLLMProvider(BaseLLMProvider):
@@ -43,6 +58,7 @@ class LiteLLMProvider(BaseLLMProvider):
     version = "0.0.1"
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        litellm, lle = _load_litellm()
         try:
             resp = await litellm.acompletion(
                 model=request.provider,
