@@ -61,6 +61,26 @@ operator populates KV secrets, second pass flips the flag to
 ''')
 param enableApiWorker bool = true
 
+@description('''
+Deploy the Azure Communication Services resource for outbound SMS
+notifications. Off by default — SMS adds a separate operator workflow
+(A2P 10DLC registration with The Campaign Registry, ~2-3 weeks) and
+small monthly cost (~$1/mo per toll-free number + per-message).
+Flip to ``true`` only when ready. See docs/v1.0-azure-design.md §10.
+''')
+param enableSms bool = false
+
+@description('''
+E.164 phone number used as the SMS "from" address. Operator obtains
+this via `az communication phonenumber purchase` AFTER the ACS
+resource is created (first pass with enableSms=true creates ACS,
+operator purchases the number out-of-band, then sets this param
+and redeploys). Empty string disables the env var on the worker
+(falls back to ConsoleSmsBackend at runtime). Leave empty on the
+provisioning pass.
+''')
+param acsFromNumber string = ''
+
 // ---------------------------------------------------------------------------
 // Per-env defaults — keep in sync with docs/v1.0-azure-design §4
 // ---------------------------------------------------------------------------
@@ -100,6 +120,7 @@ var pgName = 'movate-${env}-pg'
 var caeName = 'movate-${env}-cae'
 var apiName = 'movate-${env}-api'
 var workerName = 'movate-${env}-worker'
+var acsName = 'movate-${env}-acs'
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -147,6 +168,19 @@ module pg 'modules/postgres.bicep' = {
     storageSizeGB: pgStorageGB
     backupRetentionDays: pgBackupDays
     adminPassword: postgresAdminPassword
+    tags: tags
+  }
+}
+
+// Azure Communication Services — gated on enableSms (see param doc).
+// Independent of the API/worker apps; can be provisioned in pass 1
+// alongside everything else. The phone number is bought out-of-band
+// after this lands (Bicep can't reliably express the search-purchase
+// flow); see modules/communication.bicep for the operator runbook.
+module acs 'modules/communication.bicep' = if (enableSms) {
+  name: 'acs-${env}'
+  params: {
+    name: acsName
     tags: tags
   }
 }
@@ -211,6 +245,13 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     cpu: workerCpu
     memory: workerMemory
     queueDepthPerReplica: workerQueueDepthPerReplica
+    // SMS env-var wiring. enableSms gates both: when false, the worker
+    // gets neither env var and SMS jobs fall through to console logging.
+    // When true, MOVATE_ACS_CONNECTION_STRING is a KV reference (operator
+    // populates the secret named "acs-connection-string" once) and
+    // MOVATE_ACS_FROM_NUMBER is the non-secret E.164 from the bicepparam.
+    enableSms: enableSms
+    acsFromNumber: acsFromNumber
     tags: tags
   }
 }

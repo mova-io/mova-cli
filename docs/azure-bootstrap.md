@@ -252,6 +252,54 @@ Steady-state idle cost per env (no traffic, min replicas = 0/0):
 These are bounds; actual cost scales with traffic. Confirm budget
 with your finance lead before deploying prod.
 
+## Optional: SMS notifications via Azure Communication Services
+
+SMS is off by default. Wiring it on is a three-step flow that intersects
+with multi-week ops work outside of code (A2P 10DLC brand registration
+with The Campaign Registry). The CODE side lands in two passes:
+
+**Pass A — provision the ACS resource (~1 min):**
+
+1. In your bicepparam, set `enableSms = true`. Leave `acsFromNumber = ''`.
+2. Re-deploy. Bicep creates `movate-<env>-acs`.
+
+**Pass B — buy the toll-free number + paste connection string:**
+
+1. List + buy a toll-free SMS-capable number:
+   ```
+   az communication phonenumber list-available \
+       --service movate-<env>-acs \
+       --country-code US --phone-number-type tollFree \
+       --assignment-type application --capabilities sms=outbound
+   az communication phonenumber purchase \
+       --service movate-<env>-acs --search-id <id-from-list>
+   ```
+2. Copy the resulting E.164 number into `acsFromNumber` in your bicepparam.
+3. From the ACS resource's "Keys" blade (Portal) or `az communication
+   list-key --name movate-<env>-acs`, copy the primary connection string,
+   then paste it into Key Vault:
+   ```
+   az keyvault secret set --vault-name movate-<env>-kv \
+       --name acs-connection-string --value "endpoint=https://...;accesskey=..."
+   ```
+4. Re-deploy. The worker now starts with `MOVATE_ACS_CONNECTION_STRING`
+   and `MOVATE_ACS_FROM_NUMBER` set; `build_sms_backend()` selects
+   `AcsSmsBackend` and `movate submit ... --notify-sms +1...` works
+   end-to-end.
+
+**Pass C — out-of-band, in parallel with A+B:**
+
+* Register your brand + use case with The Campaign Registry (A2P 10DLC).
+  ~2-3 weeks for vetting + carrier filtering. Until this lands, your
+  toll-free number CAN send to short verification messages but US
+  carriers may rate-limit or block messages to numbers that haven't
+  opted in. Start this on day one if you plan to use SMS — code can
+  ship and idle while the registration finishes.
+
+The worker installs the soft-dep SDK via `pip install movate[sms-acs]`;
+the Dockerfile's worker stage already does this when `enableSms=true`
+is set, or add the extra to your `requirements.txt`.
+
 ## What's NOT covered
 
 - **Multi-region failover** — single-region deployment; bring your
@@ -261,6 +309,8 @@ with your finance lead before deploying prod.
 - **VNet integration** — public ingress in v1.0; auth still gates
   every endpoint. Move to VNet in v1.1 if a security review
   demands it.
+- **International SMS** — US-only for v1.0; ACS supports international
+  but the registration flow is per-region.
 
 See [BACKLOG.md](../BACKLOG.md) for the post-v1.0 roadmap (KEDA
 queue-depth scaler, job retry policy, rate limiting, etc.).

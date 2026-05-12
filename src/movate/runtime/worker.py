@@ -209,10 +209,16 @@ class Worker:
         # terminal status. The dispatcher's contract is "never raise";
         # we still wrap to belt-and-suspender any future implementation
         # that slips and raises something the worker shouldn't die on.
-        if final_action == "terminal" and self._notifier is not None and job.notify_email:
+        # Either channel set means we have something to notify — the
+        # composite dispatcher's per-channel backends each early-return
+        # for channels the job didn't address, so it's safe to call
+        # unconditionally as long as at least one channel is requested.
+        notify_requested = bool(job.notify_email or job.notify_sms)
+        if final_action == "terminal" and self._notifier is not None and notify_requested:
             try:
-                # Use the post-update view so the email reflects the
-                # terminal status, not the RUNNING snapshot we have here.
+                # Use the post-update view so the notification reflects
+                # the terminal status, not the RUNNING snapshot we have
+                # here.
                 terminal_view = await self._storage.get_job(job.job_id, tenant_id=job.tenant_id)
                 if terminal_view is not None:
                     await self._notifier.notify_terminal(terminal_view)

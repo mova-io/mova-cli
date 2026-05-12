@@ -34,6 +34,7 @@ from rich.table import Table
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
 from movate.core.models import JobKind, JobStatus
+from movate.core.phone import InvalidPhoneError, normalize_e164, validate_e164
 from movate.core.user_config import (
     UserConfigError,
     resolve_bearer_token,
@@ -102,6 +103,19 @@ def submit(
             "(MOVATE_SMTP_HOST + creds) or it falls back to logging only."
         ),
     ),
+    notify_sms: str = typer.Option(
+        None,
+        "--notify-sms",
+        help=(
+            "E.164 phone number the server-side worker texts when the job "
+            "reaches a terminal status. Cosmetic separators (spaces, dashes, "
+            "parens) are normalized; final form must be '+' followed by "
+            "1-15 digits. Worker must have Azure Communication Services "
+            "configured (MOVATE_ACS_CONNECTION_STRING + MOVATE_ACS_FROM_NUMBER) "
+            "and the azure-communication-sms SDK installed, otherwise it "
+            "falls back to logging only."
+        ),
+    ),
     output_format: str = typer.Option("table", "--output", "-o", help="table | json"),
 ) -> None:
     """Queue a job at a deployed runtime and (optionally) wait for completion.
@@ -130,6 +144,17 @@ def submit(
         raise typer.Exit(code=2)
     payload = _coerce_input(raw)
 
+    # Validate + normalize phone number client-side so a typo doesn't
+    # round-trip through the queue and surface as a noisy worker log
+    # hours later. Operators paste from contact cards; normalize_e164
+    # strips the spaces/dashes/parens they leave in.
+    if notify_sms is not None:
+        try:
+            notify_sms = validate_e164(normalize_e164(notify_sms))
+        except InvalidPhoneError as exc:
+            err.print(f"[red]✗[/red] --notify-sms: {exc}")
+            raise typer.Exit(code=2) from None
+
     try:
         target_name, target_cfg = resolve_target(target)
         token = resolve_bearer_token(target_cfg)
@@ -150,6 +175,7 @@ def submit(
             poll_interval=poll_interval,
             notify=notify,
             notify_email=notify_email,
+            notify_sms=notify_sms,
             output_format=output_format,
         )
     )
@@ -173,6 +199,7 @@ async def _submit(
     poll_interval: float,
     notify: bool,
     notify_email: str | None,
+    notify_sms: str | None,
     output_format: str,
 ) -> None:
     async with MovateClient(base_url=base_url, api_key=token) as client:
@@ -183,6 +210,7 @@ async def _submit(
                     target=agent,
                     input=input_payload,
                     notify_email=notify_email,
+                    notify_sms=notify_sms,
                 )
         except MovateClientError as exc:
             err.print(f"[red]✗ submit failed:[/red] {exc}")

@@ -62,3 +62,21 @@ param tags = {
   managedBy: 'bicep'
   owner: 'platform-team'
 }
+
+// OPTIONAL — provision Azure Communication Services for outbound SMS
+// notifications. Off by default; flip to `true` ONLY when you're
+// ready to A2P-10DLC-register the brand (~2-3 weeks ops work). See
+// docs/v1.0-azure-design.md §10 for the decision rationale and
+// docs/azure-bootstrap.md for the post-provision runbook.
+//
+//   param enableSms = true
+//   param acsFromNumber = '+18885551234'  // E.164, from `az communication phonenumber purchase`
+//
+// Leave `acsFromNumber` empty on the provisioning pass: the ACS
+// resource lands first, operator buys the toll-free number from the
+// Azure Portal or `az communication phonenumber purchase`, then sets
+// this param and redeploys. The worker only gets the
+// MOVATE_ACS_* env vars when BOTH `enableSms` is true AND
+// `acsFromNumber` is non-empty.
+param enableSms = false
+param acsFromNumber = ''

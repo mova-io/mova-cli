@@ -1,6 +1,9 @@
-"""Notification dispatch — email a user when their job finishes.
+"""Notification dispatch — notify a user when their job finishes.
 
-Pluggable Protocol with two backends:
+Two channels (email + SMS), composed by :class:`MultiDispatcher`. Each
+channel has its own pluggable backend pair (console + real-vendor):
+
+Email (this module):
 
 * :class:`ConsoleBackend` — logs notifications instead of sending.
   Default in dev / tests / when SMTP isn't configured. Means jobs
@@ -17,16 +20,18 @@ Pluggable Protocol with two backends:
     * ``MOVATE_SMTP_USE_SSL`` (default 'false'; flip to 'true' for port 465)
     * ``MOVATE_SMTP_TIMEOUT_SECONDS`` (default 10)
 
-Choose the active backend via :func:`build_dispatcher`:
+SMS (sister module :mod:`movate.core.notify_sms`):
 
-* No ``MOVATE_SMTP_HOST`` set → :class:`ConsoleBackend` (logs only).
-* ``MOVATE_SMTP_HOST`` set → :class:`SmtpEmailBackend`.
+* :class:`~movate.core.notify_sms.ConsoleSmsBackend` — logs only.
+* :class:`~movate.core.notify_sms.AcsSmsBackend` — Azure Communication
+  Services (locked vendor per docs/v1.0-azure-design.md §10).
 
-SMS is **deferred**. Phone-number provisioning + carrier registration
-(A2P 10DLC for US numbers, equivalents elsewhere) is a multi-week
-business setup, not a code question. Email covers the dev-team
-``movate submit ... --notify-email me@example.com`` workflow; that's
-the 90% case for now.
+Choose the active dispatcher via :func:`build_dispatcher`: it composes
+one email + one SMS backend selected from env vars and returns a
+:class:`MultiDispatcher` that forwards every terminal job to both. Each
+backend is a no-op for jobs that don't address its channel
+(``ConsoleSmsBackend.notify_terminal`` returns early when
+``job.notify_sms is None``, etc.), so composing them is cheap.
 
 The worker fires this fire-and-forget after each terminal transition.
 Failure logs but never re-queues the job — notification is courtesy,
@@ -42,6 +47,7 @@ from email.mime.text import MIMEText
 from typing import Protocol
 
 from movate.core.models import JobRecord
+from movate.core.notify_sms import build_sms_backend
 
 logger = logging.getLogger(__name__)
 
@@ -176,15 +182,48 @@ class SmtpEmailBackend:
 # ---------------------------------------------------------------------------
 
 
-def build_dispatcher() -> NotificationDispatcher:
-    """Select a backend from env vars.
+class MultiDispatcher:
+    """Forwards every terminal job to N child dispatchers.
 
-    Selection rule: ``MOVATE_SMTP_HOST`` set → SMTP; otherwise console.
-    Operators wire SMTP via env on the worker container; nothing else
-    in movate changes when they do.
+    Each child is responsible for ignoring jobs that don't address its
+    channel (e.g. the email backend's ``notify_terminal`` is a no-op
+    when ``job.notify_email is None``). Composing them is cheap because
+    of that — fanning out always touches the no-op fast path for
+    channels the job didn't request.
 
-    Idempotent + side-effect-free. Each worker startup calls this
-    once; the worker holds the result for its lifetime.
+    Exceptions in one child don't sink the others: we wrap each
+    forwarded call in a try/except. This is belt-and-suspender on top
+    of the per-backend contract (backends ARE supposed to swallow
+    their own errors — see the dispatcher Protocol docstring) — a
+    buggy backend that breaks the contract must not cascade.
+    """
+
+    def __init__(self, children: list[NotificationDispatcher]) -> None:
+        self._children = children
+        # Composite name = "smtp+acs-sms", "console+console-sms", etc.
+        # Useful for the operator-visible log on worker boot.
+        self.name = "+".join(c.name for c in children) if children else "noop"
+
+    async def notify_terminal(self, job: JobRecord) -> None:
+        for child in self._children:
+            try:
+                await child.notify_terminal(job)
+            except Exception:
+                logger.warning(
+                    "notify_multi_child_raised backend=%s job_id=%s — "
+                    "continuing with remaining backends",
+                    child.name,
+                    job.job_id,
+                    exc_info=True,
+                )
+
+
+def build_email_backend() -> ConsoleBackend | SmtpEmailBackend:
+    """Select the email channel backend from env vars.
+
+    Selection rule: ``MOVATE_SMTP_HOST`` set + parseable port → SMTP;
+    otherwise console. Split out from :func:`build_dispatcher` so tests
+    can exercise each channel in isolation.
     """
     smtp_host = os.environ.get("MOVATE_SMTP_HOST", "").strip()
     if not smtp_host:
@@ -219,6 +258,23 @@ def build_dispatcher() -> NotificationDispatcher:
         use_ssl=use_ssl,
         timeout=timeout,
     )
+
+
+def build_dispatcher() -> NotificationDispatcher:
+    """Compose a :class:`MultiDispatcher` that fires every configured
+    channel for each terminal job.
+
+    Each channel's backend is selected by its own env-driven factory
+    (:func:`build_email_backend`, :func:`build_sms_backend`) so adding
+    a third channel later (Slack, PagerDuty, etc.) is a one-line change
+    here.
+
+    Idempotent + side-effect-free. Each worker startup calls this once;
+    the worker holds the result for its lifetime.
+    """
+    email_backend = build_email_backend()
+    sms_backend = build_sms_backend()
+    return MultiDispatcher([email_backend, sms_backend])
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +319,9 @@ def _body_for(job: JobRecord) -> str:
 
 __all__ = [
     "ConsoleBackend",
+    "MultiDispatcher",
     "NotificationDispatcher",
     "SmtpEmailBackend",
     "build_dispatcher",
+    "build_email_backend",
 ]

@@ -104,18 +104,22 @@ class MovateClient:
         target: str,
         input: dict[str, Any],
         notify_email: str | None = None,
+        notify_sms: str | None = None,
     ) -> RunAccepted:
         """``POST /run`` — queue a job; returns ``{job_id, status}``.
 
         ``notify_email`` is optional; when set, the worker emails this
-        address on terminal status. The CLI surfaces this via
-        ``movate submit --notify-email <addr>``.
+        address on terminal status. ``notify_sms`` is optional and
+        accepts an E.164 phone number; when set, the worker texts that
+        number on terminal status. Both surfaces are wired into ``movate
+        submit`` via ``--notify-email <addr>`` and ``--notify-sms <num>``.
         """
         body = RunSubmission(
             kind=kind,
             target=target,
             input=input,
             notify_email=notify_email,
+            notify_sms=notify_sms,
         )
         r = await self._client.post("/run", json=body.model_dump(mode="json"))
         self._raise_for_status(r)

@@ -29,8 +29,10 @@ from movate.core.models import (
 )
 from movate.core.notify import (
     ConsoleBackend,
+    MultiDispatcher,
     SmtpEmailBackend,
     build_dispatcher,
+    build_email_backend,
 )
 from movate.runtime.dispatch import WorkerDispatch
 from movate.runtime.worker import Worker
@@ -61,19 +63,19 @@ def _make_job(**overrides) -> JobRecord:
 
 
 @pytest.mark.unit
-def test_build_dispatcher_returns_console_when_no_smtp_host(
+def test_build_email_backend_returns_console_when_no_smtp_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Default: no SMTP env vars → ConsoleBackend (logs only).
     Operators see what would have been sent; the worker doesn't break."""
     monkeypatch.delenv("MOVATE_SMTP_HOST", raising=False)
-    d = build_dispatcher()
+    d = build_email_backend()
     assert isinstance(d, ConsoleBackend)
     assert d.name == "console"
 
 
 @pytest.mark.unit
-def test_build_dispatcher_returns_smtp_when_host_set(
+def test_build_email_backend_returns_smtp_when_host_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """MOVATE_SMTP_HOST set → SmtpEmailBackend, with sane port/timeout defaults."""
@@ -81,32 +83,50 @@ def test_build_dispatcher_returns_smtp_when_host_set(
     monkeypatch.setenv("MOVATE_SMTP_USER", "user")
     monkeypatch.setenv("MOVATE_SMTP_PASSWORD", "pw")
     monkeypatch.setenv("MOVATE_SMTP_FROM", "movate@example.com")
-    d = build_dispatcher()
+    d = build_email_backend()
     assert isinstance(d, SmtpEmailBackend)
     assert d.name == "smtp"
 
 
 @pytest.mark.unit
-def test_build_dispatcher_falls_back_on_bad_port(
+def test_build_email_backend_falls_back_on_bad_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bad MOVATE_SMTP_PORT → fall back to console (don't crash the worker)."""
     monkeypatch.setenv("MOVATE_SMTP_HOST", "smtp.example.com")
     monkeypatch.setenv("MOVATE_SMTP_PORT", "not-a-number")
-    d = build_dispatcher()
+    d = build_email_backend()
     assert isinstance(d, ConsoleBackend)
 
 
 @pytest.mark.unit
-def test_build_dispatcher_smtp_with_use_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_email_backend_smtp_with_use_ssl(monkeypatch: pytest.MonkeyPatch) -> None:
     """MOVATE_SMTP_USE_SSL=true selects SMTP_SSL on send."""
     monkeypatch.setenv("MOVATE_SMTP_HOST", "smtp.example.com")
     monkeypatch.setenv("MOVATE_SMTP_PORT", "465")
     monkeypatch.setenv("MOVATE_SMTP_USE_SSL", "true")
-    d = build_dispatcher()
+    d = build_email_backend()
     assert isinstance(d, SmtpEmailBackend)
     assert d._use_ssl is True
     assert d._port == 465
+
+
+@pytest.mark.unit
+def test_build_dispatcher_returns_multidispatcher_with_email_and_sms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``build_dispatcher`` always returns a MultiDispatcher composing the
+    email + SMS channel backends. Each child handles its own no-op when
+    the job didn't address its channel. Without env config, both children
+    are the console fallbacks."""
+    monkeypatch.delenv("MOVATE_SMTP_HOST", raising=False)
+    monkeypatch.delenv("MOVATE_ACS_CONNECTION_STRING", raising=False)
+    monkeypatch.delenv("MOVATE_ACS_FROM_NUMBER", raising=False)
+    d = build_dispatcher()
+    assert isinstance(d, MultiDispatcher)
+    # Composite name reflects each child for operator visibility.
+    assert "console" in d.name
+    assert "console-sms" in d.name
 
 
 # ---------------------------------------------------------------------------

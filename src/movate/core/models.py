@@ -428,9 +428,15 @@ class JobRecord(BaseModel):
     """Optional email address to notify when the job transitions to a
     terminal status. The worker fires-and-forgets the notification via
     the configured :class:`NotificationDispatcher` — failure to
-    deliver never re-queues the job. SMS notifications are deferred
-    to a future release (phone-number provisioning + regulatory
-    approval are out of band of code)."""
+    deliver never re-queues the job."""
+    notify_sms: str | None = None
+    """Optional E.164 phone number to notify by SMS when the job
+    reaches a terminal status. Same fire-and-forget contract as
+    ``notify_email`` — SMS-provider errors log but never re-queue.
+    The actual delivery vendor (Azure Communication Services for v1.0,
+    per docs/v1.0-azure-design.md §10) is selected by
+    :func:`movate.core.notify.build_dispatcher` from env vars at worker
+    startup; this column only stores the destination."""
     attempt_count: int = Field(default=0, ge=0)
     """Number of times this job has been dispatched. Starts at 0 on
     insert; incremented every time the worker re-queues after a

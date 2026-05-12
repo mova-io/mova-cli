@@ -45,6 +45,16 @@ class RunSubmission(BaseModel):
             "is logged but never re-queues the job."
         ),
     )
+    notify_sms: str | None = Field(
+        default=None,
+        description=(
+            "Optional E.164 phone number (e.g. '+14155551234'). If set, the "
+            "worker texts this number when the job reaches a terminal status. "
+            "Vendor is Azure Communication Services on Azure-hosted runtimes "
+            "(see docs/v1.0-azure-design.md §10). Same fire-and-forget "
+            "contract as notify_email: delivery errors log but never re-queue."
+        ),
+    )
 
 
 class RunAccepted(BaseModel):
@@ -78,6 +88,7 @@ class JobView(BaseModel):
     claimed_at: datetime | None = None
     completed_at: datetime | None = None
     notify_email: str | None = None
+    notify_sms: str | None = None
 
     @classmethod
     def from_record(cls, record: JobRecord) -> JobView:
@@ -93,6 +104,7 @@ class JobView(BaseModel):
             claimed_at=record.claimed_at,
             completed_at=record.completed_at,
             notify_email=record.notify_email,
+            notify_sms=record.notify_sms,
         )
 
 

@@ -169,9 +169,10 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active "
         "ON api_keys(tenant_id) WHERE revoked_at IS NULL"
     ),
-    # post-v1.0: per-job email notification. SMS deferred — needs
-    # regulatory + phone-number provisioning out of band of code.
+    # post-v1.0: per-job email notification. SMS column was added later
+    # under v1.0 SMS work (docs/v1.0-azure-design.md §10).
     "ALTER TABLE jobs ADD COLUMN notify_email TEXT",
+    "ALTER TABLE jobs ADD COLUMN notify_sms TEXT",
     # post-v1.0: per-tenant monthly cost ceiling. One row per tenant;
     # absent row = unlimited (the default, backwards-compatible with
     # v0.x). Executor queries this on every run entry → PK lookup is
@@ -462,8 +463,8 @@ class SqliteProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email, attempt_count, next_retry_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notify_email, notify_sms, attempt_count, next_retry_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -479,6 +480,7 @@ class SqliteProvider:
                 job.claimed_at.isoformat() if job.claimed_at else None,
                 job.completed_at.isoformat() if job.completed_at else None,
                 job.notify_email,
+                job.notify_sms,
                 job.attempt_count,
                 job.next_retry_at.isoformat() if job.next_retry_at else None,
             ),
@@ -895,6 +897,7 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         claimed_at=datetime.fromisoformat(row["claimed_at"]) if row["claimed_at"] else None,
         completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
         notify_email=row["notify_email"],
+        notify_sms=row["notify_sms"],
         # Defensive: rows from pre-retry-migration schemas could
         # theoretically lack the column on a fresh open. aiosqlite.Row
         # KeyError on missing column, so we use bracket access only —

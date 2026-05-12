@@ -71,6 +71,20 @@ async def test_save_and_get_job(storage) -> None:
 
 
 @pytest.mark.unit
+async def test_save_and_get_job_round_trips_notification_targets(storage) -> None:
+    """notify_email + notify_sms persist through save → get on every
+    backend (memory, sqlite, postgres). Catches forgotten columns in
+    either INSERT or row→model mapping."""
+    j = _make_job()
+    j = j.model_copy(update={"notify_email": "ops@example.com", "notify_sms": "+14155551234"})
+    await storage.save_job(j)
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.notify_email == "ops@example.com"
+    assert got.notify_sms == "+14155551234"
+
+
+@pytest.mark.unit
 async def test_get_job_returns_none_for_missing(storage) -> None:
     assert await storage.get_job("ghost", tenant_id="tenant-a") is None
 

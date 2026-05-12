@@ -206,6 +206,7 @@ def build_app(
             input=body.input,
             api_key_id=ctx.api_key_id,
             notify_email=body.notify_email,
+            notify_sms=body.notify_sms,
         )
         store: StorageProvider = request.app.state.storage
         await store.save_job(job)

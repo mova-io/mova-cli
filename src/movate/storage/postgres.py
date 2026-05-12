@@ -129,12 +129,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     claimed_at    TIMESTAMPTZ,
     completed_at  TIMESTAMPTZ,
     notify_email  TEXT,
+    notify_sms    TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_retry_at TIMESTAMPTZ
 );
 -- Upgrade paths for PG instances created on older schemas. PG natively
 -- supports ADD COLUMN IF NOT EXISTS so this is idempotent on every init.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS notify_email TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS notify_sms TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_jobs_queue_head
@@ -476,8 +478,8 @@ class PostgresProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email, attempt_count, next_retry_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                notify_email, notify_sms, attempt_count, next_retry_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             """,
             job.job_id,
             job.tenant_id,
@@ -492,6 +494,7 @@ class PostgresProvider:
             job.claimed_at,
             job.completed_at,
             job.notify_email,
+            job.notify_sms,
             job.attempt_count,
             job.next_retry_at,
         )
@@ -856,6 +859,7 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         claimed_at=row["claimed_at"],
         completed_at=row["completed_at"],
         notify_email=row["notify_email"],
+        notify_sms=row["notify_sms"],
         attempt_count=row["attempt_count"],
         next_retry_at=row["next_retry_at"],
     )
