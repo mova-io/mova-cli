@@ -1,10 +1,14 @@
-# movate
+# MDK — Movate Development Kit
 
 Declarative platform for building, evaluating, and deploying AI agents and workflows.
 
 **Internal Movate framework.** Proprietary; private artifact distribution
 only — see [RELEASING.md](RELEASING.md). Public PyPI is intentionally
 not used.
+
+The CLI is installed as both **`mdk`** (canonical) and **`movate`** (transitional alias —
+dropped in a future major release). Every example in this README uses `mdk`; substitute
+`movate` if you prefer, both work today.
 
 ## Status
 
@@ -17,7 +21,7 @@ not used.
 | 0.2.0 | [`v0.2.0`](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.2.0) | Eval engine (exact-match + LLM-as-judge with cross-family enforcement) |
 
 **v1.0 next (`main`)** — Azure deploy + production hardening: Bicep IaC
-(ACA + Postgres Flex + ACR + Key Vault), `movate deploy`, model policy
+(ACA + Postgres Flex + ACR + Key Vault), `mdk deploy`, model policy
 enforcement, tenant isolation audit. See
 [docs/v0.5-design.md](docs/v0.5-design.md) for the v0.5 architecture
 that v1.0 builds on.
@@ -26,33 +30,33 @@ that v1.0 builds on.
 
 | capability | command | status |
 |---|---|---|
-| Scaffold an agent | `movate init <name> -t <template>` | ✓ v0.1 |
-| Validate agent.yaml + schemas | `movate validate <path>` | ✓ v0.1 |
-| Run an agent locally | `movate run <path> <input> [--mock]` | ✓ v0.1 |
-| Per-provider pricing introspection | `movate pricing` | ✓ v0.1 |
-| Multi-model bench | `movate bench <path>` | ✓ v0.2 |
-| Eval suite + gating | `movate eval <path> --gate 0.7` | ✓ v0.2 |
-| Sequential workflow execution | `movate run <workflow-path>` | ✓ v0.3 |
-| Trace replay (agent + workflow) | `movate trace replay <id>` | ✓ v0.4 |
-| Regression detection vs baseline | `movate eval --baseline <id>` <br> `movate eval --baseline-file <path>` | ✓ v0.4 |
-| Re-run a stored input against current code | `movate run <path> --replay <run-id>` | ✓ v0.4 |
-| API key issuance / revocation | `movate auth create-key | list-keys | revoke-key` | ✓ v0.5 |
-| HTTP runtime | `movate serve` | ✓ v0.5 |
-| Background worker | `movate worker` | ✓ v0.5 |
+| Scaffold an agent | `mdk init <name> -t <template>` | ✓ v0.1 |
+| Validate agent.yaml + schemas | `mdk validate <path>` | ✓ v0.1 |
+| Run an agent locally | `mdk run <path> <input> [--mock]` | ✓ v0.1 |
+| Per-provider pricing introspection | `mdk pricing` | ✓ v0.1 |
+| Multi-model bench | `mdk bench <path>` | ✓ v0.2 |
+| Eval suite + gating | `mdk eval <path> --gate 0.7` | ✓ v0.2 |
+| Sequential workflow execution | `mdk run <workflow-path>` | ✓ v0.3 |
+| Trace replay (agent + workflow) | `mdk trace replay <id>` | ✓ v0.4 |
+| Regression detection vs baseline | `mdk eval --baseline <id>` <br> `mdk eval --baseline-file <path>` | ✓ v0.4 |
+| Re-run a stored input against current code | `mdk run <path> --replay <run-id>` | ✓ v0.4 |
+| API key issuance / revocation | `mdk auth create-key | list-keys | revoke-key` | ✓ v0.5 |
+| HTTP runtime | `mdk serve` | ✓ v0.5 |
+| Background worker | `mdk worker` | ✓ v0.5 |
 | Postgres backend | `MOVATE_DB_URL=postgresql://...` | ✓ v0.5 |
-| Submit jobs to a deployed runtime | `movate submit <agent>` (with `--wait` + `--notify`) | ✓ v0.5+ |
-| Inspect jobs on a deployed runtime | `movate jobs show | wait | list-agents` | ✓ v0.5+ |
-| Manage deployment targets | `movate config add-target | use | list-targets` | ✓ v0.5+ |
+| Submit jobs to a deployed runtime | `mdk submit <agent>` (with `--wait` + `--notify`) | ✓ v0.5+ |
+| Inspect jobs on a deployed runtime | `mdk jobs show | wait | list-agents` | ✓ v0.5+ |
+| Manage deployment targets | `mdk config add-target | use | list-targets` | ✓ v0.5+ |
 | Azure deploy (Bicep IaC) | `infra/azure/main.bicep` (manual `az deployment`) | ✓ v1.0 stage 1 |
-| One-command deploy to ACA | `movate deploy --target <name>` | ✓ v1.0 stage 2 |
+| One-command deploy to ACA | `mdk deploy --target <name>` | ✓ v1.0 stage 2 |
 | Auto-deploy on push to release/* | `.github/workflows/deploy.yml` (federated OIDC) | ✓ v1.0 stage 2 |
-| Azure preflight diagnostic | `movate doctor --target <name>` | ✓ v1.0 |
+| Azure preflight diagnostic | `mdk doctor --target <name>` | ✓ v1.0 |
 | Azure bootstrap (RG + SP + federated cred) | `scripts/azure-bootstrap.sh <env>` | ✓ v1.0 |
-| Job retry + dead-letter on transient failures | `JobRetryPolicy` + `movate jobs list --status dead_letter` | ✓ post-v1.0 |
+| Job retry + dead-letter on transient failures | `JobRetryPolicy` + `mdk jobs list --status dead_letter` | ✓ post-v1.0 |
 | Liveness + readiness probes for ACA | `GET /healthz` (cheap) + `GET /ready` (deep checks) | ✓ post-v1.0 |
-| Per-API-key rate limiting | `movate serve --rate-limit-per-minute 60` | ✓ post-v1.0 |
+| Per-API-key rate limiting | `mdk serve --rate-limit-per-minute 60` | ✓ post-v1.0 |
 | Worker autoscaling on queue depth | KEDA postgresql scaler in `containerapp-worker.bicep` | ✓ post-v1.0 |
-| Per-tenant monthly cost ceiling | `movate tenants set-budget <id> --monthly-usd 500` | ✓ post-v1.0 |
+| Per-tenant monthly cost ceiling | `mdk tenants set-budget <id> --monthly-usd 500` | ✓ post-v1.0 |
 | Model policy enforcement | `movate.yaml: policy:` (allowed_providers, deny_models, max cost) | ✓ v1.0 stage 3 |
 
 ## Prerequisites
@@ -83,7 +87,7 @@ The hermetic path uses `--mock` so you don't need an API key.
 ### 1. Scaffold an agent
 
 ```bash
-movate init faq-agent -t faq
+mdk init faq-agent -t faq
 ```
 
 Creates `./faq-agent/` with `agent.yaml`, `prompt.md`, JSON schemas, and a
@@ -93,7 +97,7 @@ small eval dataset.
 
 ```bash
 MOVATE_MOCK_RESPONSE='{"answer": "Hello!", "confidence": 0.95}' \
-  movate run ./faq-agent '{"question": "what is movate?"}' --mock
+  mdk run ./faq-agent '{"question": "what is movate?"}' --mock
 ```
 
 The output JSON shows the validated response, plus `metrics.cost_usd`,
@@ -103,7 +107,7 @@ The output JSON shows the validated response, plus `metrics.cost_usd`,
 ### 3. Eval against the dataset
 
 ```bash
-movate eval ./faq-agent --mock --gate 0.7
+mdk eval ./faq-agent --mock --gate 0.7
 ```
 
 Rich table with per-case scores, mean, pass-rate, total cost, and a
@@ -114,10 +118,10 @@ PRs.
 
 ```bash
 # On main, freeze the current scores as a JSON baseline:
-movate eval ./faq-agent --mock --output-baseline .movate/faq-agent/baseline.json
+mdk eval ./faq-agent --mock --output-baseline .movate/faq-agent/baseline.json
 
 # In a PR, fail the build if scores drop past the tolerance:
-movate eval ./faq-agent --mock \
+mdk eval ./faq-agent --mock \
   --baseline-file .movate/faq-agent/baseline.json \
   --regression-tolerance 0.05
 ```
@@ -131,7 +135,7 @@ Walkthrough: [docs/ci-eval-gate.md](docs/ci-eval-gate.md).
 ```bash
 # A specific run looked wrong? Re-execute the *same input* through
 # whatever's on disk now (prompt edits, model swaps, schema changes):
-movate run ./faq-agent --replay <run-id> --mock
+mdk run ./faq-agent --replay <run-id> --mock
 ```
 
 JSON output diffs recorded vs current, surfaces `output_changed`,
@@ -140,26 +144,26 @@ JSON output diffs recorded vs current, surfaces `output_changed`,
 For a full timeline of an agent or workflow:
 
 ```bash
-movate trace replay <run-id-or-workflow-run-id>
+mdk trace replay <run-id-or-workflow-run-id>
 ```
 
 ## Quickstart — service mode (v0.5)
 
-Run movate as a real service: HTTP runtime + worker pool, sqlite or
+Run MDK as a real service: HTTP runtime + worker pool, sqlite or
 Postgres-backed.
 
 ### Sqlite (zero infra)
 
 ```bash
 # Terminal 1: scaffold an agent + start the HTTP runtime
-movate init alpha --target ./agents
-movate serve --port 8000 --agents-path ./agents
+mdk init alpha --target ./agents
+mdk serve --port 8000 --agents-path ./agents
 
 # Terminal 2: run a worker (mock mode = no API keys)
-MOVATE_MOCK_RESPONSE='{"message":"hi"}' movate worker --mock
+MOVATE_MOCK_RESPONSE='{"message":"hi"}' mdk worker --mock
 
 # Terminal 3: mint a key + queue a job
-KEY=$(movate auth create-key --tenant-id "$(uuidgen | tr -d -)" --env live --quiet 2>&1 \
+KEY=$(mdk auth create-key --tenant-id "$(uuidgen | tr -d -)" --env live --quiet 2>&1 \
         | grep -o 'mvt_[a-zA-Z0-9_-]*' | head -1)
 
 curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
@@ -178,8 +182,8 @@ Same commands; just point `MOVATE_DB_URL` at a Postgres instance:
 
 ```bash
 export MOVATE_DB_URL="postgresql://user:pw@host:5432/movate"
-movate serve --port 8000 --agents-path ./agents
-movate worker  # in another process; multiple workers run in parallel via SKIP LOCKED
+mdk serve --port 8000 --agents-path ./agents
+mdk worker  # in another process; multiple workers run in parallel via SKIP LOCKED
 ```
 
 API key + job + run state all land in Postgres. JSONB columns are
@@ -191,36 +195,35 @@ SELECT job_id, status, output->>'message' FROM runs WHERE agent = 'alpha';
 
 ## Quickstart — submit jobs to a deployed runtime
 
-Once you have a runtime running (locally via `movate serve` + `movate
-worker`, or remotely on Azure), submit jobs from any machine without
+Once you have a runtime running (locally via `mdk serve` + `mdk worker`, or remotely on Azure), submit jobs from any machine without
 hand-crafting `curl` calls.
 
 ```bash
 # One-time: register a target. The bearer token lives in an env var,
 # NOT in the config file.
-export MOVATE_PROD_KEY=mvt_live_...   # from `movate auth create-key`
-movate config add-target prod \
+export MOVATE_PROD_KEY=mvt_live_...   # from `mdk auth create-key`
+mdk config add-target prod \
     --url https://movate-prod-api.eastus2.azurecontainerapps.io \
     --key-env MOVATE_PROD_KEY \
     --set-active
 
 # Fire-and-forget — prints {job_id, status} on stdout (pipe-friendly).
-movate submit faq-agent '{"question": "what is movate?"}'
+mdk submit faq-agent '{"question": "what is movate?"}'
 
 # Wait for completion + desktop notification when done.
 # Use this for long evals / bench runs — walk away, come back to a chime.
-movate submit faq-agent '{"question": "..."}' --wait --notify
+mdk submit faq-agent '{"question": "..."}' --wait --notify
 
 # Inspect a previously-submitted job.
-movate jobs show <job-id>
-movate jobs wait <job-id> --timeout 600    # block until terminal
+mdk jobs show <job-id>
+mdk jobs wait <job-id> --timeout 600    # block until terminal
 
 # What can this runtime run?
-movate jobs list-agents
+mdk jobs list-agents
 
 # Switch targets mid-session.
-movate submit faq-agent '{...}' --target staging
-movate config use staging  # or set a new default
+mdk submit faq-agent '{...}' --target staging
+mdk config use staging  # or set a new default
 ```
 
 The `--notify` desktop fallback uses `terminal-notifier` / `osascript`
@@ -237,8 +240,8 @@ walks the first-time setup), shipping a code change is one command:
 ```bash
 # One-time: register the deploy target with its Azure metadata. The
 # bearer token still lives in an env var; --azure-* fields tell
-# `movate deploy` where to push images and which apps to update.
-movate config add-target prod \
+# `mdk deploy` where to push images and which apps to update.
+mdk config add-target prod \
     --url https://movate-prod-api.eastus2.azurecontainerapps.io \
     --key-env MOVATE_PROD_KEY \
     --azure-subscription "$SUBSCRIPTION_ID" \
@@ -250,24 +253,24 @@ movate config add-target prod \
 # Build the image in ACR (no local Docker needed) + roll out both
 # Container Apps + poll /healthz until version matches. Default tag is
 # movate:<version>-<git-sha-short>.
-movate deploy --target prod
+mdk deploy --target prod
 
 # CI / fire-and-forget — skip the /healthz verification step.
-movate deploy --target prod --no-wait
+mdk deploy --target prod --no-wait
 
 # Rollback to a previously-built image (no rebuild).
-movate deploy --target prod --skip-build --image-tag movate:0.5.0-abc1234
+mdk deploy --target prod --skip-build --image-tag movate:0.5.0-abc1234
 
 # Worker-only update (e.g. dispatch-logic change).
-movate deploy --target prod --only worker
+mdk deploy --target prod --only worker
 
 # Plan inspection — prints the `az` commands without running them.
-movate deploy --target prod --dry-run
+mdk deploy --target prod --dry-run
 ```
 
 For CI, push a commit to a `release/<env>` branch (e.g. `release/prod`)
 and [.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs
-the same `movate deploy` flow with Azure federated OIDC auth — no
+the same `mdk deploy` flow with Azure federated OIDC auth — no
 client secrets stored in GitHub. Per-env GitHub *Environments* hold
 the scoped secrets so prod can require approval gates.
 
@@ -429,13 +432,13 @@ Deploy & operate serve, worker, deploy
 Manage           auth
 ```
 
-`movate doctor` reports environment status, configured providers, the
+`mdk doctor` reports environment status, configured providers, the
 local DB path, and which optional extras are installed (`langfuse`,
 `otel`, `runtime`).
 
 ## Configuration
 
-Environment variables movate reads:
+Environment variables MDK reads:
 
 | var | purpose | default |
 |---|---|---|
@@ -461,11 +464,11 @@ policy:
 
 Enforced at two layers:
 
-* **`movate validate <agent>`** — static check on every `agent.yaml`
+* **`mdk validate <agent>`** — static check on every `agent.yaml`
   before merge. Reports all violations (primary model, every fallback,
   budget ceiling) in one pass and exits 2.
 * **`Executor.execute()`** entry — runtime check at every invocation,
-  so bundles loaded over HTTP by `movate serve` can't bypass the
+  so bundles loaded over HTTP by `mdk serve` can't bypass the
   static gate. Denied models short-circuit before any provider call —
   zero cost incurred for a forbidden run.
 

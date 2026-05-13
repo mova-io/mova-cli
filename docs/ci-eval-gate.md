@@ -2,7 +2,7 @@
 
 Block PR merges when the eval suite regresses. Two pieces compose here:
 
-1. The `--baseline-file` / `--output-baseline` flags on `movate eval` —
+1. The `--baseline-file` / `--output-baseline` flags on `mdk eval` —
    git-trackable EvalRecord snapshots, which are the unblocking primitive
    for ephemeral CI runners (sqlite is per-runner, JSON files travel with
    the repo).
@@ -19,7 +19,7 @@ This doc explains the flow and how to wire it in your own repo.
                   └────────┬─────────┘
                            │ refresh-baseline job
                            ▼
-        movate eval ./agent --output-baseline .movate/agent/baseline.json
+        mdk eval ./agent --output-baseline .movate/agent/baseline.json
                            │
                            │ git commit + push
                            ▼
@@ -32,7 +32,7 @@ This doc explains the flow and how to wire it in your own repo.
                   └────────┬─────────┘
                            │ gate-pr job
                            ▼
-        movate eval ./agent --baseline-file .movate/agent/baseline.json
+        mdk eval ./agent --baseline-file .movate/agent/baseline.json
                            │
                            ├─ exit 0 → merge allowed
                            └─ exit 1 → PR blocked (regression)
@@ -45,7 +45,7 @@ In your *consumer* repo (the one holding agents, not movate-cli itself):
 1. **Generate the first baseline locally**:
 
     ```bash
-    movate eval ./agents/my-agent --mock --output-baseline .movate/my-agent/baseline.json
+    mdk eval ./agents/my-agent --mock --output-baseline .movate/my-agent/baseline.json
     git add .movate/my-agent/baseline.json
     git commit -m "chore(eval): seed my-agent baseline"
     ```
@@ -72,7 +72,7 @@ noise:
 
 ```yaml
 - run: |
-    movate eval "./agents/${{ matrix.agent }}" \
+    mdk eval "./agents/${{ matrix.agent }}" \
       --baseline-file ".movate/${{ matrix.agent }}/baseline.json" \
       --regression-tolerance 0.05 \
       --output json
@@ -110,7 +110,7 @@ If you don't want auto-refresh, delete the `refresh-baseline` job and
 update baselines manually:
 
 ```bash
-movate eval ./agents/my-agent --mock --output-baseline .movate/my-agent/baseline.json
+mdk eval ./agents/my-agent --mock --output-baseline .movate/my-agent/baseline.json
 git commit -am "chore(eval): refresh my-agent baseline"
 ```
 
