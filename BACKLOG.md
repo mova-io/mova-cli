@@ -26,6 +26,32 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ## 🎯 Top 10 highest-leverage shortlist
 
+> _Sessions are recorded most-recent first. Today's section (2026-05-13)
+> closed three major lines: **ADR 002 (skills × every runtime)**, **the
+> 4-dim eval reporting line item from Tier 7**, and **the first half of
+> the Teams demo loop**. Full per-PR detail in
+> [docs/progress/2026-05-13.md](docs/progress/2026-05-13.md)._
+
+### Session 2026-05-13 — Teams demo loop + ADR 002 closeout
+
+**Teams Slice 3.1.c — per-user identity binding shipped this session.** 33 new tests (1230 → 1263 total). Each Teams user binds their own Movate API key via DM (`/movate connect <api-key>`) so every `@movate run` they trigger uses THEIR key, with `RunRecord.created_by` audit attribution correct in multi-user deployments. Keys encrypted at rest via Fernet (`cryptography` package, AES-128-CBC + HMAC-SHA256); operator supplies the key via `MOVATE_TEAMS_ENCRYPTION_KEY` env, bot fails fast at boot if missing. New modules: `src/movate/teams_bot/crypto.py` (Fernet wrapper, typed errors), `storage.py` (aiosqlite `teams_users` table — sqlite-only for alpha, Postgres tracked as follow-up), `identity.py` (LRU-cached per-user MovateClient resolver). New DM-only commands: `connect`, `whoami`, `disconnect` — channel posts rejected with a "DM me" card so keys never leak. `run` routes through resolver first (bound user) → fleet client (unbound, default) → reject card (unbound + `--require-binding`). Three modes: default (alpha), strict (`--require-binding`), no-identity (smoke-test). KMS swap is interface-compatible. **PR #83. Closes [#67](https://github.com/jeremyyuAWS/movate-cli/issues/67).**
+
+**Teams Slice 3.1.b — Adaptive Cards + MovateClient integration shipped this session.** 30 new tests. Replaced the 3.1.a echo with real agent execution + a rendered scorecard. New `src/movate/teams_bot/cards/` package (pure functions `RunResponse → dict`): `run_result.py` (response body, cost, latency, optional Langfuse trace link), `error.py` (failure card with category + one-line hint, no stack traces — those live in Langfuse). New `src/movate/teams_bot/client.py` with `execute_run()` wrapping `MovateClient.submit_job` → `wait_for_terminal` → `get_run`, returning a discriminated `RunOutcome`. Per-call timeout configurable via `MOVATE_TEAMS_RUN_TIMEOUT_S` (default 25s, under Teams' channel timeout). Handler dispatches on the variant — success / terminal_failure / timeout / client_failure / parse_error → distinct cards. Hint lookup table for operator-friendly suggestions on common error codes. New `Attachment` model on `ReplyActivity` for delivering Adaptive Cards inline. `build_app()` now accepts `runtime_url` / `fleet_api_key` / `langfuse_public_host` / `runtime_client` args; holds a long-lived MovateClient so the connection pool stays warm across requests. **PR #82. Closes [#66](https://github.com/jeremyyuAWS/movate-cli/issues/66).**
+
+**Teams Slice 3.1.a — Bot Framework webhook skeleton shipped this session.** 28 new tests. First half-day slice of [ADR 003](docs/adr/003-teams-integration.md) — `mdk teams-bot serve` opens a FastAPI app on port 3978 (Bot Framework Emulator default), parses `@movate <command>` mentions, replies with plain text for `ping` / `help` / `run` (3.1.a echoes parsed args; 3.1.b wires real execution). Hand-rolled the Activity protocol (Pydantic models for Activity, ChannelAccount, ConversationAccount, Mention, ReplyActivity) instead of pulling in `botbuilder-core` (~30MB of azure-core transitive deps + JWT validation we don't need in the local-dev skeleton). New `[teams]` extra: `fastapi` + `uvicorn`. New `mdk teams-bot serve` Typer subcommand under Deploy & operate panel. Hardening PR for JWT validation lands separately before public exposure. **PR #63. Closes the skeleton portion of [#66](https://github.com/jeremyyuAWS/movate-cli/issues/66) and lays the foundation for slices 3.1.b through 3.1.e.**
+
+**ADR 003 — Microsoft Teams as a self-serve front door drafted this session.** 360-line design doc capturing the CEO ask: sales team should do the first demo themselves. Cardinal rule: Teams is a *client* of the existing v0.5 HTTP runtime — no new execution surface, no forked storage. Three slices: 3.1 run-existing → 3.2 eval-with-upload → 3.3 saved-configs + scheduled. Auth model: bot-fleet API key for admin ops + per-user Movate API keys bound via DM (3.1.c, shipped). Four falsification tests documented. Status: **Proposed** (open questions on multi-tenant prospects, Langfuse trace linking, mobile UX, streaming responses called out for follow-up). **PR #60.** Establishes the v0.7 milestone.
+
+**Skills PR 6 — native tool-use across every runtime shipped this session.** 30 new tests across two PRs (#61 Anthropic, #62 OpenAI). **Closes [ADR 002](docs/adr/002-skills-and-contexts.md) completely** — every skill backend (Python / HTTP / MCP) now runs under every runtime (LiteLLM / native_anthropic / native_openai). Native Anthropic (PR #61): `to_tool_spec` override emitting Anthropic's flat `{name, description, input_schema}` shape; `complete()` parses `tool_use` content blocks → `CompletionResponse(kind="tool_use", ...)`; new `_translate_messages` helper folds the executor's OpenAI-style history (`role="assistant"` with `tool_calls` + `role="tool"` results) into Anthropic content blocks (`tool_use` on assistant messages, `tool_result` on user messages, consecutive tool_results coalesced into one user message). Native OpenAI (PR #62): smaller diff because the OpenAI SDK accepts the same flat-message + nested-tool-spec format the LiteLLM path uses — just `tools=` passthrough + response-shape parsing. First-wins on parallel tool calls (matches LiteLLM PR 1 decision; parallel-dispatch is tracked as [#74](https://github.com/jeremyyuAWS/movate-cli/issues/74)). End-to-end integration tests with scripted FakeClients + real Python skills assert wire-payload correlation. **PRs #61 and #62.**
+
+**Four-dimension eval reporting shipped this session.** 34 new tests + 2 reporter tests (1166 → 1200 total). **Flips the Tier 7 line item to done.** Every successful eval run now scores up to four dims per case: `accuracy` (existing v0.5 logic, exact-match OR LLM judge), `faithfulness` (LLM judge against optional `grounding` context — new dataset field), `coverage` (deterministic substring match against optional `expected_coverage` — new dataset field), `latency` (1.0 within budget, linear decay to 0.0 at 2x budget — uses agent's `timeouts.call_ms` or per-case `latency_budget_ms` override). New types: `Dimension` StrEnum, `DimensionScore`, `DimensionScores`, `DimensionalMeans`. Engine refactor with `_score_dimensions` orchestrator + per-dim methods. Critical back-compat: `CaseRun.score` (gate input) stays **accuracy-only** — `--gate 0.7` still means "70% accuracy across cases"; the other three dims are reporting-only. Rich table + JSON + markdown reporters all render the dimensional breakdown — but only when the dataset opts in to `faithfulness` or `coverage` (legacy datasets see the v0.5 view byte-for-byte). **PR #59.**
+
+**Skill side_effects policy gate shipped this session.** 16 new tests. New `SkillPolicy` model in `core/config.py` with `allowed_side_effects: list[SkillSideEffects] | None`. Enforced at both `mdk validate` time (operators see policy violations before any execute attempt) AND executor entry (belt-and-braces — `mdk serve` can't bypass). Wired into `cli/_runtime.py` via `project_cfg.skills`. Closes the operator-confidence gap left after the canonical config split — operators can now declare "this project only runs `read-only` skills" and have it enforced uniformly. **PR #58.** Hardens the prospect-upload story for the eventual Teams slice 3.1.d.
+
+**ADR 002 — Skills and shared contexts fully closed.** Today's PRs (#58 / #61 / #62) plus yesterday's #51-#57 close every slice in ADR 002. Skills work end-to-end across Python / HTTP / MCP backends and across LiteLLM / native_anthropic / native_openai runtimes; side_effects policy gates the inputs; shared contexts prepend automatically to prompts. Closing the ADR moves the Tier 1 / Tier 2 Deva-flagged demand to "done for the foreseeable future."
+
+### Earlier sessions (most-recent first below)
+
 **`movate watch` hot-reload shipped this session.** 8 new tests (635 unit + 3 smoke = 638 total). New `cli/watch.py` polls the agent's files (agent.yaml, prompt, both schemas, dataset, judge.yaml) every 0.5s via stdlib mtime checks (no `watchdog`/`watchfiles` dep needed). On change, re-runs `_validate_agent` (which prints lint + cost forecast + validate output). 200ms debounce for editor write-then-rename. Catches broken-mid-save `AgentLoadError` and keeps polling. `--poll-interval` + `--strict` flags. **TDD-style feedback loop: save the prompt, see results in <1s.**
 
 **Cost forecast shipped this session.** 10 new tests (627 unit + 3 smoke = 630 total). New `core/cost_forecast.py` with `estimate_eval_cost(bundle, *, pricing) -> CostForecast | None`. Renders each case's prompt with Jinja, estimates tokens via chars/4 (well-established for GPT/Anthropic), multiplies by the agent's model's pricing. Prints `eval cost: ~$0.045 (30 cases x ~120 in + ~1024 out tokens)` on every `movate validate` when both a dataset + pricing entry exist; silent skip otherwise. Cases whose inputs miss schema fields get skipped (the prompt linter is the right tool for THAT diagnostic). **Catches "$4 surprise" bills BEFORE running the eval.**
@@ -381,7 +407,7 @@ Strategic direction shift: position movate-cli as **MDK — Movate Development K
 
 ### Tier 7 — Comprehensive reporting + reconciliation (v1.0, ~3 weeks)
 
-- [ ] **Four-dimension eval reporting** `[HIGH] [v1.0] [1w]` — functionality / completeness / correctness / AI metrics. Each gets a subscore in the table.
+- [x] **Four-dimension eval reporting** `[HIGH] [v0.6] [done 2026-05-13]` — `accuracy` / `faithfulness` / `coverage` / `latency`, each scored per case, rolled up via `DimensionalMeans` on every `EvalSummary`. Dataset rows opt-in via `grounding`, `expected_coverage`, `latency_budget_ms` fields; legacy datasets see the v0.5 view byte-for-byte. CLI Rich table + `--output json` + markdown reporter all surface the rollup. Critical back-compat: gate stays on accuracy alone (`--gate 0.7` still means "70% accuracy"). 34 new tests; full suite 1166 → 1200. PR [#59](https://github.com/jeremyyuAWS/movate-cli/pull/59).
 - [ ] **Per-objective scoring breakdown** `[HIGH] [v1.0] [3d]` — eval table shows pass/fail per `objective.id` defined on agent.yaml.
 - [ ] **Eval reconciliation across deterministic + LLM + HITL** `[HIGH] [v1.0] [1w]` — configurable precedence; "if all three disagree, fall back to HITL" pattern.
 - [ ] **HITL workflow nodes (formalize)** `[HIGH] [v1.0] [1w]` — already in v1.1 plan; specify the request/resolve API.
@@ -400,6 +426,23 @@ Strategic direction shift: position movate-cli as **MDK — Movate Development K
 
 ### Tier 9 — Enterprise readiness (v1.0+, ongoing)
 
+#### Teams integration — v0.7 milestone (CEO ask: sales-led demos)
+
+The full design is in [ADR 003](docs/adr/003-teams-integration.md). Issues
+[#65–#69 + #70 + #72](https://github.com/jeremyyuAWS/movate-cli/issues?q=is%3Aopen+label%3Ateams-integration)
+track each slice; status here mirrors the v0.7 milestone.
+
+- [x] **ADR 003 — Teams as a self-serve front door (design)** `[HIGH] [v0.7] [done 2026-05-13]` — design doc with three vertical slices (3.1 run-existing → 3.2 eval-with-upload → 3.3 saved-configs). Status: Proposed (open questions on multi-tenant prospects, Langfuse trace linking across tenants, mobile UX, streaming). PR [#60](https://github.com/jeremyyuAWS/movate-cli/pull/60).
+- [x] **Teams 3.1.a — Bot Framework webhook skeleton** `[HIGH] [v0.7] [done 2026-05-13]` — hand-rolled Activity protocol + `mdk teams-bot serve` Typer command + 28 tests. Hand-rolled instead of `botbuilder-core` to avoid ~30MB of transitive deps; SDK can land in the hardening PR. PR [#63](https://github.com/jeremyyuAWS/movate-cli/pull/63).
+- [x] **Teams 3.1.b — Adaptive Cards + MovateClient integration** `[HIGH] [v0.7] [done 2026-05-13]` — `@movate run faq-agent {...}` actually executes and renders a card with response/cost/latency/optional trace link. Five outcome variants → four card templates. PR [#82](https://github.com/jeremyyuAWS/movate-cli/pull/82). Closes [#66](https://github.com/jeremyyuAWS/movate-cli/issues/66).
+- [x] **Teams 3.1.c — per-user identity binding** `[HIGH] [v0.7] [done 2026-05-13]` — `/movate connect`, `whoami`, `disconnect` DM-only; Fernet-encrypted `teams_users` sqlite table; LRU-cached per-user MovateClients; strict mode for multi-tenant. PR [#83](https://github.com/jeremyyuAWS/movate-cli/pull/83). Closes [#67](https://github.com/jeremyyuAWS/movate-cli/issues/67).
+- [ ] **Teams 3.1.d — file attachment handling** `[HIGH] [v0.7] [1w]` — drag `agent.zip` + `dataset.jsonl` into Teams; validate + ingest before run. Issue [#68](https://github.com/jeremyyuAWS/movate-cli/issues/68).
+- [ ] **Teams 3.1.e — manifest + Azure Bot Service** `[HIGH] [v0.7] [blocked:#65]` — Teams app manifest, appPackage zipper, Bot Service Bicep resource. **Blocked on Azure tenant migration ([#65](https://github.com/jeremyyuAWS/movate-cli/issues/65)).**
+- [ ] **Teams hardening — JWT validation** `[MED] [v1.0] [1w]` — production auth before any public Teams exposure. Issue [#70](https://github.com/jeremyyuAWS/movate-cli/issues/70).
+- [ ] **Teams 3.2 — eval with bring-your-own data** `[HIGH] [v0.8] [1w]` — drag dataset + agent, scorecard updates per case via Bot Framework `UpdateActivity`. Surfaces the 4-dim rollup that shipped on 2026-05-13. Issue [#72](https://github.com/jeremyyuAWS/movate-cli/issues/72).
+
+#### Original Tier 9 line items
+
 - [ ] **Reusable enterprise policy enforcement** `[HIGH] [v1.0] [1w]` — `mdk policy export/import` so teams can share `policy.yaml` snippets. Marketplace later.
 - [ ] **Multi-tenant deployments (formalize)** `[HIGH] [v1.0] [—]` — mostly shipped; add tenant-creation API, per-tenant config overrides.
 - [ ] **Helm chart for self-hosted K8s deployment** `[HIGH] [v1.0] [1w]` — alternative to Bicep; gives customers a "self-host on your cluster" path. Works on EKS / GKE / AKS / on-prem K8s.
@@ -416,3 +459,33 @@ Strategic direction shift: position movate-cli as **MDK — Movate Development K
 2. Move it to `[ip]` while you work.
 3. On merge, flip to `[x]` with the actual completion date in a commit message — the file itself stays clean.
 4. Re-rank the Top 10 every two weeks. Leverage shifts as context changes.
+
+## How to keep this file current
+
+> The pattern: **each PR-shipping session ends with two doc updates** —
+> a daily progress log (`docs/progress/<YYYY-MM-DD>.md`) AND the
+> top-of-list paragraph here. The daily log is the linear narrative;
+> this file is the persistent ranked backlog.
+
+When a PR merges (or a coherent session of merges lands), at end of session:
+
+1. **Drop a top-of-list paragraph** in `🎯 Top 10 highest-leverage shortlist` →
+   `### Session <YYYY-MM-DD>` — most-recent first. Each paragraph follows
+   the existing pattern: `**<Feature> shipped this session.**` + numeric test
+   delta + 2-3 sentences of what / why / where + PR link + linked issue.
+   Keep the bold opener + the closing **bold conclusion** sentence — readers
+   skim those.
+2. **Flip checkboxes** down in §1–§9 for any pre-existing line items the
+   session completed. Replace `[ ]` with `[x]`, change `[next]` /
+   `[ip]` to `[done <YYYY-MM-DD>]`, and append a one-line outcome summary
+   with a PR link. Don't delete the original description — operators
+   read this for context on WHY something was on the list.
+3. **Add new line items** for follow-up work the session uncovered. New
+   items default to `[ ]` and get linked to their GitHub issue.
+4. **Re-rank the Top 10** if today's work shifted what's most leverage-
+   per-effort. Items move between groups (A / B / C / D) freely.
+
+Mechanically: this file changes on every PR-shipping day. The
+[daily progress log](docs/progress/) is the source of truth for
+"what was shipped"; this file is the source of truth for "what's next
++ relative priority." Don't let them drift.
