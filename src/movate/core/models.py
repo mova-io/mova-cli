@@ -81,10 +81,29 @@ class ModelConfig(BaseModel):
 
 
 class SchemaPaths(BaseModel):
+    """Per-agent input + output schema declaration.
+
+    Each field is either:
+
+    * a **path string** (``"./schema/input.json"``) pointing at a full
+      JSON Schema document on disk — what every agent shipped before
+      v0.6 and what complex contracts (refs, ``oneOf``, regex) still
+      use; or
+    * an **inline shorthand dict** (``{"message": "string"}``) that
+      the loader compiles into JSON Schema. Trivial 2-3-field
+      contracts skip the ``schema/`` subfolder entirely. See
+      :mod:`movate.core.schema_shorthand` for the syntax.
+
+    The loader dispatches on type — string ⇒ read file, dict ⇒
+    compile — so downstream consumers (Executor, prompt linter,
+    show, run) keep seeing a plain JSON Schema dict and need no
+    changes.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    input: str
-    output: str
+    input: str | dict[str, Any]
+    output: str | dict[str, Any]
 
 
 class EvalConfig(BaseModel):

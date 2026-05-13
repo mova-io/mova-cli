@@ -276,11 +276,7 @@ def _render_explanations() -> None:
         ("Provider API keys", [k for k in EXPLANATIONS if k.endswith("_API_KEY")]),
         (
             "Tracing",
-            [
-                k
-                for k in EXPLANATIONS
-                if k.startswith(("LANGFUSE_", "OTEL_", "MOVATE_TRACER"))
-            ],
+            [k for k in EXPLANATIONS if k.startswith(("LANGFUSE_", "OTEL_", "MOVATE_TRACER"))],
         ),
         (
             "Storage & project",

@@ -18,6 +18,7 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from movate.core.models import AgentSpec
+from movate.core.schema_shorthand import SchemaShorthandError, compile_shorthand
 
 
 class AgentLoadError(Exception):
@@ -77,8 +78,8 @@ def load_agent(path: str | Path) -> AgentBundle:
     prompt_text = prompt_path.read_text()
     prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
-    input_schema = _load_json(agent_dir / spec.schemas.input)
-    output_schema = _load_json(agent_dir / spec.schemas.output)
+    input_schema = _resolve_schema(spec.schemas.input, agent_dir=agent_dir, label="input")
+    output_schema = _resolve_schema(spec.schemas.output, agent_dir=agent_dir, label="output")
 
     try:
         Draft202012Validator.check_schema(input_schema)
@@ -96,6 +97,33 @@ def load_agent(path: str | Path) -> AgentBundle:
         input_validator=Draft202012Validator(input_schema),
         output_validator=Draft202012Validator(output_schema),
     )
+
+
+def _resolve_schema(
+    raw: str | dict[str, Any],
+    *,
+    agent_dir: Path,
+    label: str,
+) -> dict[str, Any]:
+    """Resolve one of the two ``schema:`` forms into a JSON Schema dict.
+
+    * **path string** → read the file from disk and parse as JSON.
+      Original behavior; still preferred for complex contracts.
+    * **inline shorthand dict** → compile via
+      :func:`compile_shorthand`. Strict-by-default object schema,
+      same downstream API.
+
+    Validation errors from either path are normalized to
+    :class:`AgentLoadError` so the CLI surfaces one consistent
+    error surface to operators.
+    """
+    if isinstance(raw, dict):
+        try:
+            return compile_shorthand(raw, root_label=label)
+        except SchemaShorthandError as exc:
+            raise AgentLoadError(f"inline schema shorthand error: {exc}") from exc
+    # Path string — resolve relative to the agent dir and read.
+    return _load_json(agent_dir / raw)
 
 
 def _load_json(path: Path) -> dict[str, Any]:

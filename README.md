@@ -271,6 +271,37 @@ the same `movate deploy` flow with Azure federated OIDC auth — no
 client secrets stored in GitHub. Per-env GitHub *Environments* hold
 the scoped secrets so prod can require approval gates.
 
+## agent.yaml — schema shorthand
+
+For agents with a handful of fields the `schema/` subfolder is overkill.
+Declare the contract inline:
+
+```yaml
+# agent.yaml
+schema:
+  input:
+    message: string
+    priority: integer?         # ? suffix = optional
+  output:
+    response: string
+    sentiment: positive|negative|neutral   # | = string enum
+    tags: [string]             # [T] = array of T
+```
+
+The loader compiles this into JSON Schema at load time —
+`additionalProperties: false`, every non-`?` field is required. For
+complex contracts (refs, `oneOf`, regex), keep using the path form
+pointing at a full JSON Schema file:
+
+```yaml
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+```
+
+Both forms coexist; pick per-agent. The shorthand only describes
+strict object schemas — anything else uses the path form.
+
 ## Available templates
 
 | `-t` value | Shape | Eval default |

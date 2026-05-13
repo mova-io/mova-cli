@@ -46,9 +46,7 @@ def test_every_optional_dep_has_explanation() -> None:
     from movate.cli.doctor import _OPTIONAL_DEPS  # noqa: PLC0415
 
     for dep in _OPTIONAL_DEPS:
-        assert f"opt: {dep}" in EXPLANATIONS, (
-            f"Optional dep {dep!r} has no entry in EXPLANATIONS."
-        )
+        assert f"opt: {dep}" in EXPLANATIONS, f"Optional dep {dep!r} has no entry in EXPLANATIONS."
 
 
 def test_every_runtime_has_explanation() -> None:
@@ -60,16 +58,12 @@ def test_every_runtime_has_explanation() -> None:
 
 def test_every_provider_key_has_explanation() -> None:
     for env_var, _label in _PROVIDER_KEYS:
-        assert env_var in EXPLANATIONS, (
-            f"Provider key {env_var!r} has no entry in EXPLANATIONS."
-        )
+        assert env_var in EXPLANATIONS, f"Provider key {env_var!r} has no entry in EXPLANATIONS."
 
 
 def test_every_tracing_key_has_explanation() -> None:
     for env_var, _label in _TRACING_KEYS:
-        assert env_var in EXPLANATIONS, (
-            f"Tracing key {env_var!r} has no entry in EXPLANATIONS."
-        )
+        assert env_var in EXPLANATIONS, f"Tracing key {env_var!r} has no entry in EXPLANATIONS."
 
 
 # ---------------------------------------------------------------------------

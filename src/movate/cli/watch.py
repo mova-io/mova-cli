@@ -152,15 +152,15 @@ def _compute_watched_paths(agent_dir: Path) -> _WatchedSet:
     # watch() handles it; if it succeeds, we get authoritative paths.
     bundle = load_agent(agent_dir)
     spec = bundle.spec
-    paths.extend(
-        p
-        for p in (
-            (agent_dir / spec.prompt).resolve(),
-            (agent_dir / spec.schemas.input).resolve(),
-            (agent_dir / spec.schemas.output).resolve(),
-        )
-        if p.exists()
-    )
+    candidates = [(agent_dir / spec.prompt).resolve()]
+    # ``schemas.input`` / ``schemas.output`` may be either a path string
+    # (legacy, points at a file we want to watch) or an inline shorthand
+    # dict (compiled at load — nothing to watch, edits to the YAML
+    # itself already retrigger via the agent.yaml watcher below).
+    for schema_ref in (spec.schemas.input, spec.schemas.output):
+        if isinstance(schema_ref, str):
+            candidates.append((agent_dir / schema_ref).resolve())
+    paths.extend(p for p in candidates if p.exists())
     # Optional files: eval dataset + judge config.
     if spec.evals.dataset:
         ds = (agent_dir / spec.evals.dataset).resolve()

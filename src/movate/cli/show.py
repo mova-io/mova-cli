@@ -72,10 +72,10 @@ def _show_agent(path: Path) -> None:
     table.add_row("", "")
     table.add_row("prompt", str(spec.prompt))
     table.add_row("prompt_hash", bundle.prompt_hash[:16] + "…")
-    table.add_row("input.schema", str(spec.schemas.input))
+    table.add_row("input.schema", _render_schema_ref(spec.schemas.input))
     in_required = bundle.input_schema.get("required", [])
     table.add_row("  required", ", ".join(in_required) if in_required else "[dim]—[/dim]")
-    table.add_row("output.schema", str(spec.schemas.output))
+    table.add_row("output.schema", _render_schema_ref(spec.schemas.output))
     out_required = bundle.output_schema.get("required", [])
     table.add_row("  required", ", ".join(out_required) if out_required else "[dim]—[/dim]")
     table.add_row("", "")
@@ -95,6 +95,19 @@ def _show_agent(path: Path) -> None:
 
     console.print(table)
     console.print(f"[dim]agent_dir: {bundle.agent_dir}[/dim]")
+
+
+def _render_schema_ref(ref: str | dict[str, object]) -> str:
+    """Format a schemas.input / schemas.output value for the show table.
+
+    Path strings render verbatim ("./schema/input.json"); inline
+    shorthand dicts render as the literal "[dim]<inline>[/dim]" — the
+    field list below the row already exposes what's inside, so dumping
+    the raw dict would just be noise.
+    """
+    if isinstance(ref, dict):
+        return "[dim]<inline>[/dim]"
+    return str(ref)
 
 
 # ---------------------------------------------------------------------------
