@@ -17,6 +17,8 @@ from jinja2 import Environment, StrictUndefined, select_autoescape
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from movate.core.config import AgentDefaults, load_project_config
+from movate.core.layered_defaults import apply_defaults_to_raw
 from movate.core.models import AgentSpec
 from movate.core.schema_shorthand import SchemaShorthandError, compile_shorthand
 
@@ -52,8 +54,22 @@ class AgentBundle:
         return template.render(input=input_data)
 
 
-def load_agent(path: str | Path) -> AgentBundle:
-    """Load an agent directory. Raises AgentLoadError on any validation failure."""
+def load_agent(
+    path: str | Path,
+    *,
+    defaults: AgentDefaults | None = None,
+) -> AgentBundle:
+    """Load an agent directory. Raises AgentLoadError on any validation failure.
+
+    ``defaults`` is the project-wide layered-defaults block (from
+    ``policy.yaml: defaults:``). When omitted, the loader reads it
+    via :func:`load_project_config` so most CLI callers get the
+    expected merge behavior for free. Pass an explicit
+    ``AgentDefaults()`` (empty) to bypass the project config — tests
+    and library callers that want a pristine agent.yaml use that
+    escape hatch. See :mod:`movate.core.layered_defaults` for the
+    merge rules.
+    """
     agent_dir = Path(path).resolve()
     if not agent_dir.is_dir():
         raise AgentLoadError(f"agent path is not a directory: {agent_dir}")
@@ -66,6 +82,14 @@ def load_agent(path: str | Path) -> AgentBundle:
         raw = yaml.safe_load(yaml_path.read_text())
     except yaml.YAMLError as exc:
         raise AgentLoadError(f"invalid YAML in {yaml_path}: {exc}") from exc
+
+    # Apply project defaults at the raw-dict level — before Pydantic
+    # validation — so we can distinguish "operator wrote this value"
+    # from "Pydantic filled in its default". See layered_defaults.py.
+    if defaults is None:
+        defaults = load_project_config().defaults
+    if isinstance(raw, dict):
+        raw = apply_defaults_to_raw(raw, defaults)
 
     try:
         spec = AgentSpec.model_validate(raw)

@@ -242,3 +242,111 @@ def test_loader_bad_inline_shorthand_surfaces_field_path(tmp_path: Path) -> None
     )
     with pytest.raises(AgentLoadError, match=r"input\.message"):
         load_agent(agent_dir)
+
+
+# ---------------------------------------------------------------------------
+# Layered defaults (v0.6+) — policy.yaml: defaults: fills gaps in agent.yaml
+# ---------------------------------------------------------------------------
+
+
+def test_loader_applies_project_defaults(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end: a policy.yaml with project defaults causes load_agent
+    to produce a spec with those defaults filled in for keys the agent
+    didn't specify. Concrete: project sets temperature=0.0, agent
+    omits it, resolved spec has temperature=0.0."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "policy.yaml").write_text(
+        "defaults:\n"
+        "  model:\n"
+        "    params:\n"
+        "      temperature: 0.0\n"
+        "      max_tokens: 1024\n"
+        "  timeouts:\n"
+        "    call_ms: 15000\n"
+        "  budget:\n"
+        "    max_cost_usd_per_run: 0.50\n"
+    )
+    agent_dir = _write_agent(
+        tmp_path / "agent-needs-defaults",
+        schema_block=("schema:\n  input:\n    message: string\n  output:\n    response: string\n"),
+        name="needs-defaults",
+    )
+    bundle = load_agent(agent_dir)
+    # Defaults filled in for params, timeouts, budget.
+    assert bundle.spec.model.params["temperature"] == 0.0
+    assert bundle.spec.model.params["max_tokens"] == 1024
+    assert bundle.spec.timeouts.call_ms == 15000
+    assert bundle.spec.budget.max_cost_usd_per_run == 0.50
+
+
+def test_loader_agent_overrides_project_defaults(tmp_path: Path, monkeypatch) -> None:
+    """Agent.yaml always wins per-key. Project default temperature=0.0
+    is shadowed when the agent declares temperature=0.5."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "policy.yaml").write_text(
+        "defaults:\n  model:\n    params:\n      temperature: 0.0\n      max_tokens: 1024\n"
+    )
+    agent_dir = tmp_path / "agent-overrides"
+    agent_dir.mkdir()
+    (agent_dir / "agent.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Agent\n"
+        "name: overrides-defaults\n"
+        "version: 0.1.0\n"
+        "model:\n"
+        "  provider: openai/gpt-4o-mini-2024-07-18\n"
+        "  params:\n"
+        "    temperature: 0.5\n"  # explicit — wins over default 0.0
+        "prompt: ./prompt.md\n"
+        "schema:\n"
+        "  input:\n"
+        "    message: string\n"
+        "  output:\n"
+        "    response: string\n"
+    )
+    (agent_dir / "prompt.md").write_text("p\n\n{{ input.message }}")
+    bundle = load_agent(agent_dir)
+    # Agent's explicit value survives.
+    assert bundle.spec.model.params["temperature"] == 0.5
+    # Default that the agent DIDN'T override still fills.
+    assert bundle.spec.model.params["max_tokens"] == 1024
+
+
+def test_loader_explicit_empty_defaults_bypasses_policy(tmp_path: Path, monkeypatch) -> None:
+    """Passing ``defaults=AgentDefaults()`` explicitly bypasses the
+    project config — needed by tests and library callers that want
+    a pristine agent.yaml."""
+    from movate.core.config import AgentDefaults  # noqa: PLC0415
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "policy.yaml").write_text(
+        "defaults:\n  model:\n    params:\n      temperature: 0.0\n"
+    )
+    agent_dir = _write_agent(
+        tmp_path / "pristine",
+        schema_block=("schema:\n  input:\n    message: string\n  output:\n    response: string\n"),
+        name="pristine",
+    )
+    # Default arg → defaults applied:
+    with_defaults = load_agent(agent_dir)
+    assert with_defaults.spec.model.params.get("temperature") == 0.0
+    # Explicit empty defaults → pristine:
+    pristine = load_agent(agent_dir, defaults=AgentDefaults())
+    assert "temperature" not in pristine.spec.model.params
+
+
+def test_loader_no_policy_yaml_loads_pristine(tmp_path: Path, monkeypatch) -> None:
+    """When there's no policy.yaml in cwd, load_agent's default-resolution
+    is a no-op — agent.yaml loads exactly as-is."""
+    monkeypatch.chdir(tmp_path)
+    agent_dir = _write_agent(
+        tmp_path / "nodefaults",
+        schema_block=("schema:\n  input:\n    message: string\n  output:\n    response: string\n"),
+        name="nodefaults",
+    )
+    bundle = load_agent(agent_dir)
+    # Pydantic's built-in default for call_ms is 30000, not the 15000
+    # an absent policy.yaml might be confused into supplying.
+    assert bundle.spec.timeouts.call_ms == 30000
+    # No project default → params is empty (Pydantic default).
+    assert bundle.spec.model.params == {}

@@ -209,6 +209,85 @@ class RuntimePolicy(BaseModel):
         )
 
 
+class ModelParamDefaults(BaseModel):
+    """Project-wide model param defaults — agent.yaml fills the rest in.
+
+    Holds whatever LiteLLM-style params the operator wants applied
+    across every agent in the project. Each key is the param name
+    (``temperature``, ``max_tokens``, ``top_p``, ...); each value is
+    its default. Agent-level ``model.params`` always wins on key
+    conflict; defaults only fill keys the agent didn't specify.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    params: dict[str, object] = Field(
+        default_factory=dict,
+        description=(
+            "Per-key default values for `model.params` across every agent. "
+            "Empty dict = no defaults; each agent.yaml supplies its own."
+        ),
+    )
+
+
+class TimeoutDefaults(BaseModel):
+    """Project-wide default timeouts — agent.yaml fields override per-field.
+
+    Both fields are optional so the operator can pin one (e.g.
+    ``call_ms: 15000``) without inadvertently bumping ``total_ms``.
+    Agent-level ``timeouts.*`` always wins per-field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    call_ms: int | None = Field(default=None, ge=1)
+    total_ms: int | None = Field(default=None, ge=1)
+
+
+class BudgetDefaults(BaseModel):
+    """Project-wide default budget cap — agent.yaml overrides.
+
+    Distinct from :class:`ModelPolicy.max_cost_per_run_usd` (which is
+    an enforced ceiling — agents can't exceed it). This is a *default*
+    that fills in for agents whose ``budget`` block is absent.
+    Operators get tighter defaults plus the policy ceiling as two
+    independent controls.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_cost_usd_per_run: float | None = Field(default=None, ge=0)
+
+
+class AgentDefaults(BaseModel):
+    """Project-wide defaults that fill gaps in each agent.yaml.
+
+    Layered semantics — agent.yaml always wins, defaults only fill
+    keys the agent didn't specify. Concretely:
+
+    * ``model.params``: deep merge per-key. Default
+      ``temperature: 0.0`` applies to every agent that doesn't set
+      ``temperature`` in its own ``model.params``.
+    * ``timeouts.call_ms`` / ``timeouts.total_ms``: per-field. Default
+      ``call_ms: 15000`` applies to agents whose ``timeouts`` block
+      omits ``call_ms``.
+    * ``budget.max_cost_usd_per_run``: same per-field pattern.
+
+    Headline use case: set ``temperature: 0.0`` once at the project
+    level instead of repeating it across every agent.yaml.
+
+    Empty / absent ``defaults:`` block = permissive default, no merge
+    happens, every agent.yaml is loaded verbatim. Pre-existing
+    projects without a ``defaults:`` block see zero behavior change.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: ModelParamDefaults = Field(default_factory=ModelParamDefaults)
+    timeouts: TimeoutDefaults = Field(default_factory=TimeoutDefaults)
+    budget: BudgetDefaults = Field(default_factory=BudgetDefaults)
+
+
 class ProjectConfig(BaseModel):
     """Project-wide defaults — overrideable via CLI flags."""
 
@@ -218,6 +297,16 @@ class ProjectConfig(BaseModel):
     workflows_dir: str = "./workflows"
     bench: BenchConfig = Field(default_factory=BenchConfig)
     eval: EvalDefaults = Field(default_factory=EvalDefaults)
+    defaults: AgentDefaults = Field(
+        default_factory=AgentDefaults,
+        description=(
+            "Per-agent defaults applied at load time. Agent.yaml always "
+            "wins per-key; defaults only fill what the agent didn't "
+            "specify. Headline use: pin temperature / max_tokens / budget "
+            "once at the project level without copy-pasting to every "
+            "agent.yaml. See AgentDefaults for the layered semantics."
+        ),
+    )
     policy: ModelPolicy = Field(
         default_factory=ModelPolicy,
         description=(

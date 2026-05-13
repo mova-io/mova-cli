@@ -271,6 +271,39 @@ the same `movate deploy` flow with Azure federated OIDC auth — no
 client secrets stored in GitHub. Per-env GitHub *Environments* hold
 the scoped secrets so prod can require approval gates.
 
+## policy.yaml — project-wide defaults
+
+Set values once at the project level and every `agent.yaml` inherits
+them — without copy-pasting `temperature: 0.0` into every file.
+
+```yaml
+# policy.yaml
+defaults:
+  model:
+    params:
+      temperature: 0.0
+      max_tokens: 1024
+  timeouts:
+    call_ms: 15000
+  budget:
+    max_cost_usd_per_run: 0.50
+```
+
+**Agent.yaml always wins per-key.** Defaults only fill what the agent
+didn't specify:
+
+* `model.params` merges per-key (default `temperature: 0.0` applies
+  only to agents that don't write their own `temperature`).
+* `timeouts.call_ms` / `timeouts.total_ms` are per-field.
+* `budget.max_cost_usd_per_run` is per-field.
+
+Distinct from `policy:` (the enforced ceiling — agents can't exceed
+it) and `runtime:` (the gate on `AgentRuntime` values). Defaults are
+*suggestions* that fill gaps; policy is the *enforced* contract.
+
+See `mdk show <agent>` to inspect the resolved values after defaults
+are applied — that's what's actually going to run.
+
 ## agent.yaml — schema shorthand
 
 For agents with a handful of fields the `schema/` subfolder is overkill.
