@@ -1,4 +1,4 @@
-// movate-teams-bot Container App — runs `mdk teams-bot serve` behind external ingress.
+// movate-teams-bot Container App — runs `movate teams-bot serve` behind external ingress.
 //
 // Same Docker image as the API + worker; only the command differs.
 // Sits alongside `containerapp-api.bicep` because the resource shape is identical;
@@ -39,7 +39,7 @@ param image string
 @description('Key Vault URI for secret references.')
 param keyVaultUri string
 
-@description('Public URL of the Movate runtime the bot forwards to (mdk serve).')
+@description('Public URL of the Movate runtime the bot forwards to (movate serve).')
 param runtimeUrl string
 
 @description('AAD app id for the Bot Service registration. Used by the bot to validate inbound JWTs (hardening PR slot).')
@@ -135,7 +135,7 @@ resource bot 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'movate-teams-bot'
           image: '${acrLoginServer}/${image}'
-          command: ['mdk']
+          command: ['movate']
           args: [
             'teams-bot'
             'serve'
