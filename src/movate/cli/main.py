@@ -33,6 +33,9 @@ from movate.cli import chat as chat_cmd  # noqa: E402
 from movate.cli import deploy as deploy_cmd  # noqa: E402
 from movate.cli import doctor as doctor_cmd  # noqa: E402
 from movate.cli import eval as eval_cmd  # noqa: E402
+from movate.cli import (  # noqa: E402
+    import_json as _import_json,  # noqa: F401  -- registers `json` on import_app
+)
 from movate.cli import init as init_cmd  # noqa: E402
 from movate.cli import logs as logs_cmd  # noqa: E402
 from movate.cli import pricing as pricing_cmd  # noqa: E402
