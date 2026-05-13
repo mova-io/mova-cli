@@ -18,7 +18,7 @@ resource group, ACR, service principal, and GitHub Environment.
 | 4. Bicep deploy (infra) | Partial (the two-pass dance) | Key-Vault chicken-and-egg |
 | 5. Mint first runtime API key | Manual (`az containerapp exec`) | Happens once per env |
 | 6. Add GitHub Environment secrets | No (UI) | GitHub doesn't expose CLI for env secrets |
-| 7. First `movate deploy` locally | **Yes** — one command | Code is the point |
+| 7. First `mdk deploy` locally | **Yes** — one command | Code is the point |
 | 8. Auto-deploy via `release/*` push | **Yes** — `git push` | Code is the point |
 
 ## 1. Subscription + permissions
@@ -134,14 +134,14 @@ exist on the first pass).
 
 ## 5. Mint the first runtime API key
 
-`movate auth create-key` runs against whichever storage backend the
+`mdk auth create-key` runs against whichever storage backend the
 host can reach. The simplest path: exec into the running API container,
 which already has Postgres credentials wired up by Bicep.
 
 ```bash
 ENV=dev   # or whichever
 az containerapp exec -g movate-${ENV}-rg -n movate-${ENV}-api \
-    --command "movate auth create-key --tenant-id $(uuidgen) --env live --label bootstrap"
+    --command "mdk auth create-key --tenant-id $(uuidgen) --env live --label bootstrap"
 ```
 
 Copy the `mvt_live_...` value — that's the `RUNTIME_KEY` for step 6
@@ -172,7 +172,7 @@ For `prod`, also configure **required reviewers** under the
 Environment's "Deployment protection rules" — production deploys
 should require approval.
 
-## 7. First `movate deploy` locally (smoke the path)
+## 7. First `mdk deploy` locally (smoke the path)
 
 Before letting CI deploy, do one manual deploy to catch any IAM /
 config / image-build issues in the loop you're standing in:
@@ -180,7 +180,7 @@ config / image-build issues in the loop you're standing in:
 ```bash
 export MOVATE_DEV_KEY="<the mvt_live_... value from step 5>"
 
-movate config add-target dev \
+mdk config add-target dev \
     --url <RUNTIME_URL> \
     --key-env MOVATE_DEV_KEY \
     --azure-subscription "$AZURE_SUBSCRIPTION_ID" \
@@ -190,16 +190,16 @@ movate config add-target dev \
     --set-active
 
 # Validate every piece of the deploy path before pushing buttons:
-movate doctor --target dev
+mdk doctor --target dev
 
 # Then plan + execute:
-movate deploy --target dev --dry-run
-movate deploy --target dev
+mdk deploy --target dev --dry-run
+mdk deploy --target dev
 ```
 
-`movate doctor --target dev` walks `az login → subscription → RG →
+`mdk doctor --target dev` walks `az login → subscription → RG →
 ACR → containerapp api → containerapp worker → /healthz`. If
-anything's red, fix it before running `movate deploy` — the deploy
+anything's red, fix it before running `mdk deploy` — the deploy
 errors are downstream of these.
 
 ## 8. Auto-deploy via `release/<env>` push
@@ -219,7 +219,7 @@ Watch the workflow in the Actions tab. The flow:
 2. Azure federated OIDC login (no stored secrets).
 3. Hydrates `~/.movate/config.yaml` from the GitHub Environment
    secrets you set in step 6.
-4. Runs `movate deploy --target dev` end-to-end.
+4. Runs `mdk deploy --target dev` end-to-end.
 
 For ad-hoc deploys (e.g. emergency rollback), use the
 **workflow_dispatch** trigger from the Actions UI with the
@@ -229,11 +229,11 @@ For ad-hoc deploys (e.g. emergency rollback), use the
 
 | Symptom | Most likely cause | Fix |
 |---|---|---|
-| `movate deploy` exits 2 with "azure subscription missing" | Target wasn't registered with `--azure-*` flags | Re-run `movate config add-target` |
-| `movate deploy` says `/healthz` timed out (exit 124) | ACA revision is still rolling out, or the new image crashed | `az containerapp logs show -g ... -n movate-<env>-api --tail 100` |
+| `mdk deploy` exits 2 with "azure subscription missing" | Target wasn't registered with `--azure-*` flags | Re-run `mdk config add-target` |
+| `mdk deploy` says `/healthz` timed out (exit 124) | ACA revision is still rolling out, or the new image crashed | `az containerapp logs show -g ... -n movate-<env>-api --tail 100` |
 | `az acr build` says "AcrPush not granted" | Stage 3 deferred AcrPush because ACR didn't exist yet | Re-run `scripts/azure-bootstrap.sh <env>` |
 | GH Actions deploy: "AADSTS70021: No matching federated identity record" | Branch name doesn't match `release/<env>` pattern | Check the branch name, or re-create the federated credential with the right `subject` |
-| `movate doctor --target prod` shows "subscription match: missing" | Logged in to a different sub locally | `az account set --subscription <id>` |
+| `mdk doctor --target prod` shows "subscription match: missing" | Logged in to a different sub locally | `az account set --subscription <id>` |
 | GH workflow can't find the Environment | Environment name doesn't match the branch suffix | Create / rename the GH Environment to match `release/<env>` |
 
 ## Cost expectations
