@@ -40,6 +40,8 @@ testable without spinning up FastAPI.
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import tempfile
 import zipfile
@@ -50,7 +52,7 @@ from typing import TYPE_CHECKING
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 
 if TYPE_CHECKING:
-    pass
+    from movate.runtime.schemas import WizardAgentSubmission
 
 
 # Files that are allowed at known canonical paths inside a bundle.
@@ -351,3 +353,154 @@ def _write_files(staging: Path, files: dict[str, bytes]) -> None:
         dest = staging / canonical_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content)
+
+
+# ---------------------------------------------------------------------------
+# Mova iO wizard adapter — JSON submission → canonical bundle bytes
+# ---------------------------------------------------------------------------
+
+
+# Default I/O schemas applied when the wizard omits them. Free-form
+# single-field shapes the Mova iO UI can render with generic
+# textareas. Agents whose I/O needs richer structure can still POST
+# the multipart variant with explicit schemas.
+_DEFAULT_INPUT_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+        "input": {
+            "type": "string",
+            "description": "Free-form input text the agent should respond to.",
+        }
+    },
+    "required": ["input"],
+}
+
+_DEFAULT_OUTPUT_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+        "output": {
+            "type": "string",
+            "description": "The agent's free-form text response.",
+        }
+    },
+    "required": ["output"],
+}
+
+
+def _slugify(value: str) -> str:
+    """Turn a wizard-friendly string like ``"Task Agent"`` into a
+    URL-safe slug (``"task-agent"``). Stripped to lowercase
+    alphanumeric + hyphens; runs of separators collapse to a single
+    hyphen; leading / trailing hyphens trimmed.
+
+    Mirrors the regex used by AgentSpec's name + capability validators
+    so wizard inputs that pass this function automatically pass
+    downstream validation.
+    """
+    s = value.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s
+
+
+def wizard_to_bundle_files(submission: WizardAgentSubmission) -> dict[str, bytes]:
+    """Translate a :class:`WizardAgentSubmission` into the
+    ``{canonical_path: bytes}`` dict :func:`persist_bundle` accepts.
+
+    Generates:
+
+    * ``agent.yaml`` — fully populated with the wizard's field set
+      mapped onto MDK's canonical layout (see WizardAgentSubmission
+      docstring for the exact mapping).
+    * ``prompt.md`` — the wizard's ``agent_prompt`` string verbatim.
+    * ``schema/input.json`` + ``schema/output.json`` — sensible defaults
+      (free-form text). Future enhancement (item 93): infer schemas
+      from prompt + reference_output via an LLM judge.
+
+    No worker-process side effects — pure dict → dict transform.
+    Validation happens downstream when :func:`persist_bundle` calls
+    :func:`load_agent` on the staged dir.
+    """
+    # Slugify the name in case the wizard sent a human-friendly form
+    # like "Code Analyzer". load_agent's AgentSpec validator requires
+    # lowercase-alphanumeric-with-hyphens; we slugify here so the
+    # round-trip succeeds rather than 422-ing with a cryptic regex
+    # message in the operator's lap.
+    canonical_name = _slugify(submission.name)
+    if not canonical_name:
+        raise AgentCreationError(
+            f"wizard 'name' {submission.name!r} can't be slugified to "
+            "a valid agent name (must contain at least one alphanumeric character)",
+            status_code=422,
+        )
+
+    # Build the tag list from wizard extensions. Each becomes a
+    # prefix-<slug> tag so the marketplace UI can filter on them
+    # without polluting the marketplace `capabilities` slot.
+    tags: list[str] = []
+    if submission.agent_provider:
+        tags.append(f"provider-{_slugify(submission.agent_provider)}")
+    if submission.agent_type:
+        tags.append(f"type-{_slugify(submission.agent_type)}")
+    if submission.ai_foundation:
+        tags.append(f"foundation-{_slugify(submission.ai_foundation)}")
+
+    # The Mova iO Role dropdown ("Planner" / "Assistant" / ...) maps
+    # to MDK's marketplace `role` field. Lowercased + slugified to
+    # match the marketplace facet shape (URL-safe).
+    role_slug = _slugify(submission.role) if submission.role else ""
+
+    # Build the agent.yaml dict. We construct as Python dict + YAML-dump
+    # rather than string-templating so quoting + escaping of
+    # user-supplied strings (description, persona, etc.) is correct
+    # without manual sanitization.
+    import yaml  # noqa: PLC0415
+
+    agent_yaml_data: dict[str, object] = {
+        "api_version": "movate/v1",
+        "kind": "Agent",
+        "name": canonical_name,
+        "version": "0.1.0",
+        "description": submission.description,
+        "model": {"provider": submission.ai_model},
+        "prompt": "./prompt.md",
+        "schema": {
+            "input": "./schema/input.json",
+            "output": "./schema/output.json",
+        },
+    }
+
+    # Marketplace metadata — only emit fields the wizard populated
+    # (defaults stay empty / unset rather than serializing as empty
+    # strings, which would clutter the file).
+    if role_slug:
+        agent_yaml_data["role"] = role_slug
+    if submission.agent_role:
+        agent_yaml_data["persona"] = submission.agent_role
+    if submission.agent_goal:
+        # Single goal from the wizard → single-element goals list.
+        agent_yaml_data["goals"] = [submission.agent_goal]
+    if tags:
+        agent_yaml_data["tags"] = tags
+    if submission.reference_output:
+        # One example, output-only. Input is empty dict since the
+        # wizard doesn't collect a paired input example. Future
+        # wizard step could collect both.
+        agent_yaml_data["examples"] = [
+            {"input": {}, "output": {"output": submission.reference_output}},
+        ]
+    if submission.mcp_connectors:
+        agent_yaml_data["skills"] = list(submission.mcp_connectors)
+    if submission.knowledge_store:
+        agent_yaml_data["contexts"] = list(submission.knowledge_store)
+
+    agent_yaml_bytes = yaml.safe_dump(agent_yaml_data, sort_keys=False).encode("utf-8")
+
+    return {
+        "agent.yaml": agent_yaml_bytes,
+        "prompt.md": submission.agent_prompt.encode("utf-8"),
+        "schema/input.json": json.dumps(_DEFAULT_INPUT_SCHEMA, indent=2).encode("utf-8"),
+        "schema/output.json": json.dumps(_DEFAULT_OUTPUT_SCHEMA, indent=2).encode("utf-8"),
+    }

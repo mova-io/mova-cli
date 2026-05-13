@@ -399,6 +399,66 @@ remaining Wed PM → Fri window:
 
 Total realistic v1 surface: **~12 endpoints + 1 ADR + ~3 CLI helpers**. The Angular team can continue scaffolding against the OpenAPI spec — every endpoint that lands adds a typed service method via `npm run client:gen`.
 
+### Group H — Friday demo prep with Deva's Mova iO wizard (2026-05-13 PM discovery)
+
+> _Adds items surfaced by Deva's "Onboard Agent" wizard screenshot.
+> The wizard collects fields in a shape that **doesn't match MDK's
+> canonical agent.yaml directly** — without a translation layer his
+> Angular `POST /api/v1/agents` calls would 422. The wizard sends
+> inline prompt (no file), omits I/O schemas entirely, and includes
+> fields MDK doesn't track (Agent Provider, Agent Type, AI Foundation).
+> Item 82 ships the bridge; the rest are demo-prep + next-sprint
+> follow-ups._
+
+#### H-MUST — Required for Friday meeting
+
+82. [ ] **`POST /api/v1/agents/from-wizard` — Mova iO wizard adapter** `[HIGH] [v0.7] [~3h]` — Sibling endpoint to `POST /api/v1/agents` accepting `application/json` (not multipart). Body matches the wizard's field set: ``{name, agent_provider, agent_type, role, description, agent_role, agent_goal, agent_prompt, reference_output, mcp_connectors, knowledge_store, ai_model, ai_foundation}``. Translates into the canonical layout: prompt body → `prompt.md`, default I/O schemas (input: free-form text, output: free-form response), wizard-specific fields → marketplace metadata + tag extensions. Delegates to existing `persist_bundle()`. Returns same `AgentCreatedView` so the Angular client doesn't branch.
+
+83. [ ] **`POST /api/v1/agents/{name}/evals` — eval kickoff as Azure worker job** `[HIGH] [v0.7] [~3h]` — Originally item 60. Refined: new `JobKind.EVAL` + worker dispatch handler that loads the agent bundle, runs `EvalEngine`, persists `EvalRecord` to Postgres, updates job progress per case. Endpoint returns ``{eval_id, job_id, status: queued}``; Angular polls `GET /api/v1/evals/{eval_id}` (item 84).
+
+84. [ ] **`GET /api/v1/evals/{eval_id}` — eval scorecard (running or done)** `[HIGH] [v0.7] [~2h]` — Originally item 61. Returns the partial-or-final `EvalRecord`: per-case rows + dimensional means (accuracy / faithfulness / coverage / latency) + baseline diff if applicable. Works while the eval is still running (shows ``cases_completed: 23 / 50``).
+
+85. [ ] **`GET /api/v1/evals?agent=<name>` — eval history list** `[HIGH] [v0.7] [~1h]` — Originally item 62. Paginated. Each row: ``{eval_id, agent_name, gate, mean_score, pass_rate, created_at, status}``.
+
+86. [ ] **Deploy v0.7 to Azure ACA** `[HIGH] [v0.7] [~1h operator action]` — Build a fresh image (`movate:0.7.0-<sha>`) via `az acr build`, redeploy `movate-dev-rg` runtime so today's new endpoints (76, 56, 58, 59, 65, 74) + Friday's (82-85) are live. Update `MDK_CORS_ALLOWED_ORIGINS` to include Deva's Mova iO origin. Smoke test `/openapi.json` returns all v1 routes.
+
+87. [ ] **Mint API key for Deva + send onboarding bundle** `[HIGH] [v0.7] [~30min]` — `az containerapp exec` → `mdk auth create-key --tenant deva-friday-demo --env live --label angular-bff`. Send Deva: (a) runtime URL, (b) bearer token, (c) link to `docs/angular-client.md` for client-gen instructions, (d) `/openapi.json` URL.
+
+88. [ ] **Smoke-test runbook: wizard → eval → trace round-trip** `[MED] [v0.7] [~1h]` — Single doc walking the full Angular flow against the deployed runtime: hit `/from-wizard` → `/validate` → kick off eval → poll → fetch trace. Confirms every Friday-demo path works end-to-end BEFORE the meeting.
+
+#### H-NEXT — Next sprint (post-Friday)
+
+89. [ ] **Per-job progress counters on JobRecord** `[MED] [v0.8] [~2d]` — Adds `progress_total` + `progress_completed` integer columns to the jobs table. Eval worker updates per case so the Angular UI can render "23/50 cases done" without polling for the full EvalRecord every second. Pairs with item 75 (SSE) for the streaming variant.
+
+90. [ ] **Webhook callbacks on terminal status** `[MED] [v0.8] [~3d]` — Alternative to polling for the Angular BFF: at job submit time accept a `webhook_url` field; on terminal status the worker POSTs to that URL with the job payload. Signed via HMAC for verification. Lets the Mova iO BFF be event-driven instead of poll-driven.
+
+91. [ ] **Wizard field set → AgentSpec migration (rounded out)** `[MED] [v0.8] [~2d]` — Promote `agent_provider`, `agent_type`, `ai_foundation` from tag-extensions (today's shape in item 82) to first-class `AgentSpec` fields. Adds validators + `mdk show` rendering + marketplace UI surfaces.
+
+92. [ ] **Inline-prompt support on `POST /api/v1/agents` (multipart variant)** `[LOW] [v0.8] [~1h]` — Accept a `prompt_text` form field as an alternative to a `prompt` file upload — convenience for callers who don't want to construct a multipart-with-file payload. Item 82 covers the JSON path; this covers operators who use curl + multipart but don't want to manage temp files.
+
+93. [ ] **Schema auto-generation from prompt + reference output** `[MED] [v0.8] [~2d]` — When the wizard omits schemas (today: default to free-form), an LLM-judge run could infer reasonable I/O schemas from `agent_prompt` + `reference_output`. Optional, gated by a `--generate-schemas` flag on the from-wizard endpoint.
+
+94. [ ] **Mova iO BFF reference implementation** `[MED] [v0.8] [~3d]` — Sample Node.js / Python BFF that demonstrates the auth pattern from ADR 003 (Angular session → BFF → MDK fleet key). Includes CORS handling, error mapping, and the wizard payload validator. Shipped as a docs sample, not a runtime.
+
+#### H-est — Wed PM → Fri morning realistic schedule
+
+**Wed PM (today, this session):**
+* Item 82 — `POST /api/v1/agents/from-wizard` (~3h)
+
+**Thursday:**
+* Item 83 — eval kickoff endpoint (~3h)
+* Item 84 — eval retrieval (~2h)
+* Item 85 — eval history list (~1h)
+* Item 86 — deploy to Azure (~1h, operator)
+
+**Friday morning:**
+* Item 87 — mint Deva's key + send onboarding (~30min)
+* Item 88 — smoke-test runbook (~1h)
+* Meeting prep / live debugging buffer
+
+**Stretch (if Pillar 1+2+3 sticks the landing):**
+* Items 78, 79 (GitHub publish + history) — Pillar 1's GitHub layer
+
 #### Demoted / deferred
 
 These items are below the top 10 — capture so we don't lose them, but

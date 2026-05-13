@@ -292,6 +292,99 @@ class RunTraceView(BaseModel):
     single run's latency (agents)."""
 
 
+class WizardAgentSubmission(BaseModel):
+    """``POST /api/v1/agents/from-wizard`` request body.
+
+    Field set matches Deva's Mova iO "Onboard Agent" wizard (Basic
+    Details step). The endpoint translates this into MDK's canonical
+    agent.yaml + prompt.md + default schemas, then delegates to the
+    same ``persist_bundle()`` the multipart endpoint uses. Returns the
+    same ``AgentCreatedView`` so the Angular client doesn't branch
+    based on submission mode.
+
+    Why a separate endpoint vs. extending POST /agents: the multipart
+    POST is canonical-layout-strict (every byte the operator sends
+    lands on disk as-is). The wizard adapter is permissive — it
+    generates defaults for fields the wizard doesn't collect (I/O
+    schemas) and maps wizard-specific fields onto MDK extensions
+    (provider / type / foundation become tag prefixes). Keeping
+    them separate means a future wizard-shape change doesn't churn
+    the canonical contract.
+
+    Field mapping (wizard → agent.yaml):
+
+    * ``name`` → ``name``
+    * ``agent_provider`` (e.g. "Movate") → ``tags: ["provider-movate"]``
+    * ``agent_type`` (e.g. "Task Agent") → ``tags: ["type-task-agent"]``
+    * ``role`` (dropdown: "Planner" / "Assistant" / ...) → ``role``
+      (marketplace metadata, item 29). Lowercased.
+    * ``description`` → ``description``
+    * ``agent_role`` (free-form textarea) → ``persona`` (item 29 —
+      voice / tone, one sentence). Capped at 512 chars to match the
+      AgentSpec validator.
+    * ``agent_goal`` → ``goals: [<single-element-list>]``
+    * ``agent_prompt`` → inlined into ``prompt.md``
+    * ``reference_output`` → ``examples: [{output: ...}]``
+    * ``mcp_connectors`` (list of names) → ``skills: [...]``
+    * ``knowledge_store`` → ``contexts: [...]``
+    * ``ai_model`` → ``model.provider``
+    * ``ai_foundation`` (e.g. "Azure") → ``tags: ["foundation-azure"]``
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    """Agent name. Same regex as the canonical AgentSpec (lowercase
+    alphanumeric + hyphens); we slugify common UI inputs so a wizard
+    name like ``"Code Analyzer"`` survives the round-trip."""
+
+    agent_provider: str = Field(default="", max_length=64)
+    """Dropdown value (e.g. ``"Movate"``). Slugified onto a
+    ``provider-<slug>`` tag."""
+    agent_type: str = Field(default="", max_length=64)
+    """Dropdown value (e.g. ``"Task Agent"``). Slugified onto a
+    ``type-<slug>`` tag."""
+    role: str = Field(default="", max_length=64)
+    """Dropdown value (e.g. ``"Planner"``). Lowercased into the
+    marketplace ``role`` field (item 29)."""
+
+    description: str = Field(default="")
+    agent_role: str = Field(default="", max_length=512)
+    """Free-form textarea — voice / persona description.
+    Maps to AgentSpec.persona (item 29)."""
+
+    agent_goal: str = Field(default="")
+    """Single goal string from the textarea. Becomes a single-element
+    ``goals`` list in agent.yaml."""
+
+    agent_prompt: str = Field(..., min_length=1)
+    """The actual prompt template the wizard collects. Inlined into
+    ``prompt.md`` at persist time."""
+
+    reference_output: str = Field(default="")
+    """Optional reference output — if present, becomes a single
+    ``examples`` entry with ``output: <text>``."""
+
+    mcp_connectors: list[str] = Field(default_factory=list)
+    """MCP connector names from the wizard's multi-select. Mapped
+    directly to AgentSpec.skills (each entry must already exist in
+    the project's skills/ registry — wizard surfacing of available
+    skills is the Mova iO BFF's job)."""
+
+    knowledge_store: list[str] = Field(default_factory=list)
+    """Knowledge-store names. Mapped to AgentSpec.contexts (each
+    entry must exist in the project's contexts/ folder)."""
+
+    ai_model: str = Field(..., min_length=1)
+    """LiteLLM-style provider string. Wizard's "Type AI Model" text
+    field; UI is responsible for the right format
+    (``openai/gpt-4o-mini-2024-07-18``, etc.)."""
+
+    ai_foundation: str = Field(default="", max_length=64)
+    """Cloud / foundation tag (e.g. ``"Azure"``). Slugified onto a
+    ``foundation-<slug>`` tag."""
+
+
 class AgentRunSubmission(BaseModel):
     """``POST /api/v1/agents/{name}/runs`` request body.
 
@@ -513,4 +606,5 @@ __all__ = [
     "RunSubmission",
     "RunTraceView",
     "RunView",
+    "WizardAgentSubmission",
 ]

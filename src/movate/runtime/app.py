@@ -35,6 +35,7 @@ from movate.runtime.agent_creation import (
     AgentCreationError,
     persist_bundle,
     unzip_bundle,
+    wizard_to_bundle_files,
 )
 from movate.runtime.errors import auth_required, not_found
 from movate.runtime.middleware import AuthContext, make_auth_dependency
@@ -57,6 +58,7 @@ from movate.runtime.schemas import (
     RunSubmission,
     RunTraceView,
     RunView,
+    WizardAgentSubmission,
 )
 from movate.storage.base import StorageProvider
 
@@ -675,6 +677,76 @@ def build_app(
         # Reference ctx so the param isn't unused — and we record it
         # for the future audit log.
         _ = ctx.tenant_id
+
+        spec = result.bundle.spec
+        return AgentCreatedView(
+            name=spec.name,
+            version=spec.version,
+            description=spec.description,
+            agent_dir=result.agent_dir.name,
+            files_persisted=result.files_persisted,
+        )
+
+    @v1.post(
+        "/agents/from-wizard",
+        response_model=AgentCreatedView,
+        status_code=201,
+        tags=["agents-v1"],
+    )
+    async def v1_create_agent_from_wizard(
+        body: WizardAgentSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AgentCreatedView:
+        """Create a new agent from the Mova iO "Onboard Agent" wizard.
+
+        Accepts the wizard's JSON shape (NOT multipart) and translates
+        it into the canonical agent.yaml + prompt.md + default I/O
+        schemas layout. Same persist path + response shape as the
+        multipart ``POST /api/v1/agents`` — sibling endpoints, two
+        wire shapes, one canonical contract on disk.
+
+        Defaults applied:
+
+        * **Schemas** — free-form ``{input: string}`` → ``{output: string}``.
+          Agents needing richer I/O shapes use the multipart endpoint.
+        * **Version** — ``0.1.0``. Future revisions bump via PUT
+          (item 57) or via the GitHub publish flow (item 78).
+        * **Marketplace metadata** — only emitted when the wizard
+          populates the corresponding field. Empty fields stay unset
+          in the YAML rather than serializing as empty strings.
+
+        Field mapping documented in WizardAgentSubmission's docstring.
+
+        Errors:
+
+        * **400** — wizard name can't be slugified to a valid agent
+          name (no alphanumeric characters)
+        * **409** — agent with this name already exists
+        * **422** — bundle failed validation post-translation (e.g.
+          ``ai_model`` not in LiteLLM's recognized format)
+        * **503** — runtime built without an ``agents_path``
+        """
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/agents/from-wizard is unavailable",
+                status_code=503,
+            )
+
+        # Translate wizard JSON → canonical bundle bytes. Slugification
+        # of name happens here; downstream load_agent runs the same
+        # Pydantic + linter checks the multipart path uses.
+        files = wizard_to_bundle_files(body)
+
+        result = persist_bundle(files, agents_path=agents_path)
+
+        # Refresh the in-memory registry so GET /agents + GET /agents/{name}
+        # see the new bundle immediately.
+        request.app.state.agents = scan_agents(agents_path)
+
+        _ = ctx.tenant_id  # future per-tenant audit log entry
 
         spec = result.bundle.spec
         return AgentCreatedView(
