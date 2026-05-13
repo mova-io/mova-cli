@@ -56,7 +56,11 @@ class ParsedCommand:
 
     * ``help`` / ``ping`` / ``empty`` / ``unknown`` — no extra fields.
     * ``run`` — ``agent`` (str) + ``input`` (parsed JSON dict).
-    * Future: ``eval`` — ``agent`` + dataset path; ``connect`` — api key.
+    * ``connect`` — ``api_key`` (str). Validation lives in the handler.
+    * ``whoami`` — no extra fields. Handler reads the user's binding.
+    * ``disconnect`` — no extra fields. Handler removes the binding.
+    * Future: ``eval`` — ``agent`` + dataset path; ``rotate-key`` —
+      shares ``api_key`` with ``connect``.
 
     A ``parse_error`` field carries a human-readable explanation when
     the command was recognized but its arguments were malformed (e.g.
@@ -65,13 +69,20 @@ class ParsedCommand:
     """
 
     action: str
-    """One of: ``help``, ``ping``, ``run``, ``empty``, ``unknown``."""
+    """One of: ``help``, ``ping``, ``run``, ``connect``, ``whoami``,
+    ``disconnect``, ``empty``, ``unknown``."""
 
     agent: str = ""
     """For ``run``: which agent to invoke."""
 
     input: dict[str, Any] = field(default_factory=dict)
     """For ``run``: the parsed JSON input payload."""
+
+    api_key: str = ""
+    """For ``connect``: the API key the user pasted. Never logged.
+    Validation (regex + maybe a healthz check) happens in the handler
+    because the parser doesn't know which validation is appropriate
+    — same string would be valid under multiple key schemas."""
 
     raw_args: str = ""
     """Everything after the command word, before any parsing. Surfaced
@@ -142,7 +153,34 @@ def parse_command(activity: Activity) -> ParsedCommand:
         return ParsedCommand(action="ping")
     if command == "run":
         return _parse_run(raw_args)
+    if command == "connect":
+        return _parse_connect(raw_args)
+    if command == "whoami":
+        return ParsedCommand(action="whoami")
+    if command == "disconnect":
+        return ParsedCommand(action="disconnect")
     return ParsedCommand(action="unknown", raw_args=text)
+
+
+def _parse_connect(raw_args: str) -> ParsedCommand:
+    """Parse ``connect <api-key>``.
+
+    Just the shape — the handler does the actual validation (regex
+    match against :func:`parse_api_key`) so it can produce the most
+    informative error card. We strip whitespace because users often
+    paste keys with leading spaces.
+    """
+    api_key = raw_args.strip()
+    if not api_key:
+        return ParsedCommand(
+            action="connect",
+            parse_error=(
+                "missing API key. usage: `/movate connect <api-key>` "
+                "(DM only — don't paste keys in channels). Generate one "
+                "with `mdk auth create-key --tenant <yours>`."
+            ),
+        )
+    return ParsedCommand(action="connect", api_key=api_key, raw_args=raw_args)
 
 
 def _parse_run(raw_args: str) -> ParsedCommand:

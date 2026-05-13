@@ -24,6 +24,7 @@ after the optional extras have been resolved.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from movate.teams_bot.activity import Activity
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 ENV_RUNTIME_URL = "MOVATE_RUNTIME_URL"
 ENV_FLEET_API_KEY = "MOVATE_TEAMS_FLEET_API_KEY"
 ENV_LANGFUSE_PUBLIC_HOST = "MOVATE_TEAMS_LANGFUSE_PUBLIC_HOST"
+ENV_REQUIRE_BINDING = "MOVATE_TEAMS_REQUIRE_BINDING"
 
 
 def build_app(
@@ -48,6 +50,9 @@ def build_app(
     fleet_api_key: str | None = None,
     langfuse_public_host: str | None = None,
     runtime_client: MovateClient | None = None,
+    enable_identity: bool = True,
+    teams_db_path: Path | None = None,
+    require_binding: bool | None = None,
 ) -> FastAPI:
     """Construct the Teams-bot FastAPI app.
 
@@ -65,6 +70,17 @@ def build_app(
             (often backed by ``ASGITransport(app=<runtime FastAPI>)``)
             to avoid spinning up a real HTTP loop. Takes precedence
             over ``runtime_url`` + ``fleet_api_key``.
+        enable_identity: When True (default), wires up the per-user
+            identity-binding store + resolver. Requires
+            ``MOVATE_TEAMS_ENCRYPTION_KEY`` to be set; raises at boot
+            if not. Set False for the alpha smoke-test path that uses
+            only the fleet key.
+        teams_db_path: Tests pass ``Path(":memory:")``; production
+            leaves None and the store reads ``MOVATE_TEAMS_DB`` or
+            falls back to ``~/.movate/teams.db``.
+        require_binding: Strict mode for ``run``. Falls back to the
+            ``MOVATE_TEAMS_REQUIRE_BINDING`` env (truthy → strict).
+            Default False — alpha allows fallback to the fleet client.
 
     Importing FastAPI inline means a dev install without the ``[teams]``
     extra (which pulls in fastapi/uvicorn) can still import the rest of
@@ -83,6 +99,11 @@ def build_app(
     resolved_runtime_url = runtime_url or os.environ.get(ENV_RUNTIME_URL)
     resolved_api_key = fleet_api_key or os.environ.get(ENV_FLEET_API_KEY)
     resolved_langfuse = langfuse_public_host or os.environ.get(ENV_LANGFUSE_PUBLIC_HOST)
+    resolved_require_binding = (
+        require_binding
+        if require_binding is not None
+        else os.environ.get(ENV_REQUIRE_BINDING, "").lower() in {"1", "true", "yes"}
+    )
 
     # Build a long-lived MovateClient if we have everything we need.
     # The connection pool stays warm across requests — important since
@@ -97,15 +118,40 @@ def build_app(
             api_key=resolved_api_key,
         )
 
+    # Identity binding (3.1.c). Wired in two pieces:
+    #   - users_store: persistent Fernet-encrypted SQLite table
+    #   - identity_resolver: in-memory LRU of per-user MovateClients
+    # Both are optional — `enable_identity=False` falls back to the
+    # 3.1.b fleet-only behavior. The encryption key is REQUIRED when
+    # identity is enabled — we fail loud at boot rather than silently
+    # let the first `connect` crash.
+    users_store = None
+    identity_resolver = None
+    if enable_identity:
+        from movate.teams_bot.identity import IdentityResolver  # noqa: PLC0415
+        from movate.teams_bot.storage import TeamsUsersStore  # noqa: PLC0415
+
+        users_store = TeamsUsersStore(db_path=teams_db_path)
+        # init() runs in an async context inside the startup hook below
+        # — we can't call it here because build_app is sync.
+        if resolved_runtime_url:
+            identity_resolver = IdentityResolver(
+                store=users_store,
+                runtime_base_url=resolved_runtime_url,
+            )
+
     handler_ctx = HandlerContext(
         runtime_client=client,
         langfuse_public_host=resolved_langfuse,
+        users_store=users_store,
+        identity_resolver=identity_resolver,
+        require_binding=resolved_require_binding,
     )
 
     app = FastAPI(
         title="movate teams-bot",
         description="Bot Framework webhook bridging Teams to the Movate runtime.",
-        version="0.7.0b",
+        version="0.7.0c",
     )
     # Expose state on the app so the CLI ``serve`` command (and ops
     # tooling like ``mdk doctor``) can inspect the resolved config
@@ -113,13 +159,24 @@ def build_app(
     app.state.handler_ctx = handler_ctx
     app.state.runtime_url = resolved_runtime_url
 
+    @app.on_event("startup")
+    async def _startup() -> None:
+        """Initialise the teams_users sqlite schema. Idempotent (CREATE
+        TABLE IF NOT EXISTS) so it's safe across restarts."""
+        if users_store is not None:
+            await users_store.init()
+
     @app.on_event("shutdown")
     async def _shutdown() -> None:
-        """Close the runtime client pool on app shutdown. The pool
-        otherwise leaks an event-loop handle that uvicorn's reload
-        watcher complains about during dev."""
+        """Close every long-lived pool: fleet client, per-user cached
+        clients, sqlite. Order matters — close clients before the store
+        in case the store's close blocks on something the clients hold."""
         if handler_ctx.runtime_client is not None:
             await handler_ctx.runtime_client.aclose()
+        if handler_ctx.identity_resolver is not None:
+            await handler_ctx.identity_resolver.aclose()
+        if users_store is not None:
+            await users_store.close()
 
     @app.get("/health")
     async def health() -> dict[str, str]:

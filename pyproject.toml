@@ -62,6 +62,12 @@ teams = [
     # (pointed at a remote runtime) only installs what they need.
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    # Encrypts per-user Movate API keys at rest (3.1.c). Fernet is the
+    # symmetric primitive; the operator supplies the key via
+    # MOVATE_TEAMS_ENCRYPTION_KEY env. A KMS-backed alternative can
+    # later swap in behind the same interface — cryptography dep is
+    # the floor.
+    "cryptography>=42",
     # JWT validation for inbound Bot Framework requests lands in a
     # later hardening PR; its dep slot goes here so the optional
     # install stays single-step.

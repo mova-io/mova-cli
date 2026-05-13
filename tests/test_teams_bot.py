@@ -343,7 +343,11 @@ async def test_handle_unknown_command_suggests_help() -> None:
 
 @pytest.fixture
 def client() -> TestClient:
-    return TestClient(build_app())
+    """TestClient with identity disabled to keep the 3.1.a/b suite
+    hermetic — no encryption key required, no teams.db side effects.
+    The identity-binding behavior is exercised in
+    test_teams_bot_identity.py with its own in-memory fixture."""
+    return TestClient(build_app(enable_identity=False))
 
 
 @pytest.mark.unit

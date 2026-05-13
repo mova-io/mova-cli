@@ -337,15 +337,49 @@ The bot is a thin client of the existing v0.5 HTTP runtime — same
 `/run`, `/eval`, `/jobs` endpoints `mdk` itself talks to. Per-user
 auth (`/movate connect` DM flow), file uploads (drag agent.yaml +
 dataset.jsonl into a channel), and the Teams manifest land in
-follow-up slices (3.1.c, 3.1.d, 3.1.e).
+follow-up slices (3.1.d, 3.1.e).
+
+### Per-user identity binding (slice 3.1.c)
+
+Each Teams user can bind their own Movate API key in a DM, so every
+`@movate run` they trigger lands in `RunRecord.created_by` correctly.
+Keys are encrypted at rest using Fernet (`cryptography` package);
+the bot reads the encryption key from `MOVATE_TEAMS_ENCRYPTION_KEY`.
+
+```bash
+# Mint a fresh encryption key (one-time, per bot deployment):
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Export it before booting the bot:
+export MOVATE_TEAMS_ENCRYPTION_KEY=<paste-key>
+```
+
+Then in a DM with the bot:
+
+```
+/movate connect mvt_test_<tenant>_<keyid>_<secret>   → ✓ bound to tenant <X>
+/movate whoami                                       → shows tenant + last 4 chars
+/movate disconnect                                   → removes the binding
+```
+
+Identity commands are **DM-only** — channel posts are rejected with a
+"DM me" card so API keys don't leak into team channels.
+
+| Mode | Behavior |
+|---|---|
+| Default (`--no-identity` off, `--require-binding` off) | Bot accepts bindings; unbound users fall back to the fleet key |
+| Strict (`--require-binding`) | Bot rejects `run` from unbound users — use for multi-tenant deployments where every run must be attributable |
+| `--no-identity` | Disables binding entirely; every user uses the fleet key. Smoke-test mode |
 
 ### Optional config
 
 | Env var | Effect |
 |---|---|
-| `MOVATE_TEAMS_FLEET_API_KEY` | Bot's API key for the runtime. Required for `run` to work. |
+| `MOVATE_TEAMS_FLEET_API_KEY` | Bot's API key for the runtime. Required for `run` to work (or per-user keys via `/connect`). |
+| `MOVATE_TEAMS_ENCRYPTION_KEY` | **Required** for identity binding. 32-byte url-safe-base64 Fernet key. |
 | `MOVATE_RUNTIME_URL` | Default runtime URL (overridden by `--runtime-url`). |
-| `MOVATE_TEAMS_LANGFUSE_PUBLIC_HOST` | When set (e.g. `https://langfuse.movate.com`), success cards include a "View trace" button. Off by default — don't show prospects an internal URL. |
+| `MOVATE_TEAMS_DB` | Where to store the bot's `teams_users` sqlite db. Defaults to `~/.movate/teams.db`. |
+| `MOVATE_TEAMS_REQUIRE_BINDING` | `1` enables strict mode (same as `--require-binding`). |
+| `MOVATE_TEAMS_LANGFUSE_PUBLIC_HOST` | When set, success cards include a "View trace" button. Off by default — don't show prospects an internal URL. |
 | `MOVATE_TEAMS_RUN_TIMEOUT_S` | Max seconds to wait for a job before returning a timeout card. Defaults to 25 (under Teams' channel timeout). |
 
 ## Quickstart — deploy to Azure Container Apps

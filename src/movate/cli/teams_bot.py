@@ -78,6 +78,27 @@ def serve(
             "show prospects an internal-only URL)."
         ),
     ),
+    no_identity: bool = typer.Option(
+        False,
+        "--no-identity",
+        help=(
+            "Disable per-user identity binding (3.1.c) — the bot uses "
+            "only the fleet API key for every user. Lets you run the "
+            "bot without MOVATE_TEAMS_ENCRYPTION_KEY for smoke tests."
+        ),
+    ),
+    require_binding: bool = typer.Option(
+        False,
+        "--require-binding",
+        envvar="MOVATE_TEAMS_REQUIRE_BINDING",
+        help=(
+            "Strict mode: reject `run` from users who haven't bound "
+            "their own Movate API key. Default OFF (alpha) — the bot "
+            "falls back to the fleet key for unbound users. Turn ON "
+            "for multi-tenant deployments where every run must be "
+            "attributable."
+        ),
+    ),
 ) -> None:
     """Boot the Teams bot webhook on ``host:port``.
 
@@ -127,12 +148,43 @@ def serve(
             "`run` will return a config-error card until you set one."
         )
 
+    # Identity binding gate: when enabled (the default), the bot needs
+    # MOVATE_TEAMS_ENCRYPTION_KEY at boot. Fail fast rather than letting
+    # the first ``/movate connect`` crash. The CLI prints a one-line
+    # hint with a copy-pasteable command to mint a fresh key.
+    enable_identity = not no_identity
+    if enable_identity:
+        from movate.teams_bot.crypto import (  # noqa: PLC0415
+            MissingEncryptionKeyError,
+            get_fernet,
+        )
+
+        try:
+            get_fernet()  # validate at boot — discarded; app.py reads env too
+        except MissingEncryptionKeyError as exc:
+            err.print(
+                "[red]✗[/red] identity binding is enabled but "
+                "[bold]MOVATE_TEAMS_ENCRYPTION_KEY[/bold] is not set.\n"
+                f"  {exc}\n"
+                "  Or pass [bold]--no-identity[/bold] to disable per-user "
+                "binding (smoke-test mode)."
+            )
+            raise typer.Exit(code=2) from None
+
     app = build_app(
         runtime_url=runtime_url,
         fleet_api_key=fleet_api_key,
         langfuse_public_host=langfuse_public_host,
+        enable_identity=enable_identity,
+        require_binding=require_binding,
     )
 
+    if not enable_identity:
+        identity_label = "off"
+    elif require_binding:
+        identity_label = "on (strict)"
+    else:
+        identity_label = "on"
     err.print(
         f"[green]✓[/green] movate teams-bot listening on "
         f"[bold]http://{host}:{port}[/bold]\n"
@@ -140,6 +192,7 @@ def serve(
         f"  health:     GET  /health\n"
         f"  runtime:    {runtime_url or '(not configured)'}\n"
         f"  langfuse:   {langfuse_public_host or '(off)'}\n"
+        f"  identity:   {identity_label}\n"
         f"  [dim]auth:       NONE on inbound (JWT validation lands later)[/dim]"
     )
     uvicorn.run(app, host=host, port=port, log_level=log_level)
