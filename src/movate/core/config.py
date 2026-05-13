@@ -19,7 +19,7 @@ the permissive default (everything allowed, no cost ceiling).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -288,8 +288,45 @@ class AgentDefaults(BaseModel):
     budget: BudgetDefaults = Field(default_factory=BudgetDefaults)
 
 
+class KnowledgeConfig(BaseModel):
+    """Stub for v0.7+ RAG / knowledge-base configuration.
+
+    Shipped today as a placeholder so the canonical file slot
+    (``knowledge.yaml``) exists in the project layout — operators
+    can drop the file in and reserve the path. Real fields (vector
+    store backend, embedding model, re-index policy) arrive when
+    pgvector / Apache AGE land in Tier 3.
+
+    ``extra="allow"`` for forward compatibility: a partially-filled
+    ``knowledge.yaml`` with keys we haven't formalized yet doesn't
+    error — keeps experimental projects unblocked. Strict validation
+    enables when the schema firms up.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ProjectConfig(BaseModel):
-    """Project-wide defaults — overrideable via CLI flags."""
+    """Project-wide defaults — overrideable via CLI flags.
+
+    Loaded from up to four files at the project root:
+
+    * ``policy.yaml`` — the canonical file. May contain every block
+      (works exactly as v0.5 for backward compat). The recommended
+      content is ``policy:`` (enforced rules) + ``defaults:``
+      (suggestions) + project-layout fields.
+    * ``runtime.yaml`` — the ``runtime:`` block (RuntimePolicy).
+      Optional; takes precedence over policy.yaml's ``runtime:`` block
+      if both exist (with a deprecation warning on the policy.yaml side).
+    * ``eval.yaml`` — the ``eval:`` + ``bench:`` blocks. Same
+      precedence pattern.
+    * ``knowledge.yaml`` — the ``knowledge:`` block. Stub today;
+      reserved slot for Tier 3 RAG config.
+
+    Dedicated files always win on conflict. See
+    :func:`load_project_config` for the merge rules and
+    deprecation behavior.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -322,53 +359,170 @@ class ProjectConfig(BaseModel):
             "to enforce 'A by default' — see RuntimePolicy."
         ),
     )
+    knowledge: KnowledgeConfig = Field(
+        default_factory=KnowledgeConfig,
+        description=(
+            "Reserved slot for v0.7+ knowledge / RAG configuration. "
+            "Operators can drop a ``knowledge.yaml`` in the project root "
+            "today, but only forward-compatible fields are accepted "
+            "until the schema firms up."
+        ),
+    )
 
 
 def load_project_config(path: Path | str | None = None) -> ProjectConfig:
     """Load the project-level config from the project root (or provided path).
 
-    File lookup precedence (when ``path`` is not explicit):
+    Two layers:
 
-    1. ``policy.yaml`` — the canonical name going forward (MDK naming).
-    2. ``movate.yaml`` — transitional alias. Logs a deprecation warning
-       on first load so operators see the suggested rename without
-       breaking existing repos.
+    1. **Base file** — ``policy.yaml`` (canonical) or ``movate.yaml``
+       (legacy, deprecation warning). May carry every ProjectConfig
+       block for backward compatibility with v0.5 projects.
+    2. **Canonical-split files** (v0.6+) — ``runtime.yaml``,
+       ``eval.yaml``, ``knowledge.yaml`` at the same project root.
+       Each carries only its relevant top-level block(s):
 
-    If both files exist, ``policy.yaml`` wins and ``movate.yaml`` is
-    quietly ignored. This is the "migration mid-flight" state for repos
-    that have started the rename but haven't deleted the old file yet.
+       * ``runtime.yaml`` → the ``runtime:`` block
+       * ``eval.yaml`` → the ``eval:`` and/or ``bench:`` blocks
+       * ``knowledge.yaml`` → the ``knowledge:`` block
 
-    Returns defaults if neither file exists. Errors out clearly on a
-    malformed file — never silently degrades on a typo.
+    **Dedicated-file-wins:** if ``runtime.yaml`` exists AND
+    ``policy.yaml`` also has a ``runtime:`` block, the dedicated file
+    wins and the policy.yaml field triggers a one-shot deprecation
+    warning per moved field. Same pattern for ``eval:`` / ``bench:``
+    (eval.yaml) and ``knowledge:`` (knowledge.yaml).
+
+    Operators can migrate incrementally: cut a block from policy.yaml,
+    paste into its dedicated file, drop the now-empty key from
+    policy.yaml. Or stay on the unified policy.yaml indefinitely; the
+    canonical split is opt-in.
+
+    When ``path`` is explicit, only that file is read — the canonical
+    split applies only to the default-discovery flow at the project
+    root.
+
+    Returns defaults if no config files exist. Errors out clearly on
+    a malformed file — never silently degrades on a typo.
     """
     if path is not None:
-        # Explicit operator override — load exactly what they asked for,
-        # whatever it's named.
+        # Explicit operator override — load exactly what they asked
+        # for, whatever it's named. No canonical-split merging in
+        # this path; the caller is asking for one specific file.
         p = Path(path)
         if not p.exists():
             return ProjectConfig()
         data = yaml.safe_load(p.read_text()) or {}
         return ProjectConfig.model_validate(data)
 
-    policy = Path("policy.yaml")
-    legacy = Path("movate.yaml")
-
-    if policy.exists():
-        data = yaml.safe_load(policy.read_text()) or {}
-        return ProjectConfig.model_validate(data)
-
-    if legacy.exists():
-        # One-time deprecation warning per process. Don't spam stderr if
-        # the loader runs multiple times (validate + run + deploy all
-        # call this).
+    # Resolve the base file (canonical policy.yaml or legacy movate.yaml).
+    base_data: dict[str, Any] = {}
+    policy_path = Path("policy.yaml")
+    legacy_path = Path("movate.yaml")
+    if policy_path.exists():
+        base_data = yaml.safe_load(policy_path.read_text()) or {}
+    elif legacy_path.exists():
         _warn_legacy_movate_yaml_once()
-        data = yaml.safe_load(legacy.read_text()) or {}
-        return ProjectConfig.model_validate(data)
+        base_data = yaml.safe_load(legacy_path.read_text()) or {}
 
-    return ProjectConfig()
+    # Layer in canonical-split files. Each file's content replaces the
+    # corresponding block(s) in base_data and emits a deprecation
+    # warning if the operator hadn't yet migrated. Empty / missing
+    # split files are silent no-ops.
+    merged = _apply_canonical_split(
+        base_data,
+        runtime_path=Path("runtime.yaml"),
+        eval_path=Path("eval.yaml"),
+        knowledge_path=Path("knowledge.yaml"),
+    )
+
+    return ProjectConfig.model_validate(merged)
+
+
+# Fields that have moved out of policy.yaml. When both the dedicated
+# file AND policy.yaml carry the field, the dedicated file wins and
+# the operator gets a one-shot deprecation warning per field.
+_MOVED_FIELDS: dict[str, str] = {
+    "runtime": "runtime.yaml",
+    "eval": "eval.yaml",
+    "bench": "eval.yaml",
+    "knowledge": "knowledge.yaml",
+}
+
+
+def _apply_canonical_split(
+    base_data: dict[str, Any],
+    *,
+    runtime_path: Path,
+    eval_path: Path,
+    knowledge_path: Path,
+) -> dict[str, Any]:
+    """Layer dedicated split files on top of the base policy.yaml data.
+
+    Per-file merge rules:
+
+    * ``runtime.yaml`` content → top-level ``runtime:`` block.
+    * ``eval.yaml`` content → top-level ``eval:`` and/or ``bench:`` blocks.
+    * ``knowledge.yaml`` content → top-level ``knowledge:`` block.
+
+    Each dedicated file's top-level keys must be a subset of
+    {their expected blocks}. Anything else in a dedicated file is
+    an error (we surface it as ``ProjectConfig.model_validate``
+    rejecting unknown fields at the merge layer).
+
+    Conflicts (field present in both base + dedicated) — dedicated
+    wins, base field triggers a one-shot deprecation warning.
+    """
+    out = dict(base_data)
+
+    _layer_file(
+        out,
+        path=runtime_path,
+        allowed_keys={"runtime"},
+        base_data=base_data,
+    )
+    _layer_file(
+        out,
+        path=eval_path,
+        allowed_keys={"eval", "bench"},
+        base_data=base_data,
+    )
+    _layer_file(
+        out,
+        path=knowledge_path,
+        allowed_keys={"knowledge"},
+        base_data=base_data,
+    )
+    return out
+
+
+def _layer_file(
+    merged: dict[str, Any],
+    *,
+    path: Path,
+    allowed_keys: set[str],
+    base_data: dict[str, Any],
+) -> None:
+    """Read one canonical-split file and overlay its keys onto ``merged``.
+
+    Unknown keys in a dedicated file are passed through to the final
+    Pydantic validation — the resulting error message names the
+    bad key, which is the right operator experience for a typo.
+    """
+    if not path.exists():
+        return
+    raw = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a top-level object; got {type(raw).__name__}")
+    for key, value in raw.items():
+        if key in allowed_keys and key in base_data:
+            # Dedicated file wins, but warn the operator that the
+            # field is being read from two places.
+            _warn_field_moved_once(field=key, dedicated_file=path.name)
+        merged[key] = value
 
 
 _LEGACY_WARN_FIRED = False
+_MOVED_FIELD_WARNINGS: set[str] = set()
 
 
 def _warn_legacy_movate_yaml_once() -> None:
@@ -389,5 +543,25 @@ def _warn_legacy_movate_yaml_once() -> None:
         "⚠ movate.yaml is deprecated — rename to policy.yaml. "
         "movate.yaml will continue to load through v1.x; "
         "removed in a future major release.",
+        file=sys.stderr,
+    )
+
+
+def _warn_field_moved_once(*, field: str, dedicated_file: str) -> None:
+    """Warn (per-field, once per process) that a policy.yaml field has
+    a dedicated home and the operator should migrate.
+
+    The dedicated file's value still wins — we don't silently
+    discard. The warning's only job is to tell the operator they're
+    maintaining the same data in two places and which file we read."""
+    if field in _MOVED_FIELD_WARNINGS:
+        return
+    _MOVED_FIELD_WARNINGS.add(field)
+    import sys  # noqa: PLC0415
+
+    print(
+        f"⚠ policy.yaml contains a `{field}:` block, but {dedicated_file} "
+        f"also defines `{field}`. {dedicated_file} wins; remove "
+        f"`{field}:` from policy.yaml to silence this warning.",
         file=sys.stderr,
     )

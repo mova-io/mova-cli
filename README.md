@@ -307,6 +307,45 @@ it) and `runtime:` (the gate on `AgentRuntime` values). Defaults are
 See `mdk show <agent>` to inspect the resolved values after defaults
 are applied — that's what's actually going to run.
 
+### Canonical config split (v0.6+)
+
+`policy.yaml` doesn't have to hold every project-wide setting anymore.
+The loader looks for up to four files at the project root and merges
+them; each one carries a focused slice:
+
+| File | Owns |
+|---|---|
+| `policy.yaml` | `policy:` (enforced rules) + `defaults:` (suggestions) + `agents_dir:` + `workflows_dir:` |
+| `runtime.yaml` | `runtime:` (which `AgentRuntime` values are allowed) |
+| `eval.yaml` | `eval:` + `bench:` (project-wide eval gate, bench model list) |
+| `knowledge.yaml` | `knowledge:` — stub today; reserved for v0.7+ RAG config |
+
+**Migration is incremental.** Cut a block from `policy.yaml`, paste
+into its dedicated file. If both files carry the same block,
+**dedicated wins** and a one-shot deprecation warning fires on stderr.
+Operators stay on the unified `policy.yaml` indefinitely if they want
+— the split is opt-in.
+
+```yaml
+# runtime.yaml — one block, no nesting
+runtime:
+  allowed: [litellm]
+```
+
+```yaml
+# eval.yaml — both blocks live here naturally; they're both about scoring
+eval:
+  gate: 0.85
+bench:
+  models:
+    - openai/gpt-4o-mini-2024-07-18
+    - anthropic/claude-haiku-4-5-20251001
+```
+
+`mdk policy export` reads all four files and prints the merged view —
+useful for diffing the *effective* config across environments rather
+than four files at a time.
+
 ## Skills — agents that use tools
 
 An agent can invoke reusable callables ("skills") mid-turn. Declare each
