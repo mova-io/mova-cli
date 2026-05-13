@@ -55,6 +55,17 @@ param postgresAdminPassword = 'ReplaceMeBeforeDeployment-ChangeMe!'
 // OPTIONAL — defaults to resourceGroup().location if omitted.
 param location = 'eastus2'
 
+// OPTIONAL but STRONGLY RECOMMENDED — short suffix (2-6 alphanumeric
+// chars) appended to globally-unique resource names. Key Vault, ACR,
+// and Postgres Flex names live in Azure-wide namespaces, so vanilla
+// `movate-dev-kv` etc. are likely already claimed by another tenant.
+// Pick an org slug or your initials. RG-scoped resources (logs, ACA
+// env, ACA apps) ignore this — they only have to be RG-unique.
+//
+// Example: nameSuffix = 'mvio' → KV becomes 'movate-dev-kv-mvio',
+// ACR becomes 'movatedevacrmvio'.
+param nameSuffix = ''
+
 // OPTIONAL — common tags. Add your own as needed (cost center, owner, ...).
 param tags = {
   application: 'movate'
