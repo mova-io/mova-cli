@@ -236,13 +236,69 @@ class ProjectConfig(BaseModel):
 
 
 def load_project_config(path: Path | str | None = None) -> ProjectConfig:
-    """Load ``movate.yaml`` from the project root (or provided path).
+    """Load the project-level config from the project root (or provided path).
 
-    Returns defaults if the file is absent. Errors out clearly on a malformed
-    file — never silently degrades on a typo.
+    File lookup precedence (when ``path`` is not explicit):
+
+    1. ``policy.yaml`` — the canonical name going forward (MDK naming).
+    2. ``movate.yaml`` — transitional alias. Logs a deprecation warning
+       on first load so operators see the suggested rename without
+       breaking existing repos.
+
+    If both files exist, ``policy.yaml`` wins and ``movate.yaml`` is
+    quietly ignored. This is the "migration mid-flight" state for repos
+    that have started the rename but haven't deleted the old file yet.
+
+    Returns defaults if neither file exists. Errors out clearly on a
+    malformed file — never silently degrades on a typo.
     """
-    p = Path(path) if path else Path("movate.yaml")
-    if not p.exists():
-        return ProjectConfig()
-    data = yaml.safe_load(p.read_text()) or {}
-    return ProjectConfig.model_validate(data)
+    if path is not None:
+        # Explicit operator override — load exactly what they asked for,
+        # whatever it's named.
+        p = Path(path)
+        if not p.exists():
+            return ProjectConfig()
+        data = yaml.safe_load(p.read_text()) or {}
+        return ProjectConfig.model_validate(data)
+
+    policy = Path("policy.yaml")
+    legacy = Path("movate.yaml")
+
+    if policy.exists():
+        data = yaml.safe_load(policy.read_text()) or {}
+        return ProjectConfig.model_validate(data)
+
+    if legacy.exists():
+        # One-time deprecation warning per process. Don't spam stderr if
+        # the loader runs multiple times (validate + run + deploy all
+        # call this).
+        _warn_legacy_movate_yaml_once()
+        data = yaml.safe_load(legacy.read_text()) or {}
+        return ProjectConfig.model_validate(data)
+
+    return ProjectConfig()
+
+
+_LEGACY_WARN_FIRED = False
+
+
+def _warn_legacy_movate_yaml_once() -> None:
+    """Print a one-shot deprecation warning the first time we load
+    ``movate.yaml`` (legacy name) instead of ``policy.yaml`` (canonical).
+
+    Uses stderr (not the logging framework) so the warning is visible
+    even when logging is configured to WARNING-only — config-rename is
+    operator-actionable, not a debug detail.
+    """
+    global _LEGACY_WARN_FIRED  # noqa: PLW0603 — single-process one-shot warning state
+    if _LEGACY_WARN_FIRED:
+        return
+    _LEGACY_WARN_FIRED = True
+    import sys  # noqa: PLC0415
+
+    print(
+        "⚠ movate.yaml is deprecated — rename to policy.yaml. "
+        "movate.yaml will continue to load through v1.x; "
+        "removed in a future major release.",
+        file=sys.stderr,
+    )
