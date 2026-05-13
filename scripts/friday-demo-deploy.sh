@@ -39,9 +39,12 @@ readonly ACR_NAME="movatedevacrjsy"
 readonly API_APP_NAME="movate-dev-api"
 readonly ENV="dev"
 readonly TEAMS_BOT_APP_ID="90f41ab7-31a6-4610-8cf4-88ed0581df55"
-# Deva's Mova iO origin — confirm before running. Add staging/prod origins
-# as a comma-separated list when those exist.
-readonly DEVA_ORIGIN="${MOVA_IO_ORIGIN:-https://mova-io.movate.com}"
+# Deva's Mova iO origin. Default empty (localhost-only) — set via
+# `MOVA_IO_ORIGIN=https://...` when the production Mova iO hostname is
+# known. Adding the origin post-deploy is a one-liner:
+#   az containerapp update -g movate-dev-rg -n movate-dev-api \
+#     --set-env-vars MDK_CORS_ALLOWED_ORIGINS="http://localhost:4200,<new>"
+readonly DEVA_ORIGIN="${MOVA_IO_ORIGIN:-}"
 readonly LOCAL_DEV_ORIGIN="http://localhost:4200"
 
 # -----------------------------------------------------------------------------
@@ -115,7 +118,18 @@ success "Image pushed: ${ACR_NAME}.azurecr.io/${IMAGE_TAG}"
 step "2. Bicep deploy"
 
 readonly DEPLOY_NAME="friday-demo-$(date +%Y%m%d-%H%M%S)"
-readonly CORS_ORIGINS="${LOCAL_DEV_ORIGIN},${DEVA_ORIGIN}"
+# Build the CORS allow-list — drop the trailing comma when MOVA_IO_ORIGIN
+# isn't set (localhost-only deploys are fine for dev; Deva's deployed
+# Mova iO origin can be added post-deploy via one `az containerapp update`).
+if [[ -n "${DEVA_ORIGIN}" ]]; then
+    readonly CORS_ORIGINS="${LOCAL_DEV_ORIGIN},${DEVA_ORIGIN}"
+else
+    readonly CORS_ORIGINS="${LOCAL_DEV_ORIGIN}"
+    warn "MOVA_IO_ORIGIN not set — CORS allow-list will only include localhost:4200."
+    warn "Add Deva's production hostname later via:"
+    warn "  az containerapp update -g ${RESOURCE_GROUP} -n ${API_APP_NAME} \\"
+    warn "    --set-env-vars MDK_CORS_ALLOWED_ORIGINS=\"${LOCAL_DEV_ORIGIN},<new-host>\""
+fi
 
 # Deploy the existing main.bicep with the new image tag + CORS origins.
 # We pass MDK_CORS_ALLOWED_ORIGINS as a Container App env var override
@@ -301,8 +315,11 @@ Your endpoints are live. Wire your Angular app to this:
                  GET  /api/v1/jobs?status={status}
 
 ──── CORS configured for ────────────────────────────────────────────
-  ${LOCAL_DEV_ORIGIN}        (your local ng serve)
-  ${DEVA_ORIGIN}              (deployed Mova iO)
+$(if [[ -n "${DEVA_ORIGIN}" ]]; then
+    printf "  %s        (your local ng serve)\n  %s              (deployed Mova iO)" "${LOCAL_DEV_ORIGIN}" "${DEVA_ORIGIN}"
+else
+    printf "  %s        (your local ng serve)\n  %s" "${LOCAL_DEV_ORIGIN}" "(deployed Mova iO host NOT yet configured — send me the URL and I'll add it)"
+fi)
 
 ──── Auth model for v0.7 alpha ──────────────────────────────────────
   Single fleet bearer (this one). Wrap in your BFF per the auth model
