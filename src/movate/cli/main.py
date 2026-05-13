@@ -16,6 +16,14 @@ from dotenv import load_dotenv
 # Load .env from cwd (or any parent). Existing env vars take precedence.
 load_dotenv()
 
+# Bridge MDK_* ↔ MOVATE_* env vars in both directions. Runs BEFORE any
+# other module reads os.environ so legacy and canonical prefixes are
+# interchangeable for downstream readers. One-shot deprecation warning
+# on first invocation if MOVATE_* vars are in use. See _env_aliases.py.
+from movate.cli._env_aliases import sync_env_aliases  # noqa: E402
+
+sync_env_aliases()
+
 from movate import __version__  # noqa: E402
 from movate.cli import _console  # noqa: E402
 from movate.cli import bench as bench_cmd  # noqa: E402
