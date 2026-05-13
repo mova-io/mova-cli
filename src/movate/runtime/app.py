@@ -44,6 +44,9 @@ from movate.runtime.schemas import (
     AgentDatasetInfo,
     AgentDetailView,
     AgentListView,
+    AgentValidationCostForecast,
+    AgentValidationIssue,
+    AgentValidationView,
     AgentView,
     HealthView,
     JobListView,
@@ -151,6 +154,75 @@ def _agent_creation_error_code(status_code: int) -> str:
         422: "invalid_bundle",
         503: "agent_persistence_unavailable",
     }.get(status_code, "internal_error")
+
+
+def _render_agent_validation(bundle: AgentBundle) -> AgentValidationView:
+    """Build the ``AgentValidationView`` for
+    ``POST /api/v1/agents/{name}/validate``.
+
+    Runs the prompt linter + cost forecast against the bundle. The
+    bundle itself was already validated structurally at load time
+    (via ``load_agent()``) — by the time it's in the registry, it
+    parsed cleanly. This endpoint surfaces the SOFT checks the CLI
+    surfaces via ``mdk validate``: prompt-template hygiene and an
+    eval-cost forecast.
+
+    Pure function — no I/O beyond what the linter + forecaster
+    already do. Safe to call repeatedly; cheap.
+    """
+    from movate.core.cost_forecast import estimate_eval_cost  # noqa: PLC0415
+    from movate.core.prompt_linter import lint_prompt  # noqa: PLC0415
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+    # Severity is a typing.Literal["error", "warning"] (NOT an Enum) —
+    # compare against the bare strings.
+    issues = lint_prompt(bundle)
+    errors = [
+        AgentValidationIssue(
+            code=i.code,
+            severity=i.severity,
+            message=i.message,
+            hint=i.hint,
+        )
+        for i in issues
+        if i.severity == "error"
+    ]
+    warnings = [
+        AgentValidationIssue(
+            code=i.code,
+            severity=i.severity,
+            message=i.message,
+            hint=i.hint,
+        )
+        for i in issues
+        if i.severity == "warning"
+    ]
+
+    # Cost forecast — None when the agent has no dataset, or when the
+    # pricing table doesn't know the agent's model. Wrap defensively
+    # so a missing pricing.yaml doesn't 500 the endpoint.
+    forecast_view: AgentValidationCostForecast | None = None
+    try:
+        forecast = estimate_eval_cost(bundle, pricing=load_pricing())
+        if forecast is not None:
+            forecast_view = AgentValidationCostForecast(
+                model_provider=forecast.model_provider,
+                cases=forecast.cases,
+                input_tokens_per_call=forecast.input_tokens_per_call,
+                output_tokens_per_call=forecast.output_tokens_per_call,
+                cost_per_call_usd=forecast.cost_per_call_usd,
+                total_cost_usd=forecast.total_cost_usd,
+            )
+    except Exception:  # pragma: no cover — defensive
+        # Pricing-table load failure shouldn't sink validate.
+        forecast_view = None
+
+    return AgentValidationView(
+        passed=len(errors) == 0,
+        errors=errors,
+        warnings=warnings,
+        cost_forecast=forecast_view,
+    )
 
 
 def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
@@ -654,6 +726,45 @@ def build_app(
         if bundle is None:
             raise not_found("agent", name)
         return _render_agent_detail(bundle)
+
+    @v1.post(
+        "/agents/{name}/validate",
+        response_model=AgentValidationView,
+        tags=["agents-v1"],
+    )
+    async def v1_validate_agent(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AgentValidationView:
+        """Run the prompt linter + cost forecast for an agent.
+
+        Drives the Mova iO Angular "is this agent shippable?" gate
+        BEFORE the user clicks Publish or Run Eval. Returns:
+
+        * ``passed: bool`` — green-checkmark shortcut (zero errors)
+        * ``errors[]`` — block save (red chips)
+        * ``warnings[]`` — informational (yellow chips, don't block)
+        * ``cost_forecast`` — pricing-table estimate for the eval
+          dataset; lets the UI render "running this eval will cost
+          ~$0.45" alongside the Run Eval button
+
+        Note: the structural validation (Pydantic parse + I/O schema
+        sanity) already ran at POST /agents time — agents that don't
+        pass that never make it into the registry. This endpoint is
+        the SOFT validation layer: prompt-template hygiene + cost.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent not in the registry
+        """
+        _ = ctx.tenant_id  # future per-tenant isolation
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == name), None)
+        if bundle is None:
+            raise not_found("agent", name)
+        return _render_agent_validation(bundle)
 
     app.include_router(v1)
 

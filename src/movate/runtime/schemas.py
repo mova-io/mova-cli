@@ -247,6 +247,73 @@ class AgentCreatedView(BaseModel):
     "schema/input.json", "schema/output.json"]``."""
 
 
+class AgentValidationIssue(BaseModel):
+    """One finding from ``POST /api/v1/agents/{name}/validate``.
+
+    Mirrors :class:`movate.core.prompt_linter.LintIssue` but flat for
+    wire-friendliness. The Angular UI groups by severity and renders
+    a chip per issue.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    """Stable enum code (e.g. ``UNDECLARED_INPUT_REF``). The Angular
+    UI can branch on this for special-case rendering or suppress
+    via a project-level allow-list."""
+    severity: str
+    """One of ``"error"``, ``"warning"`` — matches
+    :class:`movate.core.prompt_linter.Severity`."""
+    message: str
+    """Human-readable explanation. May change wording between
+    releases; codes are the stable contract."""
+    hint: str = ""
+    """Optional fix pointer (e.g. "did you mean `input.text`?")."""
+
+
+class AgentValidationCostForecast(BaseModel):
+    """Cost forecast for an eval run, surfaced by the validate
+    endpoint. Lets the Angular UI render a "running this eval will
+    cost ~$X" chip BEFORE the user clicks the Run Eval button.
+
+    ``None`` (omitted at the parent level) when the agent has no
+    dataset or its pricing entry is missing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_provider: str
+    cases: int
+    input_tokens_per_call: int
+    output_tokens_per_call: int
+    cost_per_call_usd: float
+    total_cost_usd: float
+
+
+class AgentValidationView(BaseModel):
+    """``POST /api/v1/agents/{name}/validate`` response.
+
+    Drives the Mova iO Angular "is this agent shippable?" gate. The
+    UI uses ``errors``  to block save (red chips); ``warnings`` show
+    as yellow chips but don't block. ``cost_forecast`` is the
+    pricing-table estimate the UI displays alongside the Run Eval
+    button.
+
+    ``passed`` is the boolean shortcut — true when there are zero
+    errors. The Angular UI uses this for the green checkmark badge
+    on the agent card.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    """``True`` when zero errors. Warnings don't affect this — they're
+    informational. UI shows a green check when ``passed``."""
+    errors: list[AgentValidationIssue]
+    warnings: list[AgentValidationIssue]
+    cost_forecast: AgentValidationCostForecast | None = None
+
+
 class AgentDatasetInfo(BaseModel):
     """Dataset metadata (size + sample row count + digest) for the
     agent-detail view. Excludes row contents — the Angular UI shows
@@ -364,6 +431,9 @@ __all__ = [
     "AgentDatasetInfo",
     "AgentDetailView",
     "AgentListView",
+    "AgentValidationCostForecast",
+    "AgentValidationIssue",
+    "AgentValidationView",
     "AgentView",
     "HealthView",
     "JobListView",
