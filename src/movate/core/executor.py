@@ -114,6 +114,7 @@ class Executor:
         node_id: str | None = None,
         on_token: Callable[[str], None] | None = None,
         history: list[Message] | None = None,
+        tenant_id_override: str | None = None,
     ) -> RunResponse:
         """Execute one agent against one input.
 
@@ -143,11 +144,25 @@ class Executor:
         schema validation the same as a one-shot run; history is purely
         conversational context the model uses for continuity.
         ``movate chat`` is the primary caller; one-shot ``movate run``
-        invocations leave it ``None``."""
+        invocations leave it ``None``.
+
+        ``tenant_id_override`` lets the caller pass the tenant this run
+        belongs to. When the executor is shared across tenants (e.g. a
+        ``movate worker`` draining the multi-tenant job queue), each job
+        has its own tenant_id and the persisted ``RunRecord`` + budget
+        checks must use *that* id, not the executor's construction-time
+        default. Local-CLI callers (``movate run``) pass nothing and
+        fall back to ``self._tenant_id`` (``"local"``). Cross-tenant
+        ``GET /runs/<id>`` would return 404 if this didn't propagate."""
         job_id = job_id or str(uuid4())
         run_id = str(uuid4())
         spec = bundle.spec
         effective_model = model_override or spec.model
+        # Resolve the tenant context for this run. Worker dispatch passes
+        # job.tenant_id explicitly; local CLI passes nothing → keeps
+        # self._tenant_id (which is "local" by construction for the
+        # local-CLI runtime).
+        tenant_id = tenant_id_override or self._tenant_id
 
         span = self._tracer.start_span(
             "agent.execute",
@@ -155,7 +170,7 @@ class Executor:
                 "agent": spec.name,
                 "agent_version": spec.version,
                 "provider": effective_model.provider,
-                "tenant_id": self._tenant_id,
+                "tenant_id": tenant_id,
                 "job_id": job_id,
                 "run_id": run_id,
                 "model_override": model_override is not None,
@@ -189,7 +204,7 @@ class Executor:
             # breached, no run should fire (not even a doomed one).
             # Cheap PK lookup + a single SUM aggregate; the index on
             # (tenant_id, created_at) is the perf path.
-            await self._check_tenant_budget()
+            await self._check_tenant_budget(tenant_id)
 
             # Policy check happens BEFORE schema validation and prompt
             # rendering — a denied model shouldn't get to bill latency
@@ -336,6 +351,7 @@ class Executor:
                 bundle=bundle,
                 run_id=run_id,
                 job_id=job_id,
+                tenant_id=tenant_id,
                 request=request,
                 response=response,
                 chosen_provider=chosen_provider,
@@ -351,6 +367,7 @@ class Executor:
                 bundle=bundle,
                 run_id=run_id,
                 job_id=job_id,
+                tenant_id=tenant_id,
                 started=started,
                 err=exc,
             )
@@ -360,6 +377,7 @@ class Executor:
                 bundle=bundle,
                 run_id=run_id,
                 job_id=job_id,
+                tenant_id=tenant_id,
                 started=started,
                 err=exc.last_error,
             )
@@ -402,7 +420,7 @@ class Executor:
             raw=raw,
         )
 
-    async def _check_tenant_budget(self) -> None:
+    async def _check_tenant_budget(self, tenant_id: str) -> None:
         """Abort the run if the tenant has hit its monthly cap.
 
         Reads :meth:`StorageProvider.get_tenant_budget` (PK lookup —
@@ -411,6 +429,11 @@ class Executor:
         default-unlimited case, backwards compatible with every
         pre-budget deployment).
 
+        Takes ``tenant_id`` as a positional so the caller (Executor.execute)
+        can pass the correct per-run tenant (which may differ from
+        ``self._tenant_id`` when a worker is draining a multi-tenant
+        queue).
+
         Race window: under high concurrency two requests can both
         observe "under budget" simultaneously and both succeed,
         pushing combined cost over the cap. The overrun is bounded
@@ -418,16 +441,16 @@ class Executor:
         operators should set the cap slightly below the hard cost
         ceiling they actually want to enforce.
         """
-        budget = await self._storage.get_tenant_budget(self._tenant_id)
+        budget = await self._storage.get_tenant_budget(tenant_id)
         if budget is None or budget.monthly_usd_limit is None:
             return
-        current = await self._storage.sum_tenant_cost_current_month(self._tenant_id)
+        current = await self._storage.sum_tenant_cost_current_month(tenant_id)
         if current >= budget.monthly_usd_limit:
             raise TenantBudgetExceededError(
-                f"tenant {self._tenant_id!r} has spent ${current:.2f} of "
+                f"tenant {tenant_id!r} has spent ${current:.2f} of "
                 f"${budget.monthly_usd_limit:.2f} this month; runs are paused. "
                 f"Operator can raise the budget with "
-                f"`movate tenants set-budget {self._tenant_id} --monthly-usd <new>` "
+                f"`movate tenants set-budget {tenant_id} --monthly-usd <new>` "
                 f"or wait for next-month rollover."
             )
 
@@ -504,6 +527,7 @@ class Executor:
         bundle: AgentBundle,
         run_id: str,
         job_id: str,
+        tenant_id: str,
         request: RunRequest,
         response: RunResponse,
         chosen_provider: str,
@@ -513,7 +537,7 @@ class Executor:
         record = RunRecord(
             run_id=run_id,
             job_id=job_id,
-            tenant_id=self._tenant_id,
+            tenant_id=tenant_id,
             agent=bundle.spec.name,
             agent_version=bundle.spec.version,
             prompt_hash=bundle.prompt_hash,
@@ -539,6 +563,7 @@ class Executor:
         bundle: AgentBundle,
         run_id: str,
         job_id: str,
+        tenant_id: str,
         started: float,
         err: MovateError,
     ) -> RunResponse:
@@ -552,7 +577,7 @@ class Executor:
             FailureRecord(
                 failure_id=str(uuid4()),
                 run_id=run_id,
-                tenant_id=self._tenant_id,
+                tenant_id=tenant_id,
                 agent=bundle.spec.name,
                 failure_type=err.failure_type.value,
                 message=str(err),

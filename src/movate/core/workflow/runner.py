@@ -143,12 +143,15 @@ class WorkflowRunner:
 
             # Run through the executor with the workflow context so the
             # persisted RunRecord carries workflow_run_id + node_id without
-            # the runner needing a second save.
+            # the runner needing a second save. Pass tenant_id_override so
+            # multi-tenant workers stamp the right tenant on each node's
+            # RunRecord (executor default may be a different tenant).
             response: RunResponse = await self._executor.execute(
                 bundle,
                 RunRequest(agent=bundle.spec.name, input=agent_input),
                 workflow_run_id=wf_id,
                 node_id=node_id,
+                tenant_id_override=self._tenant_id,
             )
 
             # Python-level summary for the WorkflowResult.runs view.

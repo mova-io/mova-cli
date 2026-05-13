@@ -96,7 +96,19 @@ class WorkerDispatch:
             )
         request = RunRequest(agent=job.target, input=job.input)
         try:
-            response = await self._executor.execute(bundle, request, job_id=job.job_id)
+            # The Executor is constructed once per worker process with a
+            # default tenant_id (typically "local" or the worker's pool
+            # tenant). Pass the JOB's tenant_id explicitly so the
+            # persisted RunRecord + budget queries use the right tenant —
+            # otherwise GET /runs/<id> from the API key's tenant context
+            # returns 404 because the stored row is scoped to the wrong
+            # tenant.
+            response = await self._executor.execute(
+                bundle,
+                request,
+                job_id=job.job_id,
+                tenant_id_override=job.tenant_id,
+            )
         except Exception as exc:
             # Executor is expected to swallow MovateError into a
             # status='error' RunResponse, so an unhandled exception
@@ -133,7 +145,15 @@ class WorkerDispatch:
                 f"workflow {job.target!r} not registered on this worker",
                 retryable=False,
             )
-        runner = WorkflowRunner(executor=self._executor, storage=self._storage)
+        # Same tenant-scoping fix as the agent path: workers run jobs from
+        # many tenants through one Executor; the workflow runner must stamp
+        # the job's tenant on every node's RunRecord, not the executor's
+        # construction-time default.
+        runner = WorkflowRunner(
+            executor=self._executor,
+            storage=self._storage,
+            tenant_id=job.tenant_id,
+        )
         try:
             result = await runner.run(graph, initial_state=job.input)
         except Exception as exc:
