@@ -231,17 +231,19 @@ class AgentSpec(BaseModel):
                 f"provider {provider!r} for runtime: langchain must be a "
                 f"Python entry-point spec like 'package.module:function'"
             )
-        elif self.runtime == AgentRuntime.LYZR:
+        elif self.runtime == AgentRuntime.LYZR and (
             # `lyzr/<agent_id>` — the path is the Lyzr Studio agent ID.
             # Lyzr IDs are 24-hex Mongo ObjectIds; we accept any non-empty
             # path-suffix here and let the adapter surface a clean HTTP
             # error if the ID is wrong.
-            if not provider.startswith("lyzr/") or len(provider) <= len("lyzr/"):
-                raise ValueError(
-                    f"provider {provider!r} for runtime: lyzr must look like "
-                    f"'lyzr/<lyzr-agent-id>' (e.g. "
-                    f"'lyzr/69fe0d9890de3014e9f1cf92')"
-                )
+            not provider.startswith("lyzr/")
+            or len(provider) <= len("lyzr/")
+        ):
+            raise ValueError(
+                f"provider {provider!r} for runtime: lyzr must look like "
+                f"'lyzr/<lyzr-agent-id>' (e.g. "
+                f"'lyzr/69fe0d9890de3014e9f1cf92')"
+            )
         # Native runtimes (anthropic / openai) accept bare or prefixed —
         # adapters tolerate both via pricing_key() normalization.
         return self
