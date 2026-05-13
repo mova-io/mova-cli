@@ -236,6 +236,92 @@ clarity; **no MDK backlog items**:
 - **AI Infrastructure** (foundation row) — Bicep (shipped) + Helm (item 22) get MDK onto ACA / EKS / AKS; the substrate (cluster, network, storage classes) is platform-team territory.
 - **Org-wide governance dashboards** (Ethical & Responsible AI policy UI) — MDK enforces via items 37-38 + the existing policy gate; the policy-editor UI is a separate product.
 
+### Group G — Backend API for Mova iO Angular front end (Friday 2026-05-15 deliverable)
+
+> _The Mova iO web app (Angular) needs HTTP endpoints to use MDK's
+> evals, agent creation, and other capabilities that today live
+> CLI-side. Current runtime exposes 8 endpoints (`/healthz`, `/ready`,
+> `/agents` GET-only, `/run`, `/jobs`, `/jobs/{id}`, `/runs/{id}`,
+> `/metrics`). This group covers the gap. **Sub-groups G-MUST and G-NEXT
+> separate Friday-essential from follow-up so the team can scope
+> realistically against a 2-day window.**_
+
+#### G-cross — Cross-cutting concerns (must decide before coding)
+
+> Get these right and the per-endpoint work is mechanical. Get them
+> wrong and we'll regret it within a sprint.
+
+50. [ ] **OpenAPI client auto-gen for Angular** `[HIGH] [v0.7] [≤2h]` — FastAPI already emits an OpenAPI 3.1 spec at `/openapi.json`. Wire `ng-openapi-gen` (or `openapi-typescript-codegen`) into the Mova iO Angular repo's build so the TypeScript client is regenerated on every MDK runtime version bump. Zero hand-written DTOs. **This is the single highest-leverage decision in this group.** Without it, the Angular team writes + maintains ~30 DTO interfaces by hand.
+
+51. [ ] **CORS configuration** `[HIGH] [v0.7] [≤1h]` — FastAPI `CORSMiddleware` configured per environment via `MDK_CORS_ALLOWED_ORIGINS` env var (comma-separated). Dev permissive (`*`), staging + prod locked to the Mova iO web app's hostname. **Blocks every browser call from Angular until this lands.**
+
+52. [ ] **API versioning policy** `[HIGH] [v0.7] [≤1h]` — Mount new resource endpoints under `/api/v1/` prefix (existing `/healthz`, `/ready`, `/agents`, `/run`, `/jobs/*`, `/runs/*` stay unversioned for back-compat). Document the rule: breaking changes bump to `/api/v2/`; additive changes don't. Keeps Angular's generated client stable as MDK evolves.
+
+53. [ ] **Auth model for the Angular client** `[HIGH] [v0.7] [≤2h]` — Decision needed: does the Angular app talk to MDK with (a) a single fleet API key (admin-elevated, all tenant data visible) or (b) per-user keys (`mvt_live_<user>_…`) bound via SSO? **For Friday: fleet key behind a backend-for-frontend proxy is the pragmatic call**; SSO + per-user keys is a multi-week design. The decision flips the URL pattern from `/api/v1/agents` (single-tenant view) vs `/api/v1/tenants/{id}/agents` (admin/multi-tenant view). **Decide before any endpoint lands.**
+
+54. [ ] **Pagination + filtering conventions** `[MED] [v0.7] [≤2h]` — Cursor-based pagination (`?cursor=<opaque>&limit=50`); filter via repeated query params (`?status=running&status=queued`); response envelope `{items, next_cursor, total_estimate}`. Codify once so the 10+ list endpoints don't each invent their own shape.
+
+#### G-MUST — Friday 2026-05-15 minimum viable set
+
+> Enough for the Angular app to: (a) list + view agents, (b) create a
+> new agent from a YAML upload, (c) validate it, (d) run it with a
+> payload, (e) kick off an eval and view the 4-dim scorecard. That's
+> the minimum "Mova iO can build an agent" demo loop.
+
+55. [ ] **`POST /api/v1/agents` — create agent from bundle** `[HIGH] [v0.7] [≤1d]` — Accepts a multipart form with `agent.yaml` + `prompt.md` + `schema/input.json` + `schema/output.json` + optional `evals/dataset.jsonl`. Validates the bundle via existing `loader.load_agent()` logic. Persists to filesystem-backed agent registry (today: `./agents/` dir). Returns the agent's resolved spec + a marketplace metadata block (item 29 fields). **Two-step on conflict:** 409 if name exists; PUT for update.
+
+56. [ ] **`GET /api/v1/agents/{name}` — full agent spec + bundle metadata** `[HIGH] [v0.7] [≤2h]` — Extends today's `/agents` (which is list-only) with per-agent detail: spec JSON + prompt body + I/O schemas + dataset stats + marketplace metadata + last-known eval scores. Mirrors `mdk show` output. **The Angular agent-profile view reads this single endpoint.**
+
+57. [ ] **`PUT /api/v1/agents/{name}` — update agent bundle** `[HIGH] [v0.7] [≤1d]` — Same multipart shape as POST but updates in-place. Bumps `version` on every update (semver minor by default; major if breaking schema change detected). Returns the new resolved spec.
+
+58. [ ] **`POST /api/v1/agents/{name}/validate` — schema + prompt-linter** `[HIGH] [v0.7] [≤2h]` — Wraps `mdk validate` programmatically. Returns `{errors: [], warnings: [], cost_forecast: {...}}`. Errors block save; warnings let the UI render a yellow chip but don't block. **Drives the "is this agent shippable?" UI gate.**
+
+59. [ ] **`POST /api/v1/agents/{name}/runs` — agent-scoped run** `[HIGH] [v0.7] [≤2h]` — Equivalent to today's `POST /run` but URL-anchored on the agent (REST-clean for Angular's resource-oriented mental model). Body: `{input: {...}}`. Sync (`?wait=true`, returns `RunView`) or async (default, returns `{job_id}` + 202).
+
+60. [ ] **`POST /api/v1/agents/{name}/evals` — kick off an eval run** `[HIGH] [v0.7] [≤1d]` — Wraps `mdk eval`. Body: `{gate: 0.7, runs: 3, mock: false, baseline_id?: "...", regression_tolerance?: 0.05}`. Returns `{eval_id, status: queued}` immediately; eval runs as a background job (reuses worker infra). Poll via `GET /api/v1/evals/{eval_id}`. **Closes the eval kickoff path from Angular.**
+
+61. [ ] **`GET /api/v1/evals/{eval_id}` — eval record + 4-dim scorecard** `[HIGH] [v0.7] [≤2h]` — Full `EvalRecord` JSON: per-case rows, dimensional means (accuracy / faithfulness / coverage / latency), baseline diff if applicable. Mirrors the `mdk eval` Rich table but as structured data for Angular's chart rendering.
+
+62. [ ] **`GET /api/v1/evals?agent={name}` — eval history list** `[HIGH] [v0.7] [≤2h]` — Paginated. Each row: eval_id, agent_name, gate, gate_mode, mean_score, pass_rate, created_at, status. Drives the "evals over time" chart Angular will render.
+
+63. [ ] **`GET /api/v1/agents` enhancement — marketplace facets + filters** `[HIGH] [v0.7] [≤2h]` — Extends today's `/agents` (basic name+version list) with marketplace metadata (role / persona / capabilities / tags / examples from item 29), filterable by `?role=...&capabilities=...&tags=...`. **Drives the Mova iO Agent Catalog page directly.**
+
+#### G-NEXT — Follow-up endpoints (next sprint)
+
+64. [ ] **`POST /api/v1/bench/{agent}` + `GET /api/v1/bench/{bench_id}`** `[HIGH] [v0.8] [~1d]` — Multi-model comparison kickoff + retrieval. Mirrors `mdk bench`.
+
+65. [ ] **`GET /api/v1/runs/{run_id}/trace` — replay info** `[HIGH] [v0.8] [≤1d]` — Mirrors `mdk trace replay`. Returns timeline JSON (spans, costs, decisions) for Angular's trace-viewer component.
+
+66. [ ] **`GET /api/v1/runs/{run_id}/explain` — decision chain** `[MED] [v0.8] [≤1d, depends on item 35]` — Mirrors `mdk explain` (item 35). Skill calls, tool results, branch decisions in human-readable form. **Pairs with item 35 from Group F.**
+
+67. [ ] **`GET /api/v1/models` + `GET /api/v1/models/{id}` — model catalog** `[MED] [v0.8] [≤1d, depends on item 30]` — Pricing, context window, capabilities, region availability. **Pairs with item 30 from Group F.**
+
+68. [ ] **`GET /api/v1/pricing` — pricing table** `[MED] [v0.8] [≤2h]` — Read-only mirror of `pricing.yaml`. Lets Angular render cost-forecast UI client-side without round-tripping.
+
+69. [ ] **Skills CRUD: `GET/POST/PUT/DELETE /api/v1/skills` + `POST /api/v1/skills/{name}/invoke`** `[MED] [v0.8] [~2d]` — Wraps `mdk skills *` commands. Skill registry browsing + direct invocation from the Angular skill-authoring UI.
+
+70. [ ] **Workflows CRUD: `/api/v1/workflows` + `POST /api/v1/workflows/{name}/runs`** `[MED] [v0.8] [~2d]` — Mirrors `mdk` workflow surface. Topology JSON for Angular's flowchart renderer.
+
+71. [ ] **Datasets endpoint: `POST /api/v1/agents/{name}/dataset`** `[MED] [v0.8] [≤1d]` — Upload / replace `evals/dataset.jsonl`. Mirrors the Teams bot's file-attachment validation (slice 3.1.d). Returns row count + preview.
+
+72. [ ] **Tenant admin: `GET/POST /api/v1/tenants/{id}/budget`, `GET /api/v1/tenants/{id}/usage`** `[MED] [v0.8] [≤1d]` — Wraps `mdk tenants *`. Admin-only (RBAC needed before public exposure).
+
+73. [ ] **API keys CRUD: `GET/POST/DELETE /api/v1/auth/keys`** `[MED] [v0.8] [≤1d]` — Wraps `mdk auth create-key | list-keys | revoke-key`. Admin-only.
+
+74. [ ] **`GET /api/v1/jobs?agent={}&status={}&tenant={}` — filterable job history** `[MED] [v0.8] [≤2h]` — Extends today's `/jobs` with filtering + cursor pagination. Drives Angular's run-history table.
+
+75. [ ] **Server-Sent Events for long jobs: `GET /api/v1/jobs/{id}/events`** `[LOW] [post-v1] [~1d]` — Streams status transitions + cost updates. Useful for the agent-run UX where polling feels laggy. Defer until the polling experience is actually a problem.
+
+#### G-est — Friday scope estimate
+
+Realistic delivery for Friday 2026-05-15 with a 2-day window:
+
+* **All four G-cross items (50-53)** — ~6h total, must land first
+* **G-MUST items 55, 56, 58, 59, 60, 61** — 4 endpoints + agent CRUD basics, ~6-8h total
+* **Stretch items if time allows:** 57 (PUT), 62 (eval history list), 63 (marketplace facets)
+
+Total realistic Friday surface: **~10 endpoints** out of the 21 in this group. The remaining 11 land in the next sprint via Group G-NEXT. **Angular team can start scaffolding against the OpenAPI spec on Thursday once items 50 + 51 land** — they don't have to wait for every endpoint, the auto-generated client adapts as new routes are added.
+
 #### Demoted / deferred
 
 These items are below the top 10 — capture so we don't lose them, but
