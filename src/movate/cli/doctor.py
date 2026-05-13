@@ -27,6 +27,31 @@ console = Console()
 _REQUIRED_DEPS = ("typer", "rich", "pydantic", "yaml", "jinja2", "litellm", "aiosqlite")
 _OPTIONAL_DEPS = ("langfuse", "opentelemetry", "asyncpg", "fastapi")
 
+# SPDX license per dep. Curated by hand because Python package metadata
+# is famously inconsistent — many packages set the license as free-text
+# ("MIT License", "BSD-3", etc.) instead of an SPDX ID, so reading
+# importlib.metadata would surface inconsistent strings. This map is
+# the canonical answer documented in docs/license-posture.md; the
+# CI license-gate (when it lands) reads from the SAME table.
+#
+# Update both this map AND docs/license-posture.md when adding a dep.
+_DEP_LICENSES: dict[str, str] = {
+    # Required deps
+    "typer": "MIT",
+    "rich": "MIT",
+    "pydantic": "MIT",
+    "yaml": "MIT",
+    "jinja2": "BSD-3-Clause",
+    "litellm": "MIT",
+    "aiosqlite": "MIT",
+    # Optional deps
+    "langfuse": "MIT",
+    "opentelemetry": "Apache-2.0",
+    "asyncpg": "Apache-2.0",
+    "fastapi": "MIT",
+    "httpx": "BSD-3-Clause",
+}
+
 # Map each AgentRuntime to (probe-module, extras-install-hint). Used by
 # the runtime section of ``movate doctor`` to report what's wired vs.
 # what's an `uv add 'movate-cli[...]'` away.
@@ -61,7 +86,7 @@ def _missing(label: str) -> str:
     return f"[yellow]missing[/yellow] [dim]{label}[/dim]" if label else "[yellow]missing[/yellow]"
 
 
-def doctor(
+def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section diagnostic
     target: str = typer.Option(
         None,
         "--target",
@@ -72,32 +97,59 @@ def doctor(
             "Use this when `movate deploy` is failing."
         ),
     ),
+    licenses: bool = typer.Option(
+        False,
+        "--licenses",
+        help=(
+            "Print a license report instead of the standard doctor "
+            "output: per-dep SPDX license, resale-safety classification, "
+            "and a link to docs/license-posture.md. Use this to confirm "
+            "a deployment's dep tree is permissively licensed before "
+            "embedding in a customer deliverable."
+        ),
+    ),
 ) -> None:
     """Report on the local environment, deps, API keys, and movate state.
 
     With ``--target <name>``, adds a second table walking the Azure
     deploy path so you see the earliest broken link, not a stack trace
     from ``movate deploy``.
+
+    With ``--licenses``, prints a per-dep SPDX license report instead
+    of the standard output — useful before shipping a customer
+    deliverable that embeds movate-cli.
     """
+    if licenses:
+        _render_license_report()
+        return
+
     table = Table(title="movate doctor", show_header=True, header_style="bold")
     table.add_column("Check")
     table.add_column("Result")
+    table.add_column("License", style="dim")  # blank for non-dep rows
 
-    table.add_row("Python", sys.version.split()[0])
-    table.add_row("movate", __version__)
-    table.add_row("", "")
+    table.add_row("Python", sys.version.split()[0], "")
+    table.add_row("movate", __version__, "")
+    table.add_row("", "", "")
 
-    # Required deps
+    # Required deps — now with SPDX license column. Every entry in
+    # _REQUIRED_DEPS should have a matching entry in _DEP_LICENSES;
+    # a missing entry renders as a yellow "?" prompting the operator
+    # to update both maps (see docs/license-posture.md).
     for mod in _REQUIRED_DEPS:
         spec = importlib.util.find_spec(mod)
-        table.add_row(f"dep: {mod}", _ok("") if spec else "[red]missing (install fail)[/red]")
+        status = _ok("") if spec else "[red]missing (install fail)[/red]"
+        license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
+        table.add_row(f"dep: {mod}", status, license_str)
 
-    table.add_row("", "")
+    table.add_row("", "", "")
 
     # Optional deps
     for mod in _OPTIONAL_DEPS:
         spec = importlib.util.find_spec(mod)
-        table.add_row(f"opt: {mod}", _ok("") if spec else _missing("not installed"))
+        status = _ok("") if spec else _missing("not installed")
+        license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
+        table.add_row(f"opt: {mod}", status, license_str)
 
     table.add_row("", "")
 
@@ -180,6 +232,70 @@ def doctor(
     # ------------------------------------------------------------------
     if target is not None:
         _render_azure_preflight(target)
+
+
+# Allowlist of SPDX licenses that are safe to embed in customer
+# deliverables without copyleft / source-availability / competing-services
+# obligations. Match the same list in docs/license-posture.md. Keep
+# additions deliberate — a new entry here is a policy decision.
+_LICENSE_ALLOWLIST: frozenset[str] = frozenset({
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "PostgreSQL",
+    "PSF-2.0",
+    "MIT OR Apache-2.0",
+})
+
+
+def _render_license_report() -> None:
+    """Print a per-dep license report.
+
+    Three columns: dep name, SPDX license, resale-safety verdict. A
+    license outside :data:`_LICENSE_ALLOWLIST` renders red ("REVIEW") —
+    that's the cue to read ``docs/license-posture.md`` and decide
+    whether to keep the dep or replace it.
+
+    Today every dep in the codebase is allowlist-safe, so the report
+    is all-green. The CI license-gate (when wired) reads from the
+    same allowlist constant.
+    """
+    table = Table(
+        title="movate license posture",
+        show_header=True,
+        header_style="bold",
+        caption="See docs/license-posture.md for the full policy.",
+        caption_style="dim",
+    )
+    table.add_column("Dep")
+    table.add_column("SPDX license")
+    table.add_column("Resale-safe?")
+
+    all_deps = sorted(_DEP_LICENSES.items())
+    n_safe = 0
+    n_review = 0
+    for dep, license_id in all_deps:
+        if license_id in _LICENSE_ALLOWLIST:
+            verdict = "[green]✓ permissive[/green]"
+            n_safe += 1
+        else:
+            verdict = "[red]REVIEW[/red]"
+            n_review += 1
+        table.add_row(dep, license_id, verdict)
+
+    console.print(table)
+    if n_review:
+        console.print(
+            f"\n[red]✗ {n_review} dep(s) need review[/red] — "
+            "see docs/license-posture.md for the process."
+        )
+    else:
+        console.print(
+            f"\n[green]✓ all {n_safe} deps are permissively licensed[/green] "
+            "and safe to embed in customer deliverables."
+        )
 
 
 def _render_azure_preflight(target_name: str) -> None:
