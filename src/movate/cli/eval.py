@@ -22,7 +22,13 @@ from movate.cli._output import Report
 from movate.cli._progress import progress_bar
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.baseline import BaselineDiff, compute_baseline_diff, format_delta
-from movate.core.eval import CaseSummary, EvalConfigError, EvalEngine, EvalSummary
+from movate.core.eval import (
+    CaseSummary,
+    EvalConfigError,
+    EvalEngine,
+    EvalSummary,
+    ObjectiveSummary,
+)
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import EvalRecord
 from movate.core.reporters import render_eval_markdown
@@ -79,6 +85,17 @@ def eval_(
         "--regression-tolerance",
         help="Allowable score drop vs baseline before flagging a regression (0.0-1.0).",
     ),
+    objective: str = typer.Option(
+        None,
+        "--objective",
+        help=(
+            "Only run cases tagged for the named objective (id from "
+            "agent.yaml: objectives). Gates on that objective's own "
+            "threshold (declared in agent.yaml), not --gate. "
+            "Use this in CI to fail PRs that regress a specific objective "
+            "while letting others slip — e.g. `--objective routing-accuracy`."
+        ),
+    ),
     output_format: Report = typer.Option(Report.TABLE, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
@@ -121,12 +138,13 @@ def eval_(
             baseline_file=baseline_file,
             output_baseline=output_baseline,
             regression_tolerance=regression_tolerance,
+            objective=objective,
             output_format=output_format,
         )
     )
 
 
-async def _run_eval(
+async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     bundle: AgentBundle,
     *,
     gate: float,
@@ -137,6 +155,7 @@ async def _run_eval(
     baseline_file: Path | None = None,
     output_baseline: Path | None = None,
     regression_tolerance: float = 0.0,
+    objective: str | None = None,
     output_format: Report = Report.TABLE,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
@@ -154,6 +173,7 @@ async def _run_eval(
                 provider=rt.provider,
                 runs_per_case=runs,
                 gate_mode=gate_mode,
+                objective_filter=objective,
                 on_case_complete=on_case,
             )
             try:
@@ -179,9 +199,25 @@ async def _run_eval(
     if output_baseline is not None:
         _write_baseline_file(output_baseline, record)
 
-    # Apply CLI gate (overrides judge.threshold for "case passes").
-    cases_passing = sum(1 for c in summary.cases if c.aggregated_score >= gate)
-    overall_pass = summary.sample_count > 0 and cases_passing == summary.sample_count
+    # Apply CLI gate. When --objective is set, the objective's own
+    # threshold (declared in agent.yaml) is the gate; --gate is ignored
+    # because the objective's contract lives in the agent definition.
+    # Otherwise the eval-wide --gate is applied per-case.
+    if objective is not None:
+        # Find the matching objective summary (engine validated it exists).
+        obj_summary = next(
+            (o for o in summary.objective_summaries if o.objective_id == objective),
+            None,
+        )
+        # Engine guarantees this exists when --objective is passed; fall
+        # back to defensive defaults to keep type checkers happy.
+        effective_gate = obj_summary.threshold if obj_summary else gate
+        overall_pass = obj_summary.passed if obj_summary else False
+        cases_passing = sum(1 for c in summary.cases if c.passed)
+    else:
+        effective_gate = gate
+        cases_passing = sum(1 for c in summary.cases if c.aggregated_score >= gate)
+        overall_pass = summary.sample_count > 0 and cases_passing == summary.sample_count
 
     diff: BaselineDiff | None = None
     if baseline_record is not None:
@@ -191,22 +227,28 @@ async def _run_eval(
         _emit_json(
             summary,
             record=record,
-            gate=gate,
+            gate=effective_gate,
             cases_passing=cases_passing,
             overall_pass=overall_pass,
             diff=diff,
             regression_tolerance=regression_tolerance,
         )
     elif output_format == Report.MARKDOWN:
-        print(render_eval_markdown(summary, gate=gate))
+        print(render_eval_markdown(summary, gate=effective_gate))
     else:
         _emit_table(
             summary,
             record=record,
-            gate=gate,
+            gate=effective_gate,
             cases_passing=cases_passing,
             overall_pass=overall_pass,
+            objective_filter=objective,
         )
+        if summary.objective_summaries and objective is None:
+            # Per-objective breakdown — only when there are objectives
+            # declared AND we're showing the full eval (not a single-
+            # objective run, which already focused on that one).
+            _emit_objective_breakdown(summary.objective_summaries)
         if diff is not None:
             _emit_diff_table(diff, regression_tolerance=regression_tolerance)
 
@@ -224,9 +266,13 @@ def _emit_table(
     gate: float,
     cases_passing: int,
     overall_pass: bool,
+    objective_filter: str | None = None,
 ) -> None:
+    title = f"{summary.agent} v{summary.agent_version} — eval results"
+    if objective_filter is not None:
+        title += f"  ·  objective={objective_filter}"
     head = Table(
-        title=f"{summary.agent} v{summary.agent_version} — eval results",
+        title=title,
         show_header=False,
     )
     head.add_column("field", style="dim")
@@ -238,7 +284,12 @@ def _emit_table(
     head.add_row("dataset.hash", summary.dataset_hash[:12] + "…")
     head.add_row("runs/case", str(summary.runs_per_case))
     head.add_row("gate_mode", summary.gate_mode)
-    head.add_row("gate", f"{gate:.2f}")
+    gate_label = (
+        f"{gate:.2f}  [dim](from objective '{objective_filter}')[/dim]"
+        if objective_filter
+        else f"{gate:.2f}"
+    )
+    head.add_row("gate", gate_label)
     head.add_row("cases", str(summary.sample_count))
     head.add_row("mean score", f"{summary.mean_score:.3f}")
     head.add_row(
@@ -270,6 +321,49 @@ def _emit_table(
             _truncate(first_rat, 60),
         )
     console.print(cases)
+
+
+def _emit_objective_breakdown(summaries: list[ObjectiveSummary]) -> None:
+    """Render the per-objective rollup as its own Rich table.
+
+    Shown beneath the main eval table when the agent has objectives
+    declared in agent.yaml. Each row is one objective with its sample
+    count, mean score, pass/fail vs its threshold, and the judge method.
+
+    Objectives with zero cases (no dataset rows tagged with their id)
+    show with a dim "no cases" placeholder rather than a misleading
+    pass/fail verdict.
+    """
+    table = Table(title="Per-objective breakdown", show_header=True, header_style="bold")
+    table.add_column("objective", style="bold")
+    table.add_column("cases", justify="right")
+    table.add_column("mean", justify="right")
+    table.add_column("threshold", justify="right")
+    table.add_column("judge", style="dim")
+    table.add_column("verdict")
+
+    for s in summaries:
+        if s.sample_count == 0:
+            table.add_row(
+                s.objective_id,
+                "0",
+                "[dim]—[/dim]",
+                f"{s.threshold:.2f}",
+                s.judge_method,
+                "[dim]no cases[/dim]",
+            )
+            continue
+        mean_txt = f"{s.mean_score:.3f}"
+        verdict = "[green]PASS[/green]" if s.passed else "[red]FAIL[/red]"
+        table.add_row(
+            s.objective_id,
+            str(s.sample_count),
+            mean_txt,
+            f"{s.threshold:.2f}",
+            s.judge_method,
+            verdict,
+        )
+    console.print(table)
 
 
 def _emit_diff_table(diff: BaselineDiff, *, regression_tolerance: float) -> None:

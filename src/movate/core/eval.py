@@ -58,6 +58,15 @@ class EvalCase:
     input: dict[str, Any]
     expected: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
+    objective: str | None = None
+    """Which agent objective this case tests, if any.
+
+    Cases declare ``"objective": "<id>"`` in dataset.jsonl rows. The id
+    must match an entry in the agent's ``objectives:`` list (validated
+    by ``mdk eval`` at engine entry; an unknown id is an EvalConfigError).
+    Cases without an ``objective`` field land in the implicit "default"
+    bucket — backwards-compat for every existing dataset.
+    """
 
 
 @dataclass
@@ -82,6 +91,48 @@ class CaseSummary:
 
 
 @dataclass
+class ObjectiveSummary:
+    """Per-objective rollup for one EvalSummary.
+
+    Aggregates the subset of cases tagged with this objective id, plus
+    the objective's declared threshold from agent.yaml. The eval gate
+    can target this directly: each objective passes / fails on its OWN
+    threshold, independent of the overall pass rate.
+
+    ``objective_id == "default"`` is the implicit bucket for cases that
+    didn't declare an ``objective`` field — those are scored against
+    the eval's --gate value (or no gate if absent).
+    """
+
+    objective_id: str
+    description: str
+    threshold: float
+    judge_method: str
+    cases: list[CaseSummary]
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.cases)
+
+    @property
+    def pass_rate(self) -> float:
+        if not self.cases:
+            return 0.0
+        return sum(1 for c in self.cases if c.passed) / len(self.cases)
+
+    @property
+    def mean_score(self) -> float:
+        if not self.cases:
+            return 0.0
+        return statistics.fmean(c.aggregated_score for c in self.cases)
+
+    @property
+    def passed(self) -> bool:
+        """True iff the objective's mean score meets its threshold."""
+        return self.sample_count > 0 and self.mean_score >= self.threshold
+
+
+@dataclass
 class EvalSummary:
     agent: str
     agent_version: str
@@ -92,6 +143,12 @@ class EvalSummary:
     gate_mode: str
     threshold: float
     cases: list[CaseSummary]
+    objective_summaries: list[ObjectiveSummary] = field(default_factory=list)
+    """Per-objective rollup. Built by EvalEngine when the agent has
+    ``objectives:`` declared in agent.yaml. Empty for legacy agents
+    (no objectives → no per-objective view), in which case ``cases`` +
+    the top-level threshold are the only assertions.
+    """
 
     @property
     def sample_count(self) -> int:
@@ -167,6 +224,7 @@ def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
                 input=d.get("input", {}),
                 expected=d.get("expected", {}),
                 tags=list(d.get("tags", []) or []),
+                objective=d.get("objective"),
             )
         )
     return cases, digest
@@ -223,6 +281,46 @@ def assert_cross_family(agent_provider: str, judge_provider: str) -> None:
 _GATE_MODES = ("mean", "min", "p10")
 
 
+def _build_objective_summaries(
+    bundle: AgentBundle,
+    case_summaries: list[CaseSummary],
+    judge: JudgeConfig,
+) -> list[ObjectiveSummary]:
+    """Group case summaries by the case's ``objective`` field, producing
+    one :class:`ObjectiveSummary` per declared agent objective.
+
+    Cases without an ``objective`` field are skipped — the legacy
+    top-level ``EvalSummary.cases`` already covers them. Agents with
+    no objectives get an empty list (no per-objective view).
+
+    The threshold on each ObjectiveSummary comes from the agent's
+    objective declaration, not from the eval's --gate value. This is
+    the key design point: an objective's pass criteria is part of the
+    agent's contract (lives in agent.yaml), not a per-run flag.
+    """
+    if not bundle.spec.objectives:
+        return []
+
+    by_objective: dict[str, list[CaseSummary]] = {obj.id: [] for obj in bundle.spec.objectives}
+    for cs in case_summaries:
+        oid = cs.case.objective
+        if oid is not None and oid in by_objective:
+            by_objective[oid].append(cs)
+
+    out: list[ObjectiveSummary] = []
+    for obj in bundle.spec.objectives:
+        out.append(
+            ObjectiveSummary(
+                objective_id=obj.id,
+                description=obj.description,
+                threshold=obj.threshold,
+                judge_method=obj.judge,
+                cases=by_objective[obj.id],
+            )
+        )
+    return out
+
+
 def aggregate_scores(scores: list[float], mode: str) -> float:
     """Reduce N per-run scores to one per-case score.
 
@@ -277,6 +375,7 @@ class EvalEngine:
         provider: BaseLLMProvider,
         runs_per_case: int = 1,
         gate_mode: str = "mean",
+        objective_filter: str | None = None,
         on_case_complete: Callable[[int, int, CaseSummary], None] | None = None,
     ) -> None:
         if runs_per_case < 1:
@@ -287,6 +386,11 @@ class EvalEngine:
         self._provider = provider
         self._runs_per_case = runs_per_case
         self._gate_mode = gate_mode
+        self._objective_filter = objective_filter
+        """If set, only run cases whose ``objective`` field matches this id.
+        Used by ``mdk eval --objective <id>`` to score / gate a single
+        objective without running the whole dataset. Unknown id is an
+        EvalConfigError at run() entry."""
         self._on_case_complete = on_case_complete
         """Optional progress hook: ``(done, total, summary)``. Fires
         after each case finishes; CLI uses it to drive a Rich progress
@@ -296,6 +400,32 @@ class EvalEngine:
         judge = load_judge_config(bundle)
         self._validate_judge(bundle, judge)
         cases, dataset_hash = load_dataset(bundle)
+
+        # Validate that every case's `objective` references a real
+        # objective id on the agent. Cases without an objective land
+        # in the "default" bucket — allowed for legacy datasets.
+        declared_objective_ids = {obj.id for obj in bundle.spec.objectives}
+        for i, case in enumerate(cases, start=1):
+            if case.objective is not None and case.objective not in declared_objective_ids:
+                raise EvalConfigError(
+                    f"dataset case #{i} declares objective={case.objective!r} which "
+                    f"isn't defined in agent.yaml. Known objectives: "
+                    f"{sorted(declared_objective_ids) or '(none)'}"
+                )
+
+        # --objective <id> filter
+        if self._objective_filter is not None:
+            if self._objective_filter not in declared_objective_ids:
+                raise EvalConfigError(
+                    f"--objective {self._objective_filter!r} doesn't match any objective "
+                    f"in agent.yaml. Known: {sorted(declared_objective_ids) or '(none)'}"
+                )
+            cases = [c for c in cases if c.objective == self._objective_filter]
+            if not cases:
+                raise EvalConfigError(
+                    f"--objective {self._objective_filter!r} matched zero cases in the "
+                    f"dataset. Tag dataset rows with this objective id to score them."
+                )
 
         case_summaries: list[CaseSummary] = []
         total = len(cases)
@@ -336,6 +466,14 @@ class EvalEngine:
         judge_provider = (
             judge.model.provider if judge.method == JudgeMethod.LLM_JUDGE and judge.model else None
         )
+
+        # Per-objective rollup. Build one summary per declared objective,
+        # plus an implicit "default" bucket for cases that didn't declare
+        # an objective field. Empty when the agent has no objectives:
+        # this is the legacy code path and the existing top-level
+        # cases/threshold are the only assertions.
+        objective_summaries = _build_objective_summaries(bundle, case_summaries, judge)
+
         return EvalSummary(
             agent=bundle.spec.name,
             agent_version=bundle.spec.version,
@@ -346,6 +484,7 @@ class EvalEngine:
             gate_mode=self._gate_mode,
             threshold=judge.threshold,
             cases=case_summaries,
+            objective_summaries=objective_summaries,
         )
 
     # ---------------------------------------------------------- private

@@ -30,5 +30,14 @@ timeouts:
 budget:
   max_cost_usd_per_run: 0.10
 
+# Per-objective gating (v0.7). Each objective declares its own
+# threshold; `mdk eval --objective routing-accuracy` gates on this
+# value, independent of the eval-wide --gate.
+objectives:
+  - id: routing-accuracy
+    description: Percent of questions correctly routed to the expert lane
+    threshold: 0.9
+    judge: exact
+
 tags:
   - classifier
