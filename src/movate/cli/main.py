@@ -51,6 +51,7 @@ from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
+from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
@@ -194,6 +195,7 @@ app.command("deploy", rich_help_panel=PANEL_DEPLOY)(deploy_cmd.deploy)
 
 app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
+app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
 
