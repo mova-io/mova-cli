@@ -1,24 +1,24 @@
-{"input": {"question": "How do I scaffold a new agent?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "What templates does movate init support?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "What goes in agent.yaml?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "How do I write a prompt.md with input variables?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "What does movate validate check?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "How do I add an enum to my output schema?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "What does the prompt linter flag?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "How do I show the structure of an existing agent?"}, "expected": {"classification": "scaffold"}}
-{"input": {"question": "How do I run movate eval?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "What's the difference between exact_match and llm_judge?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "How do I gate CI on eval pass rate?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "What is the cross-family judge rule?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "How do I detect regression between agent versions?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "How do I compare two models for the same agent?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "What is movate bench for?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "How do I set a regression tolerance?"}, "expected": {"classification": "eval-bench"}}
-{"input": {"question": "How do I deploy movate to Azure?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "What does movate doctor do?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "How do I register a deployment target?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "How do I submit a job to the deployed runtime?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "How do I check the status of a queued job?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "What Azure resources does movate need?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "How do I configure Telegram notifications?"}, "expected": {"classification": "deploy-ops"}}
-{"input": {"question": "How does the CI workflow deploy to Azure?"}, "expected": {"classification": "deploy-ops"}}
+{"input": {"question": "How do I scaffold a new agent?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "What templates does movate init support?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "What goes in agent.yaml?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I write a prompt.md with input variables?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "What does movate validate check?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I add an enum to my output schema?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "What does the prompt linter flag?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I show the structure of an existing agent?"}, "expected": {"classification": "scaffold"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I run movate eval?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "What's the difference between exact_match and llm_judge?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I gate CI on eval pass rate?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "What is the cross-family judge rule?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I detect regression between agent versions?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I compare two models for the same agent?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "What is movate bench for?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I set a regression tolerance?"}, "expected": {"classification": "eval-bench"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I deploy movate to Azure?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "What does movate doctor do?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I register a deployment target?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I submit a job to the deployed runtime?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I check the status of a queued job?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "What Azure resources does movate need?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "How do I configure Telegram notifications?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
+{"input": {"question": "How does the CI workflow deploy to Azure?"}, "expected": {"classification": "deploy-ops"}, "objective": "routing-accuracy"}
