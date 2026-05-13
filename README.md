@@ -26,6 +26,11 @@ enforcement, tenant isolation audit. See
 [docs/v0.5-design.md](docs/v0.5-design.md) for the v0.5 architecture
 that v1.0 builds on.
 
+**v0.7 planned** — Microsoft Teams app for non-technical users: run +
+eval Movate agents from inside a Teams channel, no CLI required.
+Design captured in
+[ADR 003 — Teams integration](docs/adr/003-teams-integration.md).
+
 ## What works today
 
 | capability | command | status |
