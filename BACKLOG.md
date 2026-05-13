@@ -32,6 +32,8 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 > the Teams demo loop**. Full per-PR detail in
 > [docs/progress/2026-05-13.md](docs/progress/2026-05-13.md)._
 
+**2026-05-13 PM addendum:** 16 PRs merged this afternoon shipped the entire **Mova iO Angular v1 endpoint surface** — Groups G + H end-to-end. v0.7 is live on `movate-dev-api.victoriouswater-7958662f.eastus2.azurecontainerapps.io`; Deva has a bearer + 12 wrapper scripts in `scripts/deva-curl/`. Live smoke surfaced one architecture gap (wizard agents land on API pod's filesystem; worker pod can't see them — item 109) + 10 usability items now tracked as **Group I**. The previous "Top 10" below is stale — see Group I and Group H for the active Thursday/Friday queue.
+
 ### Session 2026-05-13 — Teams demo loop + ADR 002 closeout
 
 **Teams Slice 3.1.e — Teams manifest + Azure Bot Service registration shipped this session.** 15 new tests (1296 → 1311 total). The remaining piece of the Teams demo loop — package the bot as an actual Teams app and wire Azure Bot Service so Teams can route Activities to the deployed bot. New `appPackage/manifest.json` (Teams v1.16) with three scopes (personal/team/groupchat), commandLists for the autocomplete UI, `supportsFiles: true` for 3.1.d uploads; placeholder 192x192 + 32x32 PNG icons (generated via stdlib zlib so CI doesn't need binary blobs). New `scripts/teams-package.sh` zipper that substitutes `MOVATE_TEAMS_BOT_APP_ID` / version / validDomains from env at build time, warns loudly on the placeholder UUID (Teams Admin Center would reject it). Two new Bicep modules: `infra/azure/modules/containerapp-teams-bot.bicep` (Container App running `mdk teams-bot serve`; ingress port 3978; reads three KV secrets — fleet API key, encryption key, Bot Service AAD password) and `bot-service.bicep` (Bot Service registration + Teams channel; F0 for non-prod, S1 for prod; bound to an AAD app the operator pre-creates via `az ad app create`). Main.bicep wires both behind a single `enableTeamsBot` flag mirroring `enableApiWorker`'s two-pass pattern. New `docs/teams-deploy.md` 6-step runbook from "you have an Azure sub" to "Teams users `@movate ping` works". Bicep build + lint clean. **PR #87 (this one). Closes [#69](https://github.com/jeremyyuAWS/movate-cli/issues/69) (modulo the manual `az ad app create` + Teams Admin Center upload step which lives in the runbook). Demo loop complete.**
@@ -98,7 +100,7 @@ deploy is a manual `az acr build && az containerapp update` chain.
 
 1. [x] **v1.0 stage 1: Bicep IaC for Azure** `[HIGH] [v1.0] [done]` — modular `infra/azure/modules/*.bicep`; CI runs `bicep build` + `bicep lint` on every PR. Operator walkthrough at [infra/azure/README.md](infra/azure/README.md).
 2. [x] **v1.0 stage 2: `mdk deploy` CLI + GH-Actions deploy.yml** `[HIGH] [v1.0] [done]` — `mdk deploy --target <name>` wraps `az acr build` + `az containerapp update` (both API + worker) + `/healthz` poll until version matches. `TargetConfig` carries optional Azure deploy fields (`add-target --azure-*`). `.github/workflows/deploy.yml` uses federated OIDC, scoped to per-env GH Environments for approval gates. Rollback via `--skip-build --image-tag <prev>`. 23 tests across plan-building, CLI integration with subprocess mocks, and the async `/healthz` poll loop with `httpx.MockTransport`.
-3. [ ] **First Azure deployment validation** `[HIGH] [v1.0] [≤1d code, blocked on subscription access]` — operator runs the walkthrough against a real subscription; surface any IAM / region / SKU surprises that local Bicep compile can't catch. Onboarding tooling done this session: `scripts/azure-bootstrap.sh <env>` automates the RG + SP + federated-cred setup, `mdk doctor --target prod` walks the deploy path with operator pointers on every red, `docs/azure-bootstrap.md` is the 8-step end-to-end runbook. **Only the Azure-side action remains** (get sub, run the script, run Bicep, paste 7 secrets, push `release/dev`).
+3. [x] **First Azure deployment validation** `[HIGH] [v1.0] [≤1d code, blocked on subscription access]` — operator runs the walkthrough against a real subscription; surface any IAM / region / SKU surprises that local Bicep compile can't catch. Onboarding tooling done this session: `scripts/azure-bootstrap.sh <env>` automates the RG + SP + federated-cred setup, `mdk doctor --target prod` walks the deploy path with operator pointers on every red, `docs/azure-bootstrap.md` is the 8-step end-to-end runbook. **Only the Azure-side action remains** (get sub, run the script, run Bicep, paste 7 secrets, push `release/dev`).
 4. [x] **v1.0 stage 3: Model policy enforcement** `[HIGH] [v1.0] [done]` — `policy:` block on `movate.yaml` (allowed_providers / deny_models / max_cost_per_run_usd); enforced at `mdk validate` (static) + `Executor.execute()` entry (runtime, so bundles loaded by `mdk serve` can't bypass). Denied models short-circuit before any provider call → zero cost incurred. 21 tests in [tests/test_policy.py](tests/test_policy.py).
 5. [x] **v1.0 stage 4: Tenant isolation audit** `[HIGH] [v1.0] [done]` — every storage method that touches per-tenant rows now requires + filters by ``tenant_id`` at the SQL layer (9 audit gaps closed). New ``tests/test_tenant_isolation.py`` parametrized over all 3 backends sweeps every cross-tenant read path. **v1.0 is feature-complete.**
 
@@ -251,15 +253,15 @@ clarity; **no MDK backlog items**:
 > Get these right and the per-endpoint work is mechanical. Get them
 > wrong and we'll regret it within a sprint.
 
-50. [ ] **OpenAPI client auto-gen for Angular** `[HIGH] [v0.7] [≤2h]` — FastAPI already emits an OpenAPI 3.1 spec at `/openapi.json`. Wire `ng-openapi-gen` (or `openapi-typescript-codegen`) into the Mova iO Angular repo's build so the TypeScript client is regenerated on every MDK runtime version bump. Zero hand-written DTOs. **This is the single highest-leverage decision in this group.** Without it, the Angular team writes + maintains ~30 DTO interfaces by hand.
+50. [x] **OpenAPI client auto-gen for Angular** `[HIGH] [v0.7] [≤2h]` — FastAPI already emits an OpenAPI 3.1 spec at `/openapi.json`. Wire `ng-openapi-gen` (or `openapi-typescript-codegen`) into the Mova iO Angular repo's build so the TypeScript client is regenerated on every MDK runtime version bump. Zero hand-written DTOs. **This is the single highest-leverage decision in this group.** Without it, the Angular team writes + maintains ~30 DTO interfaces by hand.
 
-51. [ ] **CORS configuration** `[HIGH] [v0.7] [≤1h]` — FastAPI `CORSMiddleware` configured per environment via `MDK_CORS_ALLOWED_ORIGINS` env var (comma-separated). Dev permissive (`*`), staging + prod locked to the Mova iO web app's hostname. **Blocks every browser call from Angular until this lands.**
+51. [x] **CORS configuration** `[HIGH] [v0.7] [≤1h]` — FastAPI `CORSMiddleware` configured per environment via `MDK_CORS_ALLOWED_ORIGINS` env var (comma-separated). Dev permissive (`*`), staging + prod locked to the Mova iO web app's hostname. **Blocks every browser call from Angular until this lands.**
 
-52. [ ] **API versioning policy** `[HIGH] [v0.7] [≤1h]` — Mount new resource endpoints under `/api/v1/` prefix (existing `/healthz`, `/ready`, `/agents`, `/run`, `/jobs/*`, `/runs/*` stay unversioned for back-compat). Document the rule: breaking changes bump to `/api/v2/`; additive changes don't. Keeps Angular's generated client stable as MDK evolves.
+52. [x] **API versioning policy** `[HIGH] [v0.7] [≤1h]` — Mount new resource endpoints under `/api/v1/` prefix (existing `/healthz`, `/ready`, `/agents`, `/run`, `/jobs/*`, `/runs/*` stay unversioned for back-compat). Document the rule: breaking changes bump to `/api/v2/`; additive changes don't. Keeps Angular's generated client stable as MDK evolves.
 
-53. [ ] **Auth model for the Angular client** `[HIGH] [v0.7] [≤2h]` — Decision needed: does the Angular app talk to MDK with (a) a single fleet API key (admin-elevated, all tenant data visible) or (b) per-user keys (`mvt_live_<user>_…`) bound via SSO? **For Friday: fleet key behind a backend-for-frontend proxy is the pragmatic call**; SSO + per-user keys is a multi-week design. The decision flips the URL pattern from `/api/v1/agents` (single-tenant view) vs `/api/v1/tenants/{id}/agents` (admin/multi-tenant view). **Decide before any endpoint lands.**
+53. [x] **Auth model for the Angular client** `[HIGH] [v0.7] [≤2h]` — Decision needed: does the Angular app talk to MDK with (a) a single fleet API key (admin-elevated, all tenant data visible) or (b) per-user keys (`mvt_live_<user>_…`) bound via SSO? **For Friday: fleet key behind a backend-for-frontend proxy is the pragmatic call**; SSO + per-user keys is a multi-week design. The decision flips the URL pattern from `/api/v1/agents` (single-tenant view) vs `/api/v1/tenants/{id}/agents` (admin/multi-tenant view). **Decide before any endpoint lands.**
 
-54. [ ] **Pagination + filtering conventions** `[MED] [v0.7] [≤2h]` — Cursor-based pagination (`?cursor=<opaque>&limit=50`); filter via repeated query params (`?status=running&status=queued`); response envelope `{items, next_cursor, total_estimate}`. Codify once so the 10+ list endpoints don't each invent their own shape.
+54. [x] **Pagination + filtering conventions** `[MED] [v0.7] [≤2h]` — Cursor-based pagination (`?cursor=<opaque>&limit=50`); filter via repeated query params (`?status=running&status=queued`); response envelope `{items, next_cursor, total_estimate}`. Codify once so the 10+ list endpoints don't each invent their own shape.
 
 #### G-MUST — Friday 2026-05-15 minimum viable set
 
@@ -268,15 +270,15 @@ clarity; **no MDK backlog items**:
 > payload, (e) kick off an eval and view the 4-dim scorecard. That's
 > the minimum "Mova iO can build an agent" demo loop.
 
-55. [ ] **`POST /api/v1/agents` — create agent from bundle** `[HIGH] [v0.7] [≤1d]` — Accepts a multipart form with `agent.yaml` + `prompt.md` + `schema/input.json` + `schema/output.json` + optional `evals/dataset.jsonl`. Validates the bundle via existing `loader.load_agent()` logic. Persists to filesystem-backed agent registry (today: `./agents/` dir). Returns the agent's resolved spec + a marketplace metadata block (item 29 fields). **Two-step on conflict:** 409 if name exists; PUT for update.
+55. [x] **`POST /api/v1/agents` — create agent from bundle** `[HIGH] [v0.7] [≤1d]` — Accepts a multipart form with `agent.yaml` + `prompt.md` + `schema/input.json` + `schema/output.json` + optional `evals/dataset.jsonl`. Validates the bundle via existing `loader.load_agent()` logic. Persists to filesystem-backed agent registry (today: `./agents/` dir). Returns the agent's resolved spec + a marketplace metadata block (item 29 fields). **Two-step on conflict:** 409 if name exists; PUT for update.
 
-56. [ ] **`GET /api/v1/agents/{name}` — full agent spec + bundle metadata** `[HIGH] [v0.7] [≤2h]` — Extends today's `/agents` (which is list-only) with per-agent detail: spec JSON + prompt body + I/O schemas + dataset stats + marketplace metadata + last-known eval scores. Mirrors `mdk show` output. **The Angular agent-profile view reads this single endpoint.**
+56. [x] **`GET /api/v1/agents/{name}` — full agent spec + bundle metadata** `[HIGH] [v0.7] [≤2h]` — Extends today's `/agents` (which is list-only) with per-agent detail: spec JSON + prompt body + I/O schemas + dataset stats + marketplace metadata + last-known eval scores. Mirrors `mdk show` output. **The Angular agent-profile view reads this single endpoint.**
 
 57. [ ] **`PUT /api/v1/agents/{name}` — update agent bundle** `[HIGH] [v0.7] [≤1d]` — Same multipart shape as POST but updates in-place. Bumps `version` on every update (semver minor by default; major if breaking schema change detected). Returns the new resolved spec.
 
-58. [ ] **`POST /api/v1/agents/{name}/validate` — schema + prompt-linter** `[HIGH] [v0.7] [≤2h]` — Wraps `mdk validate` programmatically. Returns `{errors: [], warnings: [], cost_forecast: {...}}`. Errors block save; warnings let the UI render a yellow chip but don't block. **Drives the "is this agent shippable?" UI gate.**
+58. [x] **`POST /api/v1/agents/{name}/validate` — schema + prompt-linter** `[HIGH] [v0.7] [≤2h]` — Wraps `mdk validate` programmatically. Returns `{errors: [], warnings: [], cost_forecast: {...}}`. Errors block save; warnings let the UI render a yellow chip but don't block. **Drives the "is this agent shippable?" UI gate.**
 
-59. [ ] **`POST /api/v1/agents/{name}/runs` — agent-scoped run** `[HIGH] [v0.7] [≤2h]` — Equivalent to today's `POST /run` but URL-anchored on the agent (REST-clean for Angular's resource-oriented mental model). Body: `{input: {...}}`. Sync (`?wait=true`, returns `RunView`) or async (default, returns `{job_id}` + 202).
+59. [x] **`POST /api/v1/agents/{name}/runs` — agent-scoped run** `[HIGH] [v0.7] [≤2h]` — Equivalent to today's `POST /run` but URL-anchored on the agent (REST-clean for Angular's resource-oriented mental model). Body: `{input: {...}}`. Sync (`?wait=true`, returns `RunView`) or async (default, returns `{job_id}` + 202).
 
 60. [ ] **`POST /api/v1/agents/{name}/evals` — kick off an eval run** `[HIGH] [v0.7] [≤1d]` — Wraps `mdk eval`. Body: `{gate: 0.7, runs: 3, mock: false, baseline_id?: "...", regression_tolerance?: 0.05}`. Returns `{eval_id, status: queued}` immediately; eval runs as a background job (reuses worker infra). Poll via `GET /api/v1/evals/{eval_id}`. **Closes the eval kickoff path from Angular.**
 
@@ -290,7 +292,7 @@ clarity; **no MDK backlog items**:
 
 64. [ ] **`POST /api/v1/bench/{agent}` + `GET /api/v1/bench/{bench_id}`** `[HIGH] [v0.8] [~1d]` — Multi-model comparison kickoff + retrieval. Mirrors `mdk bench`.
 
-65. [ ] **`GET /api/v1/runs/{run_id}/trace` — replay info** `[HIGH] [v0.8] [≤1d]` — Mirrors `mdk trace replay`. Returns timeline JSON (spans, costs, decisions) for Angular's trace-viewer component.
+65. [x] **`GET /api/v1/runs/{run_id}/trace` — replay info** `[HIGH] [v0.8] [≤1d]` — Mirrors `mdk trace replay`. Returns timeline JSON (spans, costs, decisions) for Angular's trace-viewer component.
 
 66. [ ] **`GET /api/v1/runs/{run_id}/explain` — decision chain** `[MED] [v0.8] [≤1d, depends on item 35]` — Mirrors `mdk explain` (item 35). Skill calls, tool results, branch decisions in human-readable form. **Pairs with item 35 from Group F.**
 
@@ -308,7 +310,7 @@ clarity; **no MDK backlog items**:
 
 73. [ ] **API keys CRUD: `GET/POST/DELETE /api/v1/auth/keys`** `[MED] [v0.8] [≤1d]` — Wraps `mdk auth create-key | list-keys | revoke-key`. Admin-only.
 
-74. [ ] **`GET /api/v1/jobs?agent={}&status={}&tenant={}` — filterable job history** `[MED] [v0.8] [≤2h]` — Extends today's `/jobs` with filtering + cursor pagination. Drives Angular's run-history table.
+74. [x] **`GET /api/v1/jobs?agent={}&status={}&tenant={}` — filterable job history** `[MED] [v0.8] [≤2h]` — Extends today's `/jobs` with filtering + cursor pagination. Drives Angular's run-history table.
 
 75. [ ] **Server-Sent Events for long jobs: `GET /api/v1/jobs/{id}/events`** `[LOW] [post-v1] [~1d]` — Streams status transitions + cost updates. Useful for the agent-run UX where polling feels laggy. Defer until the polling experience is actually a problem.
 
@@ -341,9 +343,9 @@ clarity; **no MDK backlog items**:
 The existing items 55-58 cover the in-process side. **The GitHub
 piece is new** — these endpoints below close the version-control gap.
 
-76. [ ] **`POST /api/v1/agents` accepts a canonical bundle** `[HIGH] [v0.7] [~1d]` — Refines item 55. The endpoint persists agents in the canonical folder layout MDK already uses (`<agent-name>/agent.yaml` + `prompt.md` + `schema/{input,output}.json` + `evals/dataset.jsonl` + optional `skills/`, `contexts/`, `prompts/`, `knowledge.yaml`). The endpoint accepts EITHER (a) a multipart form with the individual files, or (b) a zipped bundle (multipart form `bundle.zip` field). Returns the canonical layout in the response so the Angular UI can render "your agent is now at `agents/faq-bot/...`". **Rejects bundles that violate the canonical layout** so we never persist a malformed structure to git.
+76. [x] **`POST /api/v1/agents` accepts a canonical bundle** `[HIGH] [v0.7] [~1d]` — Refines item 55. The endpoint persists agents in the canonical folder layout MDK already uses (`<agent-name>/agent.yaml` + `prompt.md` + `schema/{input,output}.json` + `evals/dataset.jsonl` + optional `skills/`, `contexts/`, `prompts/`, `knowledge.yaml`). The endpoint accepts EITHER (a) a multipart form with the individual files, or (b) a zipped bundle (multipart form `bundle.zip` field). Returns the canonical layout in the response so the Angular UI can render "your agent is now at `agents/faq-bot/...`". **Rejects bundles that violate the canonical layout** so we never persist a malformed structure to git.
 
-77. [ ] **ADR 007 — GitHub integration for agent version control** `[HIGH] [v0.7] [~3d ADR + impl]` — Design before code. Decisions: (a) one repo per agent vs one repo with subdirs? (b) GitHub App vs PAT auth? (c) commit-on-every-save vs explicit "publish" button? (d) PR-based review or direct push to main? **Recommend: one mono-repo per tenant (`mova-io-agents-<tenant>`); GitHub App auth for org installs; explicit publish action (NOT auto-commit on every save — too noisy); direct push to main with branch protection for sensitive agents.** Write the ADR Thursday, ship the code Friday.
+77. [x] **ADR 007 — GitHub integration for agent version control** `[HIGH] [v0.7] [~3d ADR + impl]` — Design before code. Decisions: (a) one repo per agent vs one repo with subdirs? (b) GitHub App vs PAT auth? (c) commit-on-every-save vs explicit "publish" button? (d) PR-based review or direct push to main? **Recommend: one mono-repo per tenant (`mova-io-agents-<tenant>`); GitHub App auth for org installs; explicit publish action (NOT auto-commit on every save — too noisy); direct push to main with branch protection for sensitive agents.** Write the ADR Thursday, ship the code Friday.
 
 78. [ ] **`POST /api/v1/agents/{name}/publish` — commit + push to GitHub** `[HIGH] [v0.7] [~1d, gated on ADR 007]` — Takes a commit message + author. Stages the canonical agent bundle into the configured GitHub repo (per ADR 007), commits, pushes. Returns `{commit_sha, html_url}` so the UI can render a "View on GitHub" link on every published version. **Idempotent** — if the working tree matches HEAD, returns the existing SHA with a `no_changes: true` flag instead of an empty commit.
 
@@ -412,19 +414,19 @@ Total realistic v1 surface: **~12 endpoints + 1 ADR + ~3 CLI helpers**. The Angu
 
 #### H-MUST — Required for Friday meeting
 
-82. [ ] **`POST /api/v1/agents/from-wizard` — Mova iO wizard adapter** `[HIGH] [v0.7] [~3h]` — Sibling endpoint to `POST /api/v1/agents` accepting `application/json` (not multipart). Body matches the wizard's field set: ``{name, agent_provider, agent_type, role, description, agent_role, agent_goal, agent_prompt, reference_output, mcp_connectors, knowledge_store, ai_model, ai_foundation}``. Translates into the canonical layout: prompt body → `prompt.md`, default I/O schemas (input: free-form text, output: free-form response), wizard-specific fields → marketplace metadata + tag extensions. Delegates to existing `persist_bundle()`. Returns same `AgentCreatedView` so the Angular client doesn't branch.
+82. [x] **`POST /api/v1/agents/from-wizard` — Mova iO wizard adapter** `[HIGH] [v0.7] [~3h]` — Sibling endpoint to `POST /api/v1/agents` accepting `application/json` (not multipart). Body matches the wizard's field set: ``{name, agent_provider, agent_type, role, description, agent_role, agent_goal, agent_prompt, reference_output, mcp_connectors, knowledge_store, ai_model, ai_foundation}``. Translates into the canonical layout: prompt body → `prompt.md`, default I/O schemas (input: free-form text, output: free-form response), wizard-specific fields → marketplace metadata + tag extensions. Delegates to existing `persist_bundle()`. Returns same `AgentCreatedView` so the Angular client doesn't branch.
 
-83. [ ] **`POST /api/v1/agents/{name}/evals` — eval kickoff as Azure worker job** `[HIGH] [v0.7] [~3h]` — Originally item 60. Refined: new `JobKind.EVAL` + worker dispatch handler that loads the agent bundle, runs `EvalEngine`, persists `EvalRecord` to Postgres, updates job progress per case. Endpoint returns ``{eval_id, job_id, status: queued}``; Angular polls `GET /api/v1/evals/{eval_id}` (item 84).
+83. [x] **`POST /api/v1/agents/{name}/evals` — eval kickoff as Azure worker job** `[HIGH] [v0.7] [~3h]` — Originally item 60. Refined: new `JobKind.EVAL` + worker dispatch handler that loads the agent bundle, runs `EvalEngine`, persists `EvalRecord` to Postgres, updates job progress per case. Endpoint returns ``{eval_id, job_id, status: queued}``; Angular polls `GET /api/v1/evals/{eval_id}` (item 84).
 
-84. [ ] **`GET /api/v1/evals/{eval_id}` — eval scorecard (running or done)** `[HIGH] [v0.7] [~2h]` — Originally item 61. Returns the partial-or-final `EvalRecord`: per-case rows + dimensional means (accuracy / faithfulness / coverage / latency) + baseline diff if applicable. Works while the eval is still running (shows ``cases_completed: 23 / 50``).
+84. [x] **`GET /api/v1/evals/{eval_id}` — eval scorecard (running or done)** `[HIGH] [v0.7] [~2h]` — Originally item 61. Returns the partial-or-final `EvalRecord`: per-case rows + dimensional means (accuracy / faithfulness / coverage / latency) + baseline diff if applicable. Works while the eval is still running (shows ``cases_completed: 23 / 50``).
 
-85. [ ] **`GET /api/v1/evals?agent=<name>` — eval history list** `[HIGH] [v0.7] [~1h]` — Originally item 62. Paginated. Each row: ``{eval_id, agent_name, gate, mean_score, pass_rate, created_at, status}``.
+85. [x] **`GET /api/v1/evals?agent=<name>` — eval history list** `[HIGH] [v0.7] [~1h]` — Originally item 62. Paginated. Each row: ``{eval_id, agent_name, gate, mean_score, pass_rate, created_at, status}``.
 
-86. [ ] **Deploy v0.7 to Azure ACA** `[HIGH] [v0.7] [~1h operator action]` — Build a fresh image (`movate:0.7.0-<sha>`) via `az acr build`, redeploy `movate-dev-rg` runtime so today's new endpoints (76, 56, 58, 59, 65, 74) + Friday's (82-85) are live. Update `MDK_CORS_ALLOWED_ORIGINS` to include Deva's Mova iO origin. Smoke test `/openapi.json` returns all v1 routes.
+86. [x] **Deploy v0.7 to Azure ACA** `[HIGH] [v0.7] [~1h operator action]` — Build a fresh image (`movate:0.7.0-<sha>`) via `az acr build`, redeploy `movate-dev-rg` runtime so today's new endpoints (76, 56, 58, 59, 65, 74) + Friday's (82-85) are live. Update `MDK_CORS_ALLOWED_ORIGINS` to include Deva's Mova iO origin. Smoke test `/openapi.json` returns all v1 routes.
 
-87. [ ] **Mint API key for Deva + send onboarding bundle** `[HIGH] [v0.7] [~30min]` — `az containerapp exec` → `mdk auth create-key --tenant deva-friday-demo --env live --label angular-bff`. Send Deva: (a) runtime URL, (b) bearer token, (c) link to `docs/angular-client.md` for client-gen instructions, (d) `/openapi.json` URL.
+87. [x] **Mint API key for Deva + send onboarding bundle** `[HIGH] [v0.7] [~30min]` — `az containerapp exec` → `mdk auth create-key --tenant deva-friday-demo --env live --label angular-bff`. Send Deva: (a) runtime URL, (b) bearer token, (c) link to `docs/angular-client.md` for client-gen instructions, (d) `/openapi.json` URL.
 
-88. [ ] **Smoke-test runbook: wizard → eval → trace round-trip** `[MED] [v0.7] [~1h]` — Single doc walking the full Angular flow against the deployed runtime: hit `/from-wizard` → `/validate` → kick off eval → poll → fetch trace. Confirms every Friday-demo path works end-to-end BEFORE the meeting.
+88. [x] **Smoke-test runbook: wizard → eval → trace round-trip** `[MED] [v0.7] [~1h]` — Single doc walking the full Angular flow against the deployed runtime: hit `/from-wizard` → `/validate` → kick off eval → poll → fetch trace. Confirms every Friday-demo path works end-to-end BEFORE the meeting.
 
 #### H-NEXT — Next sprint (post-Friday)
 
@@ -458,6 +460,66 @@ Total realistic v1 surface: **~12 endpoints + 1 ADR + ~3 CLI helpers**. The Angu
 
 **Stretch (if Pillar 1+2+3 sticks the landing):**
 * Items 78, 79 (GitHub publish + history) — Pillar 1's GitHub layer
+
+### Group I — Surfaced by 2026-05-13 PM smoke + deploy
+
+> _Triage discoveries from running scripts/friday-demo-deploy.sh + smoking
+> all 12 deva-curl wrappers against the live runtime. Most are small (~30
+> min to ~3h) but unblock either Friday demo polish or production
+> rollout. Tier per item: F = Friday-critical, R = before Mova iO ships,
+> U = usability polish._
+
+#### I-F — Friday-meeting critical
+
+109. [ ] **Cross-pod bundle sync** `[HIGH] [v0.7] [~3-4h or workaround ~2h]` — Tier F. Wizard-created agents land on the API pod's filesystem; the worker pod can't see them. Smoke proof: `POST /api/v1/agents/from-wizard` for `smoke-bot` returned 201, but `POST /api/v1/agents/smoke-bot/runs` queued a job that the worker errored with `unknown_agent: agent 'smoke-bot' not registered on this worker`. Two fix paths: (a) mount an Azure Files share at `/home/movate/agents` on both pods (proper, ~3-4h Bicep + integration test), (b) inline-run mode at the endpoint to sidestep the issue for the Mova iO demo (item 110, ~2h). Recommend (b) for Friday, (a) for v0.8.
+
+110. [ ] **Inline run mode — `POST /api/v1/agents/{name}/runs?wait=true`** `[HIGH] [v0.7] [~2h]` — Tier F. Same pattern the eval endpoint already uses: when `?wait=true`, execute the agent inline at the API endpoint and return the RunRecord directly (200). When omitted (default), preserve today's async/worker behavior (202 + job_id). Sidesteps the cross-pod bundle issue (item 109) for wizard-created agents while keeping the queue path for production load. Two tests: sync mode returns 200 with output dict; async mode returns 202 + job_id; both routed through the same Executor.
+
+111. [ ] **`POST /api/v1/agents/{name}/dataset` — upload after create** `[HIGH] [v0.7] [~1h]` — Tier F. Promoted from item 71 because wizard-created agents have no dataset and thus can't be eval'd. Multipart upload of `evals/dataset.jsonl`; validates JSONL shape (one JSON object per line); returns `{row_count, sha256_prefix, preview: [first-3-rows]}`. Refreshes the in-memory registry post-upload like the create endpoint does.
+
+#### I-R — Production rollout (before Mova iO publishes anything customer-facing)
+
+112. [ ] **HTTP-based API key management** `[HIGH] [v0.8] [~1d]` — Tier R. Today's key minting requires `az containerapp exec` + a pseudo-tty workaround (`script -q /dev/null`). HTTP endpoint surface: `POST /api/v1/auth/keys`, `GET /api/v1/auth/keys`, `DELETE /api/v1/auth/keys/{id}`. Admin-only (gated on a fleet-admin scope on the calling key). Eliminates the operator-hostile container-exec path. Pairs with item 73.
+
+113. [ ] **Bearer token expiry + rotation** `[HIGH] [v0.8] [~2d]` — Tier R. Today's `mvt_live_...` keys live forever. Add `expires_at` column to api_keys; default 90-day TTL; reject expired keys at auth middleware with a clear `expired` error code; `mdk auth rotate` command to mint a replacement and deprecate the old key with a 7-day grace window. Required before any non-Movate user (Deva's customers) get keys.
+
+114. [ ] **E2E smoke against deployed runtime in CI** `[MED] [v0.8] [~1d]` — Tier R. New GH Actions workflow `e2e-smoke.yml` runs `scripts/deva-curl/*.sh` against a staging deployment on every merge to main. Would have caught today's cross-pod issue (item 109) before the live deploy. Requires a long-lived staging runtime + a CI-scoped bearer. Gated on staging env existing.
+
+115. [ ] **Pre-deploy lockfile validator** `[MED] [v0.8] [~30min]` — Tier R. CI check that `uv lock --check` passes — fails if `pyproject.toml` declares deps not in `uv.lock`. Would have caught today's python-multipart drift before the failed deploy (cost ~30 min). One-line GH Actions step.
+
+#### I-U — Usability polish (small wins, each <½ day)
+
+116. [ ] **`MDK_CORS_ALLOWED_ORIGINS` as Bicep parameter** `[MED] [v0.7] [~1h]` — Tier U. Today's deploy script applies Bicep, then runs a separate `az containerapp update --set-env-vars` to set CORS origins (because Bicep doesn't carry the param). Adding a `corsAllowedOrigins string = ''` param + threading through to the API container's env vars eliminates the post-deploy step and makes the deploy idempotent in one Bicep apply. Pure Bicep change; small Python passthrough in `serve.py` is already done.
+
+117. [ ] **DELETE `/api/v1/agents/{name}`** `[MED] [v0.7] [~1h]` — Tier U. No clean way to remove a wizard-created agent today (operator has to `az containerapp exec` + `rm -rf`). Auth-gated; soft-delete (move to `.deleted-<name>-<timestamp>/` sibling for 7-day recovery window, then cron sweep) keeps the safety net.
+
+118. [ ] **Improved `unknown_agent` error from worker** `[LOW] [v0.7] [~30min]` — Tier U. Today's error message is `"agent 'smoke-bot' not registered on this worker"`. Add a `hint` field pointing the caller at item 109/110 (cross-pod sync limitation). Reduces operator confusion in the gap until 109 lands.
+
+119. [ ] **Bump package version to 0.7.0** `[MED] [v0.7] [~15min]` — Tier U. `pyproject.toml` + `src/movate/__init__.py` still say `0.5.0`. `/healthz` reports it as the runtime version, which is misleading after all of today's work. Bump to 0.7.0 + tag the v0.7.0 GitHub release (item 21).
+
+120. [ ] **`/api/v1/openapi.json` (versioned alias)** `[LOW] [v0.8] [~30min]` — Tier U. FastAPI emits the spec at the unversioned `/openapi.json`. Adding a `/api/v1/openapi.json` alias makes the URL consistent with the rest of the v1 surface for client-gen tooling that expects a versioned spec path.
+
+#### I-est — Recommended pickup order
+
+**Tonight or early Thursday (Tier F, ~3-4h):**
+* 110 — Inline run mode (sidesteps cross-pod issue for the demo)
+* 111 — Dataset upload (makes wizard agents eval-able)
+* 119 — Version bump (one line, cosmetic but honest)
+* BACKLOG hygiene (this PR)
+
+**Thursday (Tier U + Friday polish):**
+* 116 — CORS as Bicep param (cleaner re-deploys)
+* 117 — DELETE agent endpoint
+* 115 — `uv lock --check` in CI
+
+**Post-Friday (Tier R, in priority order):**
+* 109 — Real cross-pod filesystem (Azure Files)
+* 112 — HTTP key management
+* 113 — Bearer expiry + rotation
+* 114 — E2E CI smoke
+* 26 — Teams JWT validation
+* 78-81 — GitHub publish/history/revert/bootstrap
+* 37 + 38 — Prompt-injection + PII guardrails
 
 #### Demoted / deferred
 
