@@ -346,6 +346,33 @@ bench:
 useful for diffing the *effective* config across environments rather
 than four files at a time.
 
+### Skill policy — gate `side_effects` categories
+
+Operators can restrict which skill `side_effects` categories agents in
+the project are allowed to use. Same enforcement points as model policy
+(static at `mdk validate` + runtime at `Executor.execute` entry):
+
+```yaml
+# policy.yaml
+skills:
+  # Only pure-lookup skills allowed. Agents using network /
+  # filesystem / mutates-state skills fail `mdk validate`.
+  allowed_side_effects: [read-only]
+```
+
+The four `side_effects` categories come from `skill.yaml`:
+
+| Category | Meaning |
+|---|---|
+| `read-only` | Pure computation. No I/O, no state change. (e.g. calculator) |
+| `network` | Makes outbound network calls. (e.g. HTTP lookups, web search) |
+| `filesystem` | Reads or writes the local filesystem. |
+| `mutates-state` | Changes external state. (e.g. send email, create ticket) |
+
+Default is permissive (`allowed_side_effects: None` — every category
+accepted). An empty list `[]` is the strictest config: no skills at
+all, agents must declare `skills: []` to validate.
+
 ## Skills — agents that use tools
 
 An agent can invoke reusable callables ("skills") mid-turn. Declare each

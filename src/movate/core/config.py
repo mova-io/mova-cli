@@ -24,10 +24,11 @@ from typing import TYPE_CHECKING, Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from movate.core.models import AgentRuntime
+from movate.core.models import AgentRuntime, SkillSideEffects
 
 if TYPE_CHECKING:
     from movate.core.models import AgentSpec
+    from movate.core.skill_loader import SkillBundle
 
 
 class BenchConfig(BaseModel):
@@ -209,6 +210,86 @@ class RuntimePolicy(BaseModel):
         )
 
 
+class SkillPolicy(BaseModel):
+    """Project-wide gate on which skill ``side_effects`` categories agents may use.
+
+    Each skill declares its blast radius in ``skill.yaml: side_effects:`` —
+    one of ``read-only``, ``network``, ``filesystem``, ``mutates-state``.
+    SkillPolicy lets operators carve up which categories are allowed in
+    this project. Two example use cases:
+
+    * **Strict-prod policy:** ``allowed_side_effects: [read-only]``. Only
+      pure-lookup skills allowed; any agent referencing a skill that hits
+      the network or mutates state fails ``mdk validate``.
+    * **Default-deny on a new project:** ``allowed_side_effects: []``. No
+      skills at all — agents must declare ``skills: []``. Useful when
+      bringing up a sensitive workflow before any skills are vetted.
+
+    Permissive default (``allowed_side_effects=None``) accepts every
+    side-effects category; existing projects see zero behavior change.
+
+    Sibling to :class:`ModelPolicy` (which gates models) and
+    :class:`RuntimePolicy` (which gates runtimes). Enforced at the same
+    two layers: ``mdk validate`` (static check before merge) and
+    ``Executor.execute()`` entry (runtime check so a bundle that skipped
+    validate can't bypass).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_side_effects: list[SkillSideEffects] | None = Field(
+        default=None,
+        description=(
+            "Allowlist of skill ``side_effects`` categories that agents in "
+            "this project may use. ``None`` (default) accepts every "
+            "category. An empty list ``[]`` rejects every skill — agents "
+            "must declare ``skills: []`` to validate."
+        ),
+    )
+
+    def is_permissive(self) -> bool:
+        """True if the policy imposes no restrictions on skill side-effects."""
+        return self.allowed_side_effects is None
+
+    def check_skill(self, skill_name: str, side_effects: SkillSideEffects) -> str | None:
+        """Return a violation message if ``side_effects`` isn't allowed, or None.
+
+        Doesn't raise — returning a string lets callers aggregate
+        violations across every skill an agent declares in one pass.
+        """
+        if self.allowed_side_effects is None:
+            return None
+        if side_effects in self.allowed_side_effects:
+            return None
+        allowed_str = ", ".join(sorted(s.value for s in self.allowed_side_effects))
+        if not self.allowed_side_effects:
+            return (
+                f"skill {skill_name!r} has side_effects={side_effects.value!r} but "
+                f"project policy allows no skill side-effects (empty allowlist)"
+            )
+        return (
+            f"skill {skill_name!r} has side_effects={side_effects.value!r} but "
+            f"project policy only allows: {allowed_str}"
+        )
+
+    def check_agent_skills(self, skills: list[SkillBundle]) -> list[str]:
+        """Aggregate every per-skill violation for an agent's resolved skill list.
+
+        Returns a list of human-readable messages (empty if the agent's
+        skills all comply, or if the policy is permissive). The shape
+        mirrors :meth:`ModelPolicy.check_agent` — callers raise a
+        single :class:`PolicyViolationError` summarizing all violations.
+        """
+        if self.is_permissive():
+            return []
+        violations: list[str] = []
+        for skill in skills:
+            err = self.check_skill(skill.spec.name, skill.spec.side_effects)
+            if err is not None:
+                violations.append(err)
+        return violations
+
+
 class ModelParamDefaults(BaseModel):
     """Project-wide model param defaults — agent.yaml fills the rest in.
 
@@ -357,6 +438,15 @@ class ProjectConfig(BaseModel):
             "Project-wide gate on AgentRuntime values. Empty/absent = permissive "
             "default (any installed runtime). Set ``runtime.allowed: [litellm]`` "
             "to enforce 'A by default' — see RuntimePolicy."
+        ),
+    )
+    skills: SkillPolicy = Field(
+        default_factory=SkillPolicy,
+        description=(
+            "Project-wide gate on skill ``side_effects`` categories. "
+            "Empty/absent = permissive default. Set "
+            "``skills.allowed_side_effects: [read-only]`` to restrict "
+            "agents to pure-lookup skills — see SkillPolicy."
         ),
     )
     knowledge: KnowledgeConfig = Field(

@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from jsonschema import ValidationError as JsonSchemaError
 
-from movate.core.config import ModelPolicy, RuntimePolicy
+from movate.core.config import ModelPolicy, RuntimePolicy, SkillPolicy
 from movate.core.failures import (
     DEFAULT_RETRY,
     BudgetExceededError,
@@ -81,6 +81,7 @@ class Executor:
         tenant_id: str = "local",
         policy: ModelPolicy | None = None,
         runtime_policy: RuntimePolicy | None = None,
+        skill_policy: SkillPolicy | None = None,
     ) -> None:
         """One of ``provider`` (legacy single-runtime) OR ``registry``
         (multi-runtime, v0.6+) must be set. Passing ``provider`` is
@@ -110,6 +111,11 @@ class Executor:
         # belt-and-braces against an agent.yaml that skipped `movate
         # validate` (e.g. loaded over HTTP by a worker). Permissive default.
         self._runtime_policy = runtime_policy or RuntimePolicy()
+        # SkillPolicy gates which skill side_effects categories are
+        # permitted. Same belt-and-braces shape as RuntimePolicy —
+        # enforced at the top of execute() so a bundle that bypasses
+        # `mdk validate` can't sneak past the gate.
+        self._skill_policy = skill_policy or SkillPolicy()
 
     async def execute(
         self,
@@ -194,6 +200,17 @@ class Executor:
             runtime_violation = self._runtime_policy.check_agent(spec)
             if runtime_violation is not None:
                 raise PolicyViolationError(runtime_violation)
+
+            # Skill POLICY check — if the project restricts which skill
+            # ``side_effects`` categories are allowed, every resolved
+            # skill on the bundle gets checked. Same belt-and-braces
+            # shape as runtime_policy: ``mdk validate`` catches this
+            # statically, but bundles loaded over HTTP (worker) can
+            # skip validate, so we re-check here.
+            if not self._skill_policy.is_permissive():
+                skill_violations = self._skill_policy.check_agent_skills(bundle.skills)
+                if skill_violations:
+                    raise PolicyViolationError("; ".join(skill_violations))
 
             # Runtime AVAILABILITY check — if the agent declared a
             # runtime we don't have an adapter for (e.g. opted into a

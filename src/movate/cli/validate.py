@@ -152,6 +152,26 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             )
             raise typer.Exit(code=2)
 
+    # Project-wide skill policy. Checks each resolved skill's
+    # ``side_effects`` against the project's allowlist. Same shape as
+    # the model-policy block above — multiple skill violations report
+    # together so the operator sees the full picture.
+    skill_policy = project_cfg.skills
+    if not skill_policy.is_permissive():
+        skill_violations = skill_policy.check_agent_skills(bundle.skills)
+        if skill_violations:
+            console.print(
+                f"[red]✗ skill policy violation:[/red] agent {spec.name!r} "
+                f"uses skills outside the project's allowed side-effects"
+            )
+            for v in skill_violations:
+                console.print(f"  [red]·[/red] {v}")
+            console.print(
+                "[dim]  fix: relax policy.yaml: skills.allowed_side_effects, "
+                "or change the agent's skill list.[/dim]"
+            )
+            raise typer.Exit(code=2)
+
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
     # the operator sees lint findings even when the schema check
