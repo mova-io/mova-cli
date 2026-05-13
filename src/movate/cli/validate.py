@@ -55,6 +55,10 @@ def _available_runtimes() -> frozenset[AgentRuntime]:
         available.add(AgentRuntime.LANGCHAIN)
     except ImportError:
         pass
+    # Lyzr adapter is HTTP-only — no SDK to probe. It's always
+    # available; the LYZR_API_KEY check is deferred to runtime so
+    # `mdk validate` of a Lyzr-runtime agent works pre-credential.
+    available.add(AgentRuntime.LYZR)
     return frozenset(available)
 
 

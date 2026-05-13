@@ -235,12 +235,22 @@ class AgentRuntime(StrEnum):
       Unlocks LCEL composition, LangSmith tracing, and any other
       LangChain feature inside a movate-managed shell (auth,
       persistence, deploy, eval). [v0.6 — not yet wired.]
+
+    * ``lyzr`` — invokes a Lyzr-hosted agent via Lyzr Studio's HTTP
+      inference API. The agent's ``model.provider`` is
+      ``lyzr/<lyzr-agent-id>`` (e.g.
+      ``lyzr/69fe0d9890de3014e9f1cf92``). Requires ``LYZR_API_KEY``
+      in env. Pure HTTP — no Lyzr SDK dependency. Read-only:
+      evaluates / benchmarks customer agents that already live on
+      Lyzr; pairs with ``mdk import lyzr`` for migration to
+      MDK-native runtimes. [v0.7]
     """
 
     LITELLM = "litellm"
     NATIVE_ANTHROPIC = "native_anthropic"
     NATIVE_OPENAI = "native_openai"
     LANGCHAIN = "langchain"
+    LYZR = "lyzr"
 
 
 class AgentSpec(BaseModel):
@@ -365,6 +375,19 @@ class AgentSpec(BaseModel):
             raise ValueError(
                 f"provider {provider!r} for runtime: langchain must be a "
                 f"Python entry-point spec like 'package.module:function'"
+            )
+        elif self.runtime == AgentRuntime.LYZR and (
+            # `lyzr/<agent_id>` — the path is the Lyzr Studio agent ID.
+            # Lyzr IDs are 24-hex Mongo ObjectIds; we accept any non-empty
+            # path-suffix here and let the adapter surface a clean HTTP
+            # error if the ID is wrong.
+            not provider.startswith("lyzr/")
+            or len(provider) <= len("lyzr/")
+        ):
+            raise ValueError(
+                f"provider {provider!r} for runtime: lyzr must look like "
+                f"'lyzr/<lyzr-agent-id>' (e.g. "
+                f"'lyzr/69fe0d9890de3014e9f1cf92')"
             )
         # Native runtimes (anthropic / openai) accept bare or prefixed —
         # adapters tolerate both via pricing_key() normalization.

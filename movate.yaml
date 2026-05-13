@@ -36,4 +36,8 @@ eval:
 # allowed list) when a specific agent has a justified need for native
 # features (MCP, strict structured outputs, an existing LangChain chain).
 runtime:
-  allowed: [litellm]
+  # `lyzr` is allow-listed because v0.7 adds the Lyzr migration bridge
+  # (mdk import lyzr + runtime: lyzr adapter). Once a customer agent
+  # is migrated to MDK-native, its agent.yaml will declare runtime:
+  # litellm and won't trip this gate.
+  allowed: [litellm, lyzr]

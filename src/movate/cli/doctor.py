@@ -61,12 +61,17 @@ _RUNTIME_PROBES = (
     ("native_anthropic", "anthropic", "anthropic"),
     ("native_openai", "openai", "openai"),
     ("langchain", "langchain_core", "langchain"),
+    # lyzr is httpx-only (no SDK dep) — always wired. Probe httpx
+    # so the doctor row is still meaningful (it ships as a required
+    # dep but we list it for clarity).
+    ("lyzr", "httpx", None),
 )
 _PROVIDER_KEYS = (
     ("OPENAI_API_KEY", "OpenAI"),
     ("ANTHROPIC_API_KEY", "Anthropic"),
     ("AZURE_OPENAI_API_KEY", "Azure OpenAI"),
     ("GEMINI_API_KEY", "Gemini"),
+    ("LYZR_API_KEY", "Lyzr Studio"),
 )
 _TRACING_KEYS = (
     ("MOVATE_TRACER", "explicit override"),

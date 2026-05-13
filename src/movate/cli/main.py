@@ -46,6 +46,7 @@ from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
+from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
@@ -149,6 +150,7 @@ def _main(
 # ----- Develop --------------------------------------------------------------
 
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
+app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)

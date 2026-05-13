@@ -63,6 +63,14 @@ def _try_register_native_adapters(registry: ProviderRegistry, *, mock: bool) -> 
         registry.register(AgentRuntime.LANGCHAIN, LangChainProvider())
     except ImportError:
         pass
+    # Lyzr adapter is HTTP-only (no SDK dep), so we always register it
+    # — the constructor doesn't fail on a missing LYZR_API_KEY (we
+    # surface the AuthError on first ``complete()`` call instead). This
+    # lets ``movate validate`` of a ``runtime: lyzr`` agent succeed
+    # even before the operator has set the env var.
+    from movate.providers.lyzr import LyzrProvider  # noqa: PLC0415
+
+    registry.register(AgentRuntime.LYZR, LyzrProvider())
 
 
 async def build_local_runtime(*, mock: bool) -> LocalRuntime:
