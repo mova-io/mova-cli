@@ -17,6 +17,7 @@ works.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -113,10 +114,32 @@ def test_dispatch_once_strict_promotes_warnings(tmp_path: Path) -> None:
 def test_cli_watch_help_renders() -> None:
     r = runner.invoke(cli_app, ["watch", "--help"])
     assert r.exit_code == 0
-    assert "hot-reload" in r.stdout.lower() or "validate" in r.stdout.lower()
+    # Rich wraps long flag names across lines on narrow terminals (GH
+    # Actions runners default to ~80 cols), and the wrap may insert
+    # whitespace mid-token — strip ANSI escapes and collapse all
+    # whitespace before substring checks so the assertions are
+    # terminal-width-independent.
+    clean = _strip_for_help_check(r.stdout)
+    assert "hot-reload" in clean.lower() or "validate" in clean.lower()
     # Flags surface in --help so operators can discover them.
-    assert "--poll-interval" in r.stdout
-    assert "--strict" in r.stdout
+    assert "--poll-interval" in clean
+    assert "--strict" in clean
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_for_help_check(text: str) -> str:
+    """Normalize Rich-rendered help so substring checks tolerate
+    terminal-width-driven line wrapping.
+
+    Rich may insert a space + newline mid-token when wrapping
+    (``--poll-↵-interval`` style). Stripping ANSI escapes and
+    collapsing every whitespace run to nothing gives us a single
+    canonical string where flag names appear contiguously.
+    """
+    no_ansi = _ANSI_ESCAPE_RE.sub("", text)
+    return re.sub(r"\s+", "", no_ansi)
 
 
 # ---------------------------------------------------------------------------
