@@ -337,7 +337,7 @@ schema:
     result: number
 
 implementation:
-  kind: python                      # also: http, mcp (later PRs)
+  kind: python                      # also: http (PR #54), mcp (later)
   entry: skills.calculator.impl:evaluate
 
 cost:
@@ -379,8 +379,56 @@ the model in `tool_result` blocks and to operators in run traces:
 `mdk show ./skills/calculator` renders the resolved spec.
 `mdk show ./agents/calc-agent` lists the agent's skills inline.
 
+### HTTP skills — call any REST API as a tool
+
+For skills that hit an external service (CRM, warranty system, weather,
+hosted ML endpoint), use `implementation.kind: http` — no Python wrapper
+needed.
+
+```yaml
+# skills/warranty-lookup/skill.yaml
+api_version: movate/v1
+kind: Skill
+name: warranty-lookup
+version: 0.1.0
+description: Fetch warranty status for a customer case.
+
+schema:
+  input:
+    case_id: string
+  output:
+    status: pending|active|expired|unknown
+    expires_at: string?
+
+implementation:
+  kind: http
+  entry: https://crm.internal.movate.com/api/warranty/{{ input.case_id }}
+  method: GET                           # default POST; pick what your API expects
+  auth: bearer-from-env:CRM_TOKEN       # Authorization: Bearer $CRM_TOKEN
+  headers:
+    X-API-Version: "2026-01"
+  timeout_seconds: 10                   # optional; falls through to call_ms otherwise
+
+cost:
+  per_call_usd: 0.0                     # free internal API
+```
+
+The URL may contain `{{ input.* }}` Jinja placeholders rendered against
+the call's input dict. POST/PUT/PATCH skills send the full input as the
+JSON body; GET/DELETE send it as query parameters.
+
+The backend handles the failure modes you'd expect:
+
+* Missing auth env var → `backend_error` ("env var CRM_TOKEN is unset")
+* Non-2xx response → `backend_error` with status + body excerpt
+* Non-JSON or non-object response → `backend_error` / `validation_failed`
+* Transport errors / timeouts → `timeout` / `backend_error`
+
+Only `bearer-from-env:VAR` auth is supported today; basic-auth and
+arbitrary-header forms land in a follow-up PR.
+
 See [docs/adr/002-skills-and-contexts.md](docs/adr/002-skills-and-contexts.md)
-for the design.
+for the full design.
 
 ## Contexts — shared prompt fragments
 

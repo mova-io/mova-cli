@@ -466,9 +466,12 @@ class Executor:
             dispatch_skill,
         )
 
-        # Importing python.py for its side-effect (registers the
-        # PythonSkillBackend). Done here rather than at module load so
-        # this import doesn't run for agents without skills.
+        # Importing each backend for its side-effect (registers itself
+        # with the dispatch table). Done here rather than at module load
+        # so these imports don't fire for agents without skills. Adding
+        # a new backend is a single line + the new module — no other
+        # wiring required.
+        from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
 
         # Build a name → SkillBundle map for quick lookup inside the loop.

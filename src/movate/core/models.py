@@ -311,13 +311,15 @@ class SkillImplementationKind(StrEnum):
 class SkillImplementation(BaseModel):
     """Backend declaration for a skill.
 
-    Today the only required field is ``kind`` + ``entry``. As HTTP and
-    MCP backends arrive, they add backend-specific fields (e.g.
-    ``url``, ``auth``, ``server``) that are validated by the matching
-    Protocol implementation at load time. The base model keeps
-    ``extra='allow'`` so those backend-specific fields don't trip
-    validation on a forward-compatible skill.yaml that ships with a
-    future runtime.
+    Two required fields (``kind`` + ``entry``) plus backend-specific
+    optional fields. The model keeps ``extra='allow'`` so future
+    backends (MCP and beyond) can ship their own fields without
+    forcing a model update on every existing skill.yaml.
+
+    HTTP-specific fields (``method``, ``auth``, ``headers``,
+    ``timeout_seconds``) are first-class here as of PR #54 — they're
+    no-ops for ``kind: python`` and ``kind: mcp``. Validating them
+    upfront catches typos at load time rather than per-invocation.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -331,9 +333,51 @@ class SkillImplementation(BaseModel):
         description=(
             "Backend-specific entrypoint. For ``kind: python`` this is a "
             "``pkg.mod:func`` reference resolved via importlib. For "
-            "``kind: http`` it's the URL. For ``kind: mcp`` it's the "
-            "server connection string. Empty string is invalid except "
-            "when forward-compatible backends extend the model."
+            "``kind: http`` it's the URL (may contain ``{{ input.* }}`` "
+            "Jinja placeholders). For ``kind: mcp`` it's the server "
+            "connection string. Empty string is invalid except when "
+            "forward-compatible backends extend the model."
+        ),
+    )
+
+    # ---- HTTP-only fields (ignored for python/mcp kinds) ----
+
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = Field(
+        default="POST",
+        description=(
+            "HTTP method for ``kind: http`` skills. Default POST because "
+            "most agent tools send a JSON body. GET is fine for pure "
+            "lookups."
+        ),
+    )
+
+    auth: str | None = Field(
+        default=None,
+        description=(
+            "Auth spec for ``kind: http`` skills. Format: "
+            "``bearer-from-env:VAR_NAME``. The named env var's value is "
+            "sent as ``Authorization: Bearer <value>``. ``None`` = no auth."
+            " More auth shapes (basic, header-from-env) ship later."
+        ),
+    )
+
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Static headers added to every HTTP skill invocation. Use for "
+            "API versioning, custom user-agents, request-id propagation. "
+            "Operator-controlled; the model can't influence these."
+        ),
+    )
+
+    timeout_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "HTTP-specific timeout override in seconds. ``None`` (default) "
+            "falls through to the skill's ``timeout_call_ms`` and ultimately "
+            "the calling agent's ``timeouts.call_ms``. Use when an external "
+            "API needs longer than the model would otherwise allow."
         ),
     )
 
@@ -441,16 +485,36 @@ class SkillSpec(BaseModel):
 
     @field_validator("implementation")
     @classmethod
-    def _validate_python_entry_shape(cls, v: SkillImplementation) -> SkillImplementation:
-        """For ``kind: python``, ``entry`` must look like ``pkg.mod:func``.
+    def _validate_implementation_shape(cls, v: SkillImplementation) -> SkillImplementation:
+        """Per-kind shape checks on ``implementation``.
 
-        Catches typos at load time rather than at the first invocation,
-        where the error would be a less-helpful ``ImportError`` deep
-        inside the backend dispatch path."""
+        Each backend has its own constraints on ``entry`` and on which
+        sibling fields make sense. We enforce them at load time so a
+        typo in skill.yaml fails ``mdk validate`` rather than the
+        first per-call dispatch (where the error message would be
+        deep in a stack trace instead of "here's the bad field").
+        """
         if v.kind == SkillImplementationKind.PYTHON and (not v.entry or ":" not in v.entry):
             raise ValueError(
                 f"python skill implementation.entry must be 'pkg.mod:func'; got {v.entry!r}"
             )
+        if v.kind == SkillImplementationKind.HTTP:
+            if not v.entry:
+                raise ValueError(
+                    "http skill implementation.entry must be a URL "
+                    "(http:// or https://); got empty string"
+                )
+            lower = v.entry.lower()
+            if not (lower.startswith("http://") or lower.startswith("https://")):
+                raise ValueError(
+                    f"http skill implementation.entry must start with "
+                    f"http:// or https://; got {v.entry!r}"
+                )
+            if v.auth is not None and not v.auth.startswith("bearer-from-env:"):
+                raise ValueError(
+                    f"http skill implementation.auth must be 'bearer-from-env:<VAR>'; "
+                    f"got {v.auth!r}"
+                )
         return v
 
 
