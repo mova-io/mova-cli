@@ -50,6 +50,11 @@ from movate.snapshot.manifest import (
     SnapshotManifestError,
     load_manifest,
 )
+from movate.snapshot.rollback import (
+    RollbackResult,
+    SnapshotRollbackError,
+    rollback_to,
+)
 from movate.snapshot.store import (
     SnapshotNotFoundError,
     SnapshotStoreError,
@@ -62,15 +67,18 @@ from movate.snapshot.store import (
 __all__ = [
     "FileChange",
     "FileEntry",
+    "RollbackResult",
     "SnapshotDiff",
     "SnapshotManifest",
     "SnapshotManifestError",
     "SnapshotNotFoundError",
+    "SnapshotRollbackError",
     "SnapshotStoreError",
     "create_snapshot",
     "delete_snapshot",
     "diff_snapshots",
     "list_snapshots",
     "load_manifest",
+    "rollback_to",
     "snapshot_path",
 ]
