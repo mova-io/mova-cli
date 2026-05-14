@@ -58,7 +58,7 @@ gh release create vX.Y.Z dist/movate_cli-X.Y.Z-py3-none-any.whl \
   --notes-from-tag
 
 # consumers install with:
-#   pip install https://github.com/jeremyyuAWS/movate-cli/releases/download/vX.Y.Z/movate_cli-X.Y.Z-py3-none-any.whl
+#   pip install https://github.com/mova-io/mova-cli/releases/download/vX.Y.Z/movate_cli-X.Y.Z-py3-none-any.whl
 ```
 
 GitHub serves these to anyone with read access to the private repo. No
@@ -78,7 +78,7 @@ without a URL). Needs:
    index-servers = github
 
    [github]
-   repository = https://maven.pkg.github.com/jeremyyuAWS/movate-cli
+   repository = https://maven.pkg.github.com/mova-io/mova-cli
    username = jeremyyuAWS
    password = ghp_<PAT_with_write:packages>
    ```
@@ -127,5 +127,5 @@ covers the developer-installs-from-laptop case.
 - ✗ Published: nowhere — pick Option A/B/C above before next release
 
 The first push of this repo creates the GitHub remote at
-<https://github.com/jeremyyuAWS/movate-cli>. After that, switch to
+<https://github.com/mova-io/mova-cli>. After that, switch to
 Option A for the v0.4.0 artifact.

@@ -631,7 +631,7 @@ def slide_close(prs: Presentation, page: int, total: int) -> None:
         "  · A live walkthrough of the runtime\n"
         "  · Roadmap (Teams bot · staging · prod · custom domain)\n"
         "\n"
-        "Repository: github.com/jeremyyuAWS/movate-cli"
+        "Repository: github.com/mova-io/mova-cli"
     )
     body_box.text_frame.word_wrap = True
     for i, line in enumerate(body_text.split("\n")):
