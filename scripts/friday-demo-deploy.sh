@@ -33,11 +33,19 @@ set -euo pipefail
 # Config — change here, not inline
 # -----------------------------------------------------------------------------
 
-readonly SUBSCRIPTION_ID="61ea8b9b-8be4-4f6f-9655-e1846c6082fb"
+readonly SUBSCRIPTION_ID="8fab0f8f-b577-45d7-a485-ec32f73b22be"
 readonly RESOURCE_GROUP="movate-dev-rg"
-readonly ACR_NAME="movatedevacrjsy"
+readonly ACR_NAME="movatedevacrmvt"
 readonly API_APP_NAME="movate-dev-api"
 readonly ENV="dev"
+# Bicep parameter file. Switched from main.dev.bicepparam (personal
+# sub) to main.movate.bicepparam (Movate sub) after the 2026-05-14
+# blue/green migration. See docs/azure-movate-migration-runbook.md.
+readonly BICEP_PARAMS="infra/azure/main.movate.bicepparam"
+# Teams bot is disabled on the Movate sub for now (UAI pre-staged in
+# Bicep but the Container App + Bot Service registration are deferred
+# to a v0.8 follow-up). Keep the var so the existing parameters line
+# stays consistent if Teams gets re-enabled.
 readonly TEAMS_BOT_APP_ID="90f41ab7-31a6-4610-8cf4-88ed0581df55"
 # Deva's Mova iO origin. Default empty (localhost-only) — set via
 # `MOVA_IO_ORIGIN=https://...` when the production Mova iO hostname is
@@ -129,21 +137,23 @@ else
     warn "Add Deva's production hostname later by re-running this script with"
     warn "MOVA_IO_ORIGIN set, or pass corsAllowedOrigins directly to Bicep:"
     warn "  az deployment group create -g ${RESOURCE_GROUP} -f infra/azure/main.bicep \\"
-    warn "    -p infra/azure/main.dev.bicepparam \\"
+    warn "    -p ${BICEP_PARAMS} \\"
     warn "    --parameters corsAllowedOrigins=\"${LOCAL_DEV_ORIGIN},<new-host>\""
 fi
 
 # Deploy main.bicep with the new image tag + CORS origins. v0.7+ threads
 # corsAllowedOrigins through Bicep (item 116) so the deploy is idempotent
 # in one apply — no more post-deploy `az containerapp update` step.
+# Teams bot deferred on the Movate sub (the UAI is pre-staged but the
+# Container App + Bot Service registration aren't deployed yet) — pass
+# enableTeamsBot=false to skip the Teams-related modules.
 az deployment group create \
     -g "${RESOURCE_GROUP}" \
     -f infra/azure/main.bicep \
-    -p infra/azure/main.dev.bicepparam \
+    -p "${BICEP_PARAMS}" \
     --parameters \
         image="${IMAGE_TAG}" \
-        enableTeamsBot=true \
-        teamsBotAppId="${TEAMS_BOT_APP_ID}" \
+        enableTeamsBot=false \
         corsAllowedOrigins="${CORS_ORIGINS}" \
     --name "${DEPLOY_NAME}" \
     --query "{state: properties.provisioningState, apiUrl: properties.outputs.apiUrl.value}" \
