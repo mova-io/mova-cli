@@ -96,6 +96,7 @@ from movate.cli import (  # noqa: E402
     menu_cmd,
     migrate_cmd,
     monitor_cmd,
+    plan_cmd,
     promote_cmd,
     replay_cmd,
     rollback_cmd,
@@ -308,6 +309,7 @@ app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 # Same Develop panel because it's a scaffold command; positioned right after
 # `init` so operators see the natural progression.
 app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
+app.command("plan", rich_help_panel=PANEL_DEVELOP)(plan_cmd.plan)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
