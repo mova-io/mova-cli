@@ -214,7 +214,7 @@ org-wide:
 - [ ] Real PNG icons replace the placeholders (see `appPackage/README.md`)
 - [ ] `validDomains` in the manifest lists every URL the bot's cards
   can deep-link to (Langfuse, your trace viewer, etc.)
-- [ ] JWT validation lands ([issue #70](https://github.com/jeremyyuAWS/movate-cli/issues/70))
+- [ ] JWT validation lands ([issue #70](https://github.com/mova-io/mova-cli/issues/70))
 - [ ] Privacy + terms URLs in the manifest point at the right Movate-internal pages
 - [ ] One sales-engineer pilot for a full week, observing real run
   patterns + cost
@@ -236,4 +236,4 @@ org-wide:
   above works against any subscription. Migration to the Movate
   tenant is mechanical once Movate IT provisions access — same
   Bicep, different `--subscription` + `--resource-group`. Tracked
-  in [#65](https://github.com/jeremyyuAWS/movate-cli/issues/65).
+  in [#65](https://github.com/mova-io/mova-cli/issues/65).

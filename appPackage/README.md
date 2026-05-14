@@ -73,6 +73,6 @@ Before flipping the Teams app catalog from sideload to publish:
 - [ ] Bot Service registered in the production Azure tenant
 - [ ] Real PNG icons replace the placeholders
 - [ ] `MOVATE_TEAMS_BOT_APP_ID` env set to the registered AAD app id
-- [ ] JWT validation lands (see [issue #70](https://github.com/jeremyyuAWS/movate-cli/issues/70))
+- [ ] JWT validation lands (see [issue #70](https://github.com/mova-io/mova-cli/issues/70))
 - [ ] `validDomains` lists every URL the bot's cards can deep-link to
 - [ ] Privacy + terms URLs updated to the Movate-internal pages

@@ -14,11 +14,11 @@ dropped in a future major release). Every example in this README uses `mdk`; sub
 
 | version | tag | what landed |
 |---|---|---|
-| 0.5.0 | [`v0.5.0`](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.5.0) | HTTP runtime + worker + Postgres — movate is now a service |
-| 0.4.0 | [`v0.4.0`](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.4.0) | Observability + regression-detection (Langfuse, OTel, trace replay, eval baseline diff, run replay, CI eval-gate) |
-| 0.3.1 | [`v0.3.1`](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.3.1) | Workflow runner double-save fix |
-| 0.3.0 | [`v0.3.0`](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.3.0) | Sequential workflows (forward-aware IR + compiler + runner) |
-| 0.2.0 | [`v0.2.0`](https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.2.0) | Eval engine (exact-match + LLM-as-judge with cross-family enforcement) |
+| 0.5.0 | [`v0.5.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.5.0) | HTTP runtime + worker + Postgres — movate is now a service |
+| 0.4.0 | [`v0.4.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.4.0) | Observability + regression-detection (Langfuse, OTel, trace replay, eval baseline diff, run replay, CI eval-gate) |
+| 0.3.1 | [`v0.3.1`](https://github.com/mova-io/mova-cli/releases/tag/v0.3.1) | Workflow runner double-save fix |
+| 0.3.0 | [`v0.3.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.3.0) | Sequential workflows (forward-aware IR + compiler + runner) |
+| 0.2.0 | [`v0.2.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.2.0) | Eval engine (exact-match + LLM-as-judge with cross-family enforcement) |
 
 **v1.0 next (`main`)** — Azure deploy + production hardening: Bicep IaC
 (ACA + Postgres Flex + ACR + Key Vault), `mdk deploy`, model policy
@@ -75,10 +75,10 @@ Design captured in
 
 ```bash
 # Direct from the GitHub repo (requires read access):
-uv pip install "git+https://github.com/jeremyyuAWS/movate-cli.git"
+uv pip install "git+https://github.com/mova-io/mova-cli.git"
 
 # Or clone for development:
-git clone https://github.com/jeremyyuAWS/movate-cli.git
+git clone https://github.com/mova-io/mova-cli.git
 cd movate-cli
 uv sync --all-extras --dev
 ```

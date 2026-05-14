@@ -1165,7 +1165,7 @@ between two real processes.
   [docs/ci-eval-gate.md](docs/ci-eval-gate.md). Six new tests cover
   load, write, mutual exclusion, missing/malformed JSON.
 
-[0.5.0]: https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.5.0
+[0.5.0]: https://github.com/mova-io/mova-cli/releases/tag/v0.5.0
 
 ## [0.4.0] — 2026-05-08
 
@@ -1228,7 +1228,7 @@ format`, `ruff check`, `mypy src` (strict) all clean.
   Workflow replay deferred; single-agent debug covers the 80% case.
   14 tests in `tests/test_run_replay.py`.
 
-[0.4.0]: https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.4.0
+[0.4.0]: https://github.com/mova-io/mova-cli/releases/tag/v0.4.0
 
 ## [0.3.1] — 2026-05-09
 
@@ -1254,7 +1254,7 @@ a throwaway IR→LangGraph prototype (now deleted; findings preserved in
   compiler design (`merge_dicts` state reducer, HITL via checkpointer,
   parallel-fan-out enum redundancy).
 
-[0.3.1]: https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.3.1
+[0.3.1]: https://github.com/mova-io/mova-cli/releases/tag/v0.3.1
 
 ## [0.3.0] — 2026-05-09
 
@@ -1293,7 +1293,7 @@ so v1.1's LangGraph compiler can target it without a schema break.
 - **IR is the contract; validators are policy.** The IR's enum members include v1.1+ variants. The compiler validators decide which variants are allowed *per phase*. v1.1 swaps `validate_linear` for `validate_dag` (and adds a `LangGraphCompiler` emitting LangGraph from the same `WorkflowGraph`) without touching the IR or the structural compiler.
 - **State plumbing v0.3 = projection + shallow merge.** Explicit `inputs:` / `outputs:` mappings deferred to v0.4 when real workflows demand finer control.
 
-[0.3.0]: https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.3.0
+[0.3.0]: https://github.com/mova-io/mova-cli/releases/tag/v0.3.0
 
 ## [0.2.0] — 2026-05-08
 
@@ -1405,4 +1405,4 @@ src` (strict) all clean.
 - **Pricing is canonical, not inferred.** LiteLLM's reported cost is logged
   for drift detection but never used for billing.
 
-[0.2.0]: https://github.com/jeremyyuAWS/movate-cli/releases/tag/v0.2.0
+[0.2.0]: https://github.com/mova-io/mova-cli/releases/tag/v0.2.0

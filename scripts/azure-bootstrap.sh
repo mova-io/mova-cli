@@ -23,7 +23,7 @@
 #   AZURE_REGION       — default "eastus2"
 #   ACR_NAME_OVERRIDE  — default "movate${env}acr" (ACR names are
 #                        globally unique; override if there's a collision)
-#   GITHUB_REPO        — default "jeremyyuAWS/movate-cli" (for the
+#   GITHUB_REPO        — default "mova-io/mova-cli" (for the
 #                        federated-credential subject)
 
 set -euo pipefail
@@ -42,7 +42,7 @@ REGION="${AZURE_REGION:-eastus2}"
 RG="movate-${ENV}-rg"
 ACR="${ACR_NAME_OVERRIDE:-movate${ENV}acr}"
 SP_NAME="movate-${ENV}-github-actions"
-REPO="${GITHUB_REPO:-jeremyyuAWS/movate-cli}"
+REPO="${GITHUB_REPO:-mova-io/mova-cli}"
 FED_CRED_NAME="github-release-${ENV}"
 
 # Colors that work everywhere (no ANSI on dumb terms; sentinel for `tput`).

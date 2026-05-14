@@ -155,7 +155,7 @@ edges:
 ```
 
 Until then, orchestrate routing in a client script (see
-[`movate-faq-demo/ask.py`](https://github.com/jeremyyuAWS/movate-faq-demo/blob/main/ask.py)
+[`movate-faq-demo/ask.py`](https://github.com/mova-io/mova-cli-faq-demo/blob/main/ask.py)
 for a 40-line example).
 
 ## Strategic posture
