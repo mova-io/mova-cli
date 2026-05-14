@@ -668,6 +668,191 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 ---
 
+### Group L — Sprint phasing (2026-05-14)
+
+> _The full ~55-command MDK surface organised into 2-week sprints
+> with explicit dependencies + exit criteria. Bridges the
+> command-level granularity of Groups J + K into a sequenced multi-
+> month plan an engineering team can execute against._
+
+**Premise:** 2-week sprints × ~10 days of focused engineering each (1 engineer; 4 days lost per sprint to review / CI / docs / buffer). Parallelisation guidance per sprint.
+
+**Total: ~16 weeks for CLI surface (Sprints 1-6) + ~10 weeks for engine work (Sprints 7-8).**
+
+#### L-rollup — Sprint summary
+
+| Sprint | Theme | Items | Effort | Demo value | Cumulative cmds |
+|---|---|---|---|---|---|
+| **0** | Baseline (DONE) | 27 existing + 10 shipped this session + 4 J-phases in flight | — | Current arc | 41 |
+| **1** | State foundation | snapshot, diff, rollback, audit | 10d | "Terraform for AI" lands | 45 |
+| **2** | Env management | profiles, secrets, migrate, promote | 10d | Multi-env CI/CD promotion | 49 |
+| **3** | Onboarding polish | init --project, doctor fix, openapi import, docs runbook | 10d | "Zero to deployed in 5 min" | 53 |
+| **4** | Observability polish | monitor (was `watch --live`), tune, explain v2 | 8d | Ops-friendly debugging | 56 |
+| **5** | Interop & export | export oci-bundle, export langgraph, simulate | 14d | "MDK compiles to anything" | 59 |
+| **6** | Production validation | benchmark live, audit v2, e2e CI smoke | 14d | Safe model upgrades | 60+ |
+| **7** | Memory architecture | memory engine + CLI | 4-5 weeks | Stateful agents | 61 |
+| **8** | Multi-agent (Phase 7) | LangGraph swap-in + compose | 4-5 weeks | Conditional / parallel / HITL | 62 |
+
+#### L-0 — Sprint 0 baseline (done / in flight)
+
+**Pre-session on main (~21 commands):** `init, validate, eval, run, chat, bench, show, doctor, pricing, deploy, serve, worker, submit, jobs, auth, config, policy, tenants, trace, import, scaffold, skills, teams-bot, watch (file watcher)`
+
+**Shipped this session (10 PRs):** `add` (#5), `validate --project` + `eval --project` (#6), Safe-AI engine (#8), `list` (#9), reflection engine (#12), `guardrails` CLI (#13), `export json-schema` (#14), BACKLOG Groups J+K+L (#7, #10, #11, this PR)
+
+**In flight (Phase J-2 through J-5):** `explain <run-id>`, `plan --from`, `knowledge {add, list, query}`, Mova iO mapping doc
+
+#### L-1 — Sprint 1: State foundation (~10d)
+
+The North Star cluster. **Ships as a coordinated set** — items don't work alone.
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk snapshot {create, list, show}` | 3d | None | item 136 |
+| `mdk diff <snap-a> <snap-b>` | 2d | snapshot | item 137 |
+| `mdk rollback <snap-hash>` | 2d | snapshot | item 135 |
+| `mdk audit <snap-hash \| current>` | 3d | snapshot | item 133 |
+
+**Exit:** "Snapshot the green deploy, ship a new prompt, see eval regression, diff to confirm cause, rollback in one command."
+
+**Design lock-in:** snapshots are immutable + content-addressed (git-style) + live in `.movate/snapshots/` + tagged in git. Avoids Terraform-state pathologies.
+
+#### L-2 — Sprint 2: Env management (~10d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk profiles {use, list, show, create}` | 3d | None (refactors `MDK_TARGET` + `mdk config`) | item 139 |
+| `mdk secrets {set, get, rotate, sync}` | 4d | profiles | item 138 |
+| `mdk migrate` | 2d | snapshot | item 134 |
+| `mdk promote <snap> --to <profile>` | 2d | snapshot + profiles + eval | item 137a |
+
+**Exit:** "Dev → staging → prod promotion gated by `mdk eval` per hop, all secrets in Key Vault per profile, snapshots immutable across the chain."
+
+**Risk:** `secrets` is the riskiest item — touches env loading + Key Vault + Bicep. If it slips, push to Sprint 3 and pull `mdk doctor fix` forward.
+
+#### L-3 — Sprint 3: Onboarding polish (~10d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk init --project` | 1d | snapshot (init produces an initial snapshot) | item 142 |
+| `mdk doctor fix --dry-run` (default) / `--apply` | 3d | Existing `doctor` | item 131 |
+| `mdk import openapi <spec>` | 4d | Existing `scaffold tool` + `skills` | item 132 |
+| `mdk docs runbook` | 2d | None | item 143 |
+
+**Exit:** "`mdk init my-corp --project` → `mdk import openapi salesforce.json` → 12 skills scaffolded → `mdk add` an agent → `mdk doctor fix` resolves env gaps → deploy."
+
+#### L-4 — Sprint 4: Observability polish (~8d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk monitor` (was `watch --live`) | 3d | StorageProvider (have) | item 144 — **rename to disambiguate from existing `mdk watch`** |
+| `mdk tune --deterministic` | 2d | RunRecord history | item 145 — NO auto-prompt-engineering |
+| `mdk explain v2` (richer trail) | 3d | J-2 explain (Sprint 0) | Adds guardrail + reflection + retry/fallback surfacing |
+
+**Exit:** "Production cost spike → `mdk monitor` shows live tokens/cost → `mdk tune` suggests max_tokens cap → `mdk explain <run>` shows which runs triggered the spike."
+
+#### L-5 — Sprint 5: Interop & export (~14d, bleeds 2d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk export oci-bundle <agent>` | 5d | snapshot | item 148 |
+| `mdk export langgraph <agent>` | 7d | None (single-agent first) | item 146 — strategic ("MDK is the IDE") |
+| `mdk simulate <chatbot>` | 5d | Existing `chat` + executor | item 140 |
+
+**Exit:** "Compile any agent to LangGraph for compatibility; package any agent as OCI for any registry; stress-test any chatbot before production."
+
+#### L-6 — Sprint 6: Production validation (~14d, bleeds 4d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk benchmark live` (shadow traffic) | 8d | Async runtime (have) + RemoteExecutor (have) | item 141 |
+| `mdk audit v2` (deeper scanners) | 3d | snapshot | extends item 133 |
+| E2E CI smoke against staging | 3d | profiles + secrets | item 114 (Group I) |
+
+**Exit:** "Candidate gpt-5 model? `mdk benchmark live --shadow 1h` mirrors prod traffic, compares offline, shows latency/cost/accuracy deltas — zero customer impact."
+
+#### L-7 — Sprint 7: Memory architecture (4-5 weeks)
+
+Engine work, not CLI. CLI surface is ~5 days on top.
+
+**L-7-1 — engine (3 weeks):**
+* `MemoryStore` protocol
+* Three backends: session (in-memory), long-term (sqlite/postgres), vector (pgvector)
+* Summarisation policy (when to compress; what to retain)
+* `AgentSpec.memory` block + Executor integration
+
+**L-7-2 — CLI (~1 week):**
+* `mdk memory list <agent>`
+* `mdk memory evict <agent> --before <date>`
+* `mdk memory summarise <agent>`
+* `mdk memory query <agent> "..."`
+
+**Risk:** vector backend choice (pgvector vs Azure AI Search vs Qdrant) is the architectural pivot. Defer until forced. BACKLOG ref: item 152.
+
+#### L-8 — Sprint 8: Multi-agent (Phase 7) (4-5 weeks)
+
+Reuses Sprint 5's `export langgraph` interface design.
+
+**L-8-1 — engine (3 weeks):**
+* Workflow IR maturity (conditional routing, parallel, HITL, checkpointing)
+* LangGraph compiler (`movate.core.workflow.compilers.langgraph`)
+* `runtime: langgraph` opt-in on workflow.yaml
+
+**L-8-2 — CLI (~1 week):**
+* `mdk compose <name>` — declarative multi-agent assembly
+* Updates to `mdk show <workflow>` for conditional graphs
+
+BACKLOG ref: item 153.
+
+#### L-deps — Sprint dependency graph
+
+```
+S1 (state) ──> S2 (env+migrate+promote) ──> S5 (export oci-bundle uses snapshot)
+                                       └──> S6 (benchmark live + audit v2)
+S0 (current) ──> S3 (onboarding) parallel to S1+S2
+            └──> S4 (observability) parallel to S1+S2
+S5 (langgraph) ──> S8 (workflow Phase 7 reuses interface)
+S7 (memory) is independent — can start anytime after S0
+```
+
+#### L-parallel — If you have more than one engineer
+
+| Engineers | Parallel split | Time savings |
+|---|---|---|
+| 1 | Strict serial S1 → S8 | — (baseline 32 weeks) |
+| 2 | S3 + S4 parallel after S2 | ~3 weeks |
+| 3 | S3 + S4 + S5 parallel after S2 | ~6 weeks |
+| 4+ | S7 (memory) starts day 1 in its own track | ~10 weeks |
+
+#### L-exit — Sprint exit criteria (what "demo-ready" means)
+
+* **After S1:** "I can rollback safely."
+* **After S2:** "I can promote dev→prod with eval gates."
+* **After S3:** "I can onboard a new project in 5 minutes."
+* **After S4:** "I can debug production in real time."
+* **After S5:** "MDK compiles to anything."
+* **After S6:** "I can validate a model upgrade without customer impact."
+* **After S7:** "MDK agents have memory."
+* **After S8:** "MDK does conditional + parallel + HITL workflows."
+
+#### L-naming — Sequencing watchouts
+
+1. **`mdk monitor` rename is non-negotiable.** Existing `mdk watch` (file watcher for dev TDD loop) collides with item 144's `watch --live`. Decide naming in S4 planning, not at implementation time. Recommendation: rename item 144 to `mdk monitor`.
+2. **`bench` vs `benchmark live` are different.** `bench` (existing) = offline dataset eval across models. `benchmark live` (S6) = traffic-shadowing against prod. Document both clearly to avoid operator confusion.
+3. **`mdk logs` is a v0.4 stub.** The user-facing "what happened in this run?" command is `explain` (J-2, Sprint 0), not `logs`. The latter is reserved for streaming-log-tail when that need surfaces.
+4. **Memory + compose (S7-S8) are engine work, not CLI.** Plan accordingly — the CLI is the easy week-1; the engine is the multi-week commitment.
+
+#### L-day1 — Concrete day-by-day for Sprint 1 (the next sprint after J-phases)
+
+```
+Day 1-3:  mdk snapshot {create, list, show, delete}   # the central primitive
+Day 4-5:  mdk diff <a> <b>                             # diff prompt/policy/eval/cost
+Day 6-7:  mdk rollback <hash>                          # ACA revision + local restore
+Day 8-10: mdk audit                                    # scanners + CI-friendly JSON
+Day 10:   PR + docs + demo loop
+```
+
+---
+
 ## 1. Foundation — single agent (Phase 1 / v0.1)
 
 ### Already shipped
