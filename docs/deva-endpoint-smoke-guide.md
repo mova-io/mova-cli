@@ -216,7 +216,7 @@ curl -s -X POST "${MDK_BASE}/api/v1/agents/from-wizard" \
         "agent_prompt": "Question: {{ input.input }}\n\nAnswer concisely.",
         "reference_output": "A clear, concise answer.",
         "mcp_connectors": [],
-        "knowledge_store": "",
+        "knowledge_store": [],
         "ai_model": "gpt-4o-mini",
         "ai_foundation": "azure"
     }' | python3 -m json.tool
