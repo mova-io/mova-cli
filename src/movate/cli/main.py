@@ -29,6 +29,7 @@ sync_env_aliases()
 from movate import __version__  # noqa: E402
 from movate.cli import (  # noqa: E402
     _console,
+    audit_cmd,
     diff_cmd,
     rollback_cmd,
 )
@@ -208,6 +209,7 @@ app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(snapshot_app, name="snapshot", rich_help_panel=PANEL_MANAGE)
 app.command("diff", rich_help_panel=PANEL_MANAGE)(diff_cmd.diff)
 app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
+app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
 
