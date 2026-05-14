@@ -22,10 +22,11 @@ from uuid import uuid4
 
 from jsonschema import ValidationError as JsonSchemaError
 
-from movate.core.config import ModelPolicy, RuntimePolicy, SkillPolicy
+from movate.core.config import GuardrailsConfig, ModelPolicy, RuntimePolicy, SkillPolicy
 from movate.core.failures import (
     DEFAULT_RETRY,
     BudgetExceededError,
+    ContentFilterError,
     MovateError,
     PolicyViolationError,
     SchemaError,
@@ -45,6 +46,8 @@ from movate.core.models import (
     TokenUsage,
 )
 from movate.core.retry import RetryExhaustedError, run_with_retries
+from movate.guardrails import check_input as _guardrails_check_input
+from movate.guardrails import check_output as _guardrails_check_output
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -82,6 +85,7 @@ class Executor:
         policy: ModelPolicy | None = None,
         runtime_policy: RuntimePolicy | None = None,
         skill_policy: SkillPolicy | None = None,
+        guardrails: GuardrailsConfig | None = None,
     ) -> None:
         """One of ``provider`` (legacy single-runtime) OR ``registry``
         (multi-runtime, v0.6+) must be set. Passing ``provider`` is
@@ -116,6 +120,12 @@ class Executor:
         # enforced at the top of execute() so a bundle that bypasses
         # `mdk validate` can't sneak past the gate.
         self._skill_policy = skill_policy or SkillPolicy()
+        # Safe-AI guardrails (PII / topic / content) for input + output.
+        # Permissive default — every sub-block ``enabled: false`` means
+        # the input/output check fast-paths to allow. Wired at execute()
+        # entry (input) and exit (output). See GuardrailsConfig for the
+        # full schema and ``movate.guardrails`` for the engine.
+        self._guardrails = guardrails or GuardrailsConfig()
 
     async def execute(
         self,
@@ -250,6 +260,47 @@ class Executor:
                 raise SchemaError(f"input failed schema: {exc.message}") from exc
 
             rendered = bundle.render_prompt(request.input)
+
+            # Safe-AI INPUT guardrails — fired AFTER prompt rendering so
+            # they see the actual text headed for the model (catches
+            # template-injected content too). A ``block`` verdict raises
+            # ContentFilterError which the existing pipeline maps to
+            # ``status="safety_blocked"``; a ``redact`` verdict modifies
+            # the rendered text in place; a ``warn`` verdict logs a
+            # tracer event and continues. Fast-path early-exit when
+            # guardrails are fully disabled (the common case for
+            # projects that haven't opted in).
+            if not self._guardrails.input.is_permissive():
+                v = _guardrails_check_input(rendered, self._guardrails.input)
+                if v.action == "block":
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "input.block",
+                            "triggered_by": list(v.triggered_by),
+                            "reason": v.reason,
+                        },
+                    )
+                    raise ContentFilterError(f"input blocked: {v.reason}")
+                if v.action == "redact":
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "input.redact",
+                            "triggered_by": list(v.triggered_by),
+                        },
+                    )
+                    rendered = v.redacted_text or rendered
+                elif v.action == "warn":
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "input.warn",
+                            "triggered_by": list(v.triggered_by),
+                            "reason": v.reason,
+                        },
+                    )
+
             self._tracer.log_event(span, {"prompt_hash": bundle.prompt_hash})
 
             chain: list[tuple[str, dict[str, Any]]] = [
@@ -375,7 +426,44 @@ class Executor:
                     f"policy {self._policy.max_cost_per_run_usd})"
                 )
 
-            output = _parse_json_output(completion.text)
+            # Safe-AI OUTPUT guardrails — fired on the raw completion
+            # text BEFORE JSON parsing / schema validation, so a leaky
+            # output is caught even when the output isn't well-formed
+            # JSON (the safety_blocked path takes priority over
+            # schema_error in that case). Same fast-path skip as input.
+            completion_text = completion.text
+            if not self._guardrails.output.is_permissive():
+                v = _guardrails_check_output(completion_text, self._guardrails.output)
+                if v.action == "block":
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "output.block",
+                            "triggered_by": list(v.triggered_by),
+                            "reason": v.reason,
+                        },
+                    )
+                    raise ContentFilterError(f"output blocked: {v.reason}")
+                if v.action == "redact":
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "output.redact",
+                            "triggered_by": list(v.triggered_by),
+                        },
+                    )
+                    completion_text = v.redacted_text or completion_text
+                elif v.action == "warn":
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "output.warn",
+                            "triggered_by": list(v.triggered_by),
+                            "reason": v.reason,
+                        },
+                    )
+
+            output = _parse_json_output(completion_text)
             try:
                 bundle.output_validator.validate(output)
             except JsonSchemaError as exc:
