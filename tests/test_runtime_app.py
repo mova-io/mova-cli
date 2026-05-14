@@ -83,6 +83,30 @@ def test_healthz_returns_ok_without_auth(client: TestClient) -> None:
     assert "version" in payload
 
 
+@pytest.mark.unit
+def test_openapi_v1_alias_matches_unversioned(client: TestClient) -> None:
+    """Item 120: /api/v1/openapi.json returns the SAME spec as the
+    unversioned /openapi.json so client-gen tooling can use a consistent
+    versioned prefix."""
+    unversioned = client.get("/openapi.json")
+    versioned = client.get("/api/v1/openapi.json")
+    assert unversioned.status_code == 200
+    assert versioned.status_code == 200
+    assert unversioned.json() == versioned.json()
+    # Sanity: both expose the v1 routes (this is THE reason we care).
+    paths = versioned.json()["paths"]
+    assert any(p.startswith("/api/v1/") for p in paths)
+
+
+@pytest.mark.unit
+def test_openapi_v1_alias_is_unauthenticated(client: TestClient) -> None:
+    """The versioned alias must remain reachable without a bearer — same
+    as /openapi.json — so external client-gen pipelines (which don't
+    have a key yet) can fetch the spec."""
+    r = client.get("/api/v1/openapi.json")
+    assert r.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # /ready — unauthed readiness probe with deep checks
 # ---------------------------------------------------------------------------

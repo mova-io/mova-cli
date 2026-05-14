@@ -107,6 +107,24 @@ prospects shouldn't see an internal URL).
 ''')
 param teamsLangfusePublicHost string = ''
 
+@description('''
+Comma-separated list of origins (no spaces) the API's CORS layer
+allows. Becomes ``MDK_CORS_ALLOWED_ORIGINS`` on the API container.
+Empty string means "no browser callers configured" — the API still
+serves server-to-server traffic just fine; browsers from any origin
+will be blocked by their own preflight.
+
+Example for the Friday Mova iO demo:
+  corsAllowedOrigins = 'http://localhost:4200,https://mova-io.movate.com'
+
+History: before v0.7 this was set by a post-Bicep
+`az containerapp update --set-env-vars` step in
+scripts/friday-demo-deploy.sh. Threading it through Bicep makes the
+deploy idempotent in one pass — re-applying the same template
+preserves the value instead of stomping it.
+''')
+param corsAllowedOrigins string = ''
+
 // ---------------------------------------------------------------------------
 // Per-env defaults — keep in sync with docs/v1.0-azure-design §4
 // ---------------------------------------------------------------------------
@@ -285,6 +303,7 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     cpu: apiCpu
     memory: apiMemory
     userAssignedIdentityId: apiUai.id
+    corsAllowedOrigins: corsAllowedOrigins
     tags: tags
   }
 }

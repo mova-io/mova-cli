@@ -73,3 +73,14 @@ param tags = {
   managedBy: 'bicep'
   owner: 'platform-team'
 }
+
+// OPTIONAL — comma-separated allow-list of browser origins for CORS.
+// Becomes MDK_CORS_ALLOWED_ORIGINS on the API container. Empty string
+// disables browser callers (server-to-server calls still work). When
+// onboarding a new Angular front end, add its origin here and re-run
+// `az deployment group create` — idempotent in one apply (no more
+// post-deploy `az containerapp update` step).
+//
+// Example for the Friday Mova iO demo:
+//   param corsAllowedOrigins = 'http://localhost:4200,https://mova-io.movate.com'
+param corsAllowedOrigins = ''

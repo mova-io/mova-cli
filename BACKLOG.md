@@ -491,15 +491,15 @@ Total realistic v1 surface: **~12 endpoints + 1 ADR + ~3 CLI helpers**. The Angu
 
 #### I-U — Usability polish (small wins, each <½ day)
 
-116. [ ] **`MDK_CORS_ALLOWED_ORIGINS` as Bicep parameter** `[MED] [v0.7] [~1h]` — Tier U. Today's deploy script applies Bicep, then runs a separate `az containerapp update --set-env-vars` to set CORS origins (because Bicep doesn't carry the param). Adding a `corsAllowedOrigins string = ''` param + threading through to the API container's env vars eliminates the post-deploy step and makes the deploy idempotent in one Bicep apply. Pure Bicep change; small Python passthrough in `serve.py` is already done.
+116. [x] **`MDK_CORS_ALLOWED_ORIGINS` as Bicep parameter** `[MED] [v0.7] [done 2026-05-13]` — Tier U. Threaded `corsAllowedOrigins` through `main.bicep` → `containerapp-api.bicep` so the deploy is idempotent in one Bicep apply (no more post-deploy `az containerapp update --set-env-vars` step). `scripts/friday-demo-deploy.sh` collapsed from 6 steps to 5 — passes the allow-list through `--parameters corsAllowedOrigins=` directly. Param doc explains the empty-string default + Friday Mova iO demo example.
 
 117. [ ] **DELETE `/api/v1/agents/{name}`** `[MED] [v0.7] [~1h]` — Tier U. No clean way to remove a wizard-created agent today (operator has to `az containerapp exec` + `rm -rf`). Auth-gated; soft-delete (move to `.deleted-<name>-<timestamp>/` sibling for 7-day recovery window, then cron sweep) keeps the safety net.
 
-118. [ ] **Improved `unknown_agent` error from worker** `[LOW] [v0.7] [~30min]` — Tier U. Today's error message is `"agent 'smoke-bot' not registered on this worker"`. Add a `hint` field pointing the caller at item 109/110 (cross-pod sync limitation). Reduces operator confusion in the gap until 109 lands.
+118. [x] **Improved `unknown_agent` error from worker** `[LOW] [v0.7] [done 2026-05-13]` — Tier U. Added `hint` field to `ErrorInfo` (optional, defaults to `None`); worker's `unknown_agent` path now points callers at the cross-pod bundle-sync gap (item 109) and the `?wait=true` workaround (item 110). Wire-format propagation is automatic — `JobView.error` is `ErrorInfo | None`, so polled `GET /api/v1/jobs/{id}` responses surface the hint without further plumbing. One new assertion in `test_dispatch_unknown_agent_is_terminal_error`.
 
 119. [x] **Bump package version to 0.7.0** `[MED] [v0.7] [~15min]` — Tier U. `pyproject.toml` + `src/movate/__init__.py` still say `0.5.0`. `/healthz` reports it as the runtime version, which is misleading after all of today's work. Bump to 0.7.0 + tag the v0.7.0 GitHub release (item 21).
 
-120. [ ] **`/api/v1/openapi.json` (versioned alias)** `[LOW] [v0.8] [~30min]` — Tier U. FastAPI emits the spec at the unversioned `/openapi.json`. Adding a `/api/v1/openapi.json` alias makes the URL consistent with the rest of the v1 surface for client-gen tooling that expects a versioned spec path.
+120. [x] **`/api/v1/openapi.json` (versioned alias)** `[LOW] [v0.8] [done 2026-05-13]` — Tier U. Added unauthenticated alias that returns the same spec as the unversioned `/openapi.json` (no v1-filtered subset — the spec self-describes via per-route paths). `include_in_schema=False` so the alias doesn't show up in its own spec. Two new tests assert equality + unauthenticated reachability.
 
 #### I-est — Recommended pickup order
 

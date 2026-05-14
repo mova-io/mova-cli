@@ -89,10 +89,27 @@ class WorkerDispatch:
     async def _execute_agent(self, job: JobRecord) -> DispatchOutcome:
         bundle = self._agents.get(job.target)
         if bundle is None:
+            # Known recurring failure: in multi-pod ACA deploys the
+            # worker pod's filesystem doesn't see agents created via
+            # `POST /api/v1/agents` on the API pod (cross-pod sync gap,
+            # tracked as BACKLOG item 109). The runbook workaround is
+            # `?wait=true` on the run endpoint (item 110), which
+            # sidesteps the worker entirely. Surface that pointer in
+            # the error so callers stop debugging "did my agent
+            # actually get created?" — the agent IS there, just not on
+            # this pod.
             return _error(
                 "unknown_agent",
                 f"agent {job.target!r} not registered on this worker",
                 retryable=False,
+                hint=(
+                    "this worker pod has no bundle for the requested agent. "
+                    "if you just created it via POST /api/v1/agents, the "
+                    "bundle is on the API pod's filesystem but not yet "
+                    "synced to workers (cross-pod sync gap — see BACKLOG "
+                    "item 109). until that lands, retry the run with "
+                    "`?wait=true` to execute inline on the API pod (item 110)."
+                ),
             )
         request = RunRequest(agent=job.target, input=job.input)
         try:
@@ -179,12 +196,28 @@ class WorkerDispatch:
 # ---------------------------------------------------------------------------
 
 
-def _error(kind: str, message: str, *, retryable: bool) -> DispatchOutcome:
-    """Build an ``ERROR`` outcome from a structured failure tuple."""
+def _error(
+    kind: str,
+    message: str,
+    *,
+    retryable: bool,
+    hint: str | None = None,
+) -> DispatchOutcome:
+    """Build an ``ERROR`` outcome from a structured failure tuple.
+
+    ``hint`` is surfaced through to the persisted JobRecord (and any
+    poller staring at ``GET /api/v1/jobs/{id}``). Used to point callers
+    at the runbook for known-recurring failure classes — currently the
+    cross-pod bundle-sync gap (``unknown_agent``)."""
     return DispatchOutcome(
         status=JobStatus.ERROR,
         result_run_id=None,
-        error=ErrorInfo(type=kind, message=message, retryable=retryable).model_dump(),
+        error=ErrorInfo(
+            type=kind,
+            message=message,
+            retryable=retryable,
+            hint=hint,
+        ).model_dump(),
     )
 
 
