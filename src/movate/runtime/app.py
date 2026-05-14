@@ -435,6 +435,23 @@ def build_app(
         return HealthView(status="ok", version=movate.__version__)
 
     # ------------------------------------------------------------------
+    # /api/v1/openapi.json — versioned alias (item 120)
+    # ------------------------------------------------------------------
+    # FastAPI emits the OpenAPI spec at the unversioned /openapi.json;
+    # we keep that for backward compat AND expose a versioned alias so
+    # client-gen tooling that expects every v1 path under /api/v1/* can
+    # point at a consistent prefix. The alias returns the SAME spec —
+    # not a v1-filtered subset — because the spec already self-describes
+    # via the per-route ``/api/v1/...`` paths.
+    @app.get(
+        "/api/v1/openapi.json",
+        include_in_schema=False,
+        tags=["meta"],
+    )
+    async def openapi_v1_alias() -> JSONResponse:
+        return JSONResponse(content=app.openapi())
+
+    # ------------------------------------------------------------------
     # /ready — unauthed readiness probe with deep checks
     # ------------------------------------------------------------------
     @app.get(

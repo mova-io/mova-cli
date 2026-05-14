@@ -126,15 +126,16 @@ if [[ -n "${DEVA_ORIGIN}" ]]; then
 else
     readonly CORS_ORIGINS="${LOCAL_DEV_ORIGIN}"
     warn "MOVA_IO_ORIGIN not set — CORS allow-list will only include localhost:4200."
-    warn "Add Deva's production hostname later via:"
-    warn "  az containerapp update -g ${RESOURCE_GROUP} -n ${API_APP_NAME} \\"
-    warn "    --set-env-vars MDK_CORS_ALLOWED_ORIGINS=\"${LOCAL_DEV_ORIGIN},<new-host>\""
+    warn "Add Deva's production hostname later by re-running this script with"
+    warn "MOVA_IO_ORIGIN set, or pass corsAllowedOrigins directly to Bicep:"
+    warn "  az deployment group create -g ${RESOURCE_GROUP} -f infra/azure/main.bicep \\"
+    warn "    -p infra/azure/main.dev.bicepparam \\"
+    warn "    --parameters corsAllowedOrigins=\"${LOCAL_DEV_ORIGIN},<new-host>\""
 fi
 
-# Deploy the existing main.bicep with the new image tag + CORS origins.
-# We pass MDK_CORS_ALLOWED_ORIGINS as a Container App env var override
-# through the ACA update path AFTER Bicep settles (Bicep doesn't carry
-# a CORS-origin parameter today — adding one is a follow-up).
+# Deploy main.bicep with the new image tag + CORS origins. v0.7+ threads
+# corsAllowedOrigins through Bicep (item 116) so the deploy is idempotent
+# in one apply — no more post-deploy `az containerapp update` step.
 az deployment group create \
     -g "${RESOURCE_GROUP}" \
     -f infra/azure/main.bicep \
@@ -143,32 +144,18 @@ az deployment group create \
         image="${IMAGE_TAG}" \
         enableTeamsBot=true \
         teamsBotAppId="${TEAMS_BOT_APP_ID}" \
+        corsAllowedOrigins="${CORS_ORIGINS}" \
     --name "${DEPLOY_NAME}" \
     --query "{state: properties.provisioningState, apiUrl: properties.outputs.apiUrl.value}" \
     -o json
 
-success "Bicep deploy complete"
+success "Bicep deploy complete — CORS allow-list: ${CORS_ORIGINS}"
 
 # -----------------------------------------------------------------------------
-# 3. Inject CORS allow-list as env var (Bicep doesn't carry it yet)
+# 3. Smoke-poll /healthz + /api/v1/openapi.json until the revision flips
 # -----------------------------------------------------------------------------
 
-step "3. Set MDK_CORS_ALLOWED_ORIGINS env var on the API container"
-
-az containerapp update \
-    -g "${RESOURCE_GROUP}" \
-    -n "${API_APP_NAME}" \
-    --set-env-vars "MDK_CORS_ALLOWED_ORIGINS=${CORS_ORIGINS}" \
-    --query "{state: properties.runningStatus}" \
-    -o table
-
-success "CORS allow-list: ${CORS_ORIGINS}"
-
-# -----------------------------------------------------------------------------
-# 4. Smoke-poll /healthz + /api/v1/openapi.json until the revision flips
-# -----------------------------------------------------------------------------
-
-step "4. Smoke check"
+step "3. Smoke check"
 
 readonly API_FQDN=$(az containerapp show \
     -g "${RESOURCE_GROUP}" \
@@ -204,10 +191,10 @@ fi
 success "Confirmed: from-wizard, /api/v1/evals, /api/v1/runs/{id}/trace all in spec"
 
 # -----------------------------------------------------------------------------
-# 5. Mint Deva's API key
+# 4. Mint Deva's API key
 # -----------------------------------------------------------------------------
 
-step "5. Mint Deva's bearer token"
+step "4. Mint Deva's bearer token"
 
 # Generate a UUID for the tenant client-side so we don't have to deal
 # with $(uuidgen) shell-expansion gotchas inside `az containerapp exec`.
@@ -248,10 +235,10 @@ fi
 success "Bearer minted (tenant ${DEVA_TENANT_ID})"
 
 # -----------------------------------------------------------------------------
-# 6. Print onboarding bundle for Deva
+# 5. Print onboarding bundle for Deva
 # -----------------------------------------------------------------------------
 
-step "6. Onboarding bundle — paste this into Slack/email to Deva"
+step "5. Onboarding bundle — paste this into Slack/email to Deva"
 
 cat <<EOM
 

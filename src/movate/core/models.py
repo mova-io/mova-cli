@@ -818,6 +818,17 @@ class ErrorInfo(BaseModel):
     type: str
     message: str
     retryable: bool = False
+    hint: str | None = None
+    """Optional operator-facing remediation pointer.
+
+    Surfaced beneath the bare message to reduce confusion when the
+    underlying cause is a known limitation with a workaround already
+    documented in the runbook. Set sparingly — every hint here is a
+    bet that the error class is recurring + that the pointer text
+    won't go stale as the platform evolves. Example: the worker
+    ``unknown_agent`` outcome points callers at the cross-pod
+    bundle-sync gap (item 109) and the ``?wait=true`` workaround
+    (item 110)."""
 
 
 class RunResponse(BaseModel):

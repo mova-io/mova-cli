@@ -58,6 +58,15 @@ to pull the image / read KV secrets.
 ''')
 param userAssignedIdentityId string
 
+@description('''
+Comma-separated list of browser origins allowed by CORS. Becomes
+``MDK_CORS_ALLOWED_ORIGINS`` on the container. Empty string means
+"no CORS configured" — the runtime defaults are still applied at
+the application layer. See main.bicep param of the same name for the
+operator-facing doc.
+''')
+param corsAllowedOrigins string = ''
+
 @description('Common tags.')
 param tags object = {}
 
@@ -83,8 +92,12 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 8000
         // HTTP only inside the env; ACA terminates TLS at the edge.
         transport: 'auto'
-        // No special CORS in v1.0 — every consumer is server-to-server
-        // with bearer tokens. Browser-facing apps are out of scope.
+        // CORS for browser callers is handled inside the FastAPI app
+        // (src/movate/runtime/app.py reads MDK_CORS_ALLOWED_ORIGINS, set
+        // via the corsAllowedOrigins param threaded from main.bicep).
+        // We don't use the ACA-platform-level `corsPolicy` here — the
+        // app's middleware gives us per-route control and a single
+        // source of truth across local + Azure.
         allowInsecure: false
       }
       registries: [
@@ -178,6 +191,17 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
               // want pluggable agents would mount a volume — out of
               // scope for v1.0 (single-tenant agent set per deploy).
               value: '/app/agents'
+            }
+            {
+              // Comma-separated browser-origin allow-list consumed by
+              // the FastAPI CORSMiddleware in src/movate/runtime/app.py.
+              // Empty string ("") is valid — keeps server-to-server
+              // callers working while denying every browser preflight.
+              // Set via main.bicep param so deploys are idempotent in
+              // one Bicep apply (replacing the post-deploy
+              // `az containerapp update --set-env-vars` step).
+              name: 'MDK_CORS_ALLOWED_ORIGINS'
+              value: corsAllowedOrigins
             }
           ]
           probes: [
