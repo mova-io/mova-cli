@@ -38,7 +38,7 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ### Session 2026-05-13 — Teams demo loop + ADR 002 closeout
 
-**Teams Slice 3.1.e — Teams manifest + Azure Bot Service registration shipped this session.** 15 new tests (1296 → 1311 total). The remaining piece of the Teams demo loop — package the bot as an actual Teams app and wire Azure Bot Service so Teams can route Activities to the deployed bot. New `appPackage/manifest.json` (Teams v1.16) with three scopes (personal/team/groupchat), commandLists for the autocomplete UI, `supportsFiles: true` for 3.1.d uploads; placeholder 192x192 + 32x32 PNG icons (generated via stdlib zlib so CI doesn't need binary blobs). New `scripts/teams-package.sh` zipper that substitutes `MOVATE_TEAMS_BOT_APP_ID` / version / validDomains from env at build time, warns loudly on the placeholder UUID (Teams Admin Center would reject it). Two new Bicep modules: `infra/azure/modules/containerapp-teams-bot.bicep` (Container App running `mdk teams-bot serve`; ingress port 3978; reads three KV secrets — fleet API key, encryption key, Bot Service AAD password) and `bot-service.bicep` (Bot Service registration + Teams channel; F0 for non-prod, S1 for prod; bound to an AAD app the operator pre-creates via `az ad app create`). Main.bicep wires both behind a single `enableTeamsBot` flag mirroring `enableApiWorker`'s two-pass pattern. New `docs/teams-deploy.md` 6-step runbook from "you have an Azure sub" to "Teams users `@movate ping` works". Bicep build + lint clean. **PR #87 (this one). Closes [#69](https://github.com/mova-io/mova-cli/issues/69) (modulo the manual `az ad app create` + Teams Admin Center upload step which lives in the runbook). Demo loop complete.**
+**Teams Slice 3.1.e — Teams manifest + Azure Bot Service registration shipped this session.** 15 new tests (1296 → 1311 total). The remaining piece of the Teams demo loop — package the bot as an actual Teams app and wire Azure Bot Service so Teams can route Activities to the deployed bot. New `appPackage/manifest.json` (Teams v1.16) with three scopes (personal/team/groupchat), commandLists for the autocomplete UI, `supportsFiles: true` for 3.1.d uploads; placeholder 192x192 + 32x32 PNG icons (generated via stdlib zlib so CI doesn't need binary blobs). New `scripts/teams-package.sh` zipper that substitutes `MOVATE_TEAMS_BOT_APP_ID` / version / validDomains from env at build time, warns loudly on the placeholder UUID (Teams Admin Center would reject it). Two new Bicep modules: `infra/azure/modules/containerapp-teams-bot.bicep` (Container App running `mdk teams-bot serve`; ingress port 3978; reads three KV secrets — fleet API key, encryption key, Bot Service AAD password) and `bot-service.bicep` (Bot Service registration + Teams channel; F0 for non-prod, N for prod; bound to an AAD app the operator pre-creates via `az ad app create`). Main.bicep wires both behind a single `enableTeamsBot` flag mirroring `enableApiWorker`'s two-pass pattern. New `docs/teams-deploy.md` 6-step runbook from "you have an Azure sub" to "Teams users `@movate ping` works". Bicep build + lint clean. **PR #87 (this one). Closes [#69](https://github.com/mova-io/mova-cli/issues/69) (modulo the manual `az ad app create` + Teams Admin Center upload step which lives in the runbook). Demo loop complete.**
 
 **Teams Slice 3.1.d — file attachment handling shipped this session.** 33 new tests (1263 → 1296 total). Drag an `agent.yaml`, a zipped agent directory, or a `dataset.jsonl` into Teams and the bot validates + reports back as an Adaptive Card. New `src/movate/teams_bot/attachments.py`: async pipeline (`fetch_bytes` for file:// + http(s)://, 4MB cap; `classify` by filename suffix; `ingest_attachment` orchestrates download → materialise → validate; `temp_workspace` context-manager for per-request scratch; zip-slip protection rejects archives with `..` paths before extraction). New `src/movate/teams_bot/cards/upload.py`: `build_agent_upload_card` (FactSet showing runtime/model/skills/objectives/contexts; description container) and `build_dataset_upload_card` (row count + first-row preview, pluralisation-aware). Handler detects `activity.attachments` before slash-command parse and routes through `_handle_upload`. Run-against-uploaded-agent deferred — needs a runtime API change so `/run` accepts an inline bundle (not just a registered name); tracked as a follow-up. Microsoft Graph auth for production Teams attachments also deferred (Bot Framework Emulator's file:// URLs work today). **PR #86. Closes [#68](https://github.com/mova-io/mova-cli/issues/68).**
 
@@ -683,17 +683,17 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 | Sprint | Theme | Items | Effort | Demo value | Cumulative cmds |
 |---|---|---|---|---|---|
-| **0** | Baseline (DONE) | 27 existing + 10 shipped this session + 4 J-phases in flight | — | Current arc | 41 |
-| **1** | State foundation | snapshot, diff, rollback, audit | 10d | "Terraform for AI" lands | 45 |
-| **2** | Env management | profiles, secrets, migrate, promote | 10d | Multi-env CI/CD promotion | 49 |
-| **3** | Onboarding polish | init --project, doctor fix, openapi import, docs runbook | 10d | "Zero to deployed in 5 min" | 53 |
-| **4** | Observability polish | monitor (was `watch --live`), tune, explain v2 | 8d | Ops-friendly debugging | 56 |
-| **5** | Interop & export | export oci-bundle, export langgraph, simulate | 14d | "MDK compiles to anything" | 59 |
-| **6** | Production validation | benchmark live, audit v2, e2e CI smoke | 14d | Safe model upgrades | 60+ |
-| **7** | Memory architecture | memory engine + CLI | 4-5 weeks | Stateful agents | 61 |
-| **8** | Multi-agent (Phase 7) | LangGraph swap-in + compose | 4-5 weeks | Conditional / parallel / HITL | 62 |
+| **M** | Baseline (DONE) | 27 existing + 10 shipped this session + 4 J-phases in flight | — | Current arc | 41 |
+| **N** | State foundation | snapshot, diff, rollback, audit | 10d | "Terraform for AI" lands | 45 |
+| **O** | Env management | profiles, secrets, migrate, promote | 10d | Multi-env CI/CD promotion | 49 |
+| **P** | Onboarding polish | init --project, doctor fix, openapi import, docs runbook | 10d | "Zero to deployed in 5 min" | 53 |
+| **Q** | Observability polish | monitor (was `watch --live`), tune, explain v2 | 8d | Ops-friendly debugging | 56 |
+| **R** | Interop & export | export oci-bundle, export langgraph, simulate | 14d | "MDK compiles to anything" | 59 |
+| **S** | Production validation | benchmark live, audit v2, e2e CI smoke | 14d | Safe model upgrades | 60+ |
+| **T** | Memory architecture | memory engine + CLI | 4-5 weeks | Stateful agents | 61 |
+| **U** | Multi-agent (Phase 7) | LangGraph swap-in + compose | 4-5 weeks | Conditional / parallel / HITL | 62 |
 
-#### L-0 — Sprint 0 baseline (done / in flight)
+#### L-M — Sprint M baseline (done / in flight)
 
 **Pre-session on main (~21 commands):** `init, validate, eval, run, chat, bench, show, doctor, pricing, deploy, serve, worker, submit, jobs, auth, config, policy, tenants, trace, import, scaffold, skills, teams-bot, watch (file watcher)`
 
@@ -701,7 +701,7 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 **In flight (Phase J-2 through J-5):** `explain <run-id>`, `plan --from`, `knowledge {add, list, query}`, Mova iO mapping doc
 
-#### L-1 — Sprint 1: State foundation (~10d)
+#### L-N — Sprint N: State foundation (~10d)
 
 The North Star cluster. **Ships as a coordinated set** — items don't work alone.
 
@@ -716,7 +716,7 @@ The North Star cluster. **Ships as a coordinated set** — items don't work alon
 
 **Design lock-in:** snapshots are immutable + content-addressed (git-style) + live in `.movate/snapshots/` + tagged in git. Avoids Terraform-state pathologies.
 
-#### L-2 — Sprint 2: Env management (~10d)
+#### L-O — Sprint O: Env management (~10d)
 
 | Item | Effort | Dependencies | BACKLOG ref |
 |---|---|---|---|
@@ -727,9 +727,9 @@ The North Star cluster. **Ships as a coordinated set** — items don't work alon
 
 **Exit:** "Dev → staging → prod promotion gated by `mdk eval` per hop, all secrets in Key Vault per profile, snapshots immutable across the chain."
 
-**Risk:** `secrets` is the riskiest item — touches env loading + Key Vault + Bicep. If it slips, push to Sprint 3 and pull `mdk doctor fix` forward.
+**Risk:** `secrets` is the riskiest item — touches env loading + Key Vault + Bicep. If it slips, push to Sprint P and pull `mdk doctor fix` forward.
 
-#### L-3 — Sprint 3: Onboarding polish (~10d)
+#### L-P — Sprint P: Onboarding polish (~10d)
 
 | Item | Effort | Dependencies | BACKLOG ref |
 |---|---|---|---|
@@ -740,17 +740,17 @@ The North Star cluster. **Ships as a coordinated set** — items don't work alon
 
 **Exit:** "`mdk init my-corp --project` → `mdk import openapi salesforce.json` → 12 skills scaffolded → `mdk add` an agent → `mdk doctor fix` resolves env gaps → deploy."
 
-#### L-4 — Sprint 4: Observability polish (~8d)
+#### L-Q — Sprint Q: Observability polish (~8d)
 
 | Item | Effort | Dependencies | BACKLOG ref |
 |---|---|---|---|
 | `mdk monitor` (was `watch --live`) | 3d | StorageProvider (have) | item 144 — **rename to disambiguate from existing `mdk watch`** |
 | `mdk tune --deterministic` | 2d | RunRecord history | item 145 — NO auto-prompt-engineering |
-| `mdk explain v2` (richer trail) | 3d | J-2 explain (Sprint 0) | Adds guardrail + reflection + retry/fallback surfacing |
+| `mdk explain v2` (richer trail) | 3d | J-2 explain (Sprint M) | Adds guardrail + reflection + retry/fallback surfacing |
 
 **Exit:** "Production cost spike → `mdk monitor` shows live tokens/cost → `mdk tune` suggests max_tokens cap → `mdk explain <run>` shows which runs triggered the spike."
 
-#### L-5 — Sprint 5: Interop & export (~14d, bleeds 2d)
+#### L-R — Sprint R: Interop & export (~14d, bleeds 2d)
 
 | Item | Effort | Dependencies | BACKLOG ref |
 |---|---|---|---|
@@ -760,7 +760,7 @@ The North Star cluster. **Ships as a coordinated set** — items don't work alon
 
 **Exit:** "Compile any agent to LangGraph for compatibility; package any agent as OCI for any registry; stress-test any chatbot before production."
 
-#### L-6 — Sprint 6: Production validation (~14d, bleeds 4d)
+#### L-S — Sprint S: Production validation (~14d, bleeds 4d)
 
 | Item | Effort | Dependencies | BACKLOG ref |
 |---|---|---|---|
@@ -770,17 +770,17 @@ The North Star cluster. **Ships as a coordinated set** — items don't work alon
 
 **Exit:** "Candidate gpt-5 model? `mdk benchmark live --shadow 1h` mirrors prod traffic, compares offline, shows latency/cost/accuracy deltas — zero customer impact."
 
-#### L-7 — Sprint 7: Memory architecture (4-5 weeks)
+#### L-T — Sprint T: Memory architecture (4-5 weeks)
 
 Engine work, not CLI. CLI surface is ~5 days on top.
 
-**L-7-1 — engine (3 weeks):**
+**L-T-1 — engine (3 weeks):**
 * `MemoryStore` protocol
 * Three backends: session (in-memory), long-term (sqlite/postgres), vector (pgvector)
 * Summarisation policy (when to compress; what to retain)
 * `AgentSpec.memory` block + Executor integration
 
-**L-7-2 — CLI (~1 week):**
+**L-T-2 — CLI (~1 week):**
 * `mdk memory list <agent>`
 * `mdk memory evict <agent> --before <date>`
 * `mdk memory summarise <agent>`
@@ -788,16 +788,16 @@ Engine work, not CLI. CLI surface is ~5 days on top.
 
 **Risk:** vector backend choice (pgvector vs Azure AI Search vs Qdrant) is the architectural pivot. Defer until forced. BACKLOG ref: item 152.
 
-#### L-8 — Sprint 8: Multi-agent (Phase 7) (4-5 weeks)
+#### L-U — Sprint U: Multi-agent (Phase 7) (4-5 weeks)
 
-Reuses Sprint 5's `export langgraph` interface design.
+Reuses Sprint R's `export langgraph` interface design.
 
-**L-8-1 — engine (3 weeks):**
+**L-U-1 — engine (3 weeks):**
 * Workflow IR maturity (conditional routing, parallel, HITL, checkpointing)
 * LangGraph compiler (`movate.core.workflow.compilers.langgraph`)
 * `runtime: langgraph` opt-in on workflow.yaml
 
-**L-8-2 — CLI (~1 week):**
+**L-U-2 — CLI (~1 week):**
 * `mdk compose <name>` — declarative multi-agent assembly
 * Updates to `mdk show <workflow>` for conditional graphs
 
@@ -806,42 +806,42 @@ BACKLOG ref: item 153.
 #### L-deps — Sprint dependency graph
 
 ```
-S1 (state) ──> S2 (env+migrate+promote) ──> S5 (export oci-bundle uses snapshot)
-                                       └──> S6 (benchmark live + audit v2)
-S0 (current) ──> S3 (onboarding) parallel to S1+S2
-            └──> S4 (observability) parallel to S1+S2
-S5 (langgraph) ──> S8 (workflow Phase 7 reuses interface)
-S7 (memory) is independent — can start anytime after S0
+N (state) ──> O (env+migrate+promote) ──> R (export oci-bundle uses snapshot)
+                                       └──> S (benchmark live + audit v2)
+M (current) ──> P (onboarding) parallel to N+O
+            └──> Q (observability) parallel to N+O
+R (langgraph) ──> U (workflow Phase 7 reuses interface)
+T (memory) is independent — can start anytime after M
 ```
 
 #### L-parallel — If you have more than one engineer
 
 | Engineers | Parallel split | Time savings |
 |---|---|---|
-| 1 | Strict serial S1 → S8 | — (baseline 32 weeks) |
-| 2 | S3 + S4 parallel after S2 | ~3 weeks |
-| 3 | S3 + S4 + S5 parallel after S2 | ~6 weeks |
-| 4+ | S7 (memory) starts day 1 in its own track | ~10 weeks |
+| 1 | Strict serial N → U | — (baseline 32 weeks) |
+| 2 | P + Q parallel after O | ~3 weeks |
+| 3 | P + Q + R parallel after O | ~6 weeks |
+| 4+ | T (memory) starts day 1 in its own track | ~10 weeks |
 
 #### L-exit — Sprint exit criteria (what "demo-ready" means)
 
-* **After S1:** "I can rollback safely."
-* **After S2:** "I can promote dev→prod with eval gates."
-* **After S3:** "I can onboard a new project in 5 minutes."
-* **After S4:** "I can debug production in real time."
-* **After S5:** "MDK compiles to anything."
-* **After S6:** "I can validate a model upgrade without customer impact."
-* **After S7:** "MDK agents have memory."
-* **After S8:** "MDK does conditional + parallel + HITL workflows."
+* **After N:** "I can rollback safely."
+* **After O:** "I can promote dev→prod with eval gates."
+* **After P:** "I can onboard a new project in 5 minutes."
+* **After Q:** "I can debug production in real time."
+* **After R:** "MDK compiles to anything."
+* **After S:** "I can validate a model upgrade without customer impact."
+* **After T:** "MDK agents have memory."
+* **After U:** "MDK does conditional + parallel + HITL workflows."
 
 #### L-naming — Sequencing watchouts
 
-1. **`mdk monitor` rename is non-negotiable.** Existing `mdk watch` (file watcher for dev TDD loop) collides with item 144's `watch --live`. Decide naming in S4 planning, not at implementation time. Recommendation: rename item 144 to `mdk monitor`.
-2. **`bench` vs `benchmark live` are different.** `bench` (existing) = offline dataset eval across models. `benchmark live` (S6) = traffic-shadowing against prod. Document both clearly to avoid operator confusion.
-3. **`mdk logs` is a v0.4 stub.** The user-facing "what happened in this run?" command is `explain` (J-2, Sprint 0), not `logs`. The latter is reserved for streaming-log-tail when that need surfaces.
-4. **Memory + compose (S7-S8) are engine work, not CLI.** Plan accordingly — the CLI is the easy week-1; the engine is the multi-week commitment.
+1. **`mdk monitor` rename is non-negotiable.** Existing `mdk watch` (file watcher for dev TDD loop) collides with item 144's `watch --live`. Decide naming in Q planning, not at implementation time. Recommendation: rename item 144 to `mdk monitor`.
+2. **`bench` vs `benchmark live` are different.** `bench` (existing) = offline dataset eval across models. `benchmark live` (S) = traffic-shadowing against prod. Document both clearly to avoid operator confusion.
+3. **`mdk logs` is a v0.4 stub.** The user-facing "what happened in this run?" command is `explain` (J-2, Sprint M), not `logs`. The latter is reserved for streaming-log-tail when that need surfaces.
+4. **Memory + compose (T-U) are engine work, not CLI.** Plan accordingly — the CLI is the easy week-1; the engine is the multi-week commitment.
 
-#### L-day1 — Concrete day-by-day for Sprint 1 (the next sprint after J-phases)
+#### L-day1 — Concrete day-by-day for Sprint N (the next sprint after J-phases)
 
 ```
 Day 1-3:  mdk snapshot {create, list, show, delete}   # the central primitive
