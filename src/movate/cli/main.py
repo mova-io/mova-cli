@@ -91,6 +91,7 @@ from movate.cli import (  # noqa: E402
     demo_cmd,
     diff_cmd,
     eval_gen_cmd,
+    explain_cmd,
     fix_cmd,
     fmt_cmd,
     menu_cmd,
@@ -352,6 +353,7 @@ app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
 # sub-app would break ~30 test callsites. See eval_gen_cmd docstring.
 app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
+app.command("explain", rich_help_panel=PANEL_RUN)(explain_cmd.explain)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /
 # `logs`. Same panel since it answers an adjacent operator question.
