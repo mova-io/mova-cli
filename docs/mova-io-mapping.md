@@ -45,7 +45,7 @@
 |---|---|---|
 | Intent Recognition | 🟡 | `text-classifier` role works as intent router |
 | Planning | ✅ | `mdk plan --from "<desc>"` (PR #17 / Phase J-3) |
-| Memory Management | 🟡 → 🚧 | Chat history in `mdk chat`; persistent memory engine is Sprint 7 |
+| Memory Management | 🟡 → 🚧 | Chat history in `mdk chat`; persistent memory engine is Sprint T |
 | MCP Integrators | ✅ | Skills system supports MCP backends |
 | Agent Profiles / Job Duties | ✅ | `persona` + `role` fields on AgentSpec |
 | Reasoning | ✅ | `Executor` (retries, fallback, prompt render) |
@@ -123,10 +123,10 @@
 
 **Aggregate coverage:** ~65% → **~85%**. The 15% remaining is concentrated in:
 
-* Vector store engine (Data & Knowledge — Sprint 7)
-* Memory engine (Agent Creation — Sprint 7)
-* Compose / multi-agent (Agent Creation — Sprint 8)
-* `mdk secrets` formalisation (Infrastructure — Sprint 2)
+* Vector store engine (Data & Knowledge — Sprint T)
+* Memory engine (Agent Creation — Sprint T)
+* Compose / multi-agent (Agent Creation — Sprint U)
+* `mdk secrets` formalisation (Infrastructure — Sprint O)
 
 ---
 

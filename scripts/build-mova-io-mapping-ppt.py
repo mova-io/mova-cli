@@ -198,8 +198,8 @@ def _build_scorecard_slide(prs: Presentation) -> None:
     p = ctf.paragraphs[0]
     p.text = (
         "Aggregate coverage: ~65% → ~85%. Remaining 15% concentrated in "
-        "vector store (Sprint 7), memory engine (Sprint 7), and compose "
-        "(Sprint 8). See docs/mova-io-mapping.md for per-box detail."
+        "vector store (Sprint T), memory engine (Sprint T), and compose "
+        "(Sprint U). See docs/mova-io-mapping.md for per-box detail."
     )
     p.font.size = Pt(13)
     p.font.color.rgb = TEXT_DIM
@@ -297,14 +297,14 @@ def _build_whats_next_slide(prs: Presentation) -> None:
 
     rows = [
         ("Sprint", "Theme", "Items"),
-        ("S1", "State foundation", "snapshot / diff / rollback / audit"),
-        ("S2", "Env management", "profiles / secrets / migrate / promote"),
-        ("S3", "Onboarding polish", "init --project / doctor fix / openapi"),
-        ("S4", "Observability polish", "monitor / tune / explain v2"),
-        ("S5", "Interop & export", "oci-bundle / langgraph / simulate"),
-        ("S6", "Production validation", "benchmark live / audit v2 / e2e CI"),
-        ("S7", "Memory architecture", "engine + CLI (4-5 weeks)"),
-        ("S8", "Multi-agent / Phase 7", "LangGraph swap-in + compose"),
+        ("N", "State foundation", "snapshot / diff / rollback / audit"),
+        ("O", "Env management", "profiles / secrets / migrate / promote"),
+        ("P", "Onboarding polish", "init --project / doctor fix / openapi"),
+        ("Q", "Observability polish", "monitor / tune / explain v2"),
+        ("R", "Interop & export", "oci-bundle / langgraph / simulate"),
+        ("S", "Production validation", "benchmark live / audit v2 / e2e CI"),
+        ("T", "Memory architecture", "engine + CLI (4-5 weeks)"),
+        ("U", "Multi-agent / Phase 7", "LangGraph swap-in + compose"),
     ]
 
     table_shape = slide.shapes.add_table(
@@ -346,7 +346,7 @@ def _build_whats_next_slide(prs: Presentation) -> None:
     ft = foot.text_frame
     p = ft.paragraphs[0]
     p.text = (
-        "~16 weeks for CLI surface (S1-S6) + ~10 weeks for engine work (S7-S8). "
+        "~16 weeks for CLI surface (N-S) + ~10 weeks for engine work (T-U). "
         "See BACKLOG.md Group L for dependencies + parallelisation guidance."
     )
     p.font.size = Pt(12)
