@@ -39,6 +39,11 @@ What does NOT ship (future):
 
 from __future__ import annotations
 
+from movate.snapshot.diff import (
+    FileChange,
+    SnapshotDiff,
+    diff_snapshots,
+)
 from movate.snapshot.manifest import (
     FileEntry,
     SnapshotManifest,
@@ -55,13 +60,16 @@ from movate.snapshot.store import (
 )
 
 __all__ = [
+    "FileChange",
     "FileEntry",
+    "SnapshotDiff",
     "SnapshotManifest",
     "SnapshotManifestError",
     "SnapshotNotFoundError",
     "SnapshotStoreError",
     "create_snapshot",
     "delete_snapshot",
+    "diff_snapshots",
     "list_snapshots",
     "load_manifest",
     "snapshot_path",

@@ -27,7 +27,10 @@ from movate.cli._env_aliases import sync_env_aliases  # noqa: E402
 sync_env_aliases()
 
 from movate import __version__  # noqa: E402
-from movate.cli import _console  # noqa: E402
+from movate.cli import (  # noqa: E402
+    _console,
+    diff_cmd,
+)
 from movate.cli import bench as bench_cmd  # noqa: E402
 from movate.cli import chat as chat_cmd  # noqa: E402
 from movate.cli import deploy as deploy_cmd  # noqa: E402
@@ -202,6 +205,7 @@ app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(snapshot_app, name="snapshot", rich_help_panel=PANEL_MANAGE)
+app.command("diff", rich_help_panel=PANEL_MANAGE)(diff_cmd.diff)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
 
