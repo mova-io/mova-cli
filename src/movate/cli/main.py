@@ -134,6 +134,7 @@ from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
+from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
@@ -311,6 +312,7 @@ app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
+app.add_typer(knowledge_app, name="knowledge", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(schema_app, name="schema", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
