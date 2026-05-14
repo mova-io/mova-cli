@@ -547,11 +547,15 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 > in the response that produced this section; this is the
 > backlog-canonical view._
 
+**North Star (added 2026-05-14 post-review):** **MDK is Terraform/dbt for AI systems**, not "another agent framework." That framing has a strong implication: `mdk snapshot` is the *central primitive*, not a side feature. Every other operational command becomes a snapshot operation — `diff` compares snapshots, `rollback` activates a prior snapshot, `promote` deploys a snapshot to a new target with eval gates, `apply` materialises a snapshot, `audit` scans a snapshot, `migrate` upgrades snapshots across api_version bumps. Snapshots should be **immutable + content-addressed (git-style)** + **live in git by default** to avoid the Terraform-state-file pathologies (locking, drift, "I edited it manually"). Optional OCI-registry mirror (item 148) for cross-team sharing.
+
 **Critical cross-cutting notes:**
-1. Several items cluster — `audit` + `doctor fix` + `migrate` form a *production-readiness* group; `secrets` + `profiles` + `bootstrap` form a *dev-environment* group. Ship cluster prerequisites first.
-2. `monitor` and full `tune` are Langfuse / Helicone / DataDog territory. MDK should INTEGRATE, not duplicate.
-3. `compose` and `memory` are placeholders for huge architectural decisions (workflow IR Phase 7, memory store Tier 5). Each is an ADR + a quarter of engineering — they're NOT same-granularity line items as `doctor fix`.
-4. **Missing killer feature**: `mdk diff` — show diff between two snapshots (prompts, policies, eval scores, costs) so operators can answer "what changed and is that why cost doubled?". Higher-leverage than `monitor`.
+1. **The state cluster is foundational** (see K-state below). Without snapshot+diff+rollback+promote as a cohesive primitive, the rest of the operational story is hollow.
+2. **Production-readiness cluster**: `audit` + `doctor fix` + `migrate` form a separate group — these scan/repair/upgrade state, but they're not state operations themselves.
+3. **Dev-environment cluster**: `secrets` + `profiles` + `bootstrap` form another group — these manage *which* state context the operator is acting on.
+4. `monitor` and full `tune` are Langfuse / Helicone / DataDog territory. MDK should INTEGRATE, not duplicate.
+5. `compose` and `memory` are placeholders for huge architectural decisions (workflow IR Phase 7, memory store Tier 5). Each is an ADR + a quarter of engineering — they're NOT same-granularity line items as `doctor fix`.
+6. **External review (OpenAI 2026-05-14)** validated this framing — strong agreement on `openapi import`, `migrate+snapshot+rollback` as foundational, `watch --live` over web monitor, deterministic tune, blocking `memory`/`compose`. Their structural call: promote `diff` to co-equal with snapshot/rollback. Their additions: `mdk promote` (item 137a) + reinforcement of `mdk explain` (already Phase J-2).
 
 #### K-shipped — Already done
 
@@ -559,21 +563,31 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 130. [ ] **`mdk guardrails` CLI wrapper** `[MED] [v0.7] [~1-2d]` — Companion to the J-0 engine. Subcommands: `test <text>` (dry-run a string against the configured guardrails), `validate` (check `movate.yaml: guardrails:` block is well-formed), `enable / disable <module>` (toggle individual guardrails without editing YAML). Pairs with item 129.
 
-#### K-shipsoon — Tier 1: contained, high leverage (~2-5 days each)
+#### K-state — Tier 0: the foundational state cluster (~2-3d each, ship together)
+
+> _Per the North Star (Terraform/dbt for AI), these five are co-equal
+> faces of one primitive. They must ship as a coordinated cluster —
+> shipping `rollback` without `snapshot` is meaningless, shipping
+> `snapshot` without `diff` makes drift undetectable. Total cluster
+> budget: ~10-12 days._
+
+136. [ ] **`mdk snapshot`** `[HIGH] [v0.7] [~2-3d]` — **The central primitive.** Capture reproducible state at a point in time: prompt hashes + agent.yaml + eval scores + pricing version + provider version + model version + git SHA + skill versions + guardrails config, bundled as an immutable content-addressed artifact (git-style hash; lives under `.movate/snapshots/<hash>` + tagged in git). The thing every other operational command operates on. Audit-trail story + foundation for `diff` / `rollback` / `promote`.
+
+137. [ ] **`mdk diff <snap-a> <snap-b>`** `[HIGH] [v0.7] [~2d]` — Compare two snapshots. Diff prompts, policies, eval scores, costs, model versions, dependency lockfile. Answers "what changed between green-bar and red-bar?" — the most common operational question. Output formats: Rich (human review) and JSON (CI diff annotations). Promoted to co-equal with snapshot/rollback per external review (OpenAI 2026-05-14).
+
+135. [ ] **`mdk rollback <snap-hash>`** `[HIGH] [v0.7] [~2d]` — Activate a prior snapshot as the current deploy. Wraps `az containerapp revision activate` for the ACA piece + restores agent.yaml / prompts / policies for the local piece. Operator picks from `mdk snapshot list` (with status + eval scores + deploy time per row). Reliable demo confidence + audit trail. Critical: rollback is a NEW snapshot pointing at old content — never mutate history.
+
+137a. [ ] **`mdk promote <snap-hash> --to <profile>`** `[HIGH] [v0.8] [~3-5d]` — *Added 2026-05-14 from external review.* Deploy a snapshot from one profile to another (dev → staging → prod) with **eval gate** as a hard guard between hops. Workflow: `mdk snapshot` (in dev) → `mdk eval --baseline` (must pass) → `mdk promote <hash> --to staging` (deploys, attaches eval result to snapshot). Repeat for staging → prod. Blocked on `mdk profiles` (item 139). The single command that operationalises the "Terraform/dbt for AI" North Star.
+
+133. [ ] **`mdk audit <snap-hash | current>`** `[HIGH] [v0.7] [~3-4d]` — Scan a snapshot (or current state) for production-readiness issues: insecure prompts, exposed secrets, missing evals, unsafe tools, policy violations. Wraps existing checks (prompt linter, policy validator) + new scanners (secret-pattern matcher for agent.yaml, eval coverage, dataset hygiene). Single command, single pass/fail report, designed for CI gating. Pairs with PR #6 (`mdk validate --project`) and the K-state cluster — audit a snapshot before `promote`. Output: Rich table per category + JSON for CI annotations.
+
+#### K-shipsoon — Tier 1: contained, high leverage (~2-5 days each, ship after state cluster)
 
 131. [ ] **`mdk doctor fix`** `[HIGH] [v0.7] [~2-3d]` — Auto-remediate the common environment / setup issues that `mdk doctor` already detects: missing env vars (write to `.env.example`), wrong Python version (suggest `uv python install`), missing optional extras (suggest `uv add 'movate-cli[anthropic]'`), Docker not running (start command per OS), API-key not set (interactive prompt). **MUST default to `--dry-run`** with `--apply` opt-in — auto-modifying the user's shell is dangerous. Print every action before firing.
 
 132. [ ] **`mdk import openapi <spec-url-or-path>`** `[HIGH] [v0.8] [~3-5d]` — **Sleeper hit.** Generate skill stubs from an OpenAPI / Swagger spec. Each operation becomes a skill: `tool.yaml` with input/output schemas pulled from the spec, `handler.py` stub with `requests.<verb>(...)` boilerplate. Enterprise win: 50 internal APIs, OpenAPI specs already exist, MDK auto-scaffolds the skills. Saves days per integration. Pairs with item 7 in the original suggestion list.
 
-133. [ ] **`mdk audit`** `[HIGH] [v0.7] [~3-4d]` — Production-readiness scanner that wraps existing checks (prompt linter, policy validator) + new ones (exposed secrets in agent.yaml, missing evals, agents without datasets, agents without owners). Single command, single pass/fail report, designed for CI gating. Pairs with PR #6 (`mdk validate --project`). Output: Rich table per category + JSON for CI annotations.
-
-134. [ ] **`mdk migrate`** `[HIGH] [v0.8] [~3-4d]` — **Underrated foundational tool.** Schema migrations for `api_version: movate/vN → vM` (when we bump), eval dataset format changes, vector-DB metadata bumps. Walks the project, applies a registered migration function per file, prints a diff before writing. Without this, every schema bump is a manual hand-edit-every-YAML chore. Critical before any major version bump.
-
-135. [ ] **`mdk rollback`** `[MED] [v0.7] [~2d]` — Thin wrapper over `az containerapp revision activate` (ACA natively supports revision-based rollback). Operator picks from a revision list with status + deploy time + git SHA. Reliable demo confidence + audit trail. Pairs with `snapshot` (item 136).
-
-136. [ ] **`mdk snapshot`** `[MED] [v0.7] [~2-3d]` — Capture reproducible state at a point in time: prompt hashes + agent.yaml + eval scores + pricing version + provider version + model version + git SHA, bundled as a tagged artifact. Useful **only** if it bundles things `git` doesn't already capture (eval scores, pricing version, provider versions). Audit-trail story. Pairs with `rollback` and `diff`.
-
-137. [ ] **`mdk diff <snap-a> <snap-b>`** `[HIGH] [v0.7] [~2d]` — *Added by reviewer, not in original list.* Compare two snapshots. Diff prompts, policies, eval scores, costs, model versions. Answers "what changed between green-bar and red-bar?" — more useful than a live monitor for the most common failure mode (degradation introduced by a recent change). Pairs with `snapshot` + `rollback`.
+134. [ ] **`mdk migrate`** `[HIGH] [v0.8] [~3-4d]` — **Underrated foundational tool.** Schema migrations for `api_version: movate/vN → vM` (when we bump), eval dataset format changes, vector-DB metadata bumps. Walks the project, applies a registered migration function per file, prints a diff before writing. Operates on the snapshot graph — migrate produces a NEW snapshot, never mutates an existing one. Without this, every schema bump is a manual hand-edit-every-YAML chore. Critical before any major version bump.
 
 #### K-bigwin — Tier 2: worth doing but own phase each (~1-2 weeks)
 
@@ -617,33 +631,40 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 153. [ ] **`mdk compose`** `[MED] [v1.1+] [~2-3w]` — **BLOCKED on Phase 7.** Multi-agent declarative composition is the conditional-routing/parallel story, which requires the workflow IR to mature. Today's workflows are linear (v0.3). When LangGraph swap-in lands (Phase 7), compose is the user-facing surface on top.
 
-#### K-est — Recommended pickup order
+#### K-est — Recommended pickup order (revised 2026-05-14 post external review)
 
-**Q3 2026 (next 6 weeks):**
+**Q3 2026 — Phase 1 / state cluster (the foundation; ship as a coordinated set):**
+* 136 — `mdk snapshot` (the central primitive)
+* 137 — `mdk diff`
+* 135 — `mdk rollback`
+* 133 — `mdk audit` (operates on snapshots)
+* 134 — `mdk migrate` (operates on snapshots)
+
+**Q3 2026 — Phase 2 / standalone ergonomics (after the state cluster is live):**
 * 130 — `mdk guardrails` CLI wrapper (engine already shipped)
 * 142 — `mdk init --project`
 * 131 — `mdk doctor fix` (with --dry-run default)
-* 133 — `mdk audit`
 * 147 — `mdk export json-schema`
-* 134 — `mdk migrate`
+* 132 — `mdk import openapi`
 
-**Q3-Q4 2026:**
-* 135 + 136 + 137 — rollback + snapshot + diff (cluster)
-* 132 — openapi import
-* 143 — docs runbook
-* 144 — watch --live
+**Q3-Q4 2026 — Phase 3 / profiles + promotion:**
+* 138 + 139 — `mdk secrets` + `mdk profiles` (cluster)
+* 137a — `mdk promote` (depends on profiles + state cluster)
+* 143 — `mdk docs runbook`
+* 144 — `mdk watch --live`
 
-**Q4 2026:**
-* 138 + 139 — secrets + profiles (cluster)
-* 145 — tune (deterministic only)
-* 148 — oci-bundle export
-* 146 — langgraph export
+**Q4 2026 — Phase 4 / export + tune:**
+* 145 — `mdk tune` (deterministic only)
+* 148 — `mdk export oci-bundle`
+* 146 — `mdk export langgraph`
 
-**v0.9+:**
-* 140 — simulate (chatbot stress)
-* 141 — benchmark live (shadow traffic)
-* 152 — memory CLI (after engine lands)
-* 153 — compose (after Phase 7 lands)
+**v0.9+ — Phase 5 / blocked on engine work:**
+* 140 — `mdk simulate` (chatbot stress)
+* 141 — `mdk benchmark live` (shadow traffic)
+* 152 — `mdk memory` CLI (after memory engine lands)
+* 153 — `mdk compose` (after Phase 7 lands)
+
+**Rationale for the revised order:** the state cluster (snapshot/diff/rollback/audit/migrate) IS the foundation per the North Star. Everything else slots in on top — `init --project` produces a snapshot, `doctor fix` operates on a snapshot, `promote` ships a snapshot. Without the cluster, every subsequent feature has to invent its own state model.
 
 ---
 
