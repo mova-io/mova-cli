@@ -1,0 +1,62 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Route incoming support tickets to the right team with a priority and 1-line summary.
+owner: ""
+
+# Marketplace metadata — surfaced in Mova iO's "Onboard Agent" catalog.
+# Each role template ships with these pre-filled so customers see a
+# polished card before they customize.
+role: support-triage
+persona: |
+  Triage analyst who reads incoming tickets quickly, identifies urgency
+  cues (outages, security incidents, billing escalations), and routes
+  to the right team without over-explaining. Outputs are strictly
+  formatted for downstream ITSM ingestion.
+capabilities:
+  - triage
+  - routing
+  - structured-output
+  - prioritization
+tags:
+  - support
+  - ops
+  - ticketing
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0  # deterministic routing — same ticket should always route the same way
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+# Strict enum on `priority` and `assigned_team` so the model literally
+# cannot emit a routing decision outside the allowed set. This is the
+# core value prop of the template — your ITSM downstream can `switch`
+# on these without defensive parsing.
+schema:
+  input:
+    ticket_body: string
+    channel: web|email|phone|slack|teams?    # optional — where the ticket came in from
+    customer_tier: free|standard|enterprise?
+  output:
+    priority: low|medium|high|urgent
+    category: technical-issue|billing|account-access|feature-request|complaint|other
+    assigned_team: engineering|billing|support|security|sales|escalation
+    escalate: boolean              # true if a human lead should be paged immediately
+    summary: string                 # 1-line summary for the team's queue
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 15000
+  total_ms: 30000
+
+budget:
+  max_cost_usd_per_run: 0.05    # triage is high-volume; keep per-call cost tight
