@@ -72,3 +72,12 @@ infra/azure/*.bicepparam
 scripts/deva-curl/.env
 my-sandisk-agent/
 openai-feedback.md
+
+# Deva onboarding artifacts — generated locally with live URL + bearer
+# baked in (via scripts/build-deva-ppt.py + the sed pipeline against
+# docs/deva-endpoint-smoke-guide.md). Sent to Deva via DM, never via
+# git. The committed source-of-truth lives under docs/ with
+# placeholders; these are the build outputs.
+*.pptx
+deva-onboarding.md
+deva-onboarding.pptx
