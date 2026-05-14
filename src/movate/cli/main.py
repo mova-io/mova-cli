@@ -49,6 +49,7 @@ from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
+from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
@@ -200,6 +201,7 @@ app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
+app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
 
