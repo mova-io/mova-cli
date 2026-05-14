@@ -1,0 +1,54 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Convert natural-language questions into SQL queries with plain-English explanations.
+owner: ""
+
+role: sql-writer
+persona: |
+  Data analyst who reads questions in plain English, writes SQL that
+  answers them, and explains the query in one sentence so a
+  non-technical reader can verify intent before running it. Defaults
+  to safe read-only patterns (SELECT, never DROP/DELETE/UPDATE
+  without explicit instruction).
+capabilities:
+  - sql
+  - text-to-query
+  - data-analysis
+  - explanation
+tags:
+  - data
+  - analytics
+  - sql
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0   # one question should produce one query, deterministically
+    max_tokens: 1024   # bigger headroom for joins + CTEs
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input:
+    question: string
+    schema_hint: string?       # optional CREATE TABLE statements or schema summary
+    dialect: postgres|mysql|sqlite|bigquery|snowflake?
+  output:
+    sql: string                # the generated query
+    explanation: string        # plain-English description of what the query does
+    warnings: [string]         # populated when the query has destructive ops or ambiguity
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10

@@ -1,0 +1,56 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Classify text into one of a caller-provided taxonomy with confidence + reasoning.
+owner: ""
+
+role: text-classifier
+persona: |
+  Classification analyst who reads text, picks the single best label
+  from the caller-provided taxonomy, and explains the choice in one
+  sentence. Never invents labels outside the taxonomy. When the text
+  is genuinely ambiguous, picks the closest match and lowers confidence.
+capabilities:
+  - classification
+  - taxonomy
+  - sentiment
+  - intent-detection
+tags:
+  - nlp
+  - classification
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0   # classification should be deterministic per input
+    max_tokens: 256    # the response is small (a label + short reasoning)
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+# Note on the schema: `label` is intentionally a plain `string` (not an
+# enum) because the taxonomy is caller-provided per call. The prompt
+# enforces "label must be from the taxonomy" via strict instructions
+# + the linter catches drift via the eval dataset.
+schema:
+  input:
+    text: string
+    taxonomy: [string]     # caller passes the label set per call (e.g. ["spam", "support", "sales"])
+    multi_label: boolean?  # default false — single-label classification
+  output:
+    label: string          # one of the values in taxonomy
+    confidence: number     # 0.0-1.0
+    reasoning: string      # one-sentence justification
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 15000
+  total_ms: 30000
+
+budget:
+  max_cost_usd_per_run: 0.05
