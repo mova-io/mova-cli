@@ -69,6 +69,16 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "if any agent fails its gate. The CI eval-gate workflow uses this."
         ),
     ),
+    project: bool = typer.Option(
+        False,
+        "--project",
+        "-p",
+        help=(
+            "Run eval on every agent under <path>/agents/*. Each agent must "
+            "ship evals/dataset.jsonl. Exits non-zero if any agent misses "
+            "its gate. Use to gate a whole project in CI."
+        ),
+    ),
     gate: float = typer.Option(0.7, "--gate", help="Per-case score required to pass (0.0-1.0)."),
     gate_mode: str = typer.Option(
         "mean",
@@ -221,6 +231,20 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             runs=runs,
             mock=mock,
             regression_tolerance=regression_tolerance,
+        )
+        return
+
+    # Project mode: short-circuit before single-agent setup. Walks
+    # <root>/agents/*, runs eval per-agent, exits non-zero if any
+    # agent misses its gate.
+    if project:
+        _eval_project(
+            path,
+            gate=gate,
+            gate_mode=gate_mode,
+            runs=runs,
+            mock=mock,
+            output_format=output_format,
         )
         return
 
@@ -1359,3 +1383,202 @@ def _configure_mock_for_bundle(provider: object, bundle: AgentBundle) -> None:
     expecteds = load_dataset_expecteds(dataset_path)
     if expecteds:
         provider.configure_dataset(expecteds)
+
+
+# ---------------------------------------------------------------------------
+# Project-mode: eval every agent under <root>/agents/*
+# ---------------------------------------------------------------------------
+
+
+def _find_project_root_for_eval(start: Path) -> Path | None:
+    """Walk up from ``start`` looking for ``movate.yaml``.
+
+    Duplicate of the same walk in :mod:`movate.cli.validate` — kept
+    here rather than imported across modules to avoid a circular
+    dependency between sibling command modules. Five lines.
+    """
+    current = start.resolve()
+    while True:
+        if (current / "movate.yaml").is_file():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def _eval_one_agent_in_project(
+    agent_path: Path,
+    dataset_path: Path,
+    *,
+    gate: float,
+    gate_mode: str,
+    runs: int,
+    mock: bool,
+    output_format: Report,
+) -> tuple[str, str]:
+    """Run eval for a single agent inside the project loop.
+
+    Returns ``(status, detail)`` where status is one of
+    ``"pass" | "fail" | "skipped"`` and detail is a short human-readable
+    explanation. Extracted out of :func:`_eval_project` so that
+    function's branch count stays inside Ruff's PLR0912 limit and the
+    per-agent error handling reads as one cohesive block.
+
+    Catches :class:`typer.Exit` (gate miss) and any other exception
+    (load error, runtime crash) so a single bad agent doesn't abort
+    the project-wide loop — the operator sees the full picture in
+    the rolled-up summary table.
+    """
+    if not dataset_path.is_file():
+        console.print("  [yellow]⚠ skipped[/yellow]: no evals/dataset.jsonl")
+        return ("skipped", "no dataset")
+
+    try:
+        bundle = load_agent(agent_path)
+    except AgentLoadError as exc:
+        console.print(f"  [red]✗ load failed:[/red] {exc}")
+        return ("fail", "load error")
+
+    try:
+        asyncio.run(
+            _run_eval(
+                bundle,
+                gate=gate,
+                gate_mode=gate_mode,
+                runs=runs,
+                mock=mock,
+                baseline_id=None,
+                baseline_file=None,
+                output_baseline=None,
+                regression_tolerance=0.0,
+                objective=None,
+                output_format=output_format,
+                remote_url=None,
+                remote_api_key=None,
+            )
+        )
+        return ("pass", "")
+    except typer.Exit as exc:
+        code = getattr(exc, "exit_code", 2)
+        return ("fail", f"exit {code}")
+    except Exception as exc:
+        console.print(f"  [red]✗ unexpected:[/red] {exc}")
+        return ("fail", type(exc).__name__)
+
+
+def _eval_project(
+    path: str | None,
+    *,
+    gate: float,
+    gate_mode: str,
+    runs: int,
+    mock: bool,
+    output_format: Report,
+) -> None:
+    """Run eval on every agent under ``<root>/agents/*`` and roll up.
+
+    Resolution order for the project root:
+      1. ``path`` argument if a directory
+      2. Walk up from cwd looking for ``movate.yaml``
+      3. Hard error (exit 2)
+
+    Per-agent eval reuses the existing :func:`_run_eval` so the
+    aggregation rules, dimensional scoring, baseline diff, and JSON
+    output all stay in one place. Each agent runs in its own asyncio
+    event-loop invocation — costs a bit on runtime setup but keeps
+    the loop simple and isolates per-agent failures.
+
+    Skips agents without ``evals/dataset.jsonl`` (with a warning row).
+    Exits 2 if any agent fails its gate.
+    """
+    # Resolve project root.
+    if path is not None:
+        candidate = Path(path)
+        if not candidate.is_dir():
+            err_console.print(f"[red]✗[/red] --project path is not a directory: {candidate}")
+            raise typer.Exit(code=2)
+        root = candidate.resolve()
+    else:
+        found = _find_project_root_for_eval(Path.cwd())
+        if found is None:
+            err_console.print(
+                "[red]✗[/red] no [bold]movate.yaml[/bold] found in cwd "
+                "or any parent. Pass a project path explicitly: "
+                "[bold]mdk eval <path> --project[/bold]"
+            )
+            raise typer.Exit(code=2)
+        root = found
+
+    # Discover agents.
+    agents_dir = root / "agents"
+    if not agents_dir.is_dir():
+        err_console.print(
+            f"[yellow]⚠[/yellow] no [bold]agents/[/bold] dir under {root} — nothing to eval"
+        )
+        raise typer.Exit(code=2)
+
+    candidates = sorted(
+        entry
+        for entry in agents_dir.iterdir()
+        if entry.is_dir() and (entry / "agent.yaml").is_file()
+    )
+    if not candidates:
+        err_console.print(
+            f"[yellow]⚠[/yellow] no agents found under {agents_dir} — nothing to eval"
+        )
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"[bold]Evaluating[/bold] [cyan]{len(candidates)}[/cyan] agent(s) "
+        f"under [bold]{agents_dir}[/bold] "
+        f"(gate={gate}, mode={gate_mode}, runs={runs})"
+    )
+    console.print()
+
+    results: list[tuple[str, str, str]] = []
+    for agent_path in candidates:
+        agent_name = agent_path.name
+        console.print(f"[bold]── {agent_name} ──[/bold]")
+        # Skip agents with no dataset.
+        dataset_path = agent_path / "evals" / "dataset.jsonl"
+        status, detail = _eval_one_agent_in_project(
+            agent_path,
+            dataset_path,
+            gate=gate,
+            gate_mode=gate_mode,
+            runs=runs,
+            mock=mock,
+            output_format=output_format,
+        )
+        results.append((agent_name, status, detail))
+        console.print()
+
+    # Rolled-up summary.
+    from rich.table import Table as _Table  # noqa: PLC0415  -- lazy import
+
+    table = _Table(title="Project eval summary", title_style="bold")
+    table.add_column("Agent", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Detail", style="dim")
+    passes = fails = skipped = 0
+    for name, status, detail in results:
+        if status == "pass":
+            table.add_row(name, "[green]✓ pass[/green]", "")
+            passes += 1
+        elif status == "skipped":
+            table.add_row(name, "[yellow]⊘ skip[/yellow]", detail)
+            skipped += 1
+        else:
+            table.add_row(name, "[red]✗ fail[/red]", detail)
+            fails += 1
+    console.print(table)
+    console.print()
+    if fails:
+        console.print(
+            f"[red]✗[/red] {fails} of {len(results)} agent(s) failed eval "
+            f"({passes} passed, {skipped} skipped)"
+        )
+        raise typer.Exit(code=2)
+    console.print(
+        f"[green]✓[/green] all eligible agents passed ({passes} passed, {skipped} skipped)"
+    )

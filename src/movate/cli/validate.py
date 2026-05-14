@@ -97,6 +97,15 @@ def validate(
         "--no-lint",
         help="Skip the prompt linter (schema + policy checks still run).",
     ),
+    project: bool = typer.Option(
+        False,
+        "--project",
+        "-p",
+        help=(
+            "Validate every agent under <path>/agents/*. Exits non-zero if "
+            "any fails. Use to gate a whole project in CI."
+        ),
+    ),
 ) -> None:
     """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references.
 
@@ -107,6 +116,9 @@ def validate(
     current project in one shot — handy right after
     [bold]mdk init --project --with-agents X,Y,Z[/bold].
     """
+    if project:
+        _validate_project(path, strict=strict, run_linter=not no_lint)
+        return
     if all_in_project:
         # --all is mutually exclusive with a path argument. Passing
         # both is almost certainly a typo — surface it cleanly rather
@@ -480,3 +492,133 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  edges:       {len(graph.edges)}")
     chain = " → ".join(graph.topological_order())
     console.print(f"  topology:    {chain}")
+
+
+# ---------------------------------------------------------------------------
+# Project-mode: validate every agent under <root>/agents/*
+# ---------------------------------------------------------------------------
+
+
+def _find_project_root_for_validate(start: Path) -> Path | None:
+    """Walk up from ``start`` looking for ``movate.yaml``.
+
+    Mirrors :func:`movate.cli.add._find_project_root` — duplicated rather
+    than imported to keep ``validate`` independent of ``add`` (they're
+    in different command panels and we don't want a circular import if
+    someone later cross-references). Same five-line walk.
+    """
+    current = start.resolve()
+    while True:
+        if (current / "movate.yaml").is_file():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def _discover_project_agents(root: Path) -> list[Path]:
+    """Return every ``<root>/agents/<name>/`` that looks like an agent dir.
+
+    "Looks like an agent" = ships an ``agent.yaml``. Workflow dirs
+    (``workflow.yaml``) are skipped here — project-mode validate
+    focuses on agents, since workflows reference agents and any
+    workflow node failure surfaces as an agent failure. A future
+    iteration may also walk ``<root>/workflows/*`` for explicit
+    workflow validation in project mode.
+    """
+    agents_dir = root / "agents"
+    if not agents_dir.is_dir():
+        return []
+    return sorted(
+        entry
+        for entry in agents_dir.iterdir()
+        if entry.is_dir() and (entry / "agent.yaml").is_file()
+    )
+
+
+def _validate_project(path: Path | None, *, strict: bool, run_linter: bool) -> None:
+    """Validate every agent under ``<root>/agents/*``; roll up to a summary.
+
+    Resolution order for the project root:
+      1. ``path`` argument if provided and a directory
+      2. Walk up from cwd looking for ``movate.yaml``
+      3. Hard error (exit 2) if neither yields a project root
+
+    Per-agent validation reuses :func:`_validate_agent` so the rules
+    (load, runtime policy, model policy, skill policy, prompt linter)
+    stay in one place. We catch :class:`typer.Exit` per agent so one
+    failure doesn't abort the loop — the operator sees all failures
+    at once, not just the first.
+
+    Exits 2 if any agent fails. Exits 0 if every agent passes. Exits
+    2 with an explanatory message if the project has zero agents.
+    """
+    if path is not None:
+        if not path.is_dir():
+            console.print(f"[red]error:[/red] --project path is not a directory: {path}")
+            raise typer.Exit(code=2)
+        root = path.resolve()
+    else:
+        found = _find_project_root_for_validate(Path.cwd())
+        if found is None:
+            console.print(
+                "[red]error:[/red] no [bold]movate.yaml[/bold] found in cwd "
+                "or any parent. Pass a project path explicitly: "
+                "[bold]mdk validate <path> --project[/bold]"
+            )
+            raise typer.Exit(code=2)
+        root = found
+
+    agents = _discover_project_agents(root)
+    if not agents:
+        console.print(
+            f"[yellow]⚠[/yellow] no agents found under "
+            f"[bold]{root}/agents/[/bold] — nothing to validate"
+        )
+        raise typer.Exit(code=2)
+
+    display_root = (
+        root.relative_to(Path.cwd()) if root.is_relative_to(Path.cwd()) else root
+    )
+    console.print(
+        f"[bold]Validating[/bold] [cyan]{len(agents)}[/cyan] agent(s) "
+        f"under [bold]{display_root}/agents/[/bold]"
+    )
+    console.print()
+
+    from rich.table import Table  # noqa: PLC0415  -- lazy; project mode only
+
+    results: list[tuple[str, bool, str]] = []
+    for agent_path in agents:
+        agent_name = agent_path.name
+        console.print(f"[bold]── {agent_name} ──[/bold]")
+        try:
+            _validate_agent(agent_path, strict=strict, run_linter=run_linter)
+            results.append((agent_name, True, ""))
+        except typer.Exit as exc:
+            # _validate_agent prints its own [red]✗[/red] line; we
+            # only need to remember the failure for the summary.
+            code = getattr(exc, "exit_code", 2)
+            results.append((agent_name, False, f"exit {code}"))
+        console.print()
+
+    # Rolled-up summary table.
+    table = Table(title="Validation summary", title_style="bold", show_lines=False)
+    table.add_column("Agent", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Detail", style="dim")
+    passes = 0
+    fails = 0
+    for name, ok, detail in results:
+        if ok:
+            table.add_row(name, "[green]✓ pass[/green]", "")
+            passes += 1
+        else:
+            table.add_row(name, "[red]✗ fail[/red]", detail)
+            fails += 1
+    console.print(table)
+    console.print()
+    if fails:
+        console.print(f"[red]✗[/red] {fails} of {len(results)} agent(s) failed validation")
+        raise typer.Exit(code=2)
+    console.print(f"[green]✓[/green] all {passes} agent(s) passed validation")
