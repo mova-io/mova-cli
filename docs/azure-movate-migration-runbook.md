@@ -1,27 +1,28 @@
 # Azure migration runbook — personal sandbox → Movate sub
 
-> ⏸ **Status: PAUSED 2026-05-14.** Step 3 (first-pass Bicep deploy)
-> partially completed — ACR, Key Vault, Postgres, Log Analytics, the
-> Container Apps Environment, and the three user-assigned managed
-> identities were all provisioned successfully on the Movate sub.
-> The deploy then failed on the 6 role-assignment resources because
-> the service principal `fe9e2bf7-...` has Contributor but not
-> `Microsoft.Authorization/roleAssignments/write`.
+> ✅ **Status: COMPLETE 2026-05-14.** Migration landed end-to-end.
+> New runtime live at
+> `https://movate-dev-api.bluebush-9aec1e70.eastus2.azurecontainerapps.io`
+> on the Movate `AZLABSV2.0-Sandbox(POC)` sub. Real OpenAI calls
+> verified via `faq-agent` ($3.6e-05 cost, 35-output-token response,
+> 2972ms latency — proves API → Worker → Postgres → KV → LLM all
+> wired correctly).
 >
-> **To resume:** Movate ops needs to grant the SP `User Access
-> Administrator` (or `Owner`) on the subscription. Once granted,
-> re-running the exact same `az deployment group create` from step 3
-> is idempotent — it skips the already-created resources and adds the
-> missing role assignments. Then continue from step 4.
+> **Resolution of the earlier blocker:** Movate ops granted the SP
+> `User Access Administrator` on the sub. The Bicep deploy is
+> idempotent — re-running it picked up where it left off and added
+> the 6 missing role assignments cleanly. ARM eventual-consistency
+> on `listKeys()` for the freshly-created Log Analytics workspace
+> tripped one extra retry; the second attempt succeeded.
 >
-> **What's still running in the meantime:** the personal-sub stack
-> (`61ea8b9b-...`) is fully operational and serving Deva. The
-> Friday demo runs against the personal-sub URL unchanged. The
-> partial Movate-sub `movate-dev-rg` is left in place (~$20/mo
-> Postgres dominant) as a head-start for the eventual resume.
+> **What's still running:** the personal-sub stack (`61ea8b9b-...`)
+> remains live as a fallback through the Friday demo. The
+> `dev-personal` target in `~/.movate/config.yaml` points at it for
+> easy access if anything goes sideways. Decommission per the
+> "Post-cutover cleanup" section below once the demo confirms.
 
 **Authored:** 2026-05-14
-**Window:** originally Thu PM → Fri AM. Now: resume when SP is elevated.
+**Completed:** 2026-05-14 (same day)
 **Strategy:** Blue/green — deploy fresh stack on Movate sub in parallel, verify, cut Deva over, decommission old infra after demo confirms working.
 
 ---
