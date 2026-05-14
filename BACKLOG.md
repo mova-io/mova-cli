@@ -537,6 +537,116 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 ---
 
+### Group K — CLI ergonomics + governance wishlist (2026-05-14, post-Deva)
+
+> _Twenty CLI-feature suggestions surfaced after the Mova iO mapping
+> discussion. Critically re-sorted into five tiers — most are real
+> wins, several are duplicates of existing surface, two are
+> Langfuse-territory (don't compete), and one (`mdk guardrails`) is
+> already shipped in PR #8 modulo the CLI wrapper. Detailed review
+> in the response that produced this section; this is the
+> backlog-canonical view._
+
+**Critical cross-cutting notes:**
+1. Several items cluster — `audit` + `doctor fix` + `migrate` form a *production-readiness* group; `secrets` + `profiles` + `bootstrap` form a *dev-environment* group. Ship cluster prerequisites first.
+2. `monitor` and full `tune` are Langfuse / Helicone / DataDog territory. MDK should INTEGRATE, not duplicate.
+3. `compose` and `memory` are placeholders for huge architectural decisions (workflow IR Phase 7, memory store Tier 5). Each is an ADR + a quarter of engineering — they're NOT same-granularity line items as `doctor fix`.
+4. **Missing killer feature**: `mdk diff` — show diff between two snapshots (prompts, policies, eval scores, costs) so operators can answer "what changed and is that why cost doubled?". Higher-leverage than `monitor`.
+
+#### K-shipped — Already done
+
+129. [x] **`mdk guardrails`** `[HIGH] [v0.7] [done 2026-05-14]` — Engine shipped in PR #8 (Phase J-0): PII regex / topic allow-deny / content filter, wired to Executor entry+exit, surfaces as `safety_blocked`. The `mdk guardrails test|validate|enable|disable` CLI wrapper on top of the engine is ~1-2 days follow-up (item 130).
+
+130. [ ] **`mdk guardrails` CLI wrapper** `[MED] [v0.7] [~1-2d]` — Companion to the J-0 engine. Subcommands: `test <text>` (dry-run a string against the configured guardrails), `validate` (check `movate.yaml: guardrails:` block is well-formed), `enable / disable <module>` (toggle individual guardrails without editing YAML). Pairs with item 129.
+
+#### K-shipsoon — Tier 1: contained, high leverage (~2-5 days each)
+
+131. [ ] **`mdk doctor fix`** `[HIGH] [v0.7] [~2-3d]` — Auto-remediate the common environment / setup issues that `mdk doctor` already detects: missing env vars (write to `.env.example`), wrong Python version (suggest `uv python install`), missing optional extras (suggest `uv add 'movate-cli[anthropic]'`), Docker not running (start command per OS), API-key not set (interactive prompt). **MUST default to `--dry-run`** with `--apply` opt-in — auto-modifying the user's shell is dangerous. Print every action before firing.
+
+132. [ ] **`mdk import openapi <spec-url-or-path>`** `[HIGH] [v0.8] [~3-5d]` — **Sleeper hit.** Generate skill stubs from an OpenAPI / Swagger spec. Each operation becomes a skill: `tool.yaml` with input/output schemas pulled from the spec, `handler.py` stub with `requests.<verb>(...)` boilerplate. Enterprise win: 50 internal APIs, OpenAPI specs already exist, MDK auto-scaffolds the skills. Saves days per integration. Pairs with item 7 in the original suggestion list.
+
+133. [ ] **`mdk audit`** `[HIGH] [v0.7] [~3-4d]` — Production-readiness scanner that wraps existing checks (prompt linter, policy validator) + new ones (exposed secrets in agent.yaml, missing evals, agents without datasets, agents without owners). Single command, single pass/fail report, designed for CI gating. Pairs with PR #6 (`mdk validate --project`). Output: Rich table per category + JSON for CI annotations.
+
+134. [ ] **`mdk migrate`** `[HIGH] [v0.8] [~3-4d]` — **Underrated foundational tool.** Schema migrations for `api_version: movate/vN → vM` (when we bump), eval dataset format changes, vector-DB metadata bumps. Walks the project, applies a registered migration function per file, prints a diff before writing. Without this, every schema bump is a manual hand-edit-every-YAML chore. Critical before any major version bump.
+
+135. [ ] **`mdk rollback`** `[MED] [v0.7] [~2d]` — Thin wrapper over `az containerapp revision activate` (ACA natively supports revision-based rollback). Operator picks from a revision list with status + deploy time + git SHA. Reliable demo confidence + audit trail. Pairs with `snapshot` (item 136).
+
+136. [ ] **`mdk snapshot`** `[MED] [v0.7] [~2-3d]` — Capture reproducible state at a point in time: prompt hashes + agent.yaml + eval scores + pricing version + provider version + model version + git SHA, bundled as a tagged artifact. Useful **only** if it bundles things `git` doesn't already capture (eval scores, pricing version, provider versions). Audit-trail story. Pairs with `rollback` and `diff`.
+
+137. [ ] **`mdk diff <snap-a> <snap-b>`** `[HIGH] [v0.7] [~2d]` — *Added by reviewer, not in original list.* Compare two snapshots. Diff prompts, policies, eval scores, costs, model versions. Answers "what changed between green-bar and red-bar?" — more useful than a live monitor for the most common failure mode (degradation introduced by a recent change). Pairs with `snapshot` + `rollback`.
+
+#### K-bigwin — Tier 2: worth doing but own phase each (~1-2 weeks)
+
+138. [ ] **`mdk secrets`** `[HIGH] [v0.8] [~1-2w]` — Centralised secret management: per-profile (`local` / `dev` / `prod`) namespacing, `.env` for local, Azure Key Vault for dev/prod, SOPS encryption for git-tracked secrets, `mdk secrets {set, get, rotate, sync}` subcommands. Pairs with `profiles` (item 139). Foundational ops feature. Touches env loading, Key Vault refs in Bicep, and the per-target deploy path.
+
+139. [ ] **`mdk profiles`** `[MED] [v0.8] [~3-4d]` — Kubectl/aws-profile pattern. `mdk profiles use prod` switches the active config + secret namespace + deploy target. **Re-uses existing surface**: `MDK_TARGET` env + `mdk config` already does some of this. Frame this as a REFACTOR/consolidation, not net-new. Pairs with item 138.
+
+140. [ ] **`mdk simulate`** `[MED] [v0.9] [~5-7d]` — Conversational stress-testing for the `chatbot` template specifically. Adversarial-user simulator generates N synthetic conversations (jailbreaks, prompt injections, off-topic loops, long contexts) and reports failure modes. Don't try to be everything — dataset-driven stress testing is what `mdk eval` already does. Scope: chatbot agents only.
+
+141. [ ] **`mdk benchmark live`** `[HIGH] [v0.9] [~1-2w]` — Traffic-shadowing for safe model upgrades. Mirror prod requests to candidate model(s) in the background, compare results offline, never serve shadow output. Surfaces latency / cost / accuracy deltas per candidate. High value for production model upgrades. Requires the runtime to be in async-job mode (item 110 path). Don't confuse with offline `mdk bench` (dataset-driven model comparison).
+
+#### K-rescope — Tier 3: re-scope the original wording before building
+
+142. [ ] **`mdk init --project`** `[HIGH] [v0.7] [~1d]` — Re-scoped from "`mdk bootstrap`" — adding a `--project` flag to existing `mdk init` instead of a new command. Drops `movate.yaml`, `agents/`, `workflows/`, `skills/`, `contexts/`, `evals/baseline.json`, `.env.example`, `.gitignore`, a sample agent (default template), plus a `README.md` for the project. Surface bloat is the enemy — new command for the same outcome is the wrong choice.
+
+143. [ ] **`mdk docs runbook`** `[MED] [v0.8] [~3d]` — Re-scoped from "`mdk docs`" — auto-generated docs that mirror YAML are notoriously low-value. A RUNBOOK is what ops actually wants: env vars needed, how to invoke (with example payload), expected costs, recovery procedures, who to page on failure. Generate it once at deploy time as the handoff artifact. Reads from agent.yaml + movate.yaml + the deploy target's config.
+
+144. [ ] **`mdk watch --live`** `[MED] [v0.8] [~3d]` — Re-scoped from "`mdk monitor`" — Langfuse already provides the web dashboard for the metrics in question. Don't compete on its home turf. MDK's value-add is a TERMINAL view (curses-style live-updating table) for ops who SSH'd into a box and don't have a browser. Tightly scoped: latency p50/p95, token rate, cost burn-rate, error count, per the last 60s/5m/1h window.
+
+145. [ ] **`mdk tune`** `[LOW] [v0.9] [~2d for deterministic; ~3w for full]` — Re-scoped: ship **deterministic suggestions only**. "Your max_tokens=4096 but p95 response=200; cap at 512 and save 12%." "Your gpt-4 calls average 50 tokens — gpt-4o-mini would save 70% with negligible quality loss per your evals." These are heuristics over RunRecord history. **Don't ship auto-prompt-engineering** — it's mostly smoke; DSPy / academic tools haven't shown real-world wins outside benchmarks. Defer the prompt-tune piece indefinitely.
+
+#### K-export — Tier 4: lingua-franca exports (post-v1.0)
+
+146. [ ] **`mdk export langgraph <agent>`** `[MED] [v1.1+] [~1-2w]` — Compile an MDK `AgentBundle` to a LangGraph `Runnable`. Aligns with the existing Phase 7 plan ("LangGraph swap-in via alternative compiler"). Strategic value: MDK is the IDE; we compile to LangGraph when conditional routing / parallel / HITL is needed. Map: agent + skills → LangGraph node + tools.
+
+147. [ ] **`mdk export json-schema <agent>`** `[LOW] [v0.7] [~½d]` — Trivial. Emit the input/output JSON schemas in standalone form for downstream type-generation (Pydantic, TypeScript, Go). We already have the validators — wrapping them is a few lines. Worth shipping as a fast win.
+
+148. [ ] **`mdk export oci-bundle <agent>`** `[MED] [v1.0] [~3-5d]` — Package an agent + skills + prompt + schemas + eval dataset + provider version + pricing version as an OCI artifact (Helm-chart-style). Reproducible deploys; works with any OCI-compliant registry (ACR, GAR, ECR). The packaging story is real for enterprise customers who require artifact-based deploys.
+
+149. ~~`mdk export crewai / openai-agents-sdk`~~ — **NOT BUILDING.** Strategic value of compile-to-CrewAI is dubious — users who want CrewAI use CrewAI natively. Don't dilute the export story across three frameworks; double down on LangGraph (where the strategic case is real).
+
+#### K-skip — Tier 5: skeptical / defer
+
+150. ~~`mdk shell`~~ — **DEFER.** Engineers use their actual shell. The "env vars + tracing preloaded" benefit is solved by `.env` + `direnv`. ~2-3d for unclear value. Pick up if user demand materialises.
+
+151. ~~`mdk seed`~~ — **DEFER to v0.9.** Most value (eval datasets) already ships per role template. Sample KB data lands when RAG has substance (Phase J-4 ships a stub). Premature today.
+
+#### K-blocked — Blocks on architectural work
+
+152. [ ] **`mdk memory {list, inspect, evict, summarise}`** `[MED] [v0.8] [~5d CLI + ~4w engine]` — **BLOCKED on memory architecture.** Memory store (Tier 5 in the existing plan) is a v0.8 build. CLI is ~5 days on top of the engine. Don't pull this forward — it'll be hollow until memory has substance.
+
+153. [ ] **`mdk compose`** `[MED] [v1.1+] [~2-3w]` — **BLOCKED on Phase 7.** Multi-agent declarative composition is the conditional-routing/parallel story, which requires the workflow IR to mature. Today's workflows are linear (v0.3). When LangGraph swap-in lands (Phase 7), compose is the user-facing surface on top.
+
+#### K-est — Recommended pickup order
+
+**Q3 2026 (next 6 weeks):**
+* 130 — `mdk guardrails` CLI wrapper (engine already shipped)
+* 142 — `mdk init --project`
+* 131 — `mdk doctor fix` (with --dry-run default)
+* 133 — `mdk audit`
+* 147 — `mdk export json-schema`
+* 134 — `mdk migrate`
+
+**Q3-Q4 2026:**
+* 135 + 136 + 137 — rollback + snapshot + diff (cluster)
+* 132 — openapi import
+* 143 — docs runbook
+* 144 — watch --live
+
+**Q4 2026:**
+* 138 + 139 — secrets + profiles (cluster)
+* 145 — tune (deterministic only)
+* 148 — oci-bundle export
+* 146 — langgraph export
+
+**v0.9+:**
+* 140 — simulate (chatbot stress)
+* 141 — benchmark live (shadow traffic)
+* 152 — memory CLI (after engine lands)
+* 153 — compose (after Phase 7 lands)
+
+---
+
 ## 1. Foundation — single agent (Phase 1 / v0.1)
 
 ### Already shipped
