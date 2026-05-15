@@ -108,6 +108,20 @@ __pycache__/
 """
 
 
+def _is_in_project() -> bool:
+    """Walk up from cwd looking for ``movate.yaml`` — the same
+    convention :mod:`movate.cli.add_cmd` uses. Lets ``mdk init``
+    surface a context-aware hint when called outside a project.
+    """
+    current = Path.cwd().resolve()
+    while True:
+        if (current / "movate.yaml").is_file():
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
 # ---------------------------------------------------------------------------
 # Project mode
 # ---------------------------------------------------------------------------
@@ -832,11 +846,23 @@ def init(
         return
 
     if not name:
-        err_console.print(
-            "[red]✗[/red] agent name required. "
-            "[dim]Run [bold]mdk init --help[/bold] for usage, or pass "
-            "[bold]--project[/bold] to bootstrap a project instead.[/dim]"
-        )
+        # Context-aware hint: if the cwd has no movate.yaml anywhere up
+        # the tree, the operator is probably trying to bootstrap a
+        # project. Steer them to the right flag.
+        in_project = _is_in_project()
+        if not in_project:
+            err_console.print(
+                "[red]✗[/red] agent name required. "
+                "[dim]You're not in a movate project yet — try "
+                "[bold]mdk init --project <name>[/bold] to bootstrap "
+                "one first.[/dim]"
+            )
+        else:
+            err_console.print(
+                "[red]✗[/red] agent name required. "
+                "[dim]Run [bold]mdk init --help[/bold] for usage, or pass "
+                "[bold]--project[/bold] to bootstrap a project instead.[/dim]"
+            )
         raise typer.Exit(code=2)
 
     # Agent mode: dispatch to LLM-scaffold or template-scaffold path.
