@@ -44,9 +44,15 @@ class TargetConfig(BaseModel):
     Apps to update. All Azure fields are optional — pure read-only
     targets (e.g. a customer's runtime you can submit jobs to but
     can't deploy) leave them None.
+
+    ``extra="allow"`` so operators can annotate targets with custom
+    fields (links to dashboards, runbook URLs, IT-ops references)
+    without the loader rejecting them. The CLI ignores unknown fields
+    at read time and preserves them on rewrite via Pydantic v2's
+    ``model_extra`` mechanism.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     url: str = Field(
         ...,
