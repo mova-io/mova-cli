@@ -59,8 +59,9 @@ def test_init_project_movate_yaml_is_valid_project_config(tmp_path: Path) -> Non
     runner.invoke(app, ["init", "my-proj", "--project", "--target", str(tmp_path)])
     raw = (tmp_path / "my-proj" / "movate.yaml").read_text()
     # Project name is preserved in the comment header — operators can
-    # still grep for it by name.
-    assert "my-proj" in raw.splitlines()[0]
+    # still grep for it by name. Comment header is multi-line (banner +
+    # name on a subsequent line) so search anywhere in the file.
+    assert "my-proj" in raw
     # Body parses + validates cleanly.
     data = yaml.safe_load(raw)
     cfg = ProjectConfig.model_validate(data)
@@ -120,7 +121,9 @@ def test_init_project_in_place_uses_cwd_name(
     assert (tmp_path / "movate.yaml").is_file()
     raw = (tmp_path / "movate.yaml").read_text()
     # The project name appears in the comment header, derived from cwd.
-    assert tmp_path.name in raw.splitlines()[0]
+    # The banner spans multiple lines so search the whole file body
+    # rather than just line 1.
+    assert tmp_path.name in raw
 
 
 @pytest.mark.unit
