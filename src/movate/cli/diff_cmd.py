@@ -1,16 +1,24 @@
-"""``mdk diff <snap-a> <snap-b>`` — snapshot diff (Sprint N Day 4-5).
+"""``mdk diff`` — snapshot diff (Sprint N Day 4-5) + git working-tree diff (Sprint Q).
 
-Companion to :mod:`movate.cli.snapshot_cmd`. Answers the most-common
-operational question: *what changed between two snapshots?* — the
-analog of ``git diff`` for the AI system's state graph.
+Two modes:
 
-Pure read-only: never modifies either snapshot, never touches disk
-outside reading the two manifests.
+* ``mdk diff <snap-a> <snap-b>`` — compare two snapshots. The original
+  Sprint N form. Companion to :mod:`movate.cli.snapshot_cmd`; analog
+  of ``git diff`` for the AI system's state graph.
+
+* ``mdk diff --git`` — compare working tree against the last commit
+  (or any git ref via ``--ref``). Sprint Q extension. Answers "did I
+  introduce drift since my last commit?" without needing an explicit
+  snapshot. Cheap UX win; reuses git's own diff machinery.
+
+Both are pure read-only: never modify state, never touch disk outside
+reading what they need to compare.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import typer
@@ -27,6 +35,22 @@ from movate.snapshot.store import resolve_snapshot
 
 console = Console()
 err_console = Console(stderr=True)
+
+# Capture roots — duplicated from movate.snapshot.store (kept private
+# there). We mirror them here so the git-diff filter scopes the same
+# way the snapshot capture does. If the store's roots change, this
+# constant should track them — a Sprint S+ refactor could lift this
+# into a single module-level constant, but for ½d effort the duplicate
+# is cheaper than the breaking-change risk.
+_CAPTURE_ROOTS: tuple[str, ...] = (
+    "movate.yaml",
+    "policy.yaml",
+    "knowledge.yaml",
+    "agents",
+    "contexts",
+    "workflows",
+    "skills",
+)
 
 
 def _resolve_project_root(explicit: Path | None) -> Path:
@@ -53,12 +77,34 @@ def _resolve_project_root(explicit: Path | None) -> Path:
 
 def diff(
     snap_a: str = typer.Argument(
-        ...,
-        help="'Before' snapshot — full hash or short-hash prefix (≥4 chars).",
+        "",
+        help=(
+            "'Before' snapshot — full hash or short-hash prefix (≥4 chars). "
+            "Omit when using [bold]--git[/bold]."
+        ),
     ),
     snap_b: str = typer.Argument(
-        ...,
-        help="'After' snapshot — full hash or short-hash prefix.",
+        "",
+        help=(
+            "'After' snapshot — full hash or short-hash prefix. Omit when using [bold]--git[/bold]."
+        ),
+    ),
+    git: bool = typer.Option(
+        False,
+        "--git",
+        help=(
+            "Compare the working tree against the last commit (or [bold]--ref[/bold]) "
+            "instead of two snapshots. Cheap drift check before committing."
+        ),
+    ),
+    ref: str = typer.Option(
+        "HEAD",
+        "--ref",
+        help=(
+            "Git ref to compare against in [bold]--git[/bold] mode. "
+            "Defaults to HEAD. Examples: [dim]main[/dim], "
+            "[dim]release/v0.7[/dim], [dim]<commit-sha>[/dim]."
+        ),
     ),
     project: Path | None = typer.Option(
         None,
@@ -81,19 +127,28 @@ def diff(
         ),
     ),
 ) -> None:
-    """Compare two snapshots and render what changed between them.
+    """Compare two snapshots or the working tree against a git commit.
 
-    Shows files added / removed / modified, plus agent + workflow
-    count deltas. Answers \"what changed between green-bar and
-    red-bar?\" — the most common operational failure-mode question.
+    [bold]Snapshot mode[/bold] ([cyan]mdk diff <a> <b>[/cyan]) — shows
+    files added / removed / modified between two snapshots, plus agent +
+    workflow count deltas. Answers "what changed between green-bar and
+    red-bar?"
+
+    [bold]Git mode[/bold] ([cyan]mdk diff --git[/cyan]) — shows files
+    under the captured roots ([bold]agents/[/bold], [bold]movate.yaml[/bold],
+    etc.) that differ between the working tree and the named git ref.
+    Quick pre-commit drift check; no snapshot needed.
 
     [bold]Examples:[/bold]
 
-      [dim]# Compare two snapshots (typical use after `mdk snapshot list`)[/dim]
+      [dim]# Snapshot vs snapshot (Sprint N original)[/dim]
       $ mdk diff abc12345 def67890
 
-      [dim]# Full UUID form also works[/dim]
-      $ mdk diff sha256:abc12345... sha256:def67890...
+      [dim]# Working tree vs last commit (Sprint Q extension)[/dim]
+      $ mdk diff --git
+
+      [dim]# Working tree vs main[/dim]
+      $ mdk diff --git --ref main
 
       [dim]# CI gate — exit 1 if anything changed[/dim]
       $ mdk diff old-baseline current && echo "no drift"
@@ -102,6 +157,30 @@ def diff(
       $ mdk diff a b --json | jq '.files_modified[].path'
     """
     project_root = _resolve_project_root(project)
+
+    if git:
+        # Operator picked git mode; snap args are ignored.
+        if snap_a or snap_b:
+            err_console.print(
+                "[yellow]⚠[/yellow] [bold]--git[/bold] ignores positional snapshot args. "
+                "[dim]Use [bold]mdk diff a b[/bold] for snapshot-vs-snapshot, or "
+                "[bold]mdk diff --git[/bold] for working-tree-vs-commit.[/dim]"
+            )
+        _run_git_diff(
+            project_root=project_root,
+            ref=ref,
+            json_output=json_output,
+        )
+        return
+
+    # Snapshot mode — both snap args required.
+    if not snap_a or not snap_b:
+        err_console.print(
+            "[red]✗[/red] snapshot-vs-snapshot mode needs two positional args. "
+            "[dim]Run [bold]mdk diff --git[/bold] to compare against a git commit instead, "
+            "or [bold]mdk diff --help[/bold] for full usage.[/dim]"
+        )
+        raise typer.Exit(code=2)
 
     try:
         before = resolve_snapshot(project_root, snap_a)
@@ -263,3 +342,160 @@ def _bytes_str(n: int) -> str:
     if n < _MB_THRESHOLD:
         return f"{n / _KB_THRESHOLD:.1f} KB"
     return f"{n / _MB_THRESHOLD:.1f} MB"
+
+
+# ---------------------------------------------------------------------------
+# Git mode (Sprint Q extension)
+# ---------------------------------------------------------------------------
+
+
+# git diff --name-status emits a single-letter code per file:
+#   A — added           D — deleted          M — modified
+#   R — renamed         C — copied           T — type change
+#   U — unmerged        X — unknown
+# We map them into a human-readable label for the Rich table + a
+# normalized "status" string for the JSON output.
+_GIT_STATUS_LABEL = {
+    "A": "added",
+    "D": "deleted",
+    "M": "modified",
+    "R": "renamed",
+    "C": "copied",
+    "T": "type-change",
+    "U": "unmerged",
+}
+
+_GIT_STATUS_STYLE = {
+    "added": "green",
+    "deleted": "red",
+    "modified": "yellow",
+    "renamed": "cyan",
+    "copied": "cyan",
+    "type-change": "magenta",
+    "unmerged": "red",
+}
+
+# Minimum fields per ``git diff --name-status`` line: <status>\t<path>.
+# Renames/copies have 3 fields (``R100\told\tnew``); we strip the
+# similarity score and report the destination.
+_MIN_GIT_DIFF_LINE_FIELDS = 2
+
+
+def _run_git_diff(*, project_root: Path, ref: str, json_output: bool) -> None:
+    """Compare working tree against ``ref`` via ``git diff --name-status``.
+
+    Filters output to the same capture roots a snapshot would cover —
+    junk under .venv / __pycache__ doesn't bubble up.
+
+    Exits 1 when anything changed (drift detected), matching the
+    snapshot-mode exit-code contract so CI gating can use either
+    mode interchangeably.
+    """
+    if not (project_root / ".git").exists():
+        err_console.print(
+            f"[red]✗[/red] {project_root} is not a git repository "
+            "(no [bold].git/[/bold] directory found). "
+            "[dim]--git[/dim] mode needs a git repo to compare against."
+        )
+        raise typer.Exit(code=2)
+
+    # Build the git command. The `--` separator + capture-root paths
+    # confines the diff to files we'd care about. Skipping `--`
+    # would diff everything in the repo (license churn, etc.).
+    cmd = [
+        "git",
+        "-C",
+        str(project_root),
+        "diff",
+        "--name-status",
+        ref,
+        "--",
+        *_CAPTURE_ROOTS,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        err_console.print(
+            "[red]✗[/red] [bold]git[/bold] not found on PATH. "
+            "[dim]--git mode needs the git binary installed.[/dim]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    if result.returncode not in (0, 1):
+        # git diff returns 0 (no diff) or 1 (diff present) on success.
+        # Anything else is a real error (e.g. unknown ref, dirty index).
+        err_console.print(
+            f"[red]✗[/red] git diff failed: {result.stderr.strip() or 'unknown error'}"
+        )
+        raise typer.Exit(code=2)
+
+    changes = _parse_git_name_status(result.stdout)
+
+    if json_output:
+        payload = {
+            "ref": ref,
+            "project_root": str(project_root),
+            "changes": [{"status": c["status"], "path": c["path"]} for c in changes],
+            "n_changed": len(changes),
+        }
+        console.print_json(json.dumps(payload))
+    else:
+        _render_git_diff(changes, ref=ref, project_root=project_root)
+
+    # Drift = exit 1, clean = exit 0. Same convention as snapshot mode.
+    if changes:
+        raise typer.Exit(code=1)
+
+
+def _parse_git_name_status(output: str) -> list[dict]:
+    """Parse the tab-separated output of ``git diff --name-status``.
+
+    Returns a list of ``{"status": str, "path": str}`` dicts. Renames
+    and copies have a similarity score appended (e.g. ``R100``); we
+    strip the score and keep just the first letter for the status
+    classification.
+    """
+    changes: list[dict] = []
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < _MIN_GIT_DIFF_LINE_FIELDS:
+            continue
+        raw_status = parts[0]
+        # Strip similarity score off renames / copies (R100 → R).
+        status_letter = raw_status[0] if raw_status else "?"
+        label = _GIT_STATUS_LABEL.get(status_letter, "unknown")
+        # For renames + copies, git emits two paths (from\tto). We
+        # report the destination — that's the file the operator
+        # actually edits going forward.
+        path = parts[-1]
+        changes.append({"status": label, "path": path})
+    return changes
+
+
+def _render_git_diff(changes: list[dict], *, ref: str, project_root: Path) -> None:
+    """Render the git-diff result as a Rich table."""
+    title = f"mdk diff --git  [dim]vs {ref}[/dim]"
+    table = Table(title=title, title_style="bold", show_lines=False)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("File", style="cyan")
+
+    if not changes:
+        console.print(
+            f"[green]✓[/green] no drift between working tree and "
+            f"[bold]{ref}[/bold] under captured roots."
+        )
+        return
+
+    for entry in changes:
+        status = entry["status"]
+        style = _GIT_STATUS_STYLE.get(status, "")
+        styled_status = f"[{style}]{status}[/{style}]" if style else status
+        table.add_row(styled_status, entry["path"])
+    console.print(table)
+    console.print(
+        f"\n[yellow]⚠[/yellow] {len(changes)} file(s) differ between "
+        f"working tree and [bold]{ref}[/bold] under [dim]{project_root}[/dim]."
+    )
