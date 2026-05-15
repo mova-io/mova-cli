@@ -59,6 +59,7 @@ from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
+from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
@@ -182,6 +183,7 @@ app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
+app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
 # NOTE: do NOT pass `help=` here — Typer/Click then ignores the function's
 # docstring, which is where each command's [bold]Examples:[/bold] block
