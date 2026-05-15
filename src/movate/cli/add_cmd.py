@@ -183,6 +183,33 @@ def _matches_search(name: str, search: str) -> bool:
     )
 
 
+def _installed_templates() -> set[str]:
+    """Return the set of template names already scaffolded in the
+    current project.
+
+    Reads ``./agents/<name>/agent.yaml`` for each role/core template
+    name. When run outside a project (no walk-up match), returns the
+    empty set — the catalog renders unchanged.
+
+    The list rendering uses this to decorate already-installed
+    templates with a ``✓ installed`` marker so operators can answer
+    "what do I already have?" without leaving the catalog view.
+    """
+    project_root = _resolve_project_root()
+    if project_root is None:
+        return set()
+    agents_dir = project_root / "agents"
+    if not agents_dir.is_dir():
+        return set()
+    return {
+        candidate.name
+        for candidate in agents_dir.iterdir()
+        if candidate.is_dir()
+        and (candidate / "agent.yaml").is_file()
+        and candidate.name in TEMPLATES
+    }
+
+
 def _render_list(search: str | None = None) -> None:
     """Print the role-template catalog as Rich tables.
 
@@ -196,7 +223,12 @@ def _render_list(search: str | None = None) -> None:
     template name, description, or feature highlight. When the search
     eliminates every entry, render a "no matches" hint with the
     available role names.
+
+    When run inside a project, templates already scaffolded in
+    ``./agents/`` are decorated with a ``✓ installed`` marker — quick
+    visual cue of project state.
     """
+    installed = _installed_templates()
     role_rows: list[tuple[str, str, str, str]] = []
     for group, role_names in _ROLE_GROUPS:
         for name in role_names:
@@ -233,7 +265,13 @@ def _render_list(search: str | None = None) -> None:
             color = _GROUP_COLORS.get(group, "white")
             label = group if group != last_group else ""
             label_cell = f"[{color}]{label}[/{color}]" if label else ""
-            name_cell = f"[{color}]{name}[/{color}]"
+            # Append an "✓ installed" tag inside the Name cell when
+            # the template is already scaffolded in this project.
+            # Keeps the column count stable (alternative: separate
+            # "Installed" column adds clutter for the common "outside
+            # a project" case).
+            tag = " [green]✓ installed[/green]" if name in installed else ""
+            name_cell = f"[{color}]{name}[/{color}]{tag}"
             role_table.add_row(label_cell, name_cell, desc, feature)
             last_group = group
         console.print(role_table)
@@ -261,7 +299,9 @@ def _render_list(search: str | None = None) -> None:
         if search and not _matches_search(name, search):
             continue
         desc, feature = _ROLE_DESCRIPTIONS.get(name, ("", ""))
-        core_table.add_row(name, desc, feature)
+        # Same installed-marker treatment as the role tier.
+        tag = " [green]✓ installed[/green]" if name in installed else ""
+        core_table.add_row(f"{name}{tag}", desc, feature)
         core_rows_added += 1
 
     console.print()

@@ -789,10 +789,21 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
 
     agent_dir = _resolve_agent_dir(name, explicit_project_root)
     if agent_dir is None:
+        # Typo suggestion: fuzzy-match against agents that DO exist in
+        # the current project so `mdk doctor agent ragqa` surfaces
+        # `did you mean rag-qa?` instead of a flat error.
+        from movate.cli._resolve import suggest_similar_agent  # noqa: PLC0415
+
+        suggestion = suggest_similar_agent(name)
+        hint_text = (
+            f" Did you mean [bold]{suggestion}[/bold]?"
+            if suggestion
+            else " Pass a directory path, or run from inside a movate "
+            "project where [bold]agents/<name>/[/bold] exists."
+        )
         err.print(
-            f"[red]✗[/red] could not resolve agent [bold]{name}[/bold]. "
-            "[dim]Pass a directory path, or run from inside a movate "
-            "project where [bold]agents/<name>/[/bold] exists.[/dim]"
+            f"[red]✗[/red] could not resolve agent [bold]{name}[/bold]."
+            f"[dim]{hint_text}[/dim]"
         )
         raise typer.Exit(code=2)
 

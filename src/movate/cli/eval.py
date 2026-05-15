@@ -188,6 +188,15 @@ def eval_(
             bundle = load_agent(Path(path))
         except AgentLoadError as exc:
             err_console.print(f"[red]✗ load failed:[/red] {exc}")
+            # Fuzzy-match for typo'd bare names — same UX as `mdk run`.
+            if "/" not in path and "\\" not in path:
+                from movate.cli._resolve import suggest_similar_agent  # noqa: PLC0415
+
+                suggestion = suggest_similar_agent(path)
+                if suggestion:
+                    err_console.print(
+                        f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]"
+                    )
             raise typer.Exit(code=2) from None
 
     asyncio.run(

@@ -159,6 +159,7 @@ def _init_project(
     target: Path,
     force: bool,
     skip_snapshot: bool,
+    with_agents: str | None = None,
 ) -> None:
     """Bootstrap a fresh movate workspace.
 
@@ -241,16 +242,43 @@ def _init_project(
     # most operators want to see what's available before adding.
     # Tip about `.env` is deferred to a dim note — the credentials
     # store (PR #66) means most operators don't need to touch .env.
-    body += (
-        f"\n[bold]Next steps:[/bold]\n"
-        f"  [dim]$[/dim] [bold]cd {project_root.name} && mdk add --list[/bold]"
-        f"   [dim]# browse role templates[/dim]\n"
-        f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
-        f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
-        f"[dim]API keys: configured globally via "
-        f"[bold]mdk auth login <provider>[/bold]. Per-project [bold].env[/bold] "
-        f"still works as an override.[/dim]"
-    )
+    # Two next-steps modes depending on whether `--with-agents` was
+    # used. If agents are already in place, the suggested commands
+    # point at the next stage (validate / run / eval). If not, the
+    # suggestions point at adding agents — plus a discoverability tip
+    # about `--with-agents`.
+    if with_agents:
+        # Agents already added by the caller. Show forward-looking
+        # commands: doctor agent / run / eval / deploy.
+        agent_list = [t.strip() for t in with_agents.split(",") if t.strip()]
+        first_agent = agent_list[0] if agent_list else "<agent>"
+        body += (
+            f"\n[bold]Next steps[/bold] "
+            f"[dim](you already added {len(agent_list)} agent(s))[/dim][bold]:[/bold]\n"
+            f"  [dim]$[/dim] [bold]cd {project_root.name}[/bold]\n"
+            f"  [dim]$[/dim] [bold]mdk doctor agent {first_agent}[/bold]"
+            f"   [dim]# per-agent health check[/dim]\n"
+            f"  [dim]$[/dim] [bold]mdk run {first_agent} '{{...}}'[/bold]"
+            f"   [dim]# try one live[/dim]\n"
+            f"  [dim]$[/dim] [bold]mdk eval {first_agent} --gate 0.7[/bold]"
+            f"   [dim]# gate on the seed dataset[/dim]"
+        )
+    else:
+        # No agents yet. Suggest `add --list` + drop the
+        # `--with-agents` discoverability tip so operators see the
+        # one-command alternative for next time.
+        body += (
+            f"\n[bold]Next steps:[/bold]\n"
+            f"  [dim]$[/dim] [bold]cd {project_root.name} && mdk add --list[/bold]"
+            f"   [dim]# browse role templates[/dim]\n"
+            f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
+            f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
+            f"[dim]Tip: skip the two-step flow next time with [bold]--with-agents[/bold]:[/dim]\n"
+            f"  [dim]$ mdk init --project <name> --with-agents rag-qa,ticket-triager[/dim]\n\n"
+            f"[dim]API keys: configured globally via "
+            f"[bold]mdk auth login <provider>[/bold]. Per-project [bold].env[/bold] "
+            f"still works as an override.[/dim]"
+        )
     console.print(
         Panel(
             body,
@@ -961,6 +989,7 @@ def init(
             target=target,
             force=force,
             skip_snapshot=skip_snapshot,
+            with_agents=with_agents,
         )
         # --with-agents X,Y,Z: scaffold each role template inside the
         # freshly-bootstrapped project. Skipped when the operator is

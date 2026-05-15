@@ -426,6 +426,36 @@ def status() -> None:
                 "",
             )
 
+    # Separator + notifications group. `mdk deploy --notify` reads
+    # these env vars; surface them in the status table so operators
+    # know whether notifications will fire BEFORE attempting a deploy.
+    table.add_row("", "", "", "")
+    table.add_row(
+        "[bold]Notifications[/bold]", "", "[dim]for mdk deploy --notify[/dim]", ""
+    )
+    for env_var, hint_text in (
+        ("TELEGRAM_BOT_TOKEN", "run [bold]mdk auth login telegram[/bold]"),
+        ("TELEGRAM_CHAT_ID", "run [bold]mdk auth login telegram[/bold]"),
+        ("MOVATE_DEPLOY_WEBHOOK", "set in your shell for Slack/Teams/Discord/etc."),
+    ):
+        src = key_source(env_var)
+        if src == "unset":
+            counts["unset"] += 1
+            table.add_row(
+                env_var,
+                "[yellow]⊘ not set[/yellow]",
+                "—",
+                hint_text,
+            )
+        else:
+            counts["ok"] += 1
+            table.add_row(
+                env_var,
+                "[green]✓ set[/green]",
+                src.replace("_", " "),
+                "",
+            )
+
     stdout.print(table)
     stdout.print()
     stdout.print(

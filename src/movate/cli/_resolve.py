@@ -16,10 +16,15 @@ Resolution rules (in order):
    ``./workflows/<name>/workflow.yaml``. First hit wins.
 4. Otherwise → leave unchanged (caller's error path surfaces a clear
    "not found" message).
+
+Companion: :func:`suggest_similar_agent` surfaces a typo-distance
+suggestion when the operator's bare name doesn't resolve. Used by
+caller error paths to render "did you mean rag-qa?" hints.
 """
 
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 
 
@@ -55,6 +60,45 @@ def resolve_agent_or_workflow_arg(arg: str) -> str:
         return str(workflow_path)
 
     return arg
+
+
+def list_project_agents() -> list[str]:
+    """Return the names of every agent in the current project's
+    ``agents/`` directory.
+
+    Used by :func:`suggest_similar_agent` to fuzzy-match typo'd
+    names against the actual project state. Returns an empty list
+    when called outside a project — caller falls through to its
+    own error.
+    """
+    root = _walk_up_for_project_root()
+    if root is None:
+        return []
+    agents_dir = root / "agents"
+    if not agents_dir.is_dir():
+        return []
+    return sorted(
+        candidate.name
+        for candidate in agents_dir.iterdir()
+        if candidate.is_dir() and (candidate / "agent.yaml").is_file()
+    )
+
+
+def suggest_similar_agent(name: str, *, cutoff: float = 0.6) -> str | None:
+    """Return the closest agent name in the project, or ``None`` if
+    nothing is within the cutoff similarity.
+
+    Wraps :func:`difflib.get_close_matches` against the project's
+    actual agent directory listing — operators typing ``ragqa`` see
+    ``Did you mean rag-qa?`` instead of a bare "not found." The
+    ``cutoff`` (0.6 default) balances "obvious typo" against
+    "unrelated word that happens to share letters."
+    """
+    candidates = list_project_agents()
+    if not candidates:
+        return None
+    matches = difflib.get_close_matches(name, candidates, n=1, cutoff=cutoff)
+    return matches[0] if matches else None
 
 
 def _walk_up_for_project_root() -> Path | None:

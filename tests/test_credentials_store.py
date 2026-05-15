@@ -355,8 +355,17 @@ class TestAuthLogin:
 @pytest.mark.unit
 class TestAuthStatus:
     def test_all_unset_renders_all_rows(
-        self, isolated_creds: Path
+        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Bundle F added Notifications rows (TELEGRAM_BOT_TOKEN +
+        # TELEGRAM_CHAT_ID + MOVATE_DEPLOY_WEBHOOK) to the status
+        # table. Strip those too so the no-keys baseline is clean.
+        for key in (
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "MOVATE_DEPLOY_WEBHOOK",
+        ):
+            monkeypatch.delenv(key, raising=False)
         result = runner.invoke(
             app, ["auth", "status"], env={"COLUMNS": "200"}
         )
@@ -364,14 +373,21 @@ class TestAuthStatus:
         for env_var in PROVIDER_KEY_ENV_VARS:
             assert env_var in result.stdout
         assert "not set" in result.stdout.lower()
-        # Greppable summary line.
+        # Greppable summary line: 5 provider env vars + 3 notification
+        # env vars = 8 unset total.
         assert "mdk_auth_status_summary:" in result.stdout
         assert "set=0" in result.stdout
-        assert "unset=5" in result.stdout
+        assert "unset=8" in result.stdout
 
     def test_set_keys_show_as_set(
         self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        for key in (
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
+            "MOVATE_DEPLOY_WEBHOOK",
+        ):
+            monkeypatch.delenv(key, raising=False)
         CredentialsStore().set("OPENAI_API_KEY", "sk-test")
         # The mdk CLI runs autoload at startup, but CliRunner does NOT
         # re-import main.py — we need to manually re-autoload before
@@ -381,6 +397,6 @@ class TestAuthStatus:
             app, ["auth", "status"], env={"COLUMNS": "200"}
         )
         assert result.exit_code == 0
-        # One key set, four unset.
+        # One key set, seven unset (4 LLM + 3 notification).
         assert "set=1" in result.stdout
-        assert "unset=4" in result.stdout
+        assert "unset=7" in result.stdout

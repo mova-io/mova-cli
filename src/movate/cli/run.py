@@ -173,16 +173,81 @@ def _dispatch_agent(
         bundle = load_agent(path)
     except AgentLoadError as exc:
         console.print(f"[red]✗ load failed:[/red] {exc}")
+        _maybe_suggest_fuzzy(path)
         raise typer.Exit(code=2) from None
 
     if raw is None:
-        console.print("[red]✗ provide input as a positional arg or via --input[/red]")
+        _suggest_dataset_example(bundle)
         raise typer.Exit(code=2)
     payload = _coerce_agent_input(raw, bundle)
 
     asyncio.run(
         _run_local_agent(bundle, payload, output_format=output_format, mock=mock, stream=stream)
     )
+
+
+def _maybe_suggest_fuzzy(path: Path) -> None:
+    """When ``load_agent`` fails AND the original arg was a bare name
+    (no path separator), surface a fuzzy-match suggestion from the
+    project's actual agents directory.
+
+    Same `did you mean rag-qa?` UX the doctor-agent path emits.
+    Silent no-op when path has separators (operator passed a full
+    path; the error is more likely a real filesystem issue).
+    """
+    arg_str = str(path)
+    if "/" in arg_str or "\\" in arg_str:
+        return
+    from movate.cli._resolve import suggest_similar_agent  # noqa: PLC0415
+
+    suggestion = suggest_similar_agent(arg_str)
+    if suggestion:
+        console.print(
+            f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]"
+        )
+
+
+def _suggest_dataset_example(bundle: AgentBundle) -> None:
+    """Print a "no input" error PLUS a copy-pasteable example from the
+    agent's evals/dataset.jsonl.
+
+    Customers on first `mdk run` don't know the agent's input schema.
+    The dataset has real, valid example inputs — surface the first one
+    so they can copy-paste a working command instead of reading the
+    schema and constructing JSON manually.
+    """
+    console.print("[red]✗[/red] provide input as a positional arg or via --input.")
+
+    # Try to read the first dataset row. The path lives in the agent
+    # spec; resolve it relative to agent_dir. Failures are non-fatal —
+    # we already printed the primary error.
+    sample_input: dict[str, Any] | None = None
+    try:
+        dataset_path = (bundle.agent_dir / bundle.spec.evals.dataset).resolve()
+        if dataset_path.is_file():
+            text = dataset_path.read_text().strip()
+            if text:
+                first_row = json.loads(text.splitlines()[0])
+                if isinstance(first_row, dict) and "input" in first_row:
+                    sample_input = first_row["input"]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        sample_input = None
+
+    if sample_input is not None:
+        # Compact JSON keeps the suggested command on one line for
+        # easy copy-paste. Agent name comes from the resolved bundle —
+        # operators get the SAME shape they'd type at the prompt.
+        sample_json = json.dumps(sample_input, separators=(", ", ": "))
+        console.print(
+            f"[dim]→ try the first example from the dataset:[/dim]\n"
+            f"[bold cyan]  mdk run {bundle.spec.name} '{sample_json}'[/bold cyan]"
+        )
+    else:
+        console.print(
+            "[dim]→ no dataset sample available. Inspect the input schema "
+            "via [bold]mdk show "
+            f"{bundle.spec.name}[/bold] before composing the input.[/dim]"
+        )
 
 
 def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
