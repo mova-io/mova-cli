@@ -83,7 +83,7 @@ class AgentBundle:
         return prefix + rendered
 
 
-def load_agent(
+def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
     path: str | Path,
     *,
     defaults: AgentDefaults | None = None,
@@ -110,7 +110,16 @@ def load_agent(
     try:
         raw = yaml.safe_load(yaml_path.read_text())
     except yaml.YAMLError as exc:
-        raise AgentLoadError(f"invalid YAML in {yaml_path}: {exc}") from exc
+        # PyYAML's MarkedYAMLError carries a `problem_mark` with line +
+        # column for the offending byte. Surface it as `path:line:col`
+        # so editors (VS Code, vim quickfix) jump straight to the right
+        # spot. Falls back gracefully for unmarked errors (rare).
+        mark = getattr(exc, "problem_mark", None)
+        if mark is not None:
+            location = f"{yaml_path}:{mark.line + 1}:{mark.column + 1}"
+        else:
+            location = str(yaml_path)
+        raise AgentLoadError(f"invalid YAML in {location}: {exc}") from exc
 
     # Apply project defaults at the raw-dict level — before Pydantic
     # validation — so we can distinguish "operator wrote this value"
@@ -123,7 +132,12 @@ def load_agent(
     try:
         spec = AgentSpec.model_validate(raw)
     except ValidationError as exc:
-        raise AgentLoadError(f"agent.yaml validation failed:\n{exc}") from exc
+        # Include the file path so the error reads like a compiler
+        # diagnostic ("file: reason") rather than a bare stack-style
+        # message. Pydantic's exc carries field-level loc info; we
+        # prefix it with the file so editors can at least open the
+        # right document.
+        raise AgentLoadError(f"agent.yaml validation failed in {yaml_path}:\n{exc}") from exc
 
     prompt_path = (agent_dir / spec.prompt).resolve()
     if not prompt_path.exists():

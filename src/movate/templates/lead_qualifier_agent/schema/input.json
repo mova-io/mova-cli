@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "company", "title", "source", "message"],
+  "properties": {
+    "name":    { "type": "string", "minLength": 1 },
+    "company": { "type": "string", "minLength": 1 },
+    "title":   { "type": "string", "minLength": 1 },
+    "source":  {
+      "type": "string",
+      "enum": ["webform", "demo_request", "content_download", "outbound", "referral", "event", "other"]
+    },
+    "message": { "type": "string", "minLength": 1 }
+  }
+}

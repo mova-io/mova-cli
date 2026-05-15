@@ -35,7 +35,8 @@ Design captured in
 
 | capability | command | status |
 |---|---|---|
-| Scaffold an agent | `mdk init <name> -t <template>` | ✓ v0.1 |
+| Scaffold an agent (template) | `mdk init <name> -t <template>` | ✓ v0.1 |
+| Scaffold an agent (LLM-driven) | `mdk init <name> --llm "<description>"` | ✓ post-v1.0 |
 | Validate agent.yaml + schemas | `mdk validate <path>` | ✓ v0.1 |
 | Run an agent locally | `mdk run <path> <input> [--mock]` | ✓ v0.1 |
 | Per-provider pricing introspection | `mdk pricing` | ✓ v0.1 |
@@ -91,12 +92,30 @@ The hermetic path uses `--mock` so you don't need an API key.
 
 ### 1. Scaffold an agent
 
+Two ways. Pick one.
+
+**LLM-scaffold (fastest)** — describe what you want in English:
+
+```bash
+mdk init faq-agent --llm "An FAQ agent for our SaaS product. \
+  Answers questions about pricing, features, and trial limits. \
+  Returns an answer + confidence score."
+```
+
+The CLI calls an LLM with a meta-prompt + few-shot exemplars, validates the
+output by loading it back, retries once on failure, and writes the standard
+agent layout to `./faq-agent/`. Add `--mock` for an offline rehearsal.
+
+**Template-scaffold (classic)** — start from a packaged template:
+
 ```bash
 mdk init faq-agent -t faq
 ```
 
-Creates `./faq-agent/` with `agent.yaml`, `prompt.md`, JSON schemas, and a
-small eval dataset.
+Either approach drops `agent.yaml`, `prompt.md`, JSON schemas, and a small eval
+dataset under `./faq-agent/`. See the [LLM-driven scaffolding section in the
+User Guide](USER_GUIDE.md#llm-driven-scaffolding-mdk-init---llm) for the full
+contract (validation loop, debug artifacts, greppable summary line).
 
 ### 2. Run it once
 

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "attendees", "transcript"],
+  "properties": {
+    "title": { "type": "string", "minLength": 1 },
+    "attendees": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "transcript": { "type": "string", "minLength": 1 }
+  }
+}

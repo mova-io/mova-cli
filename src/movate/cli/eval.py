@@ -149,10 +149,19 @@ def eval_(
       [dim]# Black-box eval against a deployed mdk runtime[/dim]
       $ mdk eval https://faq-runtime.example.com \\
           --agent-yaml ./faq-agent --api-key mvt_dev_...
+
+      [dim]# Inside a project, bare names resolve to ./agents/<name>:[/dim]
+      $ mdk eval rag-qa --gate 0.7
     """
     if baseline is not None and baseline_file is not None:
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
+
+    # Bare-name resolution: `mdk eval rag-qa` → `mdk eval ./agents/rag-qa`
+    # when inside a project. URLs + full paths pass through unchanged.
+    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+
+    path = resolve_agent_or_workflow_arg(path)
 
     remote_url = _resolve_remote_url(path)
     if remote_url is not None:
@@ -179,6 +188,15 @@ def eval_(
             bundle = load_agent(Path(path))
         except AgentLoadError as exc:
             err_console.print(f"[red]✗ load failed:[/red] {exc}")
+            # Fuzzy-match for typo'd bare names — same UX as `mdk run`.
+            if "/" not in path and "\\" not in path:
+                from movate.cli._resolve import suggest_similar_agent  # noqa: PLC0415
+
+                suggestion = suggest_similar_agent(path)
+                if suggestion:
+                    err_console.print(
+                        f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]"
+                    )
             raise typer.Exit(code=2) from None
 
     asyncio.run(
@@ -328,6 +346,16 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     elif output_format == Report.MARKDOWN:
         print(render_eval_markdown(summary, gate=effective_gate))
     else:
+        # Eye-catching banner BEFORE the table — operators scrolling
+        # through CI logs see PASS/FAIL at a glance without parsing
+        # the "verdict" row buried in the head table.
+        _emit_header_line(
+            overall_pass=overall_pass,
+            cases_passing=cases_passing,
+            sample_count=summary.sample_count,
+            gate=effective_gate,
+            objective_filter=objective,
+        )
         _emit_table(
             summary,
             record=record,
@@ -349,12 +377,87 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
             _emit_objective_breakdown(summary.objective_summaries)
         if diff is not None:
             _emit_diff_table(diff, regression_tolerance=regression_tolerance)
+        # Greppable single-line summary at the very end of table mode.
+        # CI logs piped through `grep mdk_eval_summary` get one
+        # key=value line ready to parse. Skipped in JSON / Markdown
+        # modes — they have their own structured surfaces.
+        _print_eval_summary_line(
+            summary,
+            record=record,
+            gate=effective_gate,
+            cases_passing=cases_passing,
+            overall_pass=overall_pass,
+            diff=diff,
+            regression_tolerance=regression_tolerance,
+        )
 
     # Exit codes: gate failure OR baseline regression both fail the CLI.
     failed_gate = not overall_pass
     failed_regression = diff is not None and diff.is_regression(tolerance=regression_tolerance)
     if failed_gate or failed_regression:
         raise typer.Exit(code=1)
+
+
+def _emit_header_line(
+    *,
+    overall_pass: bool,
+    cases_passing: int,
+    sample_count: int,
+    gate: float,
+    objective_filter: str | None,
+) -> None:
+    """Print a single eye-catching PASS/FAIL banner above the table.
+
+    Operators scanning CI logs want a one-glance verdict before they
+    parse the head table. Renders to stdout (same channel as the
+    main table) so log capture keeps banner + table together.
+    """
+    if overall_pass:
+        verdict = "[bold green]✓ Eval PASSED[/bold green]"
+    else:
+        verdict = "[bold red]✗ Eval FAILED[/bold red]"
+    obj_tag = f" · objective={objective_filter}" if objective_filter else ""
+    console.print(
+        f"{verdict}  [dim]— {cases_passing}/{sample_count} cases at gate "
+        f"≥ {gate:.2f}{obj_tag}[/dim]"
+    )
+
+
+def _print_eval_summary_line(
+    summary: EvalSummary,
+    *,
+    record: EvalRecord,
+    gate: float,
+    cases_passing: int,
+    overall_pass: bool,
+    diff: BaselineDiff | None,
+    regression_tolerance: float,
+) -> None:
+    """Emit ``mdk_eval_summary: agent=... gate=... ...`` line.
+
+    Mirrors :func:`movate.cli.audit_cmd._print_summary_line` so the
+    diagnostic surface across audit/eval/doctor is consistent —
+    operators grep one prefix to extract structured eval results
+    from a CI log without parsing Rich panels.
+    """
+    regressed = (
+        "true"
+        if diff is not None and diff.is_regression(tolerance=regression_tolerance)
+        else "false"
+    )
+    pass_rate = cases_passing / summary.sample_count if summary.sample_count else 0.0
+    console.print(
+        f"[dim]mdk_eval_summary: "
+        f"agent={summary.agent} "
+        f"eval_id={record.eval_id[:8]} "
+        f"cases={summary.sample_count} "
+        f"passing={cases_passing} "
+        f"pass_rate={pass_rate:.3f} "
+        f"mean_score={summary.mean_score:.3f} "
+        f"gate={gate:.2f} "
+        f"overall_pass={str(overall_pass).lower()} "
+        f"regressed={regressed}[/dim]"
+    )
 
 
 def _emit_table(

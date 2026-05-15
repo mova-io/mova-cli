@@ -145,6 +145,15 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
             "embedding in a customer deliverable."
         ),
     ),
+    no_fix_prompt: bool = typer.Option(
+        False,
+        "--no-fix-prompt",
+        help=(
+            "Skip the interactive 'run mdk fix?' prompt that fires when "
+            "doctor surfaces fixable issues. Useful for CI runs that "
+            "don't want a hanging prompt."
+        ),
+    ),
 ) -> None:
     """Report on the local environment, deps, API keys, and movate state.
 
@@ -171,9 +180,23 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     table.add_column("Purpose", style="dim", overflow="fold")
     table.add_column("License", style="dim")
 
-    table.add_row("Python", sys.version.split()[0], "", "")
-    table.add_row("movate", __version__, "", "")
-    table.add_row("", "", "", "")
+    # Tally check statuses as we build the table so the greppable
+    # summary line at the bottom can report counts without scraping
+    # internal Rich row state. ``_classify_result`` turns the markup
+    # string into one of {"ok", "missing", "error"} or returns None
+    # for non-check rows (section headers, raw values like Python
+    # version, blank separators).
+    counts = {"ok": 0, "missing": 0, "error": 0}
+
+    def _add(check: str, result: str, *extra: str) -> None:
+        table.add_row(check, result, *extra)
+        kind = _classify_result(check, result)
+        if kind is not None:
+            counts[kind] += 1
+
+    _add("Python", sys.version.split()[0], "", "")
+    _add("movate", __version__, "", "")
+    _add("", "", "", "")
 
     # Required deps — Purpose + SPDX license columns. Every entry in
     # _REQUIRED_DEPS should have a matching entry in both _DEP_LICENSES
@@ -185,9 +208,9 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
         status = _ok("") if spec else "[red]missing (install fail)[/red]"
         purpose = _DEP_PURPOSE.get(mod, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
-        table.add_row(f"dep: {mod}", status, purpose, license_str)
+        _add(f"dep: {mod}", status, purpose, license_str)
 
-    table.add_row("", "", "", "")
+    _add("", "", "", "")
 
     # Optional deps
     for mod in _OPTIONAL_DEPS:
@@ -195,9 +218,9 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
         status = _ok("") if spec else _missing("not installed")
         purpose = _DEP_PURPOSE.get(mod, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
-        table.add_row(f"opt: {mod}", status, purpose, license_str)
+        _add(f"opt: {mod}", status, purpose, license_str)
 
-    table.add_row("", "")
+    _add("", "")
 
     # AgentRuntime probes — which `runtime:` values in agent.yaml will
     # actually resolve to an adapter on THIS install? litellm is always
@@ -213,58 +236,58 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
             # Should not happen — litellm is in _REQUIRED_DEPS — but the
             # branch keeps mypy happy.
             status = "[red]missing[/red]"  # pragma: no cover
-        table.add_row(f"runtime: {runtime_name}", status)
+        _add(f"runtime: {runtime_name}", status)
 
-    table.add_row("", "")
+    _add("", "")
 
     # Provider API keys
     any_key = False
     for env_var, label in _PROVIDER_KEYS:
         present = bool(os.environ.get(env_var, "").strip())
         any_key = any_key or present
-        table.add_row(env_var, _ok(label) if present else _missing(label))
+        _add(env_var, _ok(label) if present else _missing(label))
 
     if not any_key:
-        table.add_row(
+        _add(
             "[yellow]hint[/yellow]",
             "[dim]no provider keys set; use --mock for offline runs[/dim]",
         )
 
-    table.add_row("", "")
+    _add("", "")
 
     # Tracing keys (separate from agent provider keys — easier to scan)
     for env_var, label in _TRACING_KEYS:
         present = bool(os.environ.get(env_var, "").strip())
-        table.add_row(env_var, _ok(label) if present else _missing(label))
+        _add(env_var, _ok(label) if present else _missing(label))
 
     # Resolved tracer — what `movate run` would actually use right now.
     try:
         tracer = build_tracer()
-        table.add_row("resolved tracer", f"[green]{tracer.name}[/green]")
+        _add("resolved tracer", f"[green]{tracer.name}[/green]")
     except Exception as exc:  # pragma: no cover - diagnostic only
-        table.add_row("resolved tracer", f"[red]error: {exc}[/red]")
+        _add("resolved tracer", f"[red]error: {exc}[/red]")
 
-    table.add_row("", "")
+    _add("", "")
 
     # Storage
     sqlite_path = Path("~/.movate/local.db").expanduser()
     state = "exists" if sqlite_path.exists() else "will be created on first run"
-    table.add_row("storage (sqlite)", f"{sqlite_path} [dim]({state})[/dim]")
+    _add("storage (sqlite)", f"{sqlite_path} [dim]({state})[/dim]")
 
     # Pricing
     try:
         pricing = load_pricing()
         models = len(pricing.models)
-        table.add_row(
+        _add(
             "pricing",
             f"v{pricing.version} ({models} models, last_verified {pricing.last_verified})",
         )
     except Exception as exc:
-        table.add_row("pricing", f"[red]load failed: {exc}[/red]")
+        _add("pricing", f"[red]load failed: {exc}[/red]")
 
     # Project config
     project_yaml = Path("movate.yaml")
-    table.add_row(
+    _add(
         "movate.yaml",
         f"[green]found[/green] [dim]({project_yaml.resolve()})[/dim]"
         if project_yaml.exists()
@@ -284,6 +307,178 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # ------------------------------------------------------------------
     if target is not None:
         _render_azure_preflight(target)
+
+    # Greppable single-line summary at the very end. Mirrors audit /
+    # eval so CI tooling has one consistent prefix across all three
+    # diagnostic commands. Counts are tallied during row adds (see
+    # ``_add`` above) — no internal Rich state scraping.
+    _print_doctor_summary_line(counts)
+
+    # Empty-project hint: inside a movate project with zero agents,
+    # point the operator at the natural next step. Catches new users
+    # who run `mdk init --project` followed by `mdk doctor` and don't
+    # see anything actionable in the table.
+    if target is None and project_yaml.exists():
+        _maybe_offer_empty_project_hint(project_yaml.parent.resolve())
+
+    # Interactive handoff to `mdk fix`. Closes the diagnose→fix loop
+    # without making operators re-read `mdk fix --list` themselves.
+    # Gated on: TTY (not CI / log capture), no --target (Azure preflight
+    # context is a separate concern), and at least one fixable issue.
+    if target is None and (counts["missing"] > 0 or counts["error"] > 0):
+        _maybe_offer_fix(no_prompt=no_fix_prompt)
+
+
+def _maybe_offer_empty_project_hint(project_root: Path) -> None:
+    """Surface a 'no agents yet — add some' hint for new projects.
+
+    Pure UX nudge: when the project root has no agents/ at all OR has
+    an empty agents/ directory, we print a dim Rich line pointing at
+    `mdk add --list`. Doesn't fire if there are already agents — that
+    would be noise for the common case.
+    """
+    agents_dir = project_root / "agents"
+    if not agents_dir.is_dir():
+        return  # Old project layout — skip silently rather than confuse.
+    # `.gitkeep` is the standard placeholder we drop on init; ignore
+    # it when counting "real" agent dirs.
+    real_agents = [
+        p for p in agents_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+    ]
+    if real_agents:
+        return
+    console.print()
+    console.print(
+        "[dim]→ no agents yet in [bold]agents/[/bold]. "
+        "Run [bold]mdk add --list[/bold] to browse role templates, "
+        "or [bold]mdk add rag-qa ticket-triager[/bold] to bootstrap a "
+        "support workspace.[/dim]"
+    )
+
+
+def _maybe_offer_fix(*, no_prompt: bool) -> None:
+    """If `mdk fix` would do something useful, offer to run it.
+
+    Runs the registry in dry-run mode first to find out what's fixable
+    here-and-now, then asks the operator whether to commit. Skips the
+    prompt entirely when stdin isn't a TTY (CI / log capture) or when
+    --no-fix-prompt was set.
+
+    Failures inside this helper never raise — the diagnose path is the
+    primary value of `mdk doctor`; the interactive handoff is a
+    convenience layer on top.
+    """
+    # Local imports keep the cold-path doctor module free of these
+    # heavyweight subsystems. Most invocations don't fire this code.
+    import sys  # noqa: PLC0415
+
+    from movate.fixes.registry import diagnose_and_fix  # noqa: PLC0415
+
+    # Probe what's fixable from this project root.
+    try:
+        results = diagnose_and_fix(Path.cwd(), dry_run=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        console.print(f"[dim]→ skipped: fix probe failed: {exc}[/dim]")
+        return
+
+    # Only count fixes that would actually do something. "would_apply"
+    # status means dry-run saw a change that would be made; "not_needed"
+    # means no work needed.
+    fixable = [r for r in results if r.status.value == "would_apply"]
+    if not fixable:
+        return
+
+    # Surface what fix would do — operators want to know before saying yes.
+    console.print()
+    console.print(
+        f"[yellow]⚠[/yellow] [bold]mdk fix[/bold] can auto-resolve "
+        f"[bold]{len(fixable)}[/bold] of the issue(s) above:"
+    )
+    for r in fixable:
+        message = r.message or r.fix_id
+        console.print(f"  [cyan]→[/cyan] [dim]{r.fix_id}[/dim]: {message}")
+    console.print()
+
+    # Skip the prompt path when there's no TTY or operator opted out.
+    if no_prompt or not sys.stdin.isatty():
+        console.print(
+            "[dim]To apply: run [bold]mdk fix --apply[/bold]. "
+            "Suppress this prompt with [bold]--no-fix-prompt[/bold].[/dim]"
+        )
+        return
+
+    # Prompt + dispatch. typer.confirm handles the TTY interaction and
+    # returns False on Ctrl-C / EOF / "n".
+    try:
+        run_now = typer.confirm("Run `mdk fix --apply` now?", default=False)
+    except typer.Abort:
+        run_now = False
+
+    if not run_now:
+        console.print(
+            "[dim]→ skipped. Run [bold]mdk fix --apply[/bold] when ready.[/dim]"
+        )
+        return
+
+    # Re-run the same registry, this time committing. We don't call the
+    # CLI command — that would re-render its own Panel etc. Just run
+    # the registry directly and surface the results.
+    apply_results = diagnose_and_fix(Path.cwd(), dry_run=False)
+    applied = [r for r in apply_results if r.status.value == "applied"]
+    failed = [r for r in apply_results if r.status.value == "failed"]
+    if applied:
+        console.print(
+            f"[green]✓[/green] applied {len(applied)} fix(es). "
+            "Re-run [bold]mdk doctor[/bold] to confirm."
+        )
+    if failed:
+        for r in failed:
+            console.print(
+                f"[red]✗[/red] {r.fix_id} failed: {r.message or 'no detail'}"
+            )
+
+
+def _classify_result(check: str, result: str) -> str | None:
+    """Bucket a doctor table row into ``ok`` / ``missing`` / ``error``.
+
+    Returns ``None`` for non-check rows — section separators (empty
+    check + empty result) and informational rows (Python version,
+    movate version, sqlite path, pricing version, hint). The summary
+    line only counts rows that represent a pass/fail signal.
+    """
+    # Section separators contribute nothing.
+    if not check and not result:
+        return None
+    # Informational rows have a label but report a raw value, not an
+    # ok/missing/error verdict — exclude them so the summary line
+    # reflects pass/fail signal density, not row count.
+    if check in {"Python", "movate", "storage (sqlite)", "pricing", "[yellow]hint[/yellow]"}:
+        return None
+    lower = result.lower()
+    # Order matters: "missing (install fail)" is RED — required dep
+    # absent — and must classify as ``error``, not ``missing``,
+    # otherwise CI dashboards under-count broken installs.
+    if "error" in lower or "missing (install fail)" in lower or "load failed" in lower:
+        return "error"
+    if "[green]ok" in lower or "[green]found" in lower or "[green]" in lower:
+        return "ok"
+    if "missing" in lower or "[yellow]" in lower:
+        return "missing"
+    return "ok"
+
+
+def _print_doctor_summary_line(counts: dict[str, int]) -> None:
+    """Emit ``mdk_doctor_summary: checks=N ok=N missing=N error=N`` line.
+
+    Reads the tally built up during row adds. Single line, dim style,
+    same key=value shape as ``mdk_audit_summary`` and
+    ``mdk_eval_summary`` so CI grep stays trivial.
+    """
+    total = counts["ok"] + counts["missing"] + counts["error"]
+    console.print(
+        f"[dim]mdk_doctor_summary: checks={total} ok={counts['ok']} "
+        f"missing={counts['missing']} error={counts['error']}[/dim]"
+    )
 
 
 def _render_explanations() -> None:
@@ -438,3 +633,379 @@ def _render_azure_preflight(target_name: str) -> None:
 
     console.print()
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Sub-app — adds `mdk doctor agent <name>` while preserving `mdk doctor`
+# as the default env-check command.
+# ---------------------------------------------------------------------------
+
+
+doctor_app = typer.Typer(
+    name="doctor",
+    help=(
+        "Environment + configuration sanity check. Default: project-wide "
+        "doctor. Subcommand [bold]agent <name>[/bold] focuses on one agent."
+    ),
+    invoke_without_command=True,
+    rich_markup_mode="rich",
+)
+
+
+@doctor_app.callback(invoke_without_command=True)
+def _doctor_callback(
+    ctx: typer.Context,
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help=(
+            "Also run the Azure preflight for a registered target "
+            "(az login → subscription → RG → ACR → Container Apps → /healthz). "
+            "Use this when `movate deploy` is failing."
+        ),
+    ),
+    explain: bool = typer.Option(
+        False, "--explain", help="Per-check explanation block."
+    ),
+    licenses: bool = typer.Option(
+        False, "--licenses", help="Print a per-dep SPDX license report."
+    ),
+    no_fix_prompt: bool = typer.Option(
+        False,
+        "--no-fix-prompt",
+        help="Skip the interactive `mdk fix?` prompt when issues are found.",
+    ),
+) -> None:
+    """Default-mode dispatch.
+
+    When ``mdk doctor`` is called WITHOUT a subcommand, run the
+    project-wide env check (the original ``doctor()`` function). When
+    a subcommand IS given (e.g. ``mdk doctor agent rag-qa``), this
+    callback is a no-op and Typer dispatches to the subcommand.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    doctor(
+        target=target,
+        explain=explain,
+        licenses=licenses,
+        no_fix_prompt=no_fix_prompt,
+    )
+
+
+@doctor_app.command("agent")
+def doctor_agent(
+    name: str = typer.Argument(
+        ...,
+        help="Agent name (resolved under [bold]agents/<name>[/bold]) "
+        "or a literal path to an agent directory.",
+        metavar="AGENT",
+    ),
+    project_root: Path = typer.Option(
+        None,
+        "--project-root",
+        help="Override the project root. Defaults to walking up from cwd.",
+    ),
+) -> None:
+    """Agent-specific health check: validates, prices, smoke-tests.
+
+    Runs eight checks against one agent:
+
+      1. agent.yaml + schemas load
+      2. prompt template renders against the first dataset row
+      3. model is in the packaged pricing table
+      4. all declared skills resolve in the skill registry
+      5. all declared contexts exist on disk
+      6. evals/dataset.jsonl has at least one row
+      7. eval baseline is committed (or hint to create one)
+      8. last run from storage (if any) — recency + cost
+
+    Ends with a greppable ``mdk_doctor_agent_summary:`` line for CI
+    parity with the project-wide doctor's ``mdk_doctor_summary:``.
+    """
+    _run_agent_doctor(name=name, explicit_project_root=project_root)
+
+
+# ---------------------------------------------------------------------------
+# Agent-specific doctor (Bundle B item 2)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_agent_dir(name: str, explicit_project_root: Path | None) -> Path | None:
+    """Find the agent directory for ``mdk doctor agent <name>``.
+
+    Three resolution paths, in order:
+
+    1. ``name`` is itself an absolute or relative path pointing at a
+       directory — use it directly.
+    2. ``explicit_project_root`` was passed — look under
+       ``<root>/agents/<name>/``.
+    3. Walk up from cwd looking for ``movate.yaml``, then look under
+       ``<root>/agents/<name>/``.
+
+    Returns ``None`` if no resolution succeeds.
+    """
+    # Path-literal form
+    direct = Path(name)
+    if direct.is_dir() and (direct / "agent.yaml").is_file():
+        return direct.resolve()
+
+    # Explicit project root
+    if explicit_project_root is not None:
+        candidate = (explicit_project_root / "agents" / name).resolve()
+        if candidate.is_dir():
+            return candidate
+
+    # Walk-up resolution
+    current = Path.cwd().resolve()
+    while True:
+        if (current / "movate.yaml").is_file():
+            candidate = current / "agents" / name
+            if candidate.is_dir():
+                return candidate.resolve()
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    return None
+
+
+def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
+    *, name: str, explicit_project_root: Path | None
+) -> None:
+    """Render the per-agent doctor table.
+
+    Implementation lives separate from the Typer command so tests can
+    invoke it directly without `runner.invoke(...)` (and skip the Typer
+    machinery + Rich rendering complications).
+    """
+    # Local imports — keep the cold-path doctor module light.
+    from movate.core.loader import AgentLoadError, load_agent  # noqa: PLC0415
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+    err = Console(stderr=True)
+
+    agent_dir = _resolve_agent_dir(name, explicit_project_root)
+    if agent_dir is None:
+        # Typo suggestion: fuzzy-match against agents that DO exist in
+        # the current project so `mdk doctor agent ragqa` surfaces
+        # `did you mean rag-qa?` instead of a flat error.
+        from movate.cli._resolve import suggest_similar_agent  # noqa: PLC0415
+
+        suggestion = suggest_similar_agent(name)
+        hint_text = (
+            f" Did you mean [bold]{suggestion}[/bold]?"
+            if suggestion
+            else " Pass a directory path, or run from inside a movate "
+            "project where [bold]agents/<name>/[/bold] exists."
+        )
+        err.print(
+            f"[red]✗[/red] could not resolve agent [bold]{name}[/bold]."
+            f"[dim]{hint_text}[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    table = Table(
+        title=f"movate doctor → agent: [cyan]{name}[/cyan]",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Check")
+    table.add_column("Result")
+    table.add_column("Detail", style="dim", overflow="fold")
+
+    counts = {"ok": 0, "missing": 0, "error": 0}
+
+    def _row(check: str, status: str, detail: str = "") -> None:
+        table.add_row(check, status, detail)
+        if "[green]" in status:
+            counts["ok"] += 1
+        elif "[red]" in status:
+            counts["error"] += 1
+        elif "[yellow]" in status:
+            counts["missing"] += 1
+
+    # Check 1: agent loads
+    bundle = None
+    try:
+        bundle = load_agent(agent_dir)
+        _row("load", "[green]✓ ok[/green]", f"name={bundle.spec.name}")
+    except AgentLoadError as exc:
+        _row(
+            "load",
+            "[red]✗ failed[/red]",
+            str(exc).splitlines()[0][:120],
+        )
+
+    # Bail early — the remaining checks need the bundle to exist.
+    if bundle is None:
+        console.print(table)
+        _print_agent_doctor_summary(name=name, counts=counts)
+        raise typer.Exit(code=1)
+
+    # Check 2: prompt renders against the first dataset row
+    dataset_path = agent_dir / "evals" / "dataset.jsonl"
+    if dataset_path.is_file() and dataset_path.read_text().strip():
+        import json as _json  # noqa: PLC0415
+
+        first_line = dataset_path.read_text().splitlines()[0]
+        try:
+            first_input = _json.loads(first_line)["input"]
+            bundle.input_validator.validate(first_input)
+            bundle.render_prompt(first_input)
+            _row(
+                "prompt renders",
+                "[green]✓ ok[/green]",
+                "against first dataset row",
+            )
+        except Exception as exc:
+            _row("prompt renders", "[red]✗ failed[/red]", str(exc)[:120])
+    else:
+        _row(
+            "prompt renders",
+            "[yellow]skipped[/yellow]",
+            "no dataset rows to render against",
+        )
+
+    # Check 3: model is in pricing table
+    try:
+        pricing = load_pricing()
+        provider_str = bundle.spec.model.provider
+        if provider_str in pricing.models:
+            _row("pricing", "[green]✓ ok[/green]", provider_str)
+        else:
+            _row(
+                "pricing",
+                "[yellow]not listed[/yellow]",
+                f"{provider_str} not in pricing table — cost will report unknown",
+            )
+    except Exception as exc:
+        _row("pricing", "[red]✗ failed[/red]", str(exc)[:120])
+
+    # Check 4: skills resolve
+    if bundle.spec.skills:
+        if len(bundle.skills) == len(bundle.spec.skills):
+            _row(
+                "skills resolve",
+                "[green]✓ ok[/green]",
+                f"{len(bundle.skills)} skill(s)",
+            )
+        else:
+            _row(
+                "skills resolve",
+                "[red]✗ failed[/red]",
+                "declared vs resolved skill count mismatch",
+            )
+    else:
+        _row("skills resolve", "[green]✓ none declared[/green]", "")
+
+    # Check 5: contexts exist
+    if bundle.spec.contexts:
+        _row(
+            "contexts",
+            "[green]✓ ok[/green]",
+            f"{len(bundle.contexts)} context block(s)",
+        )
+    else:
+        _row("contexts", "[green]✓ none declared[/green]", "")
+
+    # Check 6: dataset rows
+    if dataset_path.is_file():
+        rows = [
+            line
+            for line in dataset_path.read_text().splitlines()
+            if line.strip()
+        ]
+        if rows:
+            _row(
+                "dataset rows",
+                "[green]✓ ok[/green]",
+                f"{len(rows)} row(s)",
+            )
+        else:
+            _row(
+                "dataset rows",
+                "[yellow]empty[/yellow]",
+                "evals/dataset.jsonl is empty — eval will skip",
+            )
+    else:
+        _row(
+            "dataset rows",
+            "[yellow]missing[/yellow]",
+            "no evals/dataset.jsonl — mdk audit will flag",
+        )
+
+    # Check 7: eval baseline
+    baseline_candidates = [
+        agent_dir / ".movate" / "baseline.json",
+        agent_dir.parent.parent / ".movate" / bundle.spec.name / "baseline.json",
+    ]
+    if any(c.is_file() for c in baseline_candidates):
+        _row("eval baseline", "[green]✓ committed[/green]", "")
+    else:
+        _row(
+            "eval baseline",
+            "[yellow]missing[/yellow]",
+            "run `mdk eval --output-baseline .movate/baseline.json`",
+        )
+
+    # Check 8: last run from storage
+    # Skip this if storage isn't accessible. It's a soft-check that gives
+    # production-aware context without being a hard requirement.
+    try:
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        from movate.storage import build_storage  # noqa: PLC0415
+
+        async def _last_run() -> tuple[str, str]:
+            storage = build_storage()
+            try:
+                await storage.init()
+                runs = await storage.list_runs(
+                    tenant_id="local",
+                    agent=bundle.spec.name,
+                    limit=1,
+                )
+                if not runs:
+                    return "no runs", ""
+                run = runs[0]
+                cost = getattr(run.metrics, "cost_usd", 0) or 0
+                latency = getattr(run.metrics, "latency_ms", 0) or 0
+                return (
+                    f"{run.run_id[:8]}",
+                    f"${cost:.4f} · {latency:.0f}ms",
+                )
+            finally:
+                await storage.close()
+
+        run_id, detail = _asyncio.run(_last_run())
+        if run_id == "no runs":
+            _row(
+                "last run",
+                "[yellow]none[/yellow]",
+                "no runs recorded for this agent yet",
+            )
+        else:
+            _row("last run", f"[green]✓ {run_id}[/green]", detail)
+    except Exception as exc:
+        _row(
+            "last run",
+            "[yellow]skipped[/yellow]",
+            f"storage probe failed: {str(exc)[:80]}",
+        )
+
+    console.print(table)
+    _print_agent_doctor_summary(name=name, counts=counts)
+
+
+def _print_agent_doctor_summary(name: str, counts: dict[str, int]) -> None:
+    """Emit the greppable summary line for `mdk doctor agent`."""
+    total = counts["ok"] + counts["missing"] + counts["error"]
+    console.print(
+        f"[dim]mdk_doctor_agent_summary: "
+        f"agent={name} "
+        f"checks={total} ok={counts['ok']} "
+        f"missing={counts['missing']} error={counts['error']}[/dim]"
+    )

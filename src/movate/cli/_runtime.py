@@ -40,18 +40,30 @@ def _try_register_native_adapters(registry: ProviderRegistry, *, mock: bool) -> 
     smoke tests / offline dev never hit real SDKs."""
     if mock:
         return  # MockProvider is wired for every runtime via the registry default
+    # Each native-SDK adapter has TWO ways to fail at registration:
+    #   1. ImportError — extras aren't installed (`pip install movate-cli[openai]`).
+    #   2. Construction-time error — extras installed but a required env
+    #      var is missing (e.g. `AsyncOpenAI()` raises OpenAIError when
+    #      OPENAI_API_KEY isn't set). The OpenAI SDK eagerly reads the
+    #      key in __init__; we can't defer that.
+    # Both are non-fatal: LiteLLM stays wired as the default fallback,
+    # so an agent with `runtime: litellm` still works. Operators only
+    # hit a problem when their agent declares `runtime: native_openai`
+    # AND the key is missing — caught later by `mdk validate`.
     try:
         from movate.providers.anthropic import AnthropicProvider  # noqa: PLC0415
-
-        registry.register(AgentRuntime.NATIVE_ANTHROPIC, AnthropicProvider())
     except ImportError:
         pass
+    else:
+        with contextlib.suppress(Exception):
+            registry.register(AgentRuntime.NATIVE_ANTHROPIC, AnthropicProvider())
     try:
         from movate.providers.openai_native import OpenAIProvider  # noqa: PLC0415
-
-        registry.register(AgentRuntime.NATIVE_OPENAI, OpenAIProvider())
     except ImportError:
         pass
+    else:
+        with contextlib.suppress(Exception):
+            registry.register(AgentRuntime.NATIVE_OPENAI, OpenAIProvider())
     try:
         # LangChain provider needs no constructor args — the user's
         # Runnable entry-point is resolved per-request from the
@@ -59,10 +71,11 @@ def _try_register_native_adapters(registry: ProviderRegistry, *, mock: bool) -> 
         import langchain_core  # noqa: F401, PLC0415
 
         from movate.providers.langchain_native import LangChainProvider  # noqa: PLC0415
-
-        registry.register(AgentRuntime.LANGCHAIN, LangChainProvider())
     except ImportError:
         pass
+    else:
+        with contextlib.suppress(Exception):
+            registry.register(AgentRuntime.LANGCHAIN, LangChainProvider())
     # Lyzr adapter is HTTP-only (no SDK dep), so we always register it
     # — the constructor doesn't fail on a missing LYZR_API_KEY (we
     # surface the AuthError on first ``complete()`` call instead). This

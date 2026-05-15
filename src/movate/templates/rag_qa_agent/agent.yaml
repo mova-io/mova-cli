@@ -1,0 +1,43 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Answers questions grounded in provided context. Returns the answer plus citation spans.
+owner: ""
+
+role: rag-qa
+persona: A careful research assistant that only answers from provided context.
+capabilities:
+  - retrieval-qa
+  - citation-extraction
+  - grounded-answer
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 1024
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - rag
+  - qa
+  - grounded

@@ -15,8 +15,65 @@ import sys
 import typer
 from dotenv import load_dotenv
 
+
+def _expand_help_alias() -> None:
+    """Treat a trailing ``help`` token as a synonym for ``--help``.
+
+    Operators consistently type ``mdk init help`` (or ``mdk auth help``)
+    expecting the help screen — most CLIs accept that as a natural-
+    language alias. Typer alone doesn't; without this hook the user
+    gets an "agent name required" error or "Missing argument" diagnostic
+    for what was really a help request.
+
+    Rules (deliberately narrow to avoid breaking legitimate ``help``
+    values):
+
+    * The LAST positional must be exactly ``help`` (case-sensitive).
+    * The preceding token must NOT start with ``-`` — otherwise ``help``
+      is the value of some flag (e.g. ``--llm help`` for the unlikely
+      operator who really wants to describe their agent as "help").
+    * ``--help`` / ``-h`` must not already be present.
+    * Opt out entirely via ``MDK_NO_HELP_ALIAS=1`` for the edge case
+      where ``help`` is genuinely a payload value (``mdk run agent help``
+      meaning "send 'help' as input").
+
+    No regex, no Typer introspection — just a sys.argv rewrite that
+    runs BEFORE Typer parses anything.
+    """
+    import os  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    if os.environ.get("MDK_NO_HELP_ALIAS", "").strip():
+        return
+    if len(sys.argv) < 2:  # noqa: PLR2004 - just program name
+        return
+    last = sys.argv[-1]
+    if last not in ("help", "?"):
+        return
+    # Already a help request — don't double-flag.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        return
+    # The token before `help` is a flag taking a value — `help` is the
+    # value, not a help request.
+    if len(sys.argv) >= 3 and sys.argv[-2].startswith("-"):  # noqa: PLR2004
+        return
+    sys.argv[-1] = "--help"
+
+
+_expand_help_alias()
+
 # Load .env from cwd (or any parent). Existing env vars take precedence.
 load_dotenv()
+
+# Machine-global credentials store. After dotenv runs, autoload any
+# provider keys that are STILL unset from ~/.movate/credentials. The
+# resolution order is therefore: shell env > project .env > active-
+# profile secrets > ~/.movate/credentials. Operators set keys once
+# via `mdk auth login <provider>` and every project on the machine
+# picks them up.
+from movate.credentials import autoload_credentials  # noqa: E402
+
+autoload_credentials()
 
 # Bridge MDK_* ↔ MOVATE_* env vars in both directions. Runs BEFORE any
 # other module reads os.environ so legacy and canonical prefixes are
@@ -27,7 +84,24 @@ from movate.cli._env_aliases import sync_env_aliases  # noqa: E402
 sync_env_aliases()
 
 from movate import __version__  # noqa: E402
-from movate.cli import _console  # noqa: E402
+from movate.cli import (  # noqa: E402
+    _console,
+    add_cmd,
+    audit_cmd,
+    demo_cmd,
+    diff_cmd,
+    eval_gen_cmd,
+    fix_cmd,
+    fmt_cmd,
+    menu_cmd,
+    migrate_cmd,
+    monitor_cmd,
+    promote_cmd,
+    replay_cmd,
+    rollback_cmd,
+    simulate_cmd,
+    tune_cmd,
+)
 from movate.cli import bench as bench_cmd  # noqa: E402
 from movate.cli import chat as chat_cmd  # noqa: E402
 from movate.cli import deploy as deploy_cmd  # noqa: E402
@@ -35,6 +109,9 @@ from movate.cli import doctor as doctor_cmd  # noqa: E402
 from movate.cli import eval as eval_cmd  # noqa: E402
 from movate.cli import (  # noqa: E402
     import_json as _import_json,  # noqa: F401  -- registers `json` on import_app
+)
+from movate.cli import (  # noqa: E402
+    import_openapi as _import_openapi,  # noqa: F401  -- registers `openapi` on import_app
 )
 from movate.cli import init as init_cmd  # noqa: E402
 from movate.cli import logs as logs_cmd  # noqa: E402
@@ -47,13 +124,23 @@ from movate.cli import validate as validate_cmd  # noqa: E402
 from movate.cli import watch as watch_cmd  # noqa: E402
 from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
+from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
+from movate.cli.costs_cmd import costs_app  # noqa: E402
+from movate.cli.docs_cmd import docs_app  # noqa: E402
+from movate.cli.doctor import doctor_app  # noqa: E402
+from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
+from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
+from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
+from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
+from movate.cli.secrets_cmd import secrets_app  # noqa: E402
 from movate.cli.skills_cmd import skills_app  # noqa: E402
+from movate.cli.snapshot_cmd import snapshot_app  # noqa: E402
 from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
@@ -69,7 +156,10 @@ app = typer.Typer(
     help=(
         "[bold]mdk[/bold] — Movate Development Kit. Declarative platform for "
         "AI agents and workflows.\n\n"
+        "[bold green]New here?[/bold green] Run [bold]mdk menu[/bold] for a "
+        "guided next-step view.\n\n"
         "Common workflows:\n"
+        "  [dim]$ mdk menu                       # status + suggested next step[/dim]\n"
         "  [dim]$ mdk init my-agent              # scaffold[/dim]\n"
         "  [dim]$ mdk run my-agent '{...}'       # one-shot[/dim]\n"
         "  [dim]$ mdk eval my-agent              # score against dataset[/dim]\n"
@@ -103,7 +193,14 @@ def _main(
     verbose: bool = typer.Option(
         False,
         "--verbose",
-        "-v",
+        # No short form for --verbose at the global level. The `-v`
+        # slot is reclaimed for --version below — matches convention
+        # (docker -v, npm -v, node -v, python -V all show version,
+        # and operators consistently typed `mdk -v` expecting that).
+        # Verbose mode is still available via the long form and is
+        # mostly used scripted (where explicit names beat shorts).
+        # Subcommand-level `-v` short forms (e.g. `mdk trace replay -v`)
+        # are unaffected — those don't collide with this top-level slot.
         help="Enable DEBUG-level logging.",
     ),
     quiet: bool = typer.Option(
@@ -128,6 +225,7 @@ def _main(
         False,
         "--version",
         "-V",
+        "-v",
         callback=_version_callback,
         is_eager=True,
         help="Show version and exit.",
@@ -155,12 +253,26 @@ def _main(
 
 # ----- Develop --------------------------------------------------------------
 
+# `menu` is the suggested first command for new users — shows workspace
+# status + contextual next-step suggestions. Lives at the top of the
+# Develop panel so it surfaces prominently in `mdk --help`.
+app.command("menu", rich_help_panel=PANEL_DEVELOP)(menu_cmd.menu)
+app.command("demo", rich_help_panel=PANEL_DEVELOP)(demo_cmd.demo)
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
+# `mdk add` — project-aware ergonomic wrapper around `mdk init -t <template>`.
+# Same Develop panel because it's a scaffold command; positioned right after
+# `init` so operators see the natural progression.
+app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
+app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
+app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
+# `inspect` is the resolved-view sibling of `show` (raw view) — same
+# Develop panel since both answer "what does this agent look like?".
+app.add_typer(inspect_app, name="inspect", rich_help_panel=PANEL_DEVELOP)
 # NOTE: do NOT pass `help=` here — Typer/Click then ignores the function's
 # docstring, which is where each command's [bold]Examples:[/bold] block
 # lives. The docstring's first line becomes the panel summary; the full
@@ -171,11 +283,32 @@ app.command("watch", rich_help_panel=PANEL_DEVELOP)(watch_cmd.watch)
 # ----- Run & evaluate -------------------------------------------------------
 
 app.command("run", rich_help_panel=PANEL_RUN)(run_cmd.run)
+# `replay` re-executes a past run with the same input — pairs with
+# `mdk explain` (what happened?) for deterministic prompt iteration.
+app.command("replay", rich_help_panel=PANEL_RUN)(replay_cmd.replay)
+# `tune` sweeps one model knob (temperature/max_tokens/model) across a
+# list of values for the same input. Deterministic helper, NOT
+# auto-prompt-engineering — operators read the table + decide.
+app.command("tune", rich_help_panel=PANEL_RUN)(tune_cmd.tune)
+# `simulate` runs a chatbot through multi-turn scenarios — sibling to
+# `eval` (single-turn) and `bench` (multi-model). Same panel.
+app.command("simulate", rich_help_panel=PANEL_RUN)(simulate_cmd.simulate)
+# `benchmark live` is shadow-traffic replay against a candidate model.
+# Pairs with `bench` (multi-model on synthetic input) by using REAL
+# recorded inputs from storage. Same panel.
+app.add_typer(benchmark_app, name="benchmark", rich_help_panel=PANEL_RUN)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
+# `eval-gen` is the sibling that creates a dataset; `eval` runs it.
+# Sibling (not subcommand) because restructuring `eval` to a Typer
+# sub-app would break ~30 test callsites. See eval_gen_cmd docstring.
+app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
+# `monitor` is the live counterpart to the historical `costs report` /
+# `logs`. Same panel since it answers an adjacent operator question.
+app.command("monitor", rich_help_panel=PANEL_RUN)(monitor_cmd.monitor)
 app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 
 # ----- Remote (talk to a deployed runtime) ----------------------------------
@@ -185,14 +318,31 @@ app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------
 
-app.command("doctor", rich_help_panel=PANEL_DIAGNOSE)(doctor_cmd.doctor)
+# `doctor` is a sub-app: `mdk doctor` runs the default env-check via
+# the callback's invoke_without_command path; `mdk doctor agent <name>`
+# runs the per-agent doctor (Bundle B). The import of doctor_cmd above
+# keeps the module loaded for backward-compat with any code reaching
+# in via `from movate.cli import doctor`.
+_ = doctor_cmd
+app.add_typer(doctor_app, name="doctor", rich_help_panel=PANEL_DIAGNOSE)
+# `fix` is the repair-side companion to `doctor` — same panel.
+# Auto-remediates common diagnostic findings. Dry-run by default.
+app.command("fix", rich_help_panel=PANEL_DIAGNOSE)(fix_cmd.fix)
 app.command("pricing", rich_help_panel=PANEL_DIAGNOSE)(pricing_cmd.pricing)
+# `costs` reports on historical spend (different from `pricing` which
+# shows the live tariff). Both share the Diagnose panel since they
+# answer adjacent operator questions ("what does this cost?" vs
+# "what HAVE we spent?").
+app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
 
 # ----- Deploy & operate -----------------------------------------------------
 
 app.command("serve", rich_help_panel=PANEL_DEPLOY)(serve_cmd.serve)
 app.command("worker", rich_help_panel=PANEL_DEPLOY)(worker_cmd.worker)
 app.command("deploy", rich_help_panel=PANEL_DEPLOY)(deploy_cmd.deploy)
+# `export` packages primitives for portability — adjacent to deploy
+# (both ship things off-host).
+app.add_typer(export_app, name="export", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
 
 # ----- Manage ---------------------------------------------------------------
@@ -200,7 +350,19 @@ app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
+app.add_typer(profiles_app, name="profiles", rich_help_panel=PANEL_MANAGE)
+app.add_typer(secrets_app, name="secrets", rich_help_panel=PANEL_MANAGE)
+app.add_typer(snapshot_app, name="snapshot", rich_help_panel=PANEL_MANAGE)
+app.command("diff", rich_help_panel=PANEL_MANAGE)(diff_cmd.diff)
+app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
+app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
+app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
+app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
+# `memory` exposes the Sprint T MVP — list/get/set/evict/summarise/
+# query against the operator-facing memory store. Lives in MANAGE
+# alongside other state-managing commands (secrets, profiles, etc.).
+app.add_typer(memory_app, name="memory", rich_help_panel=PANEL_MANAGE)
 
 
 if __name__ == "__main__":

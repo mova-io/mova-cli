@@ -10,6 +10,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from movate.cli._completion import complete_agent_path
 from movate.cli._workflow_path import is_workflow_path
@@ -66,10 +67,25 @@ console = Console()
 
 
 def validate(
-    path: Path = typer.Argument(
-        ...,
-        help="Path to an agent or workflow directory.",
+    path: Path | None = typer.Argument(
+        None,
+        help=(
+            "Path to an agent or workflow directory. Omit with "
+            "[bold]--all[/bold] to validate every agent + workflow in the "
+            "current project."
+        ),
         shell_complete=complete_agent_path,
+    ),
+    all_in_project: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Validate every agent under [bold]./agents/[/bold] AND every "
+            "workflow under [bold]./workflows/[/bold] in the current "
+            "project. Renders a summary table; exits non-zero if any "
+            "fail. Pairs with [bold]mdk init --project --with-agents[/bold] "
+            "as the natural next step."
+        ),
     ),
     strict: bool = typer.Option(
         False,
@@ -82,11 +98,160 @@ def validate(
         help="Skip the prompt linter (schema + policy checks still run).",
     ),
 ) -> None:
-    """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references."""
+    """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references.
+
+    Inside a project you can pass a bare name (``mdk validate rag-qa``);
+    it resolves under ``./agents/<name>/`` or ``./workflows/<name>/``.
+
+    Use [bold]--all[/bold] to validate every agent + workflow in the
+    current project in one shot — handy right after
+    [bold]mdk init --project --with-agents X,Y,Z[/bold].
+    """
+    if all_in_project:
+        # --all is mutually exclusive with a path argument. Passing
+        # both is almost certainly a typo — surface it cleanly rather
+        # than silently picking one.
+        if path is not None and str(path) != ".":
+            console.print(
+                "[red]✗[/red] [bold]--all[/bold] and an explicit path "
+                "argument are mutually exclusive."
+            )
+            raise typer.Exit(code=2)
+        _validate_all(strict=strict, run_linter=not no_lint)
+        return
+
+    if path is None:
+        console.print(
+            "[red]✗[/red] path required (or pass [bold]--all[/bold] to "
+            "validate every agent + workflow in the project)."
+        )
+        raise typer.Exit(code=2)
+
+    # Bare-name resolution: `mdk validate rag-qa` → `./agents/rag-qa`
+    # when inside a project. Full paths pass through unchanged.
+    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+
+    path = Path(resolve_agent_or_workflow_arg(str(path)))
+
     if is_workflow_path(path):
         _validate_workflow(path)
     else:
         _validate_agent(path, strict=strict, run_linter=not no_lint)
+
+
+def _resolve_project_root() -> Path | None:
+    """Walk up from cwd looking for ``movate.yaml`` — same convention
+    used by ``mdk add`` / ``mdk snapshot`` / ``mdk diff``.
+
+    Local to validate.py to avoid an import cycle through ``mdk add``
+    (which is the canonical owner of the walk-up routine).
+    """
+    current = Path.cwd().resolve()
+    while True:
+        if (current / "movate.yaml").is_file():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def _validate_all(*, strict: bool, run_linter: bool) -> None:
+    """Validate every agent + workflow in the current project.
+
+    Walks ``./agents/*/agent.yaml`` and ``./workflows/*/workflow.yaml``
+    under the project root, runs the same validation each is subject
+    to as a single ``mdk validate <name>`` invocation, then renders a
+    Rich Table summarizing pass/fail per item. Exits 0 if every item
+    passed, 2 if any failed.
+
+    The greppable ``mdk_validate_summary:`` line at the end (same
+    prefix family as ``mdk_init_summary`` / ``mdk_audit_summary`` etc.)
+    lets CI tail one stable token to learn workspace-level
+    validation health.
+    """
+    project_root = _resolve_project_root()
+    if project_root is None:
+        console.print(
+            "[red]✗[/red] not inside a movate project. "
+            "[dim]Run [bold]mdk init --project <name>[/bold] first, or "
+            "pass a path argument to validate one item.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    # Discover targets. Sorted for deterministic output across runs.
+    agent_dirs = sorted(
+        p.parent for p in (project_root / "agents").glob("*/agent.yaml")
+    ) if (project_root / "agents").is_dir() else []
+    workflow_dirs = sorted(
+        p.parent for p in (project_root / "workflows").glob("*/workflow.yaml")
+    ) if (project_root / "workflows").is_dir() else []
+
+    if not agent_dirs and not workflow_dirs:
+        console.print(
+            "[yellow]⚠[/yellow] no agents or workflows found under "
+            f"[dim]{project_root}/agents/[/dim] or "
+            f"[dim]{project_root}/workflows/[/dim]."
+        )
+        # Not an error — operator may have just bootstrapped an empty
+        # project. Exit 0 with the warning so CI can decide.
+        console.print(
+            "[dim]mdk_validate_summary: "
+            "agents_total=0 workflows_total=0 "
+            "passed=0 failed=0 ok=true[/dim]"
+        )
+        return
+
+    # Per-item results: (kind, name, status, detail).
+    rows: list[tuple[str, str, str, str]] = []
+    failed = 0
+
+    for agent_dir in agent_dirs:
+        try:
+            _validate_agent(agent_dir, strict=strict, run_linter=run_linter)
+            rows.append(("agent", agent_dir.name, "ok", ""))
+        except typer.Exit:
+            # _validate_agent already printed the failure detail.
+            rows.append(("agent", agent_dir.name, "failed", ""))
+            failed += 1
+
+    for workflow_dir in workflow_dirs:
+        try:
+            _validate_workflow(workflow_dir)
+            rows.append(("workflow", workflow_dir.name, "ok", ""))
+        except typer.Exit:
+            rows.append(("workflow", workflow_dir.name, "failed", ""))
+            failed += 1
+
+    # Render the summary table.
+    table = Table(
+        title=(
+            f"Project validation — [bold]{project_root.name}[/bold] "
+            f"[dim]({len(rows)} item(s))[/dim]"
+        ),
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Kind", no_wrap=True)
+    table.add_column("Name", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    for kind, name, status, _detail in rows:
+        marker = "[green]✓ ok[/green]" if status == "ok" else "[red]✗ failed[/red]"
+        table.add_row(kind, name, marker)
+    console.print()
+    console.print(table)
+
+    passed = len(rows) - failed
+    console.print(
+        f"[dim]mdk_validate_summary: "
+        f"agents_total={len(agent_dirs)} "
+        f"workflows_total={len(workflow_dirs)} "
+        f"passed={passed} failed={failed} "
+        f"ok={'true' if failed == 0 else 'false'}[/dim]"
+    )
+
+    if failed:
+        raise typer.Exit(code=2)
 
 
 def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
