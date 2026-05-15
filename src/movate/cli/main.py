@@ -66,6 +66,7 @@ from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
+from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
@@ -190,6 +191,9 @@ app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
 app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
+# `inspect` is the resolved-view sibling of `show` (raw view) — same
+# Develop panel since both answer "what does this agent look like?".
+app.add_typer(inspect_app, name="inspect", rich_help_panel=PANEL_DEVELOP)
 # NOTE: do NOT pass `help=` here — Typer/Click then ignores the function's
 # docstring, which is where each command's [bold]Examples:[/bold] block
 # lives. The docstring's first line becomes the panel summary; the full
