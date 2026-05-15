@@ -364,52 +364,84 @@ async def _run_llm_scaffold(
     # heavyweight modules. The non-LLM scaffold doesn't pay this cost.
     import tempfile  # noqa: PLC0415
 
+    from movate.cli import _console  # noqa: PLC0415
+    from movate.cli._progress import spinner  # noqa: PLC0415
     from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.core.models import TokenUsage  # noqa: PLC0415
     from movate.scaffold import (  # noqa: PLC0415
         LLMScaffoldError,
         generate_agent_from_description,
         write_agent_files,
     )
 
+    # Roll token usage across every LLM call (attempt 1 + retry) so the
+    # final cost line reflects total spend. Used by the cost echo +
+    # mdk_init_summary line at the end.
+    total_tokens = TokenUsage()
+    # Track whether a retry actually fired — used by the summary line
+    # so CI dashboards can flag "this scaffold needed correction" runs.
+    retried = False
+
     rt = await build_local_runtime(mock=mock)
     try:
         # Attempt 1 — fresh generation from the description.
         try:
-            generated = await generate_agent_from_description(
-                description=description,
-                name=name,
-                model=llm_model,
-                provider=rt.provider,
-            )
+            with spinner(f"scaffolding agent '{name}' from description..."):
+                result = await generate_agent_from_description(
+                    description=description,
+                    name=name,
+                    model=llm_model,
+                    provider=rt.provider,
+                )
+            total_tokens = _accumulate_tokens(total_tokens, result.tokens)
+            generated = result.agent
         except LLMScaffoldError as exc:
             err_console.print(f"[red]✗[/red] LLM scaffold failed: {exc}")
             raise typer.Exit(code=2) from None
+
+        # Enforce the name-constraint defensively. A forgetful LLM might
+        # echo the example's name ("faq-agent") instead of honoring the
+        # description's requested name. We override AFTER generation so
+        # the dir/file/agent-yaml correspondence is always preserved.
+        # If the LLM hallucinated a *different* name, that's a soft
+        # failure: we silently coerce. (Add a warning here if pilot data
+        # shows real LLMs ignoring this constraint at meaningful rates.)
+        generated.agent_yaml["name"] = name
 
         # Validate by writing to a tempdir and loading.
         validation_error = _try_validate(generated, name=name)
 
         # Retry once if validation failed.
         if validation_error is not None:
+            retried = True
             err_console.print(
                 f"[yellow]⚠[/yellow] first attempt failed validation: "
                 f"[dim]{validation_error}[/dim]\n"
                 f"[dim]retrying once with the error fed back to the model...[/dim]"
             )
             try:
-                generated = await generate_agent_from_description(
-                    description=description,
-                    name=name,
-                    model=llm_model,
-                    provider=rt.provider,
-                    previous_attempt=generated,
-                    validation_error=validation_error,
-                )
+                with spinner(f"retrying scaffold for '{name}'..."):
+                    result = await generate_agent_from_description(
+                        description=description,
+                        name=name,
+                        model=llm_model,
+                        provider=rt.provider,
+                        previous_attempt=generated,
+                        validation_error=validation_error,
+                    )
+                total_tokens = _accumulate_tokens(total_tokens, result.tokens)
+                generated = result.agent
+                generated.agent_yaml["name"] = name
             except LLMScaffoldError as exc:
                 _save_debug_artifact(name, payload=None, raw_error=str(exc))
                 err_console.print(
                     f"[red]✗[/red] retry also failed: {exc}\n"
                     f"[dim]raw error saved to "
                     f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]"
+                )
+                _print_init_summary_line(
+                    name=name, llm=True, model=llm_model,
+                    tokens=total_tokens, ok=False, retried=True,
                 )
                 raise typer.Exit(code=2) from None
 
@@ -424,14 +456,29 @@ async def _run_llm_scaffold(
                     f"[dim]inspect, fix manually, or re-run with a different "
                     f"description.[/dim]"
                 )
+                _print_init_summary_line(
+                    name=name, llm=True, model=llm_model,
+                    tokens=total_tokens, ok=False, retried=True,
+                )
                 raise typer.Exit(code=1)
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
+
+    # Compute cost. Lookups against the pricing table can fail (model
+    # not listed) — that's not a hard failure for scaffold; we report
+    # ``None`` and the summary line carries cost_usd= unset. The cost
+    # echo Panel just omits the line.
+    cost_usd = _safe_cost(model=llm_model, tokens=total_tokens)
 
     # At this point, ``generated`` passed validation. Either preview or
     # commit to ``dest``.
     if dry_run:
         _render_dry_run_preview(generated, name=name, dest=dest)
+        _emit_post_success_hint(_console, dry_run=True)
+        _print_init_summary_line(
+            name=name, llm=True, model=llm_model,
+            tokens=total_tokens, ok=True, retried=retried,
+        )
         return
 
     # Commit: write into a tempdir then atomic-rename into place. The
@@ -446,7 +493,12 @@ async def _run_llm_scaffold(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(tmp_dir, dest)
 
-    _render_success_panel(name=name, dest=dest, generated=generated)
+    _render_success_panel(name=name, dest=dest, generated=generated, cost_usd=cost_usd)
+    _emit_post_success_hint(_console, dry_run=False)
+    _print_init_summary_line(
+        name=name, llm=True, model=llm_model,
+        tokens=total_tokens, ok=True, retried=retried,
+    )
 
 
 def _try_validate(generated: Any, *, name: str) -> str | None:
@@ -517,7 +569,9 @@ def _render_dry_run_preview(generated: Any, *, name: str, dest: Path) -> None:
     )
 
 
-def _render_success_panel(*, name: str, dest: Path, generated: Any) -> None:
+def _render_success_panel(
+    *, name: str, dest: Path, generated: Any, cost_usd: float | None
+) -> None:
     """Print the success Panel — mirrors the template-copy success path."""
     body = (
         f"[bold]Agent:[/bold]    [cyan]{name}[/cyan]\n"
@@ -533,12 +587,17 @@ def _render_success_panel(*, name: str, dest: Path, generated: Any) -> None:
             f"  • [cyan]evals/dataset.jsonl[/cyan] "
             f"[dim]({len(generated.sample_evals)} seed cases)[/dim]\n"
         )
+    if cost_usd is not None:
+        # Cost line — typical scaffold runs are <$0.01; format with
+        # enough decimals to read meaningfully at that scale.
+        body += f"[bold]Cost:[/bold]     [dim]${cost_usd:.6f} USD[/dim]\n"
     body += (
         f"\n[bold]Next steps:[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk validate {dest}[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk run {dest} --mock '{{...}}'[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk eval {dest} --mock --gate 0.7[/bold]\n\n"
-        f"[dim]review prompt.md and the schemas before first real run.[/dim]"
+        f"[dim]scaffolded by --llm · review prompt.md and the schemas "
+        f"before first real run.[/dim]"
     )
     console.print(
         Panel(
@@ -547,6 +606,87 @@ def _render_success_panel(*, name: str, dest: Path, generated: Any) -> None:
             title_align="left",
             border_style="green",
         )
+    )
+
+
+def _accumulate_tokens(running: Any, new: Any) -> Any:
+    """Sum two :class:`TokenUsage` values into a fresh instance.
+
+    TokenUsage is a Pydantic model — addition isn't built in. This
+    helper does the field-by-field sum so the running tally across
+    attempt + retry adds up correctly.
+    """
+    from movate.core.models import TokenUsage  # noqa: PLC0415
+
+    return TokenUsage(
+        input=running.input + new.input,
+        output=running.output + new.output,
+        cached_input=running.cached_input + new.cached_input,
+    )
+
+
+def _safe_cost(*, model: str, tokens: Any) -> float | None:
+    """Compute cost in USD; return ``None`` if the model isn't in the
+    pricing table or the lookup fails for any other reason.
+
+    Scaffold should never abort on a pricing-table miss — the agent
+    files are already on disk and useful. We just skip the cost line.
+    """
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+    try:
+        pricing = load_pricing()
+        return pricing.cost_for(provider=model, tokens=tokens)
+    except (KeyError, OSError, ValueError):
+        return None
+
+
+def _emit_post_success_hint(console_module: Any, *, dry_run: bool) -> None:
+    """Stderr-only hint after success. Uses ``_console.hint`` so it
+    respects ``--quiet`` (CI runs that pipe stderr stay clean)."""
+    if dry_run:
+        console_module.hint(
+            "[dim]→ preview only · re-run without [bold]--dry-run[/bold] "
+            "to write files[/dim]"
+        )
+    else:
+        console_module.hint(
+            "[dim]→ scaffolded by [bold]--llm[/bold] · "
+            "review [bold]prompt.md[/bold] before first real run[/dim]"
+        )
+
+
+def _print_init_summary_line(
+    *,
+    name: str,
+    llm: bool,
+    model: str,
+    tokens: Any,
+    ok: bool,
+    retried: bool,
+) -> None:
+    """Emit ``mdk_init_summary:`` greppable line.
+
+    Mirrors :func:`movate.cli.audit_cmd._print_summary_line`,
+    :func:`movate.cli.eval._print_eval_summary_line`, and
+    :func:`movate.cli.doctor._print_doctor_summary_line` so CI tooling
+    has one consistent prefix across all diagnostic + generation
+    commands. Cost lookup happens via :func:`_safe_cost` — a missing
+    pricing entry renders as ``cost_usd=unknown`` rather than failing
+    the summary line altogether.
+    """
+    cost = _safe_cost(model=model, tokens=tokens)
+    cost_str = f"{cost:.6f}" if cost is not None else "unknown"
+    console.print(
+        f"[dim]mdk_init_summary: "
+        f"name={name} "
+        f"llm={str(llm).lower()} "
+        f"model={model} "
+        f"input_tokens={tokens.input} "
+        f"output_tokens={tokens.output} "
+        f"cost_usd={cost_str} "
+        f"retried={str(retried).lower()} "
+        f"ok={str(ok).lower()}[/dim]"
     )
 
 

@@ -30,12 +30,14 @@ they're the kind of thing you want to read while reviewing the prompt.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from movate.core.models import TokenUsage
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -92,6 +94,19 @@ class GeneratedAgent(BaseModel):
             "a `missing-evals` audit finding."
         ),
     )
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """A successful generation attempt: the parsed agent + its token usage.
+
+    Returned by :func:`generate_agent_from_description`. The caller
+    rolls token usage across multiple attempts (attempt + retry) to
+    compute total cost.
+    """
+
+    agent: GeneratedAgent
+    tokens: TokenUsage
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +321,12 @@ async def generate_agent_from_description(
     provider: BaseLLMProvider,
     previous_attempt: GeneratedAgent | None = None,
     validation_error: str | None = None,
-) -> GeneratedAgent:
+) -> GenerationResult:
     """Single LLM-driven generation attempt.
 
-    Returns a validated :class:`GeneratedAgent`. Raises
+    Returns a :class:`GenerationResult` carrying the validated
+    :class:`GeneratedAgent` plus the call's :class:`TokenUsage` so
+    the caller can roll cost across attempts. Raises
     :class:`LLMScaffoldError` on any of:
 
     * Wire error from the provider.
@@ -374,11 +391,12 @@ async def generate_agent_from_description(
         ) from exc
 
     try:
-        return GeneratedAgent.model_validate(payload)
+        agent = GeneratedAgent.model_validate(payload)
     except ValidationError as exc:
         raise LLMScaffoldError(
             f"LLM output doesn't match GeneratedAgent schema:\n{exc}"
         ) from exc
+    return GenerationResult(agent=agent, tokens=response.tokens)
 
 
 def write_agent_files(generated: GeneratedAgent, *, target_dir: Path) -> None:

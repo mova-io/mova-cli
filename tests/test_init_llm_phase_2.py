@@ -34,6 +34,7 @@ from movate.core.loader import load_agent
 from movate.providers.mock import MockProvider
 from movate.scaffold import (
     GeneratedAgent,
+    GenerationResult,
     LLMScaffoldError,
     generate_agent_from_description,
     write_agent_files,
@@ -136,9 +137,10 @@ class TestGeneratedAgentModel:
 
 @pytest.mark.unit
 class TestGenerateFromDescription:
-    def test_happy_path_returns_generated_agent(self) -> None:
-        """MockProvider returns valid JSON → generator returns the parsed
-        GeneratedAgent."""
+    def test_happy_path_returns_generation_result(self) -> None:
+        """MockProvider returns valid JSON → generator returns a
+        GenerationResult carrying both the parsed GeneratedAgent and
+        the call's TokenUsage."""
         canned = json.dumps(_valid_agent_payload("happy-agent"))
         provider = MockProvider(response=canned)
         result = asyncio.run(
@@ -149,8 +151,13 @@ class TestGenerateFromDescription:
                 provider=provider,
             )
         )
-        assert isinstance(result, GeneratedAgent)
-        assert result.agent_yaml["name"] == "happy-agent"
+        assert isinstance(result, GenerationResult)
+        assert isinstance(result.agent, GeneratedAgent)
+        assert result.agent.agent_yaml["name"] == "happy-agent"
+        # MockProvider stamps non-zero token counts so cost rollup
+        # has something to work with downstream.
+        assert result.tokens.input > 0
+        assert result.tokens.output > 0
 
     def test_strips_markdown_code_fences(self) -> None:
         """Even with response_format=json_object, some models still wrap
@@ -173,7 +180,7 @@ class TestGenerateFromDescription:
                 provider=provider,
             )
         )
-        assert result.agent_yaml["name"] == "fenced-agent"
+        assert result.agent.agent_yaml["name"] == "fenced-agent"
 
     def test_raises_scaffold_error_on_invalid_json(self) -> None:
         """MockProvider returns non-JSON → LLMScaffoldError surfaces clean."""
