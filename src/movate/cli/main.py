@@ -39,6 +39,7 @@ from movate.cli import (  # noqa: E402
     promote_cmd,
     replay_cmd,
     rollback_cmd,
+    tune_cmd,
 )
 from movate.cli import bench as bench_cmd  # noqa: E402
 from movate.cli import chat as chat_cmd  # noqa: E402
@@ -208,6 +209,10 @@ app.command("run", rich_help_panel=PANEL_RUN)(run_cmd.run)
 # `replay` re-executes a past run with the same input — pairs with
 # `mdk explain` (what happened?) for deterministic prompt iteration.
 app.command("replay", rich_help_panel=PANEL_RUN)(replay_cmd.replay)
+# `tune` sweeps one model knob (temperature/max_tokens/model) across a
+# list of values for the same input. Deterministic helper, NOT
+# auto-prompt-engineering — operators read the table + decide.
+app.command("tune", rich_help_panel=PANEL_RUN)(tune_cmd.tune)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
