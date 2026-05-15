@@ -623,6 +623,18 @@ def _add_one(
             agent_dir=dest, project_root=project_root
         )
 
+    # Auto-scaffold any contexts the template declares. Same rough
+    # edge as skills — an agent referencing `contexts: [style-guide]`
+    # would fail to load when the loader walks `contexts/` and the
+    # file isn't there. Reuses the same --no-skills flag (the
+    # symmetric --no-contexts is overkill; the two paths align in
+    # practice and operators rarely want one but not the other).
+    contexts_scaffolded: list[str] = []
+    if not no_skills:
+        contexts_scaffolded = _maybe_scaffold_declared_contexts(
+            agent_dir=dest, project_root=project_root
+        )
+
     # Auto-validation: load the scaffolded agent and confirm it
     # round-trips through the loader. Catches "template references a
     # non-existent skill" and similar issues that the bare scaffold-
@@ -656,6 +668,7 @@ def _add_one(
             "path": dest,
             "validates": validates_token,
             "skills_scaffolded": skills_scaffolded,
+            "contexts_scaffolded": contexts_scaffolded,
         }
 
     body = (
@@ -667,6 +680,9 @@ def _add_one(
     if skills_scaffolded:
         skills_str = ", ".join(skills_scaffolded)
         body += f"[bold]Skills:[/bold]   [cyan]{skills_str}[/cyan] (auto-scaffolded)\n"
+    if contexts_scaffolded:
+        ctx_str = ", ".join(contexts_scaffolded)
+        body += f"[bold]Contexts:[/bold] [cyan]{ctx_str}[/cyan] (auto-scaffolded)\n"
     if validation_status is not None:
         body += f"[bold]Validates:[/bold] {validation_status}\n"
     body += (
@@ -862,6 +878,101 @@ def _maybe_scaffold_declared_skills(*, agent_dir: Path, project_root: Path) -> l
                 f"[yellow]⚠[/yellow] could not auto-scaffold skill [bold]{skill_name}[/bold]: {exc}"
             )
     return scaffolded
+
+
+def _maybe_scaffold_declared_contexts(*, agent_dir: Path, project_root: Path) -> list[str]:
+    """Auto-scaffold any contexts declared in the agent's ``contexts:``
+    field that don't yet exist in ``<project>/contexts/<name>.md``.
+
+    Mirrors :func:`_maybe_scaffold_declared_skills`. Returns the list of
+    context names that were freshly scaffolded. Empty list if no
+    contexts declared, the YAML can't be parsed, or every context
+    already exists.
+
+    Contexts have no schema — they're plain Markdown files. The
+    scaffold is therefore a deliberately-minimal placeholder Markdown
+    blob with comments explaining what to fill in. Operators see
+    immediately what shape is expected without having to find docs.
+
+    Failures (write-perm denied, etc.) log a warning and continue.
+    The agent itself is on disk and useful even if a context stub
+    failed to land.
+    """
+    yaml_path = agent_dir / "agent.yaml"
+    if not yaml_path.is_file():
+        return []
+
+    import yaml as _yaml  # noqa: PLC0415
+
+    try:
+        data = _yaml.safe_load(yaml_path.read_text()) or {}
+    except _yaml.YAMLError:
+        return []
+
+    declared_contexts = data.get("contexts") or []
+    if not declared_contexts:
+        return []
+
+    scaffolded: list[str] = []
+    contexts_dir = project_root / "contexts"
+    for context_name in declared_contexts:
+        context_path = contexts_dir / f"{context_name}.md"
+        if context_path.exists():
+            continue
+        try:
+            _scaffold_one_context(name=context_name, project_root=project_root)
+            scaffolded.append(context_name)
+        except Exception as exc:
+            err_console.print(
+                f"[yellow]⚠[/yellow] could not auto-scaffold context "
+                f"[bold]{context_name}[/bold]: {exc}"
+            )
+    return scaffolded
+
+
+# Placeholder Markdown for auto-scaffolded contexts. Intentionally
+# brief — operators see the shape (`# H1` header, `## Purpose` /
+# `## Content` sections, dim TODO markers) without having to grep
+# docs for the convention.
+_CONTEXT_PLACEHOLDER = """\
+# {name}
+
+<!--
+This context was auto-scaffolded by `mdk add` because an agent's
+`contexts:` field referenced [bold]{name}[/bold] but the file didn't
+exist yet. Contexts are reusable Markdown that gets prepended to the
+agent's prompt at build time, so multiple agents can share consistent
+style guides, safety policies, domain primers, etc.
+
+Replace this placeholder with the actual content you want injected.
+The whole file body is included verbatim — there's no schema, no
+Jinja, no YAML envelope. Just write what you want the model to read.
+-->
+
+## Purpose
+
+TODO: Describe what this context provides + which agents should
+reference it.
+
+## Content
+
+TODO: Write the actual Markdown content here. This is what gets
+prepended to the agent's prompt.
+"""
+
+
+def _scaffold_one_context(*, name: str, project_root: Path) -> None:
+    """Write an empty placeholder ``<project>/contexts/<name>.md``.
+
+    Contexts have no template directory (they're single files), so
+    this just materializes :data:`_CONTEXT_PLACEHOLDER` with the name
+    stamped in. The placeholder has the operator-facing TODO
+    structure that makes "what goes here?" answerable without docs.
+    """
+    contexts_dir = project_root / "contexts"
+    contexts_dir.mkdir(parents=True, exist_ok=True)
+    dest = contexts_dir / f"{name}.md"
+    dest.write_text(_CONTEXT_PLACEHOLDER.format(name=name))
 
 
 def _scaffold_one_skill(*, name: str, project_root: Path) -> None:

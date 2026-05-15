@@ -92,6 +92,8 @@ _PROJECT_MOVATE_YAML = """\
 
 agents_dir: ./agents
 workflows_dir: ./workflows
+skills_dir: ./skills          # reusable skill defs (`skill.yaml` + impl.py)
+contexts_dir: ./contexts      # reusable Markdown contexts (prepended to prompts)
 
 
 # ---- Defaults applied to every agent ----------------------------------------
@@ -481,10 +483,21 @@ def _init_project(
     (project_root / ".env.example").write_text(_PROJECT_ENV_EXAMPLE)
     (project_root / ".gitignore").write_text(_PROJECT_GITIGNORE)
 
-    # Empty agents/ directory with a .gitkeep so it survives git add.
-    agents_dir = project_root / "agents"
-    agents_dir.mkdir(exist_ok=True)
-    (agents_dir / ".gitkeep").write_text("")
+    # Three empty top-level dirs with .gitkeep placeholders so they
+    # survive `git add`:
+    #
+    # * ``agents/``    — agent definitions (`mdk add` + `mdk init <name>`)
+    # * ``skills/``    — reusable skill definitions (`skill.yaml` + impl)
+    # * ``contexts/``  — reusable Markdown contexts (prepended to prompts)
+    #
+    # Operators don't HAVE to use skills/ + contexts/, but pre-creating
+    # them surfaces the capabilities (vs. operators discovering them
+    # through doc-reading) AND lets agent.yaml's declared `skills:` /
+    # `contexts:` references resolve cleanly from day one.
+    for subdir in ("agents", "skills", "contexts"):
+        sub = project_root / subdir
+        sub.mkdir(exist_ok=True)
+        (sub / ".gitkeep").write_text("")
 
     # .movate/ runtime state directory + README. The README explains
     # what `.movate/snapshots/` is for — operators looking inside the
@@ -526,6 +539,8 @@ def _init_project(
         f"  • [cyan].env.example[/cyan]   env-var template\n"
         f"  • [cyan].gitignore[/cyan]     standard ignores\n"
         f"  • [cyan]agents/[/cyan]        empty (waiting for agents)\n"
+        f"  • [cyan]skills/[/cyan]        empty (reusable skill defs)\n"
+        f"  • [cyan]contexts/[/cyan]      empty (reusable Markdown contexts)\n"
     )
     if snapshot_short:
         body += f"  • [cyan]snapshot[/cyan]       [dim]{snapshot_short}[/dim] (initial baseline)\n"
