@@ -18,6 +18,16 @@ from dotenv import load_dotenv
 # Load .env from cwd (or any parent). Existing env vars take precedence.
 load_dotenv()
 
+# Machine-global credentials store. After dotenv runs, autoload any
+# provider keys that are STILL unset from ~/.movate/credentials. The
+# resolution order is therefore: shell env > project .env > active-
+# profile secrets > ~/.movate/credentials. Operators set keys once
+# via `mdk auth login <provider>` and every project on the machine
+# picks them up.
+from movate.credentials import autoload_credentials  # noqa: E402
+
+autoload_credentials()
+
 # Bridge MDK_* ↔ MOVATE_* env vars in both directions. Runs BEFORE any
 # other module reads os.environ so legacy and canonical prefixes are
 # interchangeable for downstream readers. One-shot deprecation warning

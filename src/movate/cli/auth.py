@@ -201,3 +201,213 @@ async def _revoke(key_id: str) -> None:
         await storage.revoke_api_key(key_id, tenant_id=record.tenant_id)
     finally:
         await storage.close()
+
+
+# ---------------------------------------------------------------------------
+# Provider-key credentials (PR B)
+#
+# `mdk auth login <provider>` and `mdk auth status` manage the
+# machine-global ~/.movate/credentials file — distinct from the tenant
+# API keys above (which authenticate clients against the movate runtime).
+# Same `auth` command surface because both flows are about credentials.
+# ---------------------------------------------------------------------------
+
+
+_PROVIDERS_PROMPT_NAME = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "azure": "Azure OpenAI",
+    "gemini": "Gemini",
+    "lyzr": "Lyzr Studio",
+}
+
+_PROVIDER_TO_ENV_VAR = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "azure": "AZURE_OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "lyzr": "LYZR_API_KEY",
+}
+
+
+@auth_app.command("login")
+def login(
+    provider: str = typer.Argument(
+        ...,
+        help=(
+            "Provider to set the API key for: "
+            "[bold]openai[/bold], [bold]anthropic[/bold], "
+            "[bold]azure[/bold], [bold]gemini[/bold], or [bold]lyzr[/bold]."
+        ),
+    ),
+    key: str = typer.Option(
+        None,
+        "--key",
+        help=(
+            "Pass the key non-interactively (CI scripts). Without "
+            "[bold]--key[/bold], the CLI prompts interactively with "
+            "hidden input."
+        ),
+    ),
+    no_verify: bool = typer.Option(
+        False,
+        "--no-verify",
+        help=(
+            "Skip the live verification call. Useful when the provider "
+            "is unreachable from the operator's network at setup time."
+        ),
+    ),
+    save_to: str = typer.Option(
+        "global",
+        "--save-to",
+        help=(
+            "Where to write the key: [bold]global[/bold] "
+            "([bold]~/.movate/credentials[/bold], machine-global) or "
+            "[bold]project[/bold] ([bold]./.env[/bold], project-only)."
+        ),
+    ),
+) -> None:
+    """Set a provider API key, verify it, persist it for every project.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Interactive — prompts for the key, hides input[/dim]
+      $ mdk auth login openai
+
+      [dim]# Save to project .env instead of machine-global[/dim]
+      $ mdk auth login anthropic --save-to project
+
+      [dim]# CI-style: pass key non-interactively, skip verify[/dim]
+      $ mdk auth login openai --key "$OPENAI_API_KEY" --no-verify
+    """
+    from movate.credentials import (  # noqa: PLC0415
+        CredentialsStore,
+        verify_provider_key,
+    )
+
+    provider = provider.lower().strip()
+    if provider not in _PROVIDER_TO_ENV_VAR:
+        valid = ", ".join(sorted(_PROVIDER_TO_ENV_VAR))
+        error(f"unknown provider {provider!r}. Valid: {valid}")
+        raise typer.Exit(code=2)
+
+    env_var = _PROVIDER_TO_ENV_VAR[provider]
+    friendly_name = _PROVIDERS_PROMPT_NAME[provider]
+
+    # Resolve the key — flag, env var, or interactive prompt.
+    if key is None:
+        key = typer.prompt(
+            f"{friendly_name} API key",
+            hide_input=True,
+            confirmation_prompt=False,
+        )
+    key = key.strip()
+    if not key:
+        error("empty key — aborted.")
+        raise typer.Exit(code=2)
+
+    # Verify (unless opted out).
+    if not no_verify:
+        with stdout.status(f"verifying {friendly_name} key..."):
+            result = verify_provider_key(provider, key)
+        if result.ok:
+            success(result.detail)
+        elif result.network_error:
+            err.print(
+                f"[yellow]⚠[/yellow] verify call failed (network): "
+                f"{result.detail}. Saving key anyway — offline scenarios "
+                "can verify later."
+            )
+        else:
+            error(f"verification failed: {result.detail}")
+            raise typer.Exit(code=2)
+
+    # Persist.
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set(env_var, key)
+        success(
+            f"saved [bold]{env_var}[/bold] to "
+            f"[cyan]{store.path}[/cyan] (mode 0600)."
+        )
+        hint(
+            "[dim]Every `mdk` invocation on this machine now picks up "
+            "this key automatically. Run [bold]mdk auth status[/bold] "
+            "to confirm.[/dim]"
+        )
+    elif save_to == "project":
+        # Append to project .env. We don't try to in-place edit; the
+        # operator's editor handles dedup later if they want.
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        if dotenv.is_file() and env_var in dotenv.read_text():
+            error(
+                f"{env_var} is already in {dotenv.resolve()}. "
+                "Edit the file or use --save-to global instead."
+            )
+            raise typer.Exit(code=2)
+        with dotenv.open("a") as fh:
+            fh.write(f"{env_var}={key}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+@auth_app.command("status")
+def status() -> None:
+    """Show which provider keys are configured and where they came from.
+
+    Renders a table per provider showing the resolved value's source
+    (shell / dotenv / credentials_file / unset). Operators see at a
+    glance which keys are wired and where to fix gaps.
+    """
+    from movate.credentials import (  # noqa: PLC0415
+        PROVIDER_KEY_ENV_VARS,
+        CredentialsStore,
+        key_source,
+    )
+
+    table = Table(
+        title="movate auth status",
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Env var", style="cyan", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Source", style="dim")
+    table.add_column("Hint", style="dim")
+
+    counts = {"ok": 0, "unset": 0}
+    for env_var in PROVIDER_KEY_ENV_VARS:
+        src = key_source(env_var)
+        if src == "unset":
+            counts["unset"] += 1
+            provider = env_var.lower().removesuffix("_api_key").split("_")[0]
+            table.add_row(
+                env_var,
+                "[yellow]⊘ not set[/yellow]",
+                "—",
+                f"run [bold]mdk auth login {provider}[/bold]",
+            )
+        else:
+            counts["ok"] += 1
+            table.add_row(
+                env_var,
+                "[green]✓ set[/green]",
+                src.replace("_", " "),
+                "",
+            )
+
+    stdout.print(table)
+    stdout.print()
+    stdout.print(
+        f"[dim]credentials file: [cyan]{CredentialsStore().path}[/cyan][/dim]"
+    )
+    stdout.print(
+        f"[dim]mdk_auth_status_summary: "
+        f"set={counts['ok']} unset={counts['unset']}[/dim]"
+    )

@@ -1,0 +1,136 @@
+"""Auto-load credentials at CLI startup with the canonical precedence.
+
+Called by :mod:`movate.cli.main` after ``load_dotenv()``. The order
+matters: dotenv loads project-level ``.env`` first; then this module
+fills in any provider key that ISN'T already set from the
+machine-global file. That gives us the right precedence — shell env
+> project .env > credentials file — without the credentials file
+ever clobbering an explicit project-level value.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Literal
+
+from movate.credentials.store import CredentialsStore
+
+# Every provider env var movate knows about. Operators set these
+# (in shell / .env / credentials file) and `_has_any_provider_key`
+# downstream checks them. Kept here as the single source of truth;
+# :mod:`movate.cli.doctor` + :mod:`movate.cli.init` re-export this.
+PROVIDER_KEY_ENV_VARS: tuple[str, ...] = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "LYZR_API_KEY",
+)
+
+
+# Where a credential ended up resolving from. Used by `mdk auth status`
+# to tell operators "this key came from X, not Y".
+KeySource = Literal["shell", "dotenv", "credentials_file", "unset"]
+
+
+def autoload_credentials() -> None:
+    """Fill in any unset PROVIDER_KEY_ENV_VARS from the credentials file.
+
+    Called once per CLI invocation, AFTER ``dotenv.load_dotenv()``.
+    The semantics:
+
+    * If a key is already set in the environment (from shell OR .env),
+      do nothing — explicit setters always win.
+    * Otherwise, fill it in from ``~/.movate/credentials`` if present
+      there.
+
+    This implements the "narrowest beats widest" precedence model
+    without having to thread credential source through every code
+    path that reads the env. After this function runs, every
+    downstream caller can just check ``os.environ`` like they always
+    have — the lookup answers the right question because the lower-
+    precedence sources were folded in here.
+    """
+    store = CredentialsStore()
+    file_entries = store.read()
+    if not file_entries:
+        return
+    for key in PROVIDER_KEY_ENV_VARS:
+        # Skip if already set (by shell OR by dotenv already running).
+        if os.environ.get(key, "").strip():
+            continue
+        candidate = file_entries.get(key, "").strip()
+        if candidate:
+            os.environ[key] = candidate
+
+
+def key_source(key: str) -> KeySource:
+    """Tell where the current value of ``key`` came from.
+
+    Used by ``mdk auth status`` to render the resolution-path table.
+    Distinguishes "set by shell BEFORE the CLI started" from "loaded
+    from .env" from "loaded from credentials file" by checking the
+    underlying sources without re-running autoload.
+
+    Implementation note: shell vs dotenv ambiguity. ``load_dotenv()``
+    sets values in ``os.environ`` AS IF they were shell-exported, so
+    we can't distinguish them perfectly after the fact. We work
+    around it by:
+
+    1. Reading the project ``.env`` directly to see what dotenv would
+       have set.
+    2. Reading the credentials file to see what we autoloaded.
+    3. Whichever has a value AND the current ``os.environ`` matches:
+       attribute the source.
+    4. If the env var is set and matches NEITHER source, it must be
+       shell-set.
+    """
+    current = os.environ.get(key, "").strip()
+    if not current:
+        return "unset"
+
+    # Check the credentials file — lowest precedence so we know it
+    # FOUND a value here AND nothing higher overrode it.
+    file_value = CredentialsStore().get(key) or ""
+    file_value = file_value.strip()
+
+    # Check the project .env (if present). This is a best-effort read
+    # — we don't actually call dotenv, just check the file.
+    dotenv_value = _read_dotenv_value(key)
+
+    # Attribution heuristic: the source that matches the current
+    # value AND is reachable wins. Shell wins if neither file
+    # contains the matching value.
+    if dotenv_value and dotenv_value == current:
+        return "dotenv"
+    if file_value and file_value == current:
+        return "credentials_file"
+    # The env var is set but no managed source has the matching value;
+    # operator must have set it in their shell.
+    return "shell"
+
+
+def _read_dotenv_value(key: str) -> str:
+    """Read one key from a project-local ``.env`` if it exists.
+
+    Walks up from cwd looking for ``.env`` — same convention as
+    dotenv's default. Returns the unquoted value, or empty string if
+    not found.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    current = Path.cwd().resolve()
+    while True:
+        dotenv = current / ".env"
+        if dotenv.is_file():
+            for raw in dotenv.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'")
+            return ""
+        if current.parent == current:
+            return ""
+        current = current.parent
