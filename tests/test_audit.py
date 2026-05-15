@@ -74,6 +74,7 @@ def _make_agent(
             f"description: 'test agent {name}'\n"
             f"owner: 'test-team@example.com'\n"
             f"model:\n  provider: openai/gpt-4o-mini-2024-07-18\n"
+            f"  fallback:\n    - provider: anthropic/claude-haiku-4-5-20251001\n"
             f"prompt: ./prompt.md\n"
             f"schema:\n  input: {{ q: string }}\n  output: {{ a: string }}\n"
             + (

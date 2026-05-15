@@ -282,6 +282,161 @@ def scan_no_test_signal(agent_dir: Path, agent_name: str) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
+# v2 scanners (Sprint S extensions)
+# ---------------------------------------------------------------------------
+
+
+@register("floating-model-tag")
+def scan_floating_model_tag(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """Model references a floating tag (``:latest`` / ``:stable``).
+
+    Silent provider rotations on a floating tag can change behavior
+    overnight. AgentSpec already rejects this at load time, but the
+    audit catches it on shapes we don't validate (e.g. an agent.yaml
+    not loaded via the canonical loader). Defense in depth.
+    """
+    raw = _load_agent_yaml(agent_dir)
+    if raw is None:
+        return []
+    model = raw.get("model") or {}
+    provider = str(model.get("provider") or "") if isinstance(model, dict) else ""
+    bad_tokens = (":latest", ":stable", ":nightly", ":head", ":main")
+    if not any(tok in provider for tok in bad_tokens):
+        return []
+    return [
+        Finding(
+            category="floating-model-tag",
+            severity=Severity.ERROR,
+            target=agent_name,
+            message=f"model {provider!r} uses a floating tag — pin a real version",
+            hint="floating tags can rotate silently. Pin (e.g. gpt-4o-mini-2024-07-18)",
+        )
+    ]
+
+
+@register("missing-version")
+def scan_missing_version(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """Agent.yaml lacks a ``version`` field.
+
+    Without a version, snapshot diffs / promotion tracking can't tell
+    "did the operator actually bump?" from "operator forgot to bump."
+    Warning rather than error — many internal agents skip it.
+    """
+    raw = _load_agent_yaml(agent_dir)
+    if raw is None:
+        return []
+    if raw.get("version"):
+        return []
+    return [
+        Finding(
+            category="missing-version",
+            severity=Severity.WARNING,
+            target=agent_name,
+            message="agent.yaml has no `version` field",
+            hint="add `version: 0.1.0` and bump on each prompt / model change",
+        )
+    ]
+
+
+@register("missing-fallback")
+def scan_missing_fallback(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """No fallback model declared.
+
+    Agents that go to prod without a fallback fail open when the
+    primary provider has an outage. Warning, not error — short-lived
+    dev agents legitimately don't need one.
+    """
+    raw = _load_agent_yaml(agent_dir)
+    if raw is None:
+        return []
+    model = raw.get("model")
+    if not isinstance(model, dict):
+        return []
+    fallback = model.get("fallback")
+    if fallback:  # list non-empty
+        return []
+    return [
+        Finding(
+            category="missing-fallback",
+            severity=Severity.WARNING,
+            target=agent_name,
+            message="no `model.fallback` declared — primary outage = agent down",
+            hint=(
+                "add `model.fallback: [{provider: anthropic/claude-haiku-4-5-20251001}]` "
+                "(or an equivalent cross-family backup)"
+            ),
+        )
+    ]
+
+
+@register("prompt-too-long")
+def scan_prompt_too_long(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """Prompt template is unusually long (> 8000 chars).
+
+    Long prompts inflate cost on every call. Pre-prompt-engineering
+    rule of thumb: anything over ~8k chars is a candidate for
+    refactoring into per-call context retrieval. Warning so operators
+    can decide.
+    """
+    prompt_path = agent_dir / "prompt.md"
+    if not prompt_path.is_file():
+        return []
+    chars = len(prompt_path.read_text())
+    threshold = 8000
+    if chars <= threshold:
+        return []
+    return [
+        Finding(
+            category="prompt-too-long",
+            severity=Severity.WARNING,
+            target=agent_name,
+            message=f"prompt.md is {chars:,} chars (> {threshold:,})",
+            hint=(
+                "consider splitting into shared contexts (./contexts/*.md) "
+                "or trimming examples — long prompts pay per-call"
+            ),
+        )
+    ]
+
+
+@register("schema-no-required")
+def scan_schema_no_required(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """Input schema declares no ``required`` fields.
+
+    Optional-only schemas accept ``{}`` as input, which usually means
+    the agent has no constraints — operators wrap whatever and hope.
+    Warning so operators tighten the schema or explicitly accept the
+    loose contract.
+    """
+    raw = _load_agent_yaml(agent_dir)
+    if raw is None:
+        return []
+    schema = raw.get("schema") or {}
+    input_block = schema.get("input") if isinstance(schema, dict) else None
+    # Inline shorthand uses key-form with `?` for optional; the absence
+    # of any non-`?` key implies no required fields.
+    if isinstance(input_block, dict):
+        has_required = any(not str(k).endswith("?") for k in input_block)
+        if has_required:
+            return []
+    elif isinstance(input_block, str):
+        # Path-form — operators using a full JSON Schema can audit the
+        # file separately. Skip rather than guess.
+        return []
+    else:
+        return []
+    return [
+        Finding(
+            category="schema-no-required",
+            severity=Severity.WARNING,
+            target=agent_name,
+            message="input schema has no required fields — accepts {}",
+            hint="mark at least one field non-optional (drop the trailing `?`)",
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
