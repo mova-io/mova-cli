@@ -72,6 +72,7 @@ from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
+from movate.cli.doctor import doctor_app  # noqa: E402
 from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
@@ -252,7 +253,13 @@ app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------
 
-app.command("doctor", rich_help_panel=PANEL_DIAGNOSE)(doctor_cmd.doctor)
+# `doctor` is a sub-app: `mdk doctor` runs the default env-check via
+# the callback's invoke_without_command path; `mdk doctor agent <name>`
+# runs the per-agent doctor (Bundle B). The import of doctor_cmd above
+# keeps the module loaded for backward-compat with any code reaching
+# in via `from movate.cli import doctor`.
+_ = doctor_cmd
+app.add_typer(doctor_app, name="doctor", rich_help_panel=PANEL_DIAGNOSE)
 # `fix` is the repair-side companion to `doctor` — same panel.
 # Auto-remediates common diagnostic findings. Dry-run by default.
 app.command("fix", rich_help_panel=PANEL_DIAGNOSE)(fix_cmd.fix)
