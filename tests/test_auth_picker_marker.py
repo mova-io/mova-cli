@@ -77,9 +77,7 @@ class TestProviderIsConfigured:
 
 @pytest.mark.unit
 class TestPickerMarker:
-    def test_picker_renders_marker_for_configured_provider(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_picker_renders_marker_for_configured_provider(self, isolated_creds: Path) -> None:
         # Configure OpenAI before showing the picker.
         CredentialsStore().set("OPENAI_API_KEY", "sk-test")
         autoload_credentials()
@@ -94,19 +92,15 @@ class TestPickerMarker:
         assert result.exit_code == 0, result.stdout + result.stderr
         # The OpenAI row shows the green check.
         openai_lines = [
-            line
-            for line in result.stdout.splitlines()
-            if "OpenAI" in line and "openai" in line
+            line for line in result.stdout.splitlines() if "OpenAI" in line and "openai" in line
         ]
         assert openai_lines, "expected OpenAI row in picker output"
         # The marker text appears on that row.
-        assert any(
-            "configured" in line.lower() for line in openai_lines
-        ), f"expected ✓ configured marker on OpenAI row: {openai_lines}"
+        assert any("configured" in line.lower() for line in openai_lines), (
+            f"expected ✓ configured marker on OpenAI row: {openai_lines}"
+        )
 
-    def test_picker_omits_marker_for_unconfigured(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_picker_omits_marker_for_unconfigured(self, isolated_creds: Path) -> None:
         """Anthropic isn't set — its row should NOT show the marker."""
         CredentialsStore().set("OPENAI_API_KEY", "sk-test")
         autoload_credentials()
@@ -117,11 +111,7 @@ class TestPickerMarker:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        anthropic_lines = [
-            line
-            for line in result.stdout.splitlines()
-            if "Anthropic" in line
-        ]
+        anthropic_lines = [line for line in result.stdout.splitlines() if "Anthropic" in line]
         assert anthropic_lines
         for line in anthropic_lines:
             assert "configured" not in line.lower(), (
@@ -150,9 +140,7 @@ class TestPickerMarker:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        telegram_lines = [
-            line for line in result.stdout.splitlines() if "Telegram" in line
-        ]
+        telegram_lines = [line for line in result.stdout.splitlines() if "Telegram" in line]
         assert telegram_lines
         for line in telegram_lines:
             assert "configured" not in line.lower(), (

@@ -386,16 +386,13 @@ async def generate_agent_from_description(
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise LLMScaffoldError(
-            f"LLM returned invalid JSON: {exc}. "
-            f"First 200 chars of response: {raw[:200]!r}"
+            f"LLM returned invalid JSON: {exc}. First 200 chars of response: {raw[:200]!r}"
         ) from exc
 
     try:
         agent = GeneratedAgent.model_validate(payload)
     except ValidationError as exc:
-        raise LLMScaffoldError(
-            f"LLM output doesn't match GeneratedAgent schema:\n{exc}"
-        ) from exc
+        raise LLMScaffoldError(f"LLM output doesn't match GeneratedAgent schema:\n{exc}") from exc
     return GenerationResult(agent=agent, tokens=response.tokens)
 
 

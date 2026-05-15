@@ -51,9 +51,7 @@ def _strip_all_provider_keys(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.unit
 class TestNativeAdapterRegistration:
-    def test_register_without_any_keys_is_silent(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_register_without_any_keys_is_silent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The bug we shipped: `_try_register_native_adapters` raised
         OpenAIError when OPENAI_API_KEY was missing. Now it should
         be a silent no-op for that adapter."""
@@ -64,9 +62,7 @@ class TestNativeAdapterRegistration:
         # Must not raise.
         _try_register_native_adapters(registry, mock=False)
 
-    def test_register_under_mock_is_noop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_register_under_mock_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Mock mode short-circuits the entire registration path so
         no native SDK gets touched."""
         _strip_all_provider_keys(monkeypatch)
@@ -108,9 +104,7 @@ class TestFriendlyKeyMissing:
         _strip_all_provider_keys(monkeypatch)
         assert _has_any_provider_key() is False
 
-    def test_has_any_provider_key_true_with_openai(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_has_any_provider_key_true_with_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _strip_all_provider_keys(monkeypatch)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         assert _has_any_provider_key() is True
@@ -211,9 +205,7 @@ class TestPositionalDescription:
         is OPTIONAL — operators with the old syntax aren't broken."""
         _strip_all_provider_keys(monkeypatch)
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(
-            app, ["init", "plain-agent"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["init", "plain-agent"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # Template scaffold ran — agent.yaml exists.
         assert (tmp_path / "plain-agent" / "agent.yaml").is_file()

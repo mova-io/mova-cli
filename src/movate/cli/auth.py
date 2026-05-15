@@ -351,10 +351,7 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
     if save_to == "global":
         store = CredentialsStore()
         store.set(env_var, key)
-        success(
-            f"saved [bold]{env_var}[/bold] to "
-            f"[cyan]{store.path}[/cyan] (mode 0600)."
-        )
+        success(f"saved [bold]{env_var}[/bold] to [cyan]{store.path}[/cyan] (mode 0600).")
         hint(
             "[dim]Every `mdk` invocation on this machine now picks up "
             "this key automatically. Run [bold]mdk auth status[/bold] "
@@ -430,9 +427,7 @@ def status() -> None:
     # these env vars; surface them in the status table so operators
     # know whether notifications will fire BEFORE attempting a deploy.
     table.add_row("", "", "", "")
-    table.add_row(
-        "[bold]Notifications[/bold]", "", "[dim]for mdk deploy --notify[/dim]", ""
-    )
+    table.add_row("[bold]Notifications[/bold]", "", "[dim]for mdk deploy --notify[/dim]", "")
     for env_var, hint_text in (
         ("TELEGRAM_BOT_TOKEN", "run [bold]mdk auth login telegram[/bold]"),
         ("TELEGRAM_CHAT_ID", "run [bold]mdk auth login telegram[/bold]"),
@@ -458,13 +453,8 @@ def status() -> None:
 
     stdout.print(table)
     stdout.print()
-    stdout.print(
-        f"[dim]credentials file: [cyan]{CredentialsStore().path}[/cyan][/dim]"
-    )
-    stdout.print(
-        f"[dim]mdk_auth_status_summary: "
-        f"set={counts['ok']} unset={counts['unset']}[/dim]"
-    )
+    stdout.print(f"[dim]credentials file: [cyan]{CredentialsStore().path}[/cyan][/dim]")
+    stdout.print(f"[dim]mdk_auth_status_summary: set={counts['ok']} unset={counts['unset']}[/dim]")
 
 
 def _provider_is_configured(provider: str) -> bool:
@@ -580,9 +570,7 @@ def _login_telegram(*, key: str | None, no_verify: bool, save_to: str) -> None:
         "     [bold]https://api.telegram.org/bot<token>/getUpdates[/bold]\n"
         "     to find the [bold]chat_id[/bold] for the chat you want notifications in[/dim]"
     )
-    token = typer.prompt(
-        "Telegram bot token", hide_input=True, confirmation_prompt=False
-    ).strip()
+    token = typer.prompt("Telegram bot token", hide_input=True, confirmation_prompt=False).strip()
     if not token:
         error("empty token — aborted.")
         raise typer.Exit(code=2)

@@ -136,9 +136,7 @@ def test_telegram_picker_marker_after_credentials_file_save(
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    telegram_lines = [
-        line for line in result.stdout.splitlines() if "Telegram" in line
-    ]
+    telegram_lines = [line for line in result.stdout.splitlines() if "Telegram" in line]
     assert telegram_lines
     # The marker fires: telegram row shows ✓ configured.
     assert any("configured" in line.lower() for line in telegram_lines), (

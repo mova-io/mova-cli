@@ -79,9 +79,7 @@ class TestHelpAliasRewrite:
         result = self._run_with_argv(["mdk", "-h"])
         assert result == ["mdk", "-h"]
 
-    def test_opt_out_env_var(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_opt_out_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """MDK_NO_HELP_ALIAS=1 disables the rewrite entirely — needed
         for the rare case where `help` is genuinely a payload value."""
         monkeypatch.setenv("MDK_NO_HELP_ALIAS", "1")
@@ -124,9 +122,7 @@ class TestProviderPicker:
         picker prompts. Typing "1" selects OpenAI; we pipe a --key +
         --no-verify so the rest of the flow doesn't hang on more
         prompts."""
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "--key", "sk-test", "--no-verify"],
@@ -147,9 +143,7 @@ class TestProviderPicker:
         """Every supported provider should appear in the numbered list
         — operators discover what MDK supports without reading the
         --help table."""
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "--key", "sk-test", "--no-verify"],
@@ -164,9 +158,7 @@ class TestProviderPicker:
     ) -> None:
         """Operators who already know the provider can skip the
         numeric pick by typing the name."""
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "--key", "ant-test", "--no-verify"],
@@ -181,9 +173,7 @@ class TestProviderPicker:
     def test_picker_out_of_range_choice_errors(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "--key", "x", "--no-verify"],
@@ -198,9 +188,7 @@ class TestProviderPicker:
     ) -> None:
         """The picker only fires when provider is None. Passing one
         explicitly bypasses it — the existing flow."""
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "openai", "--key", "sk-test", "--no-verify"],

@@ -194,9 +194,7 @@ def test_cli_monitor_once_renders_table(db_with_runs: Path) -> None:
 
 @pytest.mark.unit
 def test_cli_monitor_once_filters_by_agent(db_with_runs: Path) -> None:
-    result = runner.invoke(
-        app, ["monitor", "--once", "--agent", "summary"], env=_WIDE_ENV
-    )
+    result = runner.invoke(app, ["monitor", "--once", "--agent", "summary"], env=_WIDE_ENV)
     assert result.exit_code == 0
     assert "summary" in result.stdout
     # `triage` filtered out

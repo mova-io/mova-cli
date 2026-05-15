@@ -50,9 +50,7 @@ def _event(**overrides: object) -> DeployEvent:
 
 @pytest.mark.unit
 class TestTelegram:
-    def test_fires_when_both_env_vars_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_fires_when_both_env_vars_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
         fake_resp = MagicMock(spec=httpx.Response)
@@ -78,9 +76,7 @@ class TestTelegram:
         assert _try_telegram(_event()) is False
         post_mock.assert_not_called()
 
-    def test_skips_when_chat_id_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_skips_when_chat_id_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         post_mock = MagicMock()
@@ -89,9 +85,7 @@ class TestTelegram:
         assert _try_telegram(_event()) is False
         post_mock.assert_not_called()
 
-    def test_non_200_returns_false_no_raise(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_non_200_returns_false_no_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
         fake_resp = MagicMock(spec=httpx.Response)
@@ -102,9 +96,7 @@ class TestTelegram:
         # Must not raise — notifications are observability, not control flow.
         assert _try_telegram(_event()) is False
 
-    def test_http_exception_returns_false_no_raise(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_http_exception_returns_false_no_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
         monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
 
@@ -123,9 +115,7 @@ class TestTelegram:
 @pytest.mark.unit
 class TestWebhook:
     def test_fires_when_url_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(
-            "MOVATE_DEPLOY_WEBHOOK", "https://hooks.example.com/deploy"
-        )
+        monkeypatch.setenv("MOVATE_DEPLOY_WEBHOOK", "https://hooks.example.com/deploy")
         fake_resp = MagicMock(spec=httpx.Response)
         fake_resp.status_code = 200
         post_mock = MagicMock(return_value=fake_resp)
@@ -160,9 +150,7 @@ class TestWebhook:
         assert _try_webhook(_event()) is True
 
     @pytest.mark.parametrize("status", [400, 401, 403, 404, 500])
-    def test_non_2xx_returns_false(
-        self, status: int, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_non_2xx_returns_false(self, status: int, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MOVATE_DEPLOY_WEBHOOK", "https://hooks.example.com")
         fake_resp = MagicMock(spec=httpx.Response)
         fake_resp.status_code = status

@@ -70,9 +70,7 @@ class TestBatchAdd:
         pricing-qa isn't a template)."""
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["add", "rag-qa", "pricing-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "rag-qa", "pricing-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # The agent landed under the rename.
         assert (proj / "agents" / "pricing-qa" / "agent.yaml").is_file()
@@ -175,9 +173,7 @@ class TestAutoValidate:
     ) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["add", "rag-qa", "--no-validate"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "rag-qa", "--no-validate"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # No Validates: row in the Panel
         assert "Validates:" not in result.stdout
@@ -285,9 +281,7 @@ class TestGroupedList:
             "HR / Recruiting",
             "Compliance / Ops",
         ):
-            assert group in result.stdout, (
-                f"expected group {group!r} in --list output"
-            )
+            assert group in result.stdout, f"expected group {group!r} in --list output"
 
     def test_list_still_includes_core_table(self) -> None:
         """Grouping applies to the role tier; the core templates table

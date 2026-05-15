@@ -77,37 +77,25 @@ class TestCredentialsStore:
         store.set("OPENAI_API_KEY", "sk-new")
         assert store.get("OPENAI_API_KEY") == "sk-new"
 
-    def test_delete_returns_true_when_present(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_delete_returns_true_when_present(self, isolated_creds: Path) -> None:
         store = CredentialsStore()
         store.set("OPENAI_API_KEY", "sk-x")
         assert store.delete("OPENAI_API_KEY") is True
         assert store.get("OPENAI_API_KEY") is None
 
-    def test_delete_returns_false_when_missing(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_delete_returns_false_when_missing(self, isolated_creds: Path) -> None:
         assert CredentialsStore().delete("OPENAI_API_KEY") is False
 
     def test_file_is_mode_0600(self, isolated_creds: Path) -> None:
         store = CredentialsStore()
         store.set("OPENAI_API_KEY", "sk-x")
         mode = isolated_creds.stat().st_mode & 0o777
-        assert mode == 0o600, (
-            f"credentials file should be 0600, got {oct(mode)}"
-        )
+        assert mode == 0o600, f"credentials file should be 0600, got {oct(mode)}"
 
-    def test_comments_in_file_are_skipped(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_comments_in_file_are_skipped(self, isolated_creds: Path) -> None:
         isolated_creds.parent.mkdir(parents=True, exist_ok=True)
         isolated_creds.write_text(
-            "# comment\n"
-            "OPENAI_API_KEY=sk-x\n"
-            "# another comment\n"
-            "\n"
-            "ANTHROPIC_API_KEY=ant-y\n"
+            "# comment\nOPENAI_API_KEY=sk-x\n# another comment\n\nANTHROPIC_API_KEY=ant-y\n"
         )
         store = CredentialsStore()
         assert store.read() == {
@@ -128,9 +116,7 @@ class TestCredentialsStore:
 
 @pytest.mark.unit
 class TestAutoload:
-    def test_loads_into_unset_env_var(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_loads_into_unset_env_var(self, isolated_creds: Path) -> None:
         CredentialsStore().set("OPENAI_API_KEY", "sk-from-file")
         assert os.environ.get("OPENAI_API_KEY") is None
         autoload_credentials()
@@ -161,16 +147,12 @@ class TestKeySource:
     def test_unset_when_no_value(self, isolated_creds: Path) -> None:
         assert key_source("OPENAI_API_KEY") == "unset"
 
-    def test_credentials_file_attribution(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_credentials_file_attribution(self, isolated_creds: Path) -> None:
         CredentialsStore().set("OPENAI_API_KEY", "sk-x")
         autoload_credentials()
         assert key_source("OPENAI_API_KEY") == "credentials_file"
 
-    def test_shell_attribution(
-        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_shell_attribution(self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A value set in os.environ that doesn't match any source
         file gets attributed to the shell."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-from-shell-only")
@@ -204,9 +186,7 @@ class TestVerify:
         assert result.ok is True
         assert "2 models" in result.detail
 
-    def test_openai_401_returns_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_openai_401_returns_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx  # noqa: PLC0415
 
         class _Resp:
@@ -218,9 +198,7 @@ class TestVerify:
         assert result.ok is False
         assert "401" in result.detail
 
-    def test_network_error_flagged_separately(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_network_error_flagged_separately(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Connectivity failures should set network_error=True so the
         caller can save the key anyway (offline-setup scenario)."""
         import httpx  # noqa: PLC0415
@@ -241,9 +219,7 @@ class TestVerify:
 
 @pytest.mark.unit
 class TestAuthLogin:
-    def test_login_with_key_flag_and_no_verify_writes_file(
-        self, isolated_creds: Path
-    ) -> None:
+    def test_login_with_key_flag_and_no_verify_writes_file(self, isolated_creds: Path) -> None:
         result = runner.invoke(
             app,
             [
@@ -263,19 +239,13 @@ class TestAuthLogin:
         combined = result.stdout + result.stderr
         assert "OPENAI_API_KEY" in combined
 
-    def test_login_unknown_provider_errors(
-        self, isolated_creds: Path
-    ) -> None:
-        result = runner.invoke(
-            app, ["auth", "login", "madeup-provider", "--key", "x"]
-        )
+    def test_login_unknown_provider_errors(self, isolated_creds: Path) -> None:
+        result = runner.invoke(app, ["auth", "login", "madeup-provider", "--key", "x"])
         assert result.exit_code == 2
         assert "unknown provider" in result.stderr.lower()
 
     def test_login_empty_key_errors(self, isolated_creds: Path) -> None:
-        result = runner.invoke(
-            app, ["auth", "login", "openai", "--key", "   ", "--no-verify"]
-        )
+        result = runner.invoke(app, ["auth", "login", "openai", "--key", "   ", "--no-verify"])
         assert result.exit_code == 2
         assert "empty key" in result.stderr.lower()
 
@@ -288,12 +258,8 @@ class TestAuthLogin:
         def fake_verify(provider: str, key: str) -> VerifyResult:
             return VerifyResult(ok=False, detail="401 Unauthorized")
 
-        with patch(
-            "movate.credentials.verify_provider_key", side_effect=fake_verify
-        ):
-            result = runner.invoke(
-                app, ["auth", "login", "openai", "--key", "sk-bad"]
-            )
+        with patch("movate.credentials.verify_provider_key", side_effect=fake_verify):
+            result = runner.invoke(app, ["auth", "login", "openai", "--key", "sk-bad"])
         assert result.exit_code == 2
         assert "401" in result.stderr or "verification failed" in result.stderr.lower()
         # Key did NOT get saved.
@@ -306,16 +272,10 @@ class TestAuthLogin:
         operator may be offline at setup time."""
 
         def fake_verify(provider: str, key: str) -> VerifyResult:
-            return VerifyResult(
-                ok=False, detail="connection refused", network_error=True
-            )
+            return VerifyResult(ok=False, detail="connection refused", network_error=True)
 
-        with patch(
-            "movate.credentials.verify_provider_key", side_effect=fake_verify
-        ):
-            result = runner.invoke(
-                app, ["auth", "login", "openai", "--key", "sk-test"]
-            )
+        with patch("movate.credentials.verify_provider_key", side_effect=fake_verify):
+            result = runner.invoke(app, ["auth", "login", "openai", "--key", "sk-test"])
         assert result.exit_code == 0, result.stdout + result.stderr
         assert CredentialsStore().get("OPENAI_API_KEY") == "sk-test"
 
@@ -366,9 +326,7 @@ class TestAuthStatus:
             "MOVATE_DEPLOY_WEBHOOK",
         ):
             monkeypatch.delenv(key, raising=False)
-        result = runner.invoke(
-            app, ["auth", "status"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         for env_var in PROVIDER_KEY_ENV_VARS:
             assert env_var in result.stdout
@@ -393,9 +351,7 @@ class TestAuthStatus:
         # re-import main.py — we need to manually re-autoload before
         # the test asserts.
         autoload_credentials()
-        result = runner.invoke(
-            app, ["auth", "status"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # One key set, seven unset (4 LLM + 3 notification).
         assert "set=1" in result.stdout

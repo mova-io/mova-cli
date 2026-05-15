@@ -259,9 +259,7 @@ def use(
     if prior == profile.name:
         # No-op switch (operator re-activating the active profile);
         # don't pretend there was a transition.
-        console.print(
-            f"[dim]✓ already active:[/dim] [bold cyan]{profile.name}[/bold cyan]"
-        )
+        console.print(f"[dim]✓ already active:[/dim] [bold cyan]{profile.name}[/bold cyan]")
     elif prior:
         console.print(
             f"[green]✓[/green] switched: "

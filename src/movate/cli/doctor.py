@@ -342,9 +342,7 @@ def _maybe_offer_empty_project_hint(project_root: Path) -> None:
         return  # Old project layout — skip silently rather than confuse.
     # `.gitkeep` is the standard placeholder we drop on init; ignore
     # it when counting "real" agent dirs.
-    real_agents = [
-        p for p in agents_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
-    ]
+    real_agents = [p for p in agents_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
     if real_agents:
         return
     console.print()
@@ -415,9 +413,7 @@ def _maybe_offer_fix(*, no_prompt: bool) -> None:
         run_now = False
 
     if not run_now:
-        console.print(
-            "[dim]→ skipped. Run [bold]mdk fix --apply[/bold] when ready.[/dim]"
-        )
+        console.print("[dim]→ skipped. Run [bold]mdk fix --apply[/bold] when ready.[/dim]")
         return
 
     # Re-run the same registry, this time committing. We don't call the
@@ -433,9 +429,7 @@ def _maybe_offer_fix(*, no_prompt: bool) -> None:
         )
     if failed:
         for r in failed:
-            console.print(
-                f"[red]✗[/red] {r.fix_id} failed: {r.message or 'no detail'}"
-            )
+            console.print(f"[red]✗[/red] {r.fix_id} failed: {r.message or 'no detail'}")
 
 
 def _classify_result(check: str, result: str) -> str | None:
@@ -665,12 +659,8 @@ def _doctor_callback(
             "Use this when `movate deploy` is failing."
         ),
     ),
-    explain: bool = typer.Option(
-        False, "--explain", help="Per-check explanation block."
-    ),
-    licenses: bool = typer.Option(
-        False, "--licenses", help="Print a per-dep SPDX license report."
-    ),
+    explain: bool = typer.Option(False, "--explain", help="Per-check explanation block."),
+    licenses: bool = typer.Option(False, "--licenses", help="Print a per-dep SPDX license report."),
     no_fix_prompt: bool = typer.Option(
         False,
         "--no-fix-prompt",
@@ -802,8 +792,7 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
             "project where [bold]agents/<name>/[/bold] exists."
         )
         err.print(
-            f"[red]✗[/red] could not resolve agent [bold]{name}[/bold]."
-            f"[dim]{hint_text}[/dim]"
+            f"[red]✗[/red] could not resolve agent [bold]{name}[/bold].[dim]{hint_text}[/dim]"
         )
         raise typer.Exit(code=2)
 
@@ -913,11 +902,7 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
 
     # Check 6: dataset rows
     if dataset_path.is_file():
-        rows = [
-            line
-            for line in dataset_path.read_text().splitlines()
-            if line.strip()
-        ]
+        rows = [line for line in dataset_path.read_text().splitlines() if line.strip()]
         if rows:
             _row(
                 "dataset rows",

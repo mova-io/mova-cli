@@ -70,9 +70,7 @@ class TestVerbosePreserved:
         assert result.exit_code == 0
         # Find the line with --verbose — it should NOT contain -v as
         # a short form.
-        verbose_lines = [
-            line for line in result.stdout.splitlines() if "--verbose" in line
-        ]
+        verbose_lines = [line for line in result.stdout.splitlines() if "--verbose" in line]
         assert verbose_lines, "expected a --verbose row in help output"
         for line in verbose_lines:
             # `-v` is no longer paired with --verbose. Allow `-V` to
@@ -85,14 +83,10 @@ class TestVerbosePreserved:
             # there shouldn't be a "-v ".
             # Easier check: the --verbose row should NOT contain "-v"
             # as a standalone token.
-            assert " -v " not in line, (
-                f"--verbose row still claims -v: {line!r}"
-            )
+            assert " -v " not in line, f"--verbose row still claims -v: {line!r}"
 
         # And `--version` row should contain BOTH -V and -v.
-        version_lines = [
-            line for line in result.stdout.splitlines() if "--version" in line
-        ]
+        version_lines = [line for line in result.stdout.splitlines() if "--version" in line]
         assert version_lines, "expected a --version row in help output"
         version_row = " ".join(version_lines)
         assert "-V" in version_row

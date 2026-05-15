@@ -105,9 +105,7 @@ def test_add_role_template_creates_agent_in_agents_dir(
 
 
 @pytest.mark.unit
-def test_add_positional_name_renames(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_positional_name_renames(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     proj = _bootstrap_project(tmp_path)
     monkeypatch.chdir(proj)
     result = runner.invoke(app, ["add", "rag-qa", "pricing-qa"])
@@ -205,9 +203,7 @@ def test_existing_agent_without_force_errors(
 
 
 @pytest.mark.unit
-def test_force_overwrites_existing_agent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_force_overwrites_existing_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     proj = _bootstrap_project(tmp_path)
     monkeypatch.chdir(proj)
     occupied = proj / "agents" / "rag-qa"
@@ -227,14 +223,10 @@ def test_force_overwrites_existing_agent(
 
 
 @pytest.mark.unit
-def test_add_emits_greppable_summary_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_emits_greppable_summary_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     proj = _bootstrap_project(tmp_path)
     monkeypatch.chdir(proj)
-    result = runner.invoke(
-        app, ["add", "rag-qa", "--force"], env={"COLUMNS": "200"}
-    )
+    result = runner.invoke(app, ["add", "rag-qa", "--force"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "mdk_add_summary:" in result.stdout
     assert "template=rag-qa" in result.stdout
