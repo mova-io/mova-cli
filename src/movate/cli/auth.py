@@ -467,18 +467,47 @@ def status() -> None:
     )
 
 
+def _provider_is_configured(provider: str) -> bool:
+    """Return True if the provider's API key(s) are already set.
+
+    Powers the green-check marker in the interactive picker so
+    operators can see at a glance which providers they've already
+    configured and which still need setup.
+
+    LLM providers each have one env var (mapped via
+    :data:`_PROVIDER_TO_ENV_VAR`). Telegram is special: needs BOTH
+    ``TELEGRAM_BOT_TOKEN`` AND ``TELEGRAM_CHAT_ID`` — show "configured"
+    only if both are set.
+    """
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    if provider == "telegram":
+        return (
+            key_source("TELEGRAM_BOT_TOKEN") != "unset"
+            and key_source("TELEGRAM_CHAT_ID") != "unset"
+        )
+    env_var = _PROVIDER_TO_ENV_VAR.get(provider)
+    if env_var is None:
+        return False
+    return key_source(env_var) != "unset"
+
+
 def _prompt_for_provider() -> str:
     """Numbered-picker fallback for ``mdk auth login`` with no arg.
 
     Renders the supported providers as a numbered list and prompts for
-    a digit. Mirrors the discoverability pattern in ``mdk menu`` — no
-    prior knowledge of provider keys required. Returns the canonical
+    a digit. Each option is decorated with a green ``✓ configured``
+    marker when the provider's API key(s) are already in the operator's
+    environment — visual confirmation of project state without a
+    separate ``mdk auth status`` call.
+
+    Mirrors the discoverability pattern in ``mdk menu`` — no prior
+    knowledge of provider keys required. Returns the canonical
     lowercase provider key (e.g. ``"openai"``, ``"telegram"``) ready
     to pass to the existing dispatch logic.
 
     Falls back to a typed name if the input isn't a digit — operators
-    who already know the provider name can skip the picker by typing
-    it directly at the prompt.
+    who already know the provider name can skip the picker.
     """
     options: list[tuple[str, str]] = [
         ("openai", _PROVIDERS_PROMPT_NAME["openai"]),
@@ -490,7 +519,12 @@ def _prompt_for_provider() -> str:
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
     for i, (key, name) in enumerate(options, start=1):
-        stdout.print(f"  [cyan]{i}[/cyan]) {name} [dim]({key})[/dim]")
+        # Green check when already configured. Re-running login on a
+        # configured provider is still allowed — it overwrites the
+        # stored key (useful for rotation), but the marker tells
+        # operators they're picking an "already-done" row.
+        marker = " [green]✓ configured[/green]" if _provider_is_configured(key) else ""
+        stdout.print(f"  [cyan]{i}[/cyan]) {name} [dim]({key})[/dim]{marker}")
     raw_input = typer.prompt(f"Choice [1-{len(options)} or provider name]")
     raw = str(raw_input).strip()
 
