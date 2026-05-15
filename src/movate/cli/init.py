@@ -38,6 +38,7 @@ project (project + working agent + dataset).
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,60 @@ def _has_any_provider_key() -> bool:
     import os  # noqa: PLC0415
 
     return any(os.environ.get(k, "").strip() for k in _PROVIDER_KEY_ENV_VARS)
+
+
+def _editor_open_hint(path: Path | str) -> str | None:
+    """Return a copy-paste-friendly ``code <path>`` line if VS Code's
+    ``code`` shim is on PATH, else None.
+
+    Operators who use VS Code skip a round trip ("which dir did mdk
+    just write to? let me copy that path... ⌘V into a new terminal,
+    code, enter"). When `code` isn't installed we silently skip the
+    line — no broken-command hint for non-VS-Code operators.
+
+    ``path`` accepts either a :class:`Path` (auto-converted) or a
+    pre-formatted string — callers pass the same display form as the
+    surrounding ``cd <path>`` line (typically :func:`_cd_target`
+    output) so the two commands in the Panel look consistent.
+
+    Detected via :func:`shutil.which` so this respects PATH at
+    invocation time (Homebrew + Cursor's `code` shim + remote
+    `code-server` all register a binary named `code`, which is what
+    we want).
+    """
+    if shutil.which("code") is None:
+        return None
+    return f"code {path}"
+
+
+def _maybe_auto_open(path: Path, *, requested: bool) -> bool:
+    """Launch VS Code on ``path`` when the operator passed ``--open``.
+
+    Returns True if we launched, False otherwise. Failure to launch
+    (binary missing, exec error) downgrades to a stderr warning —
+    `mdk init` is not blocked just because the editor didn't open.
+    """
+    if not requested:
+        return False
+    code_bin = shutil.which("code")
+    if code_bin is None:
+        err_console.print(
+            "[yellow]⚠[/yellow] [bold]--open[/bold] requested but "
+            "[bold]code[/bold] isn't on PATH. "
+            "[dim]Install the VS Code shell command (Command Palette → "
+            "'Shell Command: Install code command in PATH').[/dim]"
+        )
+        return False
+    try:
+        subprocess.Popen(
+            [code_bin, str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        err_console.print(f"[yellow]⚠[/yellow] failed to launch [bold]code {path}[/bold]: {exc}")
+        return False
+    return True
 
 
 def _cd_target(project_root: Path) -> str:
@@ -302,6 +357,16 @@ def _init_project(
     # suggestions point at adding agents — plus a discoverability tip
     # about `--with-agents`.
     cd_to = _cd_target(project_root)
+    # VS Code shortcut — fires only when `code` is on PATH. Uses the
+    # same display path as the `cd` line right above so the two
+    # commands look consistent regardless of where mdk init was run
+    # from. See _editor_open_hint.
+    code_hint = _editor_open_hint(cd_to)
+    code_line = (
+        f"  [dim]$[/dim] [bold]{code_hint}[/bold]   [dim]# or open in VS Code[/dim]\n"
+        if code_hint
+        else ""
+    )
     if with_agents:
         # Agents already added by the caller. Show forward-looking
         # commands: doctor agent / run / eval / deploy.
@@ -311,6 +376,7 @@ def _init_project(
             f"\n[bold]Next steps[/bold] "
             f"[dim](you already added {len(agent_list)} agent(s))[/dim][bold]:[/bold]\n"
             f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]\n"
+            f"{code_line}"
             f"  [dim]$[/dim] [bold]mdk doctor agent {first_agent}[/bold]"
             f"   [dim]# per-agent health check[/dim]\n"
             f"  [dim]$[/dim] [bold]mdk run {first_agent} '{{...}}'[/bold]"
@@ -326,6 +392,7 @@ def _init_project(
             f"\n[bold]Next steps:[/bold]\n"
             f"  [dim]$[/dim] [bold]cd {cd_to} && mdk add --list[/bold]"
             f"   [dim]# browse role templates[/dim]\n"
+            f"{code_line}"
             f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
             f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
             f"[dim]Tip: skip the two-step flow next time with [bold]--with-agents[/bold]:[/dim]\n"
@@ -474,11 +541,18 @@ def _render_combined_init_summary(
     # `mdk eval --gate` is the standard CI gate.
     first_name = str(added[0]["name"]) if added else "<agent>"
     cd_to = _cd_target(project_root)
-    lines.extend(
+    next_steps = [
+        "",
+        "[bold]Next steps:[/bold]",
+        f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]",
+    ]
+    code_hint = _editor_open_hint(cd_to)
+    if code_hint:
+        next_steps.append(
+            f"  [dim]$[/dim] [bold]{code_hint}[/bold]   [dim]# or open in VS Code[/dim]"
+        )
+    next_steps.extend(
         [
-            "",
-            "[bold]Next steps:[/bold]",
-            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]",
             "  [dim]$[/dim] [bold]mdk validate --all[/bold]"
             "   [dim]# confirm every agent loads cleanly[/dim]",
             f"  [dim]$[/dim] [bold]mdk run {first_name} '{{...}}'[/bold]"
@@ -487,6 +561,7 @@ def _render_combined_init_summary(
             "   [dim]# gate every agent against its baseline[/dim]",
         ]
     )
+    lines.extend(next_steps)
 
     suffix = "s" if n_agents != 1 else ""
     console.print(
@@ -544,6 +619,11 @@ def _init_agent(
     console.print("\nNext steps:")
     console.print(f"  movate validate {dest}")
     console.print(f"  movate run {dest} --mock '{{}}'   # provide input matching schema/input.json")
+    code_hint = _editor_open_hint(dest)
+    if code_hint:
+        # Only fires when VS Code's `code` shim is on PATH — otherwise
+        # silent. Pair with the new --open flag for one-step launch.
+        console.print(f"  [dim]{code_hint}   # open in VS Code[/dim]")
     if (dest / "skills" / "example-skill").is_dir():
         # The default template ships a reference skill folder. Surface
         # it here so users know it exists + know where to look for the
@@ -927,9 +1007,13 @@ def _render_success_panel(*, name: str, dest: Path, generated: Any, cost_usd: fl
         f"\n[bold]Next steps:[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk validate {dest}[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk run {dest} --mock '{{...}}'[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk eval {dest} --mock --gate 0.7[/bold]\n\n"
-        f"[dim]scaffolded by --llm · review prompt.md and the schemas "
-        f"before first real run.[/dim]"
+        f"  [dim]$[/dim] [bold]mdk eval {dest} --mock --gate 0.7[/bold]\n"
+    )
+    code_hint = _editor_open_hint(dest)
+    if code_hint:
+        body += f"  [dim]$[/dim] [bold]{code_hint}[/bold]   [dim]# open in VS Code[/dim]\n"
+    body += (
+        "\n[dim]scaffolded by --llm · review prompt.md and the schemas before first real run.[/dim]"
     )
     console.print(
         Panel(
@@ -1125,6 +1209,18 @@ def init(
             "[bold]--llm[/bold]; ignored otherwise."
         ),
     ),
+    open_editor: bool = typer.Option(
+        False,
+        "--open",
+        help=(
+            "After scaffolding, launch [bold]code <path>[/bold] to open the "
+            "agent or project in VS Code. Requires the [bold]code[/bold] shell "
+            "command to be on PATH (Command Palette → 'Shell Command: Install "
+            "code command in PATH'). Without [bold]--open[/bold], the success "
+            "panel still shows the [dim]code <path>[/dim] line so you can "
+            "copy-paste."
+        ),
+    ),
 ) -> None:
     """Scaffold a new agent, or bootstrap a fresh project workspace.
 
@@ -1194,6 +1290,9 @@ def init(
                 project_name=project_name,
                 snapshot_short=snapshot_short,
             )
+        # --open: launch VS Code on the project root. Quiet no-op if
+        # the flag wasn't set; warns on stderr if `code` isn't on PATH.
+        _maybe_auto_open(project_root, requested=open_editor)
         return
 
     if not name:
@@ -1254,6 +1353,10 @@ def init(
             starting_template=template,
             mock=mock,
         )
+        # --open: launch VS Code on the scaffolded agent dir. Skipped
+        # on --dry-run (nothing was written).
+        if not dry_run:
+            _maybe_auto_open((target / name).resolve(), requested=open_editor)
         return
 
     # No --llm: original template-copy path. --dry-run is meaningless
@@ -1266,3 +1369,4 @@ def init(
         )
 
     _init_agent(name=name, template=template, target=target, force=force)
+    _maybe_auto_open((target / name).resolve(), requested=open_editor)
