@@ -63,26 +63,156 @@ err_console = Console(stderr=True)
 # the fallback when these aren't set, so we preserve the readable
 # project identity without breaking strict validation.
 _PROJECT_MOVATE_YAML = """\
-# {name} — movate project config (canonical: policy.yaml; movate.yaml
-# is the legacy slot, still supported through v1.x).
+# =============================================================================
+# {name} — movate project config
+# =============================================================================
 #
-# Loaded by every CLI command via `load_project_config`. Per-agent
-# `agent.yaml` always wins on conflict; entries here only fill gaps.
-# See `mdk doctor` for the layered semantics, and add `policy:` /
-# `runtime:` / `skills:` blocks to gate every agent workspace-wide.
+# This file is loaded by every `mdk` command via `load_project_config`.
+# Filename note: this is the LEGACY slot — `policy.yaml` is the
+# canonical v1.x name. Both load identically; `mdk` will continue to
+# accept `movate.yaml` through the v1.x line.
+#
+# Layering: per-agent `agent.yaml` ALWAYS wins on conflict. Entries
+# here only fill gaps the agent didn't specify. The layering applies
+# per-field, not per-block — setting `defaults.model.params.temperature: 0.0`
+# below only kicks in for agents whose own `model.params` omits
+# temperature.
+#
+# Run `mdk doctor` to see the layered config a given agent resolves
+# to, and `mdk inspect agent <name>` to dump the merged bundle.
+# Workspace-wide validation: `mdk validate` (sweeps every agent +
+# workflow); per-agent: `mdk validate <name>`.
+# =============================================================================
+
+
+# ---- Project layout ---------------------------------------------------------
+# Where `mdk add` drops new agents and `mdk init -t <template> <name>`
+# scaffolds. Change these if you want a flatter layout (e.g. no
+# `agents/` prefix) — relative paths resolved from the project root.
 
 agents_dir: ./agents
 workflows_dir: ./workflows
 
+
+# ---- Defaults applied to every agent ----------------------------------------
+# Layered semantics: per-key for `model.params`, per-field for
+# `timeouts` and `budget`. The agent.yaml fields ALWAYS win.
+
 defaults:
   model:
     params:
-      # Project-wide model param defaults. Agent.yaml's `model.params`
-      # always wins per-key; these only fill keys the agent didn't
-      # specify. Headline use: pin temperature / max_tokens once at
-      # the project level instead of repeating across every agent.
+      # Project-wide model param defaults. Pinning temperature once
+      # here means every agent that doesn't override it gets the
+      # consistent 0.0 setting — the most common "fix" engineers
+      # discover after their first eval run reveals nondeterminism.
       temperature: 0.0
       max_tokens: 512
+  # timeouts:
+  #   call_ms: 15000      # per-LLM-call cap (agent.yaml field wins per-field)
+  #   total_ms: 60000     # whole-agent-run cap
+  # budget:
+  #   max_cost_usd_per_run: 0.05   # soft default; `policy` below is the hard cap
+
+
+# ---- Policy gates (commented out by default — uncomment to enforce) ---------
+# Project-wide HARD gates checked by `mdk validate` BEFORE any LLM
+# call. A policy violation exits 2 — operators can't accidentally
+# ship an agent that exceeds the org's cost ceiling or talks to an
+# un-vetted provider. See `mdk doctor` for the full enforcement order.
+
+# policy:
+#   allowed_providers:       # whitelist; agents using anything else fail validate
+#     - openai
+#     - anthropic
+#     - azure
+#   denied_providers:        # blacklist; takes precedence over the whitelist
+#     - cohere
+#   max_cost_usd_per_run: 0.50   # HARD cap; distinct from defaults.budget above
+#   fallback_chain:          # default fallback when an agent's primary fails
+#     - openai/gpt-4o-mini-2024-07-18
+#     - anthropic/claude-haiku-4-5-20251001
+
+
+# ---- Runtime gate (commented out — opt-in) ----------------------------------
+# Gates which AgentRuntime values are allowed in this workspace.
+# Default is permissive (any installed runtime). Pin to `[litellm]`
+# to enforce "LiteLLM only" — useful when native-SDK adapters
+# aren't installed in production and you want validate to catch
+# `runtime: native_anthropic` agents at gate time, not runtime.
+
+# runtime:
+#   allowed:
+#     - litellm
+#     # - native_anthropic
+#     # - native_openai
+#     # - langchain
+#     # - lyzr
+
+
+# ---- Skill side-effect gate (commented out — opt-in) ------------------------
+# Restricts which skill `side_effects` categories agents in this
+# workspace can use. Permissive by default. Pinning to
+# `[read-only]` is the "agents can lookup but not WRITE" mode —
+# audit-friendly for regulated environments.
+
+# skills:
+#   allowed_side_effects:
+#     - read-only
+#     # - external-write     # POSTs / PUTs / DELETEs to third-party APIs
+#     # - filesystem-write   # writes to the local disk
+#     # - shell              # runs subprocesses
+
+
+# ---- Eval + benchmark defaults (commented out — opt-in) ---------------------
+# Defaults applied by `mdk eval` and `mdk bench` when the agent or
+# command-line doesn't override them. Headline use: pin the eval
+# gate once here so CI uses the same threshold every team uses
+# locally.
+
+# eval:
+#   gate: 0.7                # `mdk eval --gate <N>` default
+#   runs: 3                  # # of runs per case for LLM-judge stability
+#   judge: openai/gpt-4o-mini-2024-07-18
+# bench:
+#   providers:               # `mdk bench` default model matrix
+#     - openai/gpt-4o-mini-2024-07-18
+#     - anthropic/claude-haiku-4-5-20251001
+#     - azure/gpt-4.1
+
+
+# =============================================================================
+# About .movate/ — runtime state directory
+# =============================================================================
+#
+# Created in the project root when you run any `mdk` command that
+# needs persistent state. Layout:
+#
+#   .movate/
+#   ├── local.db           — SQLite for runs + failures (gitignored)
+#   ├── snapshots/         — content-addressed snapshots of project state
+#   │   └── <hash>/        — immutable: agent.yaml + prompt.md + schemas
+#   │       ├── manifest.json
+#   │       └── <files>
+#   └── baselines/         — `mdk eval --baseline` stored eval scores
+#
+# Snapshots are the central operational primitive:
+#
+#   * `mdk diff <a> <b>`   — what changed between two snapshots?
+#   * `mdk rollback <hash>` — restore project state to a prior snapshot
+#   * `mdk audit`          — scans snapshots for drift / dangling refs
+#   * `mdk promote`        — copy a tested snapshot from dev → staging
+#
+# Snapshots are content-addressed (the directory name IS the SHA-256
+# of the manifest), so re-snapshotting identical state produces the
+# same hash. They're small + git-friendly by default; the
+# `.gitignore` shipped with this project tracks them so your repo
+# carries a verifiable history of "what shipped when". Drop
+# `.movate/snapshots/` from `.gitignore` if you'd rather treat them
+# as machine-local.
+#
+# `mdk init --project` auto-creates the initial snapshot so you have
+# a baseline for `mdk diff` / `mdk rollback` from day one. Pass
+# `--skip-snapshot` to skip (useful in tests / CI hermetic runs).
 """
 
 _PROJECT_ENV_EXAMPLE = """\
@@ -95,6 +225,68 @@ OPENAI_API_KEY=
 # Optional — enables Langfuse tracing if set:
 # LANGFUSE_PUBLIC_KEY=
 # LANGFUSE_SECRET_KEY=
+"""
+
+_MOVATE_STATE_README = """\
+# `.movate/` — movate runtime state
+
+This directory holds everything `mdk` writes between invocations.
+Created automatically by `mdk init --project` and grown by every
+subsequent CLI run. The layout:
+
+| Path | Purpose |
+|---|---|
+| `local.db` | SQLite store for runs + failures (gitignored by default) |
+| `snapshots/` | Content-addressed snapshots of project state |
+| `baselines/` | Stored eval scores for `mdk eval --baseline` drift checks |
+
+## Snapshots — the central operational primitive
+
+Every snapshot lives at `snapshots/<short-hash>/`. The directory
+name IS the SHA-256 of the manifest, so re-snapshotting identical
+state produces the same hash — two operators on the same repo can
+verify they're looking at the same agent revision without exchanging
+trust.
+
+Each snapshot directory contains:
+
+- `manifest.json` — what's in this snapshot, when it was taken, who
+  took it, the hashes of every captured file
+- `<files>` — the captured agent.yaml, prompt.md, schemas, dataset
+  files exactly as they were at snapshot time
+
+Snapshots are **immutable** — once written, neither the manifest
+nor the files are modified. Re-running `mdk snapshot` on
+unchanged state hits the same hash and no-ops.
+
+## Commands that operate on snapshots
+
+| Command | What it does |
+|---|---|
+| `mdk snapshot create` | Capture current state into a new snapshot |
+| `mdk snapshot list` | Show all snapshots, newest first |
+| `mdk diff <a> <b>` | What changed between two snapshots? |
+| `mdk rollback <hash>` | Restore project state to a prior snapshot |
+| `mdk audit` | Scan snapshots for drift / dangling refs |
+| `mdk promote --from <hash>` | Copy a tested snapshot dev → staging |
+
+## Git policy
+
+Snapshots are small + content-addressed + JSON-readable, so they're
+**git-friendly by default**. The shipped `.gitignore` tracks
+`snapshots/` so your repo carries a verifiable history of "what
+shipped when". `local.db` is gitignored (runtime state, not source).
+
+If you'd rather treat snapshots as machine-local (e.g. you don't
+want every team member's experimentation tracked), uncomment the
+`# .movate/snapshots/` line in `.gitignore`.
+
+## Did `mdk init --project` create this directory?
+
+Yes — `mdk init --project <name>` auto-creates the initial snapshot
+so you have a baseline for `mdk diff` / `mdk rollback` from day
+one. Pass `--skip-snapshot` to opt out (useful for hermetic
+test bootstrap).
 """
 
 _PROJECT_GITIGNORE = """\
@@ -255,6 +447,15 @@ def _init_project(
     agents_dir = project_root / "agents"
     agents_dir.mkdir(exist_ok=True)
     (agents_dir / ".gitkeep").write_text("")
+
+    # .movate/ runtime state directory + README. The README explains
+    # what `.movate/snapshots/` is for — operators looking inside the
+    # dir get the same context they'd find in `mdk init`'s success
+    # Panel. Created BEFORE the snapshot so the README is part of the
+    # initial captured state.
+    state_dir = project_root / ".movate"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "README.md").write_text(_MOVATE_STATE_README)
 
     # Initial snapshot — operators get a baseline for diff / rollback.
     snapshot_short: str | None = None
