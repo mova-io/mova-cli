@@ -27,6 +27,27 @@ PROVIDER_KEY_ENV_VARS: tuple[str, ...] = (
     "LYZR_API_KEY",
 )
 
+# Notification env vars — written to the credentials file by
+# ``mdk auth login telegram`` and consumed by ``mdk deploy --notify``
+# and the auth-picker ``✓ configured`` marker. Kept separate from
+# PROVIDER_KEY_ENV_VARS because they're not LLM-provider auth — but
+# they DO need the same autoload-from-credentials-file treatment so
+# operators don't have to manually export them in their shell.
+NOTIFICATION_KEY_ENV_VARS: tuple[str, ...] = (
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "MOVATE_DEPLOY_WEBHOOK",
+)
+
+# Every env var the credentials store should autoload. Union of the
+# two groups above; surfaced as a constant so `autoload_credentials`
+# and any future "what does mdk track?" enumeration agree on the
+# canonical list.
+ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
+    *PROVIDER_KEY_ENV_VARS,
+    *NOTIFICATION_KEY_ENV_VARS,
+)
+
 
 # Where a credential ended up resolving from. Used by `mdk auth status`
 # to tell operators "this key came from X, not Y".
@@ -34,7 +55,7 @@ KeySource = Literal["shell", "dotenv", "credentials_file", "unset"]
 
 
 def autoload_credentials() -> None:
-    """Fill in any unset PROVIDER_KEY_ENV_VARS from the credentials file.
+    """Fill in any unset autoloaded env vars from the credentials file.
 
     Called once per CLI invocation, AFTER ``dotenv.load_dotenv()``.
     The semantics:
@@ -43,6 +64,16 @@ def autoload_credentials() -> None:
       do nothing — explicit setters always win.
     * Otherwise, fill it in from ``~/.movate/credentials`` if present
       there.
+
+    The set of autoloaded vars is :data:`ALL_AUTOLOADED_ENV_VARS` —
+    LLM provider keys (e.g. ``OPENAI_API_KEY``) PLUS notification
+    secrets (``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` /
+    ``MOVATE_DEPLOY_WEBHOOK``). Both groups go through the same store
+    + autoload pipeline because both are set via ``mdk auth login``
+    and both need to be in ``os.environ`` for downstream code to
+    function (LiteLLM reads provider keys, ``mdk deploy --notify``
+    reads notification secrets, the auth picker reads everything to
+    render the ``✓ configured`` marker).
 
     This implements the "narrowest beats widest" precedence model
     without having to thread credential source through every code
@@ -55,7 +86,7 @@ def autoload_credentials() -> None:
     file_entries = store.read()
     if not file_entries:
         return
-    for key in PROVIDER_KEY_ENV_VARS:
+    for key in ALL_AUTOLOADED_ENV_VARS:
         # Skip if already set (by shell OR by dotenv already running).
         if os.environ.get(key, "").strip():
             continue
