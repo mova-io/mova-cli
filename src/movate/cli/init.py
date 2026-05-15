@@ -304,7 +304,10 @@ def _init_project(
     cd_to = _cd_target(project_root)
     if with_agents:
         # Agents already added by the caller. Show forward-looking
-        # commands: doctor agent / run / eval / deploy.
+        # commands: doctor agent / run / eval / serve. `mdk serve`
+        # surfaces the HTTP runtime here so operators discover the
+        # "host the agents as a service" path without having to dig
+        # through `mdk --help`.
         agent_list = [t.strip() for t in with_agents.split(",") if t.strip()]
         first_agent = agent_list[0] if agent_list else "<agent>"
         body += (
@@ -316,7 +319,9 @@ def _init_project(
             f"  [dim]$[/dim] [bold]mdk run {first_agent} '{{...}}'[/bold]"
             f"   [dim]# try one live[/dim]\n"
             f"  [dim]$[/dim] [bold]mdk eval {first_agent} --gate 0.7[/bold]"
-            f"   [dim]# gate on the seed dataset[/dim]"
+            f"   [dim]# gate on the seed dataset[/dim]\n"
+            f"  [dim]$[/dim] [bold]mdk serve[/bold]"
+            f"   [dim]# host the agents over HTTP (POST /run, GET /agents)[/dim]"
         )
     else:
         # No agents yet. Suggest `add --list` + drop the
@@ -485,6 +490,8 @@ def _render_combined_init_summary(
             "   [dim]# try one live[/dim]",
             "  [dim]$[/dim] [bold]mdk ci eval --mock[/bold]"
             "   [dim]# gate every agent against its baseline[/dim]",
+            "  [dim]$[/dim] [bold]mdk serve[/bold]"
+            "   [dim]# host the agents over HTTP (POST /run, GET /agents)[/dim]",
         ]
     )
 
