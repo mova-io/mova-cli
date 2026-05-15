@@ -12,16 +12,27 @@ Three modes:
   a baseline for ``mdk diff`` / ``mdk rollback`` immediately.
 
 * **LLM-scaffold mode** (``--llm "<description>"``): generate the
-  agent from a natural-language description using an LLM. The CLI
-  surface is wired in this PR (Phase 1 of the rollout); the actual
-  generator + validation loop land in Phase 2. Today the flag is
-  accepted and the dispatch is locked in, but invocation prints a
-  friendly "not yet implemented" message and exits 2 so downstream
-  phases can plug in without churning this file's argument list.
+  agent from a natural-language description using an LLM. The
+  generator (in :mod:`movate.scaffold`) calls the configured provider
+  with a meta-prompt + two few-shot exemplars, parses the response
+  into a :class:`GeneratedAgent`, writes it to a tempdir, and
+  validates by loading it back through :func:`load_agent`. On
+  validation failure the error is fed back to the LLM for one retry;
+  a second failure stashes the raw payload at
+  ``.movate/llm-init-failed-<name>.json`` and exits 1. Successful
+  scaffolds emit a Rich Panel with the file list + cost + next-step
+  commands, an ``_console.hint`` line pointing at ``prompt.md``, and a
+  greppable ``mdk_init_summary:`` line for CI parity with
+  ``mdk_audit_summary`` / ``mdk_eval_summary`` / ``mdk_doctor_summary``.
 
-Project mode is the "step 0" before any agents exist. Agent mode is
-the "step 1+" inside an existing project. ``mdk demo`` is the third
-sibling: full populated project (project + working agent + dataset).
+  Pair with ``--mock`` for hermetic CI (no API keys); ``--dry-run``
+  renders a preview Panel without writing files; ``--llm-model``
+  overrides the default (``openai/gpt-4o-mini-2024-07-18``).
+
+Project mode is the "step 0" before any agents exist. Agent and
+LLM-scaffold modes are the "step 1+" inside an existing project.
+``mdk demo`` is the fourth sibling: a fully populated reference
+project (project + working agent + dataset).
 """
 
 from __future__ import annotations
@@ -737,9 +748,9 @@ def init(
         help=(
             "Natural-language description of the agent. The CLI uses an LLM "
             "to generate [bold]agent.yaml[/bold] + [bold]prompt.md[/bold] + "
-            "schemas + seed eval cases. [yellow]Phase 1: flag is wired but "
-            "the generator lands in Phase 2 — invocation prints a "
-            "not-yet-implemented message and exits 2.[/yellow]"
+            "schemas + seed eval cases. Validates by loading the result back; "
+            "retries once on failure. Pair with [bold]--mock[/bold] for "
+            "hermetic CI."
         ),
     ),
     llm_model: str = typer.Option(
