@@ -146,7 +146,14 @@ def _main(
     verbose: bool = typer.Option(
         False,
         "--verbose",
-        "-v",
+        # No short form for --verbose at the global level. The `-v`
+        # slot is reclaimed for --version below — matches convention
+        # (docker -v, npm -v, node -v, python -V all show version,
+        # and operators consistently typed `mdk -v` expecting that).
+        # Verbose mode is still available via the long form and is
+        # mostly used scripted (where explicit names beat shorts).
+        # Subcommand-level `-v` short forms (e.g. `mdk trace replay -v`)
+        # are unaffected — those don't collide with this top-level slot.
         help="Enable DEBUG-level logging.",
     ),
     quiet: bool = typer.Option(
@@ -171,6 +178,7 @@ def _main(
         False,
         "--version",
         "-V",
+        "-v",
         callback=_version_callback,
         is_eager=True,
         help="Show version and exit.",
