@@ -47,6 +47,9 @@ from movate.cli import eval as eval_cmd  # noqa: E402
 from movate.cli import (  # noqa: E402
     import_json as _import_json,  # noqa: F401  -- registers `json` on import_app
 )
+from movate.cli import (  # noqa: E402
+    import_openapi as _import_openapi,  # noqa: F401  -- registers `openapi` on import_app
+)
 from movate.cli import init as init_cmd  # noqa: E402
 from movate.cli import logs as logs_cmd  # noqa: E402
 from movate.cli import pricing as pricing_cmd  # noqa: E402
