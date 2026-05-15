@@ -66,6 +66,7 @@ from movate.cli import validate as validate_cmd  # noqa: E402
 from movate.cli import watch as watch_cmd  # noqa: E402
 from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
+from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.costs_cmd import costs_app  # noqa: E402
@@ -220,6 +221,10 @@ app.command("tune", rich_help_panel=PANEL_RUN)(tune_cmd.tune)
 # `simulate` runs a chatbot through multi-turn scenarios — sibling to
 # `eval` (single-turn) and `bench` (multi-model). Same panel.
 app.command("simulate", rich_help_panel=PANEL_RUN)(simulate_cmd.simulate)
+# `benchmark live` is shadow-traffic replay against a candidate model.
+# Pairs with `bench` (multi-model on synthetic input) by using REAL
+# recorded inputs from storage. Same panel.
+app.add_typer(benchmark_app, name="benchmark", rich_help_panel=PANEL_RUN)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
