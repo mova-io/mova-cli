@@ -31,6 +31,7 @@ from movate.cli import (  # noqa: E402
     _console,
     audit_cmd,
     diff_cmd,
+    menu_cmd,
     migrate_cmd,
     rollback_cmd,
 )
@@ -78,7 +79,10 @@ app = typer.Typer(
     help=(
         "[bold]mdk[/bold] — Movate Development Kit. Declarative platform for "
         "AI agents and workflows.\n\n"
+        "[bold green]New here?[/bold green] Run [bold]mdk menu[/bold] for a "
+        "guided next-step view.\n\n"
         "Common workflows:\n"
+        "  [dim]$ mdk menu                       # status + suggested next step[/dim]\n"
         "  [dim]$ mdk init my-agent              # scaffold[/dim]\n"
         "  [dim]$ mdk run my-agent '{...}'       # one-shot[/dim]\n"
         "  [dim]$ mdk eval my-agent              # score against dataset[/dim]\n"
@@ -164,6 +168,10 @@ def _main(
 
 # ----- Develop --------------------------------------------------------------
 
+# `menu` is the suggested first command for new users — shows workspace
+# status + contextual next-step suggestions. Lives at the top of the
+# Develop panel so it surfaces prominently in `mdk --help`.
+app.command("menu", rich_help_panel=PANEL_DEVELOP)(menu_cmd.menu)
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
