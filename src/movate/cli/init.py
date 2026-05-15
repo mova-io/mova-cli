@@ -63,8 +63,11 @@ err_console = Console(stderr=True)
 # the fallback when these aren't set, so we preserve the readable
 # project identity without breaking strict validation.
 _PROJECT_MOVATE_YAML = """\
-# {name} — movate project config (canonical: policy.yaml; movate.yaml
-# is the legacy slot, still supported through v1.x).
+# {name} — movate project config.
+#
+# Canonical filename: `project.yaml` (this file). Legacy names
+# `policy.yaml` and `movate.yaml` are still loaded through v1.x for
+# back-compat; they emit a one-shot deprecation warning when used.
 #
 # Loaded by every CLI command via `load_project_config`. Per-agent
 # `agent.yaml` always wins on conflict; entries here only fill gaps.
@@ -75,6 +78,9 @@ agents_dir: ./agents
 workflows_dir: ./workflows
 skills_dir: ./skills          # reusable skill defs (`skill.yaml` + impl.py)
 contexts_dir: ./contexts      # reusable Markdown contexts (prepended to prompts)
+# Agent-LOCAL contexts at `agents/<name>/contexts/<file>.md` override
+# project-level contexts on name collision — useful when one agent
+# needs a customized version of a shared rubric.
 
 defaults:
   model:
@@ -98,6 +104,44 @@ OPENAI_API_KEY=
 # LANGFUSE_PUBLIC_KEY=
 # LANGFUSE_SECRET_KEY=
 """
+
+_KB_README = """\
+# `kb/` — Knowledge Assets
+
+This directory holds reusable knowledge artifacts used by agents +
+skills. Pre-populated by `mdk init --project` as a placeholder; the
+conventions below are what `mdk` expects but you can layer your own.
+
+## What goes here
+
+| File shape | Used by |
+|---|---|
+| `*.json` | `kb-lookup` skill + custom Python skills (structured corpora) |
+| `*.md` / `*.txt` | RAG-style skills (long-form documents) |
+| `*.pdf` / `*.docx` | Future Tier 3 RAG with chunker + embedder |
+| `embeddings/*.parquet` | Future vector-store skills (pre-computed embeddings) |
+
+## Conventions
+
+- **Filenames are stable.** Skills reference KB files by relative
+  path (`kb/<filename>`); rename = breakage.
+- **One source of truth per topic.** Don't fork `support-tickets.json`
+  into `support-tickets-v2.json`; use git or `mdk snapshot` for
+  versioning instead.
+- **kb/ is committed by default** (the `.gitignore` shipped with
+  the project tracks it). Uncomment the `.gitignore` entry to treat
+  it as machine-local — useful when corpora contain PII you can't
+  put in git.
+
+## Built-in skill that uses kb/
+
+`kb-lookup` (auto-scaffolded when an agent declares
+`skills: [kb-lookup]`) ships with a small mock `corpus.json` for
+demo purposes. To use your real KB, replace that file with your
+own JSON in the same shape, or update `impl.py` to point at a
+real search service.
+"""
+
 
 _PROJECT_GITIGNORE = """\
 # movate runtime state — never commit
@@ -180,9 +224,11 @@ def _is_in_project() -> bool:
     convention :mod:`movate.cli.add_cmd` uses. Lets ``mdk init``
     surface a context-aware hint when called outside a project.
     """
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             return True
         if current.parent == current:
             return False
@@ -238,36 +284,59 @@ def _init_project(
     else:
         project_root = target.resolve()
         project_name = project_root.name
-        # In-place bootstrap: refuse if there's already a movate.yaml,
-        # unless --force is set. Avoids clobbering a real project.
-        if (project_root / "movate.yaml").is_file() and not force:
+        # In-place bootstrap: refuse if there's already a project
+        # marker file (project.yaml / policy.yaml / movate.yaml) unless
+        # --force is set. Avoids clobbering an existing project.
+        from movate.core.config import (  # noqa: PLC0415
+            PROJECT_MARKER_FILES,
+            is_project_root,
+        )
+
+        if is_project_root(project_root) and not force:
+            existing = next(
+                (f for f in PROJECT_MARKER_FILES if (project_root / f).is_file()),
+                "project.yaml",
+            )
             err_console.print(
-                f"[red]✗[/red] {project_root}/movate.yaml already exists "
+                f"[red]✗[/red] {project_root}/{existing} already exists "
                 "(use [bold]--force[/bold] to overwrite the project config)"
             )
             raise typer.Exit(code=2)
         project_root.mkdir(parents=True, exist_ok=True)
 
-    # Project-level config files.
-    (project_root / "movate.yaml").write_text(_PROJECT_MOVATE_YAML.format(name=project_name))
+    # Project-level config files. Canonical name is `project.yaml`
+    # (the May 2026 MVP rename). Loader still accepts `policy.yaml`
+    # and `movate.yaml` for back-compat.
+    (project_root / "project.yaml").write_text(_PROJECT_MOVATE_YAML.format(name=project_name))
     (project_root / ".env.example").write_text(_PROJECT_ENV_EXAMPLE)
     (project_root / ".gitignore").write_text(_PROJECT_GITIGNORE)
 
-    # Three empty top-level dirs with .gitkeep placeholders so they
+    # Four empty top-level dirs with .gitkeep placeholders so they
     # survive `git add`:
     #
     # * ``agents/``    — agent definitions (`mdk add` + `mdk init <name>`)
     # * ``skills/``    — reusable skill definitions (`skill.yaml` + impl)
-    # * ``contexts/``  — reusable Markdown contexts (prepended to prompts)
+    # * ``contexts/``  — reusable Markdown contexts (prepended to prompts).
+    #                   Agent-LOCAL contexts at `agents/<name>/contexts/`
+    #                   override these on name collision.
+    # * ``kb/``        — knowledge assets for RAG / skills: PDFs, JSON
+    #                   corpora, embeddings (later). The `kb-lookup`
+    #                   skill's corpus lives here; `web-search`-style
+    #                   skills can write cached documents here too.
     #
-    # Operators don't HAVE to use skills/ + contexts/, but pre-creating
-    # them surfaces the capabilities (vs. operators discovering them
-    # through doc-reading) AND lets agent.yaml's declared `skills:` /
+    # Operators don't HAVE to use any of these, but pre-creating them
+    # surfaces the capabilities (vs. operators discovering them through
+    # doc-reading) AND lets agent.yaml's declared `skills:` /
     # `contexts:` references resolve cleanly from day one.
-    for subdir in ("agents", "skills", "contexts"):
+    for subdir in ("agents", "skills", "contexts", "kb"):
         sub = project_root / subdir
         sub.mkdir(exist_ok=True)
         (sub / ".gitkeep").write_text("")
+
+    # `kb/` ships a tiny README explaining the convention so operators
+    # who open the dir see "what goes here?" answered in-place rather
+    # than having to grep the docs.
+    (project_root / "kb" / "README.md").write_text(_KB_README)
 
     # Initial snapshot — operators get a baseline for diff / rollback.
     snapshot_short: str | None = None
@@ -296,12 +365,13 @@ def _init_project(
     body = (
         f"[bold]Project:[/bold]   [cyan]{project_name}[/cyan]\n"
         f"[bold]Path:[/bold]      [cyan]{project_root}[/cyan]\n\n"
-        f"  • [cyan]movate.yaml[/cyan]    project config\n"
+        f"  • [cyan]project.yaml[/cyan]   project config\n"
         f"  • [cyan].env.example[/cyan]   env-var template\n"
         f"  • [cyan].gitignore[/cyan]     standard ignores\n"
         f"  • [cyan]agents/[/cyan]        empty (waiting for agents)\n"
         f"  • [cyan]skills/[/cyan]        empty (reusable skill defs)\n"
         f"  • [cyan]contexts/[/cyan]      empty (reusable Markdown contexts)\n"
+        f"  • [cyan]kb/[/cyan]            empty (knowledge assets for RAG / skills)\n"
     )
     if snapshot_short:
         body += f"  • [cyan]snapshot[/cyan]       [dim]{snapshot_short}[/dim] (initial baseline)\n"

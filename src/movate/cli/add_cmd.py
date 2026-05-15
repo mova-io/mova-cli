@@ -146,9 +146,11 @@ def _resolve_project_root() -> Path | None:
     Same convention as ``mdk snapshot`` / ``mdk diff`` so operators
     don't have to relearn project resolution per command.
     """
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             return current
         if current.parent == current:
             return None
