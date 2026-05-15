@@ -90,6 +90,7 @@ from movate.cli import (  # noqa: E402
     audit_cmd,
     demo_cmd,
     diff_cmd,
+    env_cmd,
     eval_gen_cmd,
     fix_cmd,
     fmt_cmd,
@@ -405,6 +406,7 @@ app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
 app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
 app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
+app.add_typer(env_cmd.env_app, name="env", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 # `memory` exposes the Sprint T MVP — list/get/set/evict/summarise/
 # query against the operator-facing memory store. Lives in MANAGE
