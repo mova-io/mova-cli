@@ -26,6 +26,7 @@ Examples::
 from __future__ import annotations
 
 import difflib
+import fnmatch
 from pathlib import Path
 
 import typer
@@ -62,12 +63,57 @@ _SKIP_DIRS = frozenset(
 )
 
 
+def _load_fmtignore(roots: list[Path]) -> list[str]:
+    """Read patterns from a ``.fmtignore`` at any root, one glob per line.
+
+    Empty lines + lines starting with ``#`` are skipped. Operators
+    exempt vendored YAML / generated files by adding glob patterns
+    matched against the relative path from the project root.
+
+    Same convention as ``.gitignore`` semantically; uses fnmatch
+    (shell glob) rather than git's pattern dialect to avoid pulling
+    in a separate matcher dependency. Operators with complex
+    ignore needs can run ``mdk fmt path1/ path2/`` to scope manually.
+    """
+    patterns: list[str] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        candidate = root / ".fmtignore"
+        if not candidate.is_file():
+            continue
+        for line in candidate.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            patterns.append(stripped)
+    return patterns
+
+
+def _matches_ignore(path: Path, root: Path, patterns: list[str]) -> bool:
+    """True when ``path`` matches any of the ignore globs.
+
+    Patterns match against the path relative to ``root``, so a project's
+    ``.fmtignore`` can use repo-rooted globs without worrying about
+    the operator's cwd.
+    """
+    if not patterns:
+        return False
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        rel = path.as_posix()
+    return any(fnmatch.fnmatch(rel, p) for p in patterns)
+
+
 def _iter_formattable(roots: list[Path]) -> list[Path]:
     """Walk roots + return every recognized file we'd format.
 
     Sorted for stable output (matters for the ``--check`` use case where
-    operators read the list to fix files manually).
+    operators read the list to fix files manually). Honors a
+    ``.fmtignore`` file at any root.
     """
+    ignore_patterns = _load_fmtignore(roots)
     found: list[Path] = []
     for root in roots:
         if root.is_file():
@@ -81,6 +127,8 @@ def _iter_formattable(roots: list[Path]) -> list[Path]:
                 continue
             # Skip anything under a junk directory.
             if any(part in _SKIP_DIRS for part in path.parts):
+                continue
+            if _matches_ignore(path, root, ignore_patterns):
                 continue
             if detect_format(path) is not None:
                 found.append(path)

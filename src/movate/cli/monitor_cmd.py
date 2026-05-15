@@ -218,6 +218,15 @@ def monitor(
             "(the live loop expects a TTY)."
         ),
     ),
+    clear: bool = typer.Option(
+        False,
+        "--clear",
+        help=(
+            "Use alternate-screen mode so the live table doesn't accumulate "
+            "scrollback. Restores the terminal on exit. Recommended for "
+            "long-running sessions."
+        ),
+    ),
 ) -> None:
     """Live dashboard of recent runs.
 
@@ -270,6 +279,7 @@ def monitor(
             limit=limit,
             interval=interval,
             title=title,
+            screen=clear,
         )
     )
 
@@ -282,14 +292,21 @@ async def _live_loop(
     limit: int,
     interval: float,
     title: str,
+    screen: bool = False,
 ) -> None:
-    """Inner refresh loop. Refreshes the Live table every ``interval`` s."""
+    """Inner refresh loop. Refreshes the Live table every ``interval`` s.
+
+    ``screen=True`` enables alternate-screen mode — the terminal is
+    cleared on entry and restored on exit. Keeps long sessions from
+    bloating scrollback. Defaults off so the dashboard's last frame
+    stays visible after Ctrl+C (most operator-friendly default).
+    """
     with (
         contextlib.suppress(KeyboardInterrupt),
         Live(
             render_dashboard([], title=title),
             refresh_per_second=4,
-            screen=False,
+            screen=screen,
         ) as live,
     ):
         while True:

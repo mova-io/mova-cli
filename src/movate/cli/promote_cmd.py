@@ -231,6 +231,7 @@ def promote(  # noqa: PLR0912 — branch count is inherent to a multi-mode dispa
     [bold]Examples:[/bold]
 
       [dim]$ mdk promote abc1234 --to staging[/dim]
+      [dim]$ mdk promote abc1234 --to staging --dry-run[/dim]
       [dim]$ mdk promote abc1234 --to prod -d "v0.7 release"[/dim]
       [dim]$ mdk promote abc1234 --to prod --eval-pass-rate 0.85[/dim]
       [dim]$ mdk promote --list[/dim]

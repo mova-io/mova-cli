@@ -38,6 +38,9 @@ from movate.secrets.store import save_store
 console = Console()
 err_console = Console(stderr=True)
 
+# Canonical tight mode for the secrets file (user-only RW).
+_SECRETS_FILE_TIGHT_MODE = 0o600
+
 
 secrets_app = typer.Typer(
     name="secrets",
@@ -249,6 +252,34 @@ def list_(
             secret.last_rotated or "[dim](initial)[/dim]",
         )
     console.print(table)
+    _print_mode_warning(profile_name)
+
+
+def _print_mode_warning(profile_name: str) -> None:
+    """Surface a security warning if the secrets file's mode isn't 0600.
+
+    Catches the "I scp'd this file from another machine and the mode
+    got reset" case. Operators see a single-line warning right under
+    the secret list, distinct from the secret data so it doesn't
+    interleave with the table.
+    """
+    from movate.secrets.store import _store_path  # noqa: PLC0415
+
+    path = _store_path(profile_name)
+    if not path.is_file():
+        return
+    mode = path.stat().st_mode & 0o777
+    if mode == _SECRETS_FILE_TIGHT_MODE:
+        # All good — surface a quiet confirmation so operators see
+        # the security posture at a glance.
+        console.print(f"[dim]file:[/dim] [cyan]{path}[/cyan] [green](mode 0o600 ✓)[/green]")
+        return
+    console.print(
+        f"[dim]file:[/dim] [cyan]{path}[/cyan] "
+        f"[red]⚠ mode {oct(mode)} — should be 0o600[/red]\n"
+        "[dim]Run [bold]mdk fix --only fix-secrets-permissions --apply[/bold] "
+        "to repair.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
