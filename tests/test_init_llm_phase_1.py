@@ -1,20 +1,16 @@
 """Phase 1 of mdk init --llm: CLI surface only.
 
-Phase 1 wires up the flags + mutual-exclusion guards + dispatch path
-so Phase 2's generator can drop in without churning the CLI surface.
-The generator itself is a stub today — invocation exits 2 with a
-"not yet implemented" message.
+These tests verify the CLI contract that Phase 2 relies on:
 
-These tests verify the CLI contract Phase 2 will rely on:
-
-1. ``--llm`` is accepted as an option (parses cleanly).
+1. ``--llm`` / ``--llm-model`` / ``--dry-run`` flags are accepted.
 2. ``--llm`` + ``--project`` errors with code 2 (mutually exclusive).
-3. ``--llm`` + non-default ``--template`` warns but does not error.
-4. ``--llm "..."`` invokes the stub and exits 2 with the expected
-   captured-args block on stderr.
-5. ``--llm ""`` (empty description) exits 2 with a clear error.
-6. ``--dry-run`` without ``--llm`` warns but does not error.
-7. Existing ``mdk init <name>`` flow (no ``--llm``) is unchanged.
+3. ``--llm ""`` (empty description) exits 2 BEFORE building any runtime.
+4. ``--dry-run`` without ``--llm`` warns but does not error.
+5. Existing ``mdk init <name>`` (no ``--llm``) flow is unchanged.
+
+Tests that exercise the generator end-to-end (template-warning paths,
+captured-args echo, MockProvider behavior) moved to
+``test_init_llm_phase_2.py`` where the runtime is wired through.
 """
 
 from __future__ import annotations
@@ -85,112 +81,7 @@ def test_llm_with_project_errors_with_pointer(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Item 3: --llm + --template warns (does not error)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_llm_with_non_default_template_warns_but_invokes_stub(tmp_path: Path) -> None:
-    """`--llm` + `--template chatbot` is legal — the template becomes
-    a few-shot starting point. Phase 1 just warns; Phase 2 will use
-    the template in the meta-prompt."""
-    result = runner.invoke(
-        app,
-        [
-            "init",
-            "my-agent",
-            "--llm",
-            "a chatbot for customer support",
-            "--template",
-            "chatbot",
-            "--target",
-            str(tmp_path),
-        ],
-    )
-    # Still exits 2 because the generator stub is the terminal state in
-    # Phase 1, but the warning AND the Phase 2 capture both fire.
-    assert result.exit_code == 2
-    assert "Phase 2" in result.stderr
-    assert "template" in result.stderr.lower()
-
-
-@pytest.mark.unit
-def test_llm_with_default_template_does_not_warn(tmp_path: Path) -> None:
-    """When --template is left at the default, the LLM+template warning
-    should NOT fire (it would be noise — operators didn't ask for the
-    combination explicitly)."""
-    result = runner.invoke(
-        app,
-        [
-            "init",
-            "my-agent",
-            "--llm",
-            "an agent",
-            "--target",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 2
-    # The combination-warning text shouldn't appear.
-    assert "--template default" not in result.stderr
-    # But the Phase-1 stub message still does.
-    assert "Phase 2" in result.stderr
-
-
-# ---------------------------------------------------------------------------
-# Item 4: --llm invokes the stub and prints captured args
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_llm_invocation_prints_captured_args(tmp_path: Path) -> None:
-    """The Phase 1 stub must echo every flag through to stderr so
-    reviewers can verify end-to-end wiring without a real LLM call.
-    Phase 2 replaces this block with the actual generator output."""
-    result = runner.invoke(
-        app,
-        [
-            "init",
-            "faq-agent",
-            "--llm",
-            "FAQ agent for our SaaS pricing",
-            "--llm-model",
-            "anthropic/claude-sonnet-4",
-            "--target",
-            str(tmp_path),
-            "--dry-run",
-        ],
-    )
-    assert result.exit_code == 2
-    # All the captured flags must appear in the Phase-2-capture block.
-    assert "faq-agent" in result.stderr
-    assert "FAQ agent for our SaaS pricing" in result.stderr
-    assert "anthropic/claude-sonnet-4" in result.stderr
-    assert "dry_run:     True" in result.stderr
-
-
-@pytest.mark.unit
-def test_llm_default_model_used_when_flag_omitted(tmp_path: Path) -> None:
-    """When --llm-model isn't passed, the default must show up in the
-    captured-args block. This is what Phase 2 will dispatch to the
-    runtime."""
-    result = runner.invoke(
-        app,
-        [
-            "init",
-            "agent",
-            "--llm",
-            "an agent",
-            "--target",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 2
-    assert _DEFAULT_LLM_MODEL in result.stderr
-
-
-# ---------------------------------------------------------------------------
-# Item 5: empty --llm description
+# Item 3: empty --llm description
 # ---------------------------------------------------------------------------
 
 
@@ -214,7 +105,7 @@ def test_empty_llm_description_errors_early(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Item 6: --dry-run without --llm warns
+# Item 4: --dry-run without --llm warns
 # ---------------------------------------------------------------------------
 
 
@@ -240,7 +131,7 @@ def test_dry_run_without_llm_warns_but_succeeds(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Item 7: backwards compatibility — no --llm = unchanged behavior
+# Item 5: backwards compatibility — no --llm = unchanged behavior
 # ---------------------------------------------------------------------------
 
 

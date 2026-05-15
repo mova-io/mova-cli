@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -251,15 +252,25 @@ def _init_agent(
 
 
 # ---------------------------------------------------------------------------
-# LLM-scaffold mode (Phase 1 stub — generator lands in Phase 2)
+# LLM-scaffold mode (Phase 2 — generator + validation loop)
 # ---------------------------------------------------------------------------
 
 
 # Default model for LLM scaffolding. Cheap + reliable JSON-mode support;
 # bumped via ``--llm-model`` if an operator wants a different trade-off.
-# Same provider string format as ``agent.yaml: model.provider`` — the
-# Phase 2 generator will reuse ``build_local_runtime`` to instantiate it.
+# Same provider string format as ``agent.yaml: model.provider``.
 _DEFAULT_LLM_MODEL = "openai/gpt-4o-mini-2024-07-18"
+
+# Where Phase 2 stashes a failed-second-attempt's raw payload for the
+# operator to inspect. Relative to the cwd at invocation time — the
+# project root in the normal flow. Operators are pointed at this path
+# in the error message so they don't have to grep stderr.
+_DEBUG_ARTIFACT_REL = ".movate/llm-init-failed-{name}.json"
+
+# Preview truncation cap for the prompt body in --dry-run mode. Long
+# enough that the operator sees the agent's intent; short enough that
+# Rich Panel rendering stays compact.
+_DRY_RUN_PROMPT_PREVIEW_CHARS = 600
 
 
 def _init_agent_from_llm(
@@ -271,27 +282,29 @@ def _init_agent_from_llm(
     force: bool,
     dry_run: bool,
     starting_template: str,
+    mock: bool = False,
 ) -> None:
     """Scaffold an agent from a natural-language description.
 
-    **Phase 1 (this PR): CLI surface only.** The function signature is
-    locked in so Phase 2 can swap the body for the real generator
-    without churning ``init()``'s argument list. Today the body prints
-    a friendly "not yet implemented" message and exits 2 — the flag
-    is verified-wired but not yet functional.
+    The flow is:
 
-    **Phase 2 (next PR) will:**
+    1. Build a local runtime (:func:`build_local_runtime`) so we get a
+       provider configured the same way as :command:`mdk run` does.
+    2. Call :func:`generate_agent_from_description` once.
+    3. Write to a tempdir; run :func:`load_agent` to validate end-to-end.
+    4. On validation failure: re-prompt with the error context and retry
+       ONCE. On second failure: stash raw JSON to
+       ``.movate/llm-init-failed-<name>.json`` and exit 2.
+    5. On success: either copy the tempdir contents to
+       ``target / name`` (the normal flow) or render a Rich preview
+       to stdout (``dry_run=True``).
 
-    1. Build a local runtime via :func:`movate.cli._runtime.build_local_runtime`.
-    2. Call a new :mod:`movate.scaffold.llm_scaffold` module that returns
-       a :class:`GeneratedAgent` Pydantic payload from the description.
-    3. Write the generated files to a tempdir, run :func:`load_agent`
-       to validate, retry once if validation fails, surface a clear
-       error otherwise.
-    4. On success, copy to ``target / name`` (or print as Rich tree
-       when ``dry_run=True``).
+    The retry policy lives here rather than in :mod:`movate.scaffold`
+    because retry behavior is a CLI concern — the debug-artifact path,
+    the ``--dry-run`` short-circuit, and the operator-facing error
+    messages all depend on the CLI's context.
     """
-    # Validate inputs early — this is the contract Phase 2 will rely on.
+    # Validate inputs early — guard against silently-empty descriptions.
     if not description.strip():
         err_console.print(
             "[red]✗[/red] --llm description is empty. "
@@ -299,26 +312,242 @@ def _init_agent_from_llm(
         )
         raise typer.Exit(code=2)
 
-    err_console.print(
-        "[yellow]⚠[/yellow] [bold]--llm[/bold] is wired but the generator "
-        "lands in [bold]Phase 2[/bold].\n"
-        "[dim]This Phase-1 PR locks in the CLI surface so downstream phases\n"
-        "(generator, validation loop, docs) don't churn this file.[/dim]"
+    # Destination check before the LLM call — operators get the error
+    # immediately, not after spending tokens.
+    dest = (target / name).resolve()
+    if dest.exists() and not force and not dry_run:
+        err_console.print(
+            f"[red]✗[/red] {dest} already exists "
+            "(use [bold]--force[/bold] to overwrite, or [bold]--dry-run[/bold] "
+            "to preview without writing)"
+        )
+        raise typer.Exit(code=2)
+
+    import asyncio  # noqa: PLC0415
+
+    asyncio.run(
+        _run_llm_scaffold(
+            name=name,
+            description=description,
+            llm_model=llm_model,
+            target=target,
+            force=force,
+            dry_run=dry_run,
+            starting_template=starting_template,
+            mock=mock,
+            dest=dest,
+        )
     )
-    # Echo the captured arguments so operators (and PR reviewers) can
-    # confirm the flags wire through end-to-end without a real LLM call.
-    # Phase 2 will replace this block with the actual generation call.
-    err_console.print(
-        f"\n[dim]Captured for Phase 2:\n"
-        f"  name:        {name}\n"
-        f"  description: {description!r}\n"
-        f"  llm_model:   {llm_model}\n"
-        f"  template:    {starting_template}\n"
-        f"  target:      {target}\n"
-        f"  dry_run:     {dry_run}\n"
-        f"  force:       {force}[/dim]"
+
+
+async def _run_llm_scaffold(
+    *,
+    name: str,
+    description: str,
+    llm_model: str,
+    # `target` and `starting_template` are kept on the signature so
+    # Phase 3 (UX polish + template-aware meta-prompt) can plug in
+    # without churning callers. They're unused by today's body.
+    target: Path,
+    force: bool,
+    dry_run: bool,
+    starting_template: str,
+    mock: bool,
+    dest: Path,
+) -> None:
+    """Async body of the LLM-scaffold flow.
+
+    Split out so :func:`_init_agent_from_llm` can stay a thin sync
+    Typer handler — asyncio.run owns one event loop, here.
+    """
+    # Local imports — keep the cold-path init flow free of these
+    # heavyweight modules. The non-LLM scaffold doesn't pay this cost.
+    import tempfile  # noqa: PLC0415
+
+    from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.scaffold import (  # noqa: PLC0415
+        LLMScaffoldError,
+        generate_agent_from_description,
+        write_agent_files,
     )
-    raise typer.Exit(code=2)
+
+    rt = await build_local_runtime(mock=mock)
+    try:
+        # Attempt 1 — fresh generation from the description.
+        try:
+            generated = await generate_agent_from_description(
+                description=description,
+                name=name,
+                model=llm_model,
+                provider=rt.provider,
+            )
+        except LLMScaffoldError as exc:
+            err_console.print(f"[red]✗[/red] LLM scaffold failed: {exc}")
+            raise typer.Exit(code=2) from None
+
+        # Validate by writing to a tempdir and loading.
+        validation_error = _try_validate(generated, name=name)
+
+        # Retry once if validation failed.
+        if validation_error is not None:
+            err_console.print(
+                f"[yellow]⚠[/yellow] first attempt failed validation: "
+                f"[dim]{validation_error}[/dim]\n"
+                f"[dim]retrying once with the error fed back to the model...[/dim]"
+            )
+            try:
+                generated = await generate_agent_from_description(
+                    description=description,
+                    name=name,
+                    model=llm_model,
+                    provider=rt.provider,
+                    previous_attempt=generated,
+                    validation_error=validation_error,
+                )
+            except LLMScaffoldError as exc:
+                _save_debug_artifact(name, payload=None, raw_error=str(exc))
+                err_console.print(
+                    f"[red]✗[/red] retry also failed: {exc}\n"
+                    f"[dim]raw error saved to "
+                    f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]"
+                )
+                raise typer.Exit(code=2) from None
+
+            validation_error = _try_validate(generated, name=name)
+            if validation_error is not None:
+                _save_debug_artifact(name, payload=generated, raw_error=validation_error)
+                err_console.print(
+                    f"[red]✗[/red] retry attempt also failed validation:\n"
+                    f"[dim]{validation_error}[/dim]\n"
+                    f"[dim]raw LLM output saved to "
+                    f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]\n"
+                    f"[dim]inspect, fix manually, or re-run with a different "
+                    f"description.[/dim]"
+                )
+                raise typer.Exit(code=1)
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+    # At this point, ``generated`` passed validation. Either preview or
+    # commit to ``dest``.
+    if dry_run:
+        _render_dry_run_preview(generated, name=name, dest=dest)
+        return
+
+    # Commit: write into a tempdir then atomic-rename into place. The
+    # tempdir-write pattern avoids leaving a half-written agent dir if
+    # disk fills up mid-write (rare but easy to defend against).
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp_dir = Path(raw_tmp) / name
+        write_agent_files(generated, target_dir=tmp_dir)
+        if dest.exists() and force:
+            # --force was set (we checked above); replace cleanly.
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(tmp_dir, dest)
+
+    _render_success_panel(name=name, dest=dest, generated=generated)
+
+
+def _try_validate(generated: Any, *, name: str) -> str | None:
+    """Write ``generated`` to a tempdir and run :func:`load_agent`.
+
+    Returns ``None`` on success, or the error string on failure. The
+    string is fed back to the retry prompt so the LLM can self-correct.
+    """
+    import tempfile  # noqa: PLC0415
+
+    from movate.core.loader import AgentLoadError, load_agent  # noqa: PLC0415
+    from movate.scaffold import write_agent_files  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp_agent_dir = Path(raw_tmp) / name
+        try:
+            write_agent_files(generated, target_dir=tmp_agent_dir)
+        except (OSError, ValueError) as exc:
+            return f"file write failed: {exc}"
+        try:
+            load_agent(tmp_agent_dir)
+        except AgentLoadError as exc:
+            return str(exc)
+    return None
+
+
+def _save_debug_artifact(name: str, *, payload: Any, raw_error: str) -> None:
+    """Stash the failed LLM output to ``.movate/llm-init-failed-<name>.json``."""
+    artifact_path = Path(_DEBUG_ARTIFACT_REL.format(name=name))
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    body: dict[str, object] = {"error": raw_error, "name": name}
+    if payload is not None:
+        # GeneratedAgent.model_dump() — dump the validated Python form.
+        body["payload"] = payload.model_dump() if hasattr(payload, "model_dump") else payload
+    import json as _json  # noqa: PLC0415
+
+    artifact_path.write_text(_json.dumps(body, indent=2, default=str))
+
+
+def _render_dry_run_preview(generated: Any, *, name: str, dest: Path) -> None:
+    """Render the generated agent as a Rich tree to stdout (no file writes)."""
+    import json as _json  # noqa: PLC0415
+
+    import yaml as _yaml  # noqa: PLC0415
+
+    body = (
+        f"[bold]Agent:[/bold]   [cyan]{name}[/cyan]\n"
+        f"[bold]Target:[/bold]  [dim]{dest}[/dim] [yellow](dry-run; not written)[/yellow]\n\n"
+        f"[bold]agent.yaml:[/bold]\n"
+        f"[dim]{_yaml.safe_dump(generated.agent_yaml, sort_keys=False).strip()}[/dim]\n\n"
+        f"[bold]prompt.md:[/bold]\n"
+        f"[dim]{generated.prompt_md.strip()[:_DRY_RUN_PROMPT_PREVIEW_CHARS]}"
+        f"{'…' if len(generated.prompt_md) > _DRY_RUN_PROMPT_PREVIEW_CHARS else ''}[/dim]\n\n"
+        f"[bold]schema/input.json:[/bold]\n"
+        f"[dim]{_json.dumps(generated.input_schema, indent=2)}[/dim]\n\n"
+        f"[bold]schema/output.json:[/bold]\n"
+        f"[dim]{_json.dumps(generated.output_schema, indent=2)}[/dim]\n\n"
+        f"[bold]evals/dataset.jsonl:[/bold] "
+        f"[dim]{len(generated.sample_evals)} entries[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title="[yellow]⌕[/yellow] LLM scaffold preview",
+            title_align="left",
+            border_style="yellow",
+        )
+    )
+
+
+def _render_success_panel(*, name: str, dest: Path, generated: Any) -> None:
+    """Print the success Panel — mirrors the template-copy success path."""
+    body = (
+        f"[bold]Agent:[/bold]    [cyan]{name}[/cyan]\n"
+        f"[bold]Path:[/bold]     [cyan]{dest}[/cyan]\n"
+        f"[bold]Files:[/bold]\n"
+        f"  • [cyan]agent.yaml[/cyan]\n"
+        f"  • [cyan]prompt.md[/cyan]\n"
+        f"  • [cyan]schema/input.json[/cyan]\n"
+        f"  • [cyan]schema/output.json[/cyan]\n"
+    )
+    if generated.sample_evals:
+        body += (
+            f"  • [cyan]evals/dataset.jsonl[/cyan] "
+            f"[dim]({len(generated.sample_evals)} seed cases)[/dim]\n"
+        )
+    body += (
+        f"\n[bold]Next steps:[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk validate {dest}[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk run {dest} --mock '{{...}}'[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk eval {dest} --mock --gate 0.7[/bold]\n\n"
+        f"[dim]review prompt.md and the schemas before first real run.[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title="[green]✓[/green] LLM-scaffolded agent",
+            title_align="left",
+            border_style="green",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +616,15 @@ def init(
         help=(
             "Preview the generated files without writing to disk. Only "
             "meaningful with [bold]--llm[/bold] today; ignored otherwise."
+        ),
+    ),
+    mock: bool = typer.Option(
+        False,
+        "--mock",
+        help=(
+            "Use the deterministic [bold]MockProvider[/bold] for the LLM call. "
+            "Hermetic CI mode — no API keys required. Only meaningful with "
+            "[bold]--llm[/bold]; ignored otherwise."
         ),
     ),
 ) -> None:
@@ -472,6 +710,7 @@ def init(
             force=force,
             dry_run=dry_run,
             starting_template=template,
+            mock=mock,
         )
         return
 
