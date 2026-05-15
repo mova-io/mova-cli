@@ -83,7 +83,7 @@ from movate.cli._env_aliases import sync_env_aliases  # noqa: E402
 
 sync_env_aliases()
 
-from movate import __version__  # noqa: E402
+from movate import __release_date__, __version__  # noqa: E402
 from movate.cli import (  # noqa: E402
     _console,
     add_cmd,
@@ -184,7 +184,15 @@ def _version_callback(value: bool) -> None:
         # Anything not exactly "movate" is rendered as "mdk" (handles
         # symlinks, "mdk", and the test runner's "pytest" all the same).
         brand = "movate" if binary == "movate" else "mdk"
+        # Multi-line --version output: name + version on line 1
+        # (back-compat with scripts that grep `mdk --version | awk '{print $2}'`),
+        # then release date + Python info on subsequent dim lines so the
+        # operator can answer "which build is this and when was it cut?"
+        # at a glance.
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
         typer.echo(f"{brand} {__version__}")
+        typer.echo(f"  released:  {__release_date__}")
+        typer.echo(f"  python:    {py_version}")
         raise typer.Exit()
 
 
