@@ -36,6 +36,7 @@ from movate.cli import (  # noqa: E402
     fmt_cmd,
     menu_cmd,
     migrate_cmd,
+    monitor_cmd,
     promote_cmd,
     replay_cmd,
     rollback_cmd,
@@ -218,6 +219,9 @@ app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
+# `monitor` is the live counterpart to the historical `costs report` /
+# `logs`. Same panel since it answers an adjacent operator question.
+app.command("monitor", rich_help_panel=PANEL_RUN)(monitor_cmd.monitor)
 app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 
 # ----- Remote (talk to a deployed runtime) ----------------------------------
