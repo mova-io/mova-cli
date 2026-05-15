@@ -176,6 +176,20 @@ _SEVERITY_ICON: dict[Severity, str] = {
     Severity.INFO: "i",  # plain lowercase i (ruff RUF001 — no ambiguous unicode)
 }
 
+# Map audit scanner categories to the `mdk fix --only <id>` command
+# that would remediate them. Keeps the diagnose→fix loop tight:
+# operators don't need to remember the fix id, the audit row carries
+# it. Only listed for findings that have a 1:1 fix today; other
+# categories render without a command line (operator fixes manually).
+_CATEGORY_TO_FIX_COMMAND: dict[str, str] = {
+    # v1 audit scanners (Sprint N) → fixes (Sprint P)
+    "missing-evals": "mdk eval-gen <agent> --num 10",
+    # v2 audit scanners (Sprint S) → fixes (Sprint P)
+    # Note: `floating-model-tag` / `missing-version` / `missing-fallback`
+    # / `prompt-too-long` / `schema-no-required` are operator-edits in
+    # agent.yaml — no auto-fix maps to them. Hint stays the guide.
+}
+
 
 def _render_rich(report: AuditReport, *, target: str, strict: bool) -> None:
     """Render the audit report as a Rich panel + findings table."""
@@ -230,6 +244,14 @@ def _render_rich(report: AuditReport, *, target: str, strict: bool) -> None:
             msg_cell = finding.message
             if finding.hint:
                 msg_cell += f"\n[dim]hint: {finding.hint}[/dim]"
+            # Close the diagnose→fix loop: if this finding maps to an
+            # `mdk fix` scanner, surface the exact command operators
+            # would otherwise have to look up + retype. Today's map
+            # covers the categories that have a 1:1 fix; others render
+            # without a command line.
+            fix_cmd = _CATEGORY_TO_FIX_COMMAND.get(finding.category)
+            if fix_cmd:
+                msg_cell += f"\n[cyan]→ {fix_cmd}[/cyan]"
             table.add_row(sev_cell, finding.category, finding.target, msg_cell)
 
         console.print(table)

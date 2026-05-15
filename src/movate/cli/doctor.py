@@ -171,9 +171,23 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     table.add_column("Purpose", style="dim", overflow="fold")
     table.add_column("License", style="dim")
 
-    table.add_row("Python", sys.version.split()[0], "", "")
-    table.add_row("movate", __version__, "", "")
-    table.add_row("", "", "", "")
+    # Tally check statuses as we build the table so the greppable
+    # summary line at the bottom can report counts without scraping
+    # internal Rich row state. ``_classify_result`` turns the markup
+    # string into one of {"ok", "missing", "error"} or returns None
+    # for non-check rows (section headers, raw values like Python
+    # version, blank separators).
+    counts = {"ok": 0, "missing": 0, "error": 0}
+
+    def _add(check: str, result: str, *extra: str) -> None:
+        table.add_row(check, result, *extra)
+        kind = _classify_result(check, result)
+        if kind is not None:
+            counts[kind] += 1
+
+    _add("Python", sys.version.split()[0], "", "")
+    _add("movate", __version__, "", "")
+    _add("", "", "", "")
 
     # Required deps — Purpose + SPDX license columns. Every entry in
     # _REQUIRED_DEPS should have a matching entry in both _DEP_LICENSES
@@ -185,9 +199,9 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
         status = _ok("") if spec else "[red]missing (install fail)[/red]"
         purpose = _DEP_PURPOSE.get(mod, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
-        table.add_row(f"dep: {mod}", status, purpose, license_str)
+        _add(f"dep: {mod}", status, purpose, license_str)
 
-    table.add_row("", "", "", "")
+    _add("", "", "", "")
 
     # Optional deps
     for mod in _OPTIONAL_DEPS:
@@ -195,9 +209,9 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
         status = _ok("") if spec else _missing("not installed")
         purpose = _DEP_PURPOSE.get(mod, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
-        table.add_row(f"opt: {mod}", status, purpose, license_str)
+        _add(f"opt: {mod}", status, purpose, license_str)
 
-    table.add_row("", "")
+    _add("", "")
 
     # AgentRuntime probes — which `runtime:` values in agent.yaml will
     # actually resolve to an adapter on THIS install? litellm is always
@@ -213,58 +227,58 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
             # Should not happen — litellm is in _REQUIRED_DEPS — but the
             # branch keeps mypy happy.
             status = "[red]missing[/red]"  # pragma: no cover
-        table.add_row(f"runtime: {runtime_name}", status)
+        _add(f"runtime: {runtime_name}", status)
 
-    table.add_row("", "")
+    _add("", "")
 
     # Provider API keys
     any_key = False
     for env_var, label in _PROVIDER_KEYS:
         present = bool(os.environ.get(env_var, "").strip())
         any_key = any_key or present
-        table.add_row(env_var, _ok(label) if present else _missing(label))
+        _add(env_var, _ok(label) if present else _missing(label))
 
     if not any_key:
-        table.add_row(
+        _add(
             "[yellow]hint[/yellow]",
             "[dim]no provider keys set; use --mock for offline runs[/dim]",
         )
 
-    table.add_row("", "")
+    _add("", "")
 
     # Tracing keys (separate from agent provider keys — easier to scan)
     for env_var, label in _TRACING_KEYS:
         present = bool(os.environ.get(env_var, "").strip())
-        table.add_row(env_var, _ok(label) if present else _missing(label))
+        _add(env_var, _ok(label) if present else _missing(label))
 
     # Resolved tracer — what `movate run` would actually use right now.
     try:
         tracer = build_tracer()
-        table.add_row("resolved tracer", f"[green]{tracer.name}[/green]")
+        _add("resolved tracer", f"[green]{tracer.name}[/green]")
     except Exception as exc:  # pragma: no cover - diagnostic only
-        table.add_row("resolved tracer", f"[red]error: {exc}[/red]")
+        _add("resolved tracer", f"[red]error: {exc}[/red]")
 
-    table.add_row("", "")
+    _add("", "")
 
     # Storage
     sqlite_path = Path("~/.movate/local.db").expanduser()
     state = "exists" if sqlite_path.exists() else "will be created on first run"
-    table.add_row("storage (sqlite)", f"{sqlite_path} [dim]({state})[/dim]")
+    _add("storage (sqlite)", f"{sqlite_path} [dim]({state})[/dim]")
 
     # Pricing
     try:
         pricing = load_pricing()
         models = len(pricing.models)
-        table.add_row(
+        _add(
             "pricing",
             f"v{pricing.version} ({models} models, last_verified {pricing.last_verified})",
         )
     except Exception as exc:
-        table.add_row("pricing", f"[red]load failed: {exc}[/red]")
+        _add("pricing", f"[red]load failed: {exc}[/red]")
 
     # Project config
     project_yaml = Path("movate.yaml")
-    table.add_row(
+    _add(
         "movate.yaml",
         f"[green]found[/green] [dim]({project_yaml.resolve()})[/dim]"
         if project_yaml.exists()
@@ -284,6 +298,55 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # ------------------------------------------------------------------
     if target is not None:
         _render_azure_preflight(target)
+
+    # Greppable single-line summary at the very end. Mirrors audit /
+    # eval so CI tooling has one consistent prefix across all three
+    # diagnostic commands. Counts are tallied during row adds (see
+    # ``_add`` above) — no internal Rich state scraping.
+    _print_doctor_summary_line(counts)
+
+
+def _classify_result(check: str, result: str) -> str | None:
+    """Bucket a doctor table row into ``ok`` / ``missing`` / ``error``.
+
+    Returns ``None`` for non-check rows — section separators (empty
+    check + empty result) and informational rows (Python version,
+    movate version, sqlite path, pricing version, hint). The summary
+    line only counts rows that represent a pass/fail signal.
+    """
+    # Section separators contribute nothing.
+    if not check and not result:
+        return None
+    # Informational rows have a label but report a raw value, not an
+    # ok/missing/error verdict — exclude them so the summary line
+    # reflects pass/fail signal density, not row count.
+    if check in {"Python", "movate", "storage (sqlite)", "pricing", "[yellow]hint[/yellow]"}:
+        return None
+    lower = result.lower()
+    # Order matters: "missing (install fail)" is RED — required dep
+    # absent — and must classify as ``error``, not ``missing``,
+    # otherwise CI dashboards under-count broken installs.
+    if "error" in lower or "missing (install fail)" in lower or "load failed" in lower:
+        return "error"
+    if "[green]ok" in lower or "[green]found" in lower or "[green]" in lower:
+        return "ok"
+    if "missing" in lower or "[yellow]" in lower:
+        return "missing"
+    return "ok"
+
+
+def _print_doctor_summary_line(counts: dict[str, int]) -> None:
+    """Emit ``mdk_doctor_summary: checks=N ok=N missing=N error=N`` line.
+
+    Reads the tally built up during row adds. Single line, dim style,
+    same key=value shape as ``mdk_audit_summary`` and
+    ``mdk_eval_summary`` so CI grep stays trivial.
+    """
+    total = counts["ok"] + counts["missing"] + counts["error"]
+    console.print(
+        f"[dim]mdk_doctor_summary: checks={total} ok={counts['ok']} "
+        f"missing={counts['missing']} error={counts['error']}[/dim]"
+    )
 
 
 def _render_explanations() -> None:

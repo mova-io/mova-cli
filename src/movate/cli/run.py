@@ -21,6 +21,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli import _console
 from movate.cli._completion import complete_agent_path
 from movate.cli._output import Run
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
@@ -240,6 +241,17 @@ async def _run_local_agent(
         sys.stdout.write(response.human_readable + "\n")
     else:
         sys.stdout.write(response.model_dump_json(indent=2) + "\n")
+
+    # Echo the run_id on stderr so it survives stdout-piping (jq, `>` to a
+    # file, etc.) without corrupting the captured JSON. Closes the dev
+    # loop: operators see exactly which RunRecord to feed into
+    # `mdk replay` / `mdk explain` next. Honors --quiet via _console.hint.
+    if response.run_id:
+        short = response.run_id[:8]
+        _console.hint(
+            f"[dim]→ saved as run_id [bold]{short}[/bold] · "
+            f"replay: [cyan]mdk replay {short}[/cyan][/dim]"
+        )
 
     if response.status == "error":
         raise typer.Exit(code=1)
