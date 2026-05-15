@@ -65,7 +65,7 @@ class TestInitWithAgents:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         # Project shell exists.
-        assert (tmp_path / "support-bot" / "movate.yaml").is_file()
+        assert (tmp_path / "support-bot" / "project.yaml").is_file()
         # All three agents scaffolded.
         for name in ("rag-qa", "ticket-triager", "code-reviewer"):
             assert (tmp_path / "support-bot" / "agents" / name / "agent.yaml").is_file(), (
@@ -93,7 +93,7 @@ class TestInitWithAgents:
         assert "unknown template" in result.stderr.lower()
         # The project itself was bootstrapped (that happens FIRST), but
         # the partial agent slot is NOT populated.
-        assert (tmp_path / "proj" / "movate.yaml").is_file()
+        assert (tmp_path / "proj" / "project.yaml").is_file()
         assert not (tmp_path / "proj" / "agents" / "rag-qa").exists()
 
     def test_without_with_agents_unchanged(
@@ -108,7 +108,7 @@ class TestInitWithAgents:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        assert (tmp_path / "noagents" / "movate.yaml").is_file()
+        assert (tmp_path / "noagents" / "project.yaml").is_file()
         # agents/ dir exists but is empty (apart from .gitkeep).
         agents_dir = tmp_path / "noagents" / "agents"
         contents = [p for p in agents_dir.iterdir() if not p.name.startswith(".")]

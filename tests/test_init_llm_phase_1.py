@@ -171,5 +171,5 @@ def test_init_project_without_llm_unchanged(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert (tmp_path / "myproj" / "movate.yaml").is_file()
+    assert (tmp_path / "myproj" / "project.yaml").is_file()
     assert (tmp_path / "myproj" / "agents").is_dir()

@@ -91,23 +91,24 @@ class TestProjectConfigFields:
         assert cfg.skills_dir == "./skills"
         assert cfg.contexts_dir == "./contexts"
 
-    def test_movate_yaml_template_lists_skills_and_contexts(
+    def test_project_yaml_template_lists_skills_and_contexts(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Bootstrapped movate.yaml documents skills_dir + contexts_dir."""
+        """Bootstrapped project.yaml documents skills_dir + contexts_dir.
+        (Renamed from movate.yaml in the May-2026 MVP bundle.)"""
         proj = _bootstrap(tmp_path, monkeypatch)
-        body = (proj / "movate.yaml").read_text()
+        body = (proj / "project.yaml").read_text()
         assert "skills_dir:" in body
         assert "contexts_dir:" in body
 
-    def test_movate_yaml_still_validates_as_project_config(
+    def test_project_yaml_still_validates_as_project_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The new fields don't break ProjectConfig validation."""
         from movate.core.config import ProjectConfig  # noqa: PLC0415
 
         proj = _bootstrap(tmp_path, monkeypatch)
-        data = yaml.safe_load((proj / "movate.yaml").read_text())
+        data = yaml.safe_load((proj / "project.yaml").read_text())
         cfg = ProjectConfig.model_validate(data)
         # The defaults survive a round-trip.
         assert cfg.skills_dir == "./skills"
