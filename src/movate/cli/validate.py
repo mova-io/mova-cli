@@ -70,9 +70,11 @@ def validate(
     path: Path | None = typer.Argument(
         None,
         help=(
-            "Path to an agent or workflow directory. Omit with "
-            "[bold]--all[/bold] to validate every agent + workflow in the "
-            "current project."
+            "Path (or bare name) of an agent or workflow. Omit to "
+            "validate EVERY agent + workflow in the current project — "
+            "the default since the typical flow after "
+            "[bold]mdk init --project --with-agents X,Y,Z[/bold] is "
+            "'check everything I just made'."
         ),
         shell_complete=complete_agent_path,
     ),
@@ -80,11 +82,10 @@ def validate(
         False,
         "--all",
         help=(
-            "Validate every agent under [bold]./agents/[/bold] AND every "
-            "workflow under [bold]./workflows/[/bold] in the current "
-            "project. Renders a summary table; exits non-zero if any "
-            "fail. Pairs with [bold]mdk init --project --with-agents[/bold] "
-            "as the natural next step."
+            "Explicit form of the no-arg default — validate every agent + "
+            "workflow in the current project. Kept for back-compat with "
+            "scripts that pass [bold]--all[/bold] verbatim. Mutually "
+            "exclusive with a path argument."
         ),
     ),
     strict: bool = typer.Option(
@@ -100,32 +101,44 @@ def validate(
 ) -> None:
     """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references.
 
-    Inside a project you can pass a bare name (``mdk validate rag-qa``);
-    it resolves under ``./agents/<name>/`` or ``./workflows/<name>/``.
+    Three modes depending on arguments:
 
-    Use [bold]--all[/bold] to validate every agent + workflow in the
-    current project in one shot — handy right after
-    [bold]mdk init --project --with-agents X,Y,Z[/bold].
+    * **No path** (default): validate every agent + workflow in the
+      current project. Renders a summary table; exits non-zero if any
+      fail. Same behavior as the older [bold]--all[/bold] flag.
+    * **Path / bare name**: validate just that one. Inside a project
+      you can pass a bare name ([bold]mdk validate rag-qa[/bold]); it
+      resolves under [bold]./agents/<name>/[/bold] or
+      [bold]./workflows/<name>/[/bold].
+    * **Outside a project + no path**: error with a pointer to
+      [bold]mdk init --project[/bold].
+
+    [bold]--all[/bold] is the explicit form of the no-arg default —
+    kept for back-compat with scripts that pass it verbatim.
     """
-    if all_in_project:
-        # --all is mutually exclusive with a path argument. Passing
-        # both is almost certainly a typo — surface it cleanly rather
-        # than silently picking one.
-        if path is not None and str(path) != ".":
+    # Mutex: passing BOTH a path AND --all is almost certainly a typo;
+    # reject explicitly rather than silently picking one.
+    if all_in_project and path is not None and str(path) != ".":
+        console.print(
+            "[red]✗[/red] [bold]--all[/bold] and an explicit path argument are mutually exclusive."
+        )
+        raise typer.Exit(code=2)
+
+    # No path arg → check if we're inside a project and default to
+    # whole-project validation. Outside a project this errors with a
+    # hint (same shape as the old --all-required behavior, but the
+    # operator never had to type the flag).
+    if path is None or all_in_project:
+        if _resolve_project_root() is None:
             console.print(
-                "[red]✗[/red] [bold]--all[/bold] and an explicit path "
-                "argument are mutually exclusive."
+                "[red]✗[/red] not inside a movate project — nothing to "
+                "validate.\n"
+                "[dim]Either pass a path ([bold]mdk validate <path>[/bold]) "
+                "or run [bold]mdk init --project <name>[/bold] first.[/dim]"
             )
             raise typer.Exit(code=2)
         _validate_all(strict=strict, run_linter=not no_lint)
         return
-
-    if path is None:
-        console.print(
-            "[red]✗[/red] path required (or pass [bold]--all[/bold] to "
-            "validate every agent + workflow in the project)."
-        )
-        raise typer.Exit(code=2)
 
     # Bare-name resolution: `mdk validate rag-qa` → `./agents/rag-qa`
     # when inside a project. Full paths pass through unchanged.
