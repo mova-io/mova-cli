@@ -27,7 +27,12 @@ from movate.cli._env_aliases import sync_env_aliases  # noqa: E402
 sync_env_aliases()
 
 from movate import __version__  # noqa: E402
-from movate.cli import _console  # noqa: E402
+from movate.cli import (  # noqa: E402
+    _console,
+    audit_cmd,
+    diff_cmd,
+    rollback_cmd,
+)
 from movate.cli import bench as bench_cmd  # noqa: E402
 from movate.cli import chat as chat_cmd  # noqa: E402
 from movate.cli import deploy as deploy_cmd  # noqa: E402
@@ -56,6 +61,7 @@ from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.secrets_cmd import secrets_app  # noqa: E402
 from movate.cli.skills_cmd import skills_app  # noqa: E402
+from movate.cli.snapshot_cmd import snapshot_app  # noqa: E402
 from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
@@ -204,6 +210,10 @@ app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(profiles_app, name="profiles", rich_help_panel=PANEL_MANAGE)
 app.add_typer(secrets_app, name="secrets", rich_help_panel=PANEL_MANAGE)
+app.add_typer(snapshot_app, name="snapshot", rich_help_panel=PANEL_MANAGE)
+app.command("diff", rich_help_panel=PANEL_MANAGE)(diff_cmd.diff)
+app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
+app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
 
