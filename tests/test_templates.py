@@ -47,6 +47,117 @@ CANONICAL: dict[str, tuple[dict, str]] = {
         '{"contact_name": "Sarah", "email": "sarah@acme.io", '
         '"intent": "support_request", "urgency": "high"}',
     ),
+    # --- Role-based templates ---
+    "rag-qa": (
+        {
+            "question": "What is the refund window?",
+            "context": ["Refunds are honored within 30 days of purchase."],
+        },
+        '{"answer": "30 days.", "citations": [1], "grounded": true, '
+        '"confidence": 0.95}',
+    ),
+    "ticket-triager": (
+        {"subject": "Login broken", "body": "Cannot log in since this morning."},
+        '{"category": "bug", "priority": "p1_high", "routing_queue": "engineering", '
+        '"draft_reply": "Sorry — engineering is investigating now.", '
+        '"confidence": 0.9}',
+    ),
+    "email-responder": (
+        {
+            "from": "alice@acme.com",
+            "subject": "Q2 renewal",
+            "body": "Are we renewing in May?",
+            "intent": "Confirm renewal date with account manager.",
+            "tone": "professional",
+            "length": "short",
+        },
+        '{"subject": "Re: Q2 renewal", "body": "Hi Alice — looping in your '
+        'account manager today.", "needs_review": true, "flags": ["confirm AM"]}',
+    ),
+    "sql-writer": (
+        {
+            "question": "How many users signed up last week?",
+            "schema": "users(id int, signed_up_at timestamp)",
+            "dialect": "postgres",
+        },
+        '{"query": "SELECT COUNT(*) FROM users WHERE signed_up_at >= '
+        "NOW() - INTERVAL '7 days'\", "
+        '"explanation": "Counts users in the last 7 days.", '
+        '"tables_used": ["users"], "read_only": true, "confidence": 0.95}',
+    ),
+    "code-reviewer": (
+        {
+            "diff": "--- a/x.py\n+++ b/x.py\n@@ -1,1 +1,1 @@\n-pass\n+pass  # nit\n",
+            "language": "python",
+        },
+        '{"summary": "Trivial change.", "verdict": "approve", "findings": []}',
+    ),
+    "lead-qualifier": (
+        {
+            "name": "Sarah Chen",
+            "company": "Acme (2000 employees)",
+            "title": "VP Eng",
+            "source": "demo_request",
+            "message": "Budget approved. Want a demo this week.",
+        },
+        '{"bant": {'
+        '"budget": {"score": 3, "rationale": "Approved."}, '
+        '"authority": {"score": 3, "rationale": "VP."}, '
+        '"need": {"score": 3, "rationale": "Evaluating."}, '
+        '"timeline": {"score": 3, "rationale": "This week."}'
+        '}, "total_score": 12, "next_action": "book_meeting", '
+        '"rationale": "Textbook qualified.", "objections": []}',
+    ),
+    "meeting-summarizer": (
+        {
+            "title": "Standup",
+            "attendees": ["Alice", "Bob"],
+            "transcript": "Alice: I'll ship the migration today. Bob: thanks.",
+        },
+        '{"tldr": "Alice will ship the migration today.", '
+        '"decisions": [], '
+        '"action_items": [{"task": "Ship migration", "owner": "Alice", '
+        '"due": "today"}], '
+        '"blockers": [], "follow_ups": []}',
+    ),
+    "resume-screener": (
+        {
+            "job_description": "Senior Python engineer. 5+ years Python.",
+            "resume": "Jane Doe. 7 years Python. FastAPI + Postgres.",
+        },
+        '{"match_score": 85, "strengths": ["7 years Python"], '
+        '"gaps": ["No FastAPI specifics shown"], '
+        '"interview_questions": ["Tell us about your most complex Python project."], '
+        '"recommendation": "advance", "rationale": "Strong match."}',
+    ),
+    "compliance-checker": (
+        {
+            "text": "Our product cures headaches in 5 minutes guaranteed.",
+            "rules": [
+                {"id": "R1", "description": "No absolute medical claims."}
+            ],
+        },
+        '{"compliant": false, "violations": [{'
+        '"rule_id": "R1", "excerpt": "cures headaches", "severity": "high", '
+        '"explanation": "Absolute medical claim.", '
+        '"suggested_rewording": "may help relieve headache symptoms"'
+        '}], "summary": "One violation — rewrite before publishing."}',
+    ),
+    "research-agent": (
+        {
+            "topic": "Is GPT-4o-mini production-ready?",
+            "sources": [
+                {
+                    "title": "OAI",
+                    "url": "https://example.com",
+                    "content": "60% quality at 6% cost.",
+                }
+            ],
+        },
+        '{"executive_summary": "Production-ready for cost-sensitive workloads [1].", '
+        '"key_points": [{"claim": "60% quality at 6% cost.", "citations": [1]}], '
+        '"disagreements": [], "open_questions": []}',
+    ),
 }
 
 
@@ -58,12 +169,24 @@ CANONICAL: dict[str, tuple[dict, str]] = {
 @pytest.mark.unit
 def test_template_registry_exposes_all_known() -> None:
     assert set(TEMPLATES.keys()) == {
+        # Original core templates
         "default",
         "faq",
         "summarizer",
         "classifier",
         "chatbot",
         "extractor",
+        # Role-based templates (post-v1.0)
+        "rag-qa",
+        "ticket-triager",
+        "email-responder",
+        "sql-writer",
+        "code-reviewer",
+        "lead-qualifier",
+        "meeting-summarizer",
+        "resume-screener",
+        "compliance-checker",
+        "research-agent",
     }
     assert list_templates() == sorted(TEMPLATES.keys())
 

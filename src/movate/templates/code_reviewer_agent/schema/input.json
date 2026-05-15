@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["diff", "language"],
+  "properties": {
+    "diff":     { "type": "string", "minLength": 1, "description": "Unified-diff format." },
+    "language": {
+      "type": "string",
+      "enum": ["python", "typescript", "javascript", "go", "rust", "java", "kotlin", "csharp", "sql", "yaml", "other"]
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["question", "schema", "dialect"],
+  "properties": {
+    "question": { "type": "string", "minLength": 1 },
+    "schema":   {
+      "type": "string",
+      "minLength": 1,
+      "description": "DDL or table descriptions the agent may reference."
+    },
+    "dialect":  {
+      "type": "string",
+      "enum": ["postgres", "mysql", "sqlite", "snowflake", "bigquery", "tsql"]
+    }
+  }
+}

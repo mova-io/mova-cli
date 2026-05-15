@@ -26,6 +26,31 @@ TEMPLATES: dict[str, str] = {
     # Structured-field extractor: free-form text → strict typed fields.
     # Demonstrates strict output-schema enforcement for LLM extraction.
     "extractor": "extractor_agent",
+    # --- Role-based templates (post-v1.0) ---
+    # Each one is a complete, runnable agent for a high-frequency
+    # enterprise use case. Datasets exercise the output schema so the
+    # template passes `mdk eval` out of the box.
+    #
+    # RAG Q&A: grounded answer with citation indices.
+    "rag-qa": "rag_qa_agent",
+    # Support ticket triager: category + priority + routing + draft reply.
+    "ticket-triager": "ticket_triager_agent",
+    # Email responder: tone-aware drafted reply with needs-review flag.
+    "email-responder": "email_responder_agent",
+    # Text-to-SQL: schema-grounded query + plain-English explanation.
+    "sql-writer": "sql_writer_agent",
+    # Code reviewer: unified-diff → structured findings (file/line/severity).
+    "code-reviewer": "code_reviewer_agent",
+    # Lead qualifier: BANT scoring + next-best-action + objections.
+    "lead-qualifier": "lead_qualifier_agent",
+    # Meeting summarizer: transcript → decisions + action items + blockers.
+    "meeting-summarizer": "meeting_summarizer_agent",
+    # Resume screener: JD + resume → match score + strengths + gaps.
+    "resume-screener": "resume_screener_agent",
+    # Compliance checker: text + ruleset → violations + rewordings.
+    "compliance-checker": "compliance_checker_agent",
+    # Research agent: topic + sources → executive summary with citations.
+    "research-agent": "research_agent",
 }
 
 # Skill templates live alongside agent templates but are reached via
