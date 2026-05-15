@@ -33,6 +33,7 @@ from movate.cli import (  # noqa: E402
     diff_cmd,
     menu_cmd,
     migrate_cmd,
+    promote_cmd,
     rollback_cmd,
 )
 from movate.cli import bench as bench_cmd  # noqa: E402
@@ -223,6 +224,7 @@ app.add_typer(snapshot_app, name="snapshot", rich_help_panel=PANEL_MANAGE)
 app.command("diff", rich_help_panel=PANEL_MANAGE)(diff_cmd.diff)
 app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
 app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
+app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
