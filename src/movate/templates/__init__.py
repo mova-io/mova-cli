@@ -54,11 +54,23 @@ TEMPLATES: dict[str, str] = {
 }
 
 # Skill templates live alongside agent templates but are reached via
-# ``mdk skills scaffold`` rather than ``mdk init``. Only one entry
-# today — the python-backend echo skill — but the registry pattern
-# generalizes (e.g. an http-backend starter could ship later).
+# ``mdk skills scaffold`` rather than ``mdk init``. Each entry maps a
+# skill name to its packaged directory; the `default` key is the
+# fallback when an agent declares a skill that has no curated
+# template (auto-scaffold copies the default echo skill).
+#
+# The named templates ship REAL impls — operators can run them
+# directly via ``mdk skills run <name>`` after scaffolding without
+# replacing any code. Demo flow uses:
+#
+# * web-search — DuckDuckGo HTML scrape (rag-qa)
+# * lint-runner — subprocess `ruff check` (code-reviewer)
+# * kb-lookup — mock-data corpus search (ticket-triager)
 SKILL_TEMPLATES: dict[str, str] = {
     "default": "skill_init",
+    "web-search": "skill_web_search",
+    "lint-runner": "skill_lint_runner",
+    "kb-lookup": "skill_kb_lookup",
 }
 
 

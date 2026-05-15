@@ -242,11 +242,53 @@ _STORAGE_AND_PROJECT_EXPLANATIONS: dict[str, CheckExplanation] = {
         failure_impact="Cost reporting reads as $0.00 for unknown models. Doesn't block runs.",
         fix="The pricing table ships with the CLI — failure means a broken install.",
     ),
+    "project.yaml": CheckExplanation(
+        what="Project-level config file — canonical filename (May 2026+). Carries layered defaults, policy, runtime gates, skills allowlist, eval/bench config.",
+        why="Loaded by every `mdk` command via `load_project_config`. Per-agent `agent.yaml` always wins per-key; entries here only fill gaps. Absent = permissive defaults.",
+        failure_impact="No config = no project policy enforced. Agents run without provider / cost / runtime restrictions.",
+        fix="`mdk init <name>` scaffolds a canonical, self-documenting `project.yaml`. To migrate from a legacy filename: rename + delete the old file.",
+    ),
+    "policy.yaml": CheckExplanation(
+        what="Legacy v1.x name for the project-level config (renamed to `project.yaml` in May 2026).",
+        why="Still loaded for back-compat; emits a one-shot deprecation warning. Operators should rename to `project.yaml`.",
+        failure_impact="Same as project.yaml — no policy enforced.",
+        fix="`mv policy.yaml project.yaml` (the loader will pick up the new name; no other changes required).",
+    ),
     "movate.yaml": CheckExplanation(
-        what="Project-level config file (allowed providers, deny-list, cost caps, bench defaults, runtime policy).",
-        why="Renamed to `policy.yaml` going forward (loader checks both). Absent = permissive defaults.",
-        failure_impact="No config = no project policy enforced. All runs proceed without provider/cost restrictions.",
-        fix="`mdk init` scaffolds a starter policy.yaml; otherwise see docs/license-posture.md for the canonical shape.",
+        what="Original v0.x name for the project-level config. Still loaded for back-compat; renamed first to `policy.yaml` (v1.x), now to `project.yaml` (May 2026+).",
+        why="Loader accepts the legacy name + emits a one-shot deprecation warning. New projects scaffolded via `mdk init` use `project.yaml`.",
+        failure_impact="Same as project.yaml.",
+        fix="`mv movate.yaml project.yaml`.",
+    ),
+    "project config parses": CheckExplanation(
+        what="The project config file (project.yaml / policy.yaml / movate.yaml) parses successfully as ProjectConfig.",
+        why="A malformed config blocks every project-aware command: `mdk validate`, `mdk add`, `mdk eval`, `mdk deploy`. Catching it at doctor time prevents the failure mode where every command in a session errors with the same cryptic Pydantic ValidationError.",
+        failure_impact="Project-wide commands fail until the config is fixed.",
+        fix="Run `mdk validate` for the full error. Common causes: unknown top-level field, wrong type on `defaults.model.params.*`, malformed YAML.",
+    ),
+    "agents/": CheckExplanation(
+        what="Standard project subdirectory for agent definitions.",
+        why="`mdk add <template>` scaffolds new agents here. `mdk run <name>` resolves bare names under this directory.",
+        failure_impact="`mdk add` fails until you create it; `mdk run` can't resolve bare names.",
+        fix="`mkdir agents && touch agents/.gitkeep` — or re-run `mdk init <name>` which scaffolds it automatically.",
+    ),
+    "skills/": CheckExplanation(
+        what="Standard project subdirectory for reusable skill definitions (`skill.yaml` + `impl.py`).",
+        why="Agents that declare `skills: [foo]` resolve the skill at `<project>/skills/foo/skill.yaml`. Auto-scaffolded by `mdk add` when an agent declares skills.",
+        failure_impact="Agents that declare skills fail to load with `SkillLoadError: empty registry`.",
+        fix="`mkdir skills && touch skills/.gitkeep` — or re-run `mdk init <name>`. `mdk add` auto-creates skill dirs for declared skills.",
+    ),
+    "contexts/": CheckExplanation(
+        what="Standard project subdirectory for reusable Markdown contexts (prepended to prompts at render time).",
+        why="Agents that declare `contexts: [foo]` resolve to `<project>/contexts/foo.md`. Per-agent overrides at `agents/<name>/contexts/foo.md` win when names collide.",
+        failure_impact="Agents that declare contexts fail to load with `ContextLoadError: not registered`.",
+        fix="`mkdir contexts && touch contexts/.gitkeep` — or re-run `mdk init <name>`. Drop hand-authored `.md` files in here as the shared knowledge base for prompts.",
+    ),
+    "kb/": CheckExplanation(
+        what="Standard project subdirectory for knowledge assets (JSON corpora, documents, future embeddings).",
+        why="Skills like `kb-lookup` resolve their data via `movate.core.kb_loader.resolve_kb_file(name)`, which checks `<project>/kb/<name>` first before falling back to a bundled default. Drop your real corpus here to override the demo data.",
+        failure_impact="Skills using `resolve_kb_file` fall back to bundled defaults (usually a demo corpus). Not a hard failure, but operators expect their KB to be used.",
+        fix="`mkdir kb && touch kb/.gitkeep` — or re-run `mdk init <name>`. See `kb/README.md` for filename conventions per skill.",
     ),
 }
 

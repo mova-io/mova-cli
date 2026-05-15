@@ -41,3 +41,16 @@ budget:
 tags:
   - code-review
   - engineering-productivity
+
+# Curated review rubric — ships with this template, copied to
+# `<project>/contexts/review-rubric.md` on `mdk add code-reviewer`.
+# Encodes the discipline that produces high-signal reviews (catches
+# real bugs without nit-spam).
+contexts:
+  - review-rubric
+
+# Lint-runner skill — `ruff check` via subprocess. The agent calls
+# this on the changed files before drafting its review so concrete
+# linter output informs the findings. Requires `ruff` on PATH.
+skills:
+  - lint-runner

@@ -67,15 +67,26 @@ class TestScaffoldAndLoad:
     """
 
     @pytest.mark.parametrize("template", ROLE_TEMPLATES)
-    def test_template_scaffolds_and_loads(self, template: str, tmp_path: Path) -> None:
-        agent_name = template + "-smoke"
-        result = runner.invoke(
-            app,
-            ["init", agent_name, "-t", template, "--target", str(tmp_path)],
-        )
+    def test_template_scaffolds_and_loads(
+        self, template: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Use the realistic `mdk init --project + mdk add` flow rather
+        # than the bare `mdk init -t` path. Role templates that declare
+        # skills or contexts need a project context for the
+        # auto-scaffold mechanisms (`_maybe_scaffold_declared_skills`,
+        # `_maybe_copy_template_contexts`) to fire — without them
+        # `load_agent` errors out on missing skill / context refs.
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--project", "proj", "--skip-snapshot"])
+        assert result.exit_code == 0, result.stdout + result.stderr
+        project = tmp_path / "proj"
+        monkeypatch.chdir(project)
+
+        # `mdk add` keeps the template name as the agent name by default.
+        result = runner.invoke(app, ["add", template])
         assert result.exit_code == 0, result.stdout + result.stderr
 
-        agent_dir = tmp_path / agent_name
+        agent_dir = project / "agents" / template
         assert (agent_dir / "agent.yaml").is_file()
         assert (agent_dir / "prompt.md").is_file()
         assert (agent_dir / "schema" / "input.json").is_file()
@@ -88,10 +99,11 @@ class TestScaffoldAndLoad:
         # - bad JSON Schema in schema/{input,output}.json
         # - Jinja syntax errors in prompt.md (caught at render time —
         #   tested in a separate render check below)
+        # - Missing skill / context references (caught by the loader)
         bundle = load_agent(agent_dir)
-        assert bundle.spec.name == agent_name, (
+        assert bundle.spec.name == template, (
             f"__AGENT_NAME__ substitution didn't apply for {template} — "
-            f"got name={bundle.spec.name!r} instead of {agent_name!r}"
+            f"got name={bundle.spec.name!r} instead of {template!r}"
         )
 
         # Dataset has at least one row of valid JSONL.
@@ -110,15 +122,23 @@ class TestPromptRenders:
     Jinja syntax + that the schema and prompt agree on field names."""
 
     @pytest.mark.parametrize("template", ROLE_TEMPLATES)
-    def test_prompt_renders_with_first_dataset_row(self, template: str, tmp_path: Path) -> None:
-        agent_name = template + "-render"
-        result = runner.invoke(
-            app,
-            ["init", agent_name, "-t", template, "--target", str(tmp_path)],
-        )
+    def test_prompt_renders_with_first_dataset_row(
+        self, template: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same shape as test_template_scaffolds_and_loads — use
+        # `mdk init --project + mdk add` so the skill / context
+        # auto-scaffold mechanisms fire for templates that declare
+        # them. Without that, role templates with `skills:` blocks
+        # error at load time (no skill registry in a flat dir).
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["init", "--project", "proj", "--skip-snapshot"])
+        assert result.exit_code == 0, result.stdout + result.stderr
+        project = tmp_path / "proj"
+        monkeypatch.chdir(project)
+        result = runner.invoke(app, ["add", template])
         assert result.exit_code == 0, result.stdout + result.stderr
 
-        agent_dir = tmp_path / agent_name
+        agent_dir = project / "agents" / template
         bundle = load_agent(agent_dir)
 
         # Pull the first eval row and validate input shape, then render.

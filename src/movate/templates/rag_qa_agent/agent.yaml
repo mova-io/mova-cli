@@ -41,3 +41,16 @@ tags:
   - rag
   - qa
   - grounded
+
+# Reusable Markdown context (prepended to every prompt) — ships with
+# this template; `mdk add rag-qa` auto-copies it into the project's
+# `contexts/` dir. Edit `contexts/grounded-qa-rubric.md` to tune the
+# discipline; the agent re-reads on every run.
+contexts:
+  - grounded-qa-rubric
+
+# External skill the agent can call when the provided context doesn't
+# answer the question. `mdk add rag-qa` auto-scaffolds the skill at
+# `<project>/skills/web-search/` with a working DuckDuckGo HTML impl.
+skills:
+  - web-search

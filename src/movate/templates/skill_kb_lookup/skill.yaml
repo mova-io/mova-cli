@@ -1,0 +1,40 @@
+api_version: movate/v1
+kind: Skill
+
+name: __SKILL_NAME__
+version: 0.1.0
+description: >-
+  Searches an internal knowledge base of past support tickets and
+  resolutions, returning the top matches for a query. Used by the
+  ticket-triager agent to look up "have we seen this issue before?"
+  before drafting a reply. Ships with a small mock corpus; replace
+  with your real KB by swapping the JSON file or pointing the skill
+  at a remote search index.
+
+schema:
+  input:
+    query: string
+    top_n?: integer
+    category?: string
+  output:
+    matches:
+      - id: string
+        category: string
+        title: string
+        symptom: string
+        resolution: string
+        score: integer
+    corpus_size: integer
+    warning?: string
+
+implementation:
+  kind: python
+  entry: __SKILL_NAME__.impl:run
+
+cost:
+  # Local file lookup; no external call.
+  per_call_usd: 0.0
+
+# `read-only` — opens the JSON corpus, doesn't write anywhere. When
+# the skill is rewired to hit a remote KB index, bump to `network`.
+side_effects: read-only

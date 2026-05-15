@@ -40,8 +40,25 @@ class ContextLoadError(Exception):
     """Raised when a context file is missing or unparseable."""
 
 
-def load_context_registry(project_root: str | Path) -> dict[str, str]:
-    """Discover every context under ``<project_root>/contexts/<name>.md``.
+def load_context_registry(
+    project_root: str | Path,
+    *,
+    agent_dir: str | Path | None = None,
+) -> dict[str, str]:
+    """Discover every context under ``<project_root>/contexts/<name>.md``,
+    optionally layering agent-local contexts on top.
+
+    Two-tier resolution (May 2026 MVP):
+
+    1. **Project-level** — ``<project_root>/contexts/<name>.md``.
+       Shared across every agent in the workspace.
+    2. **Agent-local** — when ``agent_dir`` is provided,
+       ``<agent_dir>/contexts/<name>.md`` files are layered on top
+       and OVERRIDE project-level entries with the same name.
+
+    Operators put shared rubrics in the project dir; per-agent
+    overrides live alongside the agent itself. The override semantic
+    mirrors how ``agent.yaml`` overrides ``project.yaml`` defaults.
 
     Returns a ``name → body`` map keyed by the file's basename (with
     the ``.md`` suffix stripped). Nested subdirectories are NOT
@@ -56,23 +73,41 @@ def load_context_registry(project_root: str | Path) -> dict[str, str]:
     at name resolution.
     """
     project_dir = Path(project_root).resolve()
-    contexts_root = project_dir / "contexts"
-    if not contexts_root.is_dir():
-        return {}
 
+    # Tier 1: project-level. Empty if dir doesn't exist.
+    registry: dict[str, str] = _read_contexts_from(project_dir / "contexts")
+
+    # Tier 2: agent-local overrides. Same `_read_contexts_from` helper
+    # so dotfile / subdir / non-md filtering stays identical between
+    # tiers — adding rules here only requires one edit.
+    if agent_dir is not None:
+        agent_path = Path(agent_dir).resolve()
+        local = _read_contexts_from(agent_path / "contexts")
+        # Dict-update overrides on key collision — agent-local wins.
+        registry.update(local)
+
+    return registry
+
+
+def _read_contexts_from(contexts_dir: Path) -> dict[str, str]:
+    """Internal helper — read every ``<name>.md`` from a single dir.
+
+    Same filtering rules as the public loader (dotfile / subdir /
+    non-md skip). Factored out so the project + agent-local tiers
+    apply identical rules without duplicating the body.
+    """
+    if not contexts_dir.is_dir():
+        return {}
     registry: dict[str, str] = {}
-    for entry in sorted(contexts_root.iterdir()):
-        # Skip dotfiles + subdirectories + non-markdown.
+    for entry in sorted(contexts_dir.iterdir()):
         if entry.name.startswith("."):
             continue
         if not entry.is_file():
             continue
         if entry.suffix.lower() != ".md":
             continue
-        name = entry.stem  # filename without `.md`
+        name = entry.stem
         if not name:
-            # An entry like ``.md`` would yield an empty name — skip
-            # rather than register an unreferencable context.
             continue
         try:
             body = entry.read_text()

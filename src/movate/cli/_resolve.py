@@ -102,12 +102,14 @@ def suggest_similar_agent(name: str, *, cutoff: float = 0.6) -> str | None:
 
 
 def _walk_up_for_project_root() -> Path | None:
-    """Walk up from cwd looking for ``movate.yaml`` — same convention
-    used by every other project-aware command (``mdk add``,
-    ``mdk doctor agent``, ``mdk snapshot``, ``mdk diff``)."""
+    """Walk up from cwd looking for a project-root marker. Same set of
+    accepted names as :data:`movate.core.config.PROJECT_MARKER_FILES`
+    (``project.yaml`` / ``policy.yaml`` / ``movate.yaml``)."""
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             return current
         if current.parent == current:
             return None

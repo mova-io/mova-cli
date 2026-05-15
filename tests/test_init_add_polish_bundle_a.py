@@ -235,29 +235,36 @@ class TestSearchFilter:
 
 @pytest.mark.unit
 class TestInitEmptyCwdHint:
-    def test_no_args_outside_project_suggests_project_mode(
+    def test_no_args_outside_project_suggests_init_paths(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """`mdk init` (bare) outside a project must hint the three
+        common-uses paths. Post-May-2026 the canonical first one is
+        `mdk init <name>` (project mode by default)."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["init"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
-        # The empty-cwd hint variant fires.
-        assert "not in a movate project" in result.stderr.lower()
-        assert "mdk init --project" in result.stderr
+        combined = (result.stdout + result.stderr).lower()
+        assert "name required" in combined
+        # The error spells out the bare-init + --project + -t paths.
+        assert "mdk init" in combined
+        assert "--project" in combined or "project mode" in combined
+        assert "-t" in combined or "template" in combined
 
-    def test_no_args_inside_project_keeps_old_hint(
+    def test_no_args_inside_project_suggests_mdk_add(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """If you're inside a project AND forget the agent name, the
-        empty-cwd hint should NOT fire (you're not in an empty dir —
-        you just forgot an argument)."""
+        """Inside a project, the hint shifts: to add an agent use
+        `mdk add` (not `mdk init`). Reflects the May-2026 rename of
+        `mdk init` as project-mode-by-default."""
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["init"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
-        # Generic hint instead.
-        assert "not in a movate project" not in result.stderr.lower()
-        assert "mdk init --help" in result.stderr
+        combined = result.stdout + result.stderr
+        assert "name required" in combined.lower()
+        # Inside-project hint points operators at `mdk add` instead.
+        assert "mdk add" in combined
 
 
 # ---------------------------------------------------------------------------

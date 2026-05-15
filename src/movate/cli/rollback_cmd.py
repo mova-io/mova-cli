@@ -48,9 +48,11 @@ def _resolve_project_root(explicit: Path | None) -> Path:
             err_console.print(f"[red]✗[/red] --project path is not a directory: {explicit}")
             raise typer.Exit(code=2)
         return explicit.resolve()
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             return current
         if current.parent == current:
             break

@@ -523,11 +523,25 @@ def load_project_config(path: Path | str | None = None) -> ProjectConfig:
         data = yaml.safe_load(p.read_text()) or {}
         return ProjectConfig.model_validate(data)
 
-    # Resolve the base file (canonical policy.yaml or legacy movate.yaml).
+    # Resolve the base file. Three accepted names in precedence order:
+    #
+    # 1. `project.yaml` — canonical (post-MVP rename, May 2026)
+    # 2. `policy.yaml`  — legacy v1.x canonical; preserved through v1.x
+    # 3. `movate.yaml`  — original v0.x name; preserved through v1.x
+    #
+    # First-match wins. Each legacy name emits a one-shot deprecation
+    # warning when found so operators know to migrate.
     base_data: dict[str, Any] = {}
+    project_path = Path("project.yaml")
     policy_path = Path("policy.yaml")
     legacy_path = Path("movate.yaml")
-    if policy_path.exists():
+    if project_path.exists():
+        base_data = yaml.safe_load(project_path.read_text()) or {}
+    elif policy_path.exists():
+        # policy.yaml is still supported but is no longer the headline
+        # name; surface a soft deprecation so operators migrate when
+        # convenient. Same one-shot pattern as movate.yaml's warning.
+        _warn_legacy_policy_yaml_once()
         base_data = yaml.safe_load(policy_path.read_text()) or {}
     elif legacy_path.exists():
         _warn_legacy_movate_yaml_once()
@@ -545,6 +559,26 @@ def load_project_config(path: Path | str | None = None) -> ProjectConfig:
     )
 
     return ProjectConfig.model_validate(merged)
+
+
+# Project-root marker filenames recognized by ``mdk add`` /
+# ``mdk validate`` / ``mdk snapshot`` / etc. when walking up from
+# cwd to find a project. Listed in canonical-first order; ALL three
+# get accepted indefinitely (the legacy ones fire a one-shot
+# deprecation warning when read via :func:`load_project_config`).
+PROJECT_MARKER_FILES: tuple[str, ...] = (
+    "project.yaml",  # canonical (post-MVP rename, May 2026)
+    "policy.yaml",  # legacy v1.x canonical
+    "movate.yaml",  # original v0.x name
+)
+
+
+def is_project_root(path: Path | str) -> bool:
+    """True if ``path`` contains any of the recognized project-root
+    marker files. Used by every walk-up convention in the CLI so the
+    three accepted names stay synchronized in one place."""
+    p = Path(path)
+    return any((p / marker).is_file() for marker in PROJECT_MARKER_FILES)
 
 
 # Fields that have moved out of policy.yaml. When both the dedicated
@@ -631,12 +665,13 @@ def _layer_file(
 
 
 _LEGACY_WARN_FIRED = False
+_POLICY_LEGACY_WARN_FIRED = False
 _MOVED_FIELD_WARNINGS: set[str] = set()
 
 
 def _warn_legacy_movate_yaml_once() -> None:
     """Print a one-shot deprecation warning the first time we load
-    ``movate.yaml`` (legacy name) instead of ``policy.yaml`` (canonical).
+    ``movate.yaml`` (oldest name) instead of ``project.yaml`` (canonical).
 
     Uses stderr (not the logging framework) so the warning is visible
     even when logging is configured to WARNING-only — config-rename is
@@ -649,8 +684,29 @@ def _warn_legacy_movate_yaml_once() -> None:
     import sys  # noqa: PLC0415
 
     print(
-        "⚠ movate.yaml is deprecated — rename to policy.yaml. "
+        "⚠ movate.yaml is deprecated — rename to project.yaml. "
         "movate.yaml will continue to load through v1.x; "
+        "removed in a future major release.",
+        file=sys.stderr,
+    )
+
+
+def _warn_legacy_policy_yaml_once() -> None:
+    """Print a one-shot deprecation warning the first time we load
+    ``policy.yaml`` (legacy v1.x name) instead of ``project.yaml``.
+
+    Same shape as the movate.yaml warning. Both fire to stderr so
+    operators see migration prompts even under quiet logging.
+    """
+    global _POLICY_LEGACY_WARN_FIRED  # noqa: PLW0603 — one-shot warning state
+    if _POLICY_LEGACY_WARN_FIRED:
+        return
+    _POLICY_LEGACY_WARN_FIRED = True
+    import sys  # noqa: PLC0415
+
+    print(
+        "⚠ policy.yaml is deprecated — rename to project.yaml. "
+        "policy.yaml will continue to load through v1.x; "
         "removed in a future major release.",
         file=sys.stderr,
     )
