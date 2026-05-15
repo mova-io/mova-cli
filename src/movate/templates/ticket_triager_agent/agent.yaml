@@ -41,3 +41,18 @@ tags:
   - support
   - triage
   - classification
+
+# Curated contexts: the triage rubric + tone guide. Both ship with
+# this template and get copied into `<project>/contexts/` on
+# `mdk add ticket-triager`. Edit them to match your org's
+# routing queues and voice.
+contexts:
+  - triage-rubric
+  - support-tone
+
+# KB lookup skill — searches a corpus of past tickets to answer
+# "have we seen this before?". Ships with a mock corpus
+# (`<project>/skills/kb-lookup/corpus.json`); swap it for your real
+# tickets export to make the agent actually useful.
+skills:
+  - kb-lookup

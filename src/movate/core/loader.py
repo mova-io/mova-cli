@@ -27,6 +27,39 @@ class AgentLoadError(Exception):
     """Raised when an agent directory fails to load or validate."""
 
 
+# Markers used by `_resolve_project_root` to identify a project root.
+# `movate.yaml` is the legacy slot; `policy.yaml` is the canonical
+# v1.x name. Either suffices — the loader treats them as equivalent
+# for ROOT resolution (the canonical-split + deprecation handling
+# lives inside `load_project_config`).
+_PROJECT_MARKERS: tuple[str, ...] = ("movate.yaml", "policy.yaml")
+
+
+def _resolve_project_root(agent_dir: Path) -> Path:
+    """Walk up from ``agent_dir`` looking for the project root marker.
+
+    Returns the first parent dir containing ``movate.yaml`` or
+    ``policy.yaml``. Falls back to ``agent_dir.parent`` if no marker
+    is found — the legacy "agent dropped flat alongside skills/"
+    layout keeps working (used by the executor's tool-use tests).
+
+    Why this matters: the canonical project layout is
+    ``<project>/agents/<name>/``, so ``agent_dir.parent`` =
+    ``<project>/agents/``. The skills/ + contexts/ folders live at
+    ``<project>/skills/`` + ``<project>/contexts/`` — one level
+    UP from ``agent_dir.parent``. Without this walk, skill /
+    context resolution silently picks the wrong directory.
+    """
+    current = agent_dir.resolve()
+    for parent in current.parents:
+        if any((parent / marker).is_file() for marker in _PROJECT_MARKERS):
+            return parent
+    # No marker found anywhere up the tree → assume the agent lives
+    # at the project root level (legacy layout). Falls back to the
+    # agent's immediate parent.
+    return agent_dir.parent
+
+
 @dataclass
 class AgentBundle:
     """Fully-resolved agent: spec, prompt template, validated schemas, hash.
@@ -156,13 +189,20 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
 
     # Resolve declared skills against the project's skills/ registry.
     # Lazy import keeps this loader free of a circular dep with
-    # skill_loader (which imports _resolve_schema from here). The
-    # registry root is the *parent* of the agent dir — that's where
-    # `skills/` lives in the canonical project layout. If the agent
-    # was loaded from outside a project (e.g. test fixtures), the
-    # registry is empty and any non-empty `spec.skills` triggers a
-    # clean SkillLoadError.
-    project_root = agent_dir.parent
+    # skill_loader (which imports _resolve_schema from here).
+    #
+    # Project-root resolution: walk up from the agent directory
+    # looking for ``movate.yaml`` / ``policy.yaml``. That's the
+    # canonical project root marker (set by ``mdk init --project``),
+    # and ``<project>/skills/`` + ``<project>/contexts/`` live as its
+    # siblings.
+    #
+    # Fallback: if no marker is found (agent loaded outside a project,
+    # e.g. test fixtures or single-agent ``mdk init <name>`` scaffolds
+    # without project mode), use ``agent_dir.parent``. That keeps the
+    # legacy "agent dropped into a flat dir alongside skills/" layout
+    # working — the executor tool-use tests rely on this fallback.
+    project_root = _resolve_project_root(agent_dir)
     skills_resolved: list[Any] = []
     if spec.skills:
         # Local import to avoid module-load-time cycle.

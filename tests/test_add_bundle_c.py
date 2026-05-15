@@ -291,55 +291,67 @@ class TestAutoSkills:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Templates that don't declare skills should not create
-        ./skills/ at all."""
+        ./skills/ at all.
+
+        Uses `faq` template — minimal scaffold with no `skills:`
+        block. (rag-qa / ticket-triager / code-reviewer all declare
+        skills now as part of the demo-content bundle, so they'd
+        legitimately trigger skills/ creation.)
+        """
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        result = runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
-        assert result.exit_code == 0
-        # rag-qa doesn't declare skills.
+        result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # faq doesn't declare skills → no skills/ dir auto-created.
         assert not (proj / "skills").exists()
 
     def test_no_skills_flag_skips_autoscaffold(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """--no-skills must skip auto-scaffolding even when the
-        template declares skills."""
-        proj = _bootstrap_project(tmp_path)
-        # Create a scratch template that declares a skill.
-        from movate.templates import TEMPLATES_DIR  # noqa: PLC0415
+        template declares skills.
 
-        # We don't add a fake template to the registry — just verify
-        # the --no-skills flag is wired and doesn't crash the add path.
+        rag-qa now declares `skills: [web-search]`, so this test is
+        meaningful — without --no-skills the auto-scaffold would
+        create skills/web-search/ but with it the path stays empty.
+        """
+        proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["add", "rag-qa", "--no-skills"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
-        _ = TEMPLATES_DIR  # silence unused
-        assert not (proj / "skills").exists()
+        # --no-skills skips the auto-scaffold even though rag-qa
+        # declares web-search. The skill dir is NOT created.
+        assert not (proj / "skills" / "web-search").exists()
 
     def test_autoscaffold_creates_skill_dir_when_declared(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Edit a scaffolded agent's agent.yaml to declare a skill,
         then re-trigger the auto-scaffold path by calling the helper
-        directly."""
+        directly.
+
+        Uses `faq` (no shipped skills) so the test fully controls the
+        `skills:` block content. Verifies the helper materializes the
+        skill dir with at least skill.yaml.
+        """
         from movate.cli.add_cmd import _maybe_scaffold_declared_skills  # noqa: PLC0415
 
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
+        runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
 
-        # Append a skills field to the agent.yaml (rag-qa doesn't ship
-        # with one — different templates have different schemas).
-        agent_yaml = proj / "agents" / "rag-qa" / "agent.yaml"
-        agent_yaml.write_text(agent_yaml.read_text() + "\nskills:\n  - web-search\n")
+        # Append a skills field. faq ships without one, so this is
+        # the operator's first declaration.
+        agent_yaml = proj / "agents" / "faq" / "agent.yaml"
+        agent_yaml.write_text(agent_yaml.read_text() + "\nskills:\n  - my-new-skill\n")
 
         scaffolded = _maybe_scaffold_declared_skills(
-            agent_dir=proj / "agents" / "rag-qa", project_root=proj
+            agent_dir=proj / "agents" / "faq", project_root=proj
         )
-        assert scaffolded == ["web-search"]
+        assert scaffolded == ["my-new-skill"]
         # The skill dir was created with at least skill.yaml.
-        assert (proj / "skills" / "web-search").is_dir()
-        assert (proj / "skills" / "web-search" / "skill.yaml").is_file()
+        assert (proj / "skills" / "my-new-skill").is_dir()
+        assert (proj / "skills" / "my-new-skill" / "skill.yaml").is_file()
 
     def test_autoscaffold_skips_existing_skills(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

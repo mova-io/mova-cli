@@ -1,0 +1,39 @@
+api_version: movate/v1
+kind: Skill
+
+name: __SKILL_NAME__
+version: 0.1.0
+description: >-
+  Searches the public web via DuckDuckGo's HTML endpoint and returns
+  the top results as a structured list. Use when the agent needs
+  current, retrievable facts that aren't in its training data or
+  provided context.
+
+# Inline-shorthand schema (PR #47). `top_n` is optional with a sensible
+# floor — the LLM frequently omits it on first call.
+schema:
+  input:
+    query: string
+    top_n?: integer
+  output:
+    # Array of {title, url, snippet}. Inline-shorthand syntax: `[type]`
+    # for an array; nested object for each item's shape.
+    results:
+      - title: string
+        url: string
+        snippet: string
+    warning?: string
+
+implementation:
+  kind: python
+  # impl.py:run is async (httpx). The executor awaits whatever you return.
+  entry: __SKILL_NAME__.impl:run
+
+cost:
+  # DuckDuckGo's HTML endpoint has no per-call cost (rate-limited
+  # politeness instead). Bump this when swapping to a paid backend.
+  per_call_usd: 0.0
+
+# `network` because we make an outbound HTTP request. Documentary today;
+# a project's `skills.allowed_side_effects` gate enforces this in CI.
+side_effects: network

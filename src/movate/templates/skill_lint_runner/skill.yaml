@@ -1,0 +1,44 @@
+api_version: movate/v1
+kind: Skill
+
+name: __SKILL_NAME__
+version: 0.1.0
+description: >-
+  Runs `ruff check` against a Python file or directory and returns
+  the findings as a structured list. Use to inform a code review
+  with concrete linter output instead of asking the LLM to imagine
+  what a linter would say.
+
+schema:
+  input:
+    path: string
+    # Optional: limit ruff to specific rule codes (e.g. E501, F401).
+    # Empty/omitted = run the project's default rule set. Array of
+    # strings using inline-shorthand `[type]`.
+    select?:
+      - string
+  output:
+    findings:
+      - file: string
+        line: integer
+        column: integer
+        code: string
+        message: string
+        severity: string
+    ruff_version: string
+    warning?: string
+
+implementation:
+  kind: python
+  entry: __SKILL_NAME__.impl:run
+
+cost:
+  # Local subprocess; no API cost.
+  per_call_usd: 0.0
+
+# `read-only` — ruff doesn't modify any files; it just reads + reports.
+# (We DO exec a subprocess, but the side-effects enum is about DATA
+# mutation, not about process boundaries. A project that wants to
+# block subprocess exec uses its skill-registry policy or a runtime
+# sandbox, not this field.)
+side_effects: read-only

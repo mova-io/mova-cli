@@ -1,0 +1,82 @@
+[
+  {
+    "id": "KB-001",
+    "category": "billing",
+    "title": "Customer charged twice for the same invoice",
+    "symptom": "duplicate charge on credit card statement",
+    "resolution": "Confirm with Stripe dashboard, refund the duplicate via Stripe direct, email customer with reference numbers, route to billing_ops queue if the duplicate predates the 30-day refund window.",
+    "tags": ["billing", "stripe", "duplicate-charge", "refund"]
+  },
+  {
+    "id": "KB-002",
+    "category": "billing",
+    "title": "Failed payment after trial conversion",
+    "symptom": "subscription downgraded to free tier without warning",
+    "resolution": "Customer's trial converted but the saved payment method failed silently. Look up the failed Stripe charge ID, ask customer to update their card, then manually retry the charge from Stripe dashboard. Restore the subscription tier once the charge clears.",
+    "tags": ["billing", "stripe", "trial-conversion", "payment-failure"]
+  },
+  {
+    "id": "KB-003",
+    "category": "account",
+    "title": "SSO setup loops at the IdP login page",
+    "symptom": "user redirected to IdP, signs in, redirected back to login screen",
+    "resolution": "Almost always a SAML clock-skew issue (>5 min drift between our IdP-config NotBefore and the customer's IdP clock). Have ops sync the NTP servers or widen the assertion validity window in the SAML config.",
+    "tags": ["account", "sso", "saml", "clock-skew"]
+  },
+  {
+    "id": "KB-004",
+    "category": "account",
+    "title": "Locked out after password reset email",
+    "symptom": "reset email link expired before user could click",
+    "resolution": "Reset links are valid for 24h. Generate a fresh one from the admin console. If repeating, check the customer's email security gateway (Mimecast/Proofpoint sometimes pre-click links to scan them, burning the token).",
+    "tags": ["account", "password-reset", "email-gateway"]
+  },
+  {
+    "id": "KB-005",
+    "category": "bug",
+    "title": "Export job hangs at 95% for large datasets",
+    "symptom": "CSV export of >100k rows never completes",
+    "resolution": "Known issue with the streaming export's chunk-flush threshold. Workaround: have customer filter to <50k rows or use the paginated API. Fix is on the v2.4 roadmap; bump priority if customer is enterprise-tier.",
+    "tags": ["bug", "export", "performance", "known-issue"]
+  },
+  {
+    "id": "KB-006",
+    "category": "bug",
+    "title": "Webhook receiver returns 200 but events never arrive",
+    "symptom": "customer's webhook endpoint responds 200, events not received downstream",
+    "resolution": "Check the webhook signature. If customer's HMAC secret rotated and they didn't update both sides, our retry queue will silently drop after 5 sig-mismatch failures. Have them rotate, then trigger a webhook replay from the admin panel.",
+    "tags": ["bug", "webhook", "hmac", "retry"]
+  },
+  {
+    "id": "KB-007",
+    "category": "how_to",
+    "title": "Bulk import users from CSV",
+    "symptom": "customer asking how to add 200+ users at once",
+    "resolution": "Point at the bulk import endpoint: /api/v1/users/import with multipart CSV. Include a link to the CSV column reference doc. Beyond 5k users we recommend the async import flow with a callback URL.",
+    "tags": ["how_to", "bulk-import", "docs"]
+  },
+  {
+    "id": "KB-008",
+    "category": "how_to",
+    "title": "Configure email-based 2FA",
+    "symptom": "customer asking how to enforce 2FA org-wide",
+    "resolution": "Settings → Security → Two-factor authentication → toggle 'Required for all members'. Existing members get a 7-day grace period; new invites must enroll on first login.",
+    "tags": ["how_to", "2fa", "security"]
+  },
+  {
+    "id": "KB-009",
+    "category": "feature_request",
+    "title": "Custom domain support",
+    "symptom": "customer asking for branded URLs (cname → our app)",
+    "resolution": "On the roadmap for Q3. No timeline commitment to the customer. Track interest in the feature-request board so we can prioritize correctly when the work lands. Workaround: white-label proxy via their own CDN — works today.",
+    "tags": ["feature_request", "custom-domain", "roadmap"]
+  },
+  {
+    "id": "KB-010",
+    "category": "billing",
+    "title": "Annual contract renewal price increase",
+    "symptom": "customer surprised by renewal quote 20% above last year",
+    "resolution": "Per-seat list price increased Jan 1. Annual customers get the old price as long as their renewal is signed before their term ends. Forward to account_management with the customer ID; AM can grandfather if the renewal closes within the renewal window.",
+    "tags": ["billing", "renewal", "pricing", "account-management"]
+  }
+]
