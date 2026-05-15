@@ -61,6 +61,7 @@ from movate.snapshot.store import (
     create_snapshot,
     delete_snapshot,
     list_snapshots,
+    resolve_snapshot,
     snapshot_path,
 )
 
@@ -79,6 +80,7 @@ __all__ = [
     "diff_snapshots",
     "list_snapshots",
     "load_manifest",
+    "resolve_snapshot",
     "rollback_to",
     "snapshot_path",
 ]
