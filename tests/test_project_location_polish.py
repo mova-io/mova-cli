@@ -54,7 +54,7 @@ class TestAtAlias:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        assert (elsewhere / "support-bot" / "movate.yaml").is_file()
+        assert (elsewhere / "support-bot" / "project.yaml").is_file()
         # cwd was unaffected — no support-bot/ in tmp_path itself.
         assert not (tmp_path / "support-bot").exists()
 
@@ -79,11 +79,12 @@ class TestAtAlias:
         )
         assert r_at.exit_code == 0 and r_t.exit_code == 0
 
-        # Same files exist in each.
-        for fname in ("movate.yaml", ".env.example", ".gitignore"):
+        # Same files exist in each. Canonical filename is project.yaml
+        # (May 2026 MVP rename).
+        for fname in ("project.yaml", ".env.example", ".gitignore"):
             assert (a_dir / "p" / fname).is_file()
             assert (t_dir / "p" / fname).is_file()
-            # Same content (the movate.yaml has a project-name header
+            # Same content (the project.yaml has a project-name header
             # that depends on the name only, which matches both runs).
             assert (a_dir / "p" / fname).read_text() == (t_dir / "p" / fname).read_text()
 

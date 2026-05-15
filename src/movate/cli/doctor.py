@@ -13,6 +13,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -285,14 +286,40 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     except Exception as exc:
         _add("pricing", f"[red]load failed: {exc}[/red]")
 
-    # Project config
-    project_yaml = Path("movate.yaml")
-    _add(
-        "movate.yaml",
-        f"[green]found[/green] [dim]({project_yaml.resolve()})[/dim]"
-        if project_yaml.exists()
-        else _missing("not in cwd; defaults will be used"),
-    )
+    # Project config — recognizes all 3 accepted filenames + reports
+    # which is canonical. Catches the "I migrated to project.yaml but
+    # forgot to delete movate.yaml" footgun.
+    project_yaml = _detect_project_config_row(_add)
+
+    # Project layout directories. The May-2026 MVP scaffold ships
+    # `agents/`, `skills/`, `contexts/`, `kb/`. Their absence isn't
+    # always an error (operator may not need every subdir yet), but
+    # surface them so the operator knows what's there + what isn't.
+    if project_yaml is not None:
+        # We're in a project — check each conventional subdir.
+        project_root = project_yaml.parent
+        for subdir, what_for in (
+            ("agents", "agent definitions"),
+            ("skills", "reusable skill defs (`skill.yaml` + impl.py)"),
+            ("contexts", "reusable Markdown contexts"),
+            ("kb", "knowledge assets (corpora, docs)"),
+        ):
+            sub_path = project_root / subdir
+            if sub_path.is_dir():
+                _add(
+                    f"{subdir}/",
+                    _ok("present") + f" [dim]({what_for})[/dim]",
+                )
+            else:
+                _add(
+                    f"{subdir}/",
+                    _missing("not in project") + f" [dim]({what_for})[/dim]",
+                )
+
+        # Project config parses as ProjectConfig — catches malformed
+        # YAML or schema drift (e.g. an unknown top-level field after
+        # a manual edit gone wrong).
+        _add_project_yaml_parse_check(_add, project_root)
 
     console.print(table)
 
@@ -318,7 +345,7 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # point the operator at the natural next step. Catches new users
     # who run `mdk init --project` followed by `mdk doctor` and don't
     # see anything actionable in the table.
-    if target is None and project_yaml.exists():
+    if target is None and project_yaml is not None and project_yaml.exists():
         _maybe_offer_empty_project_hint(project_yaml.parent.resolve())
 
     # Interactive handoff to `mdk fix`. Closes the diagnose→fix loop
@@ -327,6 +354,94 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # context is a separate concern), and at least one fixable issue.
     if target is None and (counts["missing"] > 0 or counts["error"] > 0):
         _maybe_offer_fix(no_prompt=no_fix_prompt)
+
+
+def _detect_project_config_row(
+    _add: Any,
+) -> Path | None:
+    """Render the project-config row (one of project.yaml /
+    policy.yaml / movate.yaml) + warn on the multi-file footgun.
+
+    Returns the Path to the *first found* config file (used by the
+    caller to walk project-root subdirs). Returns None if no config
+    file is present — operator is outside a project; defaults apply.
+
+    Rich semantics:
+
+    * Exactly one canonical name → `[green]found[/green] (path)`.
+    * Canonical + legacy both present → `[yellow]found[/yellow]` on
+      the canonical with a "also legacy: ..." hint. Operator should
+      delete the legacy file to avoid confusion.
+    * Only a legacy name present → `[yellow]found (legacy)[/yellow]`
+      with the rename suggestion.
+    """
+    from movate.core.config import PROJECT_MARKER_FILES  # noqa: PLC0415
+
+    found = [Path(name) for name in PROJECT_MARKER_FILES if Path(name).exists()]
+    if not found:
+        _add(
+            "project config",
+            _missing("not in cwd; defaults will be used"),
+        )
+        return None
+
+    # First entry of PROJECT_MARKER_FILES is the canonical name.
+    canonical_name = PROJECT_MARKER_FILES[0]
+    primary = found[0]
+    extras = found[1:]
+
+    if primary.name == canonical_name and not extras:
+        _add(
+            primary.name,
+            f"[green]found[/green] [dim]({primary.resolve()})[/dim]",
+        )
+    elif primary.name == canonical_name and extras:
+        extras_str = ", ".join(e.name for e in extras)
+        _add(
+            primary.name,
+            f"[yellow]found[/yellow] [dim]({primary.resolve()}); "
+            f"also legacy: {extras_str} — delete to avoid confusion[/dim]",
+        )
+    else:
+        # Only legacy file(s) present — primary IS a legacy file.
+        _add(
+            primary.name,
+            f"[yellow]found (legacy)[/yellow] [dim]({primary.resolve()}) — "
+            f"rename to `{canonical_name}` (legacy still loads through "
+            f"v1.x with a deprecation warning)[/dim]",
+        )
+    return primary
+
+
+def _add_project_yaml_parse_check(_add: Any, project_root: Path) -> None:
+    """Validate the project's config file parses as ProjectConfig.
+
+    Catches: malformed YAML, unknown fields the schema rejects (after
+    the May-2026 `extra="forbid"` flip on ProjectConfig), bad value
+    types. A green row means `mdk validate` / `mdk eval` / `mdk add`
+    won't trip on the project config at runtime.
+    """
+    from movate.core.config import load_project_config  # noqa: PLC0415
+
+    try:
+        # load_project_config walks for the right file relative to cwd;
+        # we expect cwd == project_root in the doctor flow.
+        cfg = load_project_config()
+        _add(
+            "project config parses",
+            _ok("valid") + f" [dim](agents_dir={cfg.agents_dir}, "
+            f"skills_dir={cfg.skills_dir}, contexts_dir={cfg.contexts_dir})[/dim]",
+        )
+    except Exception as exc:
+        # Truncate so a long pydantic ValidationError doesn't blow up
+        # the table rendering. Operator runs `mdk validate` for the
+        # full error.
+        snippet = str(exc).splitlines()[0][:100]
+        _add(
+            "project config parses",
+            f"[red]invalid[/red] [dim]({snippet}; "
+            f"run [bold]mdk validate[/bold] for the full error)[/dim]",
+        )
 
 
 def _maybe_offer_empty_project_hint(project_root: Path) -> None:
@@ -500,7 +615,22 @@ def _render_explanations() -> None:
         ),
         (
             "Storage & project",
-            ["storage (sqlite)", "pricing", "movate.yaml"],
+            [
+                "storage (sqlite)",
+                "pricing",
+                # Project-config check renders under one of three
+                # filenames; the explanation file registers all three
+                # but only the present one renders.
+                "project.yaml",
+                "policy.yaml",
+                "movate.yaml",
+                # New layout checks (May-2026 MVP).
+                "project config parses",
+                "agents/",
+                "skills/",
+                "contexts/",
+                "kb/",
+            ],
         ),
     ]
 
@@ -747,10 +877,16 @@ def _resolve_agent_dir(name: str, explicit_project_root: Path | None) -> Path | 
         if candidate.is_dir():
             return candidate
 
-    # Walk-up resolution
+    # Walk-up resolution — accepts any of project.yaml / policy.yaml /
+    # movate.yaml via the shared `is_project_root` helper. Without
+    # this, `mdk init` writes `project.yaml` (post-May-2026) and the
+    # old movate.yaml-only walk would silently fail to find the
+    # agent's project root.
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             candidate = current / "agents" / name
             if candidate.is_dir():
                 return candidate.resolve()
@@ -873,32 +1009,66 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
     except Exception as exc:
         _row("pricing", "[red]✗ failed[/red]", str(exc)[:120])
 
-    # Check 4: skills resolve
+    # Check 4: skills resolve — name-by-name so a failure points at
+    # WHICH skill is missing, not just "count mismatch".
     if bundle.spec.skills:
-        if len(bundle.skills) == len(bundle.spec.skills):
+        declared_skills = list(bundle.spec.skills)
+        # Each entry in `bundle.skills` is a SkillBundle whose .spec
+        # has .name; cross-reference with what the agent.yaml declared.
+        resolved_names = [getattr(s.spec, "name", "?") for s in bundle.skills]
+        missing_skills = [n for n in declared_skills if n not in resolved_names]
+        if not missing_skills:
             _row(
                 "skills resolve",
                 "[green]✓ ok[/green]",
-                f"{len(bundle.skills)} skill(s)",
+                f"{len(declared_skills)} declared, all resolved: " + ", ".join(declared_skills),
             )
         else:
             _row(
                 "skills resolve",
                 "[red]✗ failed[/red]",
-                "declared vs resolved skill count mismatch",
+                f"missing skill(s): {', '.join(missing_skills)} "
+                f"(add to <project>/skills/<name>/ or remove from "
+                f"agent.yaml: skills)",
             )
     else:
         _row("skills resolve", "[green]✓ none declared[/green]", "")
 
-    # Check 5: contexts exist
+    # Check 5: contexts resolve — name-by-name + flag whether each
+    # came from agent-local (overrides project-level on collision)
+    # or shared project-level. Helps operators verify the override
+    # they intended actually fired.
     if bundle.spec.contexts:
-        _row(
-            "contexts",
-            "[green]✓ ok[/green]",
-            f"{len(bundle.contexts)} context block(s)",
-        )
+        declared_contexts = list(bundle.spec.contexts)
+        resolved_names = [name for name, _body in bundle.contexts]
+        missing_contexts = [n for n in declared_contexts if n not in resolved_names]
+        if not missing_contexts:
+            # Classify each resolved context by where it came from.
+            # Use `ctx_name` (not `name`) to avoid shadowing the
+            # outer-scope `name` arg (agent name) that the summary
+            # line + table title both consume.
+            agent_local_dir = agent_dir / "contexts"
+            tier_labels = []
+            for ctx_name in declared_contexts:
+                if (agent_local_dir / f"{ctx_name}.md").is_file():
+                    tier_labels.append(f"{ctx_name} (agent-local)")
+                else:
+                    tier_labels.append(f"{ctx_name} (shared)")
+            _row(
+                "contexts resolve",
+                "[green]✓ ok[/green]",
+                f"{len(declared_contexts)} resolved: " + ", ".join(tier_labels),
+            )
+        else:
+            _row(
+                "contexts resolve",
+                "[red]✗ failed[/red]",
+                f"missing context(s): {', '.join(missing_contexts)} "
+                f"(add to <project>/contexts/<name>.md or "
+                f"agents/<this-agent>/contexts/<name>.md)",
+            )
     else:
-        _row("contexts", "[green]✓ none declared[/green]", "")
+        _row("contexts resolve", "[green]✓ none declared[/green]", "")
 
     # Check 6: dataset rows
     if dataset_path.is_file():

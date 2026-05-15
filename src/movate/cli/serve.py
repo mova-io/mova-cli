@@ -15,7 +15,6 @@ process.
 from __future__ import annotations
 
 import asyncio
-import importlib
 from pathlib import Path
 
 import typer
@@ -28,85 +27,6 @@ from movate.runtime.registry import scan_agents
 from movate.storage import build_storage
 
 err = Console(stderr=True)
-
-
-# Optional deps `mdk serve` needs at startup that aren't part of the
-# core install. Each entry is (import_names, pip_name, why):
-#
-# * ``import_names`` is a tuple of module names we'll try in order —
-#   the dep is considered present if ANY of them imports. Tuple-form
-#   handles deps that renamed their canonical import (e.g.
-#   ``python-multipart`` ≥0.0.12 exports ``python_multipart``, older
-#   versions export ``multipart``).
-# * ``pip_name`` is what we tell the operator to install if missing.
-# * ``why`` is a short reason that goes in the error message.
-#
-# Keep the list tight; only add entries for deps that fail loudly +
-# late inside uvicorn / FastAPI when actually missing.
-_SERVE_REQUIRED_OPTIONAL_DEPS: tuple[tuple[tuple[str, ...], str, str], ...] = (
-    (
-        ("python_multipart", "multipart"),
-        "python-multipart",
-        "POST /api/v1/agents bundle upload",
-    ),
-)
-
-
-def _preflight_optional_deps() -> None:
-    """Fail fast with a copy-paste install hint when ``mdk serve`` is
-    missing an optional dep it would otherwise crash on deep inside
-    FastAPI's route registration.
-
-    FastAPI doesn't pull ``python-multipart`` in transitively — it's
-    only required when a route uses ``UploadFile`` / ``Form()``. We
-    use ``UploadFile`` on POST /api/v1/agents (item 76). Without
-    multipart, ``build_app()`` raises a ``RuntimeError`` mid-route-
-    registration with a stack trace 20 frames deep. This preflight
-    catches the same condition AT startup with a clean message that
-    points operators at the right install command.
-
-    Same pattern applies to any future serve-only dep — add to
-    :data:`_SERVE_REQUIRED_OPTIONAL_DEPS` and it gets caught.
-    """
-    missing: list[tuple[str, str]] = []  # (pip_name, why)
-    for import_names, pip_name, why in _SERVE_REQUIRED_OPTIONAL_DEPS:
-        if not any(_try_import(name) for name in import_names):
-            missing.append((pip_name, why))
-
-    if not missing:
-        return
-
-    err.print(
-        "[red]✗ mdk serve: missing optional dependencies[/red]\n"
-        "[dim]These come with the [bold]runtime[/bold] extra and are "
-        "required for the FastAPI surface:[/dim]"
-    )
-    for pip_name, why in missing:
-        err.print(f"  [red]•[/red] [bold]{pip_name}[/bold]   [dim]({why})[/dim]")
-    err.print(
-        "\n[bold]Fix:[/bold]\n"
-        "  [dim]$[/dim] [bold]uv tool install --force movate-cli[runtime][/bold]"
-        "   [dim]# if installed as a uv tool[/dim]\n"
-        "  [dim]$[/dim] [bold]pip install 'movate-cli[runtime]'[/bold]"
-        "   [dim]# if installed via pip[/dim]\n"
-        "\n[dim]Or install just the missing deps directly:[/dim]\n"
-        f"  [dim]$[/dim] [bold]pip install {' '.join(p for p, _ in missing)}[/bold]"
-    )
-    raise typer.Exit(code=2)
-
-
-def _try_import(name: str) -> bool:
-    """True if ``name`` imports cleanly; False on ImportError.
-
-    Wraps ``importlib.import_module`` so the preflight stays a flat
-    list of tries — readable + easy to test against multiple module
-    aliases for the same dep (e.g. python_multipart vs multipart).
-    """
-    try:
-        importlib.import_module(name)
-    except ImportError:
-        return False
-    return True
 
 
 def serve(
@@ -164,12 +84,6 @@ def serve(
       [dim]# Disable rate limiting (single-tenant dev)[/dim]
       $ movate serve --rate-limit-per-minute 0
     """
-    # Catch missing optional deps (python-multipart etc.) BEFORE
-    # uvicorn boots — operators who installed the CLI without the
-    # `[runtime]` extra get a clean error pointing at the right
-    # install command instead of a 20-frame FastAPI traceback.
-    _preflight_optional_deps()
-
     asyncio.run(
         _run_serve(
             host=host,

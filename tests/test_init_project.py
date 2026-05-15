@@ -35,7 +35,12 @@ def test_init_project_creates_full_layout(tmp_path: Path) -> None:
 
     proj = tmp_path / "my-proj"
     assert proj.is_dir()
-    assert (proj / "movate.yaml").is_file()
+    # Canonical filename (post-MVP rename, May 2026): project.yaml.
+    assert (proj / "project.yaml").is_file()
+    # Legacy names NOT written by `mdk init` going forward (they're
+    # still accepted on load for back-compat).
+    assert not (proj / "movate.yaml").exists()
+    assert not (proj / "policy.yaml").exists()
     assert (proj / ".env.example").is_file()
     assert (proj / ".gitignore").is_file()
     assert (proj / "agents").is_dir()
@@ -44,23 +49,24 @@ def test_init_project_creates_full_layout(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_init_project_movate_yaml_is_valid_project_config(tmp_path: Path) -> None:
-    """The bootstrapped movate.yaml MUST validate as ProjectConfig.
+def test_init_project_yaml_is_valid_project_config(tmp_path: Path) -> None:
+    """The bootstrapped project.yaml MUST validate as ProjectConfig.
 
-    Previously the template carried v1-spec metadata (api_version /
+    Originally the template carried v1-spec metadata (api_version /
     kind / name / description / version) plus a stray
     ``defaults.model.provider`` field. ProjectConfig is ``extra=forbid``,
     so every freshly-bootstrapped project blew up on the first
-    ``mdk validate``. New template keeps the project name in a YAML
-    comment header instead (docs/runbook falls back to ``root.name``).
+    ``mdk validate``. The May-2026 MVP rename canonized the filename
+    to `project.yaml`; the content remains strict-ProjectConfig and
+    keeps the project name in a YAML comment header (docs/runbook
+    falls back to ``root.name``).
     """
     from movate.core.config import ProjectConfig  # noqa: PLC0415
 
     runner.invoke(app, ["init", "my-proj", "--project", "--target", str(tmp_path)])
-    raw = (tmp_path / "my-proj" / "movate.yaml").read_text()
-    # Project name is preserved in the comment header — operators can
-    # still grep for it by name. Comment header is multi-line (banner +
-    # name on a subsequent line) so search anywhere in the file.
+    raw = (tmp_path / "my-proj" / "project.yaml").read_text()
+    # Project name appears anywhere in the file (banner header is
+    # multi-line, so we don't pin to line 1).
     assert "my-proj" in raw
     # Body parses + validates cleanly.
     data = yaml.safe_load(raw)
@@ -118,11 +124,10 @@ def test_init_project_in_place_uses_cwd_name(
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "--project"])
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert (tmp_path / "movate.yaml").is_file()
-    raw = (tmp_path / "movate.yaml").read_text()
-    # The project name appears in the comment header, derived from cwd.
-    # The banner spans multiple lines so search the whole file body
-    # rather than just line 1.
+    assert (tmp_path / "project.yaml").is_file()
+    raw = (tmp_path / "project.yaml").read_text()
+    # The project name appears in the canonical comment header (the
+    # banner spans multiple lines, so search anywhere in the file).
     assert tmp_path.name in raw
 
 
@@ -143,14 +148,16 @@ def test_init_project_in_place_refuses_existing_movate_yaml(
 def test_init_project_force_overwrites_existing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Operator's existing legacy `movate.yaml` simulates a pre-MVP
+    # project. `--force` should overwrite by writing the NEW canonical
+    # `project.yaml`; the old legacy file is left untouched by the
+    # writer (operator can delete it manually after migration).
     (tmp_path / "movate.yaml").write_text("existing: true\n")
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "--project", "--force"])
     assert result.exit_code == 0
-    # File replaced — the old "existing: true" line is gone and the
-    # fresh template's canonical agents_dir field is in place.
-    text = (tmp_path / "movate.yaml").read_text()
-    assert "existing: true" not in text
+    # New canonical filename is written.
+    text = (tmp_path / "project.yaml").read_text()
     assert "agents_dir: ./agents" in text
 
 
@@ -183,7 +190,8 @@ def test_init_project_named_force_wipes_and_recreates(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert not (tmp_path / "my-proj" / "old.txt").exists()
-    assert (tmp_path / "my-proj" / "movate.yaml").is_file()
+    # Canonical post-MVP filename.
+    assert (tmp_path / "my-proj" / "project.yaml").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +209,12 @@ def test_agent_mode_still_works(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_no_name_no_project_flag_exits_2(tmp_path: Path) -> None:
-    """Bare `mdk init` (no name, no --project) is a usage error."""
+    """Bare `mdk init` (no name, no --project, no -t) is a usage
+    error. Error message surfaces the three common-uses paths."""
     result = runner.invoke(app, ["init", "--target", str(tmp_path)])
     assert result.exit_code == 2
-    combined = result.stdout + result.stderr
-    assert "agent name required" in combined.lower() or "--project" in combined
+    combined = (result.stdout + result.stderr).lower()
+    # Post-default-change wording: "name required" + at least one of
+    # the common-uses lines pointing operators forward.
+    assert "name required" in combined
+    assert "mdk init" in combined  # at least one example shown

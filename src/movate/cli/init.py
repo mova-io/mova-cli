@@ -67,80 +67,108 @@ _PROJECT_MOVATE_YAML = """\
 # {name} — movate project config
 # =============================================================================
 #
-# This file is loaded by every `mdk` command via `load_project_config`.
-# Filename note: this is the LEGACY slot — `policy.yaml` is the
-# canonical v1.x name. Both load identically; `mdk` will continue to
-# accept `movate.yaml` through the v1.x line.
+# Read this file top to bottom — it's the canonical reference for what
+# you can configure at the project level. Every block below is
+# documented in-place. Active blocks are uncommented; the rest ship
+# commented-out so you can enable a feature by deleting `#` rather
+# than copy-pasting from external docs.
 #
-# Layering: per-agent `agent.yaml` ALWAYS wins on conflict. Entries
-# here only fill gaps the agent didn't specify. The layering applies
-# per-field, not per-block — setting `defaults.model.params.temperature: 0.0`
-# below only kicks in for agents whose own `model.params` omits
-# temperature.
+# Filename history (all three still load — picked in this order):
+#   1. `project.yaml` — canonical (May 2026+)
+#   2. `policy.yaml`  — legacy v1.x; loads with a deprecation warning
+#   3. `movate.yaml`  — original v0.x; loads with a deprecation warning
 #
-# Run `mdk doctor` to see the layered config a given agent resolves
-# to, and `mdk inspect agent <name>` to dump the merged bundle.
-# Workspace-wide validation: `mdk validate` (sweeps every agent +
-# workflow); per-agent: `mdk validate <name>`.
+# Layering: per-agent `agent.yaml` ALWAYS wins per-key; entries here
+# only fill the gaps an agent didn't specify. Same for contexts: an
+# `agents/<name>/contexts/<file>.md` overrides
+# `contexts/<file>.md` when names collide.
+#
+# Run `mdk doctor` to see the merged config any specific agent
+# resolves to. Run `mdk validate` to gate-check this file + every
+# agent against the active policy.
+#
 # =============================================================================
 
 
-# ---- Project layout ---------------------------------------------------------
-# Where `mdk add` drops new agents and `mdk init -t <template> <name>`
-# scaffolds. Change these if you want a flatter layout (e.g. no
-# `agents/` prefix) — relative paths resolved from the project root.
+# -----------------------------------------------------------------------------
+# Project layout — where mdk looks for things
+# -----------------------------------------------------------------------------
+# Relative paths resolved from this file's location. Change these if
+# you want a non-default folder name (rare).
 
 agents_dir: ./agents
 workflows_dir: ./workflows
-skills_dir: ./skills          # reusable skill defs (`skill.yaml` + impl.py)
-contexts_dir: ./contexts      # reusable Markdown contexts (prepended to prompts)
+skills_dir: ./skills
+contexts_dir: ./contexts
+# kb/ has no project-config field — it's resolved by convention via
+# `movate.core.kb_loader.resolve_kb_file(name)`. Drop data at
+# `./kb/<filename>` and skills like `kb-lookup` find it automatically.
 
 
-# ---- Defaults applied to every agent ----------------------------------------
-# Layered semantics: per-key for `model.params`, per-field for
-# `timeouts` and `budget`. The agent.yaml fields ALWAYS win.
+# -----------------------------------------------------------------------------
+# Defaults applied to every agent
+# -----------------------------------------------------------------------------
+# Three layered groups:
+#   * model.params — LiteLLM-style per-call params (temperature, etc.)
+#   * timeouts     — per-call + total-run caps
+#   * budget       — soft cost cap per run (hard cap lives in `policy:`)
+#
+# Per-agent `agent.yaml` always wins per-field. Headline use: pin
+# temperature once here so every agent runs deterministically without
+# repeating the same line in each agent.yaml.
 
 defaults:
   model:
     params:
-      # Project-wide model param defaults. Pinning temperature once
-      # here means every agent that doesn't override it gets the
-      # consistent 0.0 setting — the most common "fix" engineers
-      # discover after their first eval run reveals nondeterminism.
       temperature: 0.0
       max_tokens: 512
+  # Uncomment to set workspace-wide timeouts (agent.yaml fields win
+  # per-field; comment out + omit to use the executor's defaults):
   # timeouts:
-  #   call_ms: 15000      # per-LLM-call cap (agent.yaml field wins per-field)
+  #   call_ms: 15000      # per-LLM-call cap
   #   total_ms: 60000     # whole-agent-run cap
+  #
+  # Uncomment to set workspace-wide budget defaults:
   # budget:
-  #   max_cost_usd_per_run: 0.05   # soft default; `policy` below is the hard cap
+  #   max_cost_usd_per_run: 0.05   # SOFT default; policy.max_cost is HARD
 
 
-# ---- Policy gates (commented out by default — uncomment to enforce) ---------
-# Project-wide HARD gates checked by `mdk validate` BEFORE any LLM
-# call. A policy violation exits 2 — operators can't accidentally
-# ship an agent that exceeds the org's cost ceiling or talks to an
-# un-vetted provider. See `mdk doctor` for the full enforcement order.
+# -----------------------------------------------------------------------------
+# Policy gates — uncomment any block to enforce workspace-wide
+# -----------------------------------------------------------------------------
+# Hard gates checked by `mdk validate` BEFORE any LLM call. A policy
+# violation exits 2 — operators can't accidentally ship an agent that
+# breaks the org's rules. Empty / commented = permissive.
 
 # policy:
-#   allowed_providers:       # whitelist; agents using anything else fail validate
+#   # Whitelist of provider prefixes (before the `/` in a LiteLLM model
+#   # string). Agents using anything else fail validate.
+#   allowed_providers:
 #     - openai
 #     - anthropic
 #     - azure
-#   denied_providers:        # blacklist; takes precedence over the whitelist
+#
+#   # Blacklist — overrides allowed_providers. Use for specific
+#   # models you've banned (e.g. an old model with a known bug).
+#   denied_providers:
 #     - cohere
-#   max_cost_usd_per_run: 0.50   # HARD cap; distinct from defaults.budget above
-#   fallback_chain:          # default fallback when an agent's primary fails
+#
+#   # HARD ceiling on per-run cost. Agents can't override above this.
+#   max_cost_usd_per_run: 0.50
+#
+#   # Default fallback when an agent's primary model fails. Each
+#   # entry is a LiteLLM-style provider string. Agents can declare
+#   # their own `model.fallback` to override per-agent.
+#   fallback_chain:
 #     - openai/gpt-4o-mini-2024-07-18
 #     - anthropic/claude-haiku-4-5-20251001
 
 
-# ---- Runtime gate (commented out — opt-in) ----------------------------------
-# Gates which AgentRuntime values are allowed in this workspace.
-# Default is permissive (any installed runtime). Pin to `[litellm]`
-# to enforce "LiteLLM only" — useful when native-SDK adapters
-# aren't installed in production and you want validate to catch
-# `runtime: native_anthropic` agents at gate time, not runtime.
+# -----------------------------------------------------------------------------
+# Runtime gate — which AgentRuntime values are allowed
+# -----------------------------------------------------------------------------
+# Default permissive (any installed runtime). Pin to a subset to
+# enforce architectural direction. Uncomment to enable:
 
 # runtime:
 #   allowed:
@@ -151,32 +179,45 @@ defaults:
 #     # - lyzr
 
 
-# ---- Skill side-effect gate (commented out — opt-in) ------------------------
-# Restricts which skill `side_effects` categories agents in this
-# workspace can use. Permissive by default. Pinning to
-# `[read-only]` is the "agents can lookup but not WRITE" mode —
-# audit-friendly for regulated environments.
+# -----------------------------------------------------------------------------
+# Skill side-effect gate — which categories of skills are allowed
+# -----------------------------------------------------------------------------
+# Restricts agents to skills whose `side_effects:` field is in the
+# allowed list. The four categories:
+#   * read-only       — opens files / reads remote APIs, no writes
+#   * network         — outbound HTTP requests
+#   * filesystem      — writes to the local disk
+#   * mutates-state   — kills processes, deletes data, etc.
 
 # skills:
 #   allowed_side_effects:
 #     - read-only
-#     # - external-write     # POSTs / PUTs / DELETEs to third-party APIs
-#     # - filesystem-write   # writes to the local disk
-#     # - shell              # runs subprocesses
+#     # - network
+#     # - filesystem
+#     # - mutates-state
 
 
-# ---- Eval + benchmark defaults (commented out — opt-in) ---------------------
-# Defaults applied by `mdk eval` and `mdk bench` when the agent or
-# command-line doesn't override them. Headline use: pin the eval
-# gate once here so CI uses the same threshold every team uses
-# locally.
+# -----------------------------------------------------------------------------
+# Eval defaults — used by `mdk eval` + `mdk ci eval`
+# -----------------------------------------------------------------------------
+# Pin the gate threshold + runs-per-case + judge model once here so
+# CI uses the same values every team member uses locally. Per-call
+# CLI flags override.
 
 # eval:
-#   gate: 0.7                # `mdk eval --gate <N>` default
-#   runs: 3                  # # of runs per case for LLM-judge stability
-#   judge: openai/gpt-4o-mini-2024-07-18
+#   gate: 0.7                                  # `mdk eval --gate <N>` default
+#   runs: 3                                    # # of runs per case for stability
+#   judge: openai/gpt-4o-mini-2024-07-18       # cross-family preferred
+
+
+# -----------------------------------------------------------------------------
+# Bench defaults — used by `mdk bench`
+# -----------------------------------------------------------------------------
+# Default provider matrix for multi-model comparison runs. Agents
+# can override per-call.
+
 # bench:
-#   providers:               # `mdk bench` default model matrix
+#   providers:
 #     - openai/gpt-4o-mini-2024-07-18
 #     - anthropic/claude-haiku-4-5-20251001
 #     - azure/gpt-4.1
@@ -199,22 +240,18 @@ defaults:
 #
 # Snapshots are the central operational primitive:
 #
-#   * `mdk diff <a> <b>`   — what changed between two snapshots?
-#   * `mdk rollback <hash>` — restore project state to a prior snapshot
-#   * `mdk audit`          — scans snapshots for drift / dangling refs
-#   * `mdk promote`        — copy a tested snapshot from dev → staging
+#   * `mdk snapshot create`     — capture current state
+#   * `mdk diff <a> <b>`        — what changed between two snapshots?
+#   * `mdk rollback <hash>`     — restore project state to a prior snapshot
+#   * `mdk audit`               — scan snapshots for drift / dangling refs
+#   * `mdk promote --from <h>`  — copy a tested snapshot dev → staging
 #
 # Snapshots are content-addressed (the directory name IS the SHA-256
 # of the manifest), so re-snapshotting identical state produces the
-# same hash. They're small + git-friendly by default; the
-# `.gitignore` shipped with this project tracks them so your repo
-# carries a verifiable history of "what shipped when". Drop
-# `.movate/snapshots/` from `.gitignore` if you'd rather treat them
-# as machine-local.
-#
-# `mdk init --project` auto-creates the initial snapshot so you have
-# a baseline for `mdk diff` / `mdk rollback` from day one. Pass
-# `--skip-snapshot` to skip (useful in tests / CI hermetic runs).
+# same hash. They're small + git-friendly by default; `.gitignore`
+# tracks them so your repo carries a verifiable history of "what
+# shipped when". Drop `.movate/snapshots/` from `.gitignore` if you'd
+# rather treat them as machine-local.
 """
 
 _PROJECT_ENV_EXAMPLE = """\
@@ -229,67 +266,43 @@ OPENAI_API_KEY=
 # LANGFUSE_SECRET_KEY=
 """
 
-_MOVATE_STATE_README = """\
-# `.movate/` — movate runtime state
+_KB_README = """\
+# `kb/` — Knowledge Assets
 
-This directory holds everything `mdk` writes between invocations.
-Created automatically by `mdk init --project` and grown by every
-subsequent CLI run. The layout:
+This directory holds reusable knowledge artifacts used by agents +
+skills. Pre-populated by `mdk init --project` as a placeholder; the
+conventions below are what `mdk` expects but you can layer your own.
 
-| Path | Purpose |
+## What goes here
+
+| File shape | Used by |
 |---|---|
-| `local.db` | SQLite store for runs + failures (gitignored by default) |
-| `snapshots/` | Content-addressed snapshots of project state |
-| `baselines/` | Stored eval scores for `mdk eval --baseline` drift checks |
+| `*.json` | `kb-lookup` skill + custom Python skills (structured corpora) |
+| `*.md` / `*.txt` | RAG-style skills (long-form documents) |
+| `*.pdf` / `*.docx` | Future Tier 3 RAG with chunker + embedder |
+| `embeddings/*.parquet` | Future vector-store skills (pre-computed embeddings) |
 
-## Snapshots — the central operational primitive
+## Conventions
 
-Every snapshot lives at `snapshots/<short-hash>/`. The directory
-name IS the SHA-256 of the manifest, so re-snapshotting identical
-state produces the same hash — two operators on the same repo can
-verify they're looking at the same agent revision without exchanging
-trust.
+- **Filenames are stable.** Skills reference KB files by relative
+  path (`kb/<filename>`); rename = breakage.
+- **One source of truth per topic.** Don't fork `support-tickets.json`
+  into `support-tickets-v2.json`; use git or `mdk snapshot` for
+  versioning instead.
+- **kb/ is committed by default** (the `.gitignore` shipped with
+  the project tracks it). Uncomment the `.gitignore` entry to treat
+  it as machine-local — useful when corpora contain PII you can't
+  put in git.
 
-Each snapshot directory contains:
+## Built-in skill that uses kb/
 
-- `manifest.json` — what's in this snapshot, when it was taken, who
-  took it, the hashes of every captured file
-- `<files>` — the captured agent.yaml, prompt.md, schemas, dataset
-  files exactly as they were at snapshot time
-
-Snapshots are **immutable** — once written, neither the manifest
-nor the files are modified. Re-running `mdk snapshot` on
-unchanged state hits the same hash and no-ops.
-
-## Commands that operate on snapshots
-
-| Command | What it does |
-|---|---|
-| `mdk snapshot create` | Capture current state into a new snapshot |
-| `mdk snapshot list` | Show all snapshots, newest first |
-| `mdk diff <a> <b>` | What changed between two snapshots? |
-| `mdk rollback <hash>` | Restore project state to a prior snapshot |
-| `mdk audit` | Scan snapshots for drift / dangling refs |
-| `mdk promote --from <hash>` | Copy a tested snapshot dev → staging |
-
-## Git policy
-
-Snapshots are small + content-addressed + JSON-readable, so they're
-**git-friendly by default**. The shipped `.gitignore` tracks
-`snapshots/` so your repo carries a verifiable history of "what
-shipped when". `local.db` is gitignored (runtime state, not source).
-
-If you'd rather treat snapshots as machine-local (e.g. you don't
-want every team member's experimentation tracked), uncomment the
-`# .movate/snapshots/` line in `.gitignore`.
-
-## Did `mdk init --project` create this directory?
-
-Yes — `mdk init --project <name>` auto-creates the initial snapshot
-so you have a baseline for `mdk diff` / `mdk rollback` from day
-one. Pass `--skip-snapshot` to opt out (useful for hermetic
-test bootstrap).
+`kb-lookup` (auto-scaffolded when an agent declares
+`skills: [kb-lookup]`) ships with a small mock `corpus.json` for
+demo purposes. To use your real KB, replace that file with your
+own JSON in the same shape, or update `impl.py` to point at a
+real search service.
 """
+
 
 _PROJECT_GITIGNORE = """\
 # movate runtime state — never commit
@@ -340,44 +353,6 @@ def _has_any_provider_key() -> bool:
     return any(os.environ.get(k, "").strip() for k in _PROVIDER_KEY_ENV_VARS)
 
 
-def _apply_default_project_dir(target: Path) -> Path:
-    """Substitute the configured default project dir for the default
-    ``Path(".")`` ``target`` if the operator didn't pass ``--at`` /
-    ``--target``.
-
-    Resolution order (highest precedence wins):
-
-    1. Explicit ``--at`` / ``--target`` on the invocation — ``target``
-       is not ``Path(".")``, so this helper returns it unchanged.
-    2. ``default_project_dir`` from ``~/.movate/config.yaml`` (if set).
-    3. cwd (the historical default) — returned by this helper as
-       ``Path(".")`` so downstream logic resolves it via
-       ``target.resolve()``.
-
-    A stderr ``→ using configured ...`` note fires when the configured
-    path is substituted, so operators understand why their project
-    landed at an unexpected location. Quiet by default when the
-    config dir isn't set — no change in shell output for the common
-    cwd-relative case.
-    """
-    if target != Path("."):
-        return target
-    from movate.core.user_config import (  # noqa: PLC0415
-        resolve_default_project_dir,
-    )
-
-    configured = resolve_default_project_dir()
-    if configured is None:
-        return target
-    err_console.print(
-        f"[dim]→ using configured default project dir: "
-        f"[bold]{configured}[/bold] "
-        f"(set via [bold]mdk config set-project-dir[/bold]; "
-        f"override per-call with [bold]--at[/bold])[/dim]"
-    )
-    return configured
-
-
 def _cd_target(project_root: Path) -> str:
     """Pick the right ``cd`` argument for the success Panel's next-steps
     block.
@@ -410,9 +385,11 @@ def _is_in_project() -> bool:
     convention :mod:`movate.cli.add_cmd` uses. Lets ``mdk init``
     surface a context-aware hint when called outside a project.
     """
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             return True
         if current.parent == current:
             return False
@@ -468,45 +445,59 @@ def _init_project(
     else:
         project_root = target.resolve()
         project_name = project_root.name
-        # In-place bootstrap: refuse if there's already a movate.yaml,
-        # unless --force is set. Avoids clobbering a real project.
-        if (project_root / "movate.yaml").is_file() and not force:
+        # In-place bootstrap: refuse if there's already a project
+        # marker file (project.yaml / policy.yaml / movate.yaml) unless
+        # --force is set. Avoids clobbering an existing project.
+        from movate.core.config import (  # noqa: PLC0415
+            PROJECT_MARKER_FILES,
+            is_project_root,
+        )
+
+        if is_project_root(project_root) and not force:
+            existing = next(
+                (f for f in PROJECT_MARKER_FILES if (project_root / f).is_file()),
+                "project.yaml",
+            )
             err_console.print(
-                f"[red]✗[/red] {project_root}/movate.yaml already exists "
+                f"[red]✗[/red] {project_root}/{existing} already exists "
                 "(use [bold]--force[/bold] to overwrite the project config)"
             )
             raise typer.Exit(code=2)
         project_root.mkdir(parents=True, exist_ok=True)
 
-    # Project-level config files.
-    (project_root / "movate.yaml").write_text(_PROJECT_MOVATE_YAML.format(name=project_name))
+    # Project-level config files. Canonical name is `project.yaml`
+    # (the May 2026 MVP rename). Loader still accepts `policy.yaml`
+    # and `movate.yaml` for back-compat.
+    (project_root / "project.yaml").write_text(_PROJECT_MOVATE_YAML.format(name=project_name))
     (project_root / ".env.example").write_text(_PROJECT_ENV_EXAMPLE)
     (project_root / ".gitignore").write_text(_PROJECT_GITIGNORE)
 
-    # Three empty top-level dirs with .gitkeep placeholders so they
+    # Four empty top-level dirs with .gitkeep placeholders so they
     # survive `git add`:
     #
     # * ``agents/``    — agent definitions (`mdk add` + `mdk init <name>`)
     # * ``skills/``    — reusable skill definitions (`skill.yaml` + impl)
-    # * ``contexts/``  — reusable Markdown contexts (prepended to prompts)
+    # * ``contexts/``  — reusable Markdown contexts (prepended to prompts).
+    #                   Agent-LOCAL contexts at `agents/<name>/contexts/`
+    #                   override these on name collision.
+    # * ``kb/``        — knowledge assets for RAG / skills: PDFs, JSON
+    #                   corpora, embeddings (later). The `kb-lookup`
+    #                   skill's corpus lives here; `web-search`-style
+    #                   skills can write cached documents here too.
     #
-    # Operators don't HAVE to use skills/ + contexts/, but pre-creating
-    # them surfaces the capabilities (vs. operators discovering them
-    # through doc-reading) AND lets agent.yaml's declared `skills:` /
+    # Operators don't HAVE to use any of these, but pre-creating them
+    # surfaces the capabilities (vs. operators discovering them through
+    # doc-reading) AND lets agent.yaml's declared `skills:` /
     # `contexts:` references resolve cleanly from day one.
-    for subdir in ("agents", "skills", "contexts"):
+    for subdir in ("agents", "skills", "contexts", "kb"):
         sub = project_root / subdir
         sub.mkdir(exist_ok=True)
         (sub / ".gitkeep").write_text("")
 
-    # .movate/ runtime state directory + README. The README explains
-    # what `.movate/snapshots/` is for — operators looking inside the
-    # dir get the same context they'd find in `mdk init`'s success
-    # Panel. Created BEFORE the snapshot so the README is part of the
-    # initial captured state.
-    state_dir = project_root / ".movate"
-    state_dir.mkdir(exist_ok=True)
-    (state_dir / "README.md").write_text(_MOVATE_STATE_README)
+    # `kb/` ships a tiny README explaining the convention so operators
+    # who open the dir see "what goes here?" answered in-place rather
+    # than having to grep the docs.
+    (project_root / "kb" / "README.md").write_text(_KB_README)
 
     # Initial snapshot — operators get a baseline for diff / rollback.
     snapshot_short: str | None = None
@@ -535,12 +526,13 @@ def _init_project(
     body = (
         f"[bold]Project:[/bold]   [cyan]{project_name}[/cyan]\n"
         f"[bold]Path:[/bold]      [cyan]{project_root}[/cyan]\n\n"
-        f"  • [cyan]movate.yaml[/cyan]    project config\n"
+        f"  • [cyan]project.yaml[/cyan]   project config\n"
         f"  • [cyan].env.example[/cyan]   env-var template\n"
         f"  • [cyan].gitignore[/cyan]     standard ignores\n"
         f"  • [cyan]agents/[/cyan]        empty (waiting for agents)\n"
         f"  • [cyan]skills/[/cyan]        empty (reusable skill defs)\n"
         f"  • [cyan]contexts/[/cyan]      empty (reusable Markdown contexts)\n"
+        f"  • [cyan]kb/[/cyan]            empty (knowledge assets for RAG / skills)\n"
     )
     if snapshot_short:
         body += f"  • [cyan]snapshot[/cyan]       [dim]{snapshot_short}[/dim] (initial baseline)\n"
@@ -558,10 +550,7 @@ def _init_project(
     cd_to = _cd_target(project_root)
     if with_agents:
         # Agents already added by the caller. Show forward-looking
-        # commands: doctor agent / run / eval / serve. `mdk serve`
-        # surfaces the HTTP runtime here so operators discover the
-        # "host the agents as a service" path without having to dig
-        # through `mdk --help`.
+        # commands: doctor agent / run / eval / deploy.
         agent_list = [t.strip() for t in with_agents.split(",") if t.strip()]
         first_agent = agent_list[0] if agent_list else "<agent>"
         body += (
@@ -573,9 +562,7 @@ def _init_project(
             f"  [dim]$[/dim] [bold]mdk run {first_agent} '{{...}}'[/bold]"
             f"   [dim]# try one live[/dim]\n"
             f"  [dim]$[/dim] [bold]mdk eval {first_agent} --gate 0.7[/bold]"
-            f"   [dim]# gate on the seed dataset[/dim]\n"
-            f"  [dim]$[/dim] [bold]mdk serve[/bold]"
-            f"   [dim]# host the agents over HTTP (POST /run, GET /agents)[/dim]"
+            f"   [dim]# gate on the seed dataset[/dim]"
         )
     else:
         # No agents yet. Suggest `add --list` + drop the
@@ -744,8 +731,6 @@ def _render_combined_init_summary(
             "   [dim]# try one live[/dim]",
             "  [dim]$[/dim] [bold]mdk ci eval --mock[/bold]"
             "   [dim]# gate every agent against its baseline[/dim]",
-            "  [dim]$[/dim] [bold]mdk serve[/bold]"
-            "   [dim]# host the agents over HTTP (POST /run, GET /agents)[/dim]",
         ]
     )
 
@@ -1313,11 +1298,17 @@ def init(
             "[bold].gitignore[/bold] + empty [bold]agents/[/bold] + an initial snapshot."
         ),
     ),
-    template: str = typer.Option(
-        "default",
+    template: str | None = typer.Option(
+        None,
         "--template",
         "-t",
-        help=f"Template to scaffold from. One of: {', '.join(list_templates())}.",
+        help=(
+            f"Template to scaffold from. One of: {', '.join(list_templates())}. "
+            "When set (explicitly), runs in AGENT mode and produces "
+            "an agent scaffold rather than a project. Without "
+            "[bold]-t[/bold] (and without [bold]--llm[/bold]), "
+            "[bold]mdk init <name>[/bold] defaults to PROJECT mode."
+        ),
     ),
     target: Path = typer.Option(
         Path("."),
@@ -1430,12 +1421,36 @@ def init(
         )
         raise typer.Exit(code=2)
 
-    if project:
-        # Apply ~/.movate/config.yaml's default_project_dir when no
-        # explicit --at / --target was passed. Helper isolated so this
-        # function stays under the PLR0912 branch limit and the
-        # resolution rules live in one place.
-        target = _apply_default_project_dir(target)
+    # Default dispatch (May 2026): bare `mdk init <name>` (no `-t`, no
+    # `--llm`, no positional description) scaffolds a PROJECT, not an
+    # agent. Rationale: "init = project, add = agent" matches the
+    # operator mental model. Agent-mode is still reachable via:
+    #
+    #   mdk init <name> -t <template>           (template-scaffold)
+    #   mdk init <name> --llm "<description>"   (LLM-scaffold)
+    #   mdk init <name> "<description>"         (positional shorthand)
+    #
+    # The legacy `--project` flag still works (back-compat) but is no
+    # longer required when the operator wants project mode.
+    has_template = template is not None
+    has_llm_intent = llm is not None or description is not None
+    implicit_project_mode = name is not None and not has_template and not has_llm_intent
+
+    if project or (implicit_project_mode and not with_agents) or with_agents:
+        # If we're scaffolding a project INSIDE an existing project,
+        # the operator probably meant `mdk add` (which scaffolds an
+        # agent into the current project) rather than nesting a new
+        # project. Warn but proceed — they may have a legitimate
+        # reason (e.g. a sub-project for testing).
+        if implicit_project_mode and _is_in_project():
+            err_console.print(
+                f"[yellow]⚠[/yellow] You're inside an existing movate "
+                f"project, but [bold]mdk init {name}[/bold] is about "
+                f"to create a NESTED project at [bold]{(target / name).resolve()}[/bold].\n"
+                "[dim]If you meant to add an agent to the current "
+                "project, run [bold]mdk add <template>[/bold] instead "
+                f"(e.g. [bold]mdk add {name}[/bold]).[/dim]"
+            )
 
         # When --with-agents is set, suppress the standalone Project
         # Panel and fold the project metadata into the combined Panel
@@ -1464,22 +1479,31 @@ def init(
         return
 
     if not name:
-        # Context-aware hint: if the cwd has no movate.yaml anywhere up
-        # the tree, the operator is probably trying to bootstrap a
-        # project. Steer them to the right flag.
+        # Either project mode in-place (operator typed `mdk init --project`
+        # — handled above) or agent mode without a name (error).
+        # Reaching here means agent intent (operator passed -t or --llm)
+        # without a name. Surface the right hint.
         in_project = _is_in_project()
         if not in_project:
             err_console.print(
-                "[red]✗[/red] agent name required. "
-                "[dim]You're not in a movate project yet — try "
-                "[bold]mdk init --project <name>[/bold] to bootstrap "
-                "one first.[/dim]"
+                "[red]✗[/red] name required.\n"
+                "[dim]Most common uses:\n"
+                "  [bold]mdk init my-project[/bold]            "
+                "# bootstrap a new project (default)\n"
+                "  [bold]mdk init --project[/bold]             "
+                "# bootstrap the current directory in place\n"
+                "  [bold]mdk init my-agent -t faq[/bold]       "
+                "# add an agent (in-project only)[/dim]"
             )
         else:
             err_console.print(
-                "[red]✗[/red] agent name required. "
-                "[dim]Run [bold]mdk init --help[/bold] for usage, or pass "
-                "[bold]--project[/bold] to bootstrap a project instead.[/dim]"
+                "[red]✗[/red] name required.\n"
+                "[dim]You're already inside a movate project — to "
+                "add an agent, use:\n"
+                "  [bold]mdk add <template>[/bold]   "
+                "(see [bold]mdk add --list[/bold])\n"
+                "Or [bold]mdk init <name>[/bold] to nest a new "
+                "project at ./<name>/.[/dim]"
             )
         raise typer.Exit(code=2)
 
@@ -1502,11 +1526,18 @@ def init(
     # template to start from); a warning surfaces so operators don't
     # silently get a mismatched starting point. Phase 2's generator
     # will honor the template as a few-shot exemplar.
+    #
+    # Template default in agent mode is "default" (the echo template).
+    # We use that fallback here rather than at parse time so the
+    # implicit-project-mode dispatch above can distinguish "operator
+    # passed -t" (agent intent) from "operator didn't pass -t"
+    # (project intent).
+    effective_template = template or "default"
     if llm is not None:
-        if template != "default":
+        if effective_template != "default":
             err_console.print(
                 f"[yellow]⚠[/yellow] [bold]--llm[/bold] + "
-                f"[bold]--template {template}[/bold] — the template will "
+                f"[bold]--template {effective_template}[/bold] — the template will "
                 f"seed the few-shot prompt as a starting structure. "
                 f"[dim](Phase 2 will honor this; Phase 1 just acknowledges "
                 f"the combination.)[/dim]"
@@ -1518,7 +1549,7 @@ def init(
             target=target,
             force=force,
             dry_run=dry_run,
-            starting_template=template,
+            starting_template=effective_template,
             mock=mock,
         )
         return
@@ -1532,4 +1563,4 @@ def init(
             "with [bold]--llm[/bold]; ignored for template scaffold."
         )
 
-    _init_agent(name=name, template=template, target=target, force=force)
+    _init_agent(name=name, template=effective_template, target=target, force=force)

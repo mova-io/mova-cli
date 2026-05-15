@@ -4,11 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-# Bump per shipped PR. Keep in sync with `src/movate/__init__.py:__version__`
-# and `__release_date__`. The bump-on-merge practice (May 2026
-# retrospective) means PATCH increments per PR; MINOR bumps mark a
-# coherent release window (0.7 → 0.8 etc.).
-version = "0.7.1"
+version = "0.7.0"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }

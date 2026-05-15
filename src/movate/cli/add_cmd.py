@@ -146,9 +146,11 @@ def _resolve_project_root() -> Path | None:
     Same convention as ``mdk snapshot`` / ``mdk diff`` so operators
     don't have to relearn project resolution per command.
     """
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
     current = Path.cwd().resolve()
     while True:
-        if (current / "movate.yaml").is_file():
+        if is_project_root(current):
             return current
         if current.parent == current:
             return None
@@ -623,16 +625,35 @@ def _add_one(
             agent_dir=dest, project_root=project_root
         )
 
-    # Auto-scaffold any contexts the template declares. Same rough
-    # edge as skills — an agent referencing `contexts: [style-guide]`
-    # would fail to load when the loader walks `contexts/` and the
-    # file isn't there. Reuses the same --no-skills flag (the
-    # symmetric --no-contexts is overkill; the two paths align in
-    # practice and operators rarely want one but not the other).
+    # Contexts: two-step copy.
+    #
+    # Step 1 — TEMPLATE-shipped contexts. If the agent template directory
+    # has a `contexts/` subdir (curated content the template author
+    # wrote: rubrics, style guides, etc.), copy those into the project
+    # FIRST so they exist before validation. Skips files the operator
+    # already authored.
+    #
+    # Step 2 — declared-but-missing contexts auto-scaffold. After step 1
+    # there may still be `contexts:` entries in agent.yaml that nobody
+    # pre-authored. Those get empty placeholder stubs. Reuses the
+    # --no-skills flag (a separate --no-contexts is overkill; the two
+    # paths align in practice).
     contexts_scaffolded: list[str] = []
     if not no_skills:
-        contexts_scaffolded = _maybe_scaffold_declared_contexts(
-            agent_dir=dest, project_root=project_root
+        # Resolve the template directory using the same registry mapping
+        # the scaffolder already consulted; cheap re-lookup.
+        from movate.templates import get_template_path  # noqa: PLC0415
+
+        try:
+            template_src_dir = get_template_path(template)
+        except ValueError:
+            template_src_dir = None
+        if template_src_dir is not None:
+            contexts_scaffolded = _maybe_copy_template_contexts(
+                template_dir=template_src_dir, project_root=project_root
+            )
+        contexts_scaffolded.extend(
+            _maybe_scaffold_declared_contexts(agent_dir=dest, project_root=project_root)
         )
 
     # Auto-validation: load the scaffolded agent and confirm it
@@ -880,6 +901,50 @@ def _maybe_scaffold_declared_skills(*, agent_dir: Path, project_root: Path) -> l
     return scaffolded
 
 
+def _maybe_copy_template_contexts(*, template_dir: Path, project_root: Path) -> list[str]:
+    """Copy any hand-written `contexts/*.md` shipped inside an agent
+    template into the project's `<project>/contexts/` directory.
+
+    Mechanics: each role-agent template directory MAY ship a
+    ``contexts/`` subdir alongside its ``agent.yaml`` /
+    ``prompt.md`` / ``schema/`` / ``evals/``. Files there are
+    template-author-curated content (rubrics, style guides,
+    domain primers) meant to ship with the agent — distinct from
+    the empty placeholders that ``_maybe_scaffold_declared_contexts``
+    produces when an operator declares a context that nobody
+    pre-authored.
+
+    Returns the list of context names that were freshly copied
+    (skipping any that already exist in the project — operators
+    shouldn't have hand-written content silently overwritten by
+    a re-scaffold). Empty list if the template ships no contexts.
+
+    Names returned are the file basenames minus `.md`, matching
+    the convention `context_loader.py` uses for lookups.
+    """
+    src_contexts = template_dir / "contexts"
+    if not src_contexts.is_dir():
+        return []
+
+    project_contexts = project_root / "contexts"
+    project_contexts.mkdir(parents=True, exist_ok=True)
+
+    copied: list[str] = []
+    for src in sorted(src_contexts.glob("*.md")):
+        dest = project_contexts / src.name
+        if dest.exists():
+            # Don't overwrite — operator may have customized.
+            continue
+        try:
+            dest.write_text(src.read_text())
+            copied.append(src.stem)
+        except OSError as exc:
+            err_console.print(
+                f"[yellow]⚠[/yellow] could not copy template context [bold]{src.name}[/bold]: {exc}"
+            )
+    return copied
+
+
 def _maybe_scaffold_declared_contexts(*, agent_dir: Path, project_root: Path) -> list[str]:
     """Auto-scaffold any contexts declared in the agent's ``contexts:``
     field that don't yet exist in ``<project>/contexts/<name>.md``.
@@ -982,18 +1047,21 @@ def _scaffold_one_skill(*, name: str, project_root: Path) -> None:
     Wrapped here so the auto-scaffold path can reuse the same
     canonical scaffold logic without invoking the CLI command (which
     would re-render its own Panel etc.).
+
+    The skill-template lookup tries a per-name match first
+    (``SKILL_TEMPLATES["web-search"] = "skill_web_search"`` for a
+    skill literally named ``web-search``), falling back to the
+    ``default`` echo template otherwise. That lets the curated
+    skills (web-search, lint-runner, kb-lookup) ship REAL impls
+    that an operator can `mdk skills run` immediately, while ad-hoc
+    skills still get a working echo stub.
     """
-    from movate.templates import get_template_path  # noqa: PLC0415
-
-    # Skill template ships at templates/skill_init/.
-    skill_template_dir = get_template_path.__globals__["SKILL_TEMPLATES"]
-    _ = skill_template_dir  # silence unused — we use the resolve fn below
-
     import shutil  # noqa: PLC0415
 
     from movate.templates import SKILL_TEMPLATES, TEMPLATES_DIR  # noqa: PLC0415
 
-    template_subdir = SKILL_TEMPLATES.get("default", "skill_init")
+    # Per-name lookup first; default fallback otherwise.
+    template_subdir = SKILL_TEMPLATES.get(name) or SKILL_TEMPLATES["default"]
     src = TEMPLATES_DIR / template_subdir
     if not src.is_dir():
         return
@@ -1002,12 +1070,21 @@ def _scaffold_one_skill(*, name: str, project_root: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dest)
 
-    # Stamp the skill's name in its skill.yaml (mirrors agent template
-    # behavior).
-    skill_yaml = dest / "skill.yaml"
-    if skill_yaml.is_file():
-        contents = skill_yaml.read_text().replace("__SKILL_NAME__", name)
-        skill_yaml.write_text(contents)
+    # Stamp the skill's name across every file that uses the
+    # `__SKILL_NAME__` placeholder. skill.yaml is the canonical
+    # required substitution; impl.py + README.md docstrings reference
+    # the same token. A single walk catches all of them and skips
+    # binary files cleanly.
+    for path in dest.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        if "__SKILL_NAME__" not in text:
+            continue
+        path.write_text(text.replace("__SKILL_NAME__", name))
 
 
 def _render_preview(args: list[str]) -> None:

@@ -17,7 +17,11 @@ from jinja2 import Environment, StrictUndefined, select_autoescape
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from movate.core.config import AgentDefaults, load_project_config
+from movate.core.config import (
+    PROJECT_MARKER_FILES,
+    AgentDefaults,
+    load_project_config,
+)
 from movate.core.layered_defaults import apply_defaults_to_raw
 from movate.core.models import AgentSpec
 from movate.core.schema_shorthand import SchemaShorthandError, compile_shorthand
@@ -25,6 +29,46 @@ from movate.core.schema_shorthand import SchemaShorthandError, compile_shorthand
 
 class AgentLoadError(Exception):
     """Raised when an agent directory fails to load or validate."""
+
+
+# Markers used by `_resolve_project_root` to identify a project root.
+# Imported from :data:`movate.core.config.PROJECT_MARKER_FILES` so the
+# loader stays in sync with `mdk add` / `mdk validate` / `mdk snapshot`
+# walk-up conventions — adding a new project marker filename is one
+# edit, not seven. Today's set:
+#
+# * `project.yaml` — canonical (post-MVP rename, May 2026)
+# * `policy.yaml`  — legacy v1.x canonical
+# * `movate.yaml`  — original v0.x name
+#
+# All three resolve equally for ROOT detection; deprecation warnings on
+# the legacy names fire from `load_project_config` when they're read.
+_PROJECT_MARKERS: tuple[str, ...] = PROJECT_MARKER_FILES
+
+
+def _resolve_project_root(agent_dir: Path) -> Path:
+    """Walk up from ``agent_dir`` looking for the project root marker.
+
+    Returns the first parent dir containing ``movate.yaml`` or
+    ``policy.yaml``. Falls back to ``agent_dir.parent`` if no marker
+    is found — the legacy "agent dropped flat alongside skills/"
+    layout keeps working (used by the executor's tool-use tests).
+
+    Why this matters: the canonical project layout is
+    ``<project>/agents/<name>/``, so ``agent_dir.parent`` =
+    ``<project>/agents/``. The skills/ + contexts/ folders live at
+    ``<project>/skills/`` + ``<project>/contexts/`` — one level
+    UP from ``agent_dir.parent``. Without this walk, skill /
+    context resolution silently picks the wrong directory.
+    """
+    current = agent_dir.resolve()
+    for parent in current.parents:
+        if any((parent / marker).is_file() for marker in _PROJECT_MARKERS):
+            return parent
+    # No marker found anywhere up the tree → assume the agent lives
+    # at the project root level (legacy layout). Falls back to the
+    # agent's immediate parent.
+    return agent_dir.parent
 
 
 @dataclass
@@ -156,13 +200,20 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
 
     # Resolve declared skills against the project's skills/ registry.
     # Lazy import keeps this loader free of a circular dep with
-    # skill_loader (which imports _resolve_schema from here). The
-    # registry root is the *parent* of the agent dir — that's where
-    # `skills/` lives in the canonical project layout. If the agent
-    # was loaded from outside a project (e.g. test fixtures), the
-    # registry is empty and any non-empty `spec.skills` triggers a
-    # clean SkillLoadError.
-    project_root = agent_dir.parent
+    # skill_loader (which imports _resolve_schema from here).
+    #
+    # Project-root resolution: walk up from the agent directory
+    # looking for ``movate.yaml`` / ``policy.yaml``. That's the
+    # canonical project root marker (set by ``mdk init --project``),
+    # and ``<project>/skills/`` + ``<project>/contexts/`` live as its
+    # siblings.
+    #
+    # Fallback: if no marker is found (agent loaded outside a project,
+    # e.g. test fixtures or single-agent ``mdk init <name>`` scaffolds
+    # without project mode), use ``agent_dir.parent``. That keeps the
+    # legacy "agent dropped into a flat dir alongside skills/" layout
+    # working — the executor tool-use tests rely on this fallback.
+    project_root = _resolve_project_root(agent_dir)
     skills_resolved: list[Any] = []
     if spec.skills:
         # Local import to avoid module-load-time cycle.
@@ -178,9 +229,10 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
         except SkillLoadError as exc:
             raise AgentLoadError(f"skills resolution failed: {exc}") from exc
 
-    # Resolve declared contexts against the project's contexts/ folder
-    # in the same project_root. Same "agent's parent dir is the project"
-    # convention as skills; same permissive-empty-registry default.
+    # Resolve declared contexts. Two-tier registry: project-level
+    # (`<project_root>/contexts/<name>.md`) is the shared base; agent-
+    # local (`<agent_dir>/contexts/<name>.md`) overrides on name
+    # collision. Same permissive-empty-registry default.
     contexts_resolved: list[tuple[str, str]] = []
     if spec.contexts:
         from movate.core.context_loader import (  # noqa: PLC0415
@@ -190,7 +242,7 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
         )
 
         try:
-            ctx_registry = load_context_registry(project_root)
+            ctx_registry = load_context_registry(project_root, agent_dir=agent_dir)
             contexts_resolved = resolve_agent_contexts(spec.contexts, ctx_registry)
         except ContextLoadError as exc:
             raise AgentLoadError(f"contexts resolution failed: {exc}") from exc

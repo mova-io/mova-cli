@@ -32,6 +32,10 @@ def _reset_deprecation_state(monkeypatch: pytest.MonkeyPatch) -> None:
     making the "no-warn" assertions tautological-pass.
     """
     monkeypatch.setattr(cfg_mod, "_LEGACY_WARN_FIRED", False)
+    # PR #85 added a second one-shot flag for the policy.yaml → project.yaml
+    # deprecation. Reset that one too so per-test warning assertions hold.
+    if hasattr(cfg_mod, "_POLICY_LEGACY_WARN_FIRED"):
+        monkeypatch.setattr(cfg_mod, "_POLICY_LEGACY_WARN_FIRED", False)
 
 
 @pytest.fixture
@@ -60,33 +64,39 @@ def test_only_movate_yaml_loads_with_deprecation_warning(
     assert cfg.policy.allowed_providers == ["legacy"]
     captured = capsys.readouterr()
     assert "movate.yaml is deprecated" in captured.err
-    assert "policy.yaml" in captured.err
+    assert "project.yaml" in captured.err
 
 
 def test_only_policy_yaml_loads_without_warning(
     in_empty_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # Post-PR #85 (project.yaml canonical) policy.yaml is itself legacy
+    # — it still loads, but with a deprecation warning pointing at
+    # project.yaml as the new canonical name.
     (in_empty_dir / "policy.yaml").write_text("policy:\n  allowed_providers: [canonical]\n")
     cfg = load_project_config()
     assert cfg.policy.allowed_providers == ["canonical"]
     captured = capsys.readouterr()
-    assert "deprecated" not in captured.err
-    assert "movate.yaml" not in captured.err
+    assert "policy.yaml is deprecated" in captured.err
+    assert "project.yaml" in captured.err
 
 
 def test_both_files_present_policy_yaml_wins(
     in_empty_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Mid-rename state: an operator dropped policy.yaml in but didn't
-    delete movate.yaml yet. We pick the canonical name silently."""
+    delete movate.yaml yet. policy.yaml wins; we warn for policy.yaml
+    (post-PR #85 it's itself legacy) but the movate.yaml warning is
+    silent because we never read that file."""
     (in_empty_dir / "movate.yaml").write_text("policy:\n  allowed_providers: [legacy]\n")
     (in_empty_dir / "policy.yaml").write_text("policy:\n  allowed_providers: [canonical]\n")
     cfg = load_project_config()
     assert cfg.policy.allowed_providers == ["canonical"]
-    # No deprecation warning when policy.yaml exists — the migration
-    # is effectively done.
     captured = capsys.readouterr()
-    assert "deprecated" not in captured.err
+    # policy.yaml warning fires (it's the loaded file).
+    assert "policy.yaml is deprecated" in captured.err
+    # movate.yaml warning does NOT fire (we never opened that file).
+    assert "movate.yaml is deprecated" not in captured.err
 
 
 # ---------------------------------------------------------------------------

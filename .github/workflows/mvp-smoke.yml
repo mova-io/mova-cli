@@ -1,0 +1,125 @@
+# MVP smoke test — exercises the customer-demo path end-to-end on
+# every PR + nightly. Catches regressions to:
+#
+#   mdk init <name>           → project scaffolded with correct layout
+#   mdk add rag-qa            → demo agent + skill + context wired
+#   mdk doctor                → all green
+#   mdk validate              → all green
+#   mdk eval --all --mock     → all gates pass (with --gate 0.0 since
+#                                MockProvider's output rarely matches
+#                                the dataset's expected exactly)
+#
+# Sprint W (May 2026). If this workflow goes red, the customer demo
+# flow IS broken — block the PR.
+
+name: mvp-smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Only run on changes that could affect the smoke path. Keeps
+      # CI fast for docs-only PRs while still catching demo regressions.
+      - "src/movate/**"
+      - "src/movate/templates/**"
+      - ".github/workflows/mvp-smoke.yml"
+      - "pyproject.toml"
+  push:
+    branches: [main]
+    paths:
+      - "src/movate/**"
+      - "src/movate/templates/**"
+      - "pyproject.toml"
+  workflow_dispatch:
+    # Manual trigger — useful when investigating a flaky CI run.
+
+jobs:
+  smoke:
+    name: init → add → doctor → validate → eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install movate-cli with runtime extra
+        # `[runtime]` pulls fastapi/uvicorn/asyncpg/bcrypt/python-multipart
+        # — same install path operators use post-PR #80's preflight.
+        run: |
+          uv sync --all-extras
+
+      # -----------------------------------------------------------------
+      # The smoke path — each step exits non-zero if any cmd fails.
+      # -----------------------------------------------------------------
+      - name: Scaffold a fresh project
+        run: |
+          mkdir -p /tmp/smoke
+          cd /tmp/smoke
+          uv --project ${{ github.workspace }} run mdk init demo --skip-snapshot
+
+      - name: Verify project layout (kb/, contexts/, skills/, project.yaml)
+        run: |
+          cd /tmp/smoke/demo
+          test -f project.yaml          || { echo "::error::missing project.yaml"; exit 1; }
+          test -d agents                || { echo "::error::missing agents/"; exit 1; }
+          test -d skills                || { echo "::error::missing skills/"; exit 1; }
+          test -d contexts              || { echo "::error::missing contexts/"; exit 1; }
+          test -d kb                    || { echo "::error::missing kb/"; exit 1; }
+          test -f kb/README.md          || { echo "::error::missing kb/README.md"; exit 1; }
+
+      - name: Add a demo agent (rag-qa)
+        run: |
+          cd /tmp/smoke/demo
+          uv --project ${{ github.workspace }} run mdk add rag-qa
+
+      - name: Verify skill + context auto-scaffolded
+        run: |
+          cd /tmp/smoke/demo
+          test -f agents/rag-qa/agent.yaml          || { echo "::error::missing agent.yaml"; exit 1; }
+          test -f skills/web-search/skill.yaml      || { echo "::error::missing skill.yaml"; exit 1; }
+          test -f skills/web-search/impl.py         || { echo "::error::missing impl.py"; exit 1; }
+          test -f contexts/grounded-qa-rubric.md    || { echo "::error::missing context"; exit 1; }
+
+      - name: mdk doctor (no-fix-prompt for CI)
+        run: |
+          cd /tmp/smoke/demo
+          uv --project ${{ github.workspace }} run mdk doctor --no-fix-prompt
+        env:
+          COLUMNS: "200"
+
+      - name: mdk validate (whole project)
+        run: |
+          cd /tmp/smoke/demo
+          uv --project ${{ github.workspace }} run mdk validate
+
+      - name: mdk eval --all --mock (gate 0.0 — smoke, not quality)
+        # Gate at 0.0 because MockProvider produces deterministic but
+        # generic output that rarely matches dataset.jsonl's
+        # `expected` exactly. The point is "the eval RAN", not
+        # "scores are high." A real eval gate (with API keys + real
+        # models) lives in `eval-gate.example.yml` for downstream
+        # consumer projects.
+        run: |
+          cd /tmp/smoke/demo
+          uv --project ${{ github.workspace }} run mdk eval --all --mock --gate 0.0
+        env:
+          COLUMNS: "200"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## MVP smoke result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✓ init → add → doctor → validate → eval all green" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "✗ smoke broke — see step logs above" >> "$GITHUB_STEP_SUMMARY"
+          fi
