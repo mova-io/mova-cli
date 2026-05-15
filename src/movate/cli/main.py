@@ -41,6 +41,7 @@ from movate.cli import (  # noqa: E402
     promote_cmd,
     replay_cmd,
     rollback_cmd,
+    simulate_cmd,
     tune_cmd,
 )
 from movate.cli import bench as bench_cmd  # noqa: E402
@@ -216,6 +217,9 @@ app.command("replay", rich_help_panel=PANEL_RUN)(replay_cmd.replay)
 # list of values for the same input. Deterministic helper, NOT
 # auto-prompt-engineering — operators read the table + decide.
 app.command("tune", rich_help_panel=PANEL_RUN)(tune_cmd.tune)
+# `simulate` runs a chatbot through multi-turn scenarios — sibling to
+# `eval` (single-turn) and `bench` (multi-model). Same panel.
+app.command("simulate", rich_help_panel=PANEL_RUN)(simulate_cmd.simulate)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
