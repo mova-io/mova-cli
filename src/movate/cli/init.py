@@ -108,6 +108,32 @@ __pycache__/
 """
 
 
+# Env-var names every LiteLLM-backed provider checks for credentials.
+# Kept in sync with the same list in :mod:`movate.cli.doctor` — adding a
+# provider here means adding it there too.
+_PROVIDER_KEY_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "LYZR_API_KEY",
+)
+
+
+def _has_any_provider_key() -> bool:
+    """True if at least one provider API key is set in the environment.
+
+    Used by ``--llm`` mode (without ``--mock``) to fast-fail with a
+    friendly error instead of crashing deep inside the LLM call. We
+    don't try to match the KEY to the chosen model — most operators
+    have ONE key set, and any wrong-provider mismatch surfaces with a
+    clearer error from LiteLLM downstream.
+    """
+    import os  # noqa: PLC0415
+
+    return any(os.environ.get(k, "").strip() for k in _PROVIDER_KEY_ENV_VARS)
+
+
 def _is_in_project() -> bool:
     """Walk up from cwd looking for ``movate.yaml`` — the same
     convention :mod:`movate.cli.add_cmd` uses. Lets ``mdk init``
@@ -345,6 +371,20 @@ def _init_agent_from_llm(
             f"[red]✗[/red] {dest} already exists "
             "(use [bold]--force[/bold] to overwrite, or [bold]--dry-run[/bold] "
             "to preview without writing)"
+        )
+        raise typer.Exit(code=2)
+
+    # Pre-flight: without --mock we need at least one provider API key.
+    # Today this crashes deep in the LLM call with a confusing stack;
+    # surface it up-front with a clear pointer.
+    if not mock and not _has_any_provider_key():
+        err_console.print(
+            "[red]✗[/red] [bold]--llm[/bold] needs a provider API key.\n"
+            "[dim]Set one of: [bold]OPENAI_API_KEY[/bold], "
+            "[bold]ANTHROPIC_API_KEY[/bold], [bold]AZURE_OPENAI_API_KEY[/bold], "
+            "[bold]GEMINI_API_KEY[/bold] in your shell or [bold].env[/bold].\n"
+            "Or re-run with [bold]--mock[/bold] for an offline scaffold "
+            "(uses the deterministic mock provider, no key needed).[/dim]"
         )
         raise typer.Exit(code=2)
 
@@ -729,6 +769,14 @@ def init(
             "the current directory in place."
         ),
     ),
+    description: str = typer.Argument(
+        None,
+        help=(
+            "Optional natural-language description. When set, treated as "
+            "shorthand for [bold]--llm[/bold]: "
+            "[bold]mdk init faq-agent \"FAQ agent for our SaaS pricing\"[/bold]."
+        ),
+    ),
     project: bool = typer.Option(
         False,
         "--project",
@@ -864,6 +912,20 @@ def init(
                 "[bold]--project[/bold] to bootstrap a project instead.[/dim]"
             )
         raise typer.Exit(code=2)
+
+    # Positional-description shorthand: `mdk init <name> "<description>"`
+    # is equivalent to `mdk init <name> --llm "<description>"`. Operators
+    # try this naturally — the wordy second positional reads as the
+    # description without needing to know the --llm flag. When both
+    # forms are passed, --llm wins (explicit beats implicit).
+    if description and llm is None:
+        llm = description
+    elif description and llm is not None:
+        err_console.print(
+            "[yellow]⚠[/yellow] both a positional description and "
+            "[bold]--llm[/bold] were passed — [bold]--llm[/bold] wins, "
+            f"positional [dim]{description!r}[/dim] is ignored."
+        )
 
     # Agent mode: dispatch to LLM-scaffold or template-scaffold path.
     # --llm + --template is allowed (the description guides which
