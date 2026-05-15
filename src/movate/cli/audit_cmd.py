@@ -233,3 +233,24 @@ def _render_rich(report: AuditReport, *, target: str, strict: bool) -> None:
             table.add_row(sev_cell, finding.category, finding.target, msg_cell)
 
         console.print(table)
+
+    # Greppable single-line summary at the very end. Operators piping
+    # CI logs through `grep mdk_audit_summary` get one key=value line
+    # they can parse without dealing with Rich panel borders.
+    _print_summary_line(report, strict=strict)
+
+
+def _print_summary_line(report: AuditReport, *, strict: bool) -> None:
+    """Emit ``mdk_audit_summary: agents=N errors=N warnings=N ...`` line.
+
+    Greppable + parseable. Stays distinct from the Rich panel above
+    so machine-reading tools can pick this line without parsing
+    surrounding decoration.
+    """
+    blocks = "true" if report.gate_fails(strict=strict) else "false"
+    console.print(
+        f"[dim]mdk_audit_summary: agents={report.scanned_agents} "
+        f"errors={len(report.errors)} warnings={len(report.warnings)} "
+        f"info={len(report.infos)} strict={str(strict).lower()} "
+        f"blocks_deploy={blocks}[/dim]"
+    )

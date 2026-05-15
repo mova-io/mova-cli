@@ -326,6 +326,15 @@ def inspect_agent(
         "--json",
         help="Emit the resolved bundle as JSON — pipe-friendly for CI / jq.",
     ),
+    show_raw: bool = typer.Option(
+        False,
+        "--raw",
+        help=(
+            "Also print the raw agent.yaml + prompt.md alongside the "
+            'resolved view. Makes [italic]"what changed under resolution?"[/italic] '
+            "debugging trivial — both sides on screen at once."
+        ),
+    ),
     project_root: str = typer.Option(
         ".",
         "--project-root",
@@ -387,4 +396,31 @@ def inspect_agent(
         # Blank line between sections for readability — Rich Panels
         # already have their own borders, but a blank line clarifies
         # which Panel goes with which section title.
+        console.print()
+
+    if show_raw:
+        _render_raw_sources(agent_path)
+
+
+def _render_raw_sources(agent_dir: Path) -> None:
+    """Print agent.yaml + prompt.md as untouched source.
+
+    Pairs with the resolved view so operators can directly compare
+    "what I wrote" against "what the executor sees." Useful when a
+    movate.yaml default is silently overriding an agent's own
+    declaration and the operator can't figure out why.
+    """
+    for filename, syntax in (("agent.yaml", "yaml"), ("prompt.md", "markdown")):
+        path = agent_dir / filename
+        if not path.is_file():
+            continue
+        body = path.read_text()
+        console.print(
+            Panel(
+                Syntax(body, syntax, theme="ansi_dark", word_wrap=False),
+                title=f"Raw: [cyan]{filename}[/cyan]",
+                title_align="left",
+                border_style="dim",
+            )
+        )
         console.print()

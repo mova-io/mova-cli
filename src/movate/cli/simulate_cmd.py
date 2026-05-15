@@ -547,6 +547,16 @@ def simulate(
         "-o",
         help="Save full transcripts to PATH (JSON). Skipped if empty.",
     ),
+    pass_rate_gate: float = typer.Option(
+        -1.0,
+        "--pass-rate-gate",
+        help=(
+            "CI gate: exit non-zero if goal-achievement rate < threshold "
+            "(0.0 to 1.0). Default -1 = no gate. Example: "
+            "[dim]--pass-rate-gate 0.7[/dim] fails if fewer than 70% of "
+            "scenarios reached their goal."
+        ),
+    ),
     mock: bool = typer.Option(
         False,
         "--mock",
@@ -627,6 +637,24 @@ def simulate(
                 border_style="green",
             )
         )
+
+    # CI gate: compare goal-achievement rate against the threshold.
+    # -1 (default) disables the gate; 0.0..1.0 are operator-supplied.
+    # The threshold is INCLUSIVE so 1.0 = "all scenarios must achieve".
+    if pass_rate_gate >= 0.0:
+        if not 0.0 <= pass_rate_gate <= 1.0:
+            err_console.print(
+                f"[red]✗[/red] --pass-rate-gate must be in [0.0, 1.0]; got {pass_rate_gate}"
+            )
+            raise typer.Exit(code=2)
+        passed = sum(1 for r in results if r.goal_achieved)
+        rate = passed / len(results) if results else 0.0
+        if rate < pass_rate_gate:
+            err_console.print(
+                f"\n[red]✗ pass-rate gate FAILED[/red] ({rate:.0%} < {pass_rate_gate:.0%})"
+            )
+            raise typer.Exit(code=1)
+        console.print(f"\n[green]✓ pass-rate gate met[/green] ({rate:.0%} ≥ {pass_rate_gate:.0%})")
 
 
 async def _simulate_all(

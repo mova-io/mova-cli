@@ -163,8 +163,15 @@ def _render_table(
     *,
     group_by: str,
     total_runs: int,
+    highlight_over: float = 0.0,
 ) -> None:
-    """Render the rollup list as a Rich table."""
+    """Render the rollup list as a Rich table.
+
+    ``highlight_over`` (USD) flips the row style to red when the
+    rollup's total_cost_usd exceeds the threshold. 0.0 = no
+    highlighting (the default). Lets operators spot spend spikes
+    without scanning a dense table.
+    """
     if not rollups:
         console.print(
             "[yellow]⚠[/yellow] no runs recorded yet. "
@@ -183,17 +190,28 @@ def _render_table(
     table.add_column("Tokens out", justify="right", style="dim")
     table.add_column("Last run", style="dim", no_wrap=True)
 
+    n_highlighted = 0
     for r in rollups:
+        is_over = highlight_over > 0 and r.total_cost_usd > highlight_over
+        total_cell = (
+            f"[red]${r.total_cost_usd:.4f}[/red]" if is_over else f"${r.total_cost_usd:.4f}"
+        )
+        if is_over:
+            n_highlighted += 1
         table.add_row(
             r.key,
             f"{r.runs:,}",
-            f"${r.total_cost_usd:.4f}",
+            total_cell,
             f"${r.mean_cost_usd:.6f}",
             f"{r.total_tokens_in:,}",
             f"{r.total_tokens_out:,}",
             (r.last_run_at or "—").split("T", 1)[0],  # date only — keeps the row tight
         )
     console.print(table)
+    if n_highlighted:
+        console.print(
+            f"\n[red]⚠ {n_highlighted} row(s) over the ${highlight_over:.4f} threshold[/red]"
+        )
 
 
 def _as_json(rollups: list[CostRollup], *, group_by: str, total_runs: int) -> dict:
@@ -258,6 +276,16 @@ def report(
             "Maximum runs to fetch from storage before aggregating. Bump if your history is huge."
         ),
     ),
+    highlight_over: float = typer.Option(
+        0.0,
+        "--highlight-over",
+        help=(
+            "Red-bar rows whose total spend exceeds this USD threshold. "
+            "0.0 (default) = no highlighting. "
+            "Example: [dim]--highlight-over 1.0[/dim] flags any agent that's "
+            "burned > $1."
+        ),
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -299,7 +327,16 @@ def report(
 
     rollups = _rollup_runs(runs, group_by=by)
 
+    if highlight_over < 0:
+        err_console.print(f"[red]✗[/red] --highlight-over must be ≥ 0; got {highlight_over}")
+        raise typer.Exit(code=2)
+
     if json_output:
         console.print_json(json.dumps(_as_json(rollups, group_by=by, total_runs=len(runs))))
     else:
-        _render_table(rollups, group_by=by, total_runs=len(runs))
+        _render_table(
+            rollups,
+            group_by=by,
+            total_runs=len(runs),
+            highlight_over=highlight_over,
+        )

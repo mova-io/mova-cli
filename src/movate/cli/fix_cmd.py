@@ -80,6 +80,14 @@ def fix(
             "List all available fixes (id + label + description) and exit. No diagnosis, no writes."
         ),
     ),
+    explain: str = typer.Option(
+        "",
+        "--explain",
+        help=(
+            "Print the full description + current applicability of one fix "
+            "and exit. Example: [dim]--explain ensure-gitignore[/dim]."
+        ),
+    ),
     project_root: str = typer.Option(
         ".",
         "--project-root",
@@ -103,6 +111,10 @@ def fix(
     """
     if list_:
         _render_fix_catalog()
+        return
+
+    if explain:
+        _render_fix_explain(explain, project_root=Path(project_root).resolve())
         return
 
     root = Path(project_root).resolve()
@@ -157,6 +169,44 @@ def fix(
         console.print(f"\n[green]✓[/green] nothing to fix — {n_skipped} check(s) already clean.")
         return
     console.print(f"\n[green]✓[/green] {n_applied} fix(es) applied, {n_skipped} already clean.")
+
+
+def _render_fix_explain(fix_id: str, *, project_root: Path) -> None:
+    """Print one fix's full description + whether it currently applies.
+
+    Operators reach for ``--explain`` when ``--list`` showed an entry
+    they don't recognize. Shows the label, description, AND runs the
+    fix's ``check()`` so the answer to "would this fire here?" comes
+    in the same view.
+    """
+    candidates = [f for f in available_fixes() if f.id == fix_id]
+    if not candidates:
+        valid = ", ".join(f.id for f in available_fixes())
+        err_console.print(
+            f"[red]✗[/red] unknown fix [bold]{fix_id}[/bold]. [dim]Valid ids: {valid}.[/dim]"
+        )
+        raise typer.Exit(code=2)
+    fix_def = candidates[0]
+    applies = fix_def.check(project_root)
+    body = (
+        f"[bold]ID:[/bold]          [cyan]{fix_def.id}[/cyan]\n"
+        f"[bold]Label:[/bold]       {fix_def.label}\n\n"
+        f"{fix_def.description}\n\n"
+        f"[bold]Applies here?[/bold] "
+        + (
+            f"[yellow]yes[/yellow] — run [cyan]mdk fix --only {fix_def.id} --apply[/cyan] to apply"
+            if applies
+            else "[green]no[/green] — your project is already clean for this check"
+        )
+    )
+    console.print(
+        Panel(
+            body,
+            title=f"Fix: [cyan]{fix_def.id}[/cyan]",
+            title_align="left",
+            border_style="cyan",
+        )
+    )
 
 
 def _render_fix_catalog() -> None:
