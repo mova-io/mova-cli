@@ -31,6 +31,7 @@ from movate.cli import (  # noqa: E402
     _console,
     audit_cmd,
     diff_cmd,
+    fmt_cmd,
     menu_cmd,
     migrate_cmd,
     promote_cmd,
@@ -178,6 +179,7 @@ app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
+app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
 # NOTE: do NOT pass `help=` here — Typer/Click then ignores the function's
 # docstring, which is where each command's [bold]Examples:[/bold] block
