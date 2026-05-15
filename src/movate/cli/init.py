@@ -1,6 +1,6 @@
 """``movate init`` — scaffold a new agent OR bootstrap a fresh project.
 
-Two modes:
+Three modes:
 
 * **Agent mode** (default): ``movate init <name>`` scaffolds one agent
   directory under ``<target>/<name>/`` from a packaged template. Same
@@ -10,6 +10,14 @@ Two modes:
   with ``movate.yaml`` + ``.env.example`` + ``.gitignore`` + empty
   ``agents/``. Auto-creates an initial snapshot so the operator has
   a baseline for ``mdk diff`` / ``mdk rollback`` immediately.
+
+* **LLM-scaffold mode** (``--llm "<description>"``): generate the
+  agent from a natural-language description using an LLM. The CLI
+  surface is wired in this PR (Phase 1 of the rollout); the actual
+  generator + validation loop land in Phase 2. Today the flag is
+  accepted and the dispatch is locked in, but invocation prints a
+  friendly "not yet implemented" message and exits 2 so downstream
+  phases can plug in without churning this file's argument list.
 
 Project mode is the "step 0" before any agents exist. Agent mode is
 the "step 1+" inside an existing project. ``mdk demo`` is the third
@@ -243,6 +251,77 @@ def _init_agent(
 
 
 # ---------------------------------------------------------------------------
+# LLM-scaffold mode (Phase 1 stub — generator lands in Phase 2)
+# ---------------------------------------------------------------------------
+
+
+# Default model for LLM scaffolding. Cheap + reliable JSON-mode support;
+# bumped via ``--llm-model`` if an operator wants a different trade-off.
+# Same provider string format as ``agent.yaml: model.provider`` — the
+# Phase 2 generator will reuse ``build_local_runtime`` to instantiate it.
+_DEFAULT_LLM_MODEL = "openai/gpt-4o-mini-2024-07-18"
+
+
+def _init_agent_from_llm(
+    *,
+    name: str,
+    description: str,
+    llm_model: str,
+    target: Path,
+    force: bool,
+    dry_run: bool,
+    starting_template: str,
+) -> None:
+    """Scaffold an agent from a natural-language description.
+
+    **Phase 1 (this PR): CLI surface only.** The function signature is
+    locked in so Phase 2 can swap the body for the real generator
+    without churning ``init()``'s argument list. Today the body prints
+    a friendly "not yet implemented" message and exits 2 — the flag
+    is verified-wired but not yet functional.
+
+    **Phase 2 (next PR) will:**
+
+    1. Build a local runtime via :func:`movate.cli._runtime.build_local_runtime`.
+    2. Call a new :mod:`movate.scaffold.llm_scaffold` module that returns
+       a :class:`GeneratedAgent` Pydantic payload from the description.
+    3. Write the generated files to a tempdir, run :func:`load_agent`
+       to validate, retry once if validation fails, surface a clear
+       error otherwise.
+    4. On success, copy to ``target / name`` (or print as Rich tree
+       when ``dry_run=True``).
+    """
+    # Validate inputs early — this is the contract Phase 2 will rely on.
+    if not description.strip():
+        err_console.print(
+            "[red]✗[/red] --llm description is empty. "
+            "Pass a non-empty natural-language description of the agent."
+        )
+        raise typer.Exit(code=2)
+
+    err_console.print(
+        "[yellow]⚠[/yellow] [bold]--llm[/bold] is wired but the generator "
+        "lands in [bold]Phase 2[/bold].\n"
+        "[dim]This Phase-1 PR locks in the CLI surface so downstream phases\n"
+        "(generator, validation loop, docs) don't churn this file.[/dim]"
+    )
+    # Echo the captured arguments so operators (and PR reviewers) can
+    # confirm the flags wire through end-to-end without a real LLM call.
+    # Phase 2 will replace this block with the actual generation call.
+    err_console.print(
+        f"\n[dim]Captured for Phase 2:\n"
+        f"  name:        {name}\n"
+        f"  description: {description!r}\n"
+        f"  llm_model:   {llm_model}\n"
+        f"  template:    {starting_template}\n"
+        f"  target:      {target}\n"
+        f"  dry_run:     {dry_run}\n"
+        f"  force:       {force}[/dim]"
+    )
+    raise typer.Exit(code=2)
+
+
+# ---------------------------------------------------------------------------
 # Entry point — dispatches between project + agent modes
 # ---------------------------------------------------------------------------
 
@@ -283,6 +362,33 @@ def init(
             "Mostly for tests; production use should keep the baseline."
         ),
     ),
+    llm: str = typer.Option(
+        None,
+        "--llm",
+        help=(
+            "Natural-language description of the agent. The CLI uses an LLM "
+            "to generate [bold]agent.yaml[/bold] + [bold]prompt.md[/bold] + "
+            "schemas + seed eval cases. [yellow]Phase 1: flag is wired but "
+            "the generator lands in Phase 2 — invocation prints a "
+            "not-yet-implemented message and exits 2.[/yellow]"
+        ),
+    ),
+    llm_model: str = typer.Option(
+        _DEFAULT_LLM_MODEL,
+        "--llm-model",
+        help=(
+            f"Model to use when [bold]--llm[/bold] is set. Defaults to "
+            f"[bold]{_DEFAULT_LLM_MODEL}[/bold] (cheap, reliable JSON output)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Preview the generated files without writing to disk. Only "
+            "meaningful with [bold]--llm[/bold] today; ignored otherwise."
+        ),
+    ),
 ) -> None:
     """Scaffold a new agent, or bootstrap a fresh project workspace.
 
@@ -310,7 +416,23 @@ def init(
       [dim]$ mdk init --project        # bootstrap current directory[/dim]
       [dim]$ mdk init faq               # add one agent from the faq template[/dim]
       [dim]$ mdk init my-bot --template chatbot[/dim]
+      [dim]$ mdk init faq-agent --llm "FAQ agent for our SaaS pricing"  # Phase 2[/dim]
     """
+    # Mutual-exclusion guard: --llm only makes sense in agent mode.
+    # Project mode is just a movate.yaml + .gitignore + empty agents/ —
+    # nothing for an LLM to scaffold. Point the operator at agent mode
+    # so they don't have to read the long --help to figure it out.
+    if project and llm is not None:
+        err_console.print(
+            "[red]✗[/red] [bold]--llm[/bold] is for agent scaffolding, not "
+            "project bootstrap.\n"
+            "[dim]Run [bold]mdk init --project <name>[/bold] first to create "
+            "the workspace, then\n"
+            "[bold]mdk init <agent-name> --llm \"<description>\"[/bold] "
+            "inside it.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
     if project:
         _init_project(
             name=name,
@@ -327,5 +449,39 @@ def init(
             "[bold]--project[/bold] to bootstrap a project instead.[/dim]"
         )
         raise typer.Exit(code=2)
+
+    # Agent mode: dispatch to LLM-scaffold or template-scaffold path.
+    # --llm + --template is allowed (the description guides which
+    # template to start from); a warning surfaces so operators don't
+    # silently get a mismatched starting point. Phase 2's generator
+    # will honor the template as a few-shot exemplar.
+    if llm is not None:
+        if template != "default":
+            err_console.print(
+                f"[yellow]⚠[/yellow] [bold]--llm[/bold] + "
+                f"[bold]--template {template}[/bold] — the template will "
+                f"seed the few-shot prompt as a starting structure. "
+                f"[dim](Phase 2 will honor this; Phase 1 just acknowledges "
+                f"the combination.)[/dim]"
+            )
+        _init_agent_from_llm(
+            name=name,
+            description=llm,
+            llm_model=llm_model,
+            target=target,
+            force=force,
+            dry_run=dry_run,
+            starting_template=template,
+        )
+        return
+
+    # No --llm: original template-copy path. --dry-run is meaningless
+    # here today (template copy is cheap and idempotent); warn-don't-
+    # error so we don't break muscle memory if operators sprinkle it.
+    if dry_run:
+        err_console.print(
+            "[yellow]⚠[/yellow] [bold]--dry-run[/bold] is only meaningful "
+            "with [bold]--llm[/bold]; ignored for template scaffold."
+        )
 
     _init_agent(name=name, template=template, target=target, force=force)
