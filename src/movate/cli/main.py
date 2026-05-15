@@ -69,6 +69,7 @@ from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
+from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
@@ -252,6 +253,9 @@ app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
 app.command("serve", rich_help_panel=PANEL_DEPLOY)(serve_cmd.serve)
 app.command("worker", rich_help_panel=PANEL_DEPLOY)(worker_cmd.worker)
 app.command("deploy", rich_help_panel=PANEL_DEPLOY)(deploy_cmd.deploy)
+# `export` packages primitives for portability — adjacent to deploy
+# (both ship things off-host).
+app.add_typer(export_app, name="export", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
 
 # ----- Manage ---------------------------------------------------------------
