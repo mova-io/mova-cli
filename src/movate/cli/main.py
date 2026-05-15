@@ -32,6 +32,7 @@ from movate.cli import (  # noqa: E402
     audit_cmd,
     demo_cmd,
     diff_cmd,
+    eval_gen_cmd,
     fix_cmd,
     fmt_cmd,
     menu_cmd,
@@ -217,6 +218,10 @@ app.command("tune", rich_help_panel=PANEL_RUN)(tune_cmd.tune)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
+# `eval-gen` is the sibling that creates a dataset; `eval` runs it.
+# Sibling (not subcommand) because restructuring `eval` to a Typer
+# sub-app would break ~30 test callsites. See eval_gen_cmd docstring.
+app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /
