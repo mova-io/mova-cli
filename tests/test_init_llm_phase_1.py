@@ -112,12 +112,19 @@ def test_empty_llm_description_errors_early(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_dry_run_without_llm_warns_but_succeeds(tmp_path: Path) -> None:
     """--dry-run is only meaningful with --llm today. Without --llm,
-    we warn rather than error — muscle memory shouldn't break."""
+    we warn rather than error — muscle memory shouldn't break.
+
+    Uses `-t default` to opt into agent mode explicitly; the May-2026
+    default-change makes bare `mdk init <name>` project-mode, so a
+    template flag is required to exercise the agent-mode dry-run path.
+    """
     result = runner.invoke(
         app,
         [
             "init",
             "my-agent",
+            "-t",
+            "default",
             "--target",
             str(tmp_path),
             "--dry-run",
@@ -137,13 +144,16 @@ def test_dry_run_without_llm_warns_but_succeeds(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_init_without_llm_unchanged(tmp_path: Path) -> None:
-    """The original template-copy flow must remain bit-for-bit
-    identical when --llm isn't passed."""
+    """The template-copy flow must remain identical when --llm isn't
+    passed. Operator opts into agent mode via `-t default` (post the
+    May-2026 default-change, bare `mdk init <name>` is project mode)."""
     result = runner.invoke(
         app,
         [
             "init",
             "my-agent",
+            "-t",
+            "default",
             "--target",
             str(tmp_path),
         ],

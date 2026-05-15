@@ -126,8 +126,9 @@ def test_init_project_in_place_uses_cwd_name(
     assert result.exit_code == 0, result.stdout + result.stderr
     assert (tmp_path / "project.yaml").is_file()
     raw = (tmp_path / "project.yaml").read_text()
-    # The project name appears in the comment header, derived from cwd.
-    assert tmp_path.name in raw.splitlines()[0]
+    # The project name appears in the canonical comment header (the
+    # banner spans multiple lines, so search anywhere in the file).
+    assert tmp_path.name in raw
 
 
 @pytest.mark.unit
@@ -208,8 +209,12 @@ def test_agent_mode_still_works(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_no_name_no_project_flag_exits_2(tmp_path: Path) -> None:
-    """Bare `mdk init` (no name, no --project) is a usage error."""
+    """Bare `mdk init` (no name, no --project, no -t) is a usage
+    error. Error message surfaces the three common-uses paths."""
     result = runner.invoke(app, ["init", "--target", str(tmp_path)])
     assert result.exit_code == 2
-    combined = result.stdout + result.stderr
-    assert "agent name required" in combined.lower() or "--project" in combined
+    combined = (result.stdout + result.stderr).lower()
+    # Post-default-change wording: "name required" + at least one of
+    # the common-uses lines pointing operators forward.
+    assert "name required" in combined
+    assert "mdk init" in combined  # at least one example shown

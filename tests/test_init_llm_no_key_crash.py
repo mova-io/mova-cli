@@ -201,11 +201,14 @@ class TestPositionalDescription:
     def test_no_positional_description_uses_template_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No description → template-copy path. Verifies the positional
-        is OPTIONAL — operators with the old syntax aren't broken."""
+        """No description + explicit `-t` → template-copy path runs.
+        Opts into agent mode via `-t default` post the May-2026
+        default-change (bare `mdk init <name>` is project mode)."""
         _strip_all_provider_keys(monkeypatch)
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(app, ["init", "plain-agent"], env={"COLUMNS": "200"})
+        result = runner.invoke(
+            app, ["init", "plain-agent", "-t", "default"], env={"COLUMNS": "200"}
+        )
         assert result.exit_code == 0, result.stdout + result.stderr
         # Template scaffold ran — agent.yaml exists.
         assert (tmp_path / "plain-agent" / "agent.yaml").is_file()
