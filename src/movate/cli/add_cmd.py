@@ -125,6 +125,19 @@ _ROLE_GROUPS: list[tuple[str, list[str]]] = [
     ("Compliance / Ops", ["compliance-checker", "meeting-summarizer"]),
 ]
 
+# Per-group color so each row's Use-case label and Name share a hue.
+# Operators scan the catalog by color band rather than by re-reading
+# the group column. Colors picked from Rich's standard ANSI set so
+# they're visible in both dark + light terminals.
+_GROUP_COLORS: dict[str, str] = {
+    "Support": "cyan",
+    "Sales / GTM": "green",
+    "Engineering": "magenta",
+    "Knowledge work": "blue",
+    "HR / Recruiting": "yellow",
+    "Compliance / Ops": "red",
+}
+
 
 def _resolve_project_root() -> Path | None:
     """Walk up from cwd looking for ``movate.yaml``. Returns ``None``
@@ -202,19 +215,26 @@ def _render_list(search: str | None = None) -> None:
         show_header=True,
         header_style="bold",
     )
-    role_table.add_column("Use case", style="magenta", no_wrap=True)
-    role_table.add_column("Name", style="cyan", no_wrap=True)
+    # No column-level style on Use case + Name — color is applied per
+    # row via markup so each category's label + name share a hue.
+    role_table.add_column("Use case", no_wrap=True)
+    role_table.add_column("Name", no_wrap=True)
     role_table.add_column("What it does")
     role_table.add_column("Highlights", style="dim")
 
     if role_rows:
         # Print each group once — leave subsequent rows in the same
         # group blank in the Use-case column so the visual grouping
-        # reads cleanly without horizontal-rule overhead.
+        # reads cleanly without horizontal-rule overhead. Each row's
+        # Use-case label + Name share the group's color so the eye
+        # can scan by color band instead of re-reading the column.
         last_group = ""
         for group, name, desc, feature in role_rows:
+            color = _GROUP_COLORS.get(group, "white")
             label = group if group != last_group else ""
-            role_table.add_row(label, name, desc, feature)
+            label_cell = f"[{color}]{label}[/{color}]" if label else ""
+            name_cell = f"[{color}]{name}[/{color}]"
+            role_table.add_row(label_cell, name_cell, desc, feature)
             last_group = group
         console.print(role_table)
     elif search:
