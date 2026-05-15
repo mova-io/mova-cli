@@ -413,6 +413,25 @@ class ProjectConfig(BaseModel):
 
     agents_dir: str = "./agents"
     workflows_dir: str = "./workflows"
+    skills_dir: str = Field(
+        default="./skills",
+        description=(
+            "Where the project's skill definitions live. Each subdir is a "
+            "skill (``skill.yaml`` + ``impl.py``). Agents reference skills "
+            "by name via ``skills: [skill-name]``; the resolver walks this "
+            "directory at load time. See :mod:`movate.core.skill_loader`."
+        ),
+    )
+    contexts_dir: str = Field(
+        default="./contexts",
+        description=(
+            "Where the project's reusable Markdown contexts live (one "
+            "``<name>.md`` per context). Agents reference contexts by "
+            "filename (minus extension) via ``contexts: [name]``; the "
+            "loader walks this directory and prepends each declared "
+            "context to the prompt. See :mod:`movate.core.context_loader`."
+        ),
+    )
     bench: BenchConfig = Field(default_factory=BenchConfig)
     eval: EvalDefaults = Field(default_factory=EvalDefaults)
     defaults: AgentDefaults = Field(
