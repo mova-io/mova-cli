@@ -30,6 +30,7 @@ from movate import __version__  # noqa: E402
 from movate.cli import (  # noqa: E402
     _console,
     audit_cmd,
+    demo_cmd,
     diff_cmd,
     fmt_cmd,
     menu_cmd,
@@ -174,6 +175,7 @@ def _main(
 # status + contextual next-step suggestions. Lives at the top of the
 # Develop panel so it surfaces prominently in `mdk --help`.
 app.command("menu", rich_help_panel=PANEL_DEVELOP)(menu_cmd.menu)
+app.command("demo", rich_help_panel=PANEL_DEVELOP)(demo_cmd.demo)
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
