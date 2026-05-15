@@ -146,6 +146,44 @@ def _has_any_provider_key() -> bool:
     return any(os.environ.get(k, "").strip() for k in _PROVIDER_KEY_ENV_VARS)
 
 
+def _apply_default_project_dir(target: Path) -> Path:
+    """Substitute the configured default project dir for the default
+    ``Path(".")`` ``target`` if the operator didn't pass ``--at`` /
+    ``--target``.
+
+    Resolution order (highest precedence wins):
+
+    1. Explicit ``--at`` / ``--target`` on the invocation — ``target``
+       is not ``Path(".")``, so this helper returns it unchanged.
+    2. ``default_project_dir`` from ``~/.movate/config.yaml`` (if set).
+    3. cwd (the historical default) — returned by this helper as
+       ``Path(".")`` so downstream logic resolves it via
+       ``target.resolve()``.
+
+    A stderr ``→ using configured ...`` note fires when the configured
+    path is substituted, so operators understand why their project
+    landed at an unexpected location. Quiet by default when the
+    config dir isn't set — no change in shell output for the common
+    cwd-relative case.
+    """
+    if target != Path("."):
+        return target
+    from movate.core.user_config import (  # noqa: PLC0415
+        resolve_default_project_dir,
+    )
+
+    configured = resolve_default_project_dir()
+    if configured is None:
+        return target
+    err_console.print(
+        f"[dim]→ using configured default project dir: "
+        f"[bold]{configured}[/bold] "
+        f"(set via [bold]mdk config set-project-dir[/bold]; "
+        f"override per-call with [bold]--at[/bold])[/dim]"
+    )
+    return configured
+
+
 def _cd_target(project_root: Path) -> str:
     """Pick the right ``cd`` argument for the success Panel's next-steps
     block.
@@ -1170,6 +1208,12 @@ def init(
         raise typer.Exit(code=2)
 
     if project:
+        # Apply ~/.movate/config.yaml's default_project_dir when no
+        # explicit --at / --target was passed. Helper isolated so this
+        # function stays under the PLR0912 branch limit and the
+        # resolution rules live in one place.
+        target = _apply_default_project_dir(target)
+
         # When --with-agents is set, suppress the standalone Project
         # Panel and fold the project metadata into the combined Panel
         # that _scaffold_with_agents renders at the end. Otherwise
