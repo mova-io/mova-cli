@@ -32,6 +32,7 @@ from movate.cli import (  # noqa: E402
     audit_cmd,
     demo_cmd,
     diff_cmd,
+    fix_cmd,
     fmt_cmd,
     menu_cmd,
     migrate_cmd,
@@ -210,6 +211,9 @@ app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 # ----- Diagnose -------------------------------------------------------------
 
 app.command("doctor", rich_help_panel=PANEL_DIAGNOSE)(doctor_cmd.doctor)
+# `fix` is the repair-side companion to `doctor` — same panel.
+# Auto-remediates common diagnostic findings. Dry-run by default.
+app.command("fix", rich_help_panel=PANEL_DIAGNOSE)(fix_cmd.fix)
 app.command("pricing", rich_help_panel=PANEL_DIAGNOSE)(pricing_cmd.pricing)
 
 # ----- Deploy & operate -----------------------------------------------------
