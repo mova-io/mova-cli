@@ -314,12 +314,46 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # ``_add`` above) — no internal Rich state scraping.
     _print_doctor_summary_line(counts)
 
+    # Empty-project hint: inside a movate project with zero agents,
+    # point the operator at the natural next step. Catches new users
+    # who run `mdk init --project` followed by `mdk doctor` and don't
+    # see anything actionable in the table.
+    if target is None and project_yaml.exists():
+        _maybe_offer_empty_project_hint(project_yaml.parent.resolve())
+
     # Interactive handoff to `mdk fix`. Closes the diagnose→fix loop
     # without making operators re-read `mdk fix --list` themselves.
     # Gated on: TTY (not CI / log capture), no --target (Azure preflight
     # context is a separate concern), and at least one fixable issue.
     if target is None and (counts["missing"] > 0 or counts["error"] > 0):
         _maybe_offer_fix(no_prompt=no_fix_prompt)
+
+
+def _maybe_offer_empty_project_hint(project_root: Path) -> None:
+    """Surface a 'no agents yet — add some' hint for new projects.
+
+    Pure UX nudge: when the project root has no agents/ at all OR has
+    an empty agents/ directory, we print a dim Rich line pointing at
+    `mdk add --list`. Doesn't fire if there are already agents — that
+    would be noise for the common case.
+    """
+    agents_dir = project_root / "agents"
+    if not agents_dir.is_dir():
+        return  # Old project layout — skip silently rather than confuse.
+    # `.gitkeep` is the standard placeholder we drop on init; ignore
+    # it when counting "real" agent dirs.
+    real_agents = [
+        p for p in agents_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+    ]
+    if real_agents:
+        return
+    console.print()
+    console.print(
+        "[dim]→ no agents yet in [bold]agents/[/bold]. "
+        "Run [bold]mdk add --list[/bold] to browse role templates, "
+        "or [bold]mdk add rag-qa ticket-triager[/bold] to bootstrap a "
+        "support workspace.[/dim]"
+    )
 
 
 def _maybe_offer_fix(*, no_prompt: bool) -> None:

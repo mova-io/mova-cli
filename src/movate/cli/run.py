@@ -112,7 +112,20 @@ def run(
 
       [dim]# Initial state from a file[/dim]
       $ movate run ./returns-workflow --input initial_state.json
+
+    [bold]Inside a project[/bold] you can pass a bare agent or workflow
+    name (resolved under ``./agents/<name>/`` or ``./workflows/<name>/``):
+
+      [dim]# Both forms work — full path or just the name[/dim]
+      $ mdk run rag-qa '{"question":"..."}'
+      $ mdk run ./agents/rag-qa '{"question":"..."}'
     """
+    # Bare-name resolution: inside a project, `mdk run rag-qa` resolves
+    # to ./agents/rag-qa. Full paths + URLs pass through unchanged.
+    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+
+    path = Path(resolve_agent_or_workflow_arg(str(path)))
+
     if replay_id is not None:
         if input_arg is not None or input_flag is not None:
             console.print(

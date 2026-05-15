@@ -235,13 +235,21 @@ def _init_project(
     )
     if snapshot_short:
         body += f"  • [cyan]snapshot[/cyan]       [dim]{snapshot_short}[/dim] (initial baseline)\n"
+    # Combined cd + first-real-action line is copy-paste-friendly —
+    # operators don't have to retype the project name on the second
+    # line. Defaults to `mdk add --list` (browse role catalog) since
+    # most operators want to see what's available before adding.
+    # Tip about `.env` is deferred to a dim note — the credentials
+    # store (PR #66) means most operators don't need to touch .env.
     body += (
         f"\n[bold]Next steps:[/bold]\n"
-        f"  [dim]$[/dim] [bold]cd {project_root.name}[/bold]\n"
-        f"  [dim]$[/dim] [bold]cp .env.example .env[/bold]"
-        f"   [dim]# then add your API key[/dim]\n"
-        f"  [dim]$[/dim] [bold]mdk init <agent-name>[/bold]  "
-        f"[dim]# scaffold an agent[/dim]"
+        f"  [dim]$[/dim] [bold]cd {project_root.name} && mdk add --list[/bold]"
+        f"   [dim]# browse role templates[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
+        f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
+        f"[dim]API keys: configured globally via "
+        f"[bold]mdk auth login <provider>[/bold]. Per-project [bold].env[/bold] "
+        f"still works as an override.[/dim]"
     )
     console.print(
         Panel(
@@ -256,6 +264,59 @@ def _init_project(
 # ---------------------------------------------------------------------------
 # Agent mode (the original behavior, preserved verbatim)
 # ---------------------------------------------------------------------------
+
+
+def _scaffold_with_agents(
+    *, project_root: Path, agents_csv: str, force: bool
+) -> None:
+    """Scaffold a comma-separated list of role templates inside a
+    just-created project.
+
+    Dispatches to the same ``_add_one`` helper that ``mdk add`` uses,
+    so behavior (auto-validate, template-source marker, skill auto-
+    scaffold, success Panel, summary line) is identical to running
+    ``mdk add <X> <Y> <Z>`` after the fact. The point of this flow is
+    saving the operator one command — same output shape.
+
+    A trailing batch summary fires when 2+ agents are added, again
+    matching the ``mdk add`` end-of-batch behavior.
+    """
+    from movate.cli.add_cmd import _add_one, _render_batch_summary  # noqa: PLC0415
+    from movate.templates import TEMPLATES, list_templates  # noqa: PLC0415
+
+    templates = [t.strip() for t in agents_csv.split(",") if t.strip()]
+    if not templates:
+        return
+
+    # Validate up-front so a typo in slot 3 doesn't leave slots 1 and 2
+    # scaffolded behind a broken third entry. Mirrors `mdk add`.
+    invalid = [t for t in templates if t not in TEMPLATES]
+    if invalid:
+        err_console.print(
+            f"[red]✗[/red] unknown template(s): "
+            f"{', '.join(repr(t) for t in invalid)}.\n"
+            f"[dim]available: {', '.join(list_templates())}[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    # Drop each agent under ./agents/ inside the project root.
+    agents_dir = project_root / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    added_names: list[str] = []
+    for template in templates:
+        _add_one(
+            template=template,
+            agent_name=template,
+            target_dir=agents_dir,
+            force=force,
+            project_root=project_root,
+            no_validate=False,
+            no_skills=False,
+        )
+        added_names.append(template)
+
+    if len(added_names) > 1:
+        _render_batch_summary(added_names, project_root=project_root)
 
 
 def _init_agent(
@@ -804,6 +865,16 @@ def init(
             "Mostly for tests; production use should keep the baseline."
         ),
     ),
+    with_agents: str = typer.Option(
+        None,
+        "--with-agents",
+        help=(
+            "Comma-separated role templates to scaffold immediately after "
+            "the project is created. Only meaningful with [bold]--project[/bold]. "
+            "Example: [bold]--with-agents rag-qa,ticket-triager,code-reviewer[/bold] "
+            "bootstraps a support workspace in one command."
+        ),
+    ),
     llm: str = typer.Option(
         None,
         "--llm",
@@ -891,6 +962,19 @@ def init(
             force=force,
             skip_snapshot=skip_snapshot,
         )
+        # --with-agents X,Y,Z: scaffold each role template inside the
+        # freshly-bootstrapped project. Skipped when the operator is
+        # bootstrapping in place (no name) AND with_agents isn't set,
+        # but works in either layout when explicitly requested.
+        if with_agents:
+            project_root = (
+                (target / name).resolve() if name else target.resolve()
+            )
+            _scaffold_with_agents(
+                project_root=project_root,
+                agents_csv=with_agents,
+                force=force,
+            )
         return
 
     if not name:

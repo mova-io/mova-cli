@@ -289,7 +289,7 @@ def _suggest_template(unknown: str) -> str | None:
     return candidates[0] if candidates else None
 
 
-def add(
+def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
     args: list[str] = typer.Argument(
         None,
         help=(
@@ -512,6 +512,7 @@ def add(
     # and summary line so output stays parseable; the batch shape is
     # an ergonomic shortcut, not a different output format.
     target_dir = target or _default_target(project_root)
+    added_names: list[str] = []
     for template in templates:
         agent_name = rename if rename else template
         _add_one(
@@ -523,6 +524,15 @@ def add(
             no_validate=no_validate,
             no_skills=no_skills,
         )
+        added_names.append(agent_name)
+
+    # End-of-batch hint: when more than one agent was added, surface a
+    # single "Next steps for the SET" Panel pointing at the workspace-
+    # level commands (ci eval, deploy). Per-agent next-steps already
+    # render inside each _add_one Panel; this is the multi-agent
+    # follow-up that today's customers miss.
+    if len(added_names) > 1:
+        _render_batch_summary(added_names, project_root=project_root)
 
 
 def _add_one(
@@ -617,6 +627,36 @@ def _add_one(
         f"target={dest} "
         f"validates={validates_token} "
         f"ok=true[/dim]"
+    )
+
+
+def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None:
+    """Render the end-of-batch summary Panel after a multi-template add.
+
+    Per-agent Panels handle the "what's next for THIS agent" question.
+    This Panel answers the multi-agent follow-up: "what's next for the
+    workspace?" — gate every agent with `mdk ci eval`, deploy them all
+    with `mdk deploy`, etc.
+    """
+    names_str = ", ".join(f"[cyan]{n}[/cyan]" for n in added_names)
+    body = (
+        f"[bold]Added {len(added_names)} agents:[/bold] {names_str}\n"
+        f"[bold]Project:[/bold] [dim]{project_root}[/dim]\n"
+        f"\n[bold]Next steps for the workspace:[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk ci eval --mock[/bold]"
+        f"   [dim]# gate every agent against its baseline[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk doctor agent {added_names[0]}[/bold]"
+        f"   [dim]# per-agent health check[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk deploy --target prod --notify[/bold]"
+        f"   [dim]# ship to Azure with Telegram on success[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title=f"[green]✓[/green] Workspace ready ({len(added_names)} agents)",
+            title_align="left",
+            border_style="green",
+        )
     )
 
 

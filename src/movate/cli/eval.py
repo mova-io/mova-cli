@@ -149,10 +149,19 @@ def eval_(
       [dim]# Black-box eval against a deployed mdk runtime[/dim]
       $ mdk eval https://faq-runtime.example.com \\
           --agent-yaml ./faq-agent --api-key mvt_dev_...
+
+      [dim]# Inside a project, bare names resolve to ./agents/<name>:[/dim]
+      $ mdk eval rag-qa --gate 0.7
     """
     if baseline is not None and baseline_file is not None:
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
+
+    # Bare-name resolution: `mdk eval rag-qa` → `mdk eval ./agents/rag-qa`
+    # when inside a project. URLs + full paths pass through unchanged.
+    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+
+    path = resolve_agent_or_workflow_arg(path)
 
     remote_url = _resolve_remote_url(path)
     if remote_url is not None:

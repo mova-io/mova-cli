@@ -219,6 +219,10 @@ _PROVIDERS_PROMPT_NAME = {
     "azure": "Azure OpenAI",
     "gemini": "Gemini",
     "lyzr": "Lyzr Studio",
+    # Telegram is the deploy-notification channel, not an LLM provider.
+    # Same UX surface as the LLM providers because operators expect
+    # "set up the integration once" to look the same regardless.
+    "telegram": "Telegram bot (deploy notifications)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -228,6 +232,11 @@ _PROVIDER_TO_ENV_VAR = {
     "gemini": "GEMINI_API_KEY",
     "lyzr": "LYZR_API_KEY",
 }
+
+# Telegram needs TWO values (bot token + chat ID), not one — handled
+# via a dedicated code path in `login()` rather than the single-key
+# provider table above. Same auth-login UX surface either way.
+_TELEGRAM_PROVIDERS = frozenset({"telegram"})
 
 
 @auth_app.command("login")
@@ -286,8 +295,15 @@ def login(
     )
 
     provider = provider.lower().strip()
+
+    # Telegram is a separate flow — needs token + chat_id, not a single
+    # key. Dispatched here so the single-key code path below stays clean.
+    if provider in _TELEGRAM_PROVIDERS:
+        _login_telegram(key=key, no_verify=no_verify, save_to=save_to)
+        return
+
     if provider not in _PROVIDER_TO_ENV_VAR:
-        valid = ", ".join(sorted(_PROVIDER_TO_ENV_VAR))
+        valid = ", ".join(sorted(set(_PROVIDER_TO_ENV_VAR) | _TELEGRAM_PROVIDERS))
         error(f"unknown provider {provider!r}. Valid: {valid}")
         raise typer.Exit(code=2)
 
@@ -411,3 +427,115 @@ def status() -> None:
         f"[dim]mdk_auth_status_summary: "
         f"set={counts['ok']} unset={counts['unset']}[/dim]"
     )
+
+
+def _login_telegram(*, key: str | None, no_verify: bool, save_to: str) -> None:
+    """Guided Telegram-bot setup for ``mdk deploy --notify``.
+
+    Telegram needs TWO values:
+      * ``TELEGRAM_BOT_TOKEN`` — from @BotFather (create a bot, get the token)
+      * ``TELEGRAM_CHAT_ID`` — the chat to post to (DM with bot OR group ID)
+
+    Verification: send a test message to the chat. Success means the
+    token works AND the chat is reachable from the bot. Failure could
+    mean bad token, bad chat_id, or the bot isn't a member of the
+    target chat — we surface the HTTP status to disambiguate.
+
+    Saves to ``~/.movate/credentials`` (default) or project ``.env``
+    via the same dispatch as the LLM-provider login flow.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    # The --key flag isn't meaningful for telegram (we need TWO values).
+    # If passed, we'd need a parsing convention; rather than invent one,
+    # require interactive input.
+    if key is not None:
+        error(
+            "[bold]--key[/bold] doesn't apply to telegram (we need both a "
+            "bot token AND a chat ID). Re-run without [bold]--key[/bold] "
+            "for the interactive flow, or set "
+            "[bold]TELEGRAM_BOT_TOKEN[/bold] + [bold]TELEGRAM_CHAT_ID[/bold] "
+            "directly via [bold]mdk secrets set[/bold] / your shell."
+        )
+        raise typer.Exit(code=2)
+
+    hint(
+        "[dim]Telegram bot setup:\n"
+        "  1. Open Telegram, message [bold]@BotFather[/bold], run [bold]/newbot[/bold]\n"
+        "  2. Copy the [bold]HTTP API token[/bold] BotFather gives you\n"
+        "  3. /start a chat with your bot, then visit\n"
+        "     [bold]https://api.telegram.org/bot<token>/getUpdates[/bold]\n"
+        "     to find the [bold]chat_id[/bold] for the chat you want notifications in[/dim]"
+    )
+    token = typer.prompt(
+        "Telegram bot token", hide_input=True, confirmation_prompt=False
+    ).strip()
+    if not token:
+        error("empty token — aborted.")
+        raise typer.Exit(code=2)
+    chat_id = typer.prompt("Chat ID (numeric)").strip()
+    if not chat_id:
+        error("empty chat_id — aborted.")
+        raise typer.Exit(code=2)
+
+    # Verify by sending a test message. Skipping is the operator's
+    # choice (offline setup, etc.).
+    if not no_verify:
+        import httpx  # noqa: PLC0415
+
+        with stdout.status("sending test message..."):
+            try:
+                resp = httpx.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": (
+                            "✓ mdk auth login telegram — test message. "
+                            "If you see this, deploy notifications are wired."
+                        ),
+                    },
+                    timeout=5.0,
+                )
+            except httpx.HTTPError as exc:
+                err.print(
+                    f"[yellow]⚠[/yellow] verify call failed (network): "
+                    f"{exc}. Saving credentials anyway."
+                )
+                resp = None
+        if resp is not None:
+            if resp.status_code == 200:  # noqa: PLR2004
+                success("test message delivered.")
+            else:
+                error(
+                    f"test message rejected ({resp.status_code}): "
+                    f"{resp.text[:160]}. Double-check the bot token + chat_id, "
+                    "or pass [bold]--no-verify[/bold] to save anyway."
+                )
+                raise typer.Exit(code=2)
+
+    # Persist. Same save-to logic as the LLM login path.
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("TELEGRAM_BOT_TOKEN", token)
+        store.set("TELEGRAM_CHAT_ID", chat_id)
+        success(
+            f"saved [bold]TELEGRAM_BOT_TOKEN[/bold] + "
+            f"[bold]TELEGRAM_CHAT_ID[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+        hint(
+            "[dim]Every [bold]mdk deploy --notify[/bold] on this machine "
+            "will now fire a Telegram message on success.[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"TELEGRAM_BOT_TOKEN={token}\n")
+            fh.write(f"TELEGRAM_CHAT_ID={chat_id}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)

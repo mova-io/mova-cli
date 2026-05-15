@@ -82,7 +82,17 @@ def validate(
         help="Skip the prompt linter (schema + policy checks still run).",
     ),
 ) -> None:
-    """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references."""
+    """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references.
+
+    Inside a project you can pass a bare name (``mdk validate rag-qa``);
+    it resolves under ``./agents/<name>/`` or ``./workflows/<name>/``.
+    """
+    # Bare-name resolution: `mdk validate rag-qa` → `./agents/rag-qa`
+    # when inside a project. Full paths pass through unchanged.
+    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+
+    path = Path(resolve_agent_or_workflow_arg(str(path)))
+
     if is_workflow_path(path):
         _validate_workflow(path)
     else:
