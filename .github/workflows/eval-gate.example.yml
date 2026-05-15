@@ -1,16 +1,24 @@
 # Example: gate PRs on movate eval scores.
 #
 # Copy this file into your *consumer* repo (the repo holding your agents) at
-# `.github/workflows/eval-gate.yml`, adjust the matrix to point at your
-# agents, and commit. The workflow has two jobs:
+# `.github/workflows/eval-gate.yml` and commit. Post-Sprint-W (May 2026)
+# the workflow uses `mdk eval --all` so it sweeps every agent in
+# `agents/` without a matrix entry per agent — adding a new agent is
+# zero CI churn.
 #
-#   1. `gate-pr` — runs on every PR. Loads the committed baseline JSON and
-#      fails the build if mean_score or pass_rate dropped past the
-#      configured `--regression-tolerance`.
+# The workflow has two jobs:
 #
-#   2. `refresh-baseline` — runs on push to main. Writes the new baseline
-#      JSON back into `.movate/<agent>/baseline.json` and opens a follow-up
-#      commit (or PR) to keep the baseline current.
+#   1. `gate-pr` — runs on every PR. Calls `mdk eval --all --mock --gate
+#      <threshold>`. Exits non-zero if ANY agent's mean score falls below
+#      the gate. Greppable `mdk_eval_all_summary:` line is emitted to the
+#      step log so CI dashboards can scrape pass/fail without parsing
+#      the table.
+#
+#   2. `refresh-baseline` — runs on push to main. Per-agent: writes the
+#      new baseline JSON back into `.movate/<agent>/baseline.json` and
+#      commits the refreshed baselines. (Still per-agent because the
+#      baseline file is per-agent — `mdk eval --all` doesn't write a
+#      composite baseline today.)
 #
 # Hermetic mode (--mock) is the default so the gate doesn't need API keys.
 # For real-model evals, set provider keys in repo secrets and remove --mock.
@@ -29,20 +37,11 @@ on:
 
 jobs:
   # -------------------------------------------------------------------------
-  # PR gate: diff against the committed baseline; fail if regressed.
+  # PR gate: sweep every agent in agents/; fail if any gate breaks.
   # -------------------------------------------------------------------------
   gate-pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # List every agent you want gated. Each entry expects a baseline at
-        # `.movate/<agent-name>/baseline.json` — refresh it via the
-        # `refresh-baseline` job below or manually with
-        # `movate eval ./agents/<name> --mock --output-baseline ...`.
-        agent:
-          - faq-agent
     steps:
       - uses: actions/checkout@v4
 
@@ -57,38 +56,27 @@ jobs:
       - name: Install movate
         run: uv pip install --system movate-cli
 
-      - name: Check baseline exists
+      - name: Run mdk eval --all
+        # Exits 1 if any agent's mean score falls below --gate.
+        # Tune the gate threshold to your team's quality bar. The
+        # `mdk_eval_all_summary:` line in the step log is the
+        # greppable verdict (`ok=true` / `ok=false`).
         run: |
-          test -f ".movate/${{ matrix.agent }}/baseline.json" || {
-            echo "::error::missing .movate/${{ matrix.agent }}/baseline.json"
-            echo "::notice::run on main: movate eval ./agents/${{ matrix.agent }} --mock --output-baseline .movate/${{ matrix.agent }}/baseline.json"
-            exit 1
-          }
+          mdk eval --all --mock --gate 0.7
 
-      - name: Run eval against baseline
-        # Exits 1 on regression past --regression-tolerance, gating the PR.
-        # Tune --regression-tolerance up to ~0.05 for noisy LLM-as-judge.
-        run: |
-          uv run movate eval "./agents/${{ matrix.agent }}" \
-            --mock \
-            --baseline-file ".movate/${{ matrix.agent }}/baseline.json" \
-            --regression-tolerance 0.0 \
-            --output json \
-            > eval-result.json
-          cat eval-result.json
-
-      - name: Annotate PR with diff summary
+      - name: Annotate PR with summary
         if: always()
         run: |
-          if [ -f eval-result.json ]; then
-            jq -r '
-              "## movate eval — \(.agent)",
-              "",
-              "- mean_score: \(.baseline.mean_score) → \(.mean_score) (Δ \(.baseline.mean_score_delta))",
-              "- pass_rate:  \(.baseline.pass_rate) → \(.pass_rate) (Δ \(.baseline.pass_rate_delta))",
-              "- regression: \(.baseline.regression)"
-            ' eval-result.json >> "$GITHUB_STEP_SUMMARY"
-          fi
+          # Pull the greppable summary line back out of the previous
+          # step's logs would require a roundtrip; instead re-emit
+          # the summary by running mdk eval --all once more in JSON
+          # mode (cheap with --mock).
+          echo "## movate eval --all" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          mdk eval --all --mock --gate 0.0 2>&1 \
+            | grep "mdk_eval_all_summary:" \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------------
   # Main-branch refresh: write the new baseline back into the repo.

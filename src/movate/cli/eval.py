@@ -43,17 +43,27 @@ err_console = Console(stderr=True)
 
 
 def eval_(
-    path: str = typer.Argument(
-        ...,
+    path: str | None = typer.Argument(
+        None,
         help=(
             "Path to an agent directory OR a base URL of a deployed movate "
             "runtime (http://… or https://…). With a URL, each dataset case "
             "is submitted as a job, polled to terminal, and the resulting "
             "RunRecord is scored — no local provider is invoked. Requires "
             "--agent-yaml so the local copy provides the dataset and output "
-            "schema for scoring."
+            "schema for scoring. Omit with [bold]--all[/bold] to sweep every "
+            "agent in the current project."
         ),
         shell_complete=complete_agent_path,
+    ),
+    all_in_project: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Evaluate every agent under [bold]./agents/[/bold] in the current "
+            "project. Aggregates results into a summary table; exits non-zero "
+            "if any agent fails its gate. The CI eval-gate workflow uses this."
+        ),
     ),
     gate: float = typer.Option(0.7, "--gate", help="Per-case score required to pass (0.0-1.0)."),
     gate_mode: str = typer.Option(
@@ -157,6 +167,31 @@ def eval_(
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
 
+    # `--all`: evaluate every agent in the current project. Mutex
+    # with a path argument. Dispatches to the sweep helper below.
+    if all_in_project:
+        if path is not None and path not in (".", ""):
+            err_console.print(
+                "[red]✗[/red] [bold]--all[/bold] and an explicit path "
+                "argument are mutually exclusive."
+            )
+            raise typer.Exit(code=2)
+        _eval_all_in_project(
+            gate=gate,
+            gate_mode=gate_mode,
+            runs=runs,
+            mock=mock,
+            regression_tolerance=regression_tolerance,
+        )
+        return
+
+    if path is None:
+        err_console.print(
+            "[red]✗[/red] path required (or pass [bold]--all[/bold] to "
+            "evaluate every agent in the project)."
+        )
+        raise typer.Exit(code=2)
+
     # Bare-name resolution: `mdk eval rag-qa` → `mdk eval ./agents/rag-qa`
     # when inside a project. URLs + full paths pass through unchanged.
     from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
@@ -214,6 +249,134 @@ def eval_(
             remote_api_key=api_key if remote_url else None,
         )
     )
+
+
+def _eval_all_in_project(
+    *,
+    gate: float,
+    gate_mode: str,
+    runs: int,
+    mock: bool,
+    regression_tolerance: float,
+) -> None:
+    """Evaluate every agent under ``./agents/`` in the current project.
+
+    Walks ``<project>/agents/*/agent.yaml``, invokes the standard
+    ``eval_`` flow once per agent, aggregates results into a Rich
+    summary table, and emits a greppable ``mdk_eval_all_summary:``
+    line. Exits 0 if every agent's eval passes its gate; exits 2 if
+    any fail.
+
+    Used by the CI eval-gate workflow (`.github/workflows/eval-gate.yml`)
+    so a single CI step covers the whole project without operators
+    maintaining a matrix in their workflow file.
+    """
+    from rich.table import Table  # noqa: PLC0415
+
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
+    # Walk up to find the project root.
+    current = Path.cwd().resolve()
+    project_root: Path | None = None
+    while True:
+        if is_project_root(current):
+            project_root = current
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    if project_root is None:
+        err_console.print(
+            "[red]✗[/red] not inside a movate project. "
+            "[dim]Run [bold]mdk init <name>[/bold] first, or pass a "
+            "path argument to evaluate one agent.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    agents_dir = project_root / "agents"
+    agent_dirs = (
+        sorted(p.parent for p in agents_dir.glob("*/agent.yaml")) if agents_dir.is_dir() else []
+    )
+    if not agent_dirs:
+        err_console.print(
+            "[yellow]⚠[/yellow] no agents found under "
+            f"[dim]{agents_dir}[/dim]. "
+            "[dim]Add agents via [bold]mdk add <template>[/bold] first.[/dim]"
+        )
+        # Not an error — empty project is a valid state. Greppable line
+        # still fires so CI can detect the empty-eval case.
+        console.print("[dim]mdk_eval_all_summary: agents_total=0 passed=0 failed=0 ok=true[/dim]")
+        return
+
+    # Per-agent results.
+    rows: list[tuple[str, str]] = []
+    failed = 0
+
+    for agent_dir in agent_dirs:
+        try:
+            bundle = load_agent(agent_dir)
+        except AgentLoadError as exc:
+            rows.append((agent_dir.name, f"[red]✗ load failed[/red]: {str(exc)[:80]}"))
+            failed += 1
+            continue
+
+        # Run eval; capture pass/fail from the same async path that the
+        # single-agent `mdk eval` uses. Re-raises typer.Exit on gate
+        # failure — catch and record per-agent rather than aborting.
+        try:
+            asyncio.run(
+                _run_eval(
+                    bundle,
+                    gate=gate,
+                    gate_mode=gate_mode,
+                    runs=runs,
+                    mock=mock,
+                    baseline_id=None,
+                    baseline_file=None,
+                    output_baseline=None,
+                    regression_tolerance=regression_tolerance,
+                    objective=None,
+                    output_format=Report.TABLE,
+                    remote_url=None,
+                    remote_api_key=None,
+                )
+            )
+            rows.append((agent_dir.name, "[green]✓ ok[/green]"))
+        except typer.Exit as exc:
+            if exc.exit_code == 0:
+                rows.append((agent_dir.name, "[green]✓ ok[/green]"))
+            else:
+                rows.append((agent_dir.name, "[red]✗ gate failed[/red]"))
+                failed += 1
+
+    # Render the summary table.
+    table = Table(
+        title=(
+            f"Project eval — [bold]{project_root.name}[/bold] [dim]({len(rows)} agent(s))[/dim]"
+        ),
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Agent", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    for name, status in rows:
+        table.add_row(name, status)
+    console.print()
+    console.print(table)
+
+    passed = len(rows) - failed
+    console.print(
+        f"[dim]mdk_eval_all_summary: "
+        f"agents_total={len(rows)} "
+        f"passed={passed} failed={failed} "
+        f"gate={gate} "
+        f"ok={'true' if failed == 0 else 'false'}[/dim]"
+    )
+
+    if failed:
+        raise typer.Exit(code=2)
 
 
 def _resolve_remote_url(path: str) -> str | None:
