@@ -281,15 +281,21 @@ def _render_rich(result: SnapshotDiff, *, show_unchanged: bool) -> None:
 
 
 def _render_row(change: FileChange) -> tuple[str, str, str]:
-    """One row of the file-changes table — colored by kind."""
+    """One row of the file-changes table — colored single-letter kind.
+
+    Compact ``A/M/D`` status letters in the git-status style — much
+    more scannable than "+ added" / "~ modified" / "- removed" on a
+    50-row diff. Operators reading the column see git's familiar
+    A/M/D vocabulary instead of long-form prose.
+    """
     if change.kind == "added":
-        kind = "[green]+ added[/green]"
+        kind = "[green]A[/green]"
         size = _bytes_str(change.after.size) if change.after else "—"
     elif change.kind == "removed":
-        kind = "[red]- removed[/red]"
+        kind = "[red]D[/red]"
         size = _bytes_str(change.before.size) if change.before else "—"
     else:  # modified
-        kind = "[yellow]~ modified[/yellow]"
+        kind = "[yellow]M[/yellow]"
         delta = change.size_delta or 0
         sign = "+" if delta > 0 else ""
         size = f"{sign}{delta} B"

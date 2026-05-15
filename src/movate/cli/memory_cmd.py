@@ -68,12 +68,22 @@ def _store() -> MemoryStore:
 @memory_app.command("list")
 def list_(
     agent: str = typer.Argument(..., help="Agent name to list memory entries for."),
+    since_days: int = typer.Option(
+        0,
+        "--since-days",
+        help=(
+            "Only show entries newer than N days. 0 (default) = no time filter. "
+            "Mirrors [bold]mdk costs report --since-days[/bold]."
+        ),
+    ),
     json_output: bool = typer.Option(
         False, "--json", help="Emit entries as JSON instead of a Rich table."
     ),
 ) -> None:
     """List every memory entry for an agent."""
     entries = asyncio.run(_store().list(agent))
+    if since_days > 0:
+        entries = _filter_entries_by_age(entries, since_days)
     if json_output:
         console.print_json(
             json.dumps(
@@ -306,3 +316,27 @@ def query(
         )
         table.add_row(e.key, truncated, e.created_at)
     console.print(table)
+
+
+def _filter_entries_by_age(entries: list, days: int) -> list:
+    """Keep entries whose ``created_at`` is within ``days`` of now.
+
+    Permissive: entries with unparseable timestamps survive the filter
+    (we don't drop data on a parse glitch). Mirrors the semantics of
+    :func:`movate.cli.costs_cmd._filter_by_since`.
+    """
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    out = []
+    for e in entries:
+        try:
+            ts = datetime.fromisoformat(e.created_at.rstrip("Z")).replace(tzinfo=UTC)
+        except (ValueError, AttributeError):
+            # Keep the entry — unparseable timestamp is a data
+            # quality issue, not a reason to drop the row.
+            out.append(e)
+            continue
+        if ts >= cutoff:
+            out.append(e)
+    return out

@@ -82,6 +82,33 @@ def _validate_name(name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@profiles_app.command("current")
+def current() -> None:
+    """Print the active profile name (or exit 1 if none set).
+
+    Plain stdout — no Rich. Designed for shell substitution:
+
+      [dim]$ MY_PROFILE=$(mdk profiles current)[/dim]
+      [dim]$ mdk secrets list --profile "$MY_PROFILE"[/dim]
+
+    Faster typing than [bold]mdk profiles show --active-only[/bold] for
+    the single most-asked profile question. Same vibe as
+    [bold]git branch --show-current[/bold].
+    """
+    import sys  # noqa: PLC0415
+
+    from movate.profiles import get_active_profile  # noqa: PLC0415
+
+    active = get_active_profile()
+    if not active:
+        err_console.print(
+            "[red]✗[/red] no active profile. "
+            "[dim]Run [bold]mdk profiles use <name>[/bold] to set one.[/dim]"
+        )
+        raise typer.Exit(code=1)
+    sys.stdout.write(active + "\n")
+
+
 @profiles_app.command("list")
 def list_() -> None:
     """List every registered profile; mark the active one with *.
@@ -221,11 +248,32 @@ def use(
         err_console.print(f"[red]✗[/red] {exc}")
         raise typer.Exit(code=1) from None
 
+    # Capture the prior profile BEFORE setting the new one so we can
+    # echo the transition. Operators currently switch then run
+    # `profiles show` to confirm; this removes that round-trip.
+    from movate.profiles import get_active_profile  # noqa: PLC0415
+
+    prior = get_active_profile()
     set_active_profile(profile.name)
-    console.print(
-        f"[green]✓[/green] active profile: [bold cyan]{profile.name}[/bold cyan]"
-        + (f"  [dim]({profile.description})[/dim]" if profile.description else "")
-    )
+
+    if prior == profile.name:
+        # No-op switch (operator re-activating the active profile);
+        # don't pretend there was a transition.
+        console.print(
+            f"[dim]✓ already active:[/dim] [bold cyan]{profile.name}[/bold cyan]"
+        )
+    elif prior:
+        console.print(
+            f"[green]✓[/green] switched: "
+            f"[dim]{prior}[/dim] → [bold cyan]{profile.name}[/bold cyan]"
+            + (f"  [dim]({profile.description})[/dim]" if profile.description else "")
+        )
+    else:
+        # First-time activation — no prior to show.
+        console.print(
+            f"[green]✓[/green] active profile: [bold cyan]{profile.name}[/bold cyan]"
+            + (f"  [dim]({profile.description})[/dim]" if profile.description else "")
+        )
 
 
 # ---------------------------------------------------------------------------

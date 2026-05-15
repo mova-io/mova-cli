@@ -191,6 +191,9 @@ def list_(
         show_lines=False,
     )
     table.add_column("Hash", style="cyan", no_wrap=True)
+    # "Age" column reads like git-log's relative time — scannable on
+    # a 30-row table where the absolute ISO timestamp is just noise.
+    table.add_column("Age", style="dim", no_wrap=True)
     table.add_column("When", style="dim", no_wrap=True)
     table.add_column("Files", justify="right", style="dim", no_wrap=True)
     table.add_column("Agents", justify="right", style="dim", no_wrap=True)
@@ -200,12 +203,54 @@ def list_(
         short = manifest.hash.removeprefix("sha256:")[:8]
         table.add_row(
             short,
+            _relative_age(manifest.created_at),
             manifest.created_at,
             str(len(manifest.files)),
             str(manifest.agent_count),
             manifest.description or "[dim]—[/dim]",
         )
     console.print(table)
+
+
+def _relative_age(iso_ts: str) -> str:
+    """Render an ISO-8601 timestamp as 'N{s,m,h,d,w} ago'.
+
+    Permissive — unparseable input renders as "—" so a corrupted
+    manifest never blows up the list view. Matches the granularity
+    operators expect from ``git log --format=%ar``:
+
+      <60s   →  Xs
+      <60m   →  Xm
+      <24h   →  Xh
+      <14d   →  Xd
+      else   →  Xw
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    try:
+        # The manifest stores `2026-05-15T14:00:00.123Z`. fromisoformat
+        # accepts that shape if we drop the trailing 'Z' (single char,
+        # not a multi-char suffix — keep ms precision intact).
+        trimmed = iso_ts.removesuffix("Z")
+        ts = datetime.fromisoformat(trimmed).replace(tzinfo=UTC)
+    except (ValueError, AttributeError):
+        return "—"
+    now = datetime.now(UTC)
+    delta = (now - ts).total_seconds()
+    if delta < 0:
+        # Clock skew or test-injected future time — render as "now"
+        # rather than a confusing "-3s".
+        return "now"
+    minute, hour, day, week = 60, 3600, 86400, 86400 * 7
+    if delta < minute:
+        return f"{int(delta)}s ago"
+    if delta < hour:
+        return f"{int(delta / minute)}m ago"
+    if delta < day:
+        return f"{int(delta / hour)}h ago"
+    if delta < day * 14:
+        return f"{int(delta / day)}d ago"
+    return f"{int(delta / week)}w ago"
 
 
 # ---------------------------------------------------------------------------
