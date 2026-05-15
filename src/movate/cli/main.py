@@ -75,6 +75,7 @@ from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
+from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
@@ -281,6 +282,10 @@ app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
 app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
+# `memory` exposes the Sprint T MVP — list/get/set/evict/summarise/
+# query against the operator-facing memory store. Lives in MANAGE
+# alongside other state-managing commands (secrets, profiles, etc.).
+app.add_typer(memory_app, name="memory", rich_help_panel=PANEL_MANAGE)
 
 
 if __name__ == "__main__":
