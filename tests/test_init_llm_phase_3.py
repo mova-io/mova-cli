@@ -90,9 +90,7 @@ def mock_canned_response(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set MOVATE_MOCK_RESPONSE to a valid GeneratedAgent payload whose
     `agent_yaml.name` is DIFFERENT from what the CLI will pass —
     so the name-constraint test can verify the override fires."""
-    monkeypatch.setenv(
-        "MOVATE_MOCK_RESPONSE", json.dumps(_valid_agent_payload("canned-name"))
-    )
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", json.dumps(_valid_agent_payload("canned-name")))
 
 
 @pytest.fixture
@@ -181,9 +179,7 @@ class TestSafeCost:
     def test_zero_tokens_returns_zero(self) -> None:
         """Empty usage → zero cost (not ``None``). The provider was
         called and pricing succeeded; nothing was actually billed."""
-        cost = _safe_cost(
-            model="openai/gpt-4o-mini-2024-07-18", tokens=TokenUsage()
-        )
+        cost = _safe_cost(model="openai/gpt-4o-mini-2024-07-18", tokens=TokenUsage())
         assert cost == 0.0
 
 

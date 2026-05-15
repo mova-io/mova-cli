@@ -72,7 +72,7 @@ def _valid_agent_payload(name: str = "test-agent") -> dict:
             },
             "evals": {"dataset": "./evals/dataset.jsonl"},
         },
-        "prompt_md": "Echo the user input:\n{{ input.text }}\nReply: {\"message\": \"...\"}",
+        "prompt_md": 'Echo the user input:\n{{ input.text }}\nReply: {"message": "..."}',
         "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -471,12 +471,8 @@ def test_llm_scaffolded_agent_passes_mdk_validate(
     )
     assert init_result.exit_code == 0, init_result.stdout + init_result.stderr
 
-    validate_result = runner.invoke(
-        app, ["validate", str(tmp_path / "validated-agent")]
-    )
-    assert validate_result.exit_code == 0, (
-        validate_result.stdout + validate_result.stderr
-    )
+    validate_result = runner.invoke(app, ["validate", str(tmp_path / "validated-agent")])
+    assert validate_result.exit_code == 0, validate_result.stdout + validate_result.stderr
 
 
 # ---------------------------------------------------------------------------

@@ -53,8 +53,7 @@ CANONICAL: dict[str, tuple[dict, str]] = {
             "question": "What is the refund window?",
             "context": ["Refunds are honored within 30 days of purchase."],
         },
-        '{"answer": "30 days.", "citations": [1], "grounded": true, '
-        '"confidence": 0.95}',
+        '{"answer": "30 days.", "citations": [1], "grounded": true, "confidence": 0.95}',
     ),
     "ticket-triager": (
         {"subject": "Login broken", "body": "Cannot log in since this morning."},
@@ -133,9 +132,7 @@ CANONICAL: dict[str, tuple[dict, str]] = {
     "compliance-checker": (
         {
             "text": "Our product cures headaches in 5 minutes guaranteed.",
-            "rules": [
-                {"id": "R1", "description": "No absolute medical claims."}
-            ],
+            "rules": [{"id": "R1", "description": "No absolute medical claims."}],
         },
         '{"compliant": false, "violations": [{'
         '"rule_id": "R1", "excerpt": "cures headaches", "severity": "high", '

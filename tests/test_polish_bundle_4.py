@@ -55,9 +55,7 @@ class TestAuditFixCommandEmbed:
             "schema-no-required",
         }
         leaked = v2_categories & set(_CATEGORY_TO_FIX_COMMAND)
-        assert leaked == set(), (
-            f"v2 scanner(s) gained a fix mapping unexpectedly: {leaked}"
-        )
+        assert leaked == set(), f"v2 scanner(s) gained a fix mapping unexpectedly: {leaked}"
 
     def test_render_includes_fix_command_for_mapped_category(
         self, capsys: pytest.CaptureFixture[str]
@@ -206,9 +204,7 @@ def test_eval_table_emits_pass_header_and_summary_line(
     """Table mode: PASS banner + mdk_eval_summary line both appear."""
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_dir = _scaffold_eval_agent(tmp_path / "alpha", name="alpha")
-    result = runner.invoke(
-        app, ["eval", str(agent_dir), "--mock", "--gate", "0.5"]
-    )
+    result = runner.invoke(app, ["eval", str(agent_dir), "--mock", "--gate", "0.5"])
     assert result.exit_code == 0, result.stdout + result.stderr
     # PASS banner above the table.
     assert "Eval PASSED" in result.stdout
@@ -228,9 +224,7 @@ def test_eval_table_emits_fail_header_on_gate_miss(
     agent_dir = _scaffold_eval_agent(tmp_path / "beta", name="beta")
     # Sabotage mock response so score = 0.0, failing any gate > 0.
     monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "different"}')
-    result = runner.invoke(
-        app, ["eval", str(agent_dir), "--mock", "--gate", "0.9"]
-    )
+    result = runner.invoke(app, ["eval", str(agent_dir), "--mock", "--gate", "0.9"])
     assert result.exit_code == 1, result.stdout + result.stderr
     assert "Eval FAILED" in result.stdout
     assert "mdk_eval_summary:" in result.stdout
@@ -238,15 +232,11 @@ def test_eval_table_emits_fail_header_on_gate_miss(
 
 
 @pytest.mark.unit
-def test_eval_json_mode_omits_summary_line(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_eval_json_mode_omits_summary_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """JSON output must stay pipeable to jq — no Rich summary line."""
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_dir = _scaffold_eval_agent(tmp_path / "gamma", name="gamma")
-    result = runner.invoke(
-        app, ["eval", str(agent_dir), "--mock", "--gate", "0.5", "-o", "json"]
-    )
+    result = runner.invoke(app, ["eval", str(agent_dir), "--mock", "--gate", "0.5", "-o", "json"])
     assert result.exit_code == 0, result.stdout + result.stderr
     # Summary line must NOT appear — stdout has to remain pure JSON.
     assert "mdk_eval_summary:" not in result.stdout

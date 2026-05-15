@@ -194,9 +194,7 @@ def eval_(
 
                 suggestion = suggest_similar_agent(path)
                 if suggestion:
-                    err_console.print(
-                        f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]"
-                    )
+                    err_console.print(f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]")
             raise typer.Exit(code=2) from None
 
     asyncio.run(

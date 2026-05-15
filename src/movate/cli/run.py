@@ -202,9 +202,7 @@ def _maybe_suggest_fuzzy(path: Path) -> None:
 
     suggestion = suggest_similar_agent(arg_str)
     if suggestion:
-        console.print(
-            f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]"
-        )
+        console.print(f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]")
 
 
 def _suggest_dataset_example(bundle: AgentBundle) -> None:

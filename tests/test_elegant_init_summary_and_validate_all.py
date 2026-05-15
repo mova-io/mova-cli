@@ -164,13 +164,9 @@ class TestElegantInitSummary:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        summary_lines = [
-            line for line in result.stdout.splitlines()
-            if "mdk_add_summary:" in line
-        ]
+        summary_lines = [line for line in result.stdout.splitlines() if "mdk_add_summary:" in line]
         assert len(summary_lines) == 2, (
-            f"expected 2 summary lines, got {len(summary_lines)}: "
-            f"{summary_lines}"
+            f"expected 2 summary lines, got {len(summary_lines)}: {summary_lines}"
         )
         # Each summary line carries the template name.
         joined = "\n".join(summary_lines)
@@ -214,16 +210,11 @@ class TestValidateAll:
         """A freshly-scaffolded project's agents all load cleanly →
         --all exits 0 with every row marked ✓."""
         _bootstrap_with_agents(tmp_path, "rag-qa,ticket-triager", monkeypatch)
-        result = runner.invoke(
-            app, ["validate", "--all"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # Summary line present + reports ok=true.
         summary = next(
-            (
-                line for line in result.stdout.splitlines()
-                if "mdk_validate_summary:" in line
-            ),
+            (line for line in result.stdout.splitlines() if "mdk_validate_summary:" in line),
             None,
         )
         assert summary is not None, result.stdout
@@ -235,22 +226,15 @@ class TestValidateAll:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Break one agent's agent.yaml → --all exits 2 with failed≥1."""
-        project = _bootstrap_with_agents(
-            tmp_path, "rag-qa,ticket-triager", monkeypatch
-        )
+        project = _bootstrap_with_agents(tmp_path, "rag-qa,ticket-triager", monkeypatch)
         # Corrupt one agent's spec — invalid YAML / missing required field.
         broken_yaml = project / "agents" / "rag-qa" / "agent.yaml"
         broken_yaml.write_text("name: rag-qa\n# missing api_version, kind, etc.\n")
 
-        result = runner.invoke(
-            app, ["validate", "--all"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
         assert result.exit_code != 0
         summary = next(
-            (
-                line for line in result.stdout.splitlines()
-                if "mdk_validate_summary:" in line
-            ),
+            (line for line in result.stdout.splitlines() if "mdk_validate_summary:" in line),
             None,
         )
         assert summary is not None
@@ -262,9 +246,7 @@ class TestValidateAll:
     ) -> None:
         """No movate.yaml anywhere up the tree → exit 2 with a hint."""
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(
-            app, ["validate", "--all"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         # The error message points operators at `mdk init --project`.
         combined = result.stdout + result.stderr
@@ -278,20 +260,16 @@ class TestValidateAll:
         summary line."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
-            app, ["init", "--project", "empty", "--skip-snapshot"],
+            app,
+            ["init", "--project", "empty", "--skip-snapshot"],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
         monkeypatch.chdir(tmp_path / "empty")
-        result = runner.invoke(
-            app, ["validate", "--all"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         summary = next(
-            (
-                line for line in result.stdout.splitlines()
-                if "mdk_validate_summary:" in line
-            ),
+            (line for line in result.stdout.splitlines() if "mdk_validate_summary:" in line),
             None,
         )
         assert summary is not None
@@ -303,9 +281,7 @@ class TestValidateAll:
     ) -> None:
         """`mdk validate some-path --all` is almost certainly a typo;
         reject explicitly rather than picking one silently."""
-        project = _bootstrap_with_agents(
-            tmp_path, "rag-qa", monkeypatch
-        )
+        project = _bootstrap_with_agents(tmp_path, "rag-qa", monkeypatch)
         result = runner.invoke(
             app,
             ["validate", str(project / "agents" / "rag-qa"), "--all"],

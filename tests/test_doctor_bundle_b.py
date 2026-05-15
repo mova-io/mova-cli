@@ -112,9 +112,7 @@ class TestFixHandoff:
                 ),
             ],
         ) as mock_fix:
-            result = runner.invoke(
-                app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"}
-            )
+            result = runner.invoke(app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"})
             # Doctor itself succeeds (exit 0 in normal modes).
             assert result.exit_code == 0, result.stdout + result.stderr
             # The handoff message should fire but the prompt is suppressed.
@@ -137,9 +135,7 @@ class TestFixHandoff:
                 FixResult(fix_id="x", status=FixStatus.NOT_NEEDED, message=""),
             ],
         ):
-            result = runner.invoke(
-                app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"}
-            )
+            result = runner.invoke(app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"})
             assert result.exit_code == 0, result.stdout + result.stderr
             # No "mdk fix can auto-resolve" line.
             assert "auto-resolve" not in result.stdout
@@ -181,9 +177,7 @@ class TestAgentDirResolution:
         resolved = _resolve_agent_dir("test-agent", proj)
         assert resolved == (proj / "agents" / "test-agent").resolve()
 
-    def test_resolves_via_walk_up(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_resolves_via_walk_up(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         _scaffold_test_agent(proj, name="test-agent")
         # cd into a subdirectory and resolve by name only.
@@ -214,9 +208,7 @@ class TestDoctorAgent:
         proj = _bootstrap_project(tmp_path)
         _scaffold_test_agent(proj, name="happy-agent")
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["doctor", "agent", "happy-agent"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["doctor", "agent", "happy-agent"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # Every check row label appears.
         for label in (
@@ -238,9 +230,7 @@ class TestDoctorAgent:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(
-            app, ["doctor", "agent", "does-not-exist"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["doctor", "agent", "does-not-exist"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         assert "could not resolve" in result.stderr.lower()
 
@@ -252,9 +242,7 @@ class TestDoctorAgent:
         proj = _bootstrap_project(tmp_path)
         _scaffold_test_agent(proj, name="counted-agent")
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["doctor", "agent", "counted-agent"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["doctor", "agent", "counted-agent"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # Pull the summary line and parse k=v pairs.
         line = next(
@@ -297,15 +285,11 @@ class TestDoctorAgent:
 
 
 @pytest.mark.unit
-def test_default_doctor_still_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_default_doctor_still_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Calling `mdk doctor` with no subcommand must dispatch to the
     env-check callback — the existing flat-command behavior."""
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(
-        app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"}
-    )
+    result = runner.invoke(app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
     # The env-check table renders.
     assert "movate doctor" in result.stdout
@@ -320,9 +304,7 @@ def test_default_doctor_with_existing_flags(
     """The pre-existing flags --explain and --licenses must work on the
     callback path."""
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(
-        app, ["doctor", "--licenses"], env={"COLUMNS": "200"}
-    )
+    result = runner.invoke(app, ["doctor", "--licenses"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
     # --licenses takes a different render path (license posture table).
     assert "license posture" in result.stdout.lower()

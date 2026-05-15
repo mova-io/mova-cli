@@ -140,8 +140,7 @@ def _verify_azure_openai(key: str) -> VerifyResult:
     return VerifyResult(
         ok=True,
         detail=(
-            "verification skipped — Azure OpenAI needs endpoint + "
-            "deployment name; saving key as-is"
+            "verification skipped — Azure OpenAI needs endpoint + deployment name; saving key as-is"
         ),
     )
 

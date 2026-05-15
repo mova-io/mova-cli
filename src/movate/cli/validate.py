@@ -179,12 +179,16 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
         raise typer.Exit(code=2)
 
     # Discover targets. Sorted for deterministic output across runs.
-    agent_dirs = sorted(
-        p.parent for p in (project_root / "agents").glob("*/agent.yaml")
-    ) if (project_root / "agents").is_dir() else []
-    workflow_dirs = sorted(
-        p.parent for p in (project_root / "workflows").glob("*/workflow.yaml")
-    ) if (project_root / "workflows").is_dir() else []
+    agent_dirs = (
+        sorted(p.parent for p in (project_root / "agents").glob("*/agent.yaml"))
+        if (project_root / "agents").is_dir()
+        else []
+    )
+    workflow_dirs = (
+        sorted(p.parent for p in (project_root / "workflows").glob("*/workflow.yaml"))
+        if (project_root / "workflows").is_dir()
+        else []
+    )
 
     if not agent_dirs and not workflow_dirs:
         console.print(

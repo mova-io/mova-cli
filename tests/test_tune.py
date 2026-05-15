@@ -76,9 +76,7 @@ class TestParseSweep:
         assert values == [128, 512, 1024]
 
     def test_model(self) -> None:
-        key, values = _parse_sweep(
-            "model=openai/gpt-4o-mini,anthropic/claude-haiku-4-5-20251001"
-        )
+        key, values = _parse_sweep("model=openai/gpt-4o-mini,anthropic/claude-haiku-4-5-20251001")
         assert key == "model"
         assert values == ["openai/gpt-4o-mini", "anthropic/claude-haiku-4-5-20251001"]
 

@@ -68,9 +68,9 @@ class TestInitWithAgents:
         assert (tmp_path / "support-bot" / "movate.yaml").is_file()
         # All three agents scaffolded.
         for name in ("rag-qa", "ticket-triager", "code-reviewer"):
-            assert (
-                tmp_path / "support-bot" / "agents" / name / "agent.yaml"
-            ).is_file(), f"missing agent: {name}"
+            assert (tmp_path / "support-bot" / "agents" / name / "agent.yaml").is_file(), (
+                f"missing agent: {name}"
+            )
 
     def test_with_agents_unknown_template_errors_before_partial_scaffold(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -123,14 +123,9 @@ class TestInitWithAgents:
 @pytest.mark.unit
 class TestAgentNameResolution:
     def test_resolver_passes_through_urls(self) -> None:
-        assert (
-            resolve_agent_or_workflow_arg("https://example.com")
-            == "https://example.com"
-        )
+        assert resolve_agent_or_workflow_arg("https://example.com") == "https://example.com"
 
-    def test_resolver_passes_through_existing_paths(
-        self, tmp_path: Path
-    ) -> None:
+    def test_resolver_passes_through_existing_paths(self, tmp_path: Path) -> None:
         existing = tmp_path / "existing-dir"
         existing.mkdir()
         assert resolve_agent_or_workflow_arg(str(existing)) == str(existing)
@@ -162,13 +157,9 @@ class TestAgentNameResolution:
     ) -> None:
         monkeypatch.chdir(tmp_path)
         # No movate.yaml anywhere — bare names pass through.
-        assert (
-            resolve_agent_or_workflow_arg("some-name") == "some-name"
-        )
+        assert resolve_agent_or_workflow_arg("some-name") == "some-name"
 
-    def test_resolver_finds_workflow(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_resolver_finds_workflow(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         wf_dir = proj / "workflows" / "support"
         wf_dir.mkdir(parents=True)
@@ -191,9 +182,7 @@ class TestAuthLoginTelegram:
     ) -> None:
         """Passing a bogus provider must mention telegram in the valid
         list (it was added as a special-case provider)."""
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "bogus-name", "--key", "x", "--no-verify"],
@@ -206,9 +195,7 @@ class TestAuthLoginTelegram:
     ) -> None:
         """--key doesn't apply to telegram (needs TWO values). Reject
         with a helpful error pointing at the interactive flow."""
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "telegram", "--key", "fake-token"],
@@ -225,9 +212,7 @@ class TestAuthLoginTelegram:
         TELEGRAM_CHAT_ID should land in the credentials store."""
         from movate.credentials import CredentialsStore  # noqa: PLC0415
 
-        monkeypatch.setenv(
-            "MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds")
-        )
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
         result = runner.invoke(
             app,
             ["auth", "login", "telegram", "--no-verify"],
@@ -275,9 +260,7 @@ class TestBatchSummary:
         single agent."""
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["add", "rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # Single-add Panel still renders.
         assert "Added rag-qa agent" in result.stdout
@@ -297,9 +280,7 @@ class TestDoctorEmptyProjectHint:
     ) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # Hint references mdk add --list (the natural next command).
         assert "mdk add --list" in result.stdout
@@ -313,9 +294,7 @@ class TestDoctorEmptyProjectHint:
         proj = _bootstrap_project(tmp_path)
         (proj / "agents" / "existing-agent").mkdir()
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["doctor", "--no-fix-prompt"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # No empty-project hint fires.
         assert "no agents yet" not in result.stdout.lower()

@@ -67,9 +67,7 @@ class TestScaffoldAndLoad:
     """
 
     @pytest.mark.parametrize("template", ROLE_TEMPLATES)
-    def test_template_scaffolds_and_loads(
-        self, template: str, tmp_path: Path
-    ) -> None:
+    def test_template_scaffolds_and_loads(self, template: str, tmp_path: Path) -> None:
         agent_name = template + "-smoke"
         result = runner.invoke(
             app,
@@ -112,9 +110,7 @@ class TestPromptRenders:
     Jinja syntax + that the schema and prompt agree on field names."""
 
     @pytest.mark.parametrize("template", ROLE_TEMPLATES)
-    def test_prompt_renders_with_first_dataset_row(
-        self, template: str, tmp_path: Path
-    ) -> None:
+    def test_prompt_renders_with_first_dataset_row(self, template: str, tmp_path: Path) -> None:
         agent_name = template + "-render"
         result = runner.invoke(
             app,

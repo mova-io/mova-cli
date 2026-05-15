@@ -146,6 +146,33 @@ def _has_any_provider_key() -> bool:
     return any(os.environ.get(k, "").strip() for k in _PROVIDER_KEY_ENV_VARS)
 
 
+def _cd_target(project_root: Path) -> str:
+    """Pick the right ``cd`` argument for the success Panel's next-steps
+    block.
+
+    Returns:
+
+    * The project's name (e.g. ``support-bot``) when ``project_root``
+      is a direct child of cwd — the common case when the operator
+      omitted ``--target`` / ``--at`` and the project lands at
+      ``./support-bot/``. Copy-paste-friendly without an absolute path.
+    * The absolute path when ``project_root`` is outside cwd — e.g.
+      when the operator passed ``--at ~/work``, the panel should say
+      ``cd /Users/.../work/support-bot`` so the line works as-is no
+      matter where they ran ``mdk init`` from.
+    """
+    try:
+        rel = project_root.relative_to(Path.cwd())
+    except ValueError:
+        # project_root is outside cwd → absolute path is the only safe
+        # copy-paste target.
+        return str(project_root)
+    rel_str = str(rel)
+    # rel == "." would happen if the operator bootstrapped in place —
+    # the cd line is nonsense there; fall back to absolute.
+    return rel_str if rel_str != "." else str(project_root)
+
+
 def _is_in_project() -> bool:
     """Walk up from cwd looking for ``movate.yaml`` — the same
     convention :mod:`movate.cli.add_cmd` uses. Lets ``mdk init``
@@ -274,6 +301,7 @@ def _init_project(
     # point at the next stage (validate / run / eval). If not, the
     # suggestions point at adding agents — plus a discoverability tip
     # about `--with-agents`.
+    cd_to = _cd_target(project_root)
     if with_agents:
         # Agents already added by the caller. Show forward-looking
         # commands: doctor agent / run / eval / deploy.
@@ -282,7 +310,7 @@ def _init_project(
         body += (
             f"\n[bold]Next steps[/bold] "
             f"[dim](you already added {len(agent_list)} agent(s))[/dim][bold]:[/bold]\n"
-            f"  [dim]$[/dim] [bold]cd {project_root.name}[/bold]\n"
+            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]\n"
             f"  [dim]$[/dim] [bold]mdk doctor agent {first_agent}[/bold]"
             f"   [dim]# per-agent health check[/dim]\n"
             f"  [dim]$[/dim] [bold]mdk run {first_agent} '{{...}}'[/bold]"
@@ -296,7 +324,7 @@ def _init_project(
         # one-command alternative for next time.
         body += (
             f"\n[bold]Next steps:[/bold]\n"
-            f"  [dim]$[/dim] [bold]cd {project_root.name} && mdk add --list[/bold]"
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk add --list[/bold]"
             f"   [dim]# browse role templates[/dim]\n"
             f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
             f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
@@ -417,9 +445,7 @@ def _render_combined_init_summary(
         f"[bold]Path:[/bold]      [cyan]{project_root}[/cyan]",
     ]
     if snapshot_short:
-        lines.append(
-            f"[bold]Snapshot:[/bold]  [dim]{snapshot_short}[/dim] (initial baseline)"
-        )
+        lines.append(f"[bold]Snapshot:[/bold]  [dim]{snapshot_short}[/dim] (initial baseline)")
     lines.append("")
     lines.append(f"[bold]Agents added ({n_agents}):[/bold]")
 
@@ -432,8 +458,10 @@ def _render_combined_init_summary(
         # registered by extension packages).
         desc, _feature = role_descriptions.get(template, ("", ""))
         marker = (
-            "[green]✓[/green]" if validates == "true"
-            else "[yellow]⚠[/yellow]" if validates == "false"
+            "[green]✓[/green]"
+            if validates == "true"
+            else "[yellow]⚠[/yellow]"
+            if validates == "false"
             else "[dim]·[/dim]"
         )
         line = f"  {marker} [cyan]{agent_name}[/cyan]"
@@ -445,11 +473,12 @@ def _render_combined_init_summary(
     # follow-up (one command to confirm every agent loads cleanly) and
     # `mdk eval --gate` is the standard CI gate.
     first_name = str(added[0]["name"]) if added else "<agent>"
+    cd_to = _cd_target(project_root)
     lines.extend(
         [
             "",
             "[bold]Next steps:[/bold]",
-            f"  [dim]$[/dim] [bold]cd {project_root.name}[/bold]",
+            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]",
             "  [dim]$[/dim] [bold]mdk validate --all[/bold]"
             "   [dim]# confirm every agent loads cleanly[/dim]",
             f"  [dim]$[/dim] [bold]mdk run {first_name} '{{...}}'[/bold]"
@@ -729,8 +758,12 @@ async def _run_llm_scaffold(
                     f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]"
                 )
                 _print_init_summary_line(
-                    name=name, llm=True, model=llm_model,
-                    tokens=total_tokens, ok=False, retried=True,
+                    name=name,
+                    llm=True,
+                    model=llm_model,
+                    tokens=total_tokens,
+                    ok=False,
+                    retried=True,
                 )
                 raise typer.Exit(code=2) from None
 
@@ -746,8 +779,12 @@ async def _run_llm_scaffold(
                     f"description.[/dim]"
                 )
                 _print_init_summary_line(
-                    name=name, llm=True, model=llm_model,
-                    tokens=total_tokens, ok=False, retried=True,
+                    name=name,
+                    llm=True,
+                    model=llm_model,
+                    tokens=total_tokens,
+                    ok=False,
+                    retried=True,
                 )
                 raise typer.Exit(code=1)
     finally:
@@ -765,8 +802,12 @@ async def _run_llm_scaffold(
         _render_dry_run_preview(generated, name=name, dest=dest)
         _emit_post_success_hint(_console, dry_run=True)
         _print_init_summary_line(
-            name=name, llm=True, model=llm_model,
-            tokens=total_tokens, ok=True, retried=retried,
+            name=name,
+            llm=True,
+            model=llm_model,
+            tokens=total_tokens,
+            ok=True,
+            retried=retried,
         )
         return
 
@@ -785,8 +826,12 @@ async def _run_llm_scaffold(
     _render_success_panel(name=name, dest=dest, generated=generated, cost_usd=cost_usd)
     _emit_post_success_hint(_console, dry_run=False)
     _print_init_summary_line(
-        name=name, llm=True, model=llm_model,
-        tokens=total_tokens, ok=True, retried=retried,
+        name=name,
+        llm=True,
+        model=llm_model,
+        tokens=total_tokens,
+        ok=True,
+        retried=retried,
     )
 
 
@@ -858,9 +903,7 @@ def _render_dry_run_preview(generated: Any, *, name: str, dest: Path) -> None:
     )
 
 
-def _render_success_panel(
-    *, name: str, dest: Path, generated: Any, cost_usd: float | None
-) -> None:
+def _render_success_panel(*, name: str, dest: Path, generated: Any, cost_usd: float | None) -> None:
     """Print the success Panel — mirrors the template-copy success path."""
     body = (
         f"[bold]Agent:[/bold]    [cyan]{name}[/cyan]\n"
@@ -935,8 +978,7 @@ def _emit_post_success_hint(console_module: Any, *, dry_run: bool) -> None:
     respects ``--quiet`` (CI runs that pipe stderr stay clean)."""
     if dry_run:
         console_module.hint(
-            "[dim]→ preview only · re-run without [bold]--dry-run[/bold] "
-            "to write files[/dim]"
+            "[dim]→ preview only · re-run without [bold]--dry-run[/bold] to write files[/dim]"
         )
     else:
         console_module.hint(
@@ -998,7 +1040,7 @@ def init(
         help=(
             "Optional natural-language description. When set, treated as "
             "shorthand for [bold]--llm[/bold]: "
-            "[bold]mdk init faq-agent \"FAQ agent for our SaaS pricing\"[/bold]."
+            '[bold]mdk init faq-agent "FAQ agent for our SaaS pricing"[/bold].'
         ),
     ),
     project: bool = typer.Option(
@@ -1017,7 +1059,16 @@ def init(
         help=f"Template to scaffold from. One of: {', '.join(list_templates())}.",
     ),
     target: Path = typer.Option(
-        Path("."), "--target", help="Parent directory for the new agent or project."
+        Path("."),
+        "--target",
+        "--at",
+        help=(
+            "Where to scaffold the new agent / project. PARENT directory: the "
+            "agent or project ends up at [bold]<target>/<name>/[/bold]. Accepts "
+            "absolute paths ([dim]~/projects[/dim], [dim]/abs/path[/dim]) and "
+            "the [bold]--at[/bold] alias which reads more naturally for "
+            "[bold]--project[/bold] (e.g. [dim]mdk init --project foo --at ~/work[/dim])."
+        ),
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite existing directory."),
     skip_snapshot: bool = typer.Option(
@@ -1113,7 +1164,7 @@ def init(
             "project bootstrap.\n"
             "[dim]Run [bold]mdk init --project <name>[/bold] first to create "
             "the workspace, then\n"
-            "[bold]mdk init <agent-name> --llm \"<description>\"[/bold] "
+            '[bold]mdk init <agent-name> --llm "<description>"[/bold] '
             "inside it.[/dim]"
         )
         raise typer.Exit(code=2)

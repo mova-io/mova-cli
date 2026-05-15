@@ -176,11 +176,7 @@ def _matches_search(name: str, search: str) -> bool:
     """
     needle = search.lower()
     desc, feature = _ROLE_DESCRIPTIONS.get(name, ("", ""))
-    return (
-        needle in name.lower()
-        or needle in desc.lower()
-        or needle in feature.lower()
-    )
+    return needle in name.lower() or needle in desc.lower() or needle in feature.lower()
 
 
 def _installed_templates() -> set[str]:
@@ -276,10 +272,7 @@ def _render_list(search: str | None = None) -> None:
             last_group = group
         console.print(role_table)
     elif search:
-        console.print(
-            f"[yellow]⚠[/yellow] no role templates match "
-            f"[dim]{search!r}[/dim]."
-        )
+        console.print(f"[yellow]⚠[/yellow] no role templates match [dim]{search!r}[/dim].")
 
     # Core tier — minimal templates from the original set. Same
     # filter logic; less interesting in demos so it renders below.
@@ -489,11 +482,7 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
     # intent is named at the comparison site.
     rename_arg_count = 2
     positional_rename: str | None = None
-    if (
-        len(args) == rename_arg_count
-        and args[0] in TEMPLATES
-        and args[1] not in TEMPLATES
-    ):
+    if len(args) == rename_arg_count and args[0] in TEMPLATES and args[1] not in TEMPLATES:
         templates = [args[0]]
         positional_rename = args[1]
     else:
@@ -503,8 +492,7 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
     # being set is almost certainly a typo.
     if positional_rename and name:
         err_console.print(
-            "[red]✗[/red] [bold]--name[/bold] conflicts with the positional "
-            "rename form. Pick one."
+            "[red]✗[/red] [bold]--name[/bold] conflicts with the positional rename form. Pick one."
         )
         raise typer.Exit(code=2)
     rename = positional_rename or name
@@ -767,10 +755,7 @@ def _try_post_scaffold_validate(agent_dir: Path, *, skip: bool) -> str | None:
         # rendering. Operators get the full version by running
         # `mdk validate` directly on the dir.
         snippet = str(exc).splitlines()[0][:120]
-        return (
-            f"[yellow]⚠ {snippet}[/yellow] "
-            f"[dim](run `mdk validate` for full error)[/dim]"
-        )
+        return f"[yellow]⚠ {snippet}[/yellow] [dim](run `mdk validate` for full error)[/dim]"
     return "[green]✓ ok[/green]"
 
 
@@ -831,7 +816,7 @@ def _read_template_source(agent_dir: Path) -> tuple[str, str] | None:
         stripped = line.strip()
         if not stripped.startswith(prefix):
             continue
-        value = stripped[len(prefix):].strip()
+        value = stripped[len(prefix) :].strip()
         if "@" not in value:
             return None
         template_name, version = value.split("@", 1)
@@ -839,9 +824,7 @@ def _read_template_source(agent_dir: Path) -> tuple[str, str] | None:
     return None
 
 
-def _maybe_scaffold_declared_skills(
-    *, agent_dir: Path, project_root: Path
-) -> list[str]:
+def _maybe_scaffold_declared_skills(*, agent_dir: Path, project_root: Path) -> list[str]:
     """Auto-scaffold any skills declared in the agent's `skills:` field
     that don't yet exist in `<project>/skills/<name>/`.
 
@@ -876,8 +859,7 @@ def _maybe_scaffold_declared_skills(
             scaffolded.append(skill_name)
         except Exception as exc:
             err_console.print(
-                f"[yellow]⚠[/yellow] could not auto-scaffold skill "
-                f"[bold]{skill_name}[/bold]: {exc}"
+                f"[yellow]⚠[/yellow] could not auto-scaffold skill [bold]{skill_name}[/bold]: {exc}"
             )
     return scaffolded
 
@@ -928,9 +910,7 @@ def _render_preview(args: list[str]) -> None:
         err_console.print("[red]✗[/red] [bold]--preview[/bold] needs a template name.")
         raise typer.Exit(code=2)
     if len(args) > 1:
-        err_console.print(
-            "[red]✗[/red] [bold]--preview[/bold] takes one template at a time."
-        )
+        err_console.print("[red]✗[/red] [bold]--preview[/bold] takes one template at a time.")
         raise typer.Exit(code=2)
 
     template = args[0]
@@ -949,8 +929,7 @@ def _render_preview(args: list[str]) -> None:
     template_dir = get_template_path(template)
     console.print(
         Panel(
-            f"Preview of template [bold]{template}[/bold] "
-            f"[dim](from {template_dir})[/dim]",
+            f"Preview of template [bold]{template}[/bold] [dim](from {template_dir})[/dim]",
             border_style="yellow",
         )
     )
@@ -970,10 +949,7 @@ def _render_preview(args: list[str]) -> None:
         console.print(f"[dim]{body}[/dim]")
 
     console.print()
-    console.print(
-        f"[dim]To scaffold this template, run "
-        f"[bold]mdk add {template}[/bold].[/dim]"
-    )
+    console.print(f"[dim]To scaffold this template, run [bold]mdk add {template}[/bold].[/dim]")
 
 
 def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
@@ -985,17 +961,13 @@ def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
     to do with each).
     """
     if not args or len(args) > 1:
-        err_console.print(
-            "[red]✗[/red] [bold]--remove[/bold] needs exactly one agent name."
-        )
+        err_console.print("[red]✗[/red] [bold]--remove[/bold] needs exactly one agent name.")
         raise typer.Exit(code=2)
 
     agent_name = args[0]
     project_root = _resolve_project_root()
     if project_root is None:
-        err_console.print(
-            "[red]✗[/red] not inside a movate project — nothing to remove from."
-        )
+        err_console.print("[red]✗[/red] not inside a movate project — nothing to remove from.")
         raise typer.Exit(code=2)
 
     # Locate the agent. Try the default ./agents/<name>/ first.
@@ -1023,9 +995,7 @@ def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
             except OSError:
                 continue
             if agent_name in contents:
-                references.append(
-                    f"workflow: {wf_yaml.relative_to(project_root)}"
-                )
+                references.append(f"workflow: {wf_yaml.relative_to(project_root)}")
 
     # Eval baseline.
     baseline_candidates = [
@@ -1046,8 +1016,7 @@ def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
         for ref in references:
             body += f"  [yellow]⚠[/yellow] {ref}\n"
         body += (
-            "\n[dim]These won't be auto-cleaned. Decide per reference: "
-            "edit / delete / leave.[/dim]"
+            "\n[dim]These won't be auto-cleaned. Decide per reference: edit / delete / leave.[/dim]"
         )
     else:
         body += "\n[green]✓[/green] no dangling references."
@@ -1055,8 +1024,7 @@ def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
     if not apply:
         console.print(
             Panel(
-                body
-                + "\n\n[dim]Dry-run. Re-run with [bold]--apply[/bold] to "
+                body + "\n\n[dim]Dry-run. Re-run with [bold]--apply[/bold] to "
                 "actually delete.[/dim]",
                 title="[yellow]Would remove[/yellow]",
                 border_style="yellow",
@@ -1096,25 +1064,19 @@ def _do_update(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
     the current template (preserving the agent's name).
     """
     if not args or len(args) > 1:
-        err_console.print(
-            "[red]✗[/red] [bold]--update[/bold] needs exactly one agent name."
-        )
+        err_console.print("[red]✗[/red] [bold]--update[/bold] needs exactly one agent name.")
         raise typer.Exit(code=2)
 
     agent_name = args[0]
     project_root = _resolve_project_root()
     if project_root is None:
-        err_console.print(
-            "[red]✗[/red] not inside a movate project — nothing to update."
-        )
+        err_console.print("[red]✗[/red] not inside a movate project — nothing to update.")
         raise typer.Exit(code=2)
 
     candidates = [project_root / "agents" / agent_name, project_root / agent_name]
     agent_dir = next((c for c in candidates if c.is_dir()), None)
     if agent_dir is None:
-        err_console.print(
-            f"[red]✗[/red] agent [bold]{agent_name}[/bold] not found."
-        )
+        err_console.print(f"[red]✗[/red] agent [bold]{agent_name}[/bold] not found.")
         raise typer.Exit(code=2)
 
     source = _read_template_source(agent_dir)
@@ -1261,9 +1223,7 @@ def _do_update(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
         dest_file.parent.mkdir(parents=True, exist_ok=True)
         try:
             tmpl_contents = tmpl_file.read_text()
-            dest_file.write_text(
-                tmpl_contents.replace("__AGENT_NAME__", agent_name)
-            )
+            dest_file.write_text(tmpl_contents.replace("__AGENT_NAME__", agent_name))
         except (UnicodeDecodeError, OSError):
             shutil.copy2(tmpl_file, dest_file)
     # Re-stamp the source field with the current version.

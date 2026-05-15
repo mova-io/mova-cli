@@ -195,9 +195,7 @@ class TestListInstalledMarker:
         assert result.exit_code == 0
         # The installed agent's row has the ✓ installed marker.
         # Defensive: find the line containing rag-qa and check it.
-        rag_qa_lines = [
-            line for line in result.stdout.splitlines() if "rag-qa" in line
-        ]
+        rag_qa_lines = [line for line in result.stdout.splitlines() if "rag-qa" in line]
         assert rag_qa_lines, "rag-qa row missing from --list output"
         assert any("installed" in line.lower() for line in rag_qa_lines), (
             f"rag-qa row should be marked installed, got: {rag_qa_lines}"
@@ -213,9 +211,7 @@ class TestListInstalledMarker:
         result = runner.invoke(app, ["add", "--list"], env={"COLUMNS": "200"})
         # ticket-triager wasn't installed — its row should NOT show
         # the installed marker.
-        ticket_lines = [
-            line for line in result.stdout.splitlines() if "ticket-triager" in line
-        ]
+        ticket_lines = [line for line in result.stdout.splitlines() if "ticket-triager" in line]
         assert ticket_lines
         # Specifically: no "installed" marker on this row.
         for line in ticket_lines:
@@ -329,9 +325,7 @@ class TestFuzzyMatch:
         # "xyzzy" has no fuzzy match in the project.
         assert suggest_similar_agent("xyzzy") is None
 
-    def test_list_project_agents(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_list_project_agents(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         _scaffold_test_agent(proj, name="alpha")
         _scaffold_test_agent(proj, name="beta")
@@ -345,16 +339,12 @@ class TestFuzzyMatch:
         proj = _bootstrap_project(tmp_path)
         _scaffold_test_agent(proj, name="rag-qa")
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["doctor", "agent", "ragqa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["doctor", "agent", "ragqa"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         assert "did you mean" in result.stderr.lower()
         assert "rag-qa" in result.stderr
 
-    def test_run_typo_suggests_fix(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_run_typo_suggests_fix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """`mdk run ragqa` → fuzzy-match hint AFTER the load-failed error."""
         proj = _bootstrap_project(tmp_path)
         _scaffold_test_agent(proj, name="rag-qa")
@@ -368,9 +358,7 @@ class TestFuzzyMatch:
         assert "did you mean" in combined.lower()
         assert "rag-qa" in combined
 
-    def test_full_path_no_fuzzy_hint(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_full_path_no_fuzzy_hint(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """When the operator passes a full path that doesn't exist,
         DON'T show a fuzzy hint — they passed an explicit path and
         the error is more likely a real filesystem issue than a typo
@@ -439,6 +427,4 @@ class TestWithAgentsDiscoverabilityTip:
         project_panel = (
             result.stdout[:project_panel_end] if project_panel_end > 0 else result.stdout
         )
-        assert "Tip:" not in project_panel, (
-            "vanilla-only tip should not fire after --with-agents"
-        )
+        assert "Tip:" not in project_panel, "vanilla-only tip should not fire after --with-agents"

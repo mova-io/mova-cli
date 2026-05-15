@@ -50,9 +50,7 @@ def _bootstrap_project(tmp_path: Path) -> Path:
 class TestPreview:
     def test_preview_prints_template_files(self) -> None:
         """--preview shows every text file in the template dir."""
-        result = runner.invoke(
-            app, ["add", "rag-qa", "--preview"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "rag-qa", "--preview"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         # Header Panel mentions the template.
         assert "rag-qa" in result.stdout
@@ -73,9 +71,7 @@ class TestPreview:
         assert set(tmp_path.iterdir()) == before
 
     def test_preview_rejects_unknown_template(self) -> None:
-        result = runner.invoke(
-            app, ["add", "bogus-template", "--preview"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "bogus-template", "--preview"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         assert "unknown template" in result.stderr.lower()
 
@@ -107,9 +103,7 @@ class TestRemove:
         assert (proj / "agents" / "rag-qa" / "agent.yaml").is_file()
 
         # Remove without --apply — agent should survive.
-        result = runner.invoke(
-            app, ["add", "--remove", "rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--remove", "rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         assert "Would remove" in result.stdout or "dry-run" in result.stdout.lower()
         assert (proj / "agents" / "rag-qa" / "agent.yaml").is_file()
@@ -117,9 +111,7 @@ class TestRemove:
         assert "mdk_remove_summary:" in result.stdout
         assert "dry_run=true" in result.stdout
 
-    def test_remove_apply_deletes(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_remove_apply_deletes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
@@ -146,9 +138,7 @@ class TestRemove:
             "nodes:\n  - id: a\n    type: agent\n    ref: ../../agents/rag-qa\n"
         )
 
-        result = runner.invoke(
-            app, ["add", "--remove", "rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--remove", "rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # The workflow reference surfaces as a warning.
         assert "workflow" in result.stdout.lower()
@@ -159,9 +149,7 @@ class TestRemove:
     ) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["add", "--remove", "does-not-exist"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--remove", "does-not-exist"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         assert "not found" in result.stderr.lower()
 
@@ -169,9 +157,7 @@ class TestRemove:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(
-            app, ["add", "--remove", "x"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--remove", "x"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         assert "not inside a movate project" in result.stderr.lower()
 
@@ -235,9 +221,7 @@ class TestUpdate:
         monkeypatch.chdir(proj)
         runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
 
-        result = runner.invoke(
-            app, ["add", "--update", "rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--update", "rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         assert "no drift" in result.stdout.lower() or "up to date" in result.stdout.lower()
 
@@ -252,16 +236,12 @@ class TestUpdate:
         prompt_path = proj / "agents" / "rag-qa" / "prompt.md"
         prompt_path.write_text("totally rewritten prompt\n")
 
-        result = runner.invoke(
-            app, ["add", "--update", "rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--update", "rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         assert "drift" in result.stdout.lower()
         assert "prompt.md" in result.stdout
 
-    def test_update_apply_overwrites(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_update_apply_overwrites(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
@@ -295,9 +275,7 @@ class TestUpdate:
             "evals:\n  dataset: ./evals/dataset.jsonl\n"
         )
 
-        result = runner.invoke(
-            app, ["add", "--update", "manually-added"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "--update", "manually-added"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         assert "_template_source" in result.stderr
 
@@ -333,9 +311,7 @@ class TestAutoSkills:
         # We don't add a fake template to the registry — just verify
         # the --no-skills flag is wired and doesn't crash the add path.
         monkeypatch.chdir(proj)
-        result = runner.invoke(
-            app, ["add", "rag-qa", "--no-skills"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["add", "rag-qa", "--no-skills"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
         _ = TEMPLATES_DIR  # silence unused
         assert not (proj / "skills").exists()
@@ -355,9 +331,7 @@ class TestAutoSkills:
         # Append a skills field to the agent.yaml (rag-qa doesn't ship
         # with one — different templates have different schemas).
         agent_yaml = proj / "agents" / "rag-qa" / "agent.yaml"
-        agent_yaml.write_text(
-            agent_yaml.read_text() + "\nskills:\n  - web-search\n"
-        )
+        agent_yaml.write_text(agent_yaml.read_text() + "\nskills:\n  - web-search\n")
 
         scaffolded = _maybe_scaffold_declared_skills(
             agent_dir=proj / "agents" / "rag-qa", project_root=proj
@@ -383,9 +357,7 @@ class TestAutoSkills:
         # Now scaffold an agent that declares the skill.
         runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
         agent_yaml = proj / "agents" / "rag-qa" / "agent.yaml"
-        agent_yaml.write_text(
-            agent_yaml.read_text() + "\nskills:\n  - web-search\n"
-        )
+        agent_yaml.write_text(agent_yaml.read_text() + "\nskills:\n  - web-search\n")
 
         scaffolded = _maybe_scaffold_declared_skills(
             agent_dir=proj / "agents" / "rag-qa", project_root=proj
@@ -393,10 +365,7 @@ class TestAutoSkills:
         # Empty list — the existing skill dir was respected.
         assert scaffolded == []
         # Operator content survives.
-        assert (
-            (proj / "skills" / "web-search" / "skill.yaml").read_text()
-            == "# operator content\n"
-        )
+        assert (proj / "skills" / "web-search" / "skill.yaml").read_text() == "# operator content\n"
 
 
 # ---------------------------------------------------------------------------
@@ -405,9 +374,7 @@ class TestAutoSkills:
 
 
 @pytest.mark.unit
-def test_add_stamps_template_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_stamps_template_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     proj = _bootstrap_project(tmp_path)
     monkeypatch.chdir(proj)
     result = runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
