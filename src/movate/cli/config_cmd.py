@@ -199,6 +199,76 @@ def show() -> None:
     hint(f"[dim]config path: {config_path()}[/dim]")
 
 
+@config_app.command("set-project-dir")
+def set_project_dir(
+    path: str = typer.Argument(
+        ...,
+        help=(
+            "Where [bold]mdk init --project <name>[/bold] should create new "
+            "projects by default. Accepts [dim]~[/dim] (home), env vars "
+            "([dim]$HOME[/dim]), and absolute paths. Use [bold]--clear[/bold] "
+            "to unset."
+        ),
+    ),
+    clear: bool = typer.Option(
+        False,
+        "--clear",
+        help="Clear the default project dir instead of setting it. Path arg is ignored.",
+    ),
+) -> None:
+    """Set the default project directory for [bold]mdk init --project[/bold].
+
+    With this set, [bold]mdk init --project foo[/bold] (no [bold]--at[/bold])
+    creates the project under the configured dir instead of cwd.
+    [bold]--at[/bold] always wins on the invocation side.
+
+    Stored in [bold]~/.movate/config.yaml[/bold] (alongside deployment
+    targets) — same file as [bold]mdk config use[/bold] writes to.
+    """
+    cfg = load_user_config()
+    if clear:
+        cfg.default_project_dir = None
+        save_user_config(cfg)
+        success("cleared default project dir — `mdk init --project` will use cwd again")
+        return
+
+    # Don't expand here — store what the operator typed so they can
+    # grep for it later. `resolve_default_project_dir` does the
+    # expansion at read time so env-var changes take effect.
+    cfg.default_project_dir = path
+    save_user_config(cfg)
+    success(f"set default project dir to [bold]{path}[/bold]")
+    hint(
+        f"[dim]new projects will land at [bold]{path}/<name>/[/bold] when "
+        f"[bold]--at[/bold] / [bold]--target[/bold] is omitted.[/dim]"
+    )
+
+
+@config_app.command("get-project-dir")
+def get_project_dir() -> None:
+    """Print the current default project dir (or "(unset)").
+
+    Resolves ``~``, ``$VAR``s, and prints the absolute path that
+    [bold]mdk init --project[/bold] would use. Pair with
+    [bold]mdk config set-project-dir[/bold].
+    """
+    from movate.core.user_config import resolve_default_project_dir  # noqa: PLC0415
+
+    cfg = load_user_config()
+    raw = cfg.default_project_dir
+    if not raw:
+        stdout.print("[dim](unset)[/dim] — defaults to cwd")
+        hint(
+            "[dim]Set with [bold]mdk config set-project-dir <path>[/bold] so "
+            "[bold]mdk init --project <name>[/bold] lands new projects in "
+            "your usual workspace dir.[/dim]"
+        )
+        return
+    resolved = resolve_default_project_dir()
+    stdout.print(f"raw:      [cyan]{raw}[/cyan]")
+    stdout.print(f"resolved: [cyan]{resolved}[/cyan]")
+
+
 @config_app.command("remove-target")
 def remove_target(
     name: str = typer.Argument(..., help="Name of a registered target."),

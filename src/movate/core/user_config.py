@@ -91,6 +91,38 @@ class UserConfig(BaseModel):
             "Name of the default target. CLI commands default to this when --target is omitted."
         ),
     )
+    default_project_dir: str | None = Field(
+        default=None,
+        description=(
+            "Where ``mdk init --project <name>`` creates new projects when no "
+            "explicit ``--at`` / ``--target`` is passed. Accepts ``~`` and env "
+            "vars (resolved at read time). Falls back to the current working "
+            "directory if unset. Operators set this once via "
+            "``mdk config set-project-dir <path>`` so they stop typing "
+            "``--at ~/projects`` on every init."
+        ),
+    )
+
+
+def resolve_default_project_dir() -> Path | None:
+    """Return the configured default project dir, or ``None`` if unset.
+
+    Reads ``UserConfig.default_project_dir``, expands ``~`` and env vars,
+    and resolves to an absolute path. Returns ``None`` (not the cwd
+    fallback) so the caller can distinguish "no preference set, use cwd"
+    from "preference set, use that". A missing-dir target is returned
+    as-is — the caller chooses whether to ``mkdir`` it or error.
+    """
+    try:
+        cfg = load_user_config()
+    except UserConfigError:
+        # Malformed config shouldn't break `mdk init` — operators get a
+        # clear error from `mdk config show`; just fall back here.
+        return None
+    raw = cfg.default_project_dir
+    if not raw:
+        return None
+    return Path(os.path.expandvars(raw)).expanduser().resolve()
 
 
 class UserConfigError(Exception):
