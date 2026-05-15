@@ -54,6 +54,7 @@ from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
+from movate.cli.secrets_cmd import secrets_app  # noqa: E402
 from movate.cli.skills_cmd import skills_app  # noqa: E402
 from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
@@ -202,6 +203,7 @@ app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(profiles_app, name="profiles", rich_help_panel=PANEL_MANAGE)
+app.add_typer(secrets_app, name="secrets", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 
 
