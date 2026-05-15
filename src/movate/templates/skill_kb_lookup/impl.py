@@ -35,9 +35,36 @@ if TYPE_CHECKING:
     from movate.core.skill_backend import SkillExecutionContext
 
 
-# Path to the corpus JSON shipped alongside this impl. Skill scaffold
-# preserves directory layout — corpus.json lives next to impl.py.
-_CORPUS_PATH = Path(__file__).parent / "corpus.json"
+# Bundled corpus shipped alongside this impl. Used as the fallback
+# when the project's `kb/` folder doesn't carry an override file.
+# Skill scaffold preserves directory layout — `corpus.json` lives
+# next to `impl.py`.
+_BUNDLED_CORPUS_PATH = Path(__file__).parent / "corpus.json"
+
+
+def _resolve_corpus_path() -> Path:
+    """Pick the corpus file at call time.
+
+    Resolution order:
+
+    1. ``<project_root>/kb/kb-lookup-corpus.json`` — operator's
+       project-specific KB. Drop a JSON file here in the same shape
+       as the bundled corpus and this skill picks it up on next run
+       without code edits.
+    2. ``<skill_dir>/corpus.json`` — bundled demo corpus that ships
+       with the skill template. Used when the project doesn't carry
+       an override.
+
+    Resolved on every call (not module-load) so operators can edit
+    the project KB and see results without restarting `mdk serve`.
+    The lookup is cheap — one stat + maybe one is_file check.
+    """
+    from movate.core.kb_loader import resolve_kb_file  # noqa: PLC0415
+
+    project_kb = resolve_kb_file("kb-lookup-corpus.json", start=Path(__file__).parent)
+    if project_kb is not None:
+        return project_kb
+    return _BUNDLED_CORPUS_PATH
 
 
 # Words that contribute zero signal to KB matching. The list is short
@@ -141,13 +168,14 @@ async def run(input: dict[str, Any], ctx: SkillExecutionContext) -> dict[str, An
     top_n = max(1, min(_MAX_TOP_N, int(top_n)))
     category_filter = input.get("category")
 
+    corpus_path = _resolve_corpus_path()
     try:
-        corpus = json.loads(_CORPUS_PATH.read_text())
+        corpus = json.loads(corpus_path.read_text())
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         return {
             "matches": [],
             "corpus_size": 0,
-            "warning": f"could not load corpus: {exc}",
+            "warning": f"could not load corpus at {corpus_path}: {exc}",
         }
 
     # Apply category filter first.
