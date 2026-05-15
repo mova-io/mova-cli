@@ -240,13 +240,14 @@ _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 
 
 @auth_app.command("login")
-def login(
+def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
     provider: str = typer.Argument(
-        ...,
+        None,
         help=(
             "Provider to set the API key for: "
             "[bold]openai[/bold], [bold]anthropic[/bold], "
-            "[bold]azure[/bold], [bold]gemini[/bold], or [bold]lyzr[/bold]."
+            "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
+            "or [bold]telegram[/bold]. Omit to pick interactively."
         ),
     ),
     key: str = typer.Option(
@@ -293,6 +294,13 @@ def login(
         CredentialsStore,
         verify_provider_key,
     )
+
+    # When no provider is passed, render an interactive picker. Mirrors
+    # the `mdk menu` UX shape: numbered options, type the digit, hit
+    # enter. Operators who don't know which providers MDK supports get
+    # a discoverable list instead of an error.
+    if provider is None:
+        provider = _prompt_for_provider()
 
     provider = provider.lower().strip()
 
@@ -427,6 +435,47 @@ def status() -> None:
         f"[dim]mdk_auth_status_summary: "
         f"set={counts['ok']} unset={counts['unset']}[/dim]"
     )
+
+
+def _prompt_for_provider() -> str:
+    """Numbered-picker fallback for ``mdk auth login`` with no arg.
+
+    Renders the supported providers as a numbered list and prompts for
+    a digit. Mirrors the discoverability pattern in ``mdk menu`` — no
+    prior knowledge of provider keys required. Returns the canonical
+    lowercase provider key (e.g. ``"openai"``, ``"telegram"``) ready
+    to pass to the existing dispatch logic.
+
+    Falls back to a typed name if the input isn't a digit — operators
+    who already know the provider name can skip the picker by typing
+    it directly at the prompt.
+    """
+    options: list[tuple[str, str]] = [
+        ("openai", _PROVIDERS_PROMPT_NAME["openai"]),
+        ("anthropic", _PROVIDERS_PROMPT_NAME["anthropic"]),
+        ("azure", _PROVIDERS_PROMPT_NAME["azure"]),
+        ("gemini", _PROVIDERS_PROMPT_NAME["gemini"]),
+        ("lyzr", _PROVIDERS_PROMPT_NAME["lyzr"]),
+        ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
+    ]
+    stdout.print("[bold]Which provider would you like to set up?[/bold]")
+    for i, (key, name) in enumerate(options, start=1):
+        stdout.print(f"  [cyan]{i}[/cyan]) {name} [dim]({key})[/dim]")
+    raw_input = typer.prompt(f"Choice [1-{len(options)} or provider name]")
+    raw = str(raw_input).strip()
+
+    # Numeric pick takes precedence.
+    if raw.isdigit():
+        idx = int(raw)
+        if 1 <= idx <= len(options):
+            return options[idx - 1][0]
+        error(f"choice {idx} is out of range (1-{len(options)})")
+        raise typer.Exit(code=2)
+
+    # Allow the operator to skip the picker by typing a provider name
+    # at the prompt. Falls through to the existing unknown-provider
+    # error path below if the typed name isn't valid.
+    return raw
 
 
 def _login_telegram(*, key: str | None, no_verify: bool, save_to: str) -> None:

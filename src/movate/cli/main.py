@@ -15,6 +15,53 @@ import sys
 import typer
 from dotenv import load_dotenv
 
+
+def _expand_help_alias() -> None:
+    """Treat a trailing ``help`` token as a synonym for ``--help``.
+
+    Operators consistently type ``mdk init help`` (or ``mdk auth help``)
+    expecting the help screen — most CLIs accept that as a natural-
+    language alias. Typer alone doesn't; without this hook the user
+    gets an "agent name required" error or "Missing argument" diagnostic
+    for what was really a help request.
+
+    Rules (deliberately narrow to avoid breaking legitimate ``help``
+    values):
+
+    * The LAST positional must be exactly ``help`` (case-sensitive).
+    * The preceding token must NOT start with ``-`` — otherwise ``help``
+      is the value of some flag (e.g. ``--llm help`` for the unlikely
+      operator who really wants to describe their agent as "help").
+    * ``--help`` / ``-h`` must not already be present.
+    * Opt out entirely via ``MDK_NO_HELP_ALIAS=1`` for the edge case
+      where ``help`` is genuinely a payload value (``mdk run agent help``
+      meaning "send 'help' as input").
+
+    No regex, no Typer introspection — just a sys.argv rewrite that
+    runs BEFORE Typer parses anything.
+    """
+    import os  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    if os.environ.get("MDK_NO_HELP_ALIAS", "").strip():
+        return
+    if len(sys.argv) < 2:  # noqa: PLR2004 - just program name
+        return
+    last = sys.argv[-1]
+    if last not in ("help", "?"):
+        return
+    # Already a help request — don't double-flag.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        return
+    # The token before `help` is a flag taking a value — `help` is the
+    # value, not a help request.
+    if len(sys.argv) >= 3 and sys.argv[-2].startswith("-"):  # noqa: PLR2004
+        return
+    sys.argv[-1] = "--help"
+
+
+_expand_help_alias()
+
 # Load .env from cwd (or any parent). Existing env vars take precedence.
 load_dotenv()
 
