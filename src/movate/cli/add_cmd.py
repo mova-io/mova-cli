@@ -584,18 +584,38 @@ def _add_one(
     project_root: Path,
     no_validate: bool,
     no_skills: bool = False,
-) -> None:
+    quiet: bool = False,
+) -> dict[str, object] | None:
     """Scaffold a single template, render success Panel, emit summary.
 
     Extracted so the batch path loops over this helper without
     duplicating the Panel + summary-line logic per iteration.
+
+    ``quiet=True`` suppresses BOTH the legacy plain-text output from
+    ``_init_agent`` AND the per-agent success Panel. Used by batch
+    callers (``mdk init --with-agents``) that render a single combined
+    summary at the end instead of one Panel per agent. The greppable
+    ``mdk_add_summary:`` line still fires for CI parsing — it's not
+    visual clutter.
+
+    Returns a per-agent summary dict (``{"name", "template", "path",
+    "validates", "skills_scaffolded"}``) when ``quiet=True`` so the
+    batch caller can fold each agent into its combined render. Returns
+    ``None`` in verbose mode — the Panel IS the summary.
     """
     # Dispatch to the same scaffold function `mdk init` uses, so we get
     # the existing `__AGENT_NAME__` substitution + force-check + template-
-    # resolution behaviors for free.
+    # resolution behaviors for free. Pass `quiet` through so the
+    # legacy "scaffolded / Next steps" text is also suppressed.
     from movate.cli.init import _init_agent  # noqa: PLC0415
 
-    _init_agent(name=agent_name, template=template, target=target_dir, force=force)
+    _init_agent(
+        name=agent_name,
+        template=template,
+        target=target_dir,
+        force=force,
+        quiet=quiet,
+    )
 
     dest = (target_dir / agent_name).resolve()
 
@@ -620,6 +640,35 @@ def _add_one(
     # non-existent skill" and similar issues that the bare scaffold-
     # copy path won't surface until first run.
     validation_status = _try_post_scaffold_validate(dest, skip=no_validate)
+
+    # Greppable summary fields. Computed once; emitted regardless of
+    # quiet mode (machine-readable, not visual clutter).
+    if no_validate:
+        validates_token = "skipped"
+    elif validation_status and "✓" in validation_status:
+        validates_token = "true"
+    else:
+        validates_token = "false"
+
+    if quiet:
+        # Batch caller renders one combined Panel at the end.
+        # Emit the greppable line + return the per-agent info dict.
+        console.print(
+            f"[dim]mdk_add_summary: "
+            f"template={template} "
+            f"name={agent_name} "
+            f"project={project_root.name} "
+            f"target={dest} "
+            f"validates={validates_token} "
+            f"ok=true[/dim]"
+        )
+        return {
+            "template": template,
+            "name": agent_name,
+            "path": dest,
+            "validates": validates_token,
+            "skills_scaffolded": skills_scaffolded,
+        }
 
     body = (
         f"[bold]Added:[/bold]    [cyan]{agent_name}[/cyan] "
@@ -653,12 +702,6 @@ def _add_one(
     # generation-style command. The `validates=` field is new: true on
     # successful auto-validate, false on failed auto-validate, skipped
     # when --no-validate was passed.
-    if no_validate:
-        validates_token = "skipped"
-    elif validation_status and "✓" in validation_status:
-        validates_token = "true"
-    else:
-        validates_token = "false"
     console.print(
         f"[dim]mdk_add_summary: "
         f"template={template} "
@@ -668,6 +711,7 @@ def _add_one(
         f"validates={validates_token} "
         f"ok=true[/dim]"
     )
+    return None
 
 
 def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None:

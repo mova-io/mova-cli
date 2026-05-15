@@ -44,12 +44,27 @@ def test_init_project_creates_full_layout(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_init_project_movate_yaml_has_project_name(tmp_path: Path) -> None:
+def test_init_project_movate_yaml_is_valid_project_config(tmp_path: Path) -> None:
+    """The bootstrapped movate.yaml MUST validate as ProjectConfig.
+
+    Previously the template carried v1-spec metadata (api_version /
+    kind / name / description / version) plus a stray
+    ``defaults.model.provider`` field. ProjectConfig is ``extra=forbid``,
+    so every freshly-bootstrapped project blew up on the first
+    ``mdk validate``. New template keeps the project name in a YAML
+    comment header instead (docs/runbook falls back to ``root.name``).
+    """
+    from movate.core.config import ProjectConfig  # noqa: PLC0415
+
     runner.invoke(app, ["init", "my-proj", "--project", "--target", str(tmp_path)])
-    data = yaml.safe_load((tmp_path / "my-proj" / "movate.yaml").read_text())
-    assert data["api_version"] == "movate/v1"
-    assert data["kind"] == "Project"
-    assert data["name"] == "my-proj"
+    raw = (tmp_path / "my-proj" / "movate.yaml").read_text()
+    # Project name is preserved in the comment header — operators can
+    # still grep for it by name.
+    assert "my-proj" in raw.splitlines()[0]
+    # Body parses + validates cleanly.
+    data = yaml.safe_load(raw)
+    cfg = ProjectConfig.model_validate(data)
+    assert cfg.agents_dir == "./agents"
 
 
 @pytest.mark.unit
@@ -96,14 +111,16 @@ def test_init_project_in_place_uses_cwd_name(
 ) -> None:
     """Without a name, --project bootstraps the current directory in place.
 
-    The project name in movate.yaml is derived from the directory name.
+    The project name surfaces in the movate.yaml comment header (the
+    YAML body itself contains only ProjectConfig-valid fields).
     """
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "--project"])
     assert result.exit_code == 0, result.stdout + result.stderr
     assert (tmp_path / "movate.yaml").is_file()
-    data = yaml.safe_load((tmp_path / "movate.yaml").read_text())
-    assert data["name"] == tmp_path.name
+    raw = (tmp_path / "movate.yaml").read_text()
+    # The project name appears in the comment header, derived from cwd.
+    assert tmp_path.name in raw.splitlines()[0]
 
 
 @pytest.mark.unit
@@ -127,10 +144,11 @@ def test_init_project_force_overwrites_existing(
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "--project", "--force"])
     assert result.exit_code == 0
-    # File replaced
+    # File replaced — the old "existing: true" line is gone and the
+    # fresh template's canonical agents_dir field is in place.
     text = (tmp_path / "movate.yaml").read_text()
     assert "existing: true" not in text
-    assert "api_version: movate/v1" in text
+    assert "agents_dir: ./agents" in text
 
 
 # ---------------------------------------------------------------------------

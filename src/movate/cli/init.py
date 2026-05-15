@@ -54,23 +54,35 @@ err_console = Console(stderr=True)
 # Project-mode files. Kept inline (not separate templates) for the same
 # reason `mdk demo` does — they're tiny and inlining keeps the recipe
 # legible in one read. If they grow, lift to src/movate/templates/.
+#
+# Body MUST validate as :class:`movate.core.config.ProjectConfig`
+# (``extra="forbid"``) so a freshly-bootstrapped project's first
+# ``mdk validate`` call doesn't trip on schema noise. The project
+# metadata (name / description) lives in the file comment header
+# rather than in the YAML body — docs/runbook reads ``root.name`` as
+# the fallback when these aren't set, so we preserve the readable
+# project identity without breaking strict validation.
 _PROJECT_MOVATE_YAML = """\
-api_version: movate/v1
-kind: Project
-name: {name}
-description: ""
-version: 0.1.0
+# {name} — movate project config (canonical: policy.yaml; movate.yaml
+# is the legacy slot, still supported through v1.x).
+#
+# Loaded by every CLI command via `load_project_config`. Per-agent
+# `agent.yaml` always wins on conflict; entries here only fill gaps.
+# See `mdk doctor` for the layered semantics, and add `policy:` /
+# `runtime:` / `skills:` blocks to gate every agent workspace-wide.
+
+agents_dir: ./agents
+workflows_dir: ./workflows
 
 defaults:
   model:
-    provider: openai/gpt-4o-mini-2024-07-18
     params:
+      # Project-wide model param defaults. Agent.yaml's `model.params`
+      # always wins per-key; these only fill keys the agent didn't
+      # specify. Headline use: pin temperature / max_tokens once at
+      # the project level instead of repeating across every agent.
       temperature: 0.0
       max_tokens: 512
-
-storage:
-  backend: sqlite
-  path: .movate/local.db
 """
 
 _PROJECT_ENV_EXAMPLE = """\
@@ -160,7 +172,8 @@ def _init_project(
     force: bool,
     skip_snapshot: bool,
     with_agents: str | None = None,
-) -> None:
+    quiet: bool = False,
+) -> tuple[str, Path, str | None]:
     """Bootstrap a fresh movate workspace.
 
     Two layouts depending on ``name``:
@@ -172,6 +185,14 @@ def _init_project(
     ``.env.example`` + ``.gitignore`` + an empty ``agents/`` dir with
     a ``.gitkeep`` placeholder. Then we auto-snapshot — operators get
     a baseline to ``mdk diff`` / ``mdk rollback`` against from day one.
+
+    Returns ``(project_name, project_root, snapshot_short)`` so a
+    batch caller (``--with-agents``) can fold the project metadata
+    into its single combined summary Panel.
+
+    ``quiet=True`` suppresses the per-project Panel render. Used by
+    the ``--with-agents`` flow which renders ONE combined Panel
+    afterward covering both the project + the agents.
     """
     if name:
         project_root = (target / name).resolve()
@@ -225,6 +246,12 @@ def _init_project(
             # sideways, fall back to a warning rather than rolling back
             # the entire init. The project files are still useful.
             err_console.print(f"[yellow]⚠[/yellow] initial snapshot skipped: {exc}")
+
+    # Quiet mode: the caller (--with-agents flow) will render ONE
+    # combined Panel covering both the project + the agents. Skip the
+    # standalone Project Panel here to avoid double-rendering.
+    if quiet:
+        return project_name, project_root, snapshot_short
 
     body = (
         f"[bold]Project:[/bold]   [cyan]{project_name}[/cyan]\n"
@@ -287,6 +314,7 @@ def _init_project(
             border_style="green",
         )
     )
+    return project_name, project_root, snapshot_short
 
 
 # ---------------------------------------------------------------------------
@@ -295,21 +323,31 @@ def _init_project(
 
 
 def _scaffold_with_agents(
-    *, project_root: Path, agents_csv: str, force: bool
+    *,
+    project_root: Path,
+    agents_csv: str,
+    force: bool,
+    project_name: str,
+    snapshot_short: str | None,
 ) -> None:
     """Scaffold a comma-separated list of role templates inside a
-    just-created project.
+    just-created project, then render ONE combined summary Panel.
 
-    Dispatches to the same ``_add_one`` helper that ``mdk add`` uses,
-    so behavior (auto-validate, template-source marker, skill auto-
-    scaffold, success Panel, summary line) is identical to running
-    ``mdk add <X> <Y> <Z>`` after the fact. The point of this flow is
-    saving the operator one command — same output shape.
+    Dispatches to the same ``_add_one`` helper that ``mdk add`` uses
+    (so auto-validate, template-source marker, skill auto-scaffold are
+    identical) but in QUIET mode — the per-agent Panel is suppressed
+    and each call returns a dict of summary fields. After every
+    template is scaffolded we render ONE combined Panel showing:
 
-    A trailing batch summary fires when 2+ agents are added, again
-    matching the ``mdk add`` end-of-batch behavior.
+    * Project name + path + (optional) snapshot baseline hash.
+    * Each agent with its role description and a ✓ / ⚠ validation
+      marker.
+    * Workspace-level next steps including ``mdk validate --all``.
+
+    The greppable ``mdk_add_summary:`` lines still fire (one per
+    agent) so CI parsing keeps working.
     """
-    from movate.cli.add_cmd import _add_one, _render_batch_summary  # noqa: PLC0415
+    from movate.cli.add_cmd import _ROLE_DESCRIPTIONS, _add_one  # noqa: PLC0415
     from movate.templates import TEMPLATES, list_templates  # noqa: PLC0415
 
     templates = [t.strip() for t in agents_csv.split(",") if t.strip()]
@@ -330,9 +368,9 @@ def _scaffold_with_agents(
     # Drop each agent under ./agents/ inside the project root.
     agents_dir = project_root / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
-    added_names: list[str] = []
+    added: list[dict[str, object]] = []
     for template in templates:
-        _add_one(
+        info = _add_one(
             template=template,
             agent_name=template,
             target_dir=agents_dir,
@@ -340,11 +378,96 @@ def _scaffold_with_agents(
             project_root=project_root,
             no_validate=False,
             no_skills=False,
+            quiet=True,
         )
-        added_names.append(template)
+        if info is not None:
+            added.append(info)
 
-    if len(added_names) > 1:
-        _render_batch_summary(added_names, project_root=project_root)
+    # Render ONE combined Panel covering the project + every agent.
+    _render_combined_init_summary(
+        project_name=project_name,
+        project_root=project_root,
+        snapshot_short=snapshot_short,
+        added=added,
+        role_descriptions=_ROLE_DESCRIPTIONS,
+    )
+
+
+def _render_combined_init_summary(
+    *,
+    project_name: str,
+    project_root: Path,
+    snapshot_short: str | None,
+    added: list[dict[str, object]],
+    role_descriptions: dict[str, tuple[str, str]],
+) -> None:
+    """Render the unified Panel for ``mdk init --project --with-agents``.
+
+    Replaces three previous output blobs (per-agent legacy text, per-
+    agent Rich Panel, end-of-batch summary Panel) with one Panel that
+    summarizes the WHOLE workspace in ~12 lines: project info, agent
+    table, next steps. The role descriptions (cribbed from add_cmd.py)
+    give the operator a one-line sense of what each agent does
+    without having to re-grep the catalog.
+    """
+    n_agents = len(added)
+
+    lines = [
+        f"[bold]Project:[/bold]   [cyan]{project_name}[/cyan]",
+        f"[bold]Path:[/bold]      [cyan]{project_root}[/cyan]",
+    ]
+    if snapshot_short:
+        lines.append(
+            f"[bold]Snapshot:[/bold]  [dim]{snapshot_short}[/dim] (initial baseline)"
+        )
+    lines.append("")
+    lines.append(f"[bold]Agents added ({n_agents}):[/bold]")
+
+    for info in added:
+        agent_name = str(info["name"])
+        template = str(info["template"])
+        validates = str(info["validates"])
+        # Pull the one-line role description; fall back to a generic
+        # phrase if the template isn't in the catalog (custom templates
+        # registered by extension packages).
+        desc, _feature = role_descriptions.get(template, ("", ""))
+        marker = (
+            "[green]✓[/green]" if validates == "true"
+            else "[yellow]⚠[/yellow]" if validates == "false"
+            else "[dim]·[/dim]"
+        )
+        line = f"  {marker} [cyan]{agent_name}[/cyan]"
+        if desc:
+            line += f" [dim]— {desc}[/dim]"
+        lines.append(line)
+
+    # Workspace-level next steps. `mdk validate --all` is the natural
+    # follow-up (one command to confirm every agent loads cleanly) and
+    # `mdk eval --gate` is the standard CI gate.
+    first_name = str(added[0]["name"]) if added else "<agent>"
+    lines.extend(
+        [
+            "",
+            "[bold]Next steps:[/bold]",
+            f"  [dim]$[/dim] [bold]cd {project_root.name}[/bold]",
+            "  [dim]$[/dim] [bold]mdk validate --all[/bold]"
+            "   [dim]# confirm every agent loads cleanly[/dim]",
+            f"  [dim]$[/dim] [bold]mdk run {first_name} '{{...}}'[/bold]"
+            "   [dim]# try one live[/dim]",
+            "  [dim]$[/dim] [bold]mdk ci eval --mock[/bold]"
+            "   [dim]# gate every agent against its baseline[/dim]",
+        ]
+    )
+
+    suffix = "s" if n_agents != 1 else ""
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[green]✓[/green] Workspace ready ({n_agents} agent{suffix})",
+            title_align="left",
+            border_style="green",
+        )
+    )
 
 
 def _init_agent(
@@ -353,8 +476,17 @@ def _init_agent(
     template: str,
     target: Path,
     force: bool,
+    quiet: bool = False,
 ) -> None:
-    """Scaffold a single agent directory from a packaged template."""
+    """Scaffold a single agent directory from a packaged template.
+
+    ``quiet=True`` suppresses the legacy "scaffolded / Next steps"
+    plain-text block. Used by batch callers (``mdk add`` /
+    ``mdk init --with-agents``) that render their own Rich Panel
+    afterward — without ``quiet`` operators see both the legacy
+    output AND the new Panel for the same agent, doubling the
+    vertical scroll.
+    """
     try:
         template_dir = get_template_path(template)
     except ValueError as exc:
@@ -373,6 +505,9 @@ def _init_agent(
     yaml_path = dest / "agent.yaml"
     contents = yaml_path.read_text().replace("__AGENT_NAME__", name)
     yaml_path.write_text(contents)
+
+    if quiet:
+        return
 
     console.print(
         f"[green]✓[/green] scaffolded [bold]{template}[/bold] agent at [bold]{dest}[/bold]"
@@ -984,25 +1119,29 @@ def init(
         raise typer.Exit(code=2)
 
     if project:
-        _init_project(
+        # When --with-agents is set, suppress the standalone Project
+        # Panel and fold the project metadata into the combined Panel
+        # that _scaffold_with_agents renders at the end. Otherwise
+        # _init_project renders its existing Panel.
+        project_name, project_root, snapshot_short = _init_project(
             name=name,
             target=target,
             force=force,
             skip_snapshot=skip_snapshot,
             with_agents=with_agents,
+            quiet=bool(with_agents),
         )
         # --with-agents X,Y,Z: scaffold each role template inside the
         # freshly-bootstrapped project. Skipped when the operator is
         # bootstrapping in place (no name) AND with_agents isn't set,
         # but works in either layout when explicitly requested.
         if with_agents:
-            project_root = (
-                (target / name).resolve() if name else target.resolve()
-            )
             _scaffold_with_agents(
                 project_root=project_root,
                 agents_csv=with_agents,
                 force=force,
+                project_name=project_name,
+                snapshot_short=snapshot_short,
             )
         return
 

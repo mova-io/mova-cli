@@ -245,6 +245,17 @@ class TestSmartNextStepsAfterWithAgents:
     def test_with_agents_shows_forward_looking_commands(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """After --with-agents, the combined Workspace Panel's next-steps
+        block must point at forward-looking commands (validate / run /
+        eval), NOT at ``mdk add --list`` — agents are already there.
+
+        Bundle F shipped per-agent + project Panels each with their own
+        next-steps. The follow-up polish bundle collapsed those into ONE
+        combined Workspace Panel, so the assertions changed accordingly:
+        we now look for ``mdk validate --all`` (the new "menu"-style
+        workspace command) instead of ``mdk doctor agent``, and the
+        first-agent-name based commands stay.
+        """
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
@@ -259,26 +270,17 @@ class TestSmartNextStepsAfterWithAgents:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        # The next-steps section should mention the run/eval/doctor commands.
-        assert "mdk doctor agent" in result.stdout
+        # The combined-Panel next-steps block points at forward-looking
+        # commands: validate the workspace, run an agent, gate every
+        # agent against its baseline.
+        assert "mdk validate --all" in result.stdout
         assert "mdk run rag-qa" in result.stdout
-        assert "mdk eval rag-qa" in result.stdout
-        # And should NOT mention the `mdk add --list` step — agents
-        # are already there.
-        # (The workspace-summary panel from PR #68 still says "mdk ci
-        # eval" + "mdk deploy"; that's separate. The PROJECT panel
-        # specifically should not re-suggest `mdk add --list`.)
-        # Check the project Panel content by looking for the
-        # "Project initialized" title with no `mdk add --list` in
-        # the body. Defensive: look for the substring narrowing to
-        # the panel between "Project initialized" and the next panel.
-        proj_panel_start = result.stdout.find("Project initialized")
-        next_panel_start = result.stdout.find("Added rag-qa")
-        if proj_panel_start >= 0 and next_panel_start > proj_panel_start:
-            proj_panel = result.stdout[proj_panel_start:next_panel_start]
-            assert "mdk add --list" not in proj_panel, (
-                "Project Panel should not suggest mdk add --list after --with-agents"
-            )
+        assert "mdk ci eval" in result.stdout
+        # And should NOT re-suggest `mdk add --list` — agents are
+        # already in place. The standalone Project Panel doesn't even
+        # render in this mode (it's folded into the Workspace Panel),
+        # so a global check is sufficient.
+        assert "mdk add --list" not in result.stdout
 
     def test_no_with_agents_shows_add_list_tip(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
