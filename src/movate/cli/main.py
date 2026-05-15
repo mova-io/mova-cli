@@ -29,6 +29,7 @@ sync_env_aliases()
 from movate import __version__  # noqa: E402
 from movate.cli import (  # noqa: E402
     _console,
+    add_cmd,
     audit_cmd,
     demo_cmd,
     diff_cmd,
@@ -192,6 +193,10 @@ def _main(
 app.command("menu", rich_help_panel=PANEL_DEVELOP)(menu_cmd.menu)
 app.command("demo", rich_help_panel=PANEL_DEVELOP)(demo_cmd.demo)
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
+# `mdk add` — project-aware ergonomic wrapper around `mdk init -t <template>`.
+# Same Develop panel because it's a scaffold command; positioned right after
+# `init` so operators see the natural progression.
+app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)

@@ -6,6 +6,10 @@ A copy-pasteable demo script. Walks from `git clone` to a live Azure Container A
 
 **Audience:** internal demos, customer walkthroughs, recorded screencasts.
 
+> **Two recent additions used in the demo:**
+> - **`mdk add <template>`** — project-aware ergonomic wrapper. `mdk add rag-qa` drops a role-agent into `./agents/rag-qa/` from the bundled template catalog. `mdk add --list` prints the catalog.
+> - **`mdk deploy --notify`** — fires a Telegram message + generic webhook on successful deploy. Set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` for Telegram, `MOVATE_DEPLOY_WEBHOOK` for Slack/Teams/Discord/custom.
+
 > **What's real, what's stubbed:** Every command in this file runs against the shipped CLI. The one feature called out as a stub is the **knowledge-base abstraction** — there's no first-class `mdk kb` command today. RAG-style knowledge is delivered via the `contexts/` directory (manual markdown drops) plus skills for live API lookups. A vector-store integration ships in a later sprint.
 
 ---
@@ -125,7 +129,7 @@ mdk eval ./support-bot --gate 0.7
 
 Runs the seed dataset through the agent, scores against the expected outputs (exact-match or LLM-as-judge with cross-family enforcement), and exits 0 on pass / 1 on fail. The output ends with `mdk_eval_summary:` for CI parsing.
 
-### 8. Deploy to Azure Container Apps
+### 8. Deploy to Azure Container Apps (with Telegram notification)
 
 ```bash
 # One-time: register the deployment target
@@ -136,16 +140,37 @@ mdk config add-target prod \
   --azure-acr movateprodacr \
   --azure-env prod
 
+# One-time: wire your notification channel (any/all)
+export TELEGRAM_BOT_TOKEN=...                # from @BotFather
+export TELEGRAM_CHAT_ID=...                  # from getUpdates after /start
+export MOVATE_DEPLOY_WEBHOOK=https://...     # optional: Slack/Teams/Discord
+
 # Pre-flight: confirm Azure auth + permissions
 mdk doctor --target prod
 
-# Deploy: build container in ACR, update both api + worker apps
-mdk deploy --target prod
+# Deploy: build container in ACR, update both api + worker apps,
+# fire Telegram + webhook on success.
+mdk deploy --target prod --notify
 ```
 
-`mdk deploy` runs `az acr build` (no local Docker needed), tags as `movate:<version>-<git-sha>`, updates both `movate-prod-api` and `movate-prod-worker` Container Apps, and polls `/healthz` until live.
+`mdk deploy` runs `az acr build` (no local Docker needed), tags as `movate:<version>-<git-sha>`, updates both `movate-prod-api` and `movate-prod-worker` Container Apps, polls `/healthz` until live, and (with `--notify`) fires a Telegram message + webhook with:
 
-You're done. Total: 8 commands.
+- Target, image tag, runtime URL
+- Git SHA, deployer (`$USER`), wall-clock duration
+- Package version
+
+You'll see on your phone within a second of `/healthz` going green:
+
+```
+✓ Deployed to prod
+movate:0.6.1-abc1234
+Git SHA: abc1234
+v0.6.1 · deployed by alice · 173.4s
+
+[Open runtime](https://movate-prod-api.azurecontainerapps.io)
+```
+
+You're done. Total: 8 commands, plus a phone notification.
 
 ---
 
@@ -261,6 +286,10 @@ Multiple agents stitched into a linear pipeline. v0.3 ships sequential workflows
 ### C.1. Scaffold a second agent — classifier
 
 ```bash
+# Option 1: from a bundled role template (instant, no LLM call)
+mdk add classifier router
+
+# Option 2: from a natural-language description (LLM-scaffolded)
 mdk init router --llm "A two-class router. Reads a customer question \
   and decides whether it's about general FAQs ('faq') or about an \
   existing order ('order'). Returns exactly one of those two labels."

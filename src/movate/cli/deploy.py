@@ -22,9 +22,11 @@ rollbacks / redeploys of an existing image.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -39,6 +41,7 @@ from movate.core.user_config import (
     UserConfigError,
     resolve_target,
 )
+from movate.notify import DeployEvent, notify_deploy_success
 
 err = Console(stderr=True)
 stdout = Console()
@@ -91,6 +94,17 @@ def deploy(
         help=(
             "Update only one Container App: 'api' or 'worker'. Default updates "
             "both. Useful when a code change is API-only or worker-only."
+        ),
+    ),
+    notify: bool = typer.Option(
+        False,
+        "--notify",
+        help=(
+            "On successful deploy, fire outbound notifications. Reads "
+            "[bold]TELEGRAM_BOT_TOKEN[/bold] + [bold]TELEGRAM_CHAT_ID[/bold] "
+            "for a Telegram message, [bold]MOVATE_DEPLOY_WEBHOOK[/bold] for "
+            "a generic JSON POST (Slack/Teams/Discord/custom). Both fire if "
+            "both are configured. Failures are non-fatal — deploy stays green."
         ),
     ),
 ) -> None:
@@ -154,6 +168,10 @@ def deploy(
     if dry_run:
         return
 
+    # Track wall-clock duration of the deploy from this point forward
+    # so the notification carries an accurate "took N seconds" figure.
+    started_at = time.monotonic()
+
     if not skip_build:
         _run_acr_build(plan)
     for app_name in plan.apps_to_update:
@@ -164,6 +182,14 @@ def deploy(
             f"[green]✓[/green] deploy submitted to {target_name}. "
             "Skipping /healthz poll (--no-wait)."
         )
+        # --no-wait + --notify is intentionally a no-op for the
+        # notification: we don't know if the deploy actually succeeded
+        # without /healthz. Surface that mismatch on stderr.
+        if notify:
+            hint(
+                "[dim]→ --notify skipped under --no-wait "
+                "(success unconfirmed without /healthz poll)[/dim]"
+            )
         return
 
     asyncio.run(
@@ -174,6 +200,22 @@ def deploy(
         )
     )
     success(f"{target_name} is now serving {plan.image_tag}")
+
+    # Notification — fires AFTER success() so an operator running
+    # interactively sees the success line before the network round-trip
+    # to Telegram / their webhook.
+    if notify:
+        notify_deploy_success(
+            DeployEvent(
+                target=target_name,
+                image_tag=plan.image_tag,
+                runtime_url=target_cfg.url,
+                git_sha=_git_short_sha() or "",
+                deployer=os.environ.get("USER", "unknown"),
+                duration_seconds=time.monotonic() - started_at,
+                version=plan.version,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
