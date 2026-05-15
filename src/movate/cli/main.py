@@ -37,6 +37,7 @@ from movate.cli import (  # noqa: E402
     menu_cmd,
     migrate_cmd,
     promote_cmd,
+    replay_cmd,
     rollback_cmd,
 )
 from movate.cli import bench as bench_cmd  # noqa: E402
@@ -204,6 +205,9 @@ app.command("watch", rich_help_panel=PANEL_DEVELOP)(watch_cmd.watch)
 # ----- Run & evaluate -------------------------------------------------------
 
 app.command("run", rich_help_panel=PANEL_RUN)(run_cmd.run)
+# `replay` re-executes a past run with the same input — pairs with
+# `mdk explain` (what happened?) for deterministic prompt iteration.
+app.command("replay", rich_help_panel=PANEL_RUN)(replay_cmd.replay)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
 app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
