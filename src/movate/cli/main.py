@@ -63,6 +63,7 @@ from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
+from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
@@ -218,6 +219,11 @@ app.command("doctor", rich_help_panel=PANEL_DIAGNOSE)(doctor_cmd.doctor)
 # Auto-remediates common diagnostic findings. Dry-run by default.
 app.command("fix", rich_help_panel=PANEL_DIAGNOSE)(fix_cmd.fix)
 app.command("pricing", rich_help_panel=PANEL_DIAGNOSE)(pricing_cmd.pricing)
+# `costs` reports on historical spend (different from `pricing` which
+# shows the live tariff). Both share the Diagnose panel since they
+# answer adjacent operator questions ("what does this cost?" vs
+# "what HAVE we spent?").
+app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
 
 # ----- Deploy & operate -----------------------------------------------------
 
