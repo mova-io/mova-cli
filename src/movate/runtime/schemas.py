@@ -637,6 +637,32 @@ class AgentPublishedView(BaseModel):
     root, e.g. ``faq-bot/agent.yaml``."""
 
 
+class SkillCreatedView(BaseModel):
+    """``POST /api/v1/skills`` response — what landed under
+    ``<skills_path>/<name>/`` after a successful upload.
+
+    The Angular UI doesn't currently render a skills profile, but
+    deploy tooling (and operators running curl) need a confirmation
+    payload with the resolved name so a subsequent agent upload that
+    references the skill can be done with confidence the resolution
+    will succeed.
+
+    Mirror of :class:`AgentCreatedView` for the skill resource.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    skill_dir: str
+    """Path-relative-to-skills-root where the bundle landed.
+    E.g. ``web-search``."""
+    files_persisted: list[str]
+    """Sorted list of files written, relative to ``skill_dir``.
+    E.g. ``["impl.py", "skill.yaml"]``."""
+
+
 class AgentDeletedView(BaseModel):
     """``DELETE /api/v1/agents/{name}`` response.
 
@@ -897,5 +923,6 @@ __all__ = [
     "RunSubmission",
     "RunTraceView",
     "RunView",
+    "SkillCreatedView",
     "WizardAgentSubmission",
 ]

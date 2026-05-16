@@ -38,6 +38,10 @@ from movate.runtime.agent_creation import (
     unzip_bundle,
     wizard_to_bundle_files,
 )
+from movate.runtime.skill_creation import (
+    SkillCreationError,
+    persist_skill_bundle,
+)
 from movate.runtime.errors import auth_required, not_found
 from movate.runtime.middleware import AuthContext, make_auth_dependency
 from movate.runtime.registry import scan_agents
@@ -68,6 +72,7 @@ from movate.runtime.schemas import (
     RunSubmission,
     RunTraceView,
     RunView,
+    SkillCreatedView,
     WizardAgentSubmission,
 )
 from movate.storage.base import StorageProvider
@@ -362,6 +367,7 @@ def build_app(
     *,
     agents: list[AgentBundle] | None = None,
     agents_path: Path | None = None,
+    skills_path: Path | None = None,
     rate_limit_per_minute: int | None = 60,
     cors_allowed_origins: list[str] | None = None,
     github_client: object | None = None,
@@ -396,6 +402,17 @@ def build_app(
     # without an agents_path and can't persist. mdk serve always
     # passes its --agents-path here; tests pass tmp_path.
     app.state.agents_path = agents_path
+    # Where new skills (POST /api/v1/skills) land. Defaults to
+    # ``<agents_path>/skills/`` so the agent loader's project-root
+    # fallback (``agent_dir.parent`` when no project marker is found)
+    # resolves to the same directory. Explicit skills_path overrides —
+    # used by tests and operators who keep skills on a sibling volume.
+    if skills_path is not None:
+        app.state.skills_path = skills_path
+    elif agents_path is not None:
+        app.state.skills_path = agents_path / "skills"
+    else:
+        app.state.skills_path = None
     # GitHub integration (item 78 / ADR 007). Built lazily when
     # ``MDK_GITHUB_ENABLED=1`` so the typical runtime (no GitHub) pays
     # no cost. Tests pass a pre-built mock through ``github_client``.
@@ -847,6 +864,78 @@ def build_app(
             version=spec.version,
             description=spec.description,
             agent_dir=result.agent_dir.name,
+            files_persisted=result.files_persisted,
+        )
+
+    @v1.post(
+        "/skills",
+        response_model=SkillCreatedView,
+        status_code=201,
+        tags=["skills-v1"],
+    )
+    async def v1_create_skill(
+        request: Request,
+        skill_yaml: UploadFile = File(...),
+        impl: UploadFile | None = File(default=None),
+        corpus: UploadFile | None = File(default=None),
+        readme: UploadFile | None = File(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SkillCreatedView:
+        """Create or replace a skill bundle under ``<skills_path>/<name>/``.
+
+        Fixes the long-standing gap where agents declaring
+        ``skills: [<name>]`` 422'd on upload with "skills resolution
+        failed: ... Available: (empty registry)". The runtime now owns
+        a real skill registry that customers can populate via this
+        endpoint OR implicitly via the deploy command (PR 3 in the
+        same stack).
+
+        Multipart fields:
+
+        * ``skill_yaml`` (required) — the spec. ``name`` field inside
+          determines the on-disk directory.
+        * ``impl`` (optional) — Python implementation file.
+        * ``corpus`` (optional) — JSON corpus shipped alongside.
+        * ``readme`` (optional) — human-facing notes.
+
+        PUT semantics: re-uploading the same skill name overwrites
+        atomically. Skills are referenced by name from agents, so an
+        operator who tweaked their skill and re-deploys expects the
+        runtime to follow — different conflict policy from agents
+        (which 409 on conflict because agent identity is sticky).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **422** — bundle failed validation (parse / schema / shape)
+        * **503** — runtime was built without a ``skills_path``
+        """
+        skills_path: Path | None = request.app.state.skills_path
+        if skills_path is None:
+            raise SkillCreationError(
+                "runtime was built without a skills_path; "
+                "POST /api/v1/skills is unavailable",
+                status_code=503,
+            )
+
+        files: dict[str, bytes] = {"skill.yaml": await skill_yaml.read()}
+        if impl is not None:
+            files["impl.py"] = await impl.read()
+        if corpus is not None:
+            files["corpus.json"] = await corpus.read()
+        if readme is not None:
+            files["README.md"] = await readme.read()
+
+        result = persist_skill_bundle(files, skills_path=skills_path)
+
+        _ = ctx.tenant_id  # future per-tenant audit log entry
+
+        spec = result.bundle.spec
+        return SkillCreatedView(
+            name=spec.name,
+            version=spec.version,
+            description=spec.description or "",
+            skill_dir=result.skill_dir.name,
             files_persisted=result.files_persisted,
         )
 
@@ -1596,6 +1685,26 @@ def build_app(
     @app.exception_handler(AgentCreationError)
     async def _agent_creation_error_handler(
         _request: Request, exc: AgentCreationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": {
+                    "error": {
+                        "code": _agent_creation_error_code(exc.status_code),
+                        "message": str(exc),
+                    }
+                }
+            },
+        )
+
+    # SkillCreationError uses the same status_code → wire-code mapping
+    # as AgentCreationError (409/422/500/503 all carry the same
+    # operator-facing semantics regardless of resource); shared handler
+    # would couple the two unnecessarily, so keep them parallel.
+    @app.exception_handler(SkillCreationError)
+    async def _skill_creation_error_handler(
+        _request: Request, exc: SkillCreationError
     ) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
