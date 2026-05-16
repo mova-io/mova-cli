@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from movate.cli._completion import complete_agent_path
@@ -42,7 +46,7 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def eval_(
+def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatch + wizard
     path: str | None = typer.Argument(
         None,
         help=(
@@ -136,6 +140,18 @@ def eval_(
             "ignored when path is a directory."
         ),
     ),
+    guided: bool = typer.Option(
+        False,
+        "--guided",
+        "-g",
+        help=(
+            "Interactive wizard: walks the operator through agent "
+            "selection, provider (mock/real), gate, runs-per-case, "
+            "and baseline behavior — then runs the resulting eval. "
+            "Auto-triggered when [bold]mdk eval[/bold] runs with no "
+            "args from a TTY inside a project."
+        ),
+    ),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
 
@@ -166,6 +182,29 @@ def eval_(
     if baseline is not None and baseline_file is not None:
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
+
+    # Guided wizard — explicit `--guided`, OR auto-trigger when an
+    # operator typed bare `mdk eval` with no path and no `--all` from
+    # an interactive shell inside a project. CI / pipe / no-args-outside-
+    # project paths still fall through to the existing error.
+    if not guided and path is None and not all_in_project:
+        from movate.core.config import is_project_root  # noqa: PLC0415
+
+        if sys.stdin.isatty() and sys.stdout.isatty() and is_project_root(Path.cwd()):
+            guided = True
+    if guided:
+        wizard = _run_eval_wizard()
+        if wizard is None:  # operator hit Ctrl-C / quit
+            raise typer.Exit(code=0)
+        # Apply wizard's answers as if they were CLI flags, then fall
+        # through to the standard dispatch below — no duplicated logic.
+        path = wizard.path
+        all_in_project = wizard.all_in_project
+        mock = wizard.mock
+        gate = wizard.gate
+        runs = wizard.runs
+        baseline_file = wizard.baseline_file
+        output_baseline = wizard.output_baseline
 
     # `--all`: evaluate every agent in the current project. Mutex
     # with a path argument. Dispatches to the sweep helper below.
@@ -248,6 +287,238 @@ def eval_(
             remote_url=remote_url,
             remote_api_key=api_key if remote_url else None,
         )
+    )
+
+
+@dataclass
+class _EvalWizardChoices:
+    """Resolved answers from the interactive eval wizard.
+
+    Maps 1:1 to the CLI flags the dispatch path already handles, so
+    the wizard's only job is collecting choices — execution stays in
+    the existing code paths.
+    """
+
+    path: str | None
+    all_in_project: bool
+    mock: bool
+    gate: float
+    runs: int
+    baseline_file: Path | None
+    output_baseline: Path | None
+
+
+def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orchestrator; 5 prompts each with try/except adds linear branch count
+    """Interactive Rich-prompted eval setup. Returns None on Ctrl-C / quit.
+
+    Walks the operator through the five most-common decisions an eval
+    invocation needs: which agent(s), provider (mock/real), gate
+    threshold, runs per case, and baseline behavior. The full
+    surface of ``mdk eval`` has 13 flags; the wizard intentionally
+    covers only the 5 a casual operator cares about and leaves the
+    rest to the explicit CLI path.
+
+    Same visual style as ``mdk menu`` (Rich Panel + numbered
+    Prompt.ask choices) so operators see one consistent UX language
+    across guided commands.
+    """
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
+    cwd = Path.cwd()
+    if not is_project_root(cwd):
+        err_console.print(
+            "[red]✗[/red] guided eval needs a project (project.yaml / "
+            "policy.yaml / movate.yaml). None found in cwd."
+        )
+        return None
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold]mdk eval — guided setup[/bold]\n"
+            "[dim]Five questions; press Ctrl-C any time to quit. "
+            "The resolved command is shown before it runs so you can "
+            "copy-paste it next time.[/dim]",
+            border_style="cyan",
+            title_align="left",
+        )
+    )
+
+    # Q1: Which agent(s)?
+    agents_dir = cwd / "agents"
+    agent_names: list[str] = []
+    if agents_dir.is_dir():
+        agent_names = sorted(
+            d.name for d in agents_dir.iterdir() if d.is_dir() and (d / "agent.yaml").is_file()
+        )
+    if not agent_names:
+        err_console.print(
+            "[red]✗[/red] no agents in [bold]./agents/[/bold]. "
+            "Run [bold]mdk add <template>[/bold] first."
+        )
+        return None
+    # First option is "all"; remaining are the per-agent names. Operator
+    # picks by index (matches `mdk menu`'s numbered shape).
+    agent_choices = ["all", *agent_names]
+    console.print()
+    console.print("[bold]Which agent(s)?[/bold]")
+    for i, name in enumerate(agent_choices, start=1):
+        suffix = (
+            f"  [dim](every agent in project — {len(agent_names)} total)[/dim]"
+            if name == "all"
+            else ""
+        )
+        console.print(f"  [bold cyan][{i}][/bold cyan] {name}{suffix}")
+    try:
+        agent_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=[str(i) for i in range(1, len(agent_choices) + 1)],
+            default="1",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    chosen_agent = agent_choices[int(agent_idx) - 1]
+
+    # Q2: Mock or real provider?
+    console.print()
+    try:
+        use_mock = Confirm.ask(
+            "[bold]Use mock provider?[/bold] [dim](deterministic, free; no API keys "
+            "needed — recommended for CI / iteration)[/dim]",
+            default=True,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+    # Q3: Gate threshold.
+    gate_choices = {
+        "1": (0.0, "no gate (just run + score; never fails)"),
+        "2": (0.5, "loose (50%+ pass rate; permissive)"),
+        "3": (0.7, "recommended (70%+; CI default)"),
+        "4": (0.9, "strict (90%+; expects high-quality datasets)"),
+    }
+    console.print()
+    console.print("[bold]Gate threshold?[/bold]")
+    for key, (value, label) in gate_choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {value}  [dim]{label}[/dim]")
+    try:
+        gate_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(gate_choices.keys()),
+            default="3",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    gate = gate_choices[gate_idx][0]
+
+    # Q4: Runs per case.
+    runs_choices = {
+        "1": (1, "fast — single run per case"),
+        "2": (3, "recommended — defeats LLM-judge sampling variance"),
+        "3": (5, "tight CI — most tokens spent, narrowest CI"),
+    }
+    console.print()
+    console.print(
+        "[bold]Runs per case?[/bold] [dim](how many times each dataset case is run; "
+        "more = tighter confidence)[/dim]"
+    )
+    for key, (value, label) in runs_choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {value}  [dim]{label}[/dim]")
+    try:
+        runs_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(runs_choices.keys()),
+            default="1" if use_mock else "2",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    runs = runs_choices[runs_idx][0]
+
+    # Q5: Baseline behavior.
+    project_baseline = cwd / ".movate" / "baseline.json"
+    has_existing_baseline = project_baseline.is_file()
+    baseline_choices: dict[str, tuple[str, str]] = {
+        "1": ("none", "just run + show scores (no drift check)"),
+        "2": (
+            "compare",
+            f"compare against [bold].movate/baseline.json[/bold] "
+            f"({'exists' if has_existing_baseline else 'MISSING — would skip'})",
+        ),
+        "3": (
+            "write",
+            "write a fresh baseline to [bold].movate/baseline.json[/bold] after this run",
+        ),
+    }
+    console.print()
+    console.print("[bold]Baseline behavior?[/bold]")
+    for key, (_, label) in baseline_choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {label}")
+    try:
+        baseline_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(baseline_choices.keys()),
+            default="1",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    baseline_mode = baseline_choices[baseline_idx][0]
+    baseline_file_arg: Path | None = None
+    output_baseline_arg: Path | None = None
+    if baseline_mode == "compare":
+        if has_existing_baseline:
+            baseline_file_arg = project_baseline
+        else:
+            console.print(
+                "[yellow]⚠[/yellow] no baseline file at "
+                "[bold].movate/baseline.json[/bold]; running without "
+                "drift check this time."
+            )
+    elif baseline_mode == "write":
+        output_baseline_arg = project_baseline
+        project_baseline.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolved → preview the equivalent CLI command so the operator
+    # learns the flag-form for next time.
+    is_all = chosen_agent == "all"
+    path_arg: str | None = None if is_all else chosen_agent
+    parts: list[str] = ["mdk", "eval"]
+    if is_all:
+        parts.append("--all")
+    else:
+        parts.append(str(chosen_agent))
+    if use_mock:
+        parts.append("--mock")
+    parts.extend(["--gate", str(gate)])
+    if runs != 1:
+        parts.extend(["--runs", str(runs)])
+    if baseline_file_arg is not None:
+        parts.extend(["--baseline-file", str(baseline_file_arg)])
+    if output_baseline_arg is not None:
+        parts.extend(["--output-baseline", str(output_baseline_arg)])
+
+    console.print()
+    console.print(
+        Panel(
+            "[dim]Running:[/dim] [bold cyan]" + " ".join(parts) + "[/bold cyan]",
+            border_style="green",
+            title="[green]✓[/green] Configured",
+            title_align="left",
+        )
+    )
+    console.print()
+
+    return _EvalWizardChoices(
+        path=path_arg,
+        all_in_project=is_all,
+        mock=use_mock,
+        gate=gate,
+        runs=runs,
+        baseline_file=baseline_file_arg,
+        output_baseline=output_baseline_arg,
     )
 
 
