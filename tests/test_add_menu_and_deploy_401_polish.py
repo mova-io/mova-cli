@@ -123,7 +123,9 @@ def test_add_menu_renders_literal_s_bracket() -> None:
     markup. We can't easily test the rendered Panel directly (TTY
     gating skips the menu under CliRunner), so verify the source
     string is the escaped form."""
-    src = Path("src/movate/cli/add_cmd.py").read_text()
+    # Post-PR-#105 the menu rendering lives in the shared helper
+    # (src/movate/cli/_next_steps.py) instead of inline in add_cmd.py.
+    src = Path("src/movate/cli/_next_steps.py").read_text()
     # The literal source must contain the escaped bracket so Rich
     # doesn't strip it as a tag. Regression-guard: if someone
     # removes the escape, this test fails.
