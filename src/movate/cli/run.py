@@ -78,6 +78,18 @@ def run(
     mock: bool = typer.Option(
         False, "--mock", help="Use the deterministic MockProvider (no API keys; for smoke tests)."
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Run against a deployed runtime instead of locally. "
+            "Resolves to a target from ~/.movate/config.yaml (URL + key_env). "
+            "POSTs the input to /api/v1/agents/<name>/runs?wait=true and "
+            "renders the resulting RunView the same way as a local run. "
+            "Mutually exclusive with --replay and --stream (remote runtime "
+            "owns persistence + provider; no local stream callback)."
+        ),
+    ),
     stream: bool = typer.Option(
         False,
         "--stream",
@@ -105,6 +117,9 @@ def run(
       [dim]# Replay a stored run against current code (regression debug)[/dim]
       $ movate run ./faq-agent --replay 4f8a-...
 
+      [dim]# Hit a deployed runtime (Azure ACA / local-serve)[/dim]
+      $ mdk run faq "hello world" --target dev
+
     [bold]Workflow examples:[/bold]
 
       [dim]# Initial state as JSON[/dim]
@@ -120,6 +135,32 @@ def run(
       $ mdk run rag-qa '{"question":"..."}'
       $ mdk run ./agents/rag-qa '{"question":"..."}'
     """
+    # Remote dispatch wins early — when --target is set, we don't need
+    # the local bundle (the runtime has it). Mutex with --replay (replay
+    # rebuilds from a local RunRecord; nothing remote about it) and
+    # --stream (no token callback path through the runtime in v0.5).
+    if target is not None:
+        if replay_id is not None:
+            console.print(
+                "[red]✗[/red] --target is mutually exclusive with --replay; "
+                "remote runtime owns the RunRecord history."
+            )
+            raise typer.Exit(code=2)
+        if stream:
+            console.print(
+                "[red]✗[/red] --target does not support --stream in v0.7; "
+                "the runtime returns the final RunView once execution completes."
+            )
+            raise typer.Exit(code=2)
+        _dispatch_remote_agent(
+            agent_name=str(path),
+            raw=input_flag or input_arg,
+            target=target,
+            mock=mock,
+            output_format=output_format,
+        )
+        return
+
     # Bare-name resolution: inside a project, `mdk run rag-qa` resolves
     # to ./agents/rag-qa. Full paths + URLs pass through unchanged.
     from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
@@ -651,3 +692,311 @@ def _configure_mock_for_bundle(provider: Any, bundle: AgentBundle) -> None:
     expecteds = load_dataset_expecteds(dataset_path)
     if expecteds:
         provider.configure_dataset(expecteds)
+
+
+# ---------------------------------------------------------------------------
+# Remote dispatch (--target) — PR #107
+# ---------------------------------------------------------------------------
+
+
+_HTTP_OK = 200
+_HTTP_UNAUTHORIZED = 401
+_HTTP_NOT_FOUND = 404
+_HTTP_UNPROCESSABLE = 422
+
+
+def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads better than nested helpers
+    *,
+    agent_name: str,
+    raw: str | None,
+    target: str,
+    mock: bool,
+    output_format: Run,
+) -> None:
+    """Run an agent against a deployed runtime.
+
+    Closes the loop: ``init → add → eval → deploy → run --target``.
+    Resolves the target's URL + bearer-token env var from
+    ``~/.movate/config.yaml`` (same plumbing ``mdk deploy --target``
+    uses), POSTs the input to ``/api/v1/agents/<name>/runs?wait=true``,
+    and renders the resulting :class:`RunView` the same way as a local
+    run — JSON to stdout, summary line on stderr, exit code mirrors
+    the run's status.
+
+    The agent NAME (not a local path) is what we put in the URL. If
+    the caller happened to pass ``./agents/faq``, we strip to the
+    final segment — operators inside a project shouldn't have to think
+    about whether they typed the bare name or the path.
+    """
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
+
+    # Normalize agent path → bare name. The runtime indexes by name,
+    # not filesystem path. ``./agents/faq`` and ``faq`` both resolve
+    # to ``faq``. Trailing slash tolerant.
+    name = Path(agent_name).name or agent_name
+
+    # Resolve target → URL + key_env. Same error UX as `mdk deploy`.
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    # Read bearer from env. Matches the deploy preflight — separate
+    # error from "target not configured" so the operator sees exactly
+    # which knob to turn.
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    if not api_key:
+        console.print(
+            f"[red]✗[/red] env var ${target_cfg.key_env} is empty. "
+            f"Run [bold]mdk auth save-runtime-key {target_name} <key>[/bold] "
+            f"to persist + autoload, or [bold]export {target_cfg.key_env}=mvt_live_...[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    if raw is None:
+        console.print(
+            "[red]✗[/red] provide input as a positional arg or via --input "
+            "(remote runs require JSON input; no schema available client-side)."
+        )
+        raise typer.Exit(code=2)
+
+    payload = _coerce_remote_agent_input(raw, name)
+
+    base_url = target_cfg.url.rstrip("/")
+    body = {"input": payload, "mock": mock}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    # Long-ish timeout — inline mode blocks for the full agent run.
+    # Typical LLM call is a few seconds; tool-use loops can stretch.
+    # 120s gives us headroom without hanging forever on a stuck pod.
+    timeout = httpx.Timeout(120.0, connect=10.0)
+
+    console.print(
+        f"[dim]→ running [bold]{name}[/bold] on [bold]{target_name}[/bold] "
+        f"({target_cfg.url}) …[/dim]"
+    )
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                f"{base_url}/api/v1/agents/{name}/runs",
+                params={"wait": "true"},
+                json=body,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        console.print(f"[red]✗ network error:[/red] {exc}")
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=2) from None
+
+    # Friendly error mapping. The runtime's error envelope is
+    # `{detail: {...}}` for FastAPI 422 + `{detail: str}` for our typed
+    # raises (`not_found`, etc.). Surface the operator-friendly hint
+    # first, then the raw body for power users.
+    if response.status_code == _HTTP_UNAUTHORIZED:
+        prefix = api_key[:16]
+        console.print(
+            f"[red]✗ runtime rejected the bearer token[/red] "
+            f"(value starts with: '{prefix}…').\n"
+            f"  Check your env: [bold]echo ${target_cfg.key_env}[/bold] — "
+            f"likely stale from .zshrc or a prior tenant.\n"
+            f"  Fix: [bold]mdk auth save-runtime-key {target_name} <new-key>[/bold] "
+            f"to persist + autoload across shells."
+        )
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=1)
+    if response.status_code == _HTTP_NOT_FOUND:
+        console.print(
+            f"[red]✗ agent [bold]{name}[/bold] not found on [bold]{target_name}[/bold].[/red]\n"
+            f"  Did you forget to [bold]mdk deploy --target {target_name}[/bold] first?\n"
+            f"  List deployed agents: [bold]curl -H 'Authorization: Bearer "
+            f"${target_cfg.key_env}' {target_cfg.url}/api/v1/agents[/bold]"
+        )
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=1)
+    if response.status_code == _HTTP_UNPROCESSABLE:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = {"raw": response.text[:300]}
+        console.print(
+            f"[red]✗ input rejected by runtime (422):[/red]\n"
+            f"  {detail}\n"
+            f"  Inspect the deployed agent's schema: "
+            f"[bold]mdk show {name}[/bold] (local) or via the runtime."
+        )
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=1)
+    if response.status_code != _HTTP_OK:
+        try:
+            body_json = response.json()
+        except ValueError:
+            body_json = {"raw": response.text[:300]}
+        console.print(
+            f"[red]✗ HTTP {response.status_code}[/red] from {target_cfg.url}: {body_json}"
+        )
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=1)
+
+    # Parse the response. The runtime returns a RunView shape; we
+    # don't strictly validate (extra fields are forward-compat) — just
+    # surface what we got. Output goes to stdout; metadata to stderr.
+    try:
+        run_view = response.json()
+    except ValueError as exc:
+        console.print(f"[red]✗ runtime returned non-JSON body:[/red] {exc}")
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=1) from None
+
+    _render_remote_run(run_view, output_format=output_format)
+
+    status = (run_view.get("status") or "").lower()
+    ok = status == "success"
+    metrics = run_view.get("metrics") or {}
+    cost = metrics.get("cost_usd")
+    latency = metrics.get("latency_ms")
+    run_id = run_view.get("run_id")
+    _emit_remote_summary(
+        agent=name,
+        target=target_name,
+        run_id=run_id,
+        cost=cost,
+        latency=latency,
+        ok=ok,
+    )
+
+    if not ok:
+        # Surface the runtime's error envelope on stderr so the
+        # operator sees what went wrong without re-parsing JSON.
+        err = run_view.get("error") or {}
+        if err:
+            console.print(
+                f"[red]✗ run errored:[/red] {err.get('type', 'unknown')}: {err.get('message', '')}"
+            )
+        raise typer.Exit(code=1)
+
+
+def _coerce_remote_agent_input(raw: str, agent_name: str) -> dict[str, Any]:
+    """Coerce the positional input for a remote run.
+
+    Same precedence as the local path (``-``/file/JSON) but without a
+    local bundle to consult for auto-wrap. As a convenience for inside-
+    project demos, we DO try to load the local bundle by name — if it
+    exists, we can auto-wrap a plain string into ``{<field>: arg}``;
+    if it doesn't (e.g. running against a runtime whose agent isn't
+    checked out locally), we require JSON.
+    """
+    if raw == "-":
+        return _ensure_dict(json.loads(sys.stdin.read()))
+    p = Path(raw)
+    if p.is_file():
+        return _ensure_dict(json.loads(p.read_text()))
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Auto-wrap fallback: if the agent exists locally, use its input
+    # schema to wrap a plain string the same way the local path does.
+    # Silent skip on any load failure — caller gets a clean error.
+    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+
+    try:
+        local_path = Path(resolve_agent_or_workflow_arg(agent_name))
+        bundle = load_agent(local_path)
+    except (AgentLoadError, FileNotFoundError, ValueError):
+        raise typer.BadParameter(
+            f"remote input must be JSON (no local bundle for {agent_name!r} to "
+            f"auto-wrap from). Pass JSON via --input or as a JSON positional arg."
+        ) from None
+
+    schema = bundle.input_schema
+    required = list(schema.get("required", []))
+    properties = schema.get("properties", {}) or {}
+    string_required = [nm for nm in required if properties.get(nm, {}).get("type") == "string"]
+    if len(string_required) == 1 and len(required) == 1:
+        return {string_required[0]: raw}
+
+    raise typer.BadParameter(
+        f"remote input is not valid JSON and cannot be auto-wrapped — agent "
+        f"{agent_name!r} requires {required}. Pass JSON via --input or as a "
+        f"JSON-formatted positional arg."
+    )
+
+
+def _render_remote_run(run_view: dict[str, Any], *, output_format: Run) -> None:
+    """Render the RunView the runtime returned.
+
+    Mirrors the local _run_local_agent rendering:
+      - JSON mode: dump the output (or the full RunView if no output).
+      - TEXT mode: pretty-print the output as JSON (closest analog to
+        ``response.human_readable`` — the local mode's TEXT is the
+        Pydantic ``model.human_readable`` property which the runtime
+        doesn't emit over the wire).
+
+    Echo the run_id on stderr so it survives stdout-piping (jq, `>`).
+    """
+    output = run_view.get("output")
+    if output_format == Run.TEXT:
+        # The runtime doesn't ship the human_readable rendering — that's
+        # a Pydantic property on RunResponse. Fall back to pretty JSON.
+        sys.stdout.write(json.dumps(output, indent=2, default=str) + "\n")
+    else:
+        # JSON mode → emit the full RunView so callers can pipe to jq
+        # and pick out cost/latency/output. This is symmetric with the
+        # local run's `response.model_dump_json(indent=2)` which dumps
+        # the full RunResponse model.
+        sys.stdout.write(json.dumps(run_view, indent=2, default=str) + "\n")
+
+    run_id = run_view.get("run_id")
+    if run_id:
+        short = str(run_id)[:8]
+        _console.hint(
+            f"[dim]→ remote run_id [bold]{short}[/bold] "
+            f"(persisted on the runtime, not locally)[/dim]"
+        )
+
+
+def _emit_remote_summary(
+    *,
+    agent: str,
+    target: str,
+    run_id: str | None,
+    cost: float | None,
+    latency: int | None,
+    ok: bool,
+) -> None:
+    """Greppable summary — same shape as the local ``mdk_run_summary``
+    with an extra ``target=`` field so CI workflows can branch on
+    local-vs-remote runs.
+    """
+    run_short = (run_id or "")[:8] or "-"
+    sys.stderr.write(
+        f"mdk_run_summary: kind=agent agent={agent} target={target} "
+        f"run_id={run_short} "
+        f"cost_usd={cost if cost is not None else '-'} "
+        f"latency_ms={latency if latency is not None else '-'} "
+        f"ok={'true' if ok else 'false'}\n"
+    )
+    sys.stderr.flush()
