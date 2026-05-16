@@ -101,6 +101,14 @@ def validate(
         "--no-lint",
         help="Skip the prompt linter (schema + policy checks still run).",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Emit a machine-readable JSON result instead of Rich output. "
+            "Useful for CI dashboards and scripts that parse validate output."
+        ),
+    ),
 ) -> None:
     """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references.
 
@@ -121,7 +129,7 @@ def validate(
                 "argument are mutually exclusive."
             )
             raise typer.Exit(code=2)
-        _validate_all(strict=strict, run_linter=not no_lint)
+        _validate_all(strict=strict, run_linter=not no_lint, json_output=json_output)
         return
 
     if path is None:
@@ -133,7 +141,7 @@ def validate(
                 "[dim]no path given — defaulting to --all[/dim]",
                 highlight=False,
             )
-            _validate_all(strict=strict, run_linter=not no_lint)
+            _validate_all(strict=strict, run_linter=not no_lint, json_output=json_output)
             return
         console.print(
             "[red]✗[/red] not inside a movate project (no [bold]project.yaml[/bold] "
@@ -150,12 +158,27 @@ def validate(
     path = Path(resolve_agent_or_workflow_arg(str(path)))
 
     if is_workflow_path(path):
-        _validate_workflow(path)
+        if json_output:
+            try:
+                _validate_workflow(path)
+                console.print_json(json.dumps({"kind": "workflow", "name": path.name, "ok": True}))
+            except typer.Exit:
+                console.print_json(json.dumps({"kind": "workflow", "name": path.name, "ok": False}))
+                raise
+        else:
+            _validate_workflow(path)
+    elif json_output:
+        try:
+            _validate_agent(path, strict=strict, run_linter=not no_lint)
+            console.print_json(json.dumps({"kind": "agent", "name": path.name, "ok": True}))
+        except typer.Exit:
+            console.print_json(json.dumps({"kind": "agent", "name": path.name, "ok": False}))
+            raise
     else:
         _validate_agent(path, strict=strict, run_linter=not no_lint)
 
 
-def _validate_all(*, strict: bool, run_linter: bool) -> None:
+def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) -> None:
     """Validate every agent + workflow in the current project.
 
     Walks ``./agents/*/agent.yaml`` and ``./workflows/*/workflow.yaml``
@@ -234,6 +257,26 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     if failed < len(rows):
         _check_orphaned_assets(project_root, agent_dirs)
 
+    passed = len(rows) - failed
+
+    if json_output:
+        payload = {
+            "project": project_root.name,
+            "agents_total": len(agent_dirs),
+            "workflows_total": len(workflow_dirs),
+            "passed": passed,
+            "failed": failed,
+            "ok": failed == 0,
+            "items": [
+                {"kind": kind, "name": name, "ok": status == "ok"}
+                for kind, name, status, _ in rows
+            ],
+        }
+        console.print_json(json.dumps(payload))
+        if failed:
+            raise typer.Exit(code=2)
+        return
+
     # Render the summary table.
     table = Table(
         title=(
@@ -253,7 +296,6 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     console.print()
     console.print(table)
 
-    passed = len(rows) - failed
     console.print(
         f"[dim]mdk_validate_summary: "
         f"agents_total={len(agent_dirs)} "
