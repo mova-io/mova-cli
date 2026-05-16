@@ -1,0 +1,36 @@
+# ============================================================================
+# MDK Canonical Schema — Classifier Agent (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Classification Input
+description: >
+  A piece of text plus a closed set of allowed labels. The agent
+  returns exactly one of the labels (no free-form output).
+
+fields:
+
+  text:
+    type: markdown
+    description: The text to classify.
+    min_length: 1
+    ui: textarea
+    example: My order arrived broken; the box was crushed.
+
+  labels:
+    type: list[string]
+    description: >
+      The closed set of labels the agent must choose from.
+      Must contain at least 2 distinct labels.
+    min_items: 2
+    example:
+      - shipping_damage
+      - billing_question
+      - product_defect
+      - general_inquiry
+
+required:
+  - text
+  - labels

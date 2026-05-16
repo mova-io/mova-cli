@@ -1,0 +1,35 @@
+# ============================================================================
+# MDK Canonical Schema — Summarizer Agent (input)
+# ============================================================================
+# Business-readable schema for the text-summarization agent.
+
+version: 1
+type: object
+
+title: Text to Summarize
+description: >
+  A block of source text plus a target length. The agent produces a
+  concise summary that respects the word budget.
+
+fields:
+
+  text:
+    type: markdown
+    description: The source text to summarize (article, transcript, email, etc.).
+    min_length: 1
+    ui: textarea
+    example: >
+      Quarterly revenue grew 18% year-over-year, driven by strong
+      enterprise renewals. Operating margin expanded to 22% as the
+      cost-optimization program continued to pay off…
+
+  max_words:
+    type: integer
+    description: Upper bound on the summary's word count.
+    min: 5
+    max: 500
+    example: 60
+
+required:
+  - text
+  - max_words

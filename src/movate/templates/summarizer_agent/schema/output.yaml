@@ -1,0 +1,31 @@
+# ============================================================================
+# MDK Canonical Schema — Summarizer Agent (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Summary
+description: >
+  The agent's summary plus its actual word count so callers can
+  verify the budget was respected.
+
+fields:
+
+  summary:
+    type: markdown
+    description: A concise summary of the source text, within the requested word budget.
+    min_length: 1
+    example: >
+      Q3 revenue grew 18% YoY on enterprise renewals; operating
+      margin expanded to 22% from continued cost optimization.
+
+  word_count:
+    type: integer
+    description: Word count of the summary above (sanity check).
+    min: 1
+    example: 22
+
+required:
+  - summary
+  - word_count

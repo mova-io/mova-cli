@@ -22,8 +22,10 @@ model:
 prompt: ./prompt.md
 
 schema:
-  input: ./schema/input.json
-  output: ./schema/output.json
+  # Canonical YAML — business-readable. Compiles to JSON Schema at
+  # agent-load time.
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
 
 evals:
   dataset: ./evals/dataset.jsonl

@@ -1,0 +1,49 @@
+# ============================================================================
+# MDK Canonical Schema — SQL Writer (input)
+# ============================================================================
+# Natural-language → SQL agent. Pass the question, the relevant schema
+# (DDL or table descriptions), and the target SQL dialect.
+
+version: 1
+type: object
+
+title: SQL Writer Input
+
+fields:
+
+  question:
+    type: markdown
+    description: The user's question in natural language.
+    min_length: 1
+    example: "Show me total revenue by region for Q3 2026, sorted descending."
+
+  schema:
+    type: markdown
+    description: >
+      DDL or table descriptions the agent may reference. Include
+      column names + types; the agent uses only what's described here.
+    min_length: 1
+    ui: textarea
+    example: |
+      CREATE TABLE orders (
+        id BIGINT PRIMARY KEY,
+        region VARCHAR(32),
+        revenue_cents BIGINT,
+        created_at TIMESTAMP
+      );
+
+  dialect:
+    type: enum
+    description: Target SQL dialect — drives syntax choices.
+    values:
+      - postgres
+      - mysql
+      - sqlite
+      - snowflake
+      - bigquery
+      - tsql
+
+required:
+  - question
+  - schema
+  - dialect

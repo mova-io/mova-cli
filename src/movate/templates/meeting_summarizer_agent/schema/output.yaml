@@ -1,0 +1,63 @@
+# ============================================================================
+# MDK Canonical Schema — Meeting Summarizer (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Meeting Summary
+description: >
+  Structured meeting summary: TL;DR + the four things humans actually
+  reference after a meeting — decisions, action items, blockers,
+  follow-ups.
+
+types:
+
+  action_item:
+    type: object
+    fields:
+      task:
+        type: markdown
+        description: What needs to be done.
+        min_length: 1
+      owner:
+        type: string
+        description: Who owns the task (one of the attendees, ideally).
+        min_length: 1
+      due:
+        type: string
+        description: Due date or relative timing ("by EOW", "next sync", "2026-05-22").
+    required:
+      - task
+      - owner
+      - due
+
+fields:
+
+  tldr:
+    type: markdown
+    description: 2-3 sentence TL;DR of the meeting.
+    min_length: 1
+
+  decisions:
+    type: list[string]
+    description: Decisions reached in the meeting (one per entry).
+
+  action_items:
+    type: list[action_item]
+    description: Action items extracted from the transcript.
+
+  blockers:
+    type: list[string]
+    description: Open blockers raised in the meeting.
+
+  follow_ups:
+    type: list[string]
+    description: Topics that need follow-up but aren't action items yet.
+
+required:
+  - tldr
+  - decisions
+  - action_items
+  - blockers
+  - follow_ups

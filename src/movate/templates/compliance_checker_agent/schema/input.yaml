@@ -1,0 +1,55 @@
+# ============================================================================
+# MDK Canonical Schema — Compliance Checker (input)
+# ============================================================================
+# Generic policy-checking agent: pass it a piece of text + a list of
+# rules, get back a verdict + per-rule violations.
+
+version: 1
+type: object
+
+title: Compliance Check Input
+description: >
+  Text to evaluate against a set of compliance rules. Rules are
+  passed inline so the same agent can run against any rule set
+  (legal, brand voice, marketing claims, etc.).
+
+types:
+
+  rule:
+    type: object
+    fields:
+      id:
+        type: string
+        description: Stable identifier for the rule (e.g. "GDPR-12", "brand.no-superlatives").
+        min_length: 1
+        example: brand.no-superlatives
+      description:
+        type: markdown
+        description: What the rule says, in plain English.
+        min_length: 1
+        example: >
+          Do not use unqualified superlatives ("best", "fastest", "only")
+          without a specific qualifier or citation.
+    required:
+      - id
+      - description
+
+fields:
+
+  text:
+    type: markdown
+    description: The text to check against the rules.
+    min_length: 1
+    ui: textarea
+    example: >
+      Our product is the best CRM on the market — period. Trusted
+      by millions of users worldwide.
+
+  rules:
+    type: list[rule]
+    description: The rules to enforce.
+    min_items: 1
+
+required:
+  - text
+  - rules

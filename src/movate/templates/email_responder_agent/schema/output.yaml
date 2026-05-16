@@ -1,0 +1,46 @@
+# ============================================================================
+# MDK Canonical Schema — Email Responder (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Draft Reply
+
+fields:
+
+  subject:
+    type: string
+    description: 'Reply subject line (typically "Re: <original>").'
+    min_length: 1
+    example: "Re: Question about Q4 pricing"
+
+  body:
+    type: markdown
+    description: Reply body. The human reviews before sending.
+    min_length: 1
+    ui: textarea
+    example: >
+      Hi Alex — thanks for reaching out. Yes, the bundle discount
+      applies through Dec 31. Happy to set up a 15-min call to walk
+      through your use case — what works next week?
+
+  needs_review:
+    type: boolean
+    description: >
+      True when the draft mentions specifics (numbers, dates,
+      commitments) that a human MUST verify before sending.
+      Apps can use this to flag drafts that need extra attention.
+
+  flags:
+    type: list[string]
+    description: >
+      Optional advisory flags (e.g. ["mentions_pricing", "promises_call"])
+      to surface review categories without the human reading the full
+      draft. Empty array when nothing stands out.
+
+required:
+  - subject
+  - body
+  - needs_review
+  - flags

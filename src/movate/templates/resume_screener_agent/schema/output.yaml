@@ -1,0 +1,55 @@
+# ============================================================================
+# MDK Canonical Schema — Resume Screener (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Resume Screen Result
+
+fields:
+
+  match_score:
+    type: integer
+    description: 0-100 match score. >70 typically warrants a screen.
+    min: 0
+    max: 100
+    example: 78
+
+  strengths:
+    type: list[string]
+    description: Things the candidate is strong on (drawn from resume).
+    min_items: 1
+
+  gaps:
+    type: list[string]
+    description: Where the resume falls short of the job description.
+
+  interview_questions:
+    type: list[string]
+    description: >
+      Targeted questions a hiring manager could ask in a phone screen
+      to validate the strengths + probe the gaps.
+    min_items: 1
+
+  recommendation:
+    type: enum
+    description: Next-step recommendation.
+    values:
+      - advance
+      - phone_screen
+      - pass
+      - unsure
+
+  rationale:
+    type: markdown
+    description: 2-3 sentence reasoning behind the recommendation.
+    min_length: 1
+
+required:
+  - match_score
+  - strengths
+  - gaps
+  - interview_questions
+  - recommendation
+  - rationale

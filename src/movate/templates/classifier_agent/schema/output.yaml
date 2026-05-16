@@ -1,0 +1,21 @@
+# ============================================================================
+# MDK Canonical Schema — Classifier Agent (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Classification Result
+
+fields:
+
+  label:
+    type: string
+    description: >
+      The chosen label. The agent's prompt enforces that this must be
+      one of the values from the input `labels` array.
+    min_length: 1
+    example: shipping_damage
+
+required:
+  - label

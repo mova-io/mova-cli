@@ -1,0 +1,36 @@
+# ============================================================================
+# MDK Canonical Schema — Meeting Summarizer (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Meeting Transcript Input
+
+fields:
+
+  title:
+    type: string
+    description: Meeting title or topic.
+    min_length: 1
+    example: "Q4 roadmap sync — eng + product"
+
+  attendees:
+    type: list[string]
+    description: Attendee names (used to attribute action items by owner).
+    min_items: 1
+    example:
+      - Sarah Chen
+      - Alex Rivera
+      - Priya Shah
+
+  transcript:
+    type: markdown
+    description: Full meeting transcript (verbatim or near-verbatim).
+    min_length: 1
+    ui: textarea
+
+required:
+  - title
+  - attendees
+  - transcript

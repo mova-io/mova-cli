@@ -1,0 +1,35 @@
+# ============================================================================
+# MDK Canonical Schema — FAQ Agent (output)
+# ============================================================================
+# What the FAQ agent returns. The `confidence` field gates downstream
+# handoff: a calling app can route low-confidence answers to human
+# review instead of showing them directly.
+
+version: 1
+type: object
+
+title: FAQ Answer
+description: >
+  The agent's answer plus a self-reported confidence score
+  (0 = "I'm guessing", 1 = "I'm certain").
+
+fields:
+
+  answer:
+    type: markdown
+    description: The answer to the user's question, in plain prose.
+    min_length: 1
+    example: We offer full refunds within 30 days of purchase, no questions asked.
+
+  confidence:
+    type: number
+    description: >
+      How confident the agent is in the answer.
+      Apps typically route < 0.6 to a human agent.
+    min: 0
+    max: 1
+    example: 0.92
+
+required:
+  - answer
+  - confidence

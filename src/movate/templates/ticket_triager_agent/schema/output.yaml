@@ -1,0 +1,76 @@
+# ============================================================================
+# MDK Canonical Schema — Ticket Triager (output)
+# ============================================================================
+# The triage decision: WHAT kind of issue, HOW urgent, WHERE it goes,
+# and a starter draft for the assigned human.
+
+version: 1
+type: object
+
+title: Triage Decision
+description: >
+  The agent's structured triage result. Apps can use `routing_queue`
+  to auto-assign the ticket, `priority` to set SLA, `draft_reply` as
+  the human's starting point, and `confidence` to gate auto-actions
+  (e.g. only auto-route on confidence ≥ 0.85).
+
+fields:
+
+  category:
+    type: enum
+    description: What kind of issue this is.
+    values:
+      - billing
+      - bug
+      - feature_request
+      - account
+      - how_to
+      - other
+
+  priority:
+    type: enum
+    description: SLA bucket — drives response-time targets.
+    values:
+      - p0_urgent     # outages, data loss, blocked customer
+      - p1_high       # significant impact, no workaround
+      - p2_normal     # default
+      - p3_low        # nice-to-have / questions
+
+  routing_queue:
+    type: enum
+    description: Which team owns this ticket.
+    values:
+      - billing_ops
+      - engineering
+      - product
+      - customer_success
+      - tier1_support
+
+  draft_reply:
+    type: markdown
+    description: >
+      First-pass reply the assigned human can edit + send.
+      Acknowledges the issue and outlines next steps.
+    min_length: 1
+    ui: textarea
+    example: >
+      Hi — thanks for reaching out. I see you're having trouble
+      logging in after a password reset. Let me check what's
+      happening on our end and get back to you within the hour.
+
+  confidence:
+    type: number
+    description: >
+      Agent's confidence in the routing decision (0-1).
+      Apps typically auto-route at ≥ 0.85; below that, leave it in
+      a human-review queue.
+    min: 0
+    max: 1
+    example: 0.91
+
+required:
+  - category
+  - priority
+  - routing_queue
+  - draft_reply
+  - confidence
