@@ -1,12 +1,76 @@
-# Input contract — what the lead-qualifier agent receives.
-# Shorthand form: `field: type`. Compiled to JSON Schema at load time.
-# See contexts/README.md (or `mdk help schema`) for the full syntax;
-# the dialect supports ranges (`integer(0..3)`), enums (`a|b|c`),
-# arrays (`[type]`), optional fields (`field: string?`), and refs
-# (`$<defs-name>` with a top-level `$defs:` block).
+# ============================================================================
+# MDK Canonical Schema — Lead Qualifier (input)
+# ============================================================================
+# Business-readable schema for the inbound lead-qualification agent.
+# Compiles to JSON Schema Draft 2020-12 at agent-load time.
+#
+# Each field declares:
+#   * type        — what kind of value it holds (semantic-typed)
+#   * description — what the field is for (passed to the AI as context)
+#   * example     — a representative value (also seeds eval datasets)
+#
+# Edit this file directly — no codegen / round-tripping needed.
+# Run `mdk schema compile schema/input.yaml` to preview the JSON Schema.
 
-name:    string(1..)
-company: string(1..)
-title:   string(1..)
-source:  webform|demo_request|content_download|outbound|referral|event|other
-message: string(1..)
+version: 1
+type: object
+
+title: Lead Qualification Input
+description: >
+  Inbound sales lead — captured from web form, CRM intake, or
+  outbound enrichment. Feeds the BANT scoring + next-action
+  recommendation agent.
+
+fields:
+
+  name:
+    type: string
+    description: Lead's full name (used in personalization + outreach).
+    example: Sarah Chen
+
+  company:
+    type: string
+    description: Company they work at (used to enrich firmographics).
+    example: Acme Corporation
+
+  title:
+    type: string
+    description: Job title (signals authority + seniority for BANT).
+    example: VP of Engineering
+
+  source:
+    type: enum
+    description: How the lead reached us (signals quality + intent).
+    values:
+      - webform
+      - demo_request
+      - content_download
+      - outbound
+      - referral
+      - event
+      - other
+
+  message:
+    type: markdown
+    description: Free-form message the lead left (pain points, ask).
+    max_length: 4000
+    ui: textarea
+    example: >
+      We're evaluating MDK for our internal agent platform.
+      Budget approved for Q2. Want to see a live demo + pricing.
+
+required:
+  - name
+  - company
+  - title
+  - source
+  - message
+
+ui:
+  groups:
+    contact:
+      title: Contact
+      fields: [name, title, company]
+    intent:
+      title: Lead Intent
+      fields: [source, message]

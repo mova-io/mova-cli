@@ -138,6 +138,7 @@ from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
+from movate.cli.schema_cmd import schema_app  # noqa: E402
 from movate.cli.secrets_cmd import secrets_app  # noqa: E402
 from movate.cli.skills_cmd import skills_app  # noqa: E402
 from movate.cli.snapshot_cmd import snapshot_app  # noqa: E402
@@ -311,6 +312,7 @@ app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
+app.add_typer(schema_app, name="schema", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
 app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
