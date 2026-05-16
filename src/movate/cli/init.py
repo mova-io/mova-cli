@@ -725,6 +725,34 @@ def _init_project(
             border_style="green",
         )
     )
+
+    # Interactive 'What next?' picker (TTY only) — same shape as
+    # `mdk add` + `mdk eval --guided`. Skipped under non-TTY so CI
+    # logs keep showing only the static Panel above.
+    from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
+    prompt_next_step(
+        console=console,
+        steps=[
+            NextStep(
+                label="Browse role templates",
+                command=f"{bin_name} templates list",
+                argv=[bin_name, "templates", "list"],
+            ),
+            NextStep(
+                label="Add an agent (FAQ)",
+                command=f"cd {cd_to} && {bin_name} add faq",
+                argv=["sh", "-c", f"cd {cd_to} && {bin_name} add faq"],
+            ),
+            NextStep(
+                label="Run the menu",
+                command=f"cd {cd_to} && {bin_name} menu",
+                argv=["sh", "-c", f"cd {cd_to} && {bin_name} menu"],
+            ),
+        ],
+    )
+
     return project_name, project_root, snapshot_short
 
 
