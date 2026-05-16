@@ -467,6 +467,7 @@ def _resolve_deploy_mode(*, mode: str, cwd: Path) -> str:
 
 
 _HTTP_CREATED = 201
+_HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
 
 
@@ -709,6 +710,25 @@ def _upload_one_agent_bundle(
         # For now, treat 409 as a soft success (agent IS deployed,
         # just not from this exact bundle) so the demo keeps moving.
         return None
+    # 401 from the runtime means our bearer token was rejected. We
+    # already passed the "env var empty" preflight, so the value is
+    # set but wrong (stale key in shell rc, autoloaded value from a
+    # different tenant, etc). Point the operator at the env var
+    # rather than dumping the raw JSON body — the next thing they'd
+    # type is `echo $MDK_DEV_KEY` anyway.
+    if response.status_code == _HTTP_UNAUTHORIZED:
+        bearer_header = headers.get("Authorization", "")
+        # Show only the first 16 chars of the bearer (after "Bearer ")
+        # so the operator can spot whether it's the right key without
+        # leaking the secret into logs.
+        prefix = bearer_header.removeprefix("Bearer ").strip()[:16]
+        return (
+            f"runtime rejected the bearer token "
+            f"(value starts with: '{prefix}…'). Check your env: "
+            f"run `echo $MDK_DEV_KEY` — likely stale from .zshrc or a "
+            f"prior tenant. Fix: `mdk auth save-runtime-key dev <new-key>` "
+            f"to persist + autoload across shells."
+        )
     # Try to surface the runtime's error body verbatim so the
     # operator sees the actual validation failure.
     try:
