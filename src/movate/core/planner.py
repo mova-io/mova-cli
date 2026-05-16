@@ -232,9 +232,7 @@ def _parse_json_root(raw: str) -> dict:
     except json.JSONDecodeError as exc:
         raise PlanParseError(f"planner returned non-JSON: {exc}") from exc
     if not isinstance(obj, dict):
-        raise PlanParseError(
-            f"planner response must be a JSON object, got {type(obj).__name__}"
-        )
+        raise PlanParseError(f"planner response must be a JSON object, got {type(obj).__name__}")
     return obj
 
 
@@ -274,9 +272,7 @@ def _parse_agents(raw_agents: object) -> list[PlannedAgent]:
                 f"valid: {sorted(valid_templates)}"
             )
         if name in declared_names:
-            raise PlanParseError(
-                f"agents[{i}].name={name!r} duplicates an earlier agent"
-            )
+            raise PlanParseError(f"agents[{i}].name={name!r} duplicates an earlier agent")
         declared_names.add(name)
         agents.append(PlannedAgent(name=name, template=template, purpose=purpose))
 
