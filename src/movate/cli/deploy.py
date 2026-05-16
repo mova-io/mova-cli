@@ -166,6 +166,14 @@ def deploy(
     _print_plan(plan, dry_run=dry_run)
 
     if dry_run:
+        # Even dry-runs emit the summary line so CI can confirm the plan
+        # parsed cleanly. ok=true means "the plan is well-formed"; the
+        # real deploy will emit ok=true|false based on /healthz.
+        err.print(
+            f"[dim]mdk_deploy_summary: target={target_name} "
+            f"image={plan.image_tag} apps={','.join(plan.apps_to_update)} "
+            f"dry_run=true ok=true[/dim]"
+        )
         return
 
     # Track wall-clock duration of the deploy from this point forward
@@ -190,6 +198,13 @@ def deploy(
                 "[dim]→ --notify skipped under --no-wait "
                 "(success unconfirmed without /healthz poll)[/dim]"
             )
+        # Greppable summary — under --no-wait we report submitted=true
+        # but cannot prove ok=true, so emit health=unknown.
+        err.print(
+            f"[dim]mdk_deploy_summary: target={target_name} "
+            f"image={plan.image_tag} apps={','.join(plan.apps_to_update)} "
+            f"dry_run=false health=unknown ok=true[/dim]"
+        )
         return
 
     asyncio.run(
@@ -200,6 +215,15 @@ def deploy(
         )
     )
     success(f"{target_name} is now serving {plan.image_tag}")
+
+    # Greppable summary — full success path: build + roll + /healthz
+    # confirmed. CI gates branch on ok=true here.
+    duration_s = round(time.monotonic() - started_at, 1)
+    err.print(
+        f"[dim]mdk_deploy_summary: target={target_name} "
+        f"image={plan.image_tag} apps={','.join(plan.apps_to_update)} "
+        f"dry_run=false health=ok duration_s={duration_s} ok=true[/dim]"
+    )
 
     # Notification — fires AFTER success() so an operator running
     # interactively sees the success line before the network round-trip

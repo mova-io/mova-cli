@@ -166,7 +166,10 @@ class TestOutsideProject:
         # Scaffold an agent at tmp_path (NO project root).
         agent_dir = tmp_path / "standalone-agent"
         monkeypatch.chdir(tmp_path)
-        runner.invoke(app, ["init", "standalone-agent", "--target", str(tmp_path)])
+        # Post-PR #87, bare `mdk init <name>` defaults to PROJECT mode;
+        # force AGENT mode with -t to keep this "standalone agent dir
+        # outside a project" path exercised.
+        runner.invoke(app, ["init", "standalone-agent", "-t", "default", "--target", str(tmp_path)])
         assert (agent_dir / "agent.yaml").is_file()
 
         # Validate it by path; no project required.

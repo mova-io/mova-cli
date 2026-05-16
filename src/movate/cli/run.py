@@ -329,6 +329,24 @@ async def _run_local_agent(
             f"replay: [cyan]mdk replay {short}[/cyan][/dim]"
         )
 
+    # Greppable summary line — mirrors mdk_init_summary / mdk_add_summary
+    # / mdk_validate_summary / mdk_eval_*_summary so CI workflows can
+    # scrape one shape for every command. Goes to stderr so it doesn't
+    # corrupt stdout JSON output. Always fires — even on error — so CI
+    # gates can branch on `ok=true|false`.
+    ok = response.status != "error"
+    cost_usd = getattr(response.metrics, "cost_usd", None) if response.metrics else None
+    latency_ms = getattr(response.metrics, "latency_ms", None) if response.metrics else None
+    run_short = (response.run_id or "")[:8]
+    sys.stderr.write(
+        f"mdk_run_summary: kind=agent agent={bundle.spec.name} "
+        f"run_id={run_short or '-'} "
+        f"cost_usd={cost_usd if cost_usd is not None else '-'} "
+        f"latency_ms={latency_ms if latency_ms is not None else '-'} "
+        f"ok={'true' if ok else 'false'}\n"
+    )
+    sys.stderr.flush()
+
     if response.status == "error":
         raise typer.Exit(code=1)
 

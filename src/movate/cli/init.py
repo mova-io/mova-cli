@@ -788,8 +788,10 @@ def _init_agent(
         f"[green]✓[/green] scaffolded [bold]{template}[/bold] agent at [bold]{dest}[/bold]"
     )
     console.print("\nNext steps:")
-    console.print(f"  movate validate {dest}")
-    console.print(f"  movate run {dest} --mock '{{}}'   # provide input matching schema/input.json")
+    # Use `mdk` (the canonical command name) — `movate` still works as an
+    # alias but mixing names in user-facing strings is confusing.
+    console.print(f"  mdk validate {dest}")
+    console.print(f"  mdk run {dest} --mock '{{}}'   # provide input matching schema/input.json")
     if (dest / "skills" / "example-skill").is_dir():
         # The default template ships a reference skill folder. Surface
         # it here so users know it exists + know where to look for the

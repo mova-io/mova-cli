@@ -315,13 +315,23 @@ def _render_list(search: str | None = None) -> None:
 def _suggest_template(unknown: str) -> str | None:
     """Quick suggestion for "mdk add ragqa" → "did you mean: rag-qa?"
 
-    Uses naive substring + edit-distance-like scoring without pulling
-    in difflib's heavier APIs (this is a single-call hint, not a
-    full fuzzy match).
+    Two-pass: substring match (catches "ragqa" → "rag-qa" via
+    normalization) then difflib edit-distance (catches harder typos
+    like "rqa" → "rag-qa" or "chtbot" → "chatbot"). Substring runs
+    first because it's faster and cheaper on common cases.
     """
+    from difflib import get_close_matches  # noqa: PLC0415
+
     normalized = unknown.replace("_", "-").lower()
-    candidates = [t for t in TEMPLATES if normalized in t or t in normalized]
-    return candidates[0] if candidates else None
+    # Substring pass — handles missing/extra dashes and contractions.
+    substr = [t for t in TEMPLATES if normalized in t or t in normalized]
+    if substr:
+        return substr[0]
+    # Edit-distance pass — cutoff=0.6 catches one or two typos but
+    # rejects truly unrelated words (so "rag-qa" doesn't suggest itself
+    # for input "deploy").
+    close = get_close_matches(normalized, list(TEMPLATES.keys()), n=1, cutoff=0.6)
+    return close[0] if close else None
 
 
 def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
