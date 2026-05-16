@@ -672,6 +672,13 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
             "must be a JSON array."
         )
         return
+    if len(entries) == 0:
+        console.print(
+            "  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] is empty — "
+            "kb-lookup will return no matches at runtime."
+            "\n    [dim]hint: run [bold]mdk knowledge add[/bold] to add entries.[/dim]"
+        )
+        return
     bad: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
