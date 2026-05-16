@@ -126,6 +126,78 @@ class Budget(BaseModel):
     max_cost_usd_per_run: float = Field(default=1.0, ge=0)
 
 
+class ReflectionConfig(BaseModel):
+    """Self-critique / judge-in-the-loop config for an agent (Phase J-1).
+
+    When ``enabled``, the executor runs the primary completion through
+    a *judge* model after schema validation succeeds. The judge sees
+    the agent's output + the rubric and emits a structured verdict:
+    ``accept`` (no change) or ``revise`` (with feedback).
+
+    On ``revise``, the executor re-prompts the agent ONCE more with
+    the judge's feedback appended as a correction directive. The
+    second output goes through schema validation again. If the judge
+    rejects again, the loop terminates (with a tracer warning) and the
+    most recent output is returned — never silently re-prompt past
+    ``max_iterations``.
+
+    **Cross-family enforcement**: when ``require_cross_family`` is true
+    (the safe default), the judge's provider prefix (e.g. ``anthropic``
+    for ``anthropic/claude-haiku-...``) must differ from the agent's
+    primary model's provider prefix. Stops the obvious mistake of asking
+    GPT-4 to grade GPT-4's own output (sycophancy bias).
+
+    **Cost participation**: judge calls + re-prompts contribute to the
+    run's total cost; the agent's :class:`Budget.max_cost_usd_per_run`
+    ceiling still applies, so a reflection loop can't blow the budget.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    judge_model: str = Field(
+        default="",
+        description=(
+            "LiteLLM model string for the judge (e.g. "
+            "``anthropic/claude-haiku-4-5-20251001``). Required when "
+            "``enabled``. Should differ in provider family from the "
+            "agent's model — see ``require_cross_family``."
+        ),
+    )
+    rubric: str = Field(
+        default="",
+        description=(
+            "The rubric the judge applies to the agent's output. "
+            "Be concrete (e.g. 'SQL must be read-only — reject any "
+            "DROP / DELETE / UPDATE / INSERT statements'). Required "
+            "when ``enabled``."
+        ),
+    )
+    max_iterations: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description=(
+            "Cap on reflection iterations. ``1`` (default) = at most "
+            "one re-prompt after a revise verdict. ``2``+ allows the "
+            "loop to revise N times before giving up. Hard cap at 3 "
+            "to keep cost bounded — multi-turn reflection past 3 is "
+            "rarely worth the cost in practice."
+        ),
+    )
+    require_cross_family: bool = Field(
+        default=True,
+        description=(
+            "When true (the safe default), reject configs where the "
+            "judge's provider prefix matches the agent's. Catches the "
+            "common mistake of asking a model to grade its own output. "
+            "Set to false only when you have a deliberate reason — e.g. "
+            "a structured-output judge prompt that's grading format, "
+            "not content."
+        ),
+    )
+
+
 class Objective(BaseModel):
     """A measurable success criterion for an agent.
 
@@ -617,6 +689,15 @@ class AgentSpec(BaseModel):
     evals: EvalConfig = Field(default_factory=EvalConfig)
     timeouts: Timeouts = Field(default_factory=Timeouts)
     budget: Budget = Field(default_factory=Budget)
+    reflection: ReflectionConfig = Field(
+        default_factory=ReflectionConfig,
+        description=(
+            "Self-critique / judge-in-the-loop config (Phase J-1). When "
+            "enabled, a different model grades the agent's output against "
+            "a rubric and may trigger one or more re-prompts. Disabled by "
+            "default — opt in per-agent. See :class:`ReflectionConfig`."
+        ),
+    )
     tags: list[str] = Field(default_factory=list)
 
     # ---- v0.7 forward-compatible additions (Deva's strategic feedback) ----
@@ -778,6 +859,70 @@ class AgentSpec(BaseModel):
         # Native runtimes (anthropic / openai) accept bare or prefixed —
         # adapters tolerate both via pricing_key() normalization.
         return self
+
+    @model_validator(mode="after")
+    def _validate_reflection(self) -> AgentSpec:
+        """Cross-field checks for :class:`ReflectionConfig` (Phase J-1).
+
+        When ``reflection.enabled`` is true, the operator must supply
+        ``judge_model`` and ``rubric`` — silently no-opping a disabled
+        reflection because a field is empty would be confusing. Cross-
+        family enforcement guards against the sycophancy-bias mistake
+        of asking the agent to grade itself.
+
+        Skipped entirely when reflection is disabled (the default) so
+        existing agent.yaml files load unchanged.
+        """
+        if not self.reflection.enabled:
+            return self
+
+        if not self.reflection.judge_model.strip():
+            raise ValueError(
+                "reflection.enabled=true requires reflection.judge_model "
+                "(e.g. 'anthropic/claude-haiku-4-5-20251001')"
+            )
+        if not self.reflection.rubric.strip():
+            raise ValueError(
+                "reflection.enabled=true requires a non-empty "
+                "reflection.rubric describing the judge's criteria"
+            )
+
+        if self.reflection.require_cross_family:
+            # Provider family = the prefix before the first '/' in the
+            # LiteLLM model string. ``openai/gpt-4o-mini`` → ``openai``;
+            # ``anthropic/claude-...`` → ``anthropic``. Bare model ids
+            # (native runtimes) are normalised to the runtime's family
+            # for this comparison.
+            agent_family = _provider_family(self.model.provider, self.runtime)
+            judge_family = _provider_family(self.reflection.judge_model, None)
+            if agent_family and judge_family and agent_family == judge_family:
+                raise ValueError(
+                    f"reflection.judge_model {self.reflection.judge_model!r} "
+                    f"comes from the same provider family ({judge_family!r}) "
+                    f"as the agent's model ({self.model.provider!r}). "
+                    f"Cross-family judging defeats sycophancy bias; set "
+                    f"reflection.require_cross_family=false to override "
+                    f"(rarely the right call)."
+                )
+
+        return self
+
+
+def _provider_family(provider: str, runtime: AgentRuntime | None) -> str:
+    """Extract the provider-family prefix from a model string.
+
+    LiteLLM strings (``openai/gpt-4o-mini``) split on '/'. Bare model
+    ids (used by native runtimes) map to the runtime's family. Returns
+    empty string when no family can be inferred — callers should treat
+    empty as "skip the cross-family check rather than guess."
+    """
+    if "/" in provider:
+        return provider.split("/", 1)[0].lower()
+    if runtime == AgentRuntime.NATIVE_ANTHROPIC:
+        return "anthropic"
+    if runtime == AgentRuntime.NATIVE_OPENAI:
+        return "openai"
+    return ""
 
 
 # ---------------------------------------------------------------------------
