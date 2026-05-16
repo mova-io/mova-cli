@@ -136,6 +136,93 @@ def list_keys(
     stdout.print(table)
 
 
+@auth_app.command("whoami")
+def whoami(
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help=(
+            "Deployment target to query. Reads the bearer from the target's key_env. "
+            "Omit to use the [bold]MDK_API_KEY[/bold] env var and [bold]MDK_RUNTIME_URL[/bold]."
+        ),
+    ),
+) -> None:
+    """Show the identity of the current API key on a deployed runtime.
+
+    Calls [bold]GET /api/v1/auth/me[/bold] with the bearer token from
+    the configured target (or MDK_API_KEY) and prints key_id, tenant,
+    env, label, and expiry.
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk auth whoami --target dev[/dim]
+      [dim]$ MDK_API_KEY=mvt_live_... mdk auth whoami[/dim]
+    """
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    if target is not None:
+        from movate.config import resolve_target  # noqa: PLC0415
+        from movate.core.config import UserConfigError  # noqa: PLC0415
+
+        try:
+            _, target_cfg = resolve_target(target)
+        except UserConfigError as exc:
+            error(str(exc))
+            raise typer.Exit(code=2) from None
+        api_key = os.environ.get(target_cfg.key_env, "").strip()
+        base_url = target_cfg.url.rstrip("/")
+        if not api_key:
+            error(
+                f"env var ${target_cfg.key_env} is empty. "
+                f"Run mdk auth refresh-runtime-key {target}."
+            )
+            raise typer.Exit(code=2)
+    else:
+        api_key = os.environ.get("MDK_API_KEY", os.environ.get("MOVATE_API_KEY", "")).strip()
+        base_url = os.environ.get("MDK_RUNTIME_URL", "").rstrip("/")
+        if not api_key:
+            error(
+                "no API key found. Pass --target or set MDK_API_KEY."
+            )
+            raise typer.Exit(code=2)
+        if not base_url:
+            error(
+                "no runtime URL found. Pass --target or set MDK_RUNTIME_URL."
+            )
+            raise typer.Exit(code=2)
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+            resp = client.get(
+                f"{base_url}/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except httpx.HTTPError as exc:
+        error(f"could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code == httpx.codes.UNAUTHORIZED:
+        error("401 Unauthorized — key is invalid or expired.")
+        raise typer.Exit(code=2)
+    if resp.status_code != httpx.codes.OK:
+        error(f"HTTP {resp.status_code}: {resp.text[:200]!r}")
+        raise typer.Exit(code=2)
+
+    data = resp.json()
+    stdout.print(f"[bold]key_id:[/bold]    {data.get('key_id', '?')}")
+    stdout.print(f"[bold]tenant_id:[/bold] {data.get('tenant_id', '?')}")
+    stdout.print(f"[bold]env:[/bold]       {data.get('env', '?')}")
+    if data.get("label"):
+        stdout.print(f"[bold]label:[/bold]     {data['label']}")
+    if data.get("scope"):
+        stdout.print(f"[bold]scope:[/bold]     {data['scope']}")
+    expires = data.get("expires_at")
+    stdout.print(f"[bold]expires_at:[/bold] {expires if expires else 'never'}")
+
+
 @auth_app.command("revoke-key")
 def revoke_key(
     key_id: str = typer.Argument(..., help="Key id to revoke."),

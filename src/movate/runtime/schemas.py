@@ -767,6 +767,19 @@ class ApiKeyRevokedView(BaseModel):
     revoked: bool = True
 
 
+class AuthWhoamiView(BaseModel):
+    """``GET /api/v1/auth/me`` response — identity of the calling key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    tenant_id: str
+    env: str
+    scope: str | None
+    label: str | None
+    expires_at: datetime | None
+
+
 class AgentRunSubmission(BaseModel):
     """``POST /api/v1/agents/{name}/runs`` request body.
 

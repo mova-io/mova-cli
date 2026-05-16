@@ -64,6 +64,7 @@ from movate.runtime.schemas import (
     ApiKeyMintRequest,
     ApiKeyRevokedView,
     ApiKeyView,
+    AuthWhoamiView,
     EvalAcceptedView,
     EvalListView,
     EvalScorecardView,
@@ -1963,6 +1964,35 @@ def build_app(
             raise not_found("api_key", key_id)
         await store.revoke_api_key(key_id, tenant_id=ctx.tenant_id)
         return ApiKeyRevokedView(key_id=key_id)
+
+    @v1.get(
+        "/auth/me",
+        response_model=AuthWhoamiView,
+        summary="Return the identity of the calling API key.",
+    )
+    async def v1_auth_whoami(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuthWhoamiView:
+        """Return identity of the calling bearer key: key_id, tenant, env, scope, expiry.
+
+        Useful for CLI ``mdk auth whoami`` and for operators to verify
+        which key they are authenticating with before minting new ones.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_api_key(ctx.api_key_id)
+        return AuthWhoamiView(
+            key_id=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            env=ctx.env,
+            scope=None,
+            label=record.label if record is not None else None,
+            expires_at=record.expires_at if record is not None else None,
+        )
 
     app.include_router(v1)
 
