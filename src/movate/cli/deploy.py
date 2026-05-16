@@ -123,6 +123,16 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "project.yaml → agents."
         ),
     ),
+    diff: bool = typer.Option(
+        False,
+        "--diff",
+        help=(
+            "Preview what would change without uploading. Compares each local "
+            "agent's [bold]agent.yaml[/bold] hash against the deployed version "
+            "and prints a table of new / changed / unchanged agents. Exits 0; "
+            "nothing is uploaded. Only applies to agents-mode."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -172,6 +182,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         _deploy_agents(
             target=target,
             dry_run=dry_run,
+            diff=diff,
         )
         return
 
@@ -471,7 +482,7 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
 
 
-def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
+def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> None:  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
     """Upload every agent under ``<project>/agents/*/`` to the deployed
     runtime via ``POST /api/v1/agents``.
 
@@ -551,6 +562,70 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
         err.print(
             f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
             f"agents={len(agent_dirs)} dry_run=true ok=true[/dim]"
+        )
+        return
+
+    # --diff: preview new/changed/unchanged without uploading. Calls
+    # GET /api/v1/agents/<name> for each local agent and checks whether
+    # the deployed version's agent_yaml_hash matches the local file.
+    if diff:
+        import hashlib  # noqa: PLC0415
+
+        from rich.table import Table  # noqa: PLC0415
+
+        api_key_diff = os.environ.get(target_cfg.key_env, "").strip()
+        base_url_diff = target_cfg.url.rstrip("/")
+        headers_diff = {"Authorization": f"Bearer {api_key_diff}"} if api_key_diff else {}
+
+        diff_table = Table(show_header=True, header_style="bold")
+        diff_table.add_column("Agent", no_wrap=True)
+        diff_table.add_column("Status", no_wrap=True)
+        diff_table.add_column("Note", no_wrap=True)
+
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as diff_client:
+            for agent_dir in agent_dirs:
+                local_hash = hashlib.sha256(
+                    (agent_dir / "agent.yaml").read_bytes()
+                ).hexdigest()[:12]
+                try:
+                    resp = diff_client.get(
+                        f"{base_url_diff}/api/v1/agents/{agent_dir.name}",
+                        headers=headers_diff,
+                    )
+                    if resp.status_code == httpx.codes.OK:
+                        deployed = resp.json()
+                        deployed_hash = (deployed.get("agent_yaml_hash") or "")[:12]
+                        if deployed_hash and local_hash == deployed_hash:
+                            diff_table.add_row(
+                                agent_dir.name, "[dim]unchanged[/dim]",
+                                f"hash={local_hash}"
+                            )
+                        else:
+                            note = (
+                                f"local={local_hash} deployed={deployed_hash}"
+                                if deployed_hash else f"local={local_hash} (no hash in API)"
+                            )
+                            diff_table.add_row(
+                                agent_dir.name, "[yellow]changed[/yellow]", note
+                            )
+                    elif resp.status_code == httpx.codes.NOT_FOUND:
+                        diff_table.add_row(
+                            agent_dir.name, "[green]new[/green]", "not yet deployed"
+                        )
+                    else:
+                        diff_table.add_row(
+                            agent_dir.name, "[yellow]?[/yellow]",
+                            f"HTTP {resp.status_code}"
+                        )
+                except httpx.HTTPError:
+                    diff_table.add_row(
+                        agent_dir.name, "[yellow]?[/yellow]", "runtime unreachable"
+                    )
+
+        err.print(diff_table)
+        err.print(
+            f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
+            f"agents={len(agent_dirs)} diff=true ok=true[/dim]"
         )
         return
 
