@@ -31,6 +31,7 @@ from movate.audit import (
 )
 from movate.audit.report import Severity, sorted_findings
 from movate.audit.scanners import SCANNERS
+from movate.cli._resolve import walk_up_for_project_root
 from movate.snapshot import SnapshotNotFoundError, SnapshotStoreError
 
 console = Console()
@@ -38,20 +39,12 @@ err_console = Console(stderr=True)
 
 
 def _resolve_project_root(explicit: Path | None) -> Path:
-    """Walk-up resolution — same convention as snapshot_cmd / diff_cmd."""
     if explicit is not None:
         if not explicit.is_dir():
             err_console.print(f"[red]✗[/red] --project path is not a directory: {explicit}")
             raise typer.Exit(code=2)
         return explicit.resolve()
-    current = Path.cwd().resolve()
-    while True:
-        if (current / "movate.yaml").is_file():
-            return current
-        if current.parent == current:
-            break
-        current = current.parent
-    return Path.cwd().resolve()
+    return walk_up_for_project_root() or Path.cwd().resolve()
 
 
 def audit(

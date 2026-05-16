@@ -19,9 +19,9 @@ What gets captured:
 * **Troubleshooting** — exit-code legend, common gotchas, where to
   look for state files.
 
-Future fields (TODO markers):
+Future fields:
 
-* Workflows (when Phase 3 lands)
+* Workflows — one section per workflow, step count, entry/exit agents
 * Profiles + promotions snapshot (when this project has them)
 * Last N runs from SQLite (when ``mdk explain`` matures)
 """
