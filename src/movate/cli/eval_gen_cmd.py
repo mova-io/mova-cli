@@ -189,12 +189,18 @@ async def _generate_entries(
     num: int,
     sample_input: dict[str, Any] | None,
     mock: bool,
+    with_dimensions: bool = True,
 ) -> list[dict[str, Any]]:
     """Build ``num`` ``{input, expected, generated: true}`` entries.
 
     ``mock=True`` skips the LLM entirely — synthesizes inputs from the
     schema + runs the agent under MockProvider to fill ``expected``.
     Used by tests and offline operators.
+
+    When ``with_dimensions=True`` (the default), each entry also gets
+    ``grounding`` and ``expected_coverage`` fields populated via a
+    second LLM call. These fields activate faithfulness and coverage
+    scoring in ``mdk eval``.
     """
     rt = await build_local_runtime(mock=mock)
     validator = Draft202012Validator(bundle.input_schema)
@@ -221,13 +227,17 @@ async def _generate_entries(
             # the real eval runs would use.
             request = RunRequest(agent=bundle.spec.name, input=generated_input)
             response = await rt.executor.execute(bundle, request)
-            entries.append(
-                {
-                    "input": generated_input,
-                    "expected": response.data,
-                    "generated": True,
-                }
-            )
+            entry: dict[str, Any] = {
+                "input": generated_input,
+                "expected": response.data,
+                "generated": True,
+            }
+            if with_dimensions:
+                dims = await _enrich_with_dimensions(
+                    rt, bundle, generated_input, response.data, mock=mock
+                )
+                entry.update(dims)
+            entries.append(entry)
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
     return entries
@@ -238,6 +248,79 @@ _RETRY_NUDGE = (
     "markdown, no code fences. Just the bare {...}. Your previous "
     "response did not parse as JSON."
 )
+
+# ---------------------------------------------------------------------------
+# Dimensional annotation (grounding + expected_coverage)
+# ---------------------------------------------------------------------------
+
+_DIM_SYSTEM_PROMPT = """\
+You annotate AI agent responses with grounding context and coverage topics.
+Given an input and the agent's response, produce a JSON object with exactly
+two keys:
+  "grounding": one sentence of factual context that anchors the answer
+               (e.g. "The return policy allows 30-day returns with receipt.")
+  "expected_coverage": a list of 2-4 lowercase hyphenated topic slugs that
+               a correct answer should address
+               (e.g. ["return-window", "receipt-required"])
+
+Respond with ONE bare JSON object — no prose, no markdown, no code fences.
+"""
+
+
+async def _enrich_with_dimensions(
+    rt: Any,
+    bundle: AgentBundle,
+    input_data: dict[str, Any],
+    output_data: dict[str, Any],
+    *,
+    mock: bool,
+) -> dict[str, Any]:
+    """Return grounding + expected_coverage annotations for one entry.
+
+    Under mock, returns stubs so offline / test flows produce valid
+    eval datasets without a real LLM call.
+    """
+    if mock:
+        return {"grounding": "mock grounding context", "expected_coverage": ["mock-topic"]}
+
+    from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
+
+    request = CompletionRequest(
+        provider=bundle.spec.model.provider,
+        messages=[
+            Message(role="system", content=_DIM_SYSTEM_PROMPT),
+            Message(
+                role="user",
+                content=(
+                    f"Input: {json.dumps(input_data)}\n"
+                    f"Response: {json.dumps(output_data)}\n\n"
+                    "Annotate this response with grounding and expected_coverage."
+                ),
+            ),
+        ],
+        params={"temperature": 0.2, "max_tokens": 256},
+    )
+    try:
+        response = await rt.provider.complete(request)
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        parsed = json.loads(text)
+        if (
+            isinstance(parsed, dict)
+            and "grounding" in parsed
+            and "expected_coverage" in parsed
+        ):
+            return {
+                "grounding": str(parsed["grounding"]),
+                "expected_coverage": list(parsed["expected_coverage"]),
+            }
+    except Exception:
+        pass
+    return {}
 
 
 async def _generate_one_input(
@@ -550,6 +633,7 @@ def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state
     sample_input: str,
     mock: bool,
     force: bool,
+    with_dimensions: bool,
     project_root: str,
 ) -> None:
     """Generate eval cases for every agent in the project.
@@ -673,6 +757,7 @@ def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state
                     num=num,
                     sample_input=parsed_sample,
                     mock=mock,
+                    with_dimensions=with_dimensions,
                 )
             )
         except Exception as exc:  # last-resort guard for one-agent failures
@@ -804,6 +889,17 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
             "schema before paying for tokens."
         ),
     ),
+    with_dimensions: bool = typer.Option(
+        True,
+        "--with-dimensions/--no-with-dimensions",
+        help=(
+            "Annotate each entry with [bold]grounding[/bold] (one-sentence context) "
+            "and [bold]expected_coverage[/bold] (2-4 topic slugs) via a second LLM "
+            "call. These fields activate faithfulness and coverage scoring in "
+            "[bold]mdk eval[/bold]. Pass [bold]--no-with-dimensions[/bold] to skip "
+            "the extra call and generate accuracy-only entries."
+        ),
+    ),
     force: bool = typer.Option(
         False,
         "--force",
@@ -857,6 +953,7 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
             sample_input=sample_input,
             mock=mock,
             force=force,
+            with_dimensions=with_dimensions,
             project_root=project_root,
         )
         return
@@ -944,6 +1041,7 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
             num=num,
             sample_input=parsed_sample,
             mock=mock,
+            with_dimensions=with_dimensions,
         )
     )
 
