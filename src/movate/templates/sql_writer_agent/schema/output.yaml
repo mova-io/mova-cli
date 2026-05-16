@@ -1,0 +1,44 @@
+# ============================================================================
+# MDK Canonical Schema — SQL Writer (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Generated SQL Query
+
+fields:
+
+  query:
+    type: markdown
+    description: The generated SQL, dialect-correct.
+    min_length: 1
+
+  explanation:
+    type: markdown
+    description: Plain-English explanation of what the query does.
+    min_length: 1
+
+  tables_used:
+    type: list[string]
+    description: Tables referenced by the query (one per entry).
+
+  read_only:
+    type: boolean
+    description: >
+      True when the query only reads (SELECT). False if it mutates
+      (INSERT/UPDATE/DELETE/DDL) — apps should require extra
+      confirmation before running write queries.
+
+  confidence:
+    type: number
+    description: Self-reported confidence (0-1).
+    min: 0
+    max: 1
+
+required:
+  - query
+  - explanation
+  - tables_used
+  - read_only
+  - confidence

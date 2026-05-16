@@ -1,0 +1,41 @@
+# ============================================================================
+# MDK Canonical Schema — Ticket Triager (input)
+# ============================================================================
+# Incoming customer-support ticket. The agent classifies, prioritizes,
+# routes, and drafts a first-pass reply — closing the loop from
+# "ticket arrives" to "agent on the right team has a starting draft."
+
+version: 1
+type: object
+
+title: Support Ticket
+description: >
+  One inbound support ticket. Subject + body are what the agent reads;
+  every other field on a real ticket (customer info, prior history,
+  attachments) is intentionally omitted from the agent's input — the
+  triage decision should be content-driven so it generalizes across
+  channels.
+
+fields:
+
+  subject:
+    type: string
+    description: The ticket's subject line.
+    min_length: 1
+    max_length: 200
+    example: "Cannot log in after password reset"
+
+  body:
+    type: markdown
+    description: The full ticket body (markdown supported).
+    min_length: 1
+    ui: textarea
+    example: >
+      I reset my password yesterday following the email link.
+      Now I can't log in at all — I get "Invalid credentials"
+      even with the new one. Tried Chrome and Safari, same result.
+      Order #12345 if relevant.
+
+required:
+  - subject
+  - body

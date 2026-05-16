@@ -1,0 +1,26 @@
+# ============================================================================
+# MDK Canonical Schema — Resume Screener (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Resume Screen Input
+
+fields:
+
+  job_description:
+    type: markdown
+    description: The job description / requirements the candidate is being matched against.
+    min_length: 1
+    ui: textarea
+
+  resume:
+    type: markdown
+    description: Candidate's resume (paste-from-PDF or plain text).
+    min_length: 1
+    ui: textarea
+
+required:
+  - job_description
+  - resume

@@ -1,0 +1,53 @@
+# ============================================================================
+# MDK Canonical Schema — Research (input)
+# ============================================================================
+# Multi-source research synthesizer. Given a topic + pre-fetched
+# sources, the agent produces an executive summary + key claims with
+# citation indices back to the input sources.
+
+version: 1
+type: object
+
+title: Research Input
+
+types:
+
+  source:
+    type: object
+    fields:
+      title:
+        type: string
+        description: Source title (e.g. article headline, paper title).
+        min_length: 1
+      url:
+        type: string
+        description: Source URL (kept as string — `url` semantic type validates more strictly).
+        min_length: 1
+      content:
+        type: markdown
+        description: Source content (the agent reads this).
+        min_length: 1
+        ui: textarea
+    required:
+      - title
+      - url
+      - content
+
+fields:
+
+  topic:
+    type: string
+    description: The research question or topic to synthesize.
+    min_length: 1
+    example: How do AI startups manage GPU costs in 2026?
+
+  sources:
+    type: list[source]
+    description: >
+      Pre-fetched sources. Indexed 1..N; the agent's output cites
+      them by index (1-based).
+    min_items: 1
+
+required:
+  - topic
+  - sources

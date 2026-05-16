@@ -1,0 +1,29 @@
+# ============================================================================
+# MDK Canonical Schema — FAQ Agent (input)
+# ============================================================================
+# Business-readable schema for the FAQ-answering agent. Compiles to
+# JSON Schema Draft 2020-12 at agent-load time.
+#
+# Edit this file directly — no codegen / round-tripping needed.
+# Run `mdk schema compile schema/input.yaml` to preview the JSON Schema.
+
+version: 1
+type: object
+
+title: FAQ Question
+description: >
+  One end-user question to be answered against the agent's knowledge.
+  The agent decides whether to answer (with a confidence score) or
+  defer to a human if it's not confident.
+
+fields:
+
+  question:
+    type: string
+    description: The natural-language question to answer.
+    min_length: 1
+    max_length: 1000
+    example: What is your refund policy for digital products?
+
+required:
+  - question

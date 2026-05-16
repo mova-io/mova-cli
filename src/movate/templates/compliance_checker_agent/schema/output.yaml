@@ -1,0 +1,66 @@
+# ============================================================================
+# MDK Canonical Schema — Compliance Checker (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Compliance Check Result
+
+types:
+
+  violation:
+    type: object
+    fields:
+      rule_id:
+        type: string
+        description: Which rule was violated (refers back to input rule.id).
+        min_length: 1
+      excerpt:
+        type: string
+        description: The exact text excerpt that triggered the violation.
+        min_length: 1
+      severity:
+        type: enum
+        description: How serious this violation is.
+        values:
+          - high
+          - medium
+          - low
+      explanation:
+        type: markdown
+        description: Why this excerpt violates the rule, in plain English.
+        min_length: 1
+      suggested_rewording:
+        type: markdown
+        description: Compliant alternative wording (may be empty if no clean fix exists).
+    required:
+      - rule_id
+      - excerpt
+      - severity
+      - explanation
+      - suggested_rewording
+
+fields:
+
+  compliant:
+    type: boolean
+    description: True when zero violations were found.
+    example: false
+
+  violations:
+    type: list[violation]
+    description: One entry per violation found (empty when compliant=true).
+
+  summary:
+    type: markdown
+    description: One-paragraph human summary of the overall check.
+    min_length: 1
+    example: >
+      Two superlative claims violate the brand voice rule —
+      "the best CRM" and "trusted by millions" both lack qualifiers.
+
+required:
+  - compliant
+  - violations
+  - summary

@@ -1,0 +1,68 @@
+# ============================================================================
+# MDK Canonical Schema — Email Responder (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Inbound Email + Reply Brief
+description: >
+  An inbound email plus a brief for the reply. The brief (intent +
+  tone + length) gives the agent enough steer to draft something the
+  human can send with minimal edits.
+
+fields:
+
+  from:
+    type: string
+    description: Sender (name or email).
+    min_length: 1
+    example: alex@acme-corp.com
+
+  subject:
+    type: string
+    description: Inbound email subject line.
+    min_length: 1
+    example: "Question about Q4 pricing"
+
+  body:
+    type: markdown
+    description: Inbound email body.
+    min_length: 1
+    ui: textarea
+    example: >
+      Hi — saw your Q3 pricing announcement. Will the bundle discount
+      still apply if we sign before Dec 1? We're trying to budget Q1.
+
+  intent:
+    type: markdown
+    description: What you want the reply to accomplish (drives the draft).
+    min_length: 1
+    example: >
+      Confirm the bundle discount applies through Dec 31. Offer a
+      15-minute call to walk through their use case.
+
+  tone:
+    type: enum
+    description: Voice for the reply.
+    values:
+      - formal
+      - professional
+      - friendly
+      - concise
+
+  length:
+    type: enum
+    description: How much body content to generate.
+    values:
+      - one_liner
+      - short
+      - medium
+
+required:
+  - from
+  - subject
+  - body
+  - intent
+  - tone
+  - length

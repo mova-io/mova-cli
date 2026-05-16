@@ -1,0 +1,51 @@
+# ============================================================================
+# MDK Canonical Schema — Research (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Research Synthesis
+
+types:
+
+  key_point:
+    type: object
+    fields:
+      claim:
+        type: markdown
+        description: One factual claim about the topic.
+        min_length: 1
+      citations:
+        type: list[integer]
+        description: >
+          1-indexed citation references back to the input `sources`
+          array. A claim with multiple citations indicates corroboration.
+    required:
+      - claim
+      - citations
+
+fields:
+
+  executive_summary:
+    type: markdown
+    description: 1-paragraph synthesis of the topic across sources.
+    min_length: 1
+
+  key_points:
+    type: list[key_point]
+    description: Individual claims with citations.
+
+  disagreements:
+    type: list[string]
+    description: Points where sources contradict each other (empty if all agree).
+
+  open_questions:
+    type: list[string]
+    description: Questions the sources don't fully answer — needs more research.
+
+required:
+  - executive_summary
+  - key_points
+  - disagreements
+  - open_questions

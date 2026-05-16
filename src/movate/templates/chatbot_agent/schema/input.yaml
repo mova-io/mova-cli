@@ -1,0 +1,24 @@
+# ============================================================================
+# MDK Canonical Schema — Chatbot Agent (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Chat Turn (Input)
+description: >
+  One end-user turn in a multi-turn chat. `mdk chat` auto-wraps free-
+  form text into this field; prior turns reach the model via the
+  chat REPL's conversation history, not via this schema.
+
+fields:
+
+  message:
+    type: markdown
+    description: The user's message for this turn.
+    min_length: 1
+    ui: textarea
+    example: How do I export my data to CSV?
+
+required:
+  - message
