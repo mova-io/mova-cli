@@ -259,20 +259,33 @@ def test_create_zip_bundle_with_top_level_dir_strips_prefix(
     assert (agents_path / "demo" / "agent.yaml").exists()
 
 
-def test_create_zip_bundle_with_skills_subdir_round_trips(
+def test_create_zip_bundle_with_skills_subdir_routes_to_global_registry(
     client: TestClient, agents_path: Path, auth_header: dict[str, str]
 ) -> None:
     """Bundles that ship a reference ``skills/<name>/`` folder
-    (what `mdk init` produces) must upload cleanly. The skill files
-    are documentary inside the agent dir — they're not registered as
-    live skills — but the layout validation has to permit them so
-    init-template bundles round-trip through the canonical create
-    endpoint."""
+    (what `mdk init` produces) must upload cleanly AND register the
+    skill in the GLOBAL skill registry — not as documentary detritus
+    inside the agent dir. Without this, the next agent that declares
+    ``skills: [<name>]`` would 422 with "empty registry".
+    """
+    full_skill_yaml = (
+        b"api_version: movate/v1\n"
+        b"kind: Skill\n"
+        b"name: example-skill\n"
+        b"version: 0.1.0\n"
+        b"description: example skill bundled with the agent\n"
+        b"schema:\n"
+        b"  input:\n"
+        b"    q: string\n"
+        b"  output:\n"
+        b"    r: string\n"
+        b"implementation:\n"
+        b"  kind: python\n"
+        b"  entry: example_skill.impl:run\n"
+    )
     zip_bytes = _zipped_bundle(
         extra_entries={
-            "skills/example-skill/skill.yaml": (
-                b"api_version: movate/v1\nkind: Skill\nname: example\n"
-            ),
+            "skills/example-skill/skill.yaml": full_skill_yaml,
             "skills/example-skill/README.md": b"# example\n",
         },
     )
@@ -282,11 +295,14 @@ def test_create_zip_bundle_with_skills_subdir_round_trips(
         headers=auth_header,
     )
     assert r.status_code == 201, r.text
-    # Confirm the skills/ files landed on disk alongside the agent
-    # (they ride along with the bundle; the operator copies them up
-    # to <project>/skills/ when ready to wire as real skills).
-    assert (agents_path / "demo" / "skills" / "example-skill" / "skill.yaml").exists()
-    assert (agents_path / "demo" / "skills" / "example-skill" / "README.md").exists()
+    # Skill files land in the GLOBAL skill registry, NOT inside the
+    # agent dir. This is what makes a follow-up agent upload that
+    # declares `skills: [example-skill]` resolve.
+    assert (agents_path / "skills" / "example-skill" / "skill.yaml").exists()
+    assert (agents_path / "skills" / "example-skill" / "README.md").exists()
+    # Conversely, the agent dir no longer carries the skill files
+    # (no per-agent duplication).
+    assert not (agents_path / "demo" / "skills").exists()
 
 
 # ---------------------------------------------------------------------------

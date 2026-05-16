@@ -35,6 +35,7 @@ from movate.runtime.agent_creation import (
     AgentCreationError,
     persist_bundle,
     soft_delete_agent,
+    split_skills_from_bundle,
     unzip_bundle,
     wizard_to_bundle_files,
 )
@@ -775,7 +776,35 @@ def build_app(
             bundle=bundle,
         )
 
-        result = persist_bundle(files, agents_path=agents_path)
+        # Pull any nested skills/<name>/ entries out of the agent
+        # bundle and persist them to the global skill registry FIRST.
+        # Customer scaffolds (mdk add rag-qa → skills/web-search/)
+        # ship their skill folders inside the project zip; without
+        # this split they'd 422 the next time an agent declares
+        # `skills: [web-search]` ("empty registry"). Skills persist
+        # with PUT semantics so re-deploy is idempotent.
+        agent_files, skills_per_name = split_skills_from_bundle(files)
+        if skills_per_name:
+            skills_path: Path | None = request.app.state.skills_path
+            if skills_path is None:
+                raise AgentCreationError(
+                    "bundle ships skills/<name>/ entries but the runtime "
+                    "was built without a skills_path; upload skills "
+                    "separately via POST /api/v1/skills or restart with "
+                    "--skills-path set",
+                    status_code=503,
+                )
+            for skill_name, skill_files in skills_per_name.items():
+                # Skip skills that don't ship a skill.yaml — these are
+                # incomplete scaffolds (e.g. only README.md present);
+                # silently ignoring keeps deploy idempotent against
+                # half-built projects.
+                if "skill.yaml" not in skill_files:
+                    continue
+                persist_skill_bundle(skill_files, skills_path=skills_path)
+                _ = skill_name  # used implicitly via persist_skill_bundle
+
+        result = persist_bundle(agent_files, agents_path=agents_path)
 
         # Refresh the in-memory registry so an immediate GET /agents
         # sees the new bundle. Cheap — agents_path is a flat

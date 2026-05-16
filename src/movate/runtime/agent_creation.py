@@ -356,6 +356,43 @@ def _validate_layout(files: dict[str, bytes]) -> None:
         )
 
 
+def split_skills_from_bundle(
+    files: dict[str, bytes],
+) -> tuple[dict[str, bytes], dict[str, dict[str, bytes]]]:
+    """Split bundle files into ``(agent_files, skills_per_name)``.
+
+    Any entry whose key starts with ``skills/<name>/`` is pulled out
+    of the agent's file dict and grouped under ``<name>``, with the
+    ``skills/<name>/`` prefix stripped so the per-skill dict matches
+    what :func:`movate.runtime.skill_creation.persist_skill_bundle`
+    accepts.
+
+    Why: customer projects scaffolded by ``mdk add rag-qa`` ship
+    ``<project>/skills/web-search/`` alongside the agent. When zipped
+    for upload, those files arrive under the agent bundle but belong
+    in the GLOBAL skill registry, not as documentary detritus inside
+    the agent dir. Splitting here lets the route handler persist
+    skills + agent in one logical operation while keeping each
+    persistence module focused on a single resource.
+
+    Idempotent — calling on already-split files (no ``skills/*``
+    entries) returns the input unchanged and an empty skills dict.
+    """
+    agent_files: dict[str, bytes] = {}
+    skills_per_name: dict[str, dict[str, bytes]] = {}
+    for key, content in files.items():
+        # Expect "skills/<name>/<rest>"; anything shorter than that
+        # (e.g. a stray "skills/README.md") stays with the agent.
+        parts = key.split("/", 2)
+        if parts[0] == "skills" and len(parts) == 3 and parts[1] and parts[2]:
+            skill_name = parts[1]
+            inner_path = parts[2]
+            skills_per_name.setdefault(skill_name, {})[inner_path] = content
+        else:
+            agent_files[key] = content
+    return agent_files, skills_per_name
+
+
 def _extract_agent_name(agent_yaml_bytes: bytes) -> str:
     """Parse the agent's ``name`` field from raw YAML bytes.
 
