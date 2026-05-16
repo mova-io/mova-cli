@@ -103,6 +103,63 @@ class TestResolveKbFile:
         result = resolve_kb_file("x.json")
         assert result is not None and result.name == "x.json"
 
+    def test_agent_local_tier_deployed_runtime(self, tmp_path: Path) -> None:
+        """Simulates the deployed-runtime layout: agent bundle at
+        <agents_path>/<agent_name>/ with skills/ and kb/ subdirs.
+
+        When mdk deploy bundles kb/*.json into the agent dir, a skill
+        running inside <agent_name>/skills/<skill_name>/ must resolve
+        its corpus via the agent-local <agent_name>/kb/<name> tier —
+        without any project marker file being present.
+        """
+        from movate.core.kb_loader import resolve_kb_file  # noqa: PLC0415
+
+        # Simulate: /agents/ticket-triager/
+        agent_dir = tmp_path / "agents" / "ticket-triager"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "agent.yaml").write_text("name: ticket-triager\n")
+
+        # kb/ bundled alongside agent.yaml by mdk deploy
+        (agent_dir / "kb").mkdir()
+        corpus = agent_dir / "kb" / "kb-lookup-corpus.json"
+        corpus.write_text("[]")
+
+        # Skill lives at <agent_dir>/skills/<skill>/
+        skill_dir = agent_dir / "skills" / "kb-lookup"
+        skill_dir.mkdir(parents=True)
+
+        result = resolve_kb_file("kb-lookup-corpus.json", start=skill_dir)
+        assert result == corpus
+
+    def test_agent_local_falls_through_to_project_when_kb_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """If the agent boundary is found but kb/<name> is missing,
+        the walk continues and finds the project-level kb/ instead.
+
+        This handles the case where an operator didn't add their corpus
+        to the project but the skill is still running locally.
+        """
+        from movate.core.kb_loader import resolve_kb_file  # noqa: PLC0415
+
+        # Project root with a real corpus.
+        (tmp_path / "project.yaml").write_text("agents_dir: ./agents\n")
+        (tmp_path / "kb").mkdir()
+        project_corpus = tmp_path / "kb" / "kb-lookup-corpus.json"
+        project_corpus.write_text("[]")
+
+        # Agent dir present but WITHOUT a local kb/ override.
+        agent_dir = tmp_path / "agents" / "ticket-triager"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "agent.yaml").write_text("name: ticket-triager\n")
+        # No agent_dir / "kb" created.
+
+        skill_dir = agent_dir / "skills" / "kb-lookup"
+        skill_dir.mkdir(parents=True)
+
+        result = resolve_kb_file("kb-lookup-corpus.json", start=skill_dir)
+        assert result == project_corpus
+
 
 # ---------------------------------------------------------------------------
 # kb-lookup skill: corpus path resolution

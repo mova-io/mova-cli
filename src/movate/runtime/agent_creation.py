@@ -101,6 +101,12 @@ _ALLOWED_PREFIXES: tuple[str, ...] = (
     # project-level ones; deploy bundles them into the agent dir so
     # the deployed instance is self-contained without a shared volume.
     "contexts/",
+    # Knowledge-base corpus files (e.g. kb-lookup-corpus.json).
+    # `mdk deploy` bundles the project's kb/ alongside the agent so
+    # the deployed skill can resolve its corpus without a shared volume.
+    # resolve_kb_file() checks <agent_dir>/kb/<name> before walking up
+    # to the project root.
+    "kb/",
 )
 
 

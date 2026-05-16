@@ -129,6 +129,7 @@ async def _collect_bundle_files(
     dataset: UploadFile | None,
     bundle: UploadFile | None,
     contexts: list[UploadFile],
+    kb: list[UploadFile],
 ) -> dict[str, bytes]:
     """Convert the multipart form fields into a
     ``{canonical_path: bytes}`` dict :func:`persist_bundle` accepts.
@@ -196,6 +197,17 @@ async def _collect_bundle_files(
             continue
         canonical = f"contexts/{basename}"
         files[canonical] = await ctx_upload.read()
+
+    # KB corpus files — optional, repeating field. Stored under
+    # kb/<basename> so resolve_kb_file() finds them via its agent-local
+    # tier when the skill runs inside a deployed container.
+    for kb_upload in kb:
+        raw_name = (kb_upload.filename or "").lstrip("/")
+        basename = Path(raw_name).name
+        if not basename or ".." in basename:
+            continue
+        canonical = f"kb/{basename}"
+        files[canonical] = await kb_upload.read()
 
     return files
 
@@ -752,6 +764,10 @@ def build_app(
         # contexts/<name>.md that overrides the same-named entry at
         # the project level inside the deployed container.
         contexts: list[UploadFile] = File(default=[]),
+        # KB corpus files — optional repeating field. Each upload is a
+        # kb/<name>.json that resolve_kb_file() finds via its agent-local
+        # tier when the deployed skill runs inside the container.
+        kb: list[UploadFile] = File(default=[]),
         # Zipped-bundle mode. Mutually exclusive with the individual
         # fields. The zip may contain a single top-level dir
         # (e.g. ``faq-bot/agent.yaml``) — unzip_bundle strips it.
@@ -805,6 +821,7 @@ def build_app(
             dataset=dataset,
             bundle=bundle,
             contexts=contexts,
+            kb=kb,
         )
 
         # Pull any nested skills/<name>/ entries out of the agent

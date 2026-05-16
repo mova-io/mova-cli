@@ -644,6 +644,37 @@ def _append_context_files(
                 break
 
 
+def _append_kb_files(
+    files: list[tuple[str, tuple[str, bytes, str]]],
+    project_root: Path | None,
+) -> None:
+    """Append KB corpus files from ``<project_root>/kb/*.json`` to the
+    multipart upload.
+
+    Each file is sent as a repeating ``kb`` multipart field so the
+    runtime stores it at ``<agent_dir>/kb/<filename>``. The deployed
+    skill's ``resolve_kb_file()`` then finds it via its agent-local
+    tier without needing a shared project volume.
+
+    Only ``.json`` files are included — index files, YAML corpora, and
+    other assets under ``kb/`` are silently skipped (the skill's corpus
+    format is always JSON).
+    """
+    if project_root is None:
+        return
+    kb_dir = project_root / "kb"
+    if not kb_dir.is_dir():
+        return
+    for kb_file in sorted(kb_dir.iterdir()):
+        if kb_file.is_file() and kb_file.suffix.lower() == ".json":
+            files.append(
+                (
+                    "kb",
+                    (f"kb/{kb_file.name}", kb_file.read_bytes(), "application/json"),
+                )
+            )
+
+
 def _upload_one_agent_bundle(
     *,
     client: object,  # httpx.Client; typed as object to avoid top-level httpx import
@@ -732,6 +763,10 @@ def _upload_one_agent_bundle(
 
     # Context files — two-tier resolution mirrors the local loader.
     _append_context_files(files, agent_yaml_bytes, agent_dir, project_root)
+
+    # KB corpus files — bundled into the agent dir so deployed skills
+    # can resolve their corpus via resolve_kb_file()'s agent-local tier.
+    _append_kb_files(files, project_root)
 
     # httpx requires the client to be typed precisely here; the
     # `client: object` parameter signature lets the outer function
