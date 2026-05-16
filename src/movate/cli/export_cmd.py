@@ -119,7 +119,7 @@ def json_schema(
         raise typer.Exit(code=2) from None
 
     payload = _build_payload(
-        direction=direction,  # type: ignore[arg-type]  -- guarded above
+        direction=direction,  # type: ignore[arg-type]
         input_schema=bundle.input_schema,
         output_schema=bundle.output_schema,
         agent_name=bundle.spec.name,
@@ -147,10 +147,10 @@ def json_schema(
 def _build_payload(
     *,
     direction: _Direction,
-    input_schema: dict,
-    output_schema: dict,
+    input_schema: dict[str, object],
+    output_schema: dict[str, object],
     agent_name: str,
-) -> dict:
+) -> dict[str, object]:
     """Construct the JSON payload for the requested direction.
 
     For ``both``, returns a wrapper object with explicit ``input`` and
