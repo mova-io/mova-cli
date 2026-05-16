@@ -537,10 +537,16 @@ def test_lead_qualifier_shorthand_yaml_compiles_to_expected_schema(
     runner.invoke(app, ["add", "lead-qualifier"], env={"COLUMNS": "200"})
     bundle = load_agent(tmp_path / "proj" / "agents" / "lead-qualifier")
     out: dict[str, Any] = bundle.output_schema
-    # BANT root + each dimension is a $ref to #/$defs/dim
-    assert out["properties"]["bant"]["properties"]["budget"] == {"$ref": "#/$defs/dim"}
-    assert out["$defs"]["dim"]["properties"]["score"]["minimum"] == 0
-    assert out["$defs"]["dim"]["properties"]["score"]["maximum"] == 3
+    # BANT root + each dimension is a $ref to a reusable scoring shape.
+    # Post-PR-#103 the lead-qualifier ships in canonical format and the
+    # reusable type is named `scoring` (more readable than the pre-#103
+    # shorthand `dim`). Per-field descriptions also flow through —
+    # accept the dict shape with the description present.
+    budget = out["properties"]["bant"]["properties"]["budget"]
+    assert budget["$ref"] == "#/$defs/scoring"
+    assert "description" in budget  # canonical adds per-field descriptions
+    assert out["$defs"]["scoring"]["properties"]["score"]["minimum"] == 0
+    assert out["$defs"]["scoring"]["properties"]["score"]["maximum"] == 3
     # total_score is bounded.
     assert out["properties"]["total_score"]["maximum"] == 12
     # next_action enum matches.

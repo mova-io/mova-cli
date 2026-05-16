@@ -17,6 +17,11 @@ from jinja2 import Environment, StrictUndefined, select_autoescape
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from movate.core.canonical_schema import (
+    CanonicalSchemaError,
+    compile_canonical,
+    is_canonical_format,
+)
 from movate.core.config import (
     PROJECT_MARKER_FILES,
     AgentDefaults,
@@ -332,13 +337,22 @@ def _load_schema_doc(path: Path, *, label: str) -> dict[str, Any]:
     except yaml.YAMLError as exc:
         raise AgentLoadError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(data, dict):
-        raise AgentLoadError(
-            f"schema {path} must be a top-level object, got {type(data).__name__}"
-        )
-    # Shape-sniff to decide: hand-written JSON Schema vs shorthand?
-    # `$schema` is the unambiguous marker; `type: object` + `properties`
-    # is the convention for hand-written schemas (matches what's
-    # produced when compile_shorthand runs). Anything else → shorthand.
+        raise AgentLoadError(f"schema {path} must be a top-level object, got {type(data).__name__}")
+    # Three-way shape-sniff to pick the right compiler:
+    #
+    # 1. Canonical format (PR #103, May 2026 — the business-readable
+    #    DSL). Unambiguous marker: top-level `version: 1`.
+    # 2. Hand-written JSON Schema. Marker: top-level `$schema` URL
+    #    OR `type: object` + `properties` (matches what the loader
+    #    itself produces, so this captures hand-compiled exports).
+    # 3. Shorthand (the engineer's terse form). Default fall-through
+    #    for everything else — `compile_shorthand` raises with a
+    #    clear field-path error if the shape doesn't parse.
+    if is_canonical_format(data):
+        try:
+            return compile_canonical(data)
+        except CanonicalSchemaError as exc:
+            raise AgentLoadError(f"canonical schema error in {path}: {exc}") from exc
     is_json_schema = "$schema" in data or (data.get("type") == "object" and "properties" in data)
     if is_json_schema:
         return data
