@@ -618,3 +618,119 @@ class TestSchemaCompileCommand:
         )
         assert result.exit_code == 0
         assert "form=shorthand" in (result.stdout + result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# `nullable: true` modifier  (PR #114)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestNullableModifier:
+    """`nullable: true` widens a field's type to accept JSON null.
+
+    Used in extractor.output.yaml + code-reviewer.output.yaml where
+    the business meaning of a field includes "we don't have this
+    info" — e.g. `contact_name: nullable=true` means "valid string
+    OR null when not mentioned in the source."""
+
+    def test_string_with_nullable_widens_type(self) -> None:
+        schema = compile_canonical(
+            {
+                "version": 1,
+                "type": "object",
+                "fields": {
+                    "contact_name": {"type": "string", "nullable": True},
+                },
+                "required": ["contact_name"],
+            }
+        )
+        assert schema["properties"]["contact_name"]["type"] == ["string", "null"]
+
+    def test_integer_with_nullable_widens_type(self) -> None:
+        schema = compile_canonical(
+            {
+                "version": 1,
+                "type": "object",
+                "fields": {
+                    "line": {"type": "integer", "min": 1, "nullable": True},
+                },
+                "required": ["line"],
+            }
+        )
+        prop = schema["properties"]["line"]
+        assert prop["type"] == ["integer", "null"]
+        # Bounds preserved alongside the widened type.
+        assert prop["minimum"] == 1
+
+    def test_enum_with_nullable_includes_null_in_enum(self) -> None:
+        """`type: enum + nullable: true` must add null to the `enum`
+        values too — otherwise the enum constraint blocks null even
+        though the type widened. Symmetric with JSON Schema 2020-12."""
+        schema = compile_canonical(
+            {
+                "version": 1,
+                "type": "object",
+                "fields": {
+                    "urgency": {
+                        "type": "enum",
+                        "values": ["low", "medium", "high"],
+                        "nullable": True,
+                    },
+                },
+                "required": ["urgency"],
+            }
+        )
+        prop = schema["properties"]["urgency"]
+        assert prop["type"] == ["string", "null"]
+        assert None in prop["enum"]
+        # Original values still there.
+        assert "low" in prop["enum"]
+        assert "high" in prop["enum"]
+
+    def test_nullable_false_or_missing_keeps_strict_type(self) -> None:
+        """`nullable: false` (or absence) leaves the type unchanged."""
+        schema = compile_canonical(
+            {
+                "version": 1,
+                "type": "object",
+                "fields": {
+                    "name": {"type": "string", "nullable": False},
+                    "age": {"type": "integer"},
+                },
+                "required": ["name", "age"],
+            }
+        )
+        assert schema["properties"]["name"]["type"] == "string"
+        assert schema["properties"]["age"]["type"] == "integer"
+
+    def test_nullable_email_validates_null_and_email(self) -> None:
+        """Round-trip with jsonschema validation: nullable email
+        accepts both `null` and a valid address."""
+        from jsonschema import Draft202012Validator  # noqa: PLC0415
+
+        schema = compile_canonical(
+            {
+                "version": 1,
+                "type": "object",
+                "fields": {
+                    "email": {"type": "email", "nullable": True},
+                },
+                "required": ["email"],
+            }
+        )
+        prop = schema["properties"]["email"]
+        # Type widened from `string` → `["string", "null"]`.
+        assert prop["type"] == ["string", "null"]
+        # Format preserved from the `email` semantic-type mapping.
+        assert prop.get("format") == "email"
+        validator = Draft202012Validator(schema)
+        # Both should pass — nullable means "valid email OR null".
+        validator.validate({"email": "sarah@example.com"})
+        validator.validate({"email": None})
+        # A non-string non-null should still fail (type constraint).
+        # Format validation of the email itself needs an explicit
+        # FormatChecker — not enforced by default. That's downstream
+        # policy; here we just verify type widening + null acceptance.
+        with pytest.raises(Exception):
+            validator.validate({"email": 42})

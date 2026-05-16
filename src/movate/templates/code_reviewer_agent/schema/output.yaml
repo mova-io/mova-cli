@@ -1,0 +1,77 @@
+# ============================================================================
+# MDK Canonical Schema — Code Reviewer (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Code Review Result
+
+types:
+
+  finding:
+    type: object
+    fields:
+      file:
+        type: string
+        description: Path of the file the finding is about.
+        min_length: 1
+      line:
+        type: integer
+        description: 1-indexed line number, or null for file-level comments.
+        min: 1
+        nullable: true
+      severity:
+        type: enum
+        description: How serious this finding is.
+        values:
+          - blocker      # must fix before merge
+          - major        # should fix
+          - minor        # ok to defer
+          - nit          # style / polish
+      category:
+        type: enum
+        description: What category of issue this is.
+        values:
+          - bug
+          - security
+          - performance
+          - maintainability
+      message:
+        type: markdown
+        description: What's wrong (in plain English).
+        min_length: 1
+      suggestion:
+        type: markdown
+        description: Suggested fix (may be empty if no clean fix exists).
+    required:
+      - file
+      - line
+      - severity
+      - category
+      - message
+      - suggestion
+
+fields:
+
+  summary:
+    type: markdown
+    description: 1-2 sentence overview of the review.
+    min_length: 1
+
+  verdict:
+    type: enum
+    description: Overall recommendation to the author.
+    values:
+      - approve            # LGTM
+      - request_changes    # blocking findings; please fix
+      - comment            # non-blocking observations only
+
+  findings:
+    type: list[finding]
+    description: Per-line / per-file findings, ordered by severity.
+
+required:
+  - summary
+  - verdict
+  - findings

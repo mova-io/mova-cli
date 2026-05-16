@@ -1,0 +1,51 @@
+# ============================================================================
+# MDK Canonical Schema — Extractor (output)
+# ============================================================================
+# All fields are nullable — when the source text doesn't mention a
+# value, the agent returns null rather than fabricating one.
+
+version: 1
+type: object
+
+title: Extracted Fields
+
+fields:
+
+  contact_name:
+    type: string
+    description: Full name of the writer / contact, or null if not mentioned.
+    nullable: true
+    example: Sarah Chen
+
+  email:
+    type: email
+    description: >
+      Email address, or null. Strict format — the schema rejects
+      non-email strings (use canonical `email` semantic type).
+    nullable: true
+    example: sarah@acme.example
+
+  intent:
+    type: enum
+    description: Classification of the writer's intent (or null if ambiguous).
+    nullable: true
+    values:
+      - support_request
+      - feature_request
+      - billing
+      - general_inquiry
+
+  urgency:
+    type: enum
+    description: How urgent the issue is, or null if not signaled.
+    nullable: true
+    values:
+      - low
+      - medium
+      - high
+
+required:
+  - contact_name
+  - email
+  - intent
+  - urgency
