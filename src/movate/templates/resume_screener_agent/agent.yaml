@@ -24,6 +24,11 @@ model:
 
 prompt: ./prompt.md
 
+# Four-dimension scoring rubric, recommendation tiers, interview-question
+# rules, and bias guard. Scaffolded to `<project>/contexts/screening-rubric.md`.
+contexts:
+  - screening-rubric
+
 schema:
   # Canonical YAML — business-readable. Compiles to JSON Schema at
   # agent-load time.

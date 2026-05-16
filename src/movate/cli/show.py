@@ -145,6 +145,12 @@ def _add_marketplace_metadata_rows(table: Table, spec: AgentSpec) -> None:
         table.add_row("persona", spec.persona)
     if spec.capabilities:
         table.add_row("capabilities", ", ".join(spec.capabilities))
+    if spec.role or spec.persona or spec.capabilities:
+        table.add_row(
+            "",
+            "[dim]roles/persona/capabilities are catalog discovery metadata; "
+            "execution routing is not implemented[/dim]",
+        )
 
 
 def _render_schema_ref(ref: str | dict[str, object]) -> str:
