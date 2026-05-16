@@ -22,6 +22,7 @@ rollbacks / redeploys of an existing image.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -644,20 +645,37 @@ def _upload_one_agent_bundle(
         return f"missing {agent_yaml.relative_to(agent_dir)}"
     if not prompt_md.is_file():
         return f"missing {prompt_md.relative_to(agent_dir)}"
-    files.append(("agent_yaml", ("agent.yaml", agent_yaml.read_bytes(), "text/yaml")))
+
+    # YAML-schema accommodation. The deployed runtime's multipart
+    # endpoint hard-codes the persistence paths as schema/input.json
+    # + schema/output.json (see runtime/agent_creation.py
+    # `_collect_bundle_files`). If the operator's local agent ships
+    # YAML schemas (shorthand or hand-written JSON-Schema in YAML),
+    # we compile them to JSON in-flight + rewrite the agent.yaml
+    # schema paths so the runtime's loader resolves the persisted
+    # `.json` files. Operator's on-disk files are untouched.
+    agent_yaml_bytes, rewrote_paths = _maybe_rewrite_agent_yaml_for_upload(
+        agent_yaml,
+        input_schema=input_schema,
+        output_schema=output_schema,
+    )
+    files.append(("agent_yaml", ("agent.yaml", agent_yaml_bytes, "text/yaml")))
     files.append(("prompt", ("prompt.md", prompt_md.read_bytes(), "text/markdown")))
+
     if input_schema is not None:
+        input_bytes, input_name = _schema_bytes_for_upload(input_schema, label="input")
         files.append(
             (
                 "input_schema",
-                (input_schema.name, input_schema.read_bytes(), "application/octet-stream"),
+                (input_name, input_bytes, "application/json"),
             )
         )
     if output_schema is not None:
+        output_bytes, output_name = _schema_bytes_for_upload(output_schema, label="output")
         files.append(
             (
                 "output_schema",
-                (output_schema.name, output_schema.read_bytes(), "application/octet-stream"),
+                (output_name, output_bytes, "application/json"),
             )
         )
     if dataset.is_file():
@@ -667,6 +685,7 @@ def _upload_one_agent_bundle(
                 ("dataset.jsonl", dataset.read_bytes(), "application/jsonl"),
             )
         )
+    _ = rewrote_paths  # accepted for future telemetry / debug log
 
     # httpx requires the client to be typed precisely here; the
     # `client: object` parameter signature lets the outer function
@@ -697,6 +716,101 @@ def _upload_one_agent_bundle(
     except Exception:
         body = {"raw": response.text[:200]}
     return f"HTTP {response.status_code}: {body!r}"
+
+
+def _schema_bytes_for_upload(path: Path, *, label: str) -> tuple[bytes, str]:
+    """Read a local schema file + return ``(bytes, canonical_name)``
+    ready for multipart upload.
+
+    The deployed runtime's multipart endpoint hard-codes the
+    persistence paths as ``schema/input.json`` + ``schema/output.json``
+    regardless of what we send. So for ``.yaml`` / ``.yml`` schemas we
+    parse the file, detect whether it's hand-written JSON Schema or
+    the shorthand form, and serialize the compiled JSON Schema as
+    bytes — that way the on-pod ``.json`` file the runtime persists
+    is a valid Draft 2020-12 schema regardless of which form the
+    operator authored locally. ``.json`` files pass through untouched.
+    """
+    import yaml as _yaml  # noqa: PLC0415
+
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return path.read_bytes(), f"{label}.json"
+    if suffix not in (".yaml", ".yml"):
+        # Unsupported extension — pass through; the runtime will
+        # surface a clear error.
+        return path.read_bytes(), path.name
+    try:
+        data = _yaml.safe_load(path.read_text())
+    except _yaml.YAMLError as exc:
+        # Defer to the runtime's error surface; just send bytes verbatim.
+        _ = exc
+        return path.read_bytes(), f"{label}.json"
+    if not isinstance(data, dict):
+        return path.read_bytes(), f"{label}.json"
+    # Shape-sniff: hand-written JSON Schema vs shorthand. Same heuristic
+    # as the loader (movate.core.loader._load_schema_doc).
+    is_json_schema = "$schema" in data or (data.get("type") == "object" and "properties" in data)
+    if not is_json_schema:
+        # Shorthand → compile to JSON Schema via the same compiler the
+        # loader uses, so the upload is bit-for-bit equivalent.
+        from movate.core.schema_shorthand import (  # noqa: PLC0415
+            SchemaShorthandError,
+            compile_shorthand,
+        )
+
+        try:
+            data = compile_shorthand(data, root_label=label)
+        except SchemaShorthandError:
+            # Don't block the upload — let the runtime's validation
+            # surface the canonical error message.
+            return path.read_bytes(), f"{label}.json"
+    return json.dumps(data, separators=(",", ":")).encode(), f"{label}.json"
+
+
+def _maybe_rewrite_agent_yaml_for_upload(
+    agent_yaml_path: Path,
+    *,
+    input_schema: Path | None,
+    output_schema: Path | None,
+) -> tuple[bytes, bool]:
+    """Return ``(bytes, rewrote)`` where bytes is the agent.yaml content
+    to upload.
+
+    If the operator's agent.yaml declares schemas via path strings
+    pointing at ``.yaml`` / ``.yml`` files, rewrite those paths to
+    ``.json`` so the runtime's loader resolves the on-pod files
+    correctly (the runtime persists everything we upload as
+    ``schema/input.json`` + ``schema/output.json``). On-disk
+    agent.yaml is untouched — this is a transient rewrite for the
+    upload only.
+
+    Returns ``rewrote=False`` (and the original bytes) when no
+    rewrite was needed (already pointing at ``.json``, or schemas are
+    inline shorthand in agent.yaml directly).
+    """
+    import yaml as _yaml  # noqa: PLC0415
+
+    raw = agent_yaml_path.read_bytes()
+    try:
+        data = _yaml.safe_load(raw.decode())
+    except _yaml.YAMLError:
+        return raw, False
+    if not isinstance(data, dict) or "schema" not in data:
+        return raw, False
+    schema_block = data.get("schema")
+    if not isinstance(schema_block, dict):
+        return raw, False
+    rewrote = False
+    for slot, _local_path in (("input", input_schema), ("output", output_schema)):
+        current = schema_block.get(slot)
+        if isinstance(current, str) and current.lower().endswith((".yaml", ".yml")):
+            # Rewrite ./schema/input.yaml → ./schema/input.json
+            schema_block[slot] = f"./schema/{slot}.json"
+            rewrote = True
+    if not rewrote:
+        return raw, False
+    return _yaml.safe_dump(data, sort_keys=False).encode(), True
 
 
 def _pick_first_existing(*paths: Path) -> Path | None:
