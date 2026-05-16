@@ -151,7 +151,7 @@ async def _resolve_run(storage: object, *, run_id_or_prefix: str) -> RunRecord |
         run_id_or_prefix, tenant_id="local"
     )
     if record is not None:
-        return record
+        return record  # type: ignore[no-any-return]
 
     # Path 2 — prefix match over recent runs (no API key needed).
     # We accept any prefix length down to 4 chars to disambiguate
@@ -175,7 +175,7 @@ async def _resolve_run(storage: object, *, run_id_or_prefix: str) -> RunRecord |
             f"--full-id[/bold]."
         )
         raise typer.Exit(code=2)
-    return candidates[0]
+    return candidates[0]  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
