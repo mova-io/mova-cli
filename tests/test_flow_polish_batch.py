@@ -202,6 +202,9 @@ def test_deploy_dry_run_still_works_after_curl_addition(
     needs Azure)."""
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
     monkeypatch.chdir(tmp_path)
+    # Post-PR-#94: deploy preflight requires a Dockerfile in cwd. Touch
+    # one so the preflight passes for this summary-shape test.
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
     runner.invoke(
         app,
         [

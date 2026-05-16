@@ -142,6 +142,48 @@ def deploy(
         )
         raise typer.Exit(code=2)
 
+    # Dockerfile preflight — `az acr build` uploads `.` as the build
+    # context and looks for `Dockerfile` relative to it. When operators
+    # run `mdk deploy` from a CUSTOMER PROJECT directory (which has no
+    # Dockerfile — only the movate-cli source tree does), the build
+    # silently begins, uploads the project, and dies 2-4 minutes later
+    # with a cryptic ACR error. Catch it BEFORE that wasted round-trip.
+    #
+    # Skipped under --skip-build (operator is reusing an existing
+    # image; no build will happen).
+    if not skip_build and not (Path.cwd() / "Dockerfile").is_file():
+        err.print(
+            "[red]✗[/red] no [bold]Dockerfile[/bold] in current directory "
+            f"([bold]{Path.cwd()}[/bold])."
+        )
+        err.print()
+        err.print(
+            "[dim]`mdk deploy` builds the [bold]movate runtime image[/bold] "
+            "from the [bold]Dockerfile[/bold] in the movate-cli source tree, "
+            "[i]not[/i] from your project dir. Two paths forward:[/dim]"
+        )
+        err.print()
+        target_hint = target or "<target>"
+        err.print(
+            "  [bold]A.[/bold] If you meant to push runtime code: "
+            "[cyan]cd[/cyan] to the movate-cli repo, then re-run "
+            f"[cyan]mdk deploy --target {target_hint}[/cyan]."
+        )
+        err.print(
+            "  [bold]B.[/bold] If you meant to push [bold]your agents[/bold] "
+            "to an already-deployed runtime, the runtime image is the "
+            "[i]platform[/i] (built + pushed once); your agents go up via "
+            "[cyan]POST /api/v1/agents[/cyan] (or future "
+            "[cyan]mdk push --target <name>[/cyan])."
+        )
+        err.print()
+        err.print(
+            "[dim]Override this check with [bold]--skip-build "
+            "--image-tag <existing-tag>[/bold] to just roll Container Apps "
+            "to a pre-built image.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
     if only is not None and only not in ("api", "worker"):
         error(f"--only must be 'api' or 'worker'; got {only!r}")
         raise typer.Exit(code=2)
@@ -411,7 +453,10 @@ def _print_plan(plan: DeployPlan, *, dry_run: bool) -> None:
     """
     label = "[dim](dry-run)[/dim] " if dry_run else ""
     err.print()
-    err.print(f"{label}[bold]movate deploy[/bold] → {plan.target_name}")
+    # Use the canonical `mdk` brand in user-facing output (`movate`
+    # still works as a binary alias but mixing names in the demo
+    # confuses operators).
+    err.print(f"{label}[bold]mdk deploy[/bold] → {plan.target_name}")
     err.print(f"  subscription:    {plan.subscription}")
     err.print(f"  resource group:  {plan.resource_group}")
     err.print(f"  ACR:             {plan.acr_login_server}")

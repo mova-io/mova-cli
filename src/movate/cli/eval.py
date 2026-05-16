@@ -251,7 +251,7 @@ def eval_(
     )
 
 
-def _eval_all_in_project(
+def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflects the per-agent state machine
     *,
     gate: float,
     gate_mode: str,

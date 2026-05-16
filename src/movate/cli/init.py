@@ -266,6 +266,135 @@ OPENAI_API_KEY=
 # LANGFUSE_SECRET_KEY=
 """
 
+_CONTEXTS_README = """\
+# `contexts/` — Reusable Prompt Contexts
+
+Markdown files in this directory get **prepended to agent prompts**
+at runtime. The pattern lets you DRY up shared instructions across
+multiple agents — tone guides, output rubrics, persona definitions
+— without copy-pasting into every `prompt.md`.
+
+## What goes here
+
+| Path | Purpose |
+|---|---|
+| `contexts/<name>.md` | Project-level shared context |
+| `agents/<agent>/contexts/<name>.md` | Per-agent override (wins on collision) |
+
+The base name (no extension) is the context's **id**. An agent
+declaring `contexts: [support-tone]` resolves to
+`contexts/support-tone.md` (project-level) — or to
+`agents/<that-agent>/contexts/support-tone.md` when present, which
+wins per-agent.
+
+## Conventions
+
+- **Keep them short and focused.** A context is a *fragment*, not a
+  full prompt. One rubric, one tone guide, one persona — combined
+  with the agent's own `prompt.md` at runtime.
+- **No frontmatter required.** Just plain Markdown. The loader
+  reads the file verbatim.
+- **Naming is hyphen-cased.** `support-tone.md`, `triage-rubric.md` —
+  matches the rest of `mdk`'s `kebab-case` identifiers.
+- **Per-agent overrides win on collision.** If both
+  `contexts/triage-rubric.md` (project) and
+  `agents/ticket-triager/contexts/triage-rubric.md` (per-agent) exist,
+  the per-agent one is used for `ticket-triager` only. Run
+  `mdk doctor agent <name>` to see which tier each context resolved to.
+
+## Examples that ship with templates
+
+- `support-tone.md` — auto-scaffolded by `mdk add ticket-triager`,
+  defines the customer-facing tone for support responses.
+- `triage-rubric.md` — auto-scaffolded by the same template,
+  defines priority + category criteria.
+- `grounded-qa-rubric.md` — auto-scaffolded by `mdk add rag-qa`,
+  defines citation + grounding requirements.
+
+## See also
+
+- `mdk doctor agent <name>` — shows resolved context paths per agent.
+- `agents/<name>/agent.yaml` — declare which contexts the agent uses.
+"""
+
+
+_SKILLS_README = """\
+# `skills/` — Reusable Skill Definitions
+
+Skills are **callable tools** an agent can invoke at inference time:
+Python functions, HTTP endpoints, or MCP tools. The pattern lets
+multiple agents share the same tool registry instead of redefining
+it per agent.
+
+## What goes here
+
+Each skill is a directory:
+
+```
+skills/<skill-name>/
+├── skill.yaml      # contract: name, backend, side_effects, schemas
+├── impl.py         # Python backend (one of three options)
+├── README.md       # optional — explains the skill's purpose
+└── corpus.json     # optional — data the skill reads at runtime
+```
+
+`skill.yaml` declares the **backend** (`python` | `http` | `mcp`),
+the **side-effects category** (`pure` | `network_read` | `network_write` |
+`filesystem` | `shell`), and the **input/output schemas**.
+
+| Backend | When to use |
+|---|---|
+| `python` | Local logic, fast iteration, no network. `impl.py` defines `def run(input) -> output`.|
+| `http` | Wraps an existing REST API. Set `endpoint:` in `skill.yaml`. |
+| `mcp` | Plugs into a Model Context Protocol server. Set `mcp_server:` in `skill.yaml`. |
+
+## Conventions
+
+- **Skill names are hyphen-cased.** `web-search`, `kb-lookup`,
+  `lint-runner` — agents reference them by name in `agent.yaml`'s
+  `skills: [<name>]` list.
+- **One skill per directory.** Don't bundle multiple skills in one
+  folder; the loader scans `skills/*/skill.yaml` and treats each
+  dir as one skill.
+- **Schemas matter.** `skill.yaml` declares input + output JSON Schema.
+  The runtime validates calls before invoking `impl.py`, so a
+  malformed agent request fails fast instead of mid-skill.
+- **Side-effects gate is enforced.** `SkillPolicy` in `project.yaml`
+  can deny entire categories (e.g. block all `network_write` skills
+  for compliance). Skills MUST declare their category honestly.
+
+## Examples that ship with templates
+
+- `web-search` — auto-scaffolded with `mdk add rag-qa`; wraps
+  DuckDuckGo HTML scrape (network_read).
+- `kb-lookup` — auto-scaffolded with `mdk add ticket-triager`; reads
+  from `kb/*.json` corpora (filesystem). See the `kb/README.md`
+  for the corpus shape.
+- `lint-runner` — auto-scaffolded with `mdk add code-reviewer`;
+  shells out to `ruff check` (shell category).
+
+## Per-agent override pattern
+
+A project-level skill can be overridden per-agent the same way
+contexts can:
+
+```
+skills/web-search/                       # project-level (default)
+agents/rag-qa/skills/web-search/         # per-agent override
+```
+
+The per-agent version wins for that one agent. `mdk doctor agent
+<name>` shows which tier each skill resolved to.
+
+## See also
+
+- `mdk skills list` — every skill discovered in the project.
+- `mdk skills run <name> '<input-json>'` — invoke a skill directly,
+  no agent wrapper, for debugging.
+- `agents/<name>/agent.yaml` — declare which skills the agent uses.
+"""
+
+
 _KB_README = """\
 # `kb/` — Knowledge Assets
 
@@ -494,10 +623,14 @@ def _init_project(
         sub.mkdir(exist_ok=True)
         (sub / ".gitkeep").write_text("")
 
-    # `kb/` ships a tiny README explaining the convention so operators
-    # who open the dir see "what goes here?" answered in-place rather
-    # than having to grep the docs.
+    # Each top-level convention dir ships a tiny README explaining what
+    # goes inside, so operators who open the folder see "what does this
+    # do?" answered in-place rather than having to grep the docs.
+    # All three follow the same shape: What goes here, Conventions,
+    # Examples that ship with templates, See also.
     (project_root / "kb" / "README.md").write_text(_KB_README)
+    (project_root / "contexts" / "README.md").write_text(_CONTEXTS_README)
+    (project_root / "skills" / "README.md").write_text(_SKILLS_README)
 
     # Initial snapshot — operators get a baseline for diff / rollback.
     snapshot_short: str | None = None
@@ -578,8 +711,11 @@ def _init_project(
             f"[dim]Tip: skip the two-step flow next time with [bold]--with-agents[/bold]:[/dim]\n"
             f"  [dim]$ mdk init <name> --with-agents rag-qa,ticket-triager[/dim]\n\n"
             f"[dim]API keys: configured globally via "
-            f"[bold]mdk auth login <provider>[/bold]. Per-project [bold].env[/bold] "
-            f"still works as an override.[/dim]"
+            f"[bold]mdk auth login <provider>[/bold] — supported providers: "
+            f"[bold]openai[/bold], [bold]anthropic[/bold], "
+            f"[bold]azure[/bold], [bold]gemini[/bold]. Per-project "
+            f"[bold].env[/bold] still works as an override "
+            f"(see [bold].env.example[/bold]).[/dim]"
         )
     console.print(
         Panel(

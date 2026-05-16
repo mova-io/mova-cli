@@ -176,6 +176,9 @@ def test_deploy_dry_run_emits_summary(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
     # Register a fake target with the minimum required fields.
     monkeypatch.chdir(tmp_path)
+    # Post-PR-#94: deploy preflight requires a Dockerfile in cwd. Touch
+    # one so the preflight passes for this dry-run-shape test.
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
     result = runner.invoke(
         app,
         [
