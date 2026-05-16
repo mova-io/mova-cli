@@ -19,6 +19,7 @@ where it can; un-touched sections are left as-is).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import typer
 import yaml
@@ -231,8 +232,8 @@ def _module_mode(module_name: str, module_cfg: object) -> str:
     if not module_cfg.enabled:  # type: ignore[attr-defined]
         return "-"
     if module_name == "pii":
-        return module_cfg.mode  # type: ignore[attr-defined]
-    return module_cfg.on_violation  # type: ignore[attr-defined]
+        return module_cfg.mode  # type: ignore[attr-defined, no-any-return]
+    return module_cfg.on_violation  # type: ignore[attr-defined, no-any-return]
 
 
 def _module_detail(module_name: str, module_cfg: object) -> str:
@@ -324,7 +325,7 @@ def _toggle(path: str, *, enabled: bool, config_file: Path) -> None:
     direction_key, module_key = path.split(".", 1)
     config_path = config_file.resolve()
 
-    raw: dict = {}
+    raw: dict[str, Any] = {}
     if config_path.is_file():
         loaded = yaml.safe_load(config_path.read_text()) or {}
         if not isinstance(loaded, dict):
