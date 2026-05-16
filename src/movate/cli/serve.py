@@ -38,6 +38,17 @@ def serve(
         envvar=["MDK_AGENTS_PATH", "MOVATE_AGENTS_PATH"],
         help="Directory to scan for agent.yaml files. Falls back to empty catalog if missing.",
     ),
+    skills_path: Path | None = typer.Option(
+        None,
+        "--skills-path",
+        envvar=["MDK_SKILLS_PATH", "MOVATE_SKILLS_PATH"],
+        help=(
+            "Directory where POST /api/v1/skills persists uploaded skill "
+            "bundles, and where the agent loader looks for skill registry "
+            "entries. Defaults to <agents-path>/skills/ to match the "
+            "loader's project-root fallback."
+        ),
+    ),
     log_level: str = typer.Option(
         "info",
         "--log-level",
@@ -89,6 +100,7 @@ def serve(
             host=host,
             port=port,
             agents_path=agents_path,
+            skills_path=skills_path,
             log_level=log_level,
             rate_limit_per_minute=rate_limit_per_minute,
             cors_origins=cors_origins,
@@ -101,6 +113,7 @@ async def _run_serve(
     host: str,
     port: int,
     agents_path: Path,
+    skills_path: Path | None,
     log_level: str,
     rate_limit_per_minute: int,
     cors_origins: str,
@@ -143,6 +156,9 @@ async def _run_serve(
         # already walked above, so creates land in the same registry
         # GET /agents reads from.
         agents_path=agents_path,
+        # skills_path defaults to <agents_path>/skills inside build_app
+        # when None — matches the agent loader's project-root fallback.
+        skills_path=skills_path,
         rate_limit_per_minute=rate_limit_per_minute,
         cors_allowed_origins=parsed_origins,
     )
