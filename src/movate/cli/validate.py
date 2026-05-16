@@ -124,16 +124,10 @@ def validate(
         return
 
     if path is None:
-        # Inside a project, no-args is unambiguous: the operator means
-        # "validate this project." Default to --all rather than nagging
-        # them to retype. Outside a project, the original error stands
-        # — we have nothing to sweep and need explicit input.
-        from movate.core.config import is_project_root  # noqa: PLC0415
-
-        if is_project_root(Path.cwd()):
-            console.print(
-                "[dim]no path given; defaulting to [bold]--all[/bold] (inside a project).[/dim]"
-            )
+        # No path given → default to --all when inside a project (or any
+        # subdirectory of one). Walk up so `mdk validate` works from
+        # `agents/rag-qa/` just as well as from the project root.
+        if walk_up_for_project_root() is not None:
             _validate_all(strict=strict, run_linter=not no_lint)
             return
         console.print(
