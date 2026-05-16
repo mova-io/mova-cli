@@ -1,0 +1,19 @@
+# Output contract — what the lead-qualifier agent returns.
+# BANT scoring (budget/authority/need/timeline) — each dimension is
+# a (score 0-3, rationale string) pair, factored into the `dim` alias.
+# Total score is the sum; next-action follows from it.
+
+$defs:
+  dim:
+    score:     integer(0..3)
+    rationale: string(1..)
+
+bant:
+  budget:    $dim
+  authority: $dim
+  need:      $dim
+  timeline:  $dim
+total_score: integer(0..12)
+next_action: book_meeting|nurture|enrich|disqualify
+rationale:   string(1..)
+objections:  [string(1..)]
