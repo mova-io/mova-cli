@@ -457,6 +457,95 @@ def status() -> None:
     stdout.print(f"[dim]mdk_auth_status_summary: set={counts['ok']} unset={counts['unset']}[/dim]")
 
 
+@auth_app.command("save-runtime-key")
+def save_runtime_key(
+    target: str = typer.Argument(
+        ...,
+        help="Deployment target name (from `mdk config list-targets`).",
+    ),
+    key: str = typer.Argument(
+        ...,
+        help=(
+            "The full `mvt_<env>_<tenant>_<keyid>_<secret>` value printed "
+            "by `mdk auth create-key`. Quote it if your shell would otherwise "
+            "interpret special characters."
+        ),
+    ),
+) -> None:
+    """Save a minted runtime bearer key to the credentials store.
+
+    The bearer-key flow today is two-step: (1) run ``mdk auth
+    create-key`` inside the deployed Container App via ``az
+    containerapp exec``, copy the printed secret; (2) ``export
+    MDK_DEV_KEY=...`` locally. Step 2 has to run in every new shell.
+
+    This command replaces step 2 with a single write to
+    ``~/.movate/credentials``. Future shells autoload the variable
+    automatically (the loader pattern-matches ``MDK_*_KEY`` entries —
+    see :mod:`movate.credentials.loader`).
+
+    Example:
+
+      [dim]$ az containerapp exec -g movate-dev-rg -n movate-dev-api \\\\
+          --command "mdk auth create-key --tenant-id demo --env live"[/dim]
+      [dim]# copy the printed mvt_live_... value[/dim]
+
+      [dim]# locally:[/dim]
+      $ mdk auth save-runtime-key dev mvt_live_demodevt_…_…
+      ✓ saved as MDK_DEV_KEY in ~/.movate/credentials
+    """
+    # Local imports keep CLI cold-start cheap (config + credentials
+    # are only needed when this command actually runs).
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+    if target not in cfg.targets:
+        registered = sorted(cfg.targets) or ["<none>"]
+        error(
+            f"unknown target {target!r}. Registered: "
+            f"{', '.join(registered)}. Add one with `mdk config add-target`."
+        )
+        raise typer.Exit(code=2)
+    target_cfg = cfg.targets[target]
+    env_var = target_cfg.key_env
+    if not env_var:
+        error(
+            f"target {target!r} has no `key_env` configured. Re-register "
+            f"the target with `mdk config add-target {target} --key-env "
+            f"MDK_{target.upper()}_KEY ...`"
+        )
+        raise typer.Exit(code=2)
+
+    # Light sanity-check the key shape so we catch obvious paste errors
+    # (e.g. operator copied half the line) before the runtime would.
+    # The canonical format is `mvt_<env>_<tenant>_<keyid>_<secret>` —
+    # five underscore-separated parts.
+    expected_parts = 5
+    if len(key.split("_")) < expected_parts or not key.startswith("mvt_"):
+        err.print(
+            "[yellow]⚠[/yellow] key doesn't look like a movate bearer "
+            "(expected `mvt_<env>_<tenant>_<keyid>_<secret>`). "
+            "Saving anyway — if auth fails later, double-check the value."
+        )
+
+    store = CredentialsStore()
+    store.set(env_var, key)
+    success(f"saved as [cyan]{env_var}[/cyan] in [cyan]{store.path}[/cyan].")
+    hint(
+        f"[dim]Future shells autoload {env_var} automatically. "
+        f"For the current shell, run: [bold]export {env_var}={env_var}_VALUE[/bold] "
+        f"or open a new terminal.[/dim]"
+    )
+
+
 def _provider_is_configured(provider: str) -> bool:
     """Return True if the provider's API key(s) are already set.
 

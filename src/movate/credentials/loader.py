@@ -86,6 +86,9 @@ def autoload_credentials() -> None:
     file_entries = store.read()
     if not file_entries:
         return
+    # Whitelist autoload: provider keys (OPENAI_API_KEY etc.) + notification
+    # secrets. Operators set these via `mdk auth login <provider>` and
+    # expect them to survive across shells without re-exporting.
     for key in ALL_AUTOLOADED_ENV_VARS:
         # Skip if already set (by shell OR by dotenv already running).
         if os.environ.get(key, "").strip():
@@ -93,6 +96,33 @@ def autoload_credentials() -> None:
         candidate = file_entries.get(key, "").strip()
         if candidate:
             os.environ[key] = candidate
+    # Pattern-match autoload for MDK runtime bearer tokens. Target
+    # configs in `~/.movate/config.yaml` declare a `key_env:` field
+    # (e.g. `MDK_DEV_KEY`, `MDK_STAGING_KEY`, `MDK_PROD_KEY`) — any
+    # variable matching `MDK_<X>_KEY` that's in the credentials file
+    # gets surfaced automatically. Same precedence rule as the
+    # whitelist: never clobber a shell-set value. Saves operators
+    # from re-exporting after `mdk auth save-runtime-key`.
+    for key, value in file_entries.items():
+        if not _looks_like_runtime_key_env(key):
+            continue
+        if os.environ.get(key, "").strip():
+            continue
+        if value.strip():
+            os.environ[key] = value.strip()
+
+
+def _looks_like_runtime_key_env(name: str) -> bool:
+    """``MDK_<X>_KEY`` shape detector for runtime-bearer autoload.
+
+    Matches the canonical pattern that `mdk config add-target
+    --key-env` defaults to (e.g. ``MDK_DEV_KEY``,
+    ``MDK_PROD_KEY``). Anything not matching this shape stays a
+    manual export — we don't autoload arbitrary credentials file
+    entries (would be a security footgun if someone tucked
+    ``AWS_SECRET_ACCESS_KEY`` into the file).
+    """
+    return name.startswith("MDK_") and name.endswith("_KEY") and len(name) > len("MDK__KEY")
 
 
 def key_source(key: str) -> KeySource:
