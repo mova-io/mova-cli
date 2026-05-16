@@ -133,6 +133,16 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "nothing is uploaded. Only applies to agents-mode."
         ),
     ),
+    status: bool = typer.Option(
+        False,
+        "--status",
+        help=(
+            "List all live agents on the target runtime. Calls "
+            "[bold]GET /api/v1/agents[/bold] and renders a table of "
+            "name / version / created-at. Nothing is deployed. "
+            "Only applies to agents-mode."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -179,6 +189,9 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         raise typer.Exit(code=2)
     resolved_mode = _resolve_deploy_mode(mode=mode, cwd=Path.cwd())
     if resolved_mode == "agents":
+        if status:
+            _deploy_status(target=target)
+            return
         _deploy_agents(
             target=target,
             dry_run=dry_run,
@@ -480,6 +493,71 @@ def _resolve_deploy_mode(*, mode: str, cwd: Path) -> str:
 _HTTP_CREATED = 201
 _HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
+
+
+def _deploy_status(*, target: str | None) -> None:
+    """List live agents on the target runtime via GET /api/v1/agents."""
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+    from rich.table import Table  # noqa: PLC0415
+
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    base_url = target_cfg.url.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            resp = client.get(f"{base_url}/api/v1/agents", headers=headers)
+    except httpx.HTTPError as exc:
+        error(f"could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code != httpx.codes.OK:
+        error(f"GET /api/v1/agents returned HTTP {resp.status_code}: {resp.text[:200]!r}")
+        raise typer.Exit(code=2)
+
+    try:
+        agents = resp.json()
+    except Exception:
+        error("response is not valid JSON")
+        raise typer.Exit(code=2) from None
+
+    if not isinstance(agents, list):
+        # Some runtimes wrap in {"agents": [...]}.
+        agents = agents.get("agents", []) if isinstance(agents, dict) else []
+
+    table = Table(
+        title=f"Live agents on [bold]{target_name}[/bold] ({base_url})",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Name", no_wrap=True)
+    table.add_column("Version", no_wrap=True)
+    table.add_column("Created at", no_wrap=True)
+
+    for agent in sorted(agents, key=lambda a: a.get("name", "") if isinstance(a, dict) else ""):
+        if not isinstance(agent, dict):
+            continue
+        table.add_row(
+            agent.get("name", "?"),
+            agent.get("version", "?"),
+            agent.get("created_at", agent.get("createdAt", "?")),
+        )
+
+    if agents:
+        err.print(table)
+    else:
+        err.print(
+            f"[yellow]⚠[/yellow] no agents found on [bold]{target_name}[/bold]. "
+            "Run [bold]mdk deploy --mode agents[/bold] to upload some."
+        )
 
 
 def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> None:  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
