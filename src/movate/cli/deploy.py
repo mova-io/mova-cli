@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import typer
@@ -216,6 +217,30 @@ def deploy(
     )
     success(f"{target_name} is now serving {plan.image_tag}")
 
+    # Copy-pasteable smoke-test commands so the operator can confirm
+    # the deployed runtime answers from outside, not just /healthz from
+    # inside. Pick the FIRST agent in the project as the example so the
+    # /run line is real, not parameterized. Falls back to /healthz only
+    # if the project has no agents (vacuous-pass deploy of an empty
+    # workspace).
+    first_agent = _first_agent_name() or None
+    base_url = target_cfg.url.rstrip("/")
+    err.print()
+    err.print("[bold]Smoke-test the deployment:[/bold]")
+    err.print(f"  [cyan]curl -sS {base_url}/healthz[/cyan]")
+    if first_agent:
+        err.print(
+            f"  [cyan]curl -sS -X POST {base_url}/run "
+            f"-H 'content-type: application/json' "
+            f'-H "x-api-key: $MDK_DEV_KEY" '
+            f'-d \'{{"agent": "{first_agent}", "input": {{}}}}\'[/cyan]'
+        )
+    err.print(
+        f"  [cyan]az containerapp logs show -g {plan.resource_group} "
+        f"-n {plan.apps_to_update[0]} --tail 20[/cyan]"
+    )
+    err.print()
+
     # Greppable summary — full success path: build + roll + /healthz
     # confirmed. CI gates branch on ok=true here.
     duration_s = round(time.monotonic() - started_at, 1)
@@ -338,6 +363,23 @@ def _build_plan(
         apps_to_update=apps,
         version=version,
     )
+
+
+def _first_agent_name() -> str | None:
+    """Return the first agent name in the current project's
+    ``agents/`` dir, or None if there are no agents (or no project).
+
+    Used by the post-deploy success message to build a copy-pasteable
+    ``curl POST /run`` example. Pure filesystem lookup — no YAML
+    parsing — so it stays cheap and never raises.
+    """
+    agents_dir = Path.cwd() / "agents"
+    if not agents_dir.is_dir():
+        return None
+    for entry in sorted(agents_dir.iterdir()):
+        if entry.is_dir() and (entry / "agent.yaml").is_file():
+            return entry.name
+    return None
 
 
 def _git_short_sha() -> str | None:

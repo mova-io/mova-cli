@@ -378,6 +378,20 @@ def _eval_all_in_project(
     if failed:
         raise typer.Exit(code=2)
 
+    # All-pass success — close the loop. The natural next moves after
+    # an all-green eval are: serve it locally for a smoke-test, ship
+    # to dev with deploy, or one-off run for a specific input. Pick
+    # the FIRST agent name as the run-example so the line is
+    # copy-pasteable rather than a parameterized template.
+    if passed > 0:
+        first_agent = rows[0][0]
+        console.print(
+            "\n[bold]Next:[/bold]\n"
+            f"  [cyan]mdk run {first_agent}[/cyan] [dim]# one-shot invocation[/dim]\n"
+            "  [cyan]mdk serve[/cyan]              [dim]# local HTTP runtime[/dim]\n"
+            "  [cyan]mdk deploy --target dev[/cyan] [dim]# push to Azure[/dim]"
+        )
+
 
 def _resolve_remote_url(path: str) -> str | None:
     """Return ``path`` if it's an ``http(s)://`` URL, else ``None``.

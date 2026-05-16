@@ -570,12 +570,13 @@ def _init_project(
         # one-command alternative for next time.
         body += (
             f"\n[bold]Next steps:[/bold]\n"
-            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk add --list[/bold]"
-            f"   [dim]# browse role templates[/dim]\n"
+            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]\n"
+            f"  [dim]$[/dim] [bold]mdk templates list[/bold]"
+            f"   [dim]# browse the 15+ packaged role templates[/dim]\n"
             f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
             f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
             f"[dim]Tip: skip the two-step flow next time with [bold]--with-agents[/bold]:[/dim]\n"
-            f"  [dim]$ mdk init --project <name> --with-agents rag-qa,ticket-triager[/dim]\n\n"
+            f"  [dim]$ mdk init <name> --with-agents rag-qa,ticket-triager[/dim]\n\n"
             f"[dim]API keys: configured globally via "
             f"[bold]mdk auth login <provider>[/bold]. Per-project [bold].env[/bold] "
             f"still works as an override.[/dim]"

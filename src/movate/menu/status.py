@@ -114,12 +114,24 @@ def inspect_workspace(project_root: Path | str = ".") -> WorkspaceStatus:
 
 
 def _has_movate_yaml(root: Path) -> bool:
-    return (root / "movate.yaml").is_file() or (root / "mdk.yaml").is_file()
+    """Return True if root is a movate project — any of the three
+    canonical config-file names counts (project.yaml is canonical
+    post-PR #85; policy.yaml + movate.yaml are legacy aliases that
+    still load). Pre-#85 this only checked movate.yaml; that's why
+    `mdk menu` showed "not initialized" inside fresh PR #87 projects."""
+    return (
+        (root / "project.yaml").is_file()
+        or (root / "policy.yaml").is_file()
+        or (root / "movate.yaml").is_file()
+        or (root / "mdk.yaml").is_file()
+    )
 
 
 def _movate_yaml_version(root: Path) -> str | None:
-    """Read the ``api_version`` line from ``movate.yaml`` (best-effort)."""
-    for candidate in ("movate.yaml", "mdk.yaml"):
+    """Read the ``api_version`` line from the project config file
+    (best-effort). Tries the canonical name first; falls back to the
+    legacy slots so post-rename projects still report a version."""
+    for candidate in ("project.yaml", "policy.yaml", "movate.yaml", "mdk.yaml"):
         path = root / candidate
         if not path.is_file():
             continue

@@ -310,9 +310,13 @@ class TestInitProjectNextSteps:
     def test_combined_cd_command_appears(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The new next-steps line is a copy-paste-friendly
-        `cd <name> && mdk add --list` instead of a multi-line
-        sequence."""
+        """The next-steps Panel includes a `cd <name>` line so the
+        operator can copy-paste their way into the new project.
+
+        Post-flow-polish (PR #93) the discovery surface is
+        `mdk templates list` rather than the legacy
+        `mdk add --list`; the cd line moved to its own row for
+        readability."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
@@ -320,8 +324,10 @@ class TestInitProjectNextSteps:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        # Combined cd + first action.
-        assert "cd smooth-test && mdk add --list" in result.stdout
+        # `cd <name>` and `mdk templates list` both render — they're now
+        # on separate lines instead of `&&`-chained.
+        assert "cd smooth-test" in result.stdout
+        assert "mdk templates list" in result.stdout
 
     def test_obsolete_env_step_dropped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

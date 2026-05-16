@@ -288,8 +288,9 @@ class TestSmartNextStepsAfterWithAgents:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        # The traditional path shows the add catalog AND the tip.
-        assert "mdk add --list" in result.stdout
+        # Post-PR-#93 the discovery surface is `mdk templates list` —
+        # `mdk add --list` was the pre-MVP discovery path.
+        assert "mdk templates list" in result.stdout
         # Tip about --with-agents next time:
         assert "--with-agents" in result.stdout
 
@@ -396,8 +397,11 @@ class TestWithAgentsDiscoverabilityTip:
         assert result.exit_code == 0
         # The tip references --with-agents explicitly.
         assert "--with-agents" in result.stdout
-        # And shows a copy-pasteable example.
-        assert "mdk init --project" in result.stdout
+        # And shows a copy-pasteable example. Post-PR-#87 bare
+        # `mdk init <name>` defaults to project mode, so the example
+        # drops the explicit `--project` flag.
+        assert "mdk init <name>" in result.stdout
+        assert "--with-agents" in result.stdout
 
     def test_with_agents_init_omits_the_tip(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
