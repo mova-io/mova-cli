@@ -38,7 +38,7 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ### Session 2026-05-13 — Teams demo loop + ADR 002 closeout
 
-**Teams Slice 3.1.e — Teams manifest + Azure Bot Service registration shipped this session.** 15 new tests (1296 → 1311 total). The remaining piece of the Teams demo loop — package the bot as an actual Teams app and wire Azure Bot Service so Teams can route Activities to the deployed bot. New `appPackage/manifest.json` (Teams v1.16) with three scopes (personal/team/groupchat), commandLists for the autocomplete UI, `supportsFiles: true` for 3.1.d uploads; placeholder 192x192 + 32x32 PNG icons (generated via stdlib zlib so CI doesn't need binary blobs). New `scripts/teams-package.sh` zipper that substitutes `MOVATE_TEAMS_BOT_APP_ID` / version / validDomains from env at build time, warns loudly on the placeholder UUID (Teams Admin Center would reject it). Two new Bicep modules: `infra/azure/modules/containerapp-teams-bot.bicep` (Container App running `mdk teams-bot serve`; ingress port 3978; reads three KV secrets — fleet API key, encryption key, Bot Service AAD password) and `bot-service.bicep` (Bot Service registration + Teams channel; F0 for non-prod, S1 for prod; bound to an AAD app the operator pre-creates via `az ad app create`). Main.bicep wires both behind a single `enableTeamsBot` flag mirroring `enableApiWorker`'s two-pass pattern. New `docs/teams-deploy.md` 6-step runbook from "you have an Azure sub" to "Teams users `@movate ping` works". Bicep build + lint clean. **PR #87 (this one). Closes [#69](https://github.com/mova-io/mova-cli/issues/69) (modulo the manual `az ad app create` + Teams Admin Center upload step which lives in the runbook). Demo loop complete.**
+**Teams Slice 3.1.e — Teams manifest + Azure Bot Service registration shipped this session.** 15 new tests (1296 → 1311 total). The remaining piece of the Teams demo loop — package the bot as an actual Teams app and wire Azure Bot Service so Teams can route Activities to the deployed bot. New `appPackage/manifest.json` (Teams v1.16) with three scopes (personal/team/groupchat), commandLists for the autocomplete UI, `supportsFiles: true` for 3.1.d uploads; placeholder 192x192 + 32x32 PNG icons (generated via stdlib zlib so CI doesn't need binary blobs). New `scripts/teams-package.sh` zipper that substitutes `MOVATE_TEAMS_BOT_APP_ID` / version / validDomains from env at build time, warns loudly on the placeholder UUID (Teams Admin Center would reject it). Two new Bicep modules: `infra/azure/modules/containerapp-teams-bot.bicep` (Container App running `mdk teams-bot serve`; ingress port 3978; reads three KV secrets — fleet API key, encryption key, Bot Service AAD password) and `bot-service.bicep` (Bot Service registration + Teams channel; F0 for non-prod, N for prod; bound to an AAD app the operator pre-creates via `az ad app create`). Main.bicep wires both behind a single `enableTeamsBot` flag mirroring `enableApiWorker`'s two-pass pattern. New `docs/teams-deploy.md` 6-step runbook from "you have an Azure sub" to "Teams users `@movate ping` works". Bicep build + lint clean. **PR #87 (this one). Closes [#69](https://github.com/mova-io/mova-cli/issues/69) (modulo the manual `az ad app create` + Teams Admin Center upload step which lives in the runbook). Demo loop complete.**
 
 **Teams Slice 3.1.d — file attachment handling shipped this session.** 33 new tests (1263 → 1296 total). Drag an `agent.yaml`, a zipped agent directory, or a `dataset.jsonl` into Teams and the bot validates + reports back as an Adaptive Card. New `src/movate/teams_bot/attachments.py`: async pipeline (`fetch_bytes` for file:// + http(s)://, 4MB cap; `classify` by filename suffix; `ingest_attachment` orchestrates download → materialise → validate; `temp_workspace` context-manager for per-request scratch; zip-slip protection rejects archives with `..` paths before extraction). New `src/movate/teams_bot/cards/upload.py`: `build_agent_upload_card` (FactSet showing runtime/model/skills/objectives/contexts; description container) and `build_dataset_upload_card` (row count + first-row preview, pluralisation-aware). Handler detects `activity.attachments` before slash-command parse and routes through `_handle_upload`. Run-against-uploaded-agent deferred — needs a runtime API change so `/run` accepts an inline bundle (not just a registered name); tracked as a follow-up. Microsoft Graph auth for production Teams attachments also deferred (Bot Framework Emulator's file:// URLs work today). **PR #86. Closes [#68](https://github.com/mova-io/mova-cli/issues/68).**
 
@@ -631,6 +631,33 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 153. [ ] **`mdk compose`** `[MED] [v1.1+] [~2-3w]` — **BLOCKED on Phase 7.** Multi-agent declarative composition is the conditional-routing/parallel story, which requires the workflow IR to mature. Today's workflows are linear (v0.3). When LangGraph swap-in lands (Phase 7), compose is the user-facing surface on top.
 
+#### K-dx — Developer-experience polish (added 2026-05-14)
+
+> _High-leverage standalone items added after Sprint N kickoff to
+> fill the DX gap the Sprint M-U sequence didn't fully cover.
+> Scattered into existing sprints (Option A from the 2026-05-14
+> review)._
+
+154. [ ] **`mdk env {list, check, diff}`** `[HIGH] [v0.8] [~2d]` — Slot: Sprint O. **Names + presence**, distinct from `mdk secrets` (values). `list` walks the project to find every env-var reference; `check` validates that all required vars are set in the current shell; `diff` compares local vs the deploy-target's resolved env. Onboarding-critical. Pairs with profiles + secrets but answers a different question.
+
+155. [ ] **`mdk fmt`** `[HIGH] [v0.8] [~2d]` — Slot: Sprint P. gofmt / prettier for `agent.yaml` + `prompt.md` + `movate.yaml`. Normalises YAML key order, prompt whitespace, dataset JSONL line breaks. Every mature dev ecosystem has one. Without it: every PR debates trivial style. With it: zero debate ever. Highest-leverage week-2 win.
+
+156. [ ] **`mdk demo`** `[HIGH] [v0.8] [~1d]` — Slot: Sprint P. One-command runnable demo project. Generates a working FAQ agent + dataset + eval baseline, ready to `mdk run` and `mdk eval`. Different from `mdk init` (which scaffolds an empty template). Sales / onboarding / "60-second hello world" use case.
+
+157. [ ] **`mdk replay <run-id>`** `[HIGH] [v0.8] [~2d]` — Slot: Sprint Q. Re-execute an agent with the **same input** recorded in a past RunRecord. Killer for deterministic prompt iteration — "did my prompt change improve yesterday's failing case?" Without replay, the operator has to reconstruct the input manually. Pairs with `mdk explain` for the full snapshot/diff/explain/replay loop.
+
+158. [ ] **`mdk costs report`** `[MED] [v0.8] [~1d]` — Slot: Sprint Q. Historical per-agent cost report from RunRecord data. "How much did each agent spend last month?" — top-3 ops question we don't currently answer. Data's already in storage; just needs the reporter. CLI table + `--json` for piping.
+
+159. [ ] **`mdk inspect agent <name>`** `[MED] [v0.8] [~1-2d]` — Slot: Sprint Q. Show the **resolved** AgentBundle — defaults from movate.yaml applied, schemas compiled, contexts prepended, skills resolved. Different from `mdk show` (raw YAML). Real-debugging surface: "what does the executor actually see for this agent?" Currently the operator has to read the YAML + cross-reference movate.yaml manually.
+
+160. [ ] **`mdk diff --git`** `[MED] [v0.8] [~½d]` — Slot: Sprint Q (extends PR #21 `mdk diff`). Diff working tree against last commit without needing an explicit snapshot. Cheap extension; massive UX win for the "did I introduce drift since my last commit?" question. Reuses existing diff infrastructure.
+
+161. [ ] **`mdk eval gen`** `[HIGH] [v0.9] [~3-4d]` — Slot: Sprint R. LLM-generates test cases from `agent.yaml` + a sample input. Lowers the #1 barrier to using evals: "I don't have a dataset." Output: `evals/dataset.generated.jsonl` for operator review + commit. Tracks generated-vs-curated distinction for honest scoring.
+
+**Decided NOT to add (2026-05-14):**
+* ~~`mdk budget`~~ — overlaps with existing `mdk tenants set-budget`. Project-scale budget = use `tenant_id="local"` with the existing mechanism. Parallel surface duplicates work without new leverage.
+* ~~`mdk costs forecast diff`~~ — niche extension over `mdk pricing` for one specific scenario (model swap). Fold into `pricing --vs-model X` later if the use case proves out. Standalone command doesn't earn its slot.
+
 #### K-est — Recommended pickup order (revised 2026-05-14 post external review)
 
 **Q3 2026 — Phase 1 / state cluster (the foundation; ship as a coordinated set):**
@@ -665,6 +692,207 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 * 153 — `mdk compose` (after Phase 7 lands)
 
 **Rationale for the revised order:** the state cluster (snapshot/diff/rollback/audit/migrate) IS the foundation per the North Star. Everything else slots in on top — `init --project` produces a snapshot, `doctor fix` operates on a snapshot, `promote` ships a snapshot. Without the cluster, every subsequent feature has to invent its own state model.
+
+---
+
+### Group L — Sprint phasing (2026-05-14)
+
+> _The full ~55-command MDK surface organised into 2-week sprints
+> with explicit dependencies + exit criteria. Bridges the
+> command-level granularity of Groups J + K into a sequenced multi-
+> month plan an engineering team can execute against._
+
+**Premise:** 2-week sprints × ~10 days of focused engineering each (1 engineer; 4 days lost per sprint to review / CI / docs / buffer). Parallelisation guidance per sprint.
+
+**Total: ~16 weeks for CLI surface (Sprints 1-6) + ~10 weeks for engine work (Sprints 7-8).**
+
+#### L-rollup — Sprint summary
+
+| Sprint | Theme | Items | Effort | Demo value | Cumulative cmds |
+|---|---|---|---|---|---|
+| **M** | Baseline (DONE) | 27 existing + 10 shipped this session + 4 J-phases in flight | — | Current arc | 41 |
+| **N** | State foundation | snapshot, diff, rollback, audit | 10d | "Terraform for AI" lands | 45 |
+| **O** | Env management | profiles, secrets, migrate, promote, **env** | 12d | Multi-env CI/CD promotion | 50 |
+| **P** | Onboarding polish | init --project, doctor fix, openapi, runbook, **fmt**, **demo** | 13d | "Zero to deployed in 5 min" | 56 |
+| **Q** | Observability polish | monitor, tune, explain v2, **replay**, **costs report**, **inspect**, **diff --git** | 13.5d | Ops-friendly debugging | 63 |
+| **R** | Interop & export | export oci-bundle, export langgraph, simulate, **eval gen** | 17d | "MDK compiles to anything" + eval rigor | 67 |
+| **S** | Production validation | benchmark live, audit v2, e2e CI smoke | 14d | Safe model upgrades | 60+ |
+| **T** | Memory architecture | memory engine + CLI | 4-5 weeks | Stateful agents | 61 |
+| **U** | Multi-agent (Phase 7) | LangGraph swap-in + compose | 4-5 weeks | Conditional / parallel / HITL | 62 |
+
+#### L-M — Sprint M baseline (done / in flight)
+
+**Pre-session on main (~21 commands):** `init, validate, eval, run, chat, bench, show, doctor, pricing, deploy, serve, worker, submit, jobs, auth, config, policy, tenants, trace, import, scaffold, skills, teams-bot, watch (file watcher)`
+
+**Shipped this session (10 PRs):** `add` (#5), `validate --project` + `eval --project` (#6), Safe-AI engine (#8), `list` (#9), reflection engine (#12), `guardrails` CLI (#13), `export json-schema` (#14), BACKLOG Groups J+K+L (#7, #10, #11, this PR)
+
+**In flight (Phase J-2 through J-5):** `explain <run-id>`, `plan --from`, `knowledge {add, list, query}`, Mova iO mapping doc
+
+#### L-N — Sprint N: State foundation (~10d)
+
+The North Star cluster. **Ships as a coordinated set** — items don't work alone.
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk snapshot {create, list, show}` | 3d | None | item 136 |
+| `mdk diff <snap-a> <snap-b>` | 2d | snapshot | item 137 |
+| `mdk rollback <snap-hash>` | 2d | snapshot | item 135 |
+| `mdk audit <snap-hash \| current>` | 3d | snapshot | item 133 |
+
+**Exit:** "Snapshot the green deploy, ship a new prompt, see eval regression, diff to confirm cause, rollback in one command."
+
+**Design lock-in:** snapshots are immutable + content-addressed (git-style) + live in `.movate/snapshots/` + tagged in git. Avoids Terraform-state pathologies.
+
+#### L-O — Sprint O: Env management (~12d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk profiles {use, list, show, create}` | 3d | None (refactors `MDK_TARGET` + `mdk config`) | item 139 |
+| `mdk secrets {set, get, rotate, sync}` | 4d | profiles | item 138 |
+| `mdk migrate` | 2d | snapshot | item 134 |
+| `mdk promote <snap> --to <profile>` | 2d | snapshot + profiles + eval | item 137a |
+| `mdk env {list, check, diff}` | 2d | None (distinct from secrets) | item 154 (added 2026-05-14) |
+
+**Exit:** "Dev → staging → prod promotion gated by `mdk eval` per hop, all secrets in Key Vault per profile, env vars verified per profile, snapshots immutable across the chain."
+
+**Risk:** `secrets` is the riskiest item — touches env loading + Key Vault + Bicep. If it slips, push to Sprint P and pull `mdk doctor fix` forward.
+
+**Addition note (2026-05-14):** `mdk env` added to answer the *names + presence* question (distinct from `secrets`, which manages *values*). "What env vars does my project need? Are they all set? Do they match the deploy target's?"
+
+#### L-P — Sprint P: Onboarding polish (~13d, bleeds 1-2d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk init --project` | 1d | snapshot (init produces an initial snapshot) | item 142 |
+| `mdk doctor fix --dry-run` (default) / `--apply` | 3d | Existing `doctor` | item 131 |
+| `mdk import openapi <spec>` | 4d | Existing `scaffold tool` + `skills` | item 132 |
+| `mdk docs runbook` | 2d | None | item 143 |
+| `mdk fmt` | 2d | None (gofmt-style for agent.yaml + prompt.md + movate.yaml) | item 155 (added 2026-05-14) |
+| `mdk demo` | 1d | Existing `mdk init` | item 156 (added 2026-05-14) |
+
+**Exit:** "`mdk init my-corp --project` → `mdk import openapi salesforce.json` → 12 skills scaffolded → `mdk add` an agent → `mdk fmt` normalises YAML/prompt style → `mdk doctor fix` resolves env gaps → deploy. Or `mdk demo` for a 60-second runnable example."
+
+**Addition note (2026-05-14):** `mdk fmt` and `mdk demo` added. The former is the gofmt/prettier analog every mature ecosystem ends up with; the latter closes the gap between `mdk init` (empty template) and "a working agent I can show a customer in 60 seconds." Both ship at low cost with outsized ergonomic / sales impact.
+
+#### L-Q — Sprint Q: Observability polish (~13.5d, bleeds 3-4d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk monitor` (was `watch --live`) | 3d | StorageProvider (have) | item 144 — **rename to disambiguate from existing `mdk watch`** |
+| `mdk tune --deterministic` | 2d | RunRecord history | item 145 — NO auto-prompt-engineering |
+| `mdk explain v2` (richer trail) | 3d | J-2 explain (Sprint M) | Adds guardrail + reflection + retry/fallback surfacing |
+| `mdk replay <run-id>` | 2d | RunRecord + Executor | item 157 (added 2026-05-14) |
+| `mdk costs report` | 1d | RunRecord history | item 158 (added 2026-05-14) |
+| `mdk inspect agent <name>` | 2d | AgentBundle loader | item 159 (added 2026-05-14) |
+| `mdk diff --git` | ½d | Existing `mdk diff` (PR #21) | item 160 (added 2026-05-14) — extends not replaces |
+
+**Exit:** "Production cost spike → `mdk monitor` shows live tokens/cost → `mdk tune` suggests max_tokens cap → `mdk explain <run>` shows which runs triggered the spike → `mdk replay <run>` re-tests with the same input after a prompt fix. `mdk costs report` answers 'spend per agent last month'. `mdk inspect` shows what the executor actually sees after defaults + contexts are applied."
+
+**Addition note (2026-05-14):** Four observability/debugging items added. `replay` closes the loop on the snapshot/diff/explain story — deterministic re-runs of past inputs. `costs report` answers a top-3 ops question over data we already capture. `inspect agent` distinguishes from `show` (raw YAML) — surfaces the *resolved* AgentBundle with defaults applied, schemas compiled, contexts prepended. `diff --git` makes `mdk diff` work without explicit snapshots — diff against last commit transparently.
+
+#### L-R — Sprint R: Interop & export (~17d, bleeds 5d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk export oci-bundle <agent>` | 5d | snapshot | item 148 |
+| `mdk export langgraph <agent>` | 7d | None (single-agent first) | item 146 — strategic ("MDK is the IDE") |
+| `mdk simulate <chatbot>` | 5d | Existing `chat` + executor | item 140 |
+| `mdk eval gen` | 3d | Existing executor + LLM | item 161 (added 2026-05-14) |
+
+**Exit:** "Compile any agent to LangGraph for compatibility; package any agent as OCI for any registry; stress-test any chatbot before production. Generate eval datasets from a sample input to lower the eval-adoption barrier."
+
+**Addition note (2026-05-14):** `mdk eval gen` added. Lowers the #1 barrier to using evals: "I don't have a dataset." LLM-generates test cases from agent.yaml + a sample input. Operator reviews + commits the generated dataset. Slot here (not earlier) because Sprint R is when ecosystem maturity makes eval rigor table stakes for customer deploys.
+
+#### L-S — Sprint S: Production validation (~14d, bleeds 4d)
+
+| Item | Effort | Dependencies | BACKLOG ref |
+|---|---|---|---|
+| `mdk benchmark live` (shadow traffic) | 8d | Async runtime (have) + RemoteExecutor (have) | item 141 |
+| `mdk audit v2` (deeper scanners) | 3d | snapshot | extends item 133 |
+| E2E CI smoke against staging | 3d | profiles + secrets | item 114 (Group I) |
+
+**Exit:** "Candidate gpt-5 model? `mdk benchmark live --shadow 1h` mirrors prod traffic, compares offline, shows latency/cost/accuracy deltas — zero customer impact."
+
+#### L-T — Sprint T: Memory architecture (4-5 weeks)
+
+Engine work, not CLI. CLI surface is ~5 days on top.
+
+**L-T-1 — engine (3 weeks):**
+* `MemoryStore` protocol
+* Three backends: session (in-memory), long-term (sqlite/postgres), vector (pgvector)
+* Summarisation policy (when to compress; what to retain)
+* `AgentSpec.memory` block + Executor integration
+
+**L-T-2 — CLI (~1 week):**
+* `mdk memory list <agent>`
+* `mdk memory evict <agent> --before <date>`
+* `mdk memory summarise <agent>`
+* `mdk memory query <agent> "..."`
+
+**Risk:** vector backend choice (pgvector vs Azure AI Search vs Qdrant) is the architectural pivot. Defer until forced. BACKLOG ref: item 152.
+
+#### L-U — Sprint U: Multi-agent (Phase 7) (4-5 weeks)
+
+Reuses Sprint R's `export langgraph` interface design.
+
+**L-U-1 — engine (3 weeks):**
+* Workflow IR maturity (conditional routing, parallel, HITL, checkpointing)
+* LangGraph compiler (`movate.core.workflow.compilers.langgraph`)
+* `runtime: langgraph` opt-in on workflow.yaml
+
+**L-U-2 — CLI (~1 week):**
+* `mdk compose <name>` — declarative multi-agent assembly
+* Updates to `mdk show <workflow>` for conditional graphs
+
+BACKLOG ref: item 153.
+
+#### L-deps — Sprint dependency graph
+
+```
+N (state) ──> O (env+migrate+promote) ──> R (export oci-bundle uses snapshot)
+                                       └──> S (benchmark live + audit v2)
+M (current) ──> P (onboarding) parallel to N+O
+            └──> Q (observability) parallel to N+O
+R (langgraph) ──> U (workflow Phase 7 reuses interface)
+T (memory) is independent — can start anytime after M
+```
+
+#### L-parallel — If you have more than one engineer
+
+| Engineers | Parallel split | Time savings |
+|---|---|---|
+| 1 | Strict serial N → U | — (baseline 32 weeks) |
+| 2 | P + Q parallel after O | ~3 weeks |
+| 3 | P + Q + R parallel after O | ~6 weeks |
+| 4+ | T (memory) starts day 1 in its own track | ~10 weeks |
+
+#### L-exit — Sprint exit criteria (what "demo-ready" means)
+
+* **After N:** "I can rollback safely."
+* **After O:** "I can promote dev→prod with eval gates."
+* **After P:** "I can onboard a new project in 5 minutes."
+* **After Q:** "I can debug production in real time."
+* **After R:** "MDK compiles to anything."
+* **After S:** "I can validate a model upgrade without customer impact."
+* **After T:** "MDK agents have memory."
+* **After U:** "MDK does conditional + parallel + HITL workflows."
+
+#### L-naming — Sequencing watchouts
+
+1. **`mdk monitor` rename is non-negotiable.** Existing `mdk watch` (file watcher for dev TDD loop) collides with item 144's `watch --live`. Decide naming in Q planning, not at implementation time. Recommendation: rename item 144 to `mdk monitor`.
+2. **`bench` vs `benchmark live` are different.** `bench` (existing) = offline dataset eval across models. `benchmark live` (S) = traffic-shadowing against prod. Document both clearly to avoid operator confusion.
+3. **`mdk logs` is a v0.4 stub.** The user-facing "what happened in this run?" command is `explain` (J-2, Sprint M), not `logs`. The latter is reserved for streaming-log-tail when that need surfaces.
+4. **Memory + compose (T-U) are engine work, not CLI.** Plan accordingly — the CLI is the easy week-1; the engine is the multi-week commitment.
+
+#### L-day1 — Concrete day-by-day for Sprint N (the next sprint after J-phases)
+
+```
+Day 1-3:  mdk snapshot {create, list, show, delete}   # the central primitive
+Day 4-5:  mdk diff <a> <b>                             # diff prompt/policy/eval/cost
+Day 6-7:  mdk rollback <hash>                          # ACA revision + local restore
+Day 8-10: mdk audit                                    # scanners + CI-friendly JSON
+Day 10:   PR + docs + demo loop
+```
 
 ---
 
