@@ -186,7 +186,10 @@ class TestBuildActions:
         )
         actions = build_actions(status)
         assert any(a.argv == ("validate",) for a in actions)
-        assert any(a.argv == ("run", "triage") for a in actions)
+        # Post-PR #102 the run action carries the dataset example as
+        # its third argv element (or literal '{}' when no dataset
+        # ships). The path /x doesn't exist so this falls back to '{}'.
+        assert any(a.argv[:2] == ("run", "triage") for a in actions)
 
     def test_missing_env_var_surfaces_secrets_set_action(self) -> None:
         status = _make_status(

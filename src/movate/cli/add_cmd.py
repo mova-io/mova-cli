@@ -831,7 +831,9 @@ def _prompt_next_step_for_agent(
     console.print("[bold]What next?[/bold]")
     for i, (label, cmd, _argv) in enumerate(actions, start=1):
         console.print(f"  [bold cyan][{i}][/bold cyan] {label}   [dim]{cmd}[/dim]")
-    console.print("  [bold cyan][s][/bold cyan] Skip   [dim]exit menu[/dim]")
+    # Escape the [s] — Rich treats bare `[s]` as a strikethrough tag.
+    # Backslash-escaping the opening bracket renders it as a literal.
+    console.print(r"  [bold cyan]\[s][/bold cyan] Skip   [dim]exit menu[/dim]")
     try:
         choice = Prompt.ask(
             "\n[bold]Pick[/bold]",

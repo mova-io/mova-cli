@@ -24,8 +24,34 @@ without prompting).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+
+def _first_agent_dataset_input(agent_dir: Path) -> str:
+    """Return a copy-pasteable example payload from the agent's first
+    eval-dataset row, or literal ``"{}"`` if no dataset ships.
+
+    Mirrors the helper :mod:`movate.cli.add_cmd` uses for its success
+    Panel — kept as a sibling here (rather than imported) so the menu
+    module stays free of CLI-layer dependencies. Same shape, same
+    fallback. Best-effort: any read / JSON error silently falls back.
+    """
+    dataset = agent_dir / "evals" / "dataset.jsonl"
+    if not dataset.is_file():
+        return "{}"
+    try:
+        first_line = dataset.read_text().splitlines()[0]
+        row = json.loads(first_line)
+        payload = row.get("input")
+        if payload is None:
+            return "{}"
+        return json.dumps(payload, separators=(",", ":"))
+    except (OSError, IndexError, json.JSONDecodeError):
+        return "{}"
+
 
 if TYPE_CHECKING:
     from movate.menu.status import WorkspaceStatus
@@ -110,15 +136,20 @@ def build_actions(status: WorkspaceStatus) -> list[Action]:
         )
 
     if status.has_agents:
-        # Suggest running the first agent as a concrete example.
+        # Suggest running the first agent with a real example payload
+        # from its evals/dataset.jsonl[0].input (same helper that
+        # `mdk add`'s success Panel uses). Falls back to literal '{}'
+        # when the agent ships without a dataset — the operator's still
+        # prompted to fill the input, but at least the command parses.
         first = status.agents[0]
+        example = _first_agent_dataset_input(first.path)
         actions.append(
             Action(
                 label=f"Run {first.name!r}",
-                command=f"mdk run {first.name} '{{}}'",
-                argv=("run", first.name),
+                command=f"mdk run {first.name} '{example}'",
+                argv=("run", first.name, example),
                 priority=30,
-                needs_user_input=True,  # user supplies input JSON
+                needs_user_input=example == "{}",  # only prompt if no real example
             )
         )
 
