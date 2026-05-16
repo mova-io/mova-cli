@@ -580,6 +580,7 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
                 base_url=base_url,
                 headers=headers,
                 agent_dir=agent_dir,
+                project_root=project_root,
             )
             if result is None:
                 uploaded.append(agent_dir.name)
@@ -604,12 +605,52 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
         raise typer.Exit(code=2)
 
 
+def _append_context_files(
+    files: list[tuple[str, tuple[str, bytes, str]]],
+    agent_yaml_bytes: bytes,
+    agent_dir: Path,
+    project_root: Path | None,
+) -> None:
+    """Resolve context names declared in agent.yaml and append them to files.
+
+    Two-tier resolution mirrors the local loader: agent-local
+    ``contexts/<name>.md`` overrides the project-level one. Files found
+    are appended as repeating ``contexts`` multipart fields so the
+    runtime stores them inside the agent dir, making the deployed bundle
+    self-contained without a shared volume.
+    """
+    try:
+        import yaml as _yaml  # noqa: PLC0415
+
+        raw_spec = _yaml.safe_load(agent_yaml_bytes)
+        context_names: list[str] = (
+            list(raw_spec.get("contexts") or []) if isinstance(raw_spec, dict) else []
+        )
+    except Exception:
+        context_names = []
+
+    for ctx_name in context_names:
+        candidates = [agent_dir / "contexts" / f"{ctx_name}.md"]
+        if project_root is not None:
+            candidates.append(project_root / "contexts" / f"{ctx_name}.md")
+        for candidate in candidates:
+            if candidate.is_file():
+                files.append(
+                    (
+                        "contexts",
+                        (f"contexts/{ctx_name}.md", candidate.read_bytes(), "text/markdown"),
+                    )
+                )
+                break
+
+
 def _upload_one_agent_bundle(
     *,
     client: object,  # httpx.Client; typed as object to avoid top-level httpx import
     base_url: str,
     headers: dict[str, str],
     agent_dir: Path,
+    project_root: Path | None = None,
 ) -> str | None:
     """Upload a single agent bundle via multipart POST /api/v1/agents.
 
@@ -688,6 +729,9 @@ def _upload_one_agent_bundle(
             )
         )
     _ = rewrote_paths  # accepted for future telemetry / debug log
+
+    # Context files — two-tier resolution mirrors the local loader.
+    _append_context_files(files, agent_yaml_bytes, agent_dir, project_root)
 
     # httpx requires the client to be typed precisely here; the
     # `client: object` parameter signature lets the outer function
