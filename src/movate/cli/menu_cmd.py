@@ -80,12 +80,16 @@ def _render_status(status: WorkspaceStatus) -> None:
 
 
 def _yaml_row(status: WorkspaceStatus) -> tuple[str, str]:
+    # Post-PR #85 "project.yaml" is the canonical config-file name;
+    # the WorkspaceStatus field name is historical (predates the
+    # rename). Render the canonical label so the menu doesn't say
+    # "movate.yaml" when the actual file is project.yaml.
     if status.has_movate_yaml:
         version = status.movate_yaml_version or "?"
-        return ("[green]✓[/green]", f"movate.yaml  [dim]({version})[/dim]")
+        return ("[green]✓[/green]", f"project.yaml  [dim]({version})[/dim]")
     return (
         "[red]✗[/red]",
-        "movate.yaml  [dim]not initialized — run [bold]mdk init --project[/bold][/dim]",
+        "project.yaml  [dim]not initialized — run [bold]mdk init <name>[/bold][/dim]",
     )
 
 

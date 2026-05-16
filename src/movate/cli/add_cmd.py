@@ -609,12 +609,17 @@ def _add_one(
     # legacy "scaffolded / Next steps" text is also suppressed.
     from movate.cli.init import _init_agent  # noqa: PLC0415
 
+    # Always pass quiet=True — `_add_one` renders its OWN Rich Panel
+    # below, which is the canonical `mdk add` output. The plain-text
+    # "scaffolded / Next steps" from `_init_agent` would duplicate
+    # (with WORSE next-steps: absolute paths + literal '{}' payload
+    # instead of dataset-pulled examples).
     _init_agent(
         name=agent_name,
         template=template,
         target=target_dir,
         force=force,
-        quiet=quiet,
+        quiet=True,
     )
 
     dest = (target_dir / agent_name).resolve()
@@ -716,12 +721,18 @@ def _add_one(
         body += f"[bold]Contexts:[/bold] [cyan]{ctx_str}[/cyan] (auto-scaffolded)\n"
     if validation_status is not None:
         body += f"[bold]Validates:[/bold] {validation_status}\n"
+    # Pull a real example payload from the agent's dataset.jsonl (if it
+    # ships one) so the operator can copy-paste rather than guess the
+    # input shape. Templates that ship without a dataset fall back to
+    # the literal '{...}' so the next-step still parses as a command.
+    example_payload = _first_dataset_input(dest)
+    rel = dest.relative_to(project_root)
     body += (
         f"\n[bold]Next steps:[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk run ./{dest.relative_to(project_root)} "
-        f"--mock '{{...}}'[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk eval ./{dest.relative_to(project_root)} "
-        f"--mock --gate 0.7[/bold]"
+        f"  [dim]$[/dim] [bold]mdk run ./{rel} --mock '{example_payload}'[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk eval ./{rel} --mock --gate 0.7[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk doctor agent {dest.name}[/bold] "
+        f"[dim]# verify wiring (skills/contexts resolve, schema parses)[/dim]"
     )
     console.print(
         Panel(
@@ -815,6 +826,36 @@ def _try_post_scaffold_validate(agent_dir: Path, *, skip: bool) -> str | None:
 # as a comment (not a parsed field) so AgentSpec's `extra="forbid"`
 # Pydantic config doesn't reject the marker at load time.
 _TEMPLATE_SOURCE_COMMENT_PREFIX = "# _template_source:"
+
+
+def _first_dataset_input(agent_dir: Path) -> str:
+    """Return a copy-pasteable example payload from the agent's first
+    eval-dataset row. Falls back to literal ``'{...}'`` when the agent
+    ships without a dataset.
+
+    Used by the success Panel's "Next steps" so operators see a real
+    payload shape instead of an opaque placeholder. ``mdk run --mock
+    '<payload>'`` becomes copy-paste-ready.
+
+    Best-effort: any read / JSON failure falls back silently. Never
+    raises — a malformed dataset shouldn't block the success Panel.
+    """
+    import json  # noqa: PLC0415
+
+    dataset = agent_dir / "evals" / "dataset.jsonl"
+    if not dataset.is_file():
+        return "{...}"
+    try:
+        first_line = dataset.read_text().splitlines()[0]
+        row = json.loads(first_line)
+        payload = row.get("input")
+        if payload is None:
+            return "{...}"
+        # Compact JSON (no spaces around separators) keeps the line
+        # short enough to fit in a Panel without wrapping.
+        return json.dumps(payload, separators=(",", ":"))
+    except (OSError, IndexError, json.JSONDecodeError):
+        return "{...}"
 
 
 def _stamp_template_source(agent_dir: Path, *, template: str) -> None:

@@ -273,6 +273,16 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     if failed:
         raise typer.Exit(code=2)
 
+    # All-pass success — close the loop by pointing at the natural
+    # next step in the demo flow. Operators who just ran `mdk validate`
+    # almost always want `mdk eval` next (or `mdk run` for one-shots).
+    # Silent on failure (the error path is the bigger signal).
+    if passed > 0:
+        console.print(
+            "\n[bold]Next:[/bold] [cyan]mdk eval --all --mock --gate 0.7[/cyan] "
+            "[dim](scores every agent against its dataset)[/dim]"
+        )
+
 
 def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     try:
