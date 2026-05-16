@@ -206,6 +206,9 @@ _MIGRATIONS = [
         "ON jobs(tenant_id, next_retry_at) "
         "WHERE status = 'queued' AND next_retry_at IS NOT NULL"
     ),
+    # v0.7.1: key expiry. NULL = no expiry (legacy keys keep working).
+    # New keys written by mint_api_key get a 90-day default.
+    "ALTER TABLE api_keys ADD COLUMN expires_at TEXT",
 ]
 
 
@@ -674,8 +677,8 @@ class SqliteProvider:
             """
             INSERT INTO api_keys (
                 key_id, tenant_id, env, secret_hash, salt, label,
-                created_at, last_used_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, last_used_at, revoked_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 key.key_id,
@@ -687,6 +690,7 @@ class SqliteProvider:
                 key.created_at.isoformat(),
                 key.last_used_at.isoformat() if key.last_used_at else None,
                 key.revoked_at.isoformat() if key.revoked_at else None,
+                key.expires_at.isoformat() if key.expires_at else None,
             ),
         )
         await self._db.commit()
@@ -911,16 +915,29 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
 
 
 def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
+    # expires_at may be absent on rows from pre-v0.7.1 schemas (before
+    # the ALTER TABLE migration ran). dict() access raises KeyError for
+    # missing columns; use .get() via the keys() approach instead.
+    row_dict = dict(row)
     return ApiKeyRecord(
-        key_id=row["key_id"],
-        tenant_id=row["tenant_id"],
-        env=ApiKeyEnv(row["env"]),
-        secret_hash=row["secret_hash"],
-        salt=row["salt"],
-        label=row["label"],
-        created_at=datetime.fromisoformat(row["created_at"]),
-        last_used_at=datetime.fromisoformat(row["last_used_at"]) if row["last_used_at"] else None,
-        revoked_at=datetime.fromisoformat(row["revoked_at"]) if row["revoked_at"] else None,
+        key_id=row_dict["key_id"],
+        tenant_id=row_dict["tenant_id"],
+        env=ApiKeyEnv(row_dict["env"]),
+        secret_hash=row_dict["secret_hash"],
+        salt=row_dict["salt"],
+        label=row_dict["label"],
+        created_at=datetime.fromisoformat(row_dict["created_at"]),
+        last_used_at=(
+            datetime.fromisoformat(row_dict["last_used_at"]) if row_dict["last_used_at"] else None
+        ),
+        revoked_at=(
+            datetime.fromisoformat(row_dict["revoked_at"]) if row_dict["revoked_at"] else None
+        ),
+        expires_at=(
+            datetime.fromisoformat(row_dict["expires_at"])
+            if row_dict.get("expires_at")
+            else None
+        ),
     )
 
 

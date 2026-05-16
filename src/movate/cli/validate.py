@@ -6,6 +6,9 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 
 from __future__ import annotations
 
+import json
+import os
+import re
 from pathlib import Path
 
 import typer
@@ -13,11 +16,12 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._completion import complete_agent_path
+from movate.cli._resolve import walk_up_for_project_root
 from movate.cli._workflow_path import is_workflow_path
-from movate.core.config import load_project_config
+from movate.core.config import PROJECT_MARKER_FILES, load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
-from movate.core.loader import AgentLoadError, load_agent
-from movate.core.models import AgentRuntime
+from movate.core.loader import AgentBundle, AgentLoadError, load_agent
+from movate.core.models import AgentRuntime, SkillImplementationKind, SkillSpec
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
@@ -97,6 +101,14 @@ def validate(
         "--no-lint",
         help="Skip the prompt linter (schema + policy checks still run).",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Emit a machine-readable JSON result instead of Rich output. "
+            "Useful for CI dashboards and scripts that parse validate output."
+        ),
+    ),
 ) -> None:
     """Validate ``agent.yaml`` (or ``workflow.yaml``) plus its references.
 
@@ -117,21 +129,19 @@ def validate(
                 "argument are mutually exclusive."
             )
             raise typer.Exit(code=2)
-        _validate_all(strict=strict, run_linter=not no_lint)
+        _validate_all(strict=strict, run_linter=not no_lint, json_output=json_output)
         return
 
     if path is None:
-        # Inside a project, no-args is unambiguous: the operator means
-        # "validate this project." Default to --all rather than nagging
-        # them to retype. Outside a project, the original error stands
-        # — we have nothing to sweep and need explicit input.
-        from movate.core.config import is_project_root  # noqa: PLC0415
-
-        if is_project_root(Path.cwd()):
+        # No path given → default to --all when inside a project (or any
+        # subdirectory of one). Walk up so `mdk validate` works from
+        # `agents/rag-qa/` just as well as from the project root.
+        if walk_up_for_project_root() is not None:
             console.print(
-                "[dim]no path given; defaulting to [bold]--all[/bold] (inside a project).[/dim]"
+                "[dim]no path given — defaulting to --all[/dim]",
+                highlight=False,
             )
-            _validate_all(strict=strict, run_linter=not no_lint)
+            _validate_all(strict=strict, run_linter=not no_lint, json_output=json_output)
             return
         console.print(
             "[red]✗[/red] not inside a movate project (no [bold]project.yaml[/bold] "
@@ -148,30 +158,27 @@ def validate(
     path = Path(resolve_agent_or_workflow_arg(str(path)))
 
     if is_workflow_path(path):
-        _validate_workflow(path)
+        if json_output:
+            try:
+                _validate_workflow(path)
+                console.print_json(json.dumps({"kind": "workflow", "name": path.name, "ok": True}))
+            except typer.Exit:
+                console.print_json(json.dumps({"kind": "workflow", "name": path.name, "ok": False}))
+                raise
+        else:
+            _validate_workflow(path)
+    elif json_output:
+        try:
+            _validate_agent(path, strict=strict, run_linter=not no_lint)
+            console.print_json(json.dumps({"kind": "agent", "name": path.name, "ok": True}))
+        except typer.Exit:
+            console.print_json(json.dumps({"kind": "agent", "name": path.name, "ok": False}))
+            raise
     else:
         _validate_agent(path, strict=strict, run_linter=not no_lint)
 
 
-def _resolve_project_root() -> Path | None:
-    """Walk up from cwd looking for ``movate.yaml`` — same convention
-    used by ``mdk add`` / ``mdk snapshot`` / ``mdk diff``.
-
-    Local to validate.py to avoid an import cycle through ``mdk add``
-    (which is the canonical owner of the walk-up routine).
-    """
-    from movate.core.config import is_project_root  # noqa: PLC0415
-
-    current = Path.cwd().resolve()
-    while True:
-        if is_project_root(current):
-            return current
-        if current.parent == current:
-            return None
-        current = current.parent
-
-
-def _validate_all(*, strict: bool, run_linter: bool) -> None:
+def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) -> None:
     """Validate every agent + workflow in the current project.
 
     Walks ``./agents/*/agent.yaml`` and ``./workflows/*/workflow.yaml``
@@ -185,7 +192,7 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     lets CI tail one stable token to learn workspace-level
     validation health.
     """
-    project_root = _resolve_project_root()
+    project_root = walk_up_for_project_root()
     if project_root is None:
         console.print(
             "[red]✗[/red] not inside a movate project. "
@@ -242,6 +249,34 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
             rows.append(("workflow", workflow_dir.name, "failed", ""))
             failed += 1
 
+    # Orphaned-asset scan: contexts + skills that exist on disk but
+    # aren't declared by any agent. Runs after per-agent validation so
+    # the operator sees both "your agent is broken" and "you also have
+    # unused files" in one pass. Skipped on total failure — if every
+    # agent failed to load we can't distinguish declared from orphaned.
+    if failed < len(rows):
+        _check_orphaned_assets(project_root, agent_dirs)
+
+    passed = len(rows) - failed
+
+    if json_output:
+        payload = {
+            "project": project_root.name,
+            "agents_total": len(agent_dirs),
+            "workflows_total": len(workflow_dirs),
+            "passed": passed,
+            "failed": failed,
+            "ok": failed == 0,
+            "items": [
+                {"kind": kind, "name": name, "ok": status == "ok"}
+                for kind, name, status, _ in rows
+            ],
+        }
+        console.print_json(json.dumps(payload))
+        if failed:
+            raise typer.Exit(code=2)
+        return
+
     # Render the summary table.
     table = Table(
         title=(
@@ -261,7 +296,6 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     console.print()
     console.print(table)
 
-    passed = len(rows) - failed
     console.print(
         f"[dim]mdk_validate_summary: "
         f"agents_total={len(agent_dirs)} "
@@ -315,6 +349,16 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
         bundle = load_agent(path)
     except AgentLoadError as exc:
         console.print(f"[red]✗ validation failed:[/red] {exc}")
+        if "contexts resolution failed" in str(exc):
+            console.print(
+                "[dim]  hint: run [bold]mdk add context <name>[/bold] "
+                "to create the missing context.[/dim]"
+            )
+        elif "skills resolution failed" in str(exc):
+            console.print(
+                "[dim]  hint: run [bold]mdk add skill <name>[/bold] "
+                "to scaffold the missing skill directory.[/dim]"
+            )
         raise typer.Exit(code=2) from None
 
     spec = bundle.spec
@@ -393,6 +437,86 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             )
             raise typer.Exit(code=2)
 
+    # HTTP / MCP skill backend advisory. Both backends are implemented
+    # but require external resources (a URL / a subprocess command) that
+    # can't be validated statically. Warn the operator so they know a
+    # runtime failure is possible and what to check.
+    for skill in bundle.skills:
+        impl = skill.spec.implementation
+        if impl.kind == SkillImplementationKind.HTTP:
+            console.print(
+                f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold] uses "
+                "[bold]kind: http[/bold] — endpoint reachability is checked at first use, not here."
+            )
+            if impl.auth and impl.auth.startswith("bearer-from-env:"):
+                env_var = impl.auth.split(":", 1)[1]
+                if not os.environ.get(env_var):
+                    console.print(
+                        f"    [yellow]![/yellow] env var [bold]{env_var}[/bold] is unset "
+                        f"— set it before running this agent."
+                    )
+        elif impl.kind == SkillImplementationKind.MCP:
+            console.print(
+                f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold] uses "
+                "[bold]kind: mcp[/bold] — subprocess availability is checked at "
+                "first use, not here."
+            )
+
+    # Python skill impl.py reachability. The loader validates skill.yaml
+    # via SkillSpec but never imports the module — a missing impl.py
+    # only surfaces as ModuleNotFoundError on the first call. Catch it
+    # here so the operator learns at validate time, not at runtime.
+    for skill in bundle.skills:
+        if (
+            skill.spec.implementation.kind == SkillImplementationKind.PYTHON
+            and not (skill.skill_dir / "impl.py").is_file()
+        ):
+                console.print(
+                    f"  [red]✗[/red] skill [bold]{skill.spec.name!r}[/bold]: "
+                    f"[bold]impl.py[/bold] not found in [dim]{skill.skill_dir}[/dim] — "
+                    "skill will raise ModuleNotFoundError at runtime."
+                )
+                console.print(
+                    "    [dim]hint: create [bold]impl.py[/bold] with an async "
+                    "[bold]run(input, ctx)[/bold] function, or use "
+                    "[bold]mdk add <template>[/bold] to scaffold one.[/dim]"
+                )
+                raise typer.Exit(code=2)
+
+    _check_kb_corpus(bundle)
+
+    # Context size + content advisory. Contexts are prepended to the system
+    # prompt on every call; empty or very large contexts are likely mistakes.
+    for ctx_name, ctx_body in bundle.contexts:
+        if not ctx_body.strip():
+            console.print(
+                f"  [yellow]![/yellow] context [bold]{ctx_name!r}[/bold] is empty — "
+                "it contributes nothing to the system prompt. "
+                f"[dim]hint: populate [bold]contexts/{ctx_name}.md[/bold] "
+                "or remove the declaration.[/dim]"
+            )
+            continue
+        size = len(ctx_body.encode())
+        if size >= _CTX_ERROR_BYTES:
+            console.print(
+                f"  [red]✗[/red] context [bold]{ctx_name!r}[/bold] is "
+                f"{size:,} bytes — exceeds the {_CTX_ERROR_BYTES:,}-byte limit. "
+                "Trim it or split into multiple narrower contexts."
+            )
+            raise typer.Exit(code=2)
+        if size >= _CTX_ADVISORY_BYTES:
+            console.print(
+                f"  [yellow]![/yellow] context [bold]{ctx_name!r}[/bold] is "
+                f"{size:,} bytes — large contexts inflate token spend on every call."
+            )
+
+    # Dataset JSONL validation — catches truncated / malformed lines
+    # before they silently zero the eval run.
+    if bundle.spec.evals.dataset:
+        dataset_path = bundle.agent_dir / bundle.spec.evals.dataset
+        if dataset_path.is_file():
+            _check_dataset_jsonl(dataset_path)
+
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
     # the operator sees lint findings even when the schema check
@@ -418,8 +542,10 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     # empty dataset. The estimate_eval_cost helper returns None in
     # every "skip" case so this stays a single conditional.
     try:
-        forecast = estimate_eval_cost(bundle, pricing=load_pricing())
+        pricing = load_pricing()
+        forecast = estimate_eval_cost(bundle, pricing=pricing)
     except Exception:  # pragma: no cover — defensive; load_pricing rarely fails
+        pricing = None
         forecast = None
     if forecast is not None:
         console.print(
@@ -428,6 +554,17 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             f"~{forecast.input_tokens_per_call} in + "
             f"~{forecast.output_tokens_per_call} out tokens)[/dim]"
         )
+    elif pricing is not None and bundle.spec.evals.dataset:
+        # Dataset is configured but we couldn't produce a forecast.
+        # Most common cause: the model isn't in the pricing table.
+        # Let the operator know rather than staying silent.
+        model_provider = bundle.spec.model.provider
+        if model_provider not in pricing.models:
+            console.print(
+                f"  [yellow]![/yellow] eval cost: no pricing entry for "
+                f"[bold]{model_provider!r}[/bold] — add it to "
+                "providers/pricing.yaml for a forecast."
+            )
 
     # Exit non-zero if there are real errors (always) or warnings
     # under --strict (CI gate mode).
@@ -435,6 +572,222 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     has_warnings = any(i.severity == "warning" for i in lint_issues)
     if has_errors or (strict and has_warnings):
         raise typer.Exit(code=2)
+
+
+def _check_dataset_jsonl(path: Path) -> None:
+    """Validate that every non-blank line in a dataset JSONL file is a
+    parseable JSON object with at least an ``input`` key.
+
+    Malformed lines cause ``mdk eval`` to skip or crash that case at
+    eval time — better to surface them here when validate runs.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(
+            f"  [yellow]![/yellow] dataset [bold]{path.name}[/bold] "
+            f"unreadable: {exc}"
+        )
+        return
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        console.print(
+            f"  [yellow]![/yellow] dataset [bold]{path.name}[/bold] is empty — "
+            "no eval cases will run."
+        )
+        return
+    for i, line in enumerate(lines, start=1):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            console.print(
+                f"  [red]✗[/red] dataset [bold]{path.name}:{i}[/bold] "
+                f"invalid JSON: {exc}"
+            )
+            raise typer.Exit(code=2) from None
+        if not isinstance(obj, dict):
+            console.print(
+                f"  [red]✗[/red] dataset [bold]{path.name}:{i}[/bold] "
+                f"must be a JSON object, got {type(obj).__name__}"
+            )
+            raise typer.Exit(code=2)
+        if "input" not in obj:
+            console.print(
+                f"  [yellow]![/yellow] dataset [bold]{path.name}:{i}[/bold] "
+                "missing [bold]'input'[/bold] key — this case will be skipped by mdk eval."
+            )
+
+
+def _find_project_root_from_bundle(bundle: AgentBundle) -> Path | None:
+    """Walk up from bundle.agent_dir to find the project root."""
+    for parent in (bundle.agent_dir, *bundle.agent_dir.parents):
+        if any((parent / m).is_file() for m in PROJECT_MARKER_FILES):
+            return parent
+    return None
+
+
+def _check_kb_corpus(bundle: AgentBundle) -> None:
+    """Warn when a kb-lookup skill is declared but the project corpus is missing
+    or contains entries that lack required fields.
+
+    Two checks:
+    1. File absent → skill falls back to demo corpus silently.
+    2. File present but entries missing ``id``/``title``/``resolution`` → skill
+       raises KeyError or returns empty matches at eval/run time.
+    """
+    import json as _json  # noqa: PLC0415
+
+    kb_skills = [s for s in bundle.skills if "kb" in s.spec.name.lower()]
+    if not kb_skills:
+        return
+    project_root = _find_project_root_from_bundle(bundle)
+    if project_root is None:
+        return
+    corpus_path = project_root / "kb" / "kb-lookup-corpus.json"
+    if not corpus_path.is_file():
+        for skill in kb_skills:
+            console.print(
+                f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold]: "
+                f"[bold]kb/kb-lookup-corpus.json[/bold] not found — "
+                "skill will use the bundled demo corpus at runtime."
+            )
+        console.print(
+            f"    [dim]hint: drop your real corpus at "
+            f"[bold]{corpus_path}[/bold][/dim]"
+        )
+        return
+
+    # Corpus exists — validate entry fields.
+    try:
+        entries = _json.loads(corpus_path.read_text())
+    except (OSError, _json.JSONDecodeError) as exc:
+        console.print(
+            f"  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            f"could not be parsed: {exc}"
+        )
+        return
+    if not isinstance(entries, list):
+        console.print(
+            "  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            "must be a JSON array."
+        )
+        return
+    bad: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            bad.append("<non-object entry>")
+            continue
+        missing = _CORPUS_REQUIRED_FIELDS - entry.keys()
+        if missing:
+            entry_id = entry.get("id", "<no-id>")
+            bad.append(f"{entry_id!r} (missing: {sorted(missing)})")
+        if len(bad) >= _CORPUS_MAX_REPORTED_ERRORS:
+            break  # cap output — rest of corpus may also have issues
+    if bad:
+        console.print(
+            f"  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            f"has entries missing required fields "
+            f"({', '.join(sorted(_CORPUS_REQUIRED_FIELDS))}):"
+        )
+        for label in bad:
+            console.print(f"    [dim]·[/dim] {label}")
+        if len(entries) > _CORPUS_MAX_REPORTED_ERRORS:
+            console.print(
+                f"    [dim]… and possibly more "
+                f"(checked first {_CORPUS_MAX_REPORTED_ERRORS} offenders)[/dim]"
+            )
+
+
+_CTX_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+# Context size thresholds. Contexts are prepended to the system prompt
+# on every call — large ones silently eat token budget. The advisory
+# fires at 4 KB (noticeable cost impact), the error at 16 KB (more
+# than a typical system prompt itself; almost certainly a mistake).
+_CTX_ADVISORY_BYTES: int = 4_096
+_CTX_ERROR_BYTES: int = 16_384
+
+# Minimum required fields in a KB corpus entry. The kb-lookup skill
+# uses all three for scoring + response construction; missing any one
+# causes a KeyError or empty-match at eval/run time.
+_CORPUS_REQUIRED_FIELDS: frozenset[str] = frozenset({"id", "title", "resolution"})
+_CORPUS_MAX_REPORTED_ERRORS: int = 3
+
+
+def _check_orphaned_assets(project_root: Path, agent_dirs: list[Path]) -> None:
+    """Warn about contexts and skills that exist on disk but no agent declares.
+
+    An orphaned asset isn't an error — it could be staged for future use.
+    But it's the most common source of "I added the file and nothing changed"
+    confusion, so surfacing it at validate time closes the feedback loop.
+    """
+    # Collect all declared names across every loadable agent.
+    declared_contexts: set[str] = set()
+    declared_skills: set[str] = set()
+    for agent_dir in agent_dirs:
+        try:
+            b = load_agent(agent_dir)
+            declared_contexts.update(b.spec.contexts or [])
+            declared_skills.update(s.spec.name for s in b.skills)
+        except AgentLoadError:
+            pass  # already reported by per-agent validation
+
+    # Orphaned contexts: files in contexts/ not declared by any agent.
+    # Skip README / documentation files (stem contains uppercase or
+    # doesn't follow the lowercase-hyphen context naming convention).
+    ctx_dir = project_root / "contexts"
+    if ctx_dir.is_dir():
+        orphaned = sorted(
+            f for f in ctx_dir.glob("*.md")
+            if _CTX_NAME_RE.match(f.stem) and f.stem not in declared_contexts
+        )
+        for f in orphaned:
+            console.print(
+                f"  [yellow]![/yellow] [bold]contexts/{f.name}[/bold] exists but "
+                "is not declared by any agent."
+            )
+            console.print(
+                f"    [dim]hint: add [bold]{f.stem!r}[/bold] to "
+                "[bold]agent.yaml: contexts:[/bold], or run "
+                "[bold]mdk add context[/bold] to scaffold a declaration.[/dim]"
+            )
+
+    # Orphaned skills: directories in skills/ not declared by any agent.
+    # Also validates skill.yaml against SkillSpec so malformed orphan
+    # skills are caught before someone declares them in agent.yaml.
+    skills_dir = project_root / "skills"
+    if skills_dir.is_dir():
+        for skill_dir in sorted(skills_dir.iterdir()):
+            if not skill_dir.is_dir() or not (skill_dir / "skill.yaml").is_file():
+                continue
+            try:
+                import yaml as _yaml  # noqa: PLC0415
+                from pydantic import ValidationError as _PydanticVE  # noqa: PLC0415
+
+                raw = _yaml.safe_load((skill_dir / "skill.yaml").read_text())
+                try:
+                    parsed_spec = SkillSpec.model_validate(raw) if isinstance(raw, dict) else None
+                    skill_name = parsed_spec.name if parsed_spec else skill_dir.name
+                except _PydanticVE as ve:
+                    # Malformed skill.yaml — emit an error regardless of
+                    # whether the skill is declared, since declaring a broken
+                    # skill causes an AgentLoadError anyway.
+                    console.print(
+                        f"  [red]✗[/red] [bold]skills/{skill_dir.name}/skill.yaml[/bold] "
+                        f"failed SkillSpec validation: {ve}"
+                    )
+                    continue
+            except Exception:
+                skill_name = skill_dir.name
+            if skill_name not in declared_skills:
+                console.print(
+                    f"  [yellow]![/yellow] skill [bold]{skill_name!r}[/bold] is registered "
+                    "but not declared by any agent."
+                )
+                console.print(
+                    f"    [dim]hint: add [bold]{skill_name!r}[/bold] to "
+                    "[bold]agent.yaml: skills:[/bold] to use it.[/dim]"
+                )
 
 
 def _render_lint_issues(issues: list[LintIssue]) -> None:

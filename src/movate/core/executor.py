@@ -1,6 +1,6 @@
-"""Linear single-agent executor.
+"""Single-agent executor.
 
-Pipeline (v0.1):
+Pipeline:
 
     validate input
         → render prompt
@@ -8,7 +8,7 @@ Pipeline (v0.1):
         → validate output
         → record metrics + persist
 
-Workflow orchestration is Phase 3 (`movate.core.workflow`).
+Workflow orchestration lives in ``movate.core.workflow``.
 """
 
 from __future__ import annotations
@@ -130,6 +130,7 @@ class Executor:
         on_token: Callable[[str], None] | None = None,
         history: list[Message] | None = None,
         tenant_id_override: str | None = None,
+        skill_fixture: dict[str, Any] | None = None,
     ) -> RunResponse:
         """Execute one agent against one input.
 
@@ -304,6 +305,7 @@ class Executor:
                         tool_specs=tool_specs,
                         run_id=run_id,
                         tenant_id=tenant_id,
+                        skill_fixture=skill_fixture,
                     )
                     chosen_provider = provider_str
                     break
@@ -484,6 +486,7 @@ class Executor:
         tool_specs: list[dict[str, Any]] | None,
         run_id: str,
         tenant_id: str,
+        skill_fixture: dict[str, Any] | None = None,
     ) -> tuple[CompletionResponse, float]:
         """Drive the tool-use loop for one provider in the fallback chain.
 
@@ -612,6 +615,16 @@ class Executor:
                     message=(f"unknown tool {tool_name!r}; available: {sorted(skill_index)}"),
                 )
                 tool_result_content = json.dumps({"error": err.type.value, "message": err.message})
+            elif skill_fixture is not None and tool_name in skill_fixture:
+                # Fixture short-circuit: eval dataset provided a canned
+                # response for this skill. Return it immediately without
+                # any real network/python dispatch. Cost stays zero —
+                # fixtures are deterministic stand-ins, not real calls.
+                tool_result_content = json.dumps(skill_fixture[tool_name])
+                self._tracer.log_event(
+                    span,
+                    {"skill_fixture_used": tool_name, "turn": turns_taken},
+                )
             else:
                 # Effective per-call budget is skill override OR agent
                 # inheritance (ADR 002 D3).

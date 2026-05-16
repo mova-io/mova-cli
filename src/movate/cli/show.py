@@ -27,13 +27,37 @@ console = Console()
 
 
 def show(
-    path: Path = typer.Argument(
-        ...,
-        help="Path to an agent, workflow, or skill directory.",
+    path: Path | None = typer.Argument(
+        None,
+        help=(
+            "Path to an agent, workflow, or skill directory. "
+            "Omit with [bold]--project[/bold] for a project-wide asset map."
+        ),
         shell_complete=complete_agent_path,
     ),
+    project: bool = typer.Option(
+        False,
+        "--project",
+        help=(
+            "Show a project-wide asset map: contexts, skills, and KB files "
+            "with which agents declare each one."
+        ),
+    ),
 ) -> None:
-    """Show the resolved spec for an agent, workflow, or skill."""
+    """Show the resolved spec for an agent, workflow, or skill.
+
+    Pass [bold]--project[/bold] to get a full map of every context, skill,
+    and KB file in the project and which agents declare each one.
+    """
+    if project:
+        _show_project()
+        return
+    if path is None:
+        console.print(
+            "[red]✗[/red] provide a path argument or pass [bold]--project[/bold] "
+            "for the project-wide asset map."
+        )
+        raise typer.Exit(code=2)
     # Dispatch by what file the directory contains. Order matters —
     # workflows have their own ``workflow.yaml``; skills have
     # ``skill.yaml``; agents have ``agent.yaml``. Each is mutually
@@ -44,6 +68,125 @@ def show(
         _show_skill(path)
     else:
         _show_agent(path)
+
+
+# ---------------------------------------------------------------------------
+# Project-wide asset map
+# ---------------------------------------------------------------------------
+
+
+def _show_project() -> None:  # noqa: PLR0912 — three independent asset tables
+    """Render a project-wide map: which agents declare each context/skill/KB file."""
+    import yaml  # noqa: PLC0415
+
+    from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
+
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        console.print(
+            "[red]✗[/red] not inside a movate project (no project.yaml / policy.yaml "
+            "/ movate.yaml up the tree)."
+        )
+        raise typer.Exit(code=2)
+
+    agent_dirs = (
+        sorted(p.parent for p in (project_root / "agents").glob("*/agent.yaml"))
+        if (project_root / "agents").is_dir()
+        else []
+    )
+
+    # Collect declared items per agent. Maps: name → list[agent_name].
+    contexts_map: dict[str, list[str]] = {}
+    skills_map: dict[str, list[str]] = {}
+
+    for agent_dir in agent_dirs:
+        try:
+            raw = yaml.safe_load((agent_dir / "agent.yaml").read_text())
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        for ctx in raw.get("contexts") or []:
+            contexts_map.setdefault(ctx, []).append(agent_dir.name)
+        for skill in raw.get("skills") or []:
+            skills_map.setdefault(skill, []).append(agent_dir.name)
+
+    console.print(
+        f"\n[bold]Project asset map — {project_root.name}[/bold]\n"
+    )
+
+    # Contexts table.
+    ctx_table = Table(title="Contexts", show_header=True, header_style="bold")
+    ctx_table.add_column("Name", no_wrap=True)
+    ctx_table.add_column("Size", no_wrap=True, justify="right")
+    ctx_table.add_column("Declared by")
+
+    ctx_root = project_root / "contexts"
+    ctx_files = sorted(ctx_root.glob("*.md")) if ctx_root.is_dir() else []
+    for ctx_file in ctx_files:
+        size = ctx_file.stat().st_size
+        agents_using = contexts_map.get(ctx_file.stem, [])
+        ctx_table.add_row(
+            ctx_file.name,
+            f"{size:,} B",
+            ", ".join(agents_using) if agents_using else "[dim]orphaned[/dim]",
+        )
+    if not ctx_files:
+        ctx_table.add_row("[dim]none[/dim]", "", "")
+    console.print(ctx_table)
+
+    # Skills table.
+    skill_table = Table(title="Skills", show_header=True, header_style="bold")
+    skill_table.add_column("Name", no_wrap=True)
+    skill_table.add_column("Kind", no_wrap=True)
+    skill_table.add_column("Declared by")
+
+    skills_root = project_root / "skills"
+    skill_dirs = (
+        [d for d in sorted(skills_root.iterdir()) if d.is_dir() and (d / "skill.yaml").is_file()]
+        if skills_root.is_dir()
+        else []
+    )
+    for skill_dir in skill_dirs:
+        try:
+            raw_skill = yaml.safe_load((skill_dir / "skill.yaml").read_text())
+            kind = (raw_skill.get("implementation") or {}).get("kind", "?")
+        except Exception:
+            kind = "?"
+        agents_using = skills_map.get(skill_dir.name, [])
+        skill_table.add_row(
+            skill_dir.name,
+            kind,
+            ", ".join(agents_using) if agents_using else "[dim]orphaned[/dim]",
+        )
+    if not skill_dirs:
+        skill_table.add_row("[dim]none[/dim]", "", "")
+    console.print(skill_table)
+
+    # KB files table.
+    kb_table = Table(title="KB Files", show_header=True, header_style="bold")
+    kb_table.add_column("File", no_wrap=True)
+    kb_table.add_column("Entries", no_wrap=True, justify="right")
+    kb_table.add_column("Used by agents with kb-lookup")
+
+    kb_root = project_root / "kb"
+    kb_files = sorted(kb_root.glob("*.json")) if kb_root.is_dir() else []
+    kb_agents = [a for a in skills_map.get("kb-lookup", [])]
+    for kb_file in kb_files:
+        try:
+            import json as _json  # noqa: PLC0415
+            data = _json.loads(kb_file.read_text())
+            entry_count = str(len(data)) if isinstance(data, list) else "?"
+        except Exception:
+            entry_count = "?"
+        kb_table.add_row(
+            kb_file.name,
+            entry_count,
+            ", ".join(kb_agents) if kb_agents else "[dim]none[/dim]",
+        )
+    if not kb_files:
+        kb_table.add_row("[dim]none[/dim]", "", "")
+    console.print(kb_table)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +288,12 @@ def _add_marketplace_metadata_rows(table: Table, spec: AgentSpec) -> None:
         table.add_row("persona", spec.persona)
     if spec.capabilities:
         table.add_row("capabilities", ", ".join(spec.capabilities))
+    if spec.role or spec.persona or spec.capabilities:
+        table.add_row(
+            "",
+            "[dim]roles/persona/capabilities are catalog discovery metadata; "
+            "execution routing is not implemented[/dim]",
+        )
 
 
 def _render_schema_ref(ref: str | dict[str, object]) -> str:

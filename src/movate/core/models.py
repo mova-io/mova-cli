@@ -2,14 +2,6 @@
 
 Includes the agent specification (parsed from agent.yaml), request/response
 contracts, and persisted records.
-
-v0.1 deliberately drops MDK fields that belong to later phases:
-
-  * ``workflow`` (Phase 3 — sequential workflows)
-  * ``skills``   (Phase 7 — skills/tools)
-  * ``tools``    (Phase 7 — tools)
-
-They will be re-added with proper validation when their phase ships.
 """
 
 from __future__ import annotations
@@ -310,21 +302,22 @@ class AgentRuntime(StrEnum):
       SDK directly. Unlocks tool-use, computer-use, prompt caching,
       thinking blocks, vision, and the MCP-server ecosystem. The
       agent's ``model.provider`` is a bare Anthropic model id
-      (``claude-sonnet-4-6``). [v0.6 — not yet wired.]
+      (``claude-sonnet-4-6``). Requires ``movate-cli[anthropic]``.
 
     * ``native_openai`` — calls the official ``openai`` Python SDK
       directly. Unlocks Assistants API, strict structured outputs
       via ``response_format``, vision-with-tools, parallel
       function-calling. The agent's ``model.provider`` is a bare
-      OpenAI model id (``gpt-4o-mini-2024-07-18``). [v0.6 — not yet
-      wired.]
+      OpenAI model id (``gpt-4o-mini-2024-07-18``). Requires
+      ``movate-cli[openai]``.
 
     * ``langchain`` — the agent's ``model.provider`` is an import
       path to a Python entry-point returning a LangChain
       ``Runnable``; movate invokes it with the validated input.
       Unlocks LCEL composition, LangSmith tracing, and any other
       LangChain feature inside a movate-managed shell (auth,
-      persistence, deploy, eval). [v0.6 — not yet wired.]
+      persistence, deploy, eval). Requires
+      ``movate-cli[langchain]``.
 
     * ``lyzr`` — invokes a Lyzr-hosted agent via Lyzr Studio's HTTP
       inference API. The agent's ``model.provider`` is
@@ -655,7 +648,9 @@ class AgentSpec(BaseModel):
         description=(
             "Job category this agent fills, as a short noun phrase. "
             "Example: 'support-triage', 'data-analyst', 'returns-processor'. "
-            "Used by the marketplace for grouping + filtering."
+            "Used by the marketplace for grouping + filtering. "
+            "Execution-semantic: none — role-based routing is not implemented; "
+            "this field is catalog metadata only."
         ),
     )
     capabilities: list[str] = Field(
@@ -666,7 +661,7 @@ class AgentSpec(BaseModel):
             "Each entry must be lowercase alphanumeric with hyphens "
             "(matches tag rules). Used by the marketplace as search "
             "facets; complements free-form `tags` (which can be any "
-            "string)."
+            "string). Execution-semantic: none — catalog metadata only."
         ),
     )
 
@@ -1290,6 +1285,9 @@ class ApiKeyRecord(BaseModel):
     """Updated async on every successful verify; useful for "stale key" cleanup."""
     revoked_at: datetime | None = None
     """Set by ``movate auth revoke <key-id>``. ``None`` = active."""
+    expires_at: datetime | None = None
+    """UTC expiry. None = no expiry (legacy keys minted before v0.7.1).
+    New keys default to 90 days from mint time via :func:`movate.core.auth.mint_api_key`."""
 
 
 # Forward ref resolution

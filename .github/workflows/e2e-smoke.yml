@@ -24,6 +24,9 @@
 name: e2e-smoke
 
 on:
+  # Every merge to main — the earliest signal that a bad deploy broke staging.
+  push:
+    branches: [main]
   # Nightly @ 03:00 UTC — well after typical deploy windows so we
   # smoke the post-deploy state, not the in-flight state.
   schedule:

@@ -73,7 +73,24 @@ def resolve_kb_file(name: str, *, start: Path | None = None) -> Path | None:
     # Walk up from `base` including base itself — the project marker
     # might be at the starting directory (rare but possible when a
     # skill is invoked from the project root in tests).
+    #
+    # Two-tier resolution order:
+    # 1. Agent-local: <agent_dir>/kb/<name> — populated by `mdk deploy`
+    #    when it bundles the project's kb/ alongside the agent. An agent
+    #    boundary is detected by the presence of agent.yaml (same file
+    #    the loader requires). When found, we check for the kb file but
+    #    keep walking so the project-root tier can still win if the
+    #    agent-local kb/ is absent (e.g. during local dev where skills
+    #    live at <project>/skills/, not inside an agent dir).
+    # 2. Project root: <project_root>/kb/<name> — the canonical local-dev
+    #    location; found via the PROJECT_MARKER_FILES walk.
     for parent in (base, *base.parents):
+        if (parent / "agent.yaml").is_file():
+            agent_kb = parent / "kb" / name
+            if agent_kb.is_file():
+                return agent_kb
+            # Found agent boundary but kb/<name> absent; keep walking
+            # so the project-root tier can still resolve it.
         if any((parent / marker).is_file() for marker in PROJECT_MARKER_FILES):
             kb_file = parent / "kb" / name
             return kb_file if kb_file.is_file() else None

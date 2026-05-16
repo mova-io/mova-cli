@@ -24,6 +24,11 @@ model:
 
 prompt: ./prompt.md
 
+# BANT scoring rubric — dimension definitions, composite tiers, and
+# next-action rules. Scaffolded to `<project>/contexts/bant-rubric.md`.
+contexts:
+  - bant-rubric
+
 schema:
   # Shorthand YAML — human-readable; compiled to JSON Schema at load
   # time (ranges/enums/refs in one line each). Legacy ./schema/*.json

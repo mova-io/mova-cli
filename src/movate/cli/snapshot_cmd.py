@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from movate.cli._resolve import walk_up_for_project_root
 from movate.snapshot import (
     SnapshotNotFoundError,
     SnapshotStoreError,
@@ -49,31 +50,14 @@ snapshot_app = typer.Typer(
 
 
 def _resolve_project_root(explicit: Path | None) -> Path:
-    """Resolve the project root from ``--project`` or walk-up.
-
-    Mirrors the pattern :mod:`movate.cli.add` uses — explicit flag
-    wins; otherwise walk up from cwd for ``movate.yaml``; otherwise
-    use cwd. Keeps the surface ergonomic for the common case where
-    the operator already cd'd into the project.
-    """
     if explicit is not None:
         if not explicit.is_dir():
             err_console.print(f"[red]✗[/red] --project path is not a directory: {explicit}")
             raise typer.Exit(code=2)
         return explicit.resolve()
-    from movate.core.config import is_project_root  # noqa: PLC0415
-
-    current = Path.cwd().resolve()
-    while True:
-        if is_project_root(current):
-            return current
-        if current.parent == current:
-            break
-        current = current.parent
-    # Fall back to cwd with a soft warning rather than blocking — a
-    # fresh project that hasn't been `mdk init`'d yet should still be
-    # snapshot-able.
-    return Path.cwd().resolve()
+    # Fall back to cwd — a fresh project that hasn't been `mdk init`'d
+    # yet should still be snapshot-able.
+    return walk_up_for_project_root() or Path.cwd().resolve()
 
 
 # ---------------------------------------------------------------------------

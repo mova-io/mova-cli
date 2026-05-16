@@ -437,6 +437,97 @@ def scan_schema_no_required(agent_dir: Path, agent_name: str) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
+# Scanner: kb-lookup skill declared but no corpus
+# ---------------------------------------------------------------------------
+
+
+@register("missing-kb-corpus")
+def scan_missing_kb_corpus(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """Agent declares the kb-lookup skill but no kb corpus exists.
+
+    The kb-lookup skill silently falls back to its bundled demo corpus
+    when ``kb/kb-lookup-corpus.json`` is absent. Operators often don't
+    notice until they wonder why answers reference "demo" tickets.
+    """
+    raw = _load_agent_yaml(agent_dir)
+    if raw is None:
+        return []
+    if "kb-lookup" not in (raw.get("skills") or []):
+        return []
+    # Walk up to find project root and check kb/ there; also check
+    # agent-local kb/ (deployed-runtime layout).
+    for candidate in (agent_dir / "kb", agent_dir.parent.parent / "kb"):
+        corpus = candidate / "kb-lookup-corpus.json"
+        if corpus.is_file():
+            return []
+    return [
+        Finding(
+            category="missing-kb-corpus",
+            severity=Severity.WARNING,
+            target=agent_name,
+            message=(
+                "declares `kb-lookup` skill but no `kb/kb-lookup-corpus.json` found — "
+                "skill will use the bundled demo corpus"
+            ),
+            hint="run `mdk add kb` to scaffold a real corpus, then populate it",
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Scanner: declared context is oversized
+# ---------------------------------------------------------------------------
+
+_LARGE_CONTEXT_BYTES = 4_096
+
+
+@register("large-context")
+def scan_large_context(agent_dir: Path, agent_name: str) -> list[Finding]:
+    """A declared context file is larger than the advisory threshold.
+
+    Contexts are prepended to the system prompt on every call. At
+    > 4 KB they inflate token spend by a measurable fraction. Warning
+    (not error) — operators sometimes legitimately ship large rubrics.
+    """
+    raw = _load_agent_yaml(agent_dir)
+    if raw is None:
+        return []
+    ctx_names: list[str] = list(raw.get("contexts") or [])
+    if not ctx_names:
+        return []
+
+    findings: list[Finding] = []
+    for ctx_name in ctx_names:
+        # Agent-local override beats project-level (mirrors loader).
+        candidates = [
+            agent_dir / "contexts" / f"{ctx_name}.md",
+            agent_dir.parent.parent / "contexts" / f"{ctx_name}.md",
+        ]
+        ctx_file = next((p for p in candidates if p.is_file()), None)
+        if ctx_file is None:
+            continue
+        size = ctx_file.stat().st_size
+        if size <= _LARGE_CONTEXT_BYTES:
+            continue
+        findings.append(
+            Finding(
+                category="large-context",
+                severity=Severity.WARNING,
+                target=agent_name,
+                message=(
+                    f"context `{ctx_name}` is {size:,} bytes "
+                    f"(> {_LARGE_CONTEXT_BYTES:,} B advisory limit)"
+                ),
+                hint=(
+                    "trim the context or split into narrower context files — "
+                    "large contexts pay per-call in token spend"
+                ),
+            )
+        )
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 

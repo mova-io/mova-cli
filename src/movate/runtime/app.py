@@ -28,8 +28,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import movate
+from movate.core.auth import mint_api_key
 from movate.core.loader import AgentBundle
-from movate.core.models import JobKind, JobRecord, JobStatus
+from movate.core.models import ApiKeyEnv, JobKind, JobRecord, JobStatus
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.runtime.agent_creation import (
     AgentCreationError,
@@ -39,10 +40,6 @@ from movate.runtime.agent_creation import (
     unzip_bundle,
     wizard_to_bundle_files,
 )
-from movate.runtime.skill_creation import (
-    SkillCreationError,
-    persist_skill_bundle,
-)
 from movate.runtime.errors import auth_required, not_found
 from movate.runtime.middleware import AuthContext, make_auth_dependency
 from movate.runtime.registry import scan_agents
@@ -50,6 +47,7 @@ from movate.runtime.schemas import (
     AgentCommitView,
     AgentCreatedView,
     AgentDatasetInfo,
+    AgentDatasetUploadView,
     AgentDeletedView,
     AgentDetailView,
     AgentHistoryView,
@@ -61,6 +59,12 @@ from movate.runtime.schemas import (
     AgentValidationIssue,
     AgentValidationView,
     AgentView,
+    ApiKeyListView,
+    ApiKeyMintedView,
+    ApiKeyMintRequest,
+    ApiKeyRevokedView,
+    ApiKeyView,
+    AuthWhoamiView,
     EvalAcceptedView,
     EvalListView,
     EvalScorecardView,
@@ -75,6 +79,10 @@ from movate.runtime.schemas import (
     RunView,
     SkillCreatedView,
     WizardAgentSubmission,
+)
+from movate.runtime.skill_creation import (
+    SkillCreationError,
+    persist_skill_bundle,
 )
 from movate.storage.base import StorageProvider
 
@@ -121,6 +129,8 @@ async def _collect_bundle_files(
     output_schema: UploadFile | None,
     dataset: UploadFile | None,
     bundle: UploadFile | None,
+    contexts: list[UploadFile],
+    kb: list[UploadFile],
 ) -> dict[str, bytes]:
     """Convert the multipart form fields into a
     ``{canonical_path: bytes}`` dict :func:`persist_bundle` accepts.
@@ -128,6 +138,10 @@ async def _collect_bundle_files(
     Enforces the two-mode contract: EITHER ``bundle`` OR the four
     individual files, never both, never neither. 400 with a clear
     pointer at the conflict on either error.
+
+    ``contexts`` is always optional — zero or more ``contexts/<name>.md``
+    files uploaded via the repeating ``contexts`` multipart field. They
+    are merged into the bundle regardless of which mode is used.
     """
     individual = [agent_yaml, prompt, input_schema, output_schema, dataset]
     has_individual = any(f is not None for f in individual)
@@ -147,30 +161,55 @@ async def _collect_bundle_files(
         )
 
     if bundle is not None:
-        return unzip_bundle(await bundle.read())
+        files = unzip_bundle(await bundle.read())
+    else:
+        # Individual-files mode. Re-check the required fields are present
+        # — the FastAPI param defaults make them all optional at the route
+        # level, but the bundle contract requires the canonical 4.
+        required = {
+            "agent.yaml": agent_yaml,
+            "prompt.md": prompt,
+            "schema/input.json": input_schema,
+            "schema/output.json": output_schema,
+        }
+        missing = [name for name, f in required.items() if f is None]
+        if missing:
+            raise AgentCreationError(
+                f"individual-files mode requires {sorted(required)}; missing: {sorted(missing)}",
+                status_code=400,
+            )
 
-    # Individual-files mode. Re-check the required fields are present
-    # — the FastAPI param defaults make them all optional at the route
-    # level, but the bundle contract requires the canonical 4.
-    required = {
-        "agent.yaml": agent_yaml,
-        "prompt.md": prompt,
-        "schema/input.json": input_schema,
-        "schema/output.json": output_schema,
-    }
-    missing = [name for name, f in required.items() if f is None]
-    if missing:
-        raise AgentCreationError(
-            f"individual-files mode requires {sorted(required)}; missing: {sorted(missing)}",
-            status_code=400,
-        )
+        files = {}
+        for canonical_path, upload in required.items():
+            assert upload is not None  # narrowed by the missing-check above
+            files[canonical_path] = await upload.read()
+        if dataset is not None:
+            files["evals/dataset.jsonl"] = await dataset.read()
 
-    files: dict[str, bytes] = {}
-    for canonical_path, upload in required.items():
-        assert upload is not None  # narrowed by the missing-check above
-        files[canonical_path] = await upload.read()
-    if dataset is not None:
-        files["evals/dataset.jsonl"] = await dataset.read()
+    # Context files — optional, repeating field. Each upload is stored
+    # under contexts/<basename> so the loader's two-tier resolution finds
+    # them inside the agent dir without a shared project volume.
+    for ctx_upload in contexts:
+        raw_name = (ctx_upload.filename or "").lstrip("/")
+        # Safety: only the basename, prefixed with contexts/. Reject
+        # any name with path separators that could escape the dir.
+        basename = Path(raw_name).name
+        if not basename or ".." in basename:
+            continue
+        canonical = f"contexts/{basename}"
+        files[canonical] = await ctx_upload.read()
+
+    # KB corpus files — optional, repeating field. Stored under
+    # kb/<basename> so resolve_kb_file() finds them via its agent-local
+    # tier when the skill runs inside a deployed container.
+    for kb_upload in kb:
+        raw_name = (kb_upload.filename or "").lstrip("/")
+        basename = Path(raw_name).name
+        if not basename or ".." in basename:
+            continue
+        canonical = f"kb/{basename}"
+        files[canonical] = await kb_upload.read()
+
     return files
 
 
@@ -722,6 +761,14 @@ def build_app(
         input_schema: UploadFile | None = File(default=None),
         output_schema: UploadFile | None = File(default=None),
         dataset: UploadFile | None = File(default=None),
+        # Context files — optional repeating field. Each upload is a
+        # contexts/<name>.md that overrides the same-named entry at
+        # the project level inside the deployed container.
+        contexts: list[UploadFile] = File(default=[]),
+        # KB corpus files — optional repeating field. Each upload is a
+        # kb/<name>.json that resolve_kb_file() finds via its agent-local
+        # tier when the deployed skill runs inside the container.
+        kb: list[UploadFile] = File(default=[]),
         # Zipped-bundle mode. Mutually exclusive with the individual
         # fields. The zip may contain a single top-level dir
         # (e.g. ``faq-bot/agent.yaml``) — unzip_bundle strips it.
@@ -774,6 +821,8 @@ def build_app(
             output_schema=output_schema,
             dataset=dataset,
             bundle=bundle,
+            contexts=contexts,
+            kb=kb,
         )
 
         # Pull any nested skills/<name>/ entries out of the agent
@@ -1101,6 +1150,97 @@ def build_app(
         return AgentDeletedView(
             name=result.name,
             deleted_dir=result.deleted_dir.name,
+        )
+
+    @v1.post(
+        "/agents/{name}/dataset",
+        response_model=AgentDatasetUploadView,
+        status_code=200,
+        tags=["agents-v1"],
+    )
+    async def v1_upload_agent_dataset(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        file: UploadFile = File(...),
+    ) -> AgentDatasetUploadView:
+        """Upload or replace an agent's eval dataset (item 111 / Tier I-F).
+
+        Accepts a ``multipart/form-data`` upload with a single field
+        ``file`` containing a JSONL file — one JSON object per line.
+        Writes the content to ``<agents_path>/<name>/evals/dataset.jsonl``,
+        creating the ``evals/`` sub-directory if needed. Replaces any
+        existing dataset atomically.
+
+        Returns row count, a SHA-256 prefix for integrity checking, and
+        a preview of the first up to three rows so the caller can confirm
+        the upload was parsed correctly.
+
+        Wizard-created agents have no dataset and can't be eval'd until
+        this endpoint is called at least once.
+
+        Errors:
+
+        * **400** — file is not valid JSONL (non-object line detected)
+        * **401** — missing / bad bearer token
+        * **404** — agent not found in the runtime's agents_path
+        * **503** — runtime built without an agents_path
+        """
+        import hashlib  # noqa: PLC0415
+        import json  # noqa: PLC0415
+
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/agents/{name}/dataset is unavailable",
+                status_code=503,
+            )
+
+        _ = ctx.tenant_id
+
+        agent_dir = agents_path / name
+        if not agent_dir.is_dir():
+            raise not_found("agent", name)
+
+        raw = await file.read()
+
+        # Validate: every non-empty line must be a JSON object.
+        rows: list[dict[str, object]] = []
+        for lineno, raw_line in enumerate(raw.decode().splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise AgentCreationError(
+                    f"dataset line {lineno} is not valid JSON: {exc}",
+                    status_code=400,
+                ) from exc
+            if not isinstance(obj, dict):
+                raise AgentCreationError(
+                    f"dataset line {lineno} must be a JSON object, got {type(obj).__name__}",
+                    status_code=400,
+                )
+            rows.append(obj)
+
+        evals_dir = agent_dir / "evals"
+        evals_dir.mkdir(exist_ok=True)
+        dataset_path = evals_dir / "dataset.jsonl"
+        dataset_path.write_bytes(raw)
+
+        sha256_prefix = hashlib.sha256(raw).hexdigest()[:12]
+        preview = rows[:3]
+
+        # Refresh registry so GET /agents/{name} reflects updated dataset stats.
+        request.app.state.agents = scan_agents(agents_path)
+
+        return AgentDatasetUploadView(
+            agent_name=name,
+            row_count=len(rows),
+            sha256_prefix=sha256_prefix,
+            preview=preview,
         )
 
     @v1.post(
@@ -1703,6 +1843,156 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Auth key management — tenant-scoped (operators manage their own keys).
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/auth/keys",
+        response_model=ApiKeyMintedView,
+        status_code=201,
+        summary="Mint a new API key for the calling tenant.",
+    )
+    async def v1_mint_key(
+        request: Request,
+        body: ApiKeyMintRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ApiKeyMintedView:
+        """Mint a new bearer key for the calling tenant.
+
+        The ``full_key`` in the response is shown **once** — it cannot
+        be recovered. Store it immediately in your secrets vault.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        try:
+            env = ApiKeyEnv(ctx.env)
+        except ValueError:
+            env = ApiKeyEnv.LIVE
+        minted = mint_api_key(
+            tenant_id=ctx.tenant_id,
+            env=env,
+            label=body.label,
+            ttl_days=body.ttl_days,
+        )
+        await store.save_api_key(minted.record)
+        return ApiKeyMintedView(
+            key_id=minted.record.key_id,
+            full_key=minted.full_key,
+            tenant_id=minted.record.tenant_id,
+            env=minted.record.env.value,
+            label=minted.record.label,
+            expires_at=minted.record.expires_at,
+        )
+
+    @v1.get(
+        "/auth/keys",
+        response_model=ApiKeyListView,
+        summary="List API keys for the calling tenant.",
+    )
+    async def v1_list_keys(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        include_revoked: bool = False,
+    ) -> ApiKeyListView:
+        """List API keys belonging to the calling tenant, newest first.
+
+        Pass ``include_revoked=true`` to show revoked keys too.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_api_keys(
+            tenant_id=ctx.tenant_id,
+            include_revoked=include_revoked,
+        )
+        now = datetime.now(UTC)
+        views = [
+            ApiKeyView(
+                key_id=r.key_id,
+                tenant_id=r.tenant_id,
+                env=r.env.value,
+                label=r.label,
+                created_at=r.created_at,
+                last_used_at=r.last_used_at,
+                expires_at=r.expires_at,
+                status=(
+                    "revoked"
+                    if r.revoked_at is not None
+                    else (
+                        "expired"
+                        if r.expires_at is not None and r.expires_at < now
+                        else "active"
+                    )
+                ),
+            )
+            for r in records
+        ]
+        return ApiKeyListView(keys=views, count=len(views))
+
+    @v1.delete(
+        "/auth/keys/{key_id}",
+        response_model=ApiKeyRevokedView,
+        summary="Revoke an API key.",
+    )
+    async def v1_revoke_key(
+        request: Request,
+        key_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ApiKeyRevokedView:
+        """Revoke the API key with the given ``key_id``.
+
+        Idempotent — revoking an already-revoked key returns 200.
+        Tenant-scoped: you can only revoke your own keys.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        * **404** — key not found or belongs to a different tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_api_key(key_id)
+        if record is None or record.tenant_id != ctx.tenant_id:
+            raise not_found("api_key", key_id)
+        await store.revoke_api_key(key_id, tenant_id=ctx.tenant_id)
+        return ApiKeyRevokedView(key_id=key_id)
+
+    @v1.get(
+        "/auth/me",
+        response_model=AuthWhoamiView,
+        summary="Return the identity of the calling API key.",
+    )
+    async def v1_auth_whoami(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuthWhoamiView:
+        """Return identity of the calling bearer key: key_id, tenant, env, scope, expiry.
+
+        Useful for CLI ``mdk auth whoami`` and for operators to verify
+        which key they are authenticating with before minting new ones.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_api_key(ctx.api_key_id)
+        return AuthWhoamiView(
+            key_id=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            env=ctx.env,
+            scope=None,
+            label=record.label if record is not None else None,
+            expires_at=record.expires_at if record is not None else None,
+        )
 
     app.include_router(v1)
 

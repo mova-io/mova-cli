@@ -23,6 +23,11 @@ model:
 
 prompt: ./prompt.md
 
+# SQL formatting, safety rules, dialect table, and parameterization
+# policy. Scaffolded to `<project>/contexts/sql-style.md`.
+contexts:
+  - sql-style
+
 schema:
   # Canonical YAML — business-readable. Compiles to JSON Schema at
   # agent-load time.

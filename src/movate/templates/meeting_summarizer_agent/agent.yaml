@@ -24,6 +24,11 @@ model:
 
 prompt: ./prompt.md
 
+# Output structure rules for decisions, action items, blockers, and
+# follow-ups. Scaffolded to `<project>/contexts/meeting-format.md`.
+contexts:
+  - meeting-format
+
 schema:
   # Canonical YAML — business-readable. Compiles to JSON Schema at
   # agent-load time.

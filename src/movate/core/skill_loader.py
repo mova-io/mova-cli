@@ -73,7 +73,7 @@ def load_skill(path: str | Path) -> SkillBundle:
     try:
         spec = SkillSpec.model_validate(raw)
     except ValidationError as exc:
-        raise SkillLoadError(f"skill.yaml validation failed:\n{exc}") from exc
+        raise SkillLoadError(f"{skill_dir.name}/skill.yaml validation failed:\n{exc}") from exc
 
     # Reuse the agent loader's schema-resolution helper — same
     # path-or-inline-dict semantics, just labelled with the field name

@@ -48,9 +48,9 @@ def _register_skill_backends() -> None:
     just when an operator actually uses a ``mdk skills`` subcommand.
     Same pattern the executor follows from its tool-use loop entry.
 
-    Today only the Python backend is registered here; the HTTP
-    backend (sibling PR) follows the same pattern via importlib once
-    it lands, so adding it is a one-line change.
+    All three backends (python, http, mcp) are imported here.
+    HTTP and MCP are wrapped in contextlib.suppress(ImportError) so
+    the command stays usable if a backend module is absent.
     """
     # importlib over `from movate... import python` so mypy stays
     # happy under strict mode (the package's __init__ doesn't re-

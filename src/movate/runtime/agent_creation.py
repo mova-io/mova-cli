@@ -96,6 +96,17 @@ _ALLOWED_PREFIXES: tuple[str, ...] = (
     # init-template scaffold round-trips cleanly through the canonical
     # POST /api/v1/agents path.
     "skills/",
+    # Context files prepended to the agent's system prompt at runtime.
+    # Two-tier resolution: agent-local contexts/<name>.md override
+    # project-level ones; deploy bundles them into the agent dir so
+    # the deployed instance is self-contained without a shared volume.
+    "contexts/",
+    # Knowledge-base corpus files (e.g. kb-lookup-corpus.json).
+    # `mdk deploy` bundles the project's kb/ alongside the agent so
+    # the deployed skill can resolve its corpus without a shared volume.
+    # resolve_kb_file() checks <agent_dir>/kb/<name> before walking up
+    # to the project root.
+    "kb/",
 )
 
 
@@ -378,13 +389,14 @@ def split_skills_from_bundle(
     Idempotent — calling on already-split files (no ``skills/*``
     entries) returns the input unchanged and an empty skills dict.
     """
+    _skill_path_parts = 3  # "skills/<name>/<rest>"
     agent_files: dict[str, bytes] = {}
     skills_per_name: dict[str, dict[str, bytes]] = {}
     for key, content in files.items():
         # Expect "skills/<name>/<rest>"; anything shorter than that
         # (e.g. a stray "skills/README.md") stays with the agent.
         parts = key.split("/", 2)
-        if parts[0] == "skills" and len(parts) == 3 and parts[1] and parts[2]:
+        if parts[0] == "skills" and len(parts) == _skill_path_parts and parts[1] and parts[2]:
             skill_name = parts[1]
             inner_path = parts[2]
             skills_per_name.setdefault(skill_name, {})[inner_path] = content

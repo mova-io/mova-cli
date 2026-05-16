@@ -1,25 +1,16 @@
-"""Shared path-resolution helpers for CLI commands that accept a
-positional ``<path>`` argument referring to an agent or workflow.
+"""Shared path-resolution helpers for CLI commands.
 
-The motivating use case: when inside a movate project, operators want
-to type a bare name (``mdk run rag-qa``) instead of the full path
-(``mdk run ./agents/rag-qa``). This module's
-:func:`resolve_agent_or_workflow_arg` does that resolution for any
-command that opts in.
+Exports:
 
-Resolution rules (in order):
+* :func:`walk_up_for_project_root` — walk up from cwd to find a project
+  root (``project.yaml`` / ``policy.yaml`` / ``movate.yaml``). Returns
+  ``None`` when not found. Used by every command that needs the project root.
 
-1. URL → leave unchanged (``http://`` / ``https://`` for remote eval).
-2. Path that exists on disk → leave unchanged (operator passed full path).
-3. Bare name + we're inside a movate project (walk-up finds movate.yaml):
-   look for ``./agents/<name>/agent.yaml`` first, then
-   ``./workflows/<name>/workflow.yaml``. First hit wins.
-4. Otherwise → leave unchanged (caller's error path surfaces a clear
-   "not found" message).
+* :func:`resolve_agent_or_workflow_arg` — resolve a bare name to its
+  ``agents/`` or ``workflows/`` path when inside a project, falling
+  through unchanged for URLs and paths that already exist on disk.
 
-Companion: :func:`suggest_similar_agent` surfaces a typo-distance
-suggestion when the operator's bare name doesn't resolve. Used by
-caller error paths to render "did you mean rag-qa?" hints.
+* :func:`suggest_similar_agent` — typo-distance hint for "did you mean X?"
 """
 
 from __future__ import annotations
@@ -46,7 +37,7 @@ def resolve_agent_or_workflow_arg(arg: str) -> str:
         return arg
 
     # Bare name. Need a project root to resolve under.
-    project_root = _walk_up_for_project_root()
+    project_root = walk_up_for_project_root()
     if project_root is None:
         return arg
 
@@ -71,7 +62,7 @@ def list_project_agents() -> list[str]:
     when called outside a project — caller falls through to its
     own error.
     """
-    root = _walk_up_for_project_root()
+    root = walk_up_for_project_root()
     if root is None:
         return []
     agents_dir = root / "agents"
@@ -101,10 +92,14 @@ def suggest_similar_agent(name: str, *, cutoff: float = 0.6) -> str | None:
     return matches[0] if matches else None
 
 
-def _walk_up_for_project_root() -> Path | None:
-    """Walk up from cwd looking for a project-root marker. Same set of
-    accepted names as :data:`movate.core.config.PROJECT_MARKER_FILES`
-    (``project.yaml`` / ``policy.yaml`` / ``movate.yaml``)."""
+def walk_up_for_project_root() -> Path | None:
+    """Walk up from cwd looking for a project-root marker.
+
+    Checks ``project.yaml``, ``policy.yaml``, and ``movate.yaml`` —
+    the same set as :data:`movate.core.config.PROJECT_MARKER_FILES`.
+    Returns ``None`` when the filesystem root is reached without finding
+    any marker, so callers can distinguish "no project" from "cwd is root".
+    """
     from movate.core.config import is_project_root  # noqa: PLC0415
 
     current = Path.cwd().resolve()

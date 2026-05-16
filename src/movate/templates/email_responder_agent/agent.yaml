@@ -23,6 +23,11 @@ model:
 
 prompt: ./prompt.md
 
+# Tone + length policy for replies. Scaffolded to
+# `<project>/contexts/response-tone-guide.md` on `mdk add email-responder`.
+contexts:
+  - response-tone-guide
+
 schema:
   # Canonical YAML — business-readable. Compiles to JSON Schema at
   # agent-load time.

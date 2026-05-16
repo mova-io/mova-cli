@@ -67,6 +67,18 @@ operator-facing doc.
 ''')
 param corsAllowedOrigins string = ''
 
+@description('''
+Name of the Container Apps Environment storage config that backs the
+Azure Files agents volume. When non-empty, a volume named ``agents-vol``
+is mounted at ``/home/movate/agents`` and ``MOVATE_AGENTS_PATH`` points
+there instead of the image-baked ``/app/agents``. Empty string (default)
+disables the mount — dev/staging with a single replica works fine on
+pod-local storage.
+
+Set this to ``'agents-vol'`` when ``useAzureFiles=true`` in main.bicep.
+''')
+param agentsStorageName string = ''
+
 @description('Common tags.')
 param tags object = {}
 
@@ -187,10 +199,9 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'MOVATE_AGENTS_PATH'
-              // Image bakes agents under /app/agents. Operators who
-              // want pluggable agents would mount a volume — out of
-              // scope for v1.0 (single-tenant agent set per deploy).
-              value: '/app/agents'
+              // Pod-local when Azure Files is off (single-replica dev);
+              // shared mount when agentsStorageName is set (multi-pod).
+              value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'
             }
             {
               // Comma-separated browser-origin allow-list consumed by
@@ -202,6 +213,12 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
               // `az containerapp update --set-env-vars` step).
               name: 'MDK_CORS_ALLOWED_ORIGINS'
               value: corsAllowedOrigins
+            }
+          ]
+          volumeMounts: empty(agentsStorageName) ? [] : [
+            {
+              volumeName: 'agents-vol'
+              mountPath: '/home/movate/agents'
             }
           ]
           probes: [
@@ -233,6 +250,15 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
               failureThreshold: 3
             }
           ]
+        }
+      ]
+      volumes: empty(agentsStorageName) ? [] : [
+        {
+          name: 'agents-vol'
+          storageType: 'AzureFile'
+          // storageName references the managedEnvironment/storages binding
+          // (Microsoft.App/managedEnvironments/storages) created in main.bicep.
+          storageName: agentsStorageName
         }
       ]
       scale: {

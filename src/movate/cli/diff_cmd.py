@@ -25,6 +25,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._resolve import walk_up_for_project_root
 from movate.snapshot import (
     SnapshotNotFoundError,
     SnapshotStoreError,
@@ -54,25 +55,12 @@ _CAPTURE_ROOTS: tuple[str, ...] = (
 
 
 def _resolve_project_root(explicit: Path | None) -> Path:
-    """Same walk-up resolution :mod:`snapshot_cmd` uses.
-
-    Duplicated rather than imported to avoid a circular dependency
-    between sibling CLI modules — both surfaces share the same
-    convention but stay independently loadable.
-    """
     if explicit is not None:
         if not explicit.is_dir():
             err_console.print(f"[red]✗[/red] --project path is not a directory: {explicit}")
             raise typer.Exit(code=2)
         return explicit.resolve()
-    current = Path.cwd().resolve()
-    while True:
-        if (current / "movate.yaml").is_file():
-            return current
-        if current.parent == current:
-            break
-        current = current.parent
-    return Path.cwd().resolve()
+    return walk_up_for_project_root() or Path.cwd().resolve()
 
 
 def diff(
@@ -302,7 +290,7 @@ def _render_row(change: FileChange) -> tuple[str, str, str]:
     return (kind, change.path, size)
 
 
-def _diff_as_json(result: SnapshotDiff) -> dict:
+def _diff_as_json(result: SnapshotDiff) -> dict[str, object]:
     """Serialise the diff to a JSON-friendly dict.
 
     Field names match the dataclass; FileChange entries flatten to
@@ -453,7 +441,7 @@ def _run_git_diff(*, project_root: Path, ref: str, json_output: bool) -> None:
         raise typer.Exit(code=1)
 
 
-def _parse_git_name_status(output: str) -> list[dict]:
+def _parse_git_name_status(output: str) -> list[dict[str, str]]:
     """Parse the tab-separated output of ``git diff --name-status``.
 
     Returns a list of ``{"status": str, "path": str}`` dicts. Renames
@@ -461,7 +449,7 @@ def _parse_git_name_status(output: str) -> list[dict]:
     strip the score and keep just the first letter for the status
     classification.
     """
-    changes: list[dict] = []
+    changes: list[dict[str, str]] = []
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
         if not line:
@@ -481,7 +469,7 @@ def _parse_git_name_status(output: str) -> list[dict]:
     return changes
 
 
-def _render_git_diff(changes: list[dict], *, ref: str, project_root: Path) -> None:
+def _render_git_diff(changes: list[dict[str, str]], *, ref: str, project_root: Path) -> None:
     """Render the git-diff result as a Rich table."""
     title = f"mdk diff --git  [dim]vs {ref}[/dim]"
     table = Table(title=title, title_style="bold", show_lines=False)

@@ -119,8 +119,12 @@ _TOKEN_RE = re.compile(r"\b[a-z0-9][a-z0-9_-]*\b")
 
 # Score weights for the three sources of evidence.
 _W_TAG = 5
-_W_TITLE = 3
+_W_TITLE = 4  # title match is strong signal (4x body)
 _W_BODY = 1
+# When ALL query tokens appear in the title (precise query), we double
+# the title component. "SSO login loop" matching a title that contains
+# every word is a much stronger hit than partial overlap.
+_W_TITLE_EXACT_BONUS = 2
 
 # Defaults / caps for top_n.
 _DEFAULT_TOP_N = 3
@@ -138,16 +142,24 @@ def _score(entry: dict[str, Any], query_tokens: set[str]) -> int:
     Higher weight on tag hits + title hits than on body word overlap;
     a query that EXACTLY matches a tag should always beat a query
     that happens to share filler words with a resolution paragraph.
+
+    Title exact-coverage bonus: when ALL query tokens appear in the title
+    (every term the user typed is present), the title component is doubled.
+    This rewards focused queries ("SSO login loop") matching precise titles
+    over broad queries that get scattered body-word overlap.
     """
     if not query_tokens:
         return 0
     tag_hits = sum(1 for t in entry.get("tags", []) if t.lower() in query_tokens)
-    title_hits = len(_tokenize(entry.get("title", "")) & query_tokens)
+    title_tokens = _tokenize(entry.get("title", ""))
+    title_hits = len(title_tokens & query_tokens)
+    title_all_matched = title_hits == len(query_tokens)
+    title_score = _W_TITLE * title_hits * (_W_TITLE_EXACT_BONUS if title_all_matched else 1)
     body_hits = len(
         (_tokenize(entry.get("symptom", "")) | _tokenize(entry.get("resolution", "")))
         & query_tokens
     )
-    return _W_TAG * tag_hits + _W_TITLE * title_hits + _W_BODY * body_hits
+    return _W_TAG * tag_hits + title_score + _W_BODY * body_hits
 
 
 async def run(input: dict[str, Any], ctx: SkillExecutionContext) -> dict[str, Any]:

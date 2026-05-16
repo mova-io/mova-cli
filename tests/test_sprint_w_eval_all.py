@@ -109,8 +109,9 @@ class TestEvalAllMutex:
         result = runner.invoke(app, ["eval"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         combined = result.stdout + result.stderr
-        assert "path required" in combined.lower()
         assert "--all" in combined
+        # Inside a project, the error now explains the TTY issue and offers both alternatives.
+        assert "mdk eval --all" in combined or "path required" in combined.lower()
 
 
 @pytest.mark.unit

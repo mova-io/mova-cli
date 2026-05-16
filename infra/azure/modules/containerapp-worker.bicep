@@ -76,6 +76,14 @@ and-egg deadlock that system-assigned identities trip on a cold deploy.
 param userAssignedIdentityId string
 
 
+@description('''
+Name of the Container Apps Environment storage config that backs the
+Azure Files agents volume. When non-empty, a volume named ``agents-vol``
+is mounted at ``/home/movate/agents`` and ``MOVATE_AGENTS_PATH`` points
+there. See the API module param of the same name for full docs.
+''')
+param agentsStorageName string = ''
+
 @description('Common tags.')
 param tags object = {}
 
@@ -194,9 +202,22 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'MOVATE_AGENTS_PATH'
-              value: '/app/agents'
+              value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'
             }
           ]
+          volumeMounts: empty(agentsStorageName) ? [] : [
+            {
+              volumeName: 'agents-vol'
+              mountPath: '/home/movate/agents'
+            }
+          ]
+        }
+      ]
+      volumes: empty(agentsStorageName) ? [] : [
+        {
+          name: 'agents-vol'
+          storageType: 'AzureFile'
+          storageName: agentsStorageName
         }
       ]
       scale: {

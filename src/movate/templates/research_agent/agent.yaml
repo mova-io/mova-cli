@@ -35,6 +35,11 @@ prompt: ./prompt.md
 # scaffold away (`mdk skills scaffold web-search`).
 skills: []
 
+# Citation format rules, source attribution policy, and field-level
+# content constraints. Scaffolded to `<project>/contexts/citation-style.md`.
+contexts:
+  - citation-style
+
 schema:
   # Canonical YAML — business-readable. Compiles to JSON Schema at
   # agent-load time.

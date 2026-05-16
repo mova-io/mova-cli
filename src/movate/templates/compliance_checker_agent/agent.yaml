@@ -24,6 +24,11 @@ model:
 
 prompt: ./prompt.md
 
+# Severity definitions, finding structure rules, ordering policy, and
+# overall-assessment format. Scaffolded to `<project>/contexts/compliance-rubric.md`.
+contexts:
+  - compliance-rubric
+
 schema:
   # Canonical YAML — business-readable. Compiles to JSON Schema at
   # agent-load time.

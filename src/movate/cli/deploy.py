@@ -123,6 +123,26 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "project.yaml → agents."
         ),
     ),
+    diff: bool = typer.Option(
+        False,
+        "--diff",
+        help=(
+            "Preview what would change without uploading. Compares each local "
+            "agent's [bold]agent.yaml[/bold] hash against the deployed version "
+            "and prints a table of new / changed / unchanged agents. Exits 0; "
+            "nothing is uploaded. Only applies to agents-mode."
+        ),
+    ),
+    status: bool = typer.Option(
+        False,
+        "--status",
+        help=(
+            "List all live agents on the target runtime. Calls "
+            "[bold]GET /api/v1/agents[/bold] and renders a table of "
+            "name / version / created-at. Nothing is deployed. "
+            "Only applies to agents-mode."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -169,9 +189,13 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         raise typer.Exit(code=2)
     resolved_mode = _resolve_deploy_mode(mode=mode, cwd=Path.cwd())
     if resolved_mode == "agents":
+        if status:
+            _deploy_status(target=target)
+            return
         _deploy_agents(
             target=target,
             dry_run=dry_run,
+            diff=diff,
         )
         return
 
@@ -471,7 +495,72 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
 
 
-def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
+def _deploy_status(*, target: str | None) -> None:
+    """List live agents on the target runtime via GET /api/v1/agents."""
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+    from rich.table import Table  # noqa: PLC0415
+
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    base_url = target_cfg.url.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            resp = client.get(f"{base_url}/api/v1/agents", headers=headers)
+    except httpx.HTTPError as exc:
+        error(f"could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code != httpx.codes.OK:
+        error(f"GET /api/v1/agents returned HTTP {resp.status_code}: {resp.text[:200]!r}")
+        raise typer.Exit(code=2)
+
+    try:
+        agents = resp.json()
+    except Exception:
+        error("response is not valid JSON")
+        raise typer.Exit(code=2) from None
+
+    if not isinstance(agents, list):
+        # Some runtimes wrap in {"agents": [...]}.
+        agents = agents.get("agents", []) if isinstance(agents, dict) else []
+
+    table = Table(
+        title=f"Live agents on [bold]{target_name}[/bold] ({base_url})",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Name", no_wrap=True)
+    table.add_column("Version", no_wrap=True)
+    table.add_column("Created at", no_wrap=True)
+
+    for agent in sorted(agents, key=lambda a: a.get("name", "") if isinstance(a, dict) else ""):
+        if not isinstance(agent, dict):
+            continue
+        table.add_row(
+            agent.get("name", "?"),
+            agent.get("version", "?"),
+            agent.get("created_at", agent.get("createdAt", "?")),
+        )
+
+    if agents:
+        err.print(table)
+    else:
+        err.print(
+            f"[yellow]⚠[/yellow] no agents found on [bold]{target_name}[/bold]. "
+            "Run [bold]mdk deploy --mode agents[/bold] to upload some."
+        )
+
+
+def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> None:  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
     """Upload every agent under ``<project>/agents/*/`` to the deployed
     runtime via ``POST /api/v1/agents``.
 
@@ -554,6 +643,70 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
         )
         return
 
+    # --diff: preview new/changed/unchanged without uploading. Calls
+    # GET /api/v1/agents/<name> for each local agent and checks whether
+    # the deployed version's agent_yaml_hash matches the local file.
+    if diff:
+        import hashlib  # noqa: PLC0415
+
+        from rich.table import Table  # noqa: PLC0415
+
+        api_key_diff = os.environ.get(target_cfg.key_env, "").strip()
+        base_url_diff = target_cfg.url.rstrip("/")
+        headers_diff = {"Authorization": f"Bearer {api_key_diff}"} if api_key_diff else {}
+
+        diff_table = Table(show_header=True, header_style="bold")
+        diff_table.add_column("Agent", no_wrap=True)
+        diff_table.add_column("Status", no_wrap=True)
+        diff_table.add_column("Note", no_wrap=True)
+
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as diff_client:
+            for agent_dir in agent_dirs:
+                local_hash = hashlib.sha256(
+                    (agent_dir / "agent.yaml").read_bytes()
+                ).hexdigest()[:12]
+                try:
+                    resp = diff_client.get(
+                        f"{base_url_diff}/api/v1/agents/{agent_dir.name}",
+                        headers=headers_diff,
+                    )
+                    if resp.status_code == httpx.codes.OK:
+                        deployed = resp.json()
+                        deployed_hash = (deployed.get("agent_yaml_hash") or "")[:12]
+                        if deployed_hash and local_hash == deployed_hash:
+                            diff_table.add_row(
+                                agent_dir.name, "[dim]unchanged[/dim]",
+                                f"hash={local_hash}"
+                            )
+                        else:
+                            note = (
+                                f"local={local_hash} deployed={deployed_hash}"
+                                if deployed_hash else f"local={local_hash} (no hash in API)"
+                            )
+                            diff_table.add_row(
+                                agent_dir.name, "[yellow]changed[/yellow]", note
+                            )
+                    elif resp.status_code == httpx.codes.NOT_FOUND:
+                        diff_table.add_row(
+                            agent_dir.name, "[green]new[/green]", "not yet deployed"
+                        )
+                    else:
+                        diff_table.add_row(
+                            agent_dir.name, "[yellow]?[/yellow]",
+                            f"HTTP {resp.status_code}"
+                        )
+                except httpx.HTTPError:
+                    diff_table.add_row(
+                        agent_dir.name, "[yellow]?[/yellow]", "runtime unreachable"
+                    )
+
+        err.print(diff_table)
+        err.print(
+            f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
+            f"agents={len(agent_dirs)} diff=true ok=true[/dim]"
+        )
+        return
+
     # Resolve the bearer token from the env var named by the target.
     # The variable holds the FULL `mvt_<env>_<tenant>_<keyid>_<secret>`
     # string — same one used for `Authorization: Bearer ...`.
@@ -580,6 +733,7 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
                 base_url=base_url,
                 headers=headers,
                 agent_dir=agent_dir,
+                project_root=project_root,
             )
             if result is None:
                 uploaded.append(agent_dir.name)
@@ -604,12 +758,83 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
         raise typer.Exit(code=2)
 
 
+def _append_context_files(
+    files: list[tuple[str, tuple[str, bytes, str]]],
+    agent_yaml_bytes: bytes,
+    agent_dir: Path,
+    project_root: Path | None,
+) -> None:
+    """Resolve context names declared in agent.yaml and append them to files.
+
+    Two-tier resolution mirrors the local loader: agent-local
+    ``contexts/<name>.md`` overrides the project-level one. Files found
+    are appended as repeating ``contexts`` multipart fields so the
+    runtime stores them inside the agent dir, making the deployed bundle
+    self-contained without a shared volume.
+    """
+    try:
+        import yaml as _yaml  # noqa: PLC0415
+
+        raw_spec = _yaml.safe_load(agent_yaml_bytes)
+        context_names: list[str] = (
+            list(raw_spec.get("contexts") or []) if isinstance(raw_spec, dict) else []
+        )
+    except Exception:
+        context_names = []
+
+    for ctx_name in context_names:
+        candidates = [agent_dir / "contexts" / f"{ctx_name}.md"]
+        if project_root is not None:
+            candidates.append(project_root / "contexts" / f"{ctx_name}.md")
+        for candidate in candidates:
+            if candidate.is_file():
+                files.append(
+                    (
+                        "contexts",
+                        (f"contexts/{ctx_name}.md", candidate.read_bytes(), "text/markdown"),
+                    )
+                )
+                break
+
+
+def _append_kb_files(
+    files: list[tuple[str, tuple[str, bytes, str]]],
+    project_root: Path | None,
+) -> None:
+    """Append KB corpus files from ``<project_root>/kb/*.json`` to the
+    multipart upload.
+
+    Each file is sent as a repeating ``kb`` multipart field so the
+    runtime stores it at ``<agent_dir>/kb/<filename>``. The deployed
+    skill's ``resolve_kb_file()`` then finds it via its agent-local
+    tier without needing a shared project volume.
+
+    Only ``.json`` files are included — index files, YAML corpora, and
+    other assets under ``kb/`` are silently skipped (the skill's corpus
+    format is always JSON).
+    """
+    if project_root is None:
+        return
+    kb_dir = project_root / "kb"
+    if not kb_dir.is_dir():
+        return
+    for kb_file in sorted(kb_dir.iterdir()):
+        if kb_file.is_file() and kb_file.suffix.lower() == ".json":
+            files.append(
+                (
+                    "kb",
+                    (f"kb/{kb_file.name}", kb_file.read_bytes(), "application/json"),
+                )
+            )
+
+
 def _upload_one_agent_bundle(
     *,
     client: object,  # httpx.Client; typed as object to avoid top-level httpx import
     base_url: str,
     headers: dict[str, str],
     agent_dir: Path,
+    project_root: Path | None = None,
 ) -> str | None:
     """Upload a single agent bundle via multipart POST /api/v1/agents.
 
@@ -688,6 +913,13 @@ def _upload_one_agent_bundle(
             )
         )
     _ = rewrote_paths  # accepted for future telemetry / debug log
+
+    # Context files — two-tier resolution mirrors the local loader.
+    _append_context_files(files, agent_yaml_bytes, agent_dir, project_root)
+
+    # KB corpus files — bundled into the agent dir so deployed skills
+    # can resolve their corpus via resolve_kb_file()'s agent-local tier.
+    _append_kb_files(files, project_root)
 
     # httpx requires the client to be typed precisely here; the
     # `client: object` parameter signature lets the outer function

@@ -125,6 +125,19 @@ preserves the value instead of stomping it.
 ''')
 param corsAllowedOrigins string = ''
 
+@description('''
+Mount a shared Azure Files volume at /home/movate/agents on both the
+API and worker pods. Required for wizard-created agents to survive
+cross-pod — without it a POST /api/v1/agents writes to the API pod's
+local disk and the worker pods can't see the bundle.
+
+Set ``false`` (default) for dev (single-replica, pod-local is fine)
+and ``true`` for staging + prod where multiple replicas and pods run
+concurrently. When enabled, a Storage Account + File Share are created
+and wired to the Container Apps Environment via a storages binding.
+''')
+param useAzureFiles bool = false
+
 // ---------------------------------------------------------------------------
 // Per-env defaults — keep in sync with docs/v1.0-azure-design §4
 // ---------------------------------------------------------------------------
@@ -171,6 +184,9 @@ var pgName = 'movate-${env}-pg${sfx}'
 var caeName = 'movate-${env}-cae'
 var apiName = 'movate-${env}-api'
 var workerName = 'movate-${env}-worker'
+// Storage account names: globally unique, 3-24 chars, lowercase alphanumeric.
+// Max expansion: 'movate' (6) + 'staging' (7) + 'sa' (2) + sfxNoHyphen (≤6) = 21 ✓
+var saName = 'movate${env}sa${sfxNoHyphen}'
 var teamsBotName = 'movate-${env}-teams-bot'
 var botServiceName = 'movate-${env}-bot'
 // User-assigned identities for the api + worker + teams-bot apps.
@@ -254,6 +270,58 @@ module cae 'modules/containerapp-env.bicep' = {
   // also creates an implicit edge.
 }
 
+// ---------------------------------------------------------------------------
+// Azure Files — optional shared agents volume (Item 11).
+//
+// When useAzureFiles=true, a Storage Account + File Share are created and
+// a ``Microsoft.App/managedEnvironments/storages`` binding links the share
+// to the CAE under the name 'agents-vol'. The API and worker modules then
+// mount 'agents-vol' at /home/movate/agents, giving all pods a shared
+// filesystem for wizard-created agent bundles.
+//
+// The storage binding is a CHILD of the CAE environment resource. Because
+// the CAE is managed inside the ``cae`` module, we reference it via an
+// ``existing`` resource — Bicep compiles this to a GET on the ARM resource
+// rather than creating a second copy.
+// ---------------------------------------------------------------------------
+
+module azfiles 'modules/azurefiles.bicep' = if (useAzureFiles && enableApiWorker) {
+  name: 'azfiles-${env}'
+  params: {
+    name: saName
+    location: location
+    tags: tags
+  }
+}
+
+// Unconditional existing reference — no-op on the ARM side (just a
+// symbolic link for dependency tracking). The CHILD resource
+// ``caeAgentsStorage`` below carries the ``if`` condition.
+resource caeResource 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
+  name: caeName
+}
+
+// Link the Azure Files share into the CAE so container apps can reference
+// it by the name 'agents-vol' in their volumes[] arrays. The binding
+// stores the storage account key (via listKeys) in the CAE — it never
+// appears in deployment outputs.
+resource caeAgentsStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01' = if (useAzureFiles && enableApiWorker) {
+  parent: caeResource
+  name: 'agents-vol'
+  properties: {
+    azureFile: {
+      accountName: saName
+      // listKeys() is implicitly ordered after ``azfiles`` because we pass
+      // azfiles.outputs.storageAccountId as the resource id argument —
+      // Bicep registers it as a dependency edge in the ARM graph.
+      accountKey: listKeys(azfiles.outputs.storageAccountId, '2023-01-01').keys[0].value
+      shareName: 'movate-agents'
+      accessMode: 'ReadWrite'
+    }
+  }
+  dependsOn: [cae]
+}
+
 // User-assigned managed identities for the api + worker apps.
 // Created UNCONDITIONALLY (even on the infra-only first pass) — they
 // cost nothing, they're idempotent across deploys, and pre-staging
@@ -304,6 +372,9 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     memory: apiMemory
     userAssignedIdentityId: apiUai.id
     corsAllowedOrigins: corsAllowedOrigins
+    // Pass the CAE storage config name when Azure Files is enabled;
+    // empty string means no volume mount (pod-local /app/agents).
+    agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     tags: tags
   }
 }
@@ -327,6 +398,7 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     memory: workerMemory
     queueDepthPerReplica: workerQueueDepthPerReplica
     userAssignedIdentityId: workerUai.id
+    agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     tags: tags
   }
 }
