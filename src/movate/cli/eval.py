@@ -180,6 +180,17 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "Exit 1 if latency mean is below this threshold."
         ),
     ),
+    compare: bool = typer.Option(
+        False,
+        "--compare",
+        help=(
+            "Auto-compare against the previous run. Reads "
+            "[bold]evals/.last-run.json[/bold] as the baseline (if it exists) "
+            "and writes the current run there afterward. Shorthand for "
+            "[bold]--baseline-file evals/.last-run.json "
+            "--output-baseline evals/.last-run.json[/bold]."
+        ),
+    ),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
 
@@ -210,6 +221,10 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
     if baseline is not None and baseline_file is not None:
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
+
+    # --compare: auto-read+write evals/.last-run.json in the agent dir (or
+    # cwd for --all). Resolved to actual path after path resolution below.
+    _compare_pending = compare
 
     # Guided wizard — explicit `--guided`, OR auto-trigger when an
     # operator typed bare `mdk eval` with no path and no `--all` from
@@ -310,6 +325,16 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
                 if suggestion:
                     err_console.print(f"[dim]→ did you mean [bold]{suggestion}[/bold]?[/dim]")
             raise typer.Exit(code=2) from None
+
+    # --compare: resolve to evals/.last-run.json inside the agent dir.
+    # Only activates when neither --baseline nor --baseline-file was given
+    # (those are the explicit forms; --compare is the "lazy" shorthand).
+    if _compare_pending and baseline is None and baseline_file is None:
+        agent_dir = agent_yaml if agent_yaml is not None else Path(path)
+        last_run_path = agent_dir / "evals" / ".last-run.json"
+        if last_run_path.is_file():
+            baseline_file = last_run_path
+        output_baseline = last_run_path
 
     asyncio.run(
         _run_eval(
