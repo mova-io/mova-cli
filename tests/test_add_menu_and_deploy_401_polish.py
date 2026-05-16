@@ -180,10 +180,13 @@ def test_deploy_401_returns_actionable_hint() -> None:
             agent_dir=agent_dir,
         )
     assert result is not None
-    # Hint mentions the env var.
-    assert "$MDK_DEV_KEY" in result or "MDK_DEV_KEY" in result
-    # Hint mentions the recovery command.
+    # Hint mentions the actionable recovery command. Post-PR-#111 the
+    # primary suggestion is `refresh-runtime-key` (one-shot mint+save);
+    # `save-runtime-key` is mentioned as the manual fallback.
+    assert "refresh-runtime-key" in result
     assert "save-runtime-key" in result
+    # Hint surfaces WHY: revision rotation → JWT rotation → key expired.
+    assert "redeployed" in result.lower() or "JWT" in result
     # Hint shows a TRUNCATED prefix of the bearer (first 16 chars
     # after `Bearer `; not the whole thing — that would leak the
     # secret into logs).
