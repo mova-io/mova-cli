@@ -92,7 +92,7 @@ jobs:
           fi
           # Poll until the job leaves QUEUED. 60s of retry budget;
           # if the worker is healthy this resolves in <5s.
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             STATUS=$(uv run mdk jobs get "$JOB_ID" --json | jq -r '.status')
             if [ "$STATUS" = "success" ] || [ "$STATUS" = "error" ]; then
               echo "::notice::job $JOB_ID finished with status=$STATUS"

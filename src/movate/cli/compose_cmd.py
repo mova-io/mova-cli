@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 
 import typer
 import yaml
@@ -54,7 +55,7 @@ def _scaffold_workflow_yaml(
     agent_names: list[str],
     runtime: str,
     description: str,
-) -> dict:
+) -> dict[str, Any]:
     """Build the workflow.yaml dict for ``mdk compose``.
 
     Each agent becomes a node; consecutive agents are wired with a
@@ -76,7 +77,7 @@ def _scaffold_workflow_yaml(
     for src, dst in pairwise(nodes):
         edges.append({"from": src["id"], "to": dst["id"]})
 
-    spec: dict = {
+    spec: dict[str, Any] = {
         "api_version": "movate/v1",
         "kind": "Workflow",
         "name": _slug_id(workflow_name),
