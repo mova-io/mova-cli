@@ -45,6 +45,8 @@ import asyncio
 import json
 import random
 import string
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,7 @@ import typer
 from jsonschema import Draft202012Validator, ValidationError
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
 
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
@@ -318,16 +321,237 @@ async def _attempt_generate(
 
 
 # ---------------------------------------------------------------------------
+# Guided wizard — `mdk eval-gen --guided`  (PR #108)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _EvalGenWizardChoices:
+    """Resolved answers from the interactive eval-gen wizard.
+
+    Maps 1:1 to the CLI flags the dispatch path already handles, so
+    the wizard's only job is collecting choices — execution stays in
+    the existing code paths.
+    """
+
+    name: str
+    num: int
+    sample_input: str
+    mock: bool
+    output: str | None
+    force: bool
+
+
+def _run_eval_gen_wizard() -> _EvalGenWizardChoices | None:  # noqa: PLR0912 — orchestrator; 4 prompts each with try/except adds linear branch count
+    """Interactive Rich-prompted eval-gen setup. Returns None on Ctrl-C.
+
+    Walks the operator through the four most common decisions a
+    generation invocation needs: which agent, how many cases, mock vs
+    real provider, and whether to bias generation with a sample input
+    from the existing dataset. The full surface of ``mdk eval-gen``
+    has 6 flags; the wizard intentionally covers the 4 a casual
+    operator cares about and leaves --output / --force to the
+    explicit CLI path (sensible defaults work for the wizard flow).
+
+    Same visual style as ``mdk eval --guided`` (Rich Panel + numbered
+    Prompt.ask choices) so operators see one consistent UX language
+    across the guided commands.
+    """
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
+    cwd = Path.cwd()
+    if not is_project_root(cwd):
+        err_console.print(
+            "[red]✗[/red] guided eval-gen needs a project (project.yaml / "
+            "policy.yaml / movate.yaml). None found in cwd."
+        )
+        return None
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold]mdk eval-gen — guided setup[/bold]\n"
+            "[dim]Four questions; press Ctrl-C any time to quit. "
+            "The resolved command is shown before it runs so you can "
+            "copy-paste it next time.[/dim]",
+            border_style="cyan",
+            title_align="left",
+        )
+    )
+
+    # Q1: Which agent? (Unlike `mdk eval --guided`, no "all" here —
+    # that's PR #109's `--all` flag, a separate sweep path. Operators
+    # who want the sweep type `mdk eval-gen --all` instead of taking
+    # the wizard route.)
+    agents_dir = cwd / "agents"
+    agent_names: list[str] = []
+    if agents_dir.is_dir():
+        agent_names = sorted(
+            d.name for d in agents_dir.iterdir() if d.is_dir() and (d / "agent.yaml").is_file()
+        )
+    if not agent_names:
+        err_console.print(
+            "[red]✗[/red] no agents in [bold]./agents/[/bold]. "
+            "Run [bold]mdk add <template>[/bold] first."
+        )
+        return None
+    console.print()
+    console.print("[bold]Which agent?[/bold]")
+    for i, agent_name in enumerate(agent_names, start=1):
+        console.print(f"  [bold cyan][{i}][/bold cyan] {agent_name}")
+    try:
+        agent_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=[str(i) for i in range(1, len(agent_names) + 1)],
+            default="1",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    chosen_agent = agent_names[int(agent_idx) - 1]
+
+    # Q2: How many cases? Common defaults — most demo flows want 5-10
+    # for quick iteration. 50+ is "I'm building a real eval set" — give
+    # it a dedicated option so operators don't have to type a number.
+    num_choices = {
+        "1": (5, "quick — 5 cases, sub-minute LLM cost"),
+        "2": (10, "default — 10 cases, balanced coverage"),
+        "3": (20, "deeper — 20 cases, catches more edge behaviors"),
+        "4": (50, "comprehensive — 50 cases, real eval set"),
+    }
+    console.print()
+    console.print("[bold]How many cases to generate?[/bold]")
+    for key, (value, label) in num_choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {value}  [dim]{label}[/dim]")
+    try:
+        num_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(num_choices.keys()),
+            default="2",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    chosen_num = num_choices[num_idx][0]
+
+    # Q3: Mock or real provider? Same shape as `mdk eval --guided`.
+    # Mock = synthetic schema-walking inputs, no LLM call (free,
+    # offline). Real = LLM-generated inputs (better variety, costs
+    # tokens). Demo path: mock-default keeps the cost-of-curiosity at
+    # $0 for first-time operators.
+    console.print()
+    try:
+        use_mock = Confirm.ask(
+            "[bold]Use mock provider?[/bold] [dim](no LLM call; synthesizes "
+            "inputs from the schema. Free + offline; lower variety than "
+            "the real generator. Recommended for first-look.)[/dim]",
+            default=True,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+    # Q4: Sample-input strategy. Skipped under mock (no LLM means the
+    # sample doesn't influence anything — synthetic inputs are
+    # schema-driven). Under real LLM gen, seeding with the first
+    # dataset row significantly improves topic/tone variety.
+    sample_input_arg = ""
+    if not use_mock:
+        existing_dataset = _find_existing_dataset(cwd / "agents" / chosen_agent)
+        sample_choices: dict[str, tuple[str, str]] = {
+            "1": (
+                "none",
+                "let the LLM choose freely — broadest variety, less anchoring",
+            ),
+            "2": (
+                "first_row",
+                "seed with first row from existing dataset"
+                + (
+                    " [yellow](no dataset found — would skip)[/yellow]"
+                    if existing_dataset is None
+                    else ""
+                ),
+            ),
+        }
+        console.print()
+        console.print("[bold]Sample-input strategy?[/bold]")
+        for key, (_, label) in sample_choices.items():
+            console.print(f"  [bold cyan][{key}][/bold cyan] {label}")
+        try:
+            sample_idx = Prompt.ask(
+                "\n[bold]Pick[/bold]",
+                choices=list(sample_choices.keys()),
+                default="2" if existing_dataset is not None else "1",
+                show_choices=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if sample_choices[sample_idx][0] == "first_row" and existing_dataset is not None:
+            sample_input_arg = json.dumps(existing_dataset)
+
+    # Preview the equivalent CLI command so the operator learns the
+    # flag-form for next time. Same affordance as `mdk eval --guided`.
+    parts: list[str] = ["mdk", "eval-gen", chosen_agent, "--num", str(chosen_num)]
+    if use_mock:
+        parts.append("--mock")
+    if sample_input_arg:
+        parts.extend(["--sample-input", sample_input_arg])
+
+    console.print()
+    console.print(
+        Panel(
+            "[dim]Running:[/dim] [bold cyan]" + " ".join(parts) + "[/bold cyan]",
+            border_style="green",
+            title="[green]✓[/green] Configured",
+            title_align="left",
+        )
+    )
+
+    return _EvalGenWizardChoices(
+        name=chosen_agent,
+        num=chosen_num,
+        sample_input=sample_input_arg,
+        mock=use_mock,
+        output=None,  # let the dispatch path use the default location
+        force=False,
+    )
+
+
+def _find_existing_dataset(agent_dir: Path) -> dict[str, Any] | None:
+    """Return the first row's ``input`` from an existing dataset.jsonl,
+    or None when there's no dataset / it's empty / the row isn't shape-
+    correct. Used by the wizard's sample-input prompt to bias generation
+    when the operator already has a curated example."""
+    dataset_path = agent_dir / "evals" / "dataset.jsonl"
+    if not dataset_path.is_file():
+        return None
+    try:
+        text = dataset_path.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        first_row = json.loads(text.splitlines()[0])
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(first_row, dict):
+        return None
+    input_field = first_row.get("input")
+    if not isinstance(input_field, dict):
+        return None
+    return input_field
+
+
+# ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
 
 
-def eval_gen(
+def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch flat reads clearer
     name: str = typer.Argument(
-        ...,
+        None,
         help=(
             "Agent name (resolved under [bold]agents/<name>[/bold]) or a "
-            "literal path to an agent directory."
+            "literal path to an agent directory. Omit with [bold]--guided[/bold] "
+            "to pick interactively, or with [bold]--all[/bold] to sweep "
+            "every agent in the project."
         ),
         metavar="AGENT",
     ),
@@ -336,6 +560,18 @@ def eval_gen(
         "--num",
         "-n",
         help=f"How many cases to generate. Default 10; max {_MAX_GENERATE}.",
+    ),
+    guided: bool = typer.Option(
+        False,
+        "--guided",
+        "-g",
+        help=(
+            "Interactive wizard: walks the operator through agent "
+            "selection, case count, provider (mock/real), and sample-"
+            "input strategy — then runs the generator. Auto-triggered "
+            "when [bold]mdk eval-gen[/bold] is invoked with no agent "
+            "from a TTY inside a project."
+        ),
     ),
     sample_input: str = typer.Option(
         "",
@@ -392,7 +628,37 @@ def eval_gen(
       [dim]$ mdk eval-gen triage --num 5 --sample-input '{"text": "x"}'[/dim]
       [dim]$ mdk eval-gen triage --num 10 -o evals/triage/cases.jsonl[/dim]
       [dim]$ mdk eval-gen triage --num 3 --mock     # offline test[/dim]
+      [dim]$ mdk eval-gen --guided                  # interactive wizard[/dim]
     """
+    # Guided wizard — explicit `--guided`, OR auto-trigger when an
+    # operator typed bare `mdk eval-gen` with no agent name from a TTY
+    # inside a project. CI / pipe / no-args-outside-project paths still
+    # fall through to the existing "agent required" error.
+    if not guided and name is None:
+        from movate.core.config import is_project_root  # noqa: PLC0415
+
+        if sys.stdin.isatty() and sys.stdout.isatty() and is_project_root(Path.cwd()):
+            guided = True
+    if guided:
+        wizard = _run_eval_gen_wizard()
+        if wizard is None:  # operator hit Ctrl-C / quit
+            raise typer.Exit(code=0)
+        # Apply wizard's answers as if they were CLI flags, then fall
+        # through to the standard dispatch below — no duplicated logic.
+        name = wizard.name
+        num = wizard.num
+        sample_input = wizard.sample_input
+        mock = wizard.mock
+        output = wizard.output or ""
+        force = wizard.force
+
+    if name is None:
+        err_console.print(
+            "[red]✗[/red] AGENT required. Pass an agent name, or use "
+            "[bold]--guided[/bold] to pick interactively."
+        )
+        raise typer.Exit(code=2)
+
     if num < 1:
         err_console.print(f"[red]✗[/red] --num must be ≥ 1; got {num}")
         raise typer.Exit(code=2)
