@@ -88,12 +88,14 @@ def audit(
 
     [bold]Categories shipped this sprint:[/bold]
 
-      [dim]missing-evals      — agent has no evals/dataset.jsonl[/dim]
-      [dim]missing-description — agent.yaml lacks `description:`[/dim]
-      [dim]missing-owner       — agent.yaml lacks `owner:`[/dim]
-      [dim]exposed-secret      — regex scan for committed credentials[/dim]
-      [dim]empty-prompt        — prompt.md is empty / whitespace-only[/dim]
-      [dim]no-test-signal      — no examples AND no dataset[/dim]
+      [dim]missing-evals       — agent has no evals/dataset.jsonl[/dim]
+      [dim]missing-description  — agent.yaml lacks `description:`[/dim]
+      [dim]missing-owner        — agent.yaml lacks `owner:`[/dim]
+      [dim]exposed-secret       — regex scan for committed credentials[/dim]
+      [dim]empty-prompt         — prompt.md is empty / whitespace-only[/dim]
+      [dim]no-test-signal       — no examples AND no dataset[/dim]
+      [dim]missing-kb-corpus    — kb-lookup declared but no corpus in kb/[/dim]
+      [dim]large-context        — declared context > 4 KB advisory limit[/dim]
 
     [bold]Examples:[/bold]
 
