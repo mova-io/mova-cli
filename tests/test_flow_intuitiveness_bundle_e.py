@@ -249,7 +249,9 @@ class TestBatchSummary:
         assert "rag-qa" in result.stdout
         assert "ticket-triager" in result.stdout
         # Hints for the workspace-level next commands.
-        assert "mdk ci eval" in result.stdout
+        # Post-PR-#94 the canonical command is `mdk eval --all`
+        # (was: `mdk ci eval --mock`, which was a stale placeholder).
+        assert "mdk eval --all" in result.stdout
         assert "mdk deploy" in result.stdout
 
     def test_single_add_no_workspace_summary(

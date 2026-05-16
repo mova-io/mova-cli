@@ -765,20 +765,38 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
 
     Per-agent Panels handle the "what's next for THIS agent" question.
     This Panel answers the multi-agent follow-up: "what's next for the
-    workspace?" — gate every agent with `mdk ci eval`, deploy them all
+    workspace?" — gate every agent with `mdk eval --all`, deploy them all
     with `mdk deploy`, etc.
+
+    Post-PR-#92 the canonical commands are ``mdk validate --all`` and
+    ``mdk eval --all``; the legacy ``mdk ci eval`` was a placeholder
+    that never shipped. Post-PR-#88 the active-target is resolvable
+    from user config instead of hard-coding ``prod`` (which most
+    operators don't have configured).
     """
+    # Resolve the active target if one is configured; fall back to
+    # the literal `<your-target>` so the line still parses and the
+    # operator sees they need to register one.
+    try:
+        from movate.core.user_config import load_user_config  # noqa: PLC0415
+
+        active = load_user_config().active or "<your-target>"
+    except Exception:  # best-effort hint; never block the Panel
+        active = "<your-target>"
+
     names_str = ", ".join(f"[cyan]{n}[/cyan]" for n in added_names)
     body = (
         f"[bold]Added {len(added_names)} agents:[/bold] {names_str}\n"
         f"[bold]Project:[/bold] [dim]{project_root}[/dim]\n"
         f"\n[bold]Next steps for the workspace:[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk ci eval --mock[/bold]"
-        f"   [dim]# gate every agent against its baseline[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk validate --all[/bold]"
+        f"   [dim]# schema + lint sweep across all agents[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk eval --all --mock --gate 0.7[/bold]"
+        f"   [dim]# gate every agent against its dataset[/dim]\n"
         f"  [dim]$[/dim] [bold]mdk doctor agent {added_names[0]}[/bold]"
         f"   [dim]# per-agent health check[/dim]\n"
-        f"  [dim]$[/dim] [bold]mdk deploy --target prod --notify[/bold]"
-        f"   [dim]# ship to Azure with Telegram on success[/dim]"
+        f"  [dim]$[/dim] [bold]mdk deploy --target {active}[/bold]"
+        f"   [dim]# push runtime image to Azure[/dim]"
     )
     console.print(
         Panel(
