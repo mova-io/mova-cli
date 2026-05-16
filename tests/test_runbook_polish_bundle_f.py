@@ -157,6 +157,10 @@ class TestAuthStatusNotifications:
     ) -> None:
         """The greppable summary line should count notification keys too."""
         monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "creds"))
+        # PR #112 — isolate user config so the Runtime Targets section
+        # (added in #112) doesn't bleed in counts from the operator's
+        # real ~/.movate/config.yaml.
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / "config.yaml"))
         for key in (
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",

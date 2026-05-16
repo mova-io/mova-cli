@@ -530,7 +530,7 @@ def _is_in_project() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _init_project(
+def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read clearer flat
     *,
     name: str | None,
     target: Path,
@@ -658,7 +658,9 @@ def _init_project(
 
     body = (
         f"[bold]Project:[/bold]   [cyan]{project_name}[/cyan]\n"
-        f"[bold]Path:[/bold]      [cyan]{project_root}[/cyan]\n\n"
+        f"[bold]Path:[/bold]      [bold cyan]{project_root}[/bold cyan]   "
+        f"[dim](open this folder in your IDE — agents/, skills/, contexts/, kb/ "
+        f"are all here)[/dim]\n\n"
         f"  • [cyan]project.yaml[/cyan]   project config\n"
         f"  • [cyan].env.example[/cyan]   env-var template\n"
         f"  • [cyan].gitignore[/cyan]     standard ignores\n"
@@ -733,9 +735,31 @@ def _init_project(
     from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
 
     bin_name = mdk_bin_name()
-    prompt_next_step(
-        console=console,
-        steps=[
+    # Pick an editor command best-effort. Most operators on macOS/Linux
+    # have `code` (VS Code); we fall back to `open` (macOS Finder) so
+    # the action always runs even without VS Code installed. Windows
+    # operators can pick option [2]/[3] instead.
+    import shutil as _shutil  # noqa: PLC0415
+
+    editor_cmd: str | None = None
+    if _shutil.which("code"):
+        editor_cmd = f"code {project_root}"
+        editor_argv = ["code", str(project_root)]
+        editor_label = "Open project in VS Code"
+    elif _shutil.which("cursor"):
+        editor_cmd = f"cursor {project_root}"
+        editor_argv = ["cursor", str(project_root)]
+        editor_label = "Open project in Cursor"
+    elif _shutil.which("open"):  # macOS Finder fallback
+        editor_cmd = f"open {project_root}"
+        editor_argv = ["open", str(project_root)]
+        editor_label = "Reveal project in Finder"
+
+    next_steps = []
+    if editor_cmd is not None:
+        next_steps.append(NextStep(label=editor_label, command=editor_cmd, argv=editor_argv))
+    next_steps.extend(
+        [
             NextStep(
                 label="Browse role templates",
                 command=f"{bin_name} templates list",
@@ -748,17 +772,16 @@ def _init_project(
             ),
             NextStep(
                 label="Add two role agents (rag-qa + ticket-triager)",
-                command=(
-                    f"cd {cd_to} && {bin_name} add rag-qa ticket-triager"
-                ),
+                command=f"cd {cd_to} && {bin_name} add rag-qa ticket-triager",
                 argv=[
                     "sh",
                     "-c",
                     f"cd {cd_to} && {bin_name} add rag-qa ticket-triager",
                 ],
             ),
-        ],
+        ]
     )
+    prompt_next_step(console=console, steps=next_steps)
 
     return project_name, project_root, snapshot_short
 

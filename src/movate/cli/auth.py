@@ -453,8 +453,162 @@ def status() -> None:
 
     stdout.print(table)
     stdout.print()
+
+    # ------------------------------------------------------------------
+    # Runtime targets section (PR #112)
+    #
+    # The provider-keys table above covers LLM creds. Operators also
+    # juggle (a) one or more deployed-runtime bearer keys minted via
+    # `mdk auth save-runtime-key` / `mdk auth refresh-runtime-key`, and
+    # (b) the Azure subscription each target is pinned to. Both live
+    # on disk (credentials file + ~/.movate/config.yaml respectively),
+    # but operators switching between VS Code windows / terminals
+    # constantly grep for them. Show them HERE so `mdk auth status`
+    # is the one command that answers "am I wired up?".
+    # ------------------------------------------------------------------
+    _render_runtime_targets_section(counts)
+
+    stdout.print()
     stdout.print(f"[dim]credentials file: [cyan]{CredentialsStore().path}[/cyan][/dim]")
     stdout.print(f"[dim]mdk_auth_status_summary: set={counts['ok']} unset={counts['unset']}[/dim]")
+
+
+def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PLR0912 — per-target state-machine reads clearer flat than refactored
+    """Append the Runtime Targets table to `mdk auth status` output.
+
+    For each target in ~/.movate/config.yaml shows:
+      - URL (the deployed runtime endpoint)
+      - key_env name + whether the bearer is currently resolved
+      - Azure subscription (or `—` for non-Azure targets)
+      - Drift flag if `az account show` returns a different subscription
+
+    The `az` check is best-effort: if `az` isn't installed or the
+    operator isn't logged in, we skip the drift detection and don't
+    fail the whole `status` command — the LLM-keys part still works
+    offline.
+    """
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        stdout.print(f"[yellow]⚠[/yellow] could not read user config: {exc}")
+        return
+
+    if not cfg.targets:
+        stdout.print(
+            "[dim]No deployment targets configured. "
+            "Add one with [bold]mdk config add-target <name> --url <url> "
+            "--key-env <ENV_VAR> --azure-subscription <id> ...[/bold][/dim]"
+        )
+        return
+
+    # Best-effort: ask az for the currently-active subscription so we
+    # can flag drift between the operator's shell + each target's
+    # pinned subscription. Catches the cross-window footgun where you
+    # `az account set` in one terminal and forget about it in another.
+    current_az_sub = _current_az_subscription()
+
+    table = Table(
+        title="Runtime Targets",
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Target", style="cyan", no_wrap=True)
+    table.add_column("Bearer", no_wrap=True)
+    table.add_column("URL", style="dim", no_wrap=False)
+    table.add_column("Azure subscription", style="dim", no_wrap=False)
+
+    for name in sorted(cfg.targets):
+        target = cfg.targets[name]
+        is_active = name == cfg.active
+        name_cell = f"{name}{' [green](active)[/green]' if is_active else ''}"
+
+        # Bearer key resolution — same `key_source` the LLM-keys path
+        # uses, so the diagnostic comes from the same machinery.
+        if target.key_env:
+            src = key_source(target.key_env)
+            if src == "unset":
+                bearer_cell = f"[yellow]⊘ {target.key_env} not set[/yellow]"
+                counts["unset"] += 1
+            else:
+                bearer_cell = (
+                    f"[green]✓ {target.key_env}[/green] [dim]({src.replace('_', ' ')})[/dim]"
+                )
+                counts["ok"] += 1
+        else:
+            bearer_cell = "[dim]—[/dim]"
+
+        # Azure subscription cell — flag drift when current az account
+        # doesn't match this target's pinned subscription.
+        if target.azure_subscription:
+            sub_short = target.azure_subscription[:8] + "…"
+            if current_az_sub and current_az_sub != target.azure_subscription:
+                drift_short = current_az_sub[:8] + "…"
+                azure_cell = (
+                    f"[yellow]⚠[/yellow] {sub_short} "
+                    f"[dim](az is on {drift_short} — run "
+                    f"[bold]az account set --subscription {target.azure_subscription}[/bold])[/dim]"
+                )
+            elif current_az_sub:
+                azure_cell = f"[green]✓[/green] {sub_short}"
+            else:
+                # az unavailable or not logged in — show the pinned id but
+                # don't claim it matches.
+                azure_cell = f"{sub_short} [dim](az not detected)[/dim]"
+        else:
+            azure_cell = "[dim]—[/dim]"
+
+        table.add_row(name_cell, bearer_cell, target.url, azure_cell)
+
+    stdout.print(table)
+
+    # If we couldn't reach az at all, give one hint at the bottom.
+    if current_az_sub is None:
+        stdout.print(
+            "[dim]→ Azure drift detection skipped (`az` not installed or "
+            "not logged in). Run [bold]az login[/bold] to enable.[/dim]"
+        )
+
+
+def _current_az_subscription() -> str | None:
+    """Return the current `az account show --query id` value, or None.
+
+    Best-effort. Returns None silently when:
+      - `az` isn't on PATH (Azure CLI not installed)
+      - operator isn't logged in (`az login` not run)
+      - az returns non-JSON or non-zero
+    Keeps `mdk auth status` working offline + on non-Azure dev boxes.
+    """
+    import json as _json  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which("az") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["az", "account", "show", "--output", "json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return None
+    sub_id = payload.get("id")
+    return sub_id if isinstance(sub_id, str) else None
 
 
 @auth_app.command("save-runtime-key")
