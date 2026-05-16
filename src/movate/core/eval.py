@@ -87,6 +87,7 @@ class Dimension(StrEnum):
     FAITHFULNESS = "faithfulness"
     COVERAGE = "coverage"
     LATENCY = "latency"
+    CONTEXT_COMPLIANCE = "context_compliance"
 
 
 @dataclass
@@ -106,18 +107,29 @@ class DimensionScore:
 
 @dataclass
 class DimensionScores:
-    """All four per-case dimension scores. Any subset may be unscored."""
+    """All five per-case dimension scores. Any subset may be unscored."""
 
     accuracy: DimensionScore = field(default_factory=DimensionScore)
     faithfulness: DimensionScore = field(default_factory=DimensionScore)
     coverage: DimensionScore = field(default_factory=DimensionScore)
     latency: DimensionScore = field(default_factory=DimensionScore)
+    context_compliance: DimensionScore = field(default_factory=DimensionScore)
+    """LLM-as-judge: does the output comply with the agent's context guidelines?
+
+    Scored when the agent has one or more loaded contexts (``agent.yaml:
+    contexts: [...]``). The judge checks whether the output respects any
+    constraints, tone, scope, or style instructions in those contexts.
+    Skipped (value=None) for agents without contexts.
+    """
 
     def scored_values(self) -> list[float]:
         """Just the non-None scores, in the canonical dimension order."""
         return [
             d.value
-            for d in (self.accuracy, self.faithfulness, self.coverage, self.latency)
+            for d in (
+                self.accuracy, self.faithfulness, self.coverage,
+                self.latency, self.context_compliance,
+            )
             if d.value is not None
         ]
 
@@ -278,6 +290,7 @@ class DimensionalMeans:
     faithfulness: float | None = None
     coverage: float | None = None
     latency: float | None = None
+    context_compliance: float | None = None
 
 
 @dataclass
@@ -580,6 +593,24 @@ Return ONLY a JSON object on a single line, no prose, no code fences:
 """
 
 
+_CONTEXT_COMPLIANCE_PROMPT = """You are an expert evaluator measuring CONTEXT COMPLIANCE.
+
+Context guidelines the agent was given (these instructions shape what the agent should do):
+{context_text}
+
+Actual output produced by the agent:
+{actual_json}
+
+Score how well the output complies with the spirit and rules in the context:
+- 1.0 = output fully respects every constraint, tone, scope, and style in the context
+- 0.5 = output partially complies; some constraints followed, others ignored or violated
+- 0.0 = output clearly violates the context guidelines (wrong tone, out-of-scope, ignores rules)
+
+Return ONLY a JSON object on a single line, no prose, no code fences:
+{{"score": <float between 0.0 and 1.0>, "rationale": "<brief explanation>"}}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Deterministic per-dimension scoring helpers (module-level, testable
 # without an Executor or LLM)
@@ -677,6 +708,7 @@ def _compute_dimensional_means(cases: list[CaseSummary]) -> DimensionalMeans:
         faithfulness=_mean_for("faithfulness"),
         coverage=_mean_for("coverage"),
         latency=_mean_for("latency"),
+        context_compliance=_mean_for("context_compliance"),
     )
 
 
@@ -778,6 +810,7 @@ class EvalEngine:
                     response=response,
                     judge=judge,
                     agent_call_ms=agent_call_ms,
+                    bundle=bundle,
                 )
                 # The gate uses accuracy alone — back-compat with v0.5.
                 # Faithfulness/coverage/latency are *additional* reporting
@@ -851,8 +884,9 @@ class EvalEngine:
         response: RunResponse,
         judge: JudgeConfig,
         agent_call_ms: int,
+        bundle: AgentBundle,
     ) -> DimensionScores:
-        """Score one successful run on all four dimensions.
+        """Score one successful run on all five dimensions.
 
         Each dim's helper returns a :class:`DimensionScore` (value +
         rationale) or an unscored ``DimensionScore()`` when the case
@@ -883,11 +917,18 @@ class EvalEngine:
             budget_ms=case.latency_budget_ms or agent_call_ms,
         )
 
+        # Context compliance — scored only when the agent has loaded contexts.
+        # The judge checks whether the output respects the context guidelines.
+        context_compliance = DimensionScore()
+        if bundle.contexts:
+            context_compliance = await self._score_context_compliance(actual, bundle, judge)
+
         return DimensionScores(
             accuracy=accuracy,
             faithfulness=faithfulness,
             coverage=coverage,
             latency=latency,
+            context_compliance=context_compliance,
         )
 
     async def _score_accuracy(
@@ -914,6 +955,42 @@ class EvalEngine:
             expected_json=json.dumps(case.expected),
             actual_json=json.dumps(actual),
             rubric=judge.rubric,
+        )
+        req = CompletionRequest(
+            provider=judge.model.provider,
+            messages=[Message(role="user", content=prompt)],
+            params=dict(judge.model.params),
+        )
+        judge_response = await self._provider.complete(req)
+        score, rationale = _parse_judge_response(judge_response.text)
+        return DimensionScore(score, rationale)
+
+    async def _score_context_compliance(
+        self,
+        actual: dict[str, Any],
+        bundle: AgentBundle,
+        judge: JudgeConfig,
+    ) -> DimensionScore:
+        """LLM-judge: does the output comply with the agent's context guidelines?
+
+        Concatenates all loaded context bodies, then asks the judge to
+        score how well the actual output respects those constraints.
+        Same fallback as faithfulness: no judge model → no-score with hint.
+
+        Requires ``bundle.contexts`` to be non-empty — caller checks that.
+        """
+        if judge.model is None:
+            return DimensionScore(
+                None,
+                "skipped: context_compliance needs a judge model — add evals/judge.yaml",
+            )
+
+        context_text = "\n\n---\n\n".join(
+            f"[{name}]\n{body}" for name, body in bundle.contexts
+        )
+        prompt = _CONTEXT_COMPLIANCE_PROMPT.format(
+            context_text=context_text,
+            actual_json=json.dumps(actual),
         )
         req = CompletionRequest(
             provider=judge.model.provider,
