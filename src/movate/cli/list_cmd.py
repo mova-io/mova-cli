@@ -204,16 +204,16 @@ async def _run_list(
             else:
                 _emit_jobs_table(records, full_id=full_id)
         else:
-            records = await _fetch_runs(
+            records = await _fetch_runs(  # type: ignore[assignment]
                 runtime.storage,
                 agent=agent,
                 status=status,
                 limit=limit,
             )
             if json_output:
-                _emit_runs_json(records)
+                _emit_runs_json(records)  # type: ignore[arg-type]
             else:
-                _emit_runs_table(records, full_id=full_id)
+                _emit_runs_table(records, full_id=full_id)  # type: ignore[arg-type]
     finally:
         await shutdown_runtime(runtime.storage, runtime.tracer)
 
@@ -236,7 +236,7 @@ async def _fetch_runs(
     have to thread a Protocol-typed reference through; mypy still
     catches misuse via the method signatures.
     """
-    return await storage.list_runs(  # type: ignore[attr-defined]
+    return await storage.list_runs(  # type: ignore[attr-defined, no-any-return]
         agent=agent,
         status=status,
         limit=limit,
@@ -274,7 +274,7 @@ async def _fetch_jobs(
         results.sort(key=lambda j: j.created_at, reverse=True)
         return results[:limit]
     status_filter = JobStatus(status) if status else None
-    return await storage.list_jobs(  # type: ignore[attr-defined]
+    return await storage.list_jobs(  # type: ignore[attr-defined, no-any-return]
         status=status_filter,
         target=agent,
         limit=limit,
