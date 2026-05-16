@@ -649,8 +649,9 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
     if failed:
         raise typer.Exit(code=2)
 
-    # All-pass success — close the loop. Interactive picker in TTY
-    # mode, static fallback in CI / scripts.
+    # All-pass success — interactive picker (TTY prompts, non-TTY
+    # renders the list as documentation only). One surface for
+    # next-steps; no separate static block.
     if passed > 0:
         first_agent = rows[0][0]
         from movate.cli._next_steps import (  # noqa: PLC0415
@@ -660,36 +661,26 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
         )
 
         bin_name = mdk_bin_name()
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            prompt_next_step(
-                console=console,
-                steps=[
-                    NextStep(
-                        label=f"Quick-run {first_agent!r}",
-                        command=f"{bin_name} run {first_agent} --mock",
-                        argv=[bin_name, "run", first_agent, "--mock"],
-                    ),
-                    NextStep(
-                        label="Serve runtime locally (HTTP)",
-                        command=f"{bin_name} serve",
-                        argv=[bin_name, "serve"],
-                    ),
-                    NextStep(
-                        label="Deploy agents to Azure dev",
-                        command=f"{bin_name} deploy --target dev",
-                        argv=[bin_name, "deploy", "--target", "dev"],
-                    ),
-                ],
-            )
-        else:
-            # Static fallback for CI / scripts — keeps the existing
-            # `Next:` line shape so log-scrapers don't break.
-            console.print(
-                "\n[bold]Next:[/bold]\n"
-                f"  [cyan]{bin_name} run {first_agent}[/cyan] [dim]# one-shot invocation[/dim]\n"
-                f"  [cyan]{bin_name} serve[/cyan]              [dim]# local HTTP runtime[/dim]\n"
-                f"  [cyan]{bin_name} deploy --target dev[/cyan] [dim]# push to Azure[/dim]"
-            )
+        prompt_next_step(
+            console=console,
+            steps=[
+                NextStep(
+                    label=f"Quick-run {first_agent!r}",
+                    command=f"{bin_name} run {first_agent} --mock",
+                    argv=[bin_name, "run", first_agent, "--mock"],
+                ),
+                NextStep(
+                    label="Serve runtime locally (HTTP)",
+                    command=f"{bin_name} serve",
+                    argv=[bin_name, "serve"],
+                ),
+                NextStep(
+                    label="Deploy agents to Azure dev",
+                    command=f"{bin_name} deploy --target dev",
+                    argv=[bin_name, "deploy", "--target", "dev"],
+                ),
+            ],
+        )
 
 
 def _resolve_remote_url(path: str) -> str | None:

@@ -701,21 +701,20 @@ def _init_project(
         # No agents yet. Suggest `add --list` + drop the
         # `--with-agents` discoverability tip so operators see the
         # one-command alternative for next time.
+        # Next-steps live in the shared interactive picker below; the
+        # `--with-agents` tip + API-keys footer stay in-Panel as
+        # informational sidebars (different concerns from "what
+        # command should I run next?").
         body += (
-            f"\n[bold]Next steps:[/bold]\n"
-            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]\n"
-            f"  [dim]$[/dim] [bold]mdk templates list[/bold]"
-            f"   [dim]# browse the 15+ packaged role templates[/dim]\n"
-            f"  [dim]$[/dim] [bold]mdk add rag-qa ticket-triager[/bold]"
-            f"   [dim]# or batch-add any 2-3 roles[/dim]\n\n"
-            f"[dim]Tip: skip the two-step flow next time with [bold]--with-agents[/bold]:[/dim]\n"
-            f"  [dim]$ mdk init <name> --with-agents rag-qa,ticket-triager[/dim]\n\n"
-            f"[dim]API keys: configured globally via "
-            f"[bold]mdk auth login <provider>[/bold] — supported providers: "
-            f"[bold]openai[/bold], [bold]anthropic[/bold], "
-            f"[bold]azure[/bold], [bold]gemini[/bold]. Per-project "
-            f"[bold].env[/bold] still works as an override "
-            f"(see [bold].env.example[/bold]).[/dim]"
+            "\n[dim]Tip: skip the two-step flow next time with "
+            "[bold]--with-agents[/bold]:[/dim]\n"
+            "  [dim]$ mdk init <name> --with-agents rag-qa,ticket-triager[/dim]\n\n"
+            "[dim]API keys: configured globally via "
+            "[bold]mdk auth login <provider>[/bold] — supported providers: "
+            "[bold]openai[/bold], [bold]anthropic[/bold], "
+            "[bold]azure[/bold], [bold]gemini[/bold]. Per-project "
+            "[bold].env[/bold] still works as an override "
+            "(see [bold].env.example[/bold]).[/dim]"
         )
     console.print(
         Panel(
@@ -726,9 +725,11 @@ def _init_project(
         )
     )
 
-    # Interactive 'What next?' picker (TTY only) — same shape as
-    # `mdk add` + `mdk eval --guided`. Skipped under non-TTY so CI
-    # logs keep showing only the static Panel above.
+    # 'Next:' picker — the single next-step surface (renders list in
+    # all modes; prompts only under TTY). The picker is the
+    # canonical answer to "what do I type next?", so we don't ALSO
+    # render a static `Next steps:` block inside the Panel (would
+    # duplicate for interactive operators).
     from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
 
     bin_name = mdk_bin_name()
@@ -741,14 +742,20 @@ def _init_project(
                 argv=[bin_name, "templates", "list"],
             ),
             NextStep(
-                label="Add an agent (FAQ)",
+                label="Add the FAQ agent",
                 command=f"cd {cd_to} && {bin_name} add faq",
                 argv=["sh", "-c", f"cd {cd_to} && {bin_name} add faq"],
             ),
             NextStep(
-                label="Run the menu",
-                command=f"cd {cd_to} && {bin_name} menu",
-                argv=["sh", "-c", f"cd {cd_to} && {bin_name} menu"],
+                label="Add two role agents (rag-qa + ticket-triager)",
+                command=(
+                    f"cd {cd_to} && {bin_name} add rag-qa ticket-triager"
+                ),
+                argv=[
+                    "sh",
+                    "-c",
+                    f"cd {cd_to} && {bin_name} add rag-qa ticket-triager",
+                ],
             ),
         ],
     )

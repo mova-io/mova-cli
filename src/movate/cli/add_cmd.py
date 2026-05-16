@@ -721,19 +721,13 @@ def _add_one(
         body += f"[bold]Contexts:[/bold] [cyan]{ctx_str}[/cyan] (auto-scaffolded)\n"
     if validation_status is not None:
         body += f"[bold]Validates:[/bold] {validation_status}\n"
-    # Pull a real example payload from the agent's dataset.jsonl (if it
-    # ships one) so the operator can copy-paste rather than guess the
-    # input shape. Templates that ship without a dataset fall back to
-    # the literal '{...}' so the next-step still parses as a command.
+    # Real example payload for the interactive picker below. Templates
+    # without a dataset fall back to literal '{...}'. The picker
+    # itself is the next-steps surface — no static block in Panel
+    # body (would duplicate for TTY operators; the picker prints
+    # the same list in non-TTY mode too).
     example_payload = _first_dataset_input(dest)
     rel = dest.relative_to(project_root)
-    body += (
-        f"\n[bold]Next steps:[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk run ./{rel} --mock '{example_payload}'[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk eval ./{rel} --mock --gate 0.7[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk doctor agent {dest.name}[/bold] "
-        f"[dim]# verify wiring (skills/contexts resolve, schema parses)[/dim]"
-    )
     console.print(
         Panel(
             body,
@@ -820,16 +814,7 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
     names_str = ", ".join(f"[cyan]{n}[/cyan]" for n in added_names)
     body = (
         f"[bold]Added {len(added_names)} agents:[/bold] {names_str}\n"
-        f"[bold]Project:[/bold] [dim]{project_root}[/dim]\n"
-        f"\n[bold]Next steps for the workspace:[/bold]\n"
-        f"  [dim]$[/dim] [bold]mdk validate --all[/bold]"
-        f"   [dim]# schema + lint sweep across all agents[/dim]\n"
-        f"  [dim]$[/dim] [bold]mdk eval --all --mock --gate 0.7[/bold]"
-        f"   [dim]# gate every agent against its dataset[/dim]\n"
-        f"  [dim]$[/dim] [bold]mdk doctor agent {added_names[0]}[/bold]"
-        f"   [dim]# per-agent health check[/dim]\n"
-        f"  [dim]$[/dim] [bold]mdk deploy --target {active}[/bold]"
-        f"   [dim]# push runtime image to Azure[/dim]"
+        f"[bold]Project:[/bold] [dim]{project_root}[/dim]"
     )
     console.print(
         Panel(
@@ -838,6 +823,38 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
             title_align="left",
             border_style="green",
         )
+    )
+
+    # Interactive picker — the single next-steps surface for the
+    # batch-add path (no static block inside the Panel; the picker
+    # renders the same list in both TTY and non-TTY modes).
+    from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
+    prompt_next_step(
+        console=console,
+        steps=[
+            NextStep(
+                label="Validate all agents",
+                command=f"{bin_name} validate --all",
+                argv=[bin_name, "validate", "--all"],
+            ),
+            NextStep(
+                label="Eval all agents (mock)",
+                command=f"{bin_name} eval --all --mock --gate 0.7",
+                argv=[bin_name, "eval", "--all", "--mock", "--gate", "0.7"],
+            ),
+            NextStep(
+                label=f"Health-check {added_names[0]!r}",
+                command=f"{bin_name} doctor agent {added_names[0]}",
+                argv=[bin_name, "doctor", "agent", added_names[0]],
+            ),
+            NextStep(
+                label="Deploy agents to Azure",
+                command=f"{bin_name} deploy --target {active}",
+                argv=[bin_name, "deploy", "--target", active],
+            ),
+        ],
     )
 
 
