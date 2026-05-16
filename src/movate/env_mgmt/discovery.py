@@ -114,11 +114,7 @@ def parse_env_example(path: Path) -> list[EnvVarRef]:
         # Needs at least 2 chars (the opening + closing quote) for the
         # check to make sense; single-quote-only strings stay as-is.
         min_quoted_len = 2
-        if (
-            len(value) >= min_quoted_len
-            and value[0] in ('"', "'")
-            and value[-1] == value[0]
-        ):
+        if len(value) >= min_quoted_len and value[0] in ('"', "'") and value[-1] == value[0]:
             value = value[1:-1]
         refs.append(
             EnvVarRef(
