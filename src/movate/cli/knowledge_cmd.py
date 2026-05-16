@@ -308,3 +308,93 @@ def knowledge_validate(
         out.print("\n[green]✓[/green] all eval queries have at least one corpus match.")
     else:
         raise typer.Exit(code=1)
+
+
+@knowledge_app.command("add")
+def knowledge_add(
+    json_entry: str = typer.Option(
+        None,
+        "--json",
+        "-j",
+        help=(
+            "JSON object with entry fields (id, title, symptom, resolution, tags). "
+            "Omit to be prompted interactively."
+        ),
+    ),
+    corpus: str = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help=(
+            "Path to corpus JSON. Defaults to [bold]kb/kb-lookup-corpus.json[/bold] "
+            "in the project root."
+        ),
+    ),
+    project_root: str = typer.Option(
+        ".",
+        "--project-root",
+        envvar="MOVATE_PROJECT_ROOT",
+        hidden=True,
+    ),
+) -> None:
+    """Append one entry to the KB corpus interactively or via --json.
+
+    In a TTY, prompts for each required field. In CI/non-TTY, pass
+    [bold]--json '{"id":"...","title":"...","resolution":"..."}' [/bold].
+
+    Required fields: [bold]id[/bold], [bold]title[/bold], [bold]resolution[/bold].
+    Optional: [bold]symptom[/bold], [bold]tags[/bold].
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk knowledge add[/dim]
+      [dim]$ mdk knowledge add --json '{"id":"KB-042","title":"T","resolution":"R"}'[/dim]
+    """
+    root = Path(project_root).resolve()
+    corpus_path = _resolve_corpus_path(corpus, root)
+
+    if json_entry is not None:
+        try:
+            entry: dict[str, Any] = json.loads(json_entry)
+        except json.JSONDecodeError as exc:
+            err.print(f"[red]✗[/red] --json value is not valid JSON: {exc}")
+            raise typer.Exit(code=2) from None
+        if not isinstance(entry, dict):
+            err.print("[red]✗[/red] --json value must be a JSON object, not an array or scalar.")
+            raise typer.Exit(code=2)
+    else:
+        import sys  # noqa: PLC0415
+
+        if not sys.stdin.isatty():
+            err.print(
+                "[red]✗[/red] not a TTY — pass [bold]--json '{...}'[/bold] with the entry fields."
+            )
+            raise typer.Exit(code=2)
+        out.print("[bold]Add KB corpus entry[/bold] [dim](Ctrl-C to cancel)[/dim]\n")
+        entry = {}
+        entry["id"] = typer.prompt("  id       (e.g. KB-001)")
+        entry["title"] = typer.prompt("  title    (short description)")
+        entry["symptom"] = typer.prompt("  symptom  (what the user observes)", default="")
+        entry["resolution"] = typer.prompt("  resolution (how to fix)")
+        raw_tags = typer.prompt("  tags     (comma-separated, optional)", default="")
+        entry["tags"] = [t.strip() for t in raw_tags.split(",") if t.strip()]
+
+    missing = [f for f in ("id", "title", "resolution") if not entry.get(f)]
+    if missing:
+        err.print(f"[red]✗[/red] missing required fields: {', '.join(missing)}")
+        raise typer.Exit(code=2)
+
+    # Load existing corpus (or start fresh).
+    if corpus_path.is_file():
+        existing = _load_corpus(corpus_path)
+    else:
+        corpus_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+
+    existing.append(entry)
+    corpus_path.write_text(json.dumps(existing, indent=2))
+    out.print(
+        f"[green]✓[/green] added [bold]{entry['id']!r}[/bold] — "
+        f"corpus now has {len(existing)} entr{'y' if len(existing) == 1 else 'ies'} "
+        f"at [dim]{corpus_path}[/dim]"
+    )
