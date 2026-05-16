@@ -681,6 +681,92 @@ class AgentDeletedView(BaseModel):
     restore can ``mv`` it back to the original name."""
 
 
+class AgentDatasetUploadView(BaseModel):
+    """``POST /api/v1/agents/{name}/dataset`` response.
+
+    Returned after a successful dataset upload. Lets callers verify
+    the upload landed correctly before kicking off an eval.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    row_count: int
+    """Number of JSONL rows accepted."""
+    sha256_prefix: str
+    """First 12 hex chars of the SHA-256 of the written file — enough
+    for a quick integrity spot-check without sending the full hash."""
+    preview: list[dict[str, Any]]
+    """First up to 3 rows, for a quick sanity-check in the UI."""
+
+
+# ---------------------------------------------------------------------------
+# Auth key management wire types
+# ---------------------------------------------------------------------------
+
+
+class ApiKeyMintRequest(BaseModel):
+    """``POST /api/v1/auth/keys`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str | None = None
+    """Optional human-readable note (e.g. ``"ci-bot"``)."""
+    ttl_days: int = 90
+    """Validity in days. 0 = no expiry (service-account use)."""
+
+
+class ApiKeyMintedView(BaseModel):
+    """``POST /api/v1/auth/keys`` response.
+
+    ``full_key`` is shown **once** — it is irrecoverable after this
+    response. Callers must store it immediately.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    full_key: str
+    tenant_id: str
+    env: str
+    label: str | None
+    expires_at: datetime | None
+
+
+class ApiKeyView(BaseModel):
+    """One row in ``GET /api/v1/auth/keys`` — no plaintext secret."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    tenant_id: str
+    env: str
+    label: str | None
+    created_at: datetime
+    last_used_at: datetime | None
+    expires_at: datetime | None
+    status: str
+    """``active`` | ``revoked`` | ``expired``"""
+
+
+class ApiKeyListView(BaseModel):
+    """``GET /api/v1/auth/keys`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keys: list[ApiKeyView]
+    count: int
+
+
+class ApiKeyRevokedView(BaseModel):
+    """``DELETE /api/v1/auth/keys/{key_id}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    revoked: bool = True
+
+
 class AgentRunSubmission(BaseModel):
     """``POST /api/v1/agents/{name}/runs`` request body.
 

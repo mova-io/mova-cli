@@ -203,6 +203,67 @@ async def _revoke(key_id: str) -> None:
         await storage.close()
 
 
+@auth_app.command("rotate-key")
+def rotate_key(
+    key_id: str = typer.Argument(..., help="Key id of the key to rotate."),
+    ttl_days: int = typer.Option(
+        90,
+        "--ttl-days",
+        help="Validity of the new key in days. 0 = no expiry.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirm prompt.",
+    ),
+) -> None:
+    """Rotate an API key — mint a fresh one, revoke the old one.
+
+    Prints the new key to stdout once (pipe into your vault).
+    The old key is revoked immediately after the new one is saved, so
+    there is a brief window where both are valid. Use ``--yes`` in
+    automated rotation scripts.
+
+    [bold]Example:[/bold]
+
+      [dim]$ NEW=$(mdk auth rotate-key <key_id> --yes)[/dim]
+    """
+    confirm_destructive(
+        f"Rotate API key {key_id}? The old key will be revoked immediately.",
+        yes=yes,
+    )
+
+    async def _rotate(old_key_id: str) -> str:
+        storage = build_storage()
+        await storage.init()
+        try:
+            old_record = await storage.get_api_key(old_key_id)
+            if old_record is None:
+                error(f"key {old_key_id!r} not found")
+                raise typer.Exit(code=2)
+            if old_record.revoked_at is not None:
+                error(f"key {old_key_id!r} is already revoked")
+                raise typer.Exit(code=2)
+            minted = mint_api_key(
+                tenant_id=old_record.tenant_id,
+                env=old_record.env,
+                label=old_record.label,
+                ttl_days=ttl_days,
+            )
+            await storage.save_api_key(minted.record)
+            await storage.revoke_api_key(old_key_id, tenant_id=old_record.tenant_id)
+            return minted.full_key
+        finally:
+            await storage.close()
+
+    new_key = asyncio.run(_rotate(key_id))
+    stdout.print(new_key, soft_wrap=True, highlight=False)
+    err.print("[yellow]save this now — never shown again[/yellow]")
+    err.print(f"[dim]old key {key_id} revoked[/dim]")
+    success("rotated → new key minted")
+
+
 # ---------------------------------------------------------------------------
 # Provider-key credentials (PR B)
 #

@@ -37,7 +37,7 @@ import hmac
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from movate.core.models import ApiKeyEnv, ApiKeyRecord
 
@@ -48,6 +48,7 @@ TENANT_PREFIX_LEN = 8
 KEY_ID_BYTES = 8  # 8 raw bytes → 13 base32 chars after stripping padding
 SECRET_BYTES = 32  # 256 bits of entropy
 SALT_BYTES = 16
+KEY_DEFAULT_TTL_DAYS = 90
 
 # Token shape: mvt_<env>_<8 alnum>_<10-15 alnum>_<40-50 url-safe-b64>
 # Hard prefix `mvt`, then four underscore-separated segments.
@@ -112,6 +113,7 @@ def mint_api_key(
     tenant_id: str,
     env: ApiKeyEnv,
     label: str | None = None,
+    ttl_days: int = KEY_DEFAULT_TTL_DAYS,
 ) -> MintedApiKey:
     """Generate a new API key for ``tenant_id``.
 
@@ -119,6 +121,11 @@ def mint_api_key(
     so the prefix segment is well-defined; UUIDs satisfy this trivially.
     The full key is assembled but not stored — the caller persists
     ``minted.record`` and shows ``minted.full_key`` exactly once.
+
+    ``ttl_days`` defaults to :data:`KEY_DEFAULT_TTL_DAYS` (90). Pass
+    ``ttl_days=0`` to create a non-expiring key (legacy / service-account
+    use — requires an explicit opt-in so expiry is never accidentally
+    omitted).
     """
     if len(tenant_id) < TENANT_PREFIX_LEN:
         raise ValueError(f"tenant_id must be ≥ {TENANT_PREFIX_LEN} chars; got {len(tenant_id)!r}")
@@ -128,6 +135,8 @@ def mint_api_key(
     salt = _urlsafe_b64(SALT_BYTES)
     secret_hash = hash_secret(secret, salt)
     tenant_prefix = tenant_id[:TENANT_PREFIX_LEN]
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(days=ttl_days) if ttl_days > 0 else None
 
     full_key = f"{KEY_PREFIX}_{env.value}_{tenant_prefix}_{key_id}_{secret}"
     record = ApiKeyRecord(
@@ -137,7 +146,8 @@ def mint_api_key(
         secret_hash=secret_hash,
         salt=salt,
         label=label,
-        created_at=datetime.now(UTC),
+        created_at=now,
+        expires_at=expires_at,
     )
     return MintedApiKey(full_key=full_key, record=record)
 
@@ -226,6 +236,8 @@ def check_record(parsed: ParsedApiKey, record: ApiKeyRecord | None) -> Verificat
         return VerificationFailure(reason="not_found")
     if record.revoked_at is not None:
         return VerificationFailure(reason="revoked")
+    if record.expires_at is not None and record.expires_at < datetime.now(UTC):
+        return VerificationFailure(reason="expired")
     if record.tenant_id[:TENANT_PREFIX_LEN] != parsed.tenant_prefix:
         # Tampered tenant prefix — somebody mangled the key.
         return VerificationFailure(reason="tenant_mismatch")
