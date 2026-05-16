@@ -269,13 +269,16 @@ def _resolve_schema(
 ) -> dict[str, Any]:
     """Resolve one of the two ``schema:`` forms into a JSON Schema dict.
 
-    * **path string** → read the file from disk and parse as JSON.
-      Original behavior; still preferred for complex contracts.
-    * **inline shorthand dict** → compile via
-      :func:`compile_shorthand`. Strict-by-default object schema,
-      same downstream API.
+    * **path string** → read the file from disk. Three file types:
+      ``.json`` is parsed as JSON Schema (canonical, unchanged from
+      v0.x). ``.yaml`` / ``.yml`` are parsed as YAML — if the YAML
+      looks like a JSON Schema (top-level ``type``/``properties`` or
+      ``$schema``) it's used verbatim; otherwise it's treated as
+      :func:`compile_shorthand` shorthand and compiled to JSON Schema.
+    * **inline shorthand dict** → compile via :func:`compile_shorthand`.
+      Strict-by-default object schema, same downstream API.
 
-    Validation errors from either path are normalized to
+    Validation errors from any path are normalized to
     :class:`AgentLoadError` so the CLI surfaces one consistent
     error surface to operators.
     """
@@ -284,17 +287,65 @@ def _resolve_schema(
             return compile_shorthand(raw, root_label=label)
         except SchemaShorthandError as exc:
             raise AgentLoadError(f"inline schema shorthand error: {exc}") from exc
-    # Path string — resolve relative to the agent dir and read.
-    return _load_json(agent_dir / raw)
+    # Path string — resolve relative to the agent dir + parse by extension.
+    return _load_schema_doc(agent_dir / raw, label=label)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_schema_doc(path: Path, *, label: str) -> dict[str, Any]:
+    """Load a schema file from disk; dispatch on extension + shape.
+
+    Supports:
+
+    * ``.json`` — parsed as JSON; assumed to be a full JSON Schema
+      (the v0.x canonical path; unchanged for backwards-compat).
+    * ``.yaml`` / ``.yml`` — parsed as YAML, then shape-sniffed:
+      a top-level ``$schema`` field or a ``type=object`` paired with
+      ``properties`` marks it as a hand-written JSON Schema (used
+      verbatim); anything else is treated as the readable shorthand
+      and run through :func:`compile_shorthand`.
+    """
     if not path.exists():
         raise AgentLoadError(f"schema file not found: {path}")
+    text = path.read_text()
+    suffix = path.suffix.lower()
+    # `.json` is unambiguous: always a hand-written JSON Schema (the
+    # v0.x canonical path). Operators don't write shorthand in JSON
+    # — they write it inline in agent.yaml, or in a .yaml file. Routing
+    # .json through the shorthand compiler would mis-classify legitimate
+    # JSON Schemas with non-`object` roots or `additionalProperties: true`.
+    if suffix == ".json":
+        try:
+            data: Any = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AgentLoadError(f"invalid JSON in {path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise AgentLoadError(
+                f"schema {path} must be a top-level object, got {type(data).__name__}"
+            )
+        return data
+    if suffix not in (".yaml", ".yml"):
+        raise AgentLoadError(
+            f"schema file extension {suffix!r} not supported (use .json, .yaml, .yml): {path}"
+        )
     try:
-        data: Any = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise AgentLoadError(f"invalid JSON in {path}: {exc}") from exc
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise AgentLoadError(f"invalid YAML in {path}: {exc}") from exc
     if not isinstance(data, dict):
-        raise AgentLoadError(f"schema {path} must be a JSON object, got {type(data).__name__}")
-    return data
+        raise AgentLoadError(
+            f"schema {path} must be a top-level object, got {type(data).__name__}"
+        )
+    # Shape-sniff to decide: hand-written JSON Schema vs shorthand?
+    # `$schema` is the unambiguous marker; `type: object` + `properties`
+    # is the convention for hand-written schemas (matches what's
+    # produced when compile_shorthand runs). Anything else → shorthand.
+    is_json_schema = "$schema" in data or (data.get("type") == "object" and "properties" in data)
+    if is_json_schema:
+        return data
+    # Shorthand path — compile to JSON Schema. Use the file path as the
+    # error-message label so operators see the exact file, not just
+    # "input"/"output".
+    try:
+        return compile_shorthand(data, root_label=f"{label} ({path.name})")
+    except SchemaShorthandError as exc:
+        raise AgentLoadError(f"schema shorthand error in {path}: {exc}") from exc

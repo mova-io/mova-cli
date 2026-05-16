@@ -1,0 +1,12 @@
+# Input contract — what the lead-qualifier agent receives.
+# Shorthand form: `field: type`. Compiled to JSON Schema at load time.
+# See contexts/README.md (or `mdk help schema`) for the full syntax;
+# the dialect supports ranges (`integer(0..3)`), enums (`a|b|c`),
+# arrays (`[type]`), optional fields (`field: string?`), and refs
+# (`$<defs-name>` with a top-level `$defs:` block).
+
+name:    string(1..)
+company: string(1..)
+title:   string(1..)
+source:  webform|demo_request|content_download|outbound|referral|event|other
+message: string(1..)
