@@ -147,7 +147,7 @@ def add(
     )
 
 
-def _load_yaml(path: Path) -> dict:
+def _load_yaml(path: Path) -> dict[str, object]:
     """Read existing YAML, returning empty dict if absent or empty."""
     if not path.is_file():
         return {}

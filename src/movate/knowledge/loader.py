@@ -126,7 +126,7 @@ def _parse_config(path: Path) -> KnowledgeConfig:
     )
 
 
-def _ingest_document(entry: dict, *, knowledge_root: Path | None) -> Document:
+def _ingest_document(entry: dict[str, object], *, knowledge_root: Path | None) -> Document:
     """Resolve a single document entry → loaded body → :class:`Document`.
 
     Validates required fields (id + path), resolves the path relative
