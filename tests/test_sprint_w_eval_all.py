@@ -121,7 +121,11 @@ class TestEvalAllFailurePath:
         """An agent that fails its gate produces a red row in the
         project eval table AND --all exits 2 overall."""
         proj = _bootstrap_with_agent(tmp_path, monkeypatch)
-        # Run with an aggressive gate that mock data can't pass.
+        # Post-PR-#104 the mock auto-conforms to dataset expecteds so
+        # eval scores 1.0 by default. Force a non-conforming response
+        # via the env override so the gate genuinely fails — that's
+        # what this test means by "agent fails its gate."
+        monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"unexpected_field": "wrong"}')
         result = runner.invoke(
             app,
             ["eval", "--all", "--mock", "--gate", "1.0"],

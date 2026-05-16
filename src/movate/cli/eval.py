@@ -694,6 +694,15 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     remote_api_key: str | None = None,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
+    # Dataset-aware mock (PR #104): when running --mock, configure
+    # the MockProvider to return dataset[*].expected per call. The
+    # eval engine iterates dataset rows in order, so the mock's
+    # per-call cycle matches case-by-case — every case gets the
+    # exactly-right expected output and scoring passes. Without this
+    # the mock returns `{"message": "mock"}` for every case and ALL
+    # cases fail schema validation (the previous demo annoyance).
+    if mock:
+        _configure_mock_for_bundle(rt.provider, bundle)
     # When path was a URL, swap the local in-process Executor for a
     # RemoteExecutor that submits each case as a job and polls. The
     # local runtime is still built because we need its provider (for
@@ -1307,3 +1316,27 @@ def _maybe_eval_progress(
             advance(total=total, suffix=f" (mean={mean:.2f})")
 
         yield on_case
+
+
+def _configure_mock_for_bundle(provider: object, bundle: AgentBundle) -> None:
+    """If ``provider`` is a :class:`MockProvider` and ``bundle`` ships an
+    evals dataset, configure the mock to cycle through the dataset's
+    ``expected`` outputs in order. See PR #104 — keeps ``mdk eval --mock``
+    from failing every case on schema_error against templates with
+    non-trivial output schemas (lead-qualifier, ticket-triager, etc.).
+
+    Mirrors the same helper in ``run.py``. Lives here (rather than in a
+    shared module) because both call-sites are short + the import surface
+    of ``movate.providers.mock`` is intentionally narrow.
+    """
+    from movate.providers.mock import MockProvider, load_dataset_expecteds  # noqa: PLC0415
+
+    if not isinstance(provider, MockProvider):
+        return
+    dataset_decl = getattr(bundle.spec.evals, "dataset", None) if bundle.spec.evals else None
+    if not dataset_decl:
+        return
+    dataset_path = (bundle.agent_dir / dataset_decl).resolve()
+    expecteds = load_dataset_expecteds(dataset_path)
+    if expecteds:
+        provider.configure_dataset(expecteds)
