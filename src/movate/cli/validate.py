@@ -7,6 +7,7 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import typer
@@ -16,9 +17,9 @@ from rich.table import Table
 from movate.cli._completion import complete_agent_path
 from movate.cli._resolve import walk_up_for_project_root
 from movate.cli._workflow_path import is_workflow_path
-from movate.core.config import load_project_config
+from movate.core.config import PROJECT_MARKER_FILES, load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
-from movate.core.loader import AgentLoadError, load_agent
+from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import AgentRuntime, SkillImplementationKind
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
@@ -226,6 +227,14 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
             rows.append(("workflow", workflow_dir.name, "failed", ""))
             failed += 1
 
+    # Orphaned-asset scan: contexts + skills that exist on disk but
+    # aren't declared by any agent. Runs after per-agent validation so
+    # the operator sees both "your agent is broken" and "you also have
+    # unused files" in one pass. Skipped on total failure — if every
+    # agent failed to load we can't distinguish declared from orphaned.
+    if failed < len(rows):
+        _check_orphaned_assets(project_root, agent_dirs)
+
     # Render the summary table.
     table = Table(
         title=(
@@ -407,6 +416,8 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
                 "first use, not here."
             )
 
+    _check_kb_corpus(bundle)
+
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
     # the operator sees lint findings even when the schema check
@@ -462,6 +473,110 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     has_warnings = any(i.severity == "warning" for i in lint_issues)
     if has_errors or (strict and has_warnings):
         raise typer.Exit(code=2)
+
+
+def _find_project_root_from_bundle(bundle: AgentBundle) -> Path | None:
+    """Walk up from bundle.agent_dir to find the project root."""
+    for parent in (bundle.agent_dir, *bundle.agent_dir.parents):
+        if any((parent / m).is_file() for m in PROJECT_MARKER_FILES):
+            return parent
+    return None
+
+
+def _check_kb_corpus(bundle: AgentBundle) -> None:
+    """Warn when a kb-lookup skill is declared but the project corpus is missing.
+
+    The skill silently falls back to the bundled demo corpus when
+    ``<project>/kb/kb-lookup-corpus.json`` doesn't exist. Operators
+    doing this for the first time won't notice — this surfaces it.
+    """
+    kb_skills = [s for s in bundle.skills if "kb" in s.spec.name.lower()]
+    if not kb_skills:
+        return
+    project_root = _find_project_root_from_bundle(bundle)
+    if project_root is None:
+        return
+    corpus_path = project_root / "kb" / "kb-lookup-corpus.json"
+    if corpus_path.is_file():
+        return
+    for skill in kb_skills:
+        console.print(
+            f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold]: "
+            f"[bold]kb/kb-lookup-corpus.json[/bold] not found — "
+            "skill will use the bundled demo corpus at runtime."
+        )
+    console.print(
+        f"    [dim]hint: drop your real corpus at "
+        f"[bold]{project_root / 'kb' / 'kb-lookup-corpus.json'}[/bold][/dim]"
+    )
+
+
+_CTX_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+def _check_orphaned_assets(project_root: Path, agent_dirs: list[Path]) -> None:
+    """Warn about contexts and skills that exist on disk but no agent declares.
+
+    An orphaned asset isn't an error — it could be staged for future use.
+    But it's the most common source of "I added the file and nothing changed"
+    confusion, so surfacing it at validate time closes the feedback loop.
+    """
+    # Collect all declared names across every loadable agent.
+    declared_contexts: set[str] = set()
+    declared_skills: set[str] = set()
+    for agent_dir in agent_dirs:
+        try:
+            b = load_agent(agent_dir)
+            declared_contexts.update(b.spec.contexts or [])
+            declared_skills.update(s.spec.name for s in b.skills)
+        except AgentLoadError:
+            pass  # already reported by per-agent validation
+
+    # Orphaned contexts: files in contexts/ not declared by any agent.
+    # Skip README / documentation files (stem contains uppercase or
+    # doesn't follow the lowercase-hyphen context naming convention).
+    ctx_dir = project_root / "contexts"
+    if ctx_dir.is_dir():
+        orphaned = sorted(
+            f for f in ctx_dir.glob("*.md")
+            if _CTX_NAME_RE.match(f.stem) and f.stem not in declared_contexts
+        )
+        for f in orphaned:
+            console.print(
+                f"  [yellow]![/yellow] [bold]contexts/{f.name}[/bold] exists but "
+                "is not declared by any agent."
+            )
+            console.print(
+                f"    [dim]hint: add [bold]{f.stem!r}[/bold] to "
+                "[bold]agent.yaml: contexts:[/bold], or run "
+                "[bold]mdk add context[/bold] to scaffold a declaration.[/dim]"
+            )
+
+    # Orphaned skills: directories in skills/ not declared by any agent.
+    skills_dir = project_root / "skills"
+    if skills_dir.is_dir():
+        for skill_dir in sorted(skills_dir.iterdir()):
+            if not skill_dir.is_dir() or not (skill_dir / "skill.yaml").is_file():
+                continue
+            # Read name from skill.yaml to compare against declared_skills
+            # (directory name may differ from spec.name).
+            try:
+                import yaml as _yaml  # noqa: PLC0415
+                raw = _yaml.safe_load((skill_dir / "skill.yaml").read_text())
+                skill_name = (
+                    raw.get("name", skill_dir.name) if isinstance(raw, dict) else skill_dir.name
+                )
+            except Exception:
+                skill_name = skill_dir.name
+            if skill_name not in declared_skills:
+                console.print(
+                    f"  [yellow]![/yellow] skill [bold]{skill_name!r}[/bold] is registered "
+                    "but not declared by any agent."
+                )
+                console.print(
+                    f"    [dim]hint: add [bold]{skill_name!r}[/bold] to "
+                    "[bold]agent.yaml: skills:[/bold] to use it.[/dim]"
+                )
 
 
 def _render_lint_issues(issues: list[LintIssue]) -> None:
