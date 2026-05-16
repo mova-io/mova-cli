@@ -326,13 +326,19 @@ class TestAuthStatus:
             "MOVATE_DEPLOY_WEBHOOK",
         ):
             monkeypatch.delenv(key, raising=False)
+        # PR #112 added a Runtime Targets section to `mdk auth status`
+        # that reads ~/.movate/config.yaml. Isolate it too so this test
+        # doesn't depend on whatever targets the operator's real
+        # machine has configured.
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(isolated_creds.parent / "config.yaml"))
         result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         for env_var in PROVIDER_KEY_ENV_VARS:
             assert env_var in result.stdout
         assert "not set" in result.stdout.lower()
         # Greppable summary line: 5 provider env vars + 3 notification
-        # env vars = 8 unset total.
+        # env vars = 8 unset total (no runtime targets configured in
+        # the isolated config path).
         assert "mdk_auth_status_summary:" in result.stdout
         assert "set=0" in result.stdout
         assert "unset=8" in result.stdout
@@ -346,6 +352,10 @@ class TestAuthStatus:
             "MOVATE_DEPLOY_WEBHOOK",
         ):
             monkeypatch.delenv(key, raising=False)
+        # PR #112 — isolate user config path so the Runtime Targets
+        # section doesn't bleed in counts from the operator's real
+        # ~/.movate/config.yaml.
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(isolated_creds.parent / "config.yaml"))
         CredentialsStore().set("OPENAI_API_KEY", "sk-test")
         # The mdk CLI runs autoload at startup, but CliRunner does NOT
         # re-import main.py — we need to manually re-autoload before
