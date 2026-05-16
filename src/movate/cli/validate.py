@@ -20,7 +20,7 @@ from movate.cli._workflow_path import is_workflow_path
 from movate.core.config import PROJECT_MARKER_FILES, load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
-from movate.core.models import AgentRuntime, SkillImplementationKind
+from movate.core.models import AgentRuntime, SkillImplementationKind, SkillSpec
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
@@ -416,7 +416,45 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
                 "first use, not here."
             )
 
+    # Python skill impl.py reachability. The loader validates skill.yaml
+    # via SkillSpec but never imports the module — a missing impl.py
+    # only surfaces as ModuleNotFoundError on the first call. Catch it
+    # here so the operator learns at validate time, not at runtime.
+    for skill in bundle.skills:
+        if (
+            skill.spec.implementation.kind == SkillImplementationKind.PYTHON
+            and not (skill.skill_dir / "impl.py").is_file()
+        ):
+                console.print(
+                    f"  [red]✗[/red] skill [bold]{skill.spec.name!r}[/bold]: "
+                    f"[bold]impl.py[/bold] not found in [dim]{skill.skill_dir}[/dim] — "
+                    "skill will raise ModuleNotFoundError at runtime."
+                )
+                console.print(
+                    "    [dim]hint: create [bold]impl.py[/bold] with an async "
+                    "[bold]run(input, ctx)[/bold] function, or use "
+                    "[bold]mdk add <template>[/bold] to scaffold one.[/dim]"
+                )
+                raise typer.Exit(code=2)
+
     _check_kb_corpus(bundle)
+
+    # Context size advisory. Contexts are prepended to the system prompt
+    # on every call; a large context silently inflates token spend.
+    for ctx_name, ctx_body in bundle.contexts:
+        size = len(ctx_body.encode())
+        if size >= _CTX_ERROR_BYTES:
+            console.print(
+                f"  [red]✗[/red] context [bold]{ctx_name!r}[/bold] is "
+                f"{size:,} bytes — exceeds the {_CTX_ERROR_BYTES:,}-byte limit. "
+                "Trim it or split into multiple narrower contexts."
+            )
+            raise typer.Exit(code=2)
+        if size >= _CTX_ADVISORY_BYTES:
+            console.print(
+                f"  [yellow]![/yellow] context [bold]{ctx_name!r}[/bold] is "
+                f"{size:,} bytes — large contexts inflate token spend on every call."
+            )
 
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
@@ -484,12 +522,16 @@ def _find_project_root_from_bundle(bundle: AgentBundle) -> Path | None:
 
 
 def _check_kb_corpus(bundle: AgentBundle) -> None:
-    """Warn when a kb-lookup skill is declared but the project corpus is missing.
+    """Warn when a kb-lookup skill is declared but the project corpus is missing
+    or contains entries that lack required fields.
 
-    The skill silently falls back to the bundled demo corpus when
-    ``<project>/kb/kb-lookup-corpus.json`` doesn't exist. Operators
-    doing this for the first time won't notice — this surfaces it.
+    Two checks:
+    1. File absent → skill falls back to demo corpus silently.
+    2. File present but entries missing ``id``/``title``/``resolution`` → skill
+       raises KeyError or returns empty matches at eval/run time.
     """
+    import json as _json  # noqa: PLC0415
+
     kb_skills = [s for s in bundle.skills if "kb" in s.spec.name.lower()]
     if not kb_skills:
         return
@@ -497,21 +539,74 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
     if project_root is None:
         return
     corpus_path = project_root / "kb" / "kb-lookup-corpus.json"
-    if corpus_path.is_file():
-        return
-    for skill in kb_skills:
+    if not corpus_path.is_file():
+        for skill in kb_skills:
+            console.print(
+                f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold]: "
+                f"[bold]kb/kb-lookup-corpus.json[/bold] not found — "
+                "skill will use the bundled demo corpus at runtime."
+            )
         console.print(
-            f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold]: "
-            f"[bold]kb/kb-lookup-corpus.json[/bold] not found — "
-            "skill will use the bundled demo corpus at runtime."
+            f"    [dim]hint: drop your real corpus at "
+            f"[bold]{corpus_path}[/bold][/dim]"
         )
-    console.print(
-        f"    [dim]hint: drop your real corpus at "
-        f"[bold]{project_root / 'kb' / 'kb-lookup-corpus.json'}[/bold][/dim]"
-    )
+        return
+
+    # Corpus exists — validate entry fields.
+    try:
+        entries = _json.loads(corpus_path.read_text())
+    except (OSError, _json.JSONDecodeError) as exc:
+        console.print(
+            f"  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            f"could not be parsed: {exc}"
+        )
+        return
+    if not isinstance(entries, list):
+        console.print(
+            "  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            "must be a JSON array."
+        )
+        return
+    bad: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            bad.append("<non-object entry>")
+            continue
+        missing = _CORPUS_REQUIRED_FIELDS - entry.keys()
+        if missing:
+            entry_id = entry.get("id", "<no-id>")
+            bad.append(f"{entry_id!r} (missing: {sorted(missing)})")
+        if len(bad) >= _CORPUS_MAX_REPORTED_ERRORS:
+            break  # cap output — rest of corpus may also have issues
+    if bad:
+        console.print(
+            f"  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            f"has entries missing required fields "
+            f"({', '.join(sorted(_CORPUS_REQUIRED_FIELDS))}):"
+        )
+        for label in bad:
+            console.print(f"    [dim]·[/dim] {label}")
+        if len(entries) > _CORPUS_MAX_REPORTED_ERRORS:
+            console.print(
+                f"    [dim]… and possibly more "
+                f"(checked first {_CORPUS_MAX_REPORTED_ERRORS} offenders)[/dim]"
+            )
 
 
 _CTX_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+# Context size thresholds. Contexts are prepended to the system prompt
+# on every call — large ones silently eat token budget. The advisory
+# fires at 4 KB (noticeable cost impact), the error at 16 KB (more
+# than a typical system prompt itself; almost certainly a mistake).
+_CTX_ADVISORY_BYTES: int = 4_096
+_CTX_ERROR_BYTES: int = 16_384
+
+# Minimum required fields in a KB corpus entry. The kb-lookup skill
+# uses all three for scoring + response construction; missing any one
+# causes a KeyError or empty-match at eval/run time.
+_CORPUS_REQUIRED_FIELDS: frozenset[str] = frozenset({"id", "title", "resolution"})
+_CORPUS_MAX_REPORTED_ERRORS: int = 3
 
 
 def _check_orphaned_assets(project_root: Path, agent_dirs: list[Path]) -> None:
@@ -553,19 +648,30 @@ def _check_orphaned_assets(project_root: Path, agent_dirs: list[Path]) -> None:
             )
 
     # Orphaned skills: directories in skills/ not declared by any agent.
+    # Also validates skill.yaml against SkillSpec so malformed orphan
+    # skills are caught before someone declares them in agent.yaml.
     skills_dir = project_root / "skills"
     if skills_dir.is_dir():
         for skill_dir in sorted(skills_dir.iterdir()):
             if not skill_dir.is_dir() or not (skill_dir / "skill.yaml").is_file():
                 continue
-            # Read name from skill.yaml to compare against declared_skills
-            # (directory name may differ from spec.name).
             try:
                 import yaml as _yaml  # noqa: PLC0415
+                from pydantic import ValidationError as _PydanticVE  # noqa: PLC0415
+
                 raw = _yaml.safe_load((skill_dir / "skill.yaml").read_text())
-                skill_name = (
-                    raw.get("name", skill_dir.name) if isinstance(raw, dict) else skill_dir.name
-                )
+                try:
+                    parsed_spec = SkillSpec.model_validate(raw) if isinstance(raw, dict) else None
+                    skill_name = parsed_spec.name if parsed_spec else skill_dir.name
+                except _PydanticVE as ve:
+                    # Malformed skill.yaml — emit an error regardless of
+                    # whether the skill is declared, since declaring a broken
+                    # skill causes an AgentLoadError anyway.
+                    console.print(
+                        f"  [red]✗[/red] [bold]skills/{skill_dir.name}/skill.yaml[/bold] "
+                        f"failed SkillSpec validation: {ve}"
+                    )
+                    continue
             except Exception:
                 skill_name = skill_dir.name
             if skill_name not in declared_skills:
