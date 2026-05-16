@@ -404,6 +404,26 @@ def _compile_field(  # noqa: PLR0912 — type dispatcher; branch count reflects 
     if "ui" in spec:
         schema["x-mdk-ui"] = spec["ui"]
 
+    # `nullable: true` — widen the underlying type so the value can
+    # legitimately be JSON null. Canonical idiom: a field where the
+    # business meaning is "we may not have this info" (e.g.
+    # `email: { type: email, nullable: true }` → "either a valid
+    # email, or null when not known").
+    #
+    # JSON Schema 2020-12 expresses this via `type: [<base>, "null"]`
+    # — same shape the legacy hand-written schemas use. We also
+    # propagate `null` to the enum so `type: enum + nullable: true`
+    # actually accepts null (otherwise the enum constraint blocks it).
+    if spec.get("nullable") is True:
+        base_type = schema.get("type")
+        if isinstance(base_type, str):
+            schema["type"] = [base_type, "null"]
+        elif isinstance(base_type, list) and "null" not in base_type:
+            schema["type"] = [*base_type, "null"]
+        # For enums: append null to the values list so `null` validates.
+        if "enum" in schema and None not in schema["enum"]:
+            schema["enum"] = [*schema["enum"], None]
+
     return schema
 
 

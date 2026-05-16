@@ -1,0 +1,28 @@
+# ============================================================================
+# MDK Canonical Schema — Extractor (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Extractor Input
+description: >
+  Unstructured text to extract typed fields from. Typically an email
+  body, a support-ticket description, or a meeting transcript snippet.
+
+fields:
+
+  text:
+    type: markdown
+    description: >
+      The unstructured text to extract fields from. The agent's
+      output schema decides what gets pulled out.
+    min_length: 1
+    ui: textarea
+    example: >
+      Hi, this is Sarah Chen from Acme Corp. Our login API has been
+      down for 30 minutes — this is super urgent. Please email me
+      at sarah@acme.example.
+
+required:
+  - text

@@ -1,0 +1,46 @@
+# ============================================================================
+# MDK Canonical Schema — Code Reviewer (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Code Review Input
+description: >
+  A unified diff plus the source language. The agent returns a
+  structured review with verdict (approve / request-changes / comment)
+  and per-finding annotations.
+
+fields:
+
+  diff:
+    type: markdown
+    description: Unified-diff format. Patch hunks the agent reviews.
+    min_length: 1
+    ui: textarea
+    example: |
+      diff --git a/src/main.py b/src/main.py
+      @@ -1,3 +1,4 @@
+       def hello():
+      +    print("hi")
+           return None
+
+  language:
+    type: enum
+    description: Source language of the diff. Drives review heuristics.
+    values:
+      - python
+      - typescript
+      - javascript
+      - go
+      - rust
+      - java
+      - kotlin
+      - csharp
+      - sql
+      - yaml
+      - other
+
+required:
+  - diff
+  - language
