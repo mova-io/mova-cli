@@ -6,6 +6,7 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import typer
@@ -13,11 +14,12 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._completion import complete_agent_path
+from movate.cli._resolve import walk_up_for_project_root
 from movate.cli._workflow_path import is_workflow_path
 from movate.core.config import load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
 from movate.core.loader import AgentLoadError, load_agent
-from movate.core.models import AgentRuntime
+from movate.core.models import AgentRuntime, SkillImplementationKind
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
@@ -153,24 +155,6 @@ def validate(
         _validate_agent(path, strict=strict, run_linter=not no_lint)
 
 
-def _resolve_project_root() -> Path | None:
-    """Walk up from cwd looking for ``movate.yaml`` — same convention
-    used by ``mdk add`` / ``mdk snapshot`` / ``mdk diff``.
-
-    Local to validate.py to avoid an import cycle through ``mdk add``
-    (which is the canonical owner of the walk-up routine).
-    """
-    from movate.core.config import is_project_root  # noqa: PLC0415
-
-    current = Path.cwd().resolve()
-    while True:
-        if is_project_root(current):
-            return current
-        if current.parent == current:
-            return None
-        current = current.parent
-
-
 def _validate_all(*, strict: bool, run_linter: bool) -> None:
     """Validate every agent + workflow in the current project.
 
@@ -185,7 +169,7 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     lets CI tail one stable token to learn workspace-level
     validation health.
     """
-    project_root = _resolve_project_root()
+    project_root = walk_up_for_project_root()
     if project_root is None:
         console.print(
             "[red]✗[/red] not inside a movate project. "
@@ -315,6 +299,11 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
         bundle = load_agent(path)
     except AgentLoadError as exc:
         console.print(f"[red]✗ validation failed:[/red] {exc}")
+        if "contexts resolution failed" in str(exc):
+            console.print(
+                "[dim]  hint: run [bold]mdk add context <name>[/bold] "
+                "to create the missing context.[/dim]"
+            )
         raise typer.Exit(code=2) from None
 
     spec = bundle.spec
@@ -393,6 +382,31 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             )
             raise typer.Exit(code=2)
 
+    # HTTP / MCP skill backend advisory. Both backends are implemented
+    # but require external resources (a URL / a subprocess command) that
+    # can't be validated statically. Warn the operator so they know a
+    # runtime failure is possible and what to check.
+    for skill in bundle.skills:
+        impl = skill.spec.implementation
+        if impl.kind == SkillImplementationKind.HTTP:
+            console.print(
+                f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold] uses "
+                "[bold]kind: http[/bold] — endpoint reachability is checked at first use, not here."
+            )
+            if impl.auth and impl.auth.startswith("bearer-from-env:"):
+                env_var = impl.auth.split(":", 1)[1]
+                if not os.environ.get(env_var):
+                    console.print(
+                        f"    [yellow]![/yellow] env var [bold]{env_var}[/bold] is unset "
+                        f"— set it before running this agent."
+                    )
+        elif impl.kind == SkillImplementationKind.MCP:
+            console.print(
+                f"  [yellow]![/yellow] skill [bold]{skill.spec.name!r}[/bold] uses "
+                "[bold]kind: mcp[/bold] — subprocess availability is checked at "
+                "first use, not here."
+            )
+
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
     # the operator sees lint findings even when the schema check
@@ -418,8 +432,10 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     # empty dataset. The estimate_eval_cost helper returns None in
     # every "skip" case so this stays a single conditional.
     try:
-        forecast = estimate_eval_cost(bundle, pricing=load_pricing())
+        pricing = load_pricing()
+        forecast = estimate_eval_cost(bundle, pricing=pricing)
     except Exception:  # pragma: no cover — defensive; load_pricing rarely fails
+        pricing = None
         forecast = None
     if forecast is not None:
         console.print(
@@ -428,6 +444,17 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             f"~{forecast.input_tokens_per_call} in + "
             f"~{forecast.output_tokens_per_call} out tokens)[/dim]"
         )
+    elif pricing is not None and bundle.spec.evals.dataset:
+        # Dataset is configured but we couldn't produce a forecast.
+        # Most common cause: the model isn't in the pricing table.
+        # Let the operator know rather than staying silent.
+        model_provider = bundle.spec.model.provider
+        if model_provider not in pricing.models:
+            console.print(
+                f"  [yellow]![/yellow] eval cost: no pricing entry for "
+                f"[bold]{model_provider!r}[/bold] — add it to "
+                "providers/pricing.yaml for a forecast."
+            )
 
     # Exit non-zero if there are real errors (always) or warnings
     # under --strict (CI gate mode).
