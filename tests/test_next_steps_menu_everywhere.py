@@ -38,16 +38,19 @@ runner = CliRunner(mix_stderr=False)
 
 @pytest.mark.unit
 class TestPromptNextStepHelper:
-    def test_no_op_on_non_tty(self) -> None:
-        """Default: stdin/stdout aren't TTYs (pytest), helper returns
-        immediately without rendering anything."""
+    def test_renders_list_under_non_tty(self) -> None:
+        """Post-PR-#106 the helper renders the `Next:` list in BOTH
+        TTY and non-TTY modes — only the prompt is gated. Non-TTY
+        callers get the list as documentation; scripts can grep it."""
         out = Console(record=True)
         prompt_next_step(
             console=out,
-            steps=[NextStep(label="x", command="mdk x", argv=["mdk", "x"])],
+            steps=[NextStep(label="Foo", command="mdk foo", argv=["mdk", "foo"])],
         )
-        # Nothing rendered.
-        assert out.export_text() == ""
+        rendered = out.export_text()
+        assert "Next:" in rendered
+        assert "Foo" in rendered
+        assert "mdk foo" in rendered
 
     def test_no_op_on_empty_steps(self) -> None:
         out = Console(record=True)
@@ -106,25 +109,25 @@ def test_eval_all_renders_static_next_under_non_tty(
 
 
 @pytest.mark.unit
-def test_init_does_not_render_menu_under_non_tty(
+def test_init_renders_next_steps_under_non_tty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`mdk init` keeps its existing Panel + static next-steps block
-    in the Panel body. The new helper call is gated on TTY — under
-    pytest it's silent."""
+    """Post-PR-#106 the helper renders the `Next:` list in both
+    modes (only the prompt is TTY-gated). Under pytest (non-TTY)
+    we should see the numbered list as documentation, but no
+    interactive prompt fires."""
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "demo", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    # The Panel's own `Next steps:` block (existing pre-PR-#105) is
-    # still rendered — operators reading captured output still see
-    # what to do next.
-    assert "Next steps:" in result.stdout
-    # The interactive picker's `[1]`-style cyan markers are NOT
-    # rendered (no TTY).
-    interactive_marker_count = result.stdout.count("[1]")
-    # If the menu fired, we'd see at least 1 `[N]` row. Allow up to
-    # 1 in case some other Panel uses the same shape (paranoid check).
-    assert interactive_marker_count <= 1
+    # Helper's `Next:` list rendered.
+    assert "Next:" in result.stdout
+    # Numbered rows present.
+    assert "[1]" in result.stdout
+    # Skip marker too (proof the helper got past the early return).
+    assert "[s]" in result.stdout
+    # The legacy duplicate `Next steps:` block (inside Panel body)
+    # is GONE. Asserting on the legacy string catches regressions.
+    assert "Next steps:" not in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -137,16 +140,20 @@ def test_add_menu_uses_shared_helper_no_regression(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression check: PR #105 refactored `mdk add`'s inline menu
-    to use the shared helper. The non-TTY path must still show the
-    static `Next steps:` block in the Panel (unchanged behavior)."""
+    to use the shared helper. Post-PR-#106 the helper's `Next:`
+    list renders in both modes; the legacy in-Panel `Next steps:`
+    block is gone."""
     monkeypatch.chdir(tmp_path)
     runner.invoke(app, ["init", "p", "--skip-snapshot"], env={"COLUMNS": "200"})
     monkeypatch.chdir(tmp_path / "p")
     result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    # Static `Next steps:` from the Panel body still rendered.
-    assert "Next steps:" in result.stdout
-    # Interactive menu NOT rendered (non-TTY).
+    # Helper-rendered `Next:` surface present.
+    assert "Next:" in result.stdout
+    # Legacy in-Panel `Next steps:` block GONE (would be a regression).
+    assert "Next steps:" not in result.stdout
+    # Legacy `What next?` header from PR #101's inline version also
+    # gone — the helper uses `Next:`.
     assert "What next?" not in result.stdout
 
 

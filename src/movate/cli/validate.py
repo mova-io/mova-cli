@@ -273,13 +273,10 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
     if failed:
         raise typer.Exit(code=2)
 
-    # All-pass success — close the loop. TTY mode gets an interactive
-    # picker (same shape as `mdk add` + `mdk eval --guided`). Non-TTY
-    # (CI) falls back to a single static `Next:` line so logs still
-    # surface the recommendation.
+    # All-pass success — interactive picker (TTY prompts, non-TTY
+    # just renders the list as documentation). The picker is the
+    # canonical next-steps surface; no separate static block needed.
     if passed > 0:
-        import sys as _sys  # noqa: PLC0415
-
         from movate.cli._next_steps import (  # noqa: PLC0415
             NextStep,
             mdk_bin_name,
@@ -288,38 +285,29 @@ def _validate_all(*, strict: bool, run_linter: bool) -> None:
 
         bin_name = mdk_bin_name()
         first_agent_name = agent_dirs[0].name if agent_dirs else None
-
-        if _sys.stdin.isatty() and _sys.stdout.isatty():
-            # Interactive picker.
-            steps = [
-                NextStep(
-                    label="Run eval across all agents",
-                    command=f"{bin_name} eval --all --mock --gate 0.7",
-                    argv=[bin_name, "eval", "--all", "--mock", "--gate", "0.7"],
-                ),
-            ]
-            if first_agent_name:
-                steps.append(
-                    NextStep(
-                        label=f"Quick-run {first_agent_name!r} on a sample input",
-                        command=f"{bin_name} run {first_agent_name} --mock",
-                        argv=[bin_name, "run", first_agent_name, "--mock"],
-                    )
-                )
+        steps = [
+            NextStep(
+                label="Run eval across all agents",
+                command=f"{bin_name} eval --all --mock --gate 0.7",
+                argv=[bin_name, "eval", "--all", "--mock", "--gate", "0.7"],
+            ),
+        ]
+        if first_agent_name:
             steps.append(
                 NextStep(
-                    label="Deploy agents to Azure dev",
-                    command=f"{bin_name} deploy --target dev",
-                    argv=[bin_name, "deploy", "--target", "dev"],
+                    label=f"Quick-run {first_agent_name!r} on a sample input",
+                    command=f"{bin_name} run {first_agent_name} --mock",
+                    argv=[bin_name, "run", first_agent_name, "--mock"],
                 )
             )
-            prompt_next_step(console=console, steps=steps)
-        else:
-            # Static fallback for CI / scripts.
-            console.print(
-                f"\n[bold]Next:[/bold] [cyan]{bin_name} eval --all --mock --gate 0.7[/cyan] "
-                "[dim](scores every agent against its dataset)[/dim]"
+        steps.append(
+            NextStep(
+                label="Deploy agents to Azure dev",
+                command=f"{bin_name} deploy --target dev",
+                argv=[bin_name, "deploy", "--target", "dev"],
             )
+        )
+        prompt_next_step(console=console, steps=steps)
 
 
 def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:

@@ -53,28 +53,23 @@ def prompt_next_step(
     steps: list[NextStep],
     console: Console | None = None,
 ) -> None:
-    """Render the 'What next?' menu + run the operator's choice.
+    """Render the 'Next:' menu + (when interactive) run the chosen step.
 
-    Two modes:
+    Two modes, ONE rendered surface:
 
-    * **TTY (interactive)**: render the numbered picker, prompt the
-      operator to pick, shell out to the chosen ``argv``.
-    * **Non-TTY (CI / scripts / pytest)**: render the SAME numbered
-      list as static output, then return without prompting. Scripts
-      grepping for `Next:` / a specific command still see it; the
-      operator's terminal isn't blocked waiting for input.
+    * **TTY (interactive)**: numbered list + ``[s] Skip``, then
+      prompt for a choice. Selection shells out via
+      ``subprocess.run`` with inherited stdio.
+    * **Non-TTY (CI / scripts / pytest)**: SAME numbered list,
+      then return without prompting. Scripts grepping for
+      ``Next:`` / a specific command still see it; the operator's
+      terminal isn't blocked.
 
-    The operator's choice (TTY mode) is executed via ``subprocess.run``
-    with inherited stdio so the child command's output streams as if
-    they'd typed it directly. Exit code is swallowed.
+    This is the single 'what to do next?' surface for the demo
+    flow — callers should NOT add a second static block in their
+    Panel body (that produces duplicate output for TTY operators).
     """
     if not steps:
-        return
-
-    # No-op under non-TTY: each call site is responsible for any
-    # static "Next steps" fallback (typically already in the Panel
-    # body above this call). Avoids double-printing for tests + CI.
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
 
     c = console or Console()
@@ -84,6 +79,11 @@ def prompt_next_step(
         c.print(f"  [bold cyan][{i}][/bold cyan] {step.label}   [dim]{step.command}[/dim]")
     # Escape the `[s]` to keep Rich from rendering it as strikethrough.
     c.print(r"  [bold cyan]\[s][/bold cyan] Skip   [dim]exit menu[/dim]")
+
+    # Non-TTY: rendered the list as documentation; skip the prompt
+    # so scripts / CI don't hang waiting for input.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
     try:
         choice = Prompt.ask(
             "\n[bold]Pick[/bold]",

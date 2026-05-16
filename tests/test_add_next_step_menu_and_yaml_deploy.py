@@ -65,13 +65,21 @@ def test_add_does_not_render_menu_under_non_tty(
 def test_add_panel_still_includes_static_next_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: even without the menu, the static `Next steps:`
-    block in the Panel must keep rendering — operators reading the
-    output (esp. in CI logs) still need the commands surfaced."""
+    """Regression: even on non-TTY (no interactive prompt), the
+    next-steps list must keep rendering — operators reading the
+    output (esp. in CI logs) still need the commands surfaced.
+
+    Post-PR-#106 the single next-steps surface is the `Next:` block
+    printed by the shared menu helper (renders in both modes; only
+    prompts under TTY). The legacy `Next steps:` block inside the
+    Panel body was dropped — it duplicated the helper's output.
+    """
     _bootstrap(tmp_path, monkeypatch)
     result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    assert "Next steps:" in result.stdout
+    # Helper-printed Next: surface.
+    assert "Next:" in result.stdout
+    # The three suggested commands appear in the list.
     assert "mdk run" in result.stdout
     assert "mdk eval" in result.stdout
     assert "mdk doctor agent faq" in result.stdout

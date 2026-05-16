@@ -80,17 +80,23 @@ def test_menu_recognizes_project_yaml(tmp_path: Path, monkeypatch: pytest.Monkey
 
 @pytest.mark.unit
 def test_add_prints_next_steps_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`mdk add faq` should render ONE "Next steps" block (the Panel)
-    — pre-fix the legacy plain-text echo from `_init_agent` rendered
-    a second one above the Panel."""
+    """`mdk add faq` should render ONE next-steps surface (the
+    interactive helper's `Next:` block). Pre-PR-#101 the legacy
+    plain-text echo from _init_agent rendered an extra block above
+    the Panel; pre-PR-#106 the Panel itself had a static `Next
+    steps:` block that duplicated the helper. PR #106 makes the
+    helper's `Next:` block the sole surface."""
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     monkeypatch.chdir(tmp_path / "proj")
     result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    # Exactly ONE "Next steps" appears in stdout.
-    assert result.stdout.count("Next steps") == 1
+    # Exactly ONE `Next:` block in stdout.
+    assert result.stdout.count("Next:") == 1
+    # The legacy `Next steps:` block must NOT appear (would mean we
+    # accidentally re-introduced the duplication).
+    assert "Next steps:" not in result.stdout
 
 
 # ---------------------------------------------------------------------------
