@@ -23,6 +23,8 @@ stays as the general / power-user entry point.
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import typer
@@ -757,7 +759,105 @@ def _add_one(
         f"validates={validates_token} "
         f"ok=true[/dim]"
     )
+
+    # Interactive "what next?" picker — same numbered Rich.Prompt
+    # shape as `mdk menu` + `mdk eval --guided`. Skipped under
+    # non-TTY (CI / piped stdout / `--quiet`) so scripts and tests
+    # see only the static Panel + summary line above.
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        _prompt_next_step_for_agent(
+            agent_name=agent_name,
+            dest=dest,
+            project_root=project_root,
+            example_payload=example_payload,
+        )
     return None
+
+
+def _prompt_next_step_for_agent(
+    *,
+    agent_name: str,
+    dest: Path,
+    project_root: Path,
+    example_payload: str,
+) -> None:
+    """Numbered picker shown after `mdk add` succeeds.
+
+    Mirrors `mdk menu`'s visual language: one-letter / digit choice,
+    each row shows the action label + the resolved command. The
+    operator's selection shells out to that command; quit ("s") just
+    exits. Doesn't block CI (caller gates on TTY).
+
+    The selected command runs via ``subprocess`` so output streams
+    inline to the operator's terminal — identical to typing the
+    command directly. That keeps the "I'm learning the CLI by
+    watching" flow intact: the picker is training wheels, not a
+    walled garden.
+    """
+    import shlex  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from rich.prompt import Prompt  # noqa: PLC0415
+
+    rel = dest.relative_to(project_root)
+    bin_name = "movate" if os.path.basename(sys.argv[0]) == "movate" else "mdk"
+
+    # (label, displayed-command, argv-list-to-exec). argv as a list
+    # avoids the shell quoting hazards from passing real example
+    # JSON via a string-only path.
+    actions: list[tuple[str, str, list[str]]] = [
+        (
+            "Run with a sample input",
+            f"{bin_name} run ./{rel} --mock '{example_payload}'",
+            [bin_name, "run", f"./{rel}", "--mock", example_payload],
+        ),
+        (
+            "Run the eval suite",
+            f"{bin_name} eval ./{rel} --mock --gate 0.7",
+            [bin_name, "eval", f"./{rel}", "--mock", "--gate", "0.7"],
+        ),
+        (
+            "Check wiring + setup",
+            f"{bin_name} doctor agent {agent_name}",
+            [bin_name, "doctor", "agent", agent_name],
+        ),
+        (
+            "Deploy to Azure",
+            f"{bin_name} deploy --target dev",
+            [bin_name, "deploy", "--target", "dev"],
+        ),
+    ]
+    console.print()
+    console.print("[bold]What next?[/bold]")
+    for i, (label, cmd, _argv) in enumerate(actions, start=1):
+        console.print(f"  [bold cyan][{i}][/bold cyan] {label}   [dim]{cmd}[/dim]")
+    console.print("  [bold cyan][s][/bold cyan] Skip   [dim]exit menu[/dim]")
+    try:
+        choice = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=[str(i) for i in range(1, len(actions) + 1)] + ["s"],
+            default="s",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return
+    if choice == "s":
+        return
+    _, displayed, argv = actions[int(choice) - 1]
+    console.print(f"\n[dim]$ {displayed}[/dim]")
+    # Use shlex to display, subprocess.run with list to execute.
+    # exit code is intentionally swallowed — the child command already
+    # printed its own diagnostics; the parent (mdk add) succeeded.
+    _ = shlex
+    try:
+        subprocess.run(argv, check=False)
+    except FileNotFoundError:
+        # `mdk` not on PATH — shouldn't happen since we're running
+        # under it, but be graceful.
+        err_console.print(
+            f"[yellow]⚠[/yellow] couldn't shell out to [bold]{bin_name}[/bold] — "
+            "try running the command manually."
+        )
 
 
 def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None:
