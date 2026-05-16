@@ -6,6 +6,7 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -128,6 +129,10 @@ def validate(
         # subdirectory of one). Walk up so `mdk validate` works from
         # `agents/rag-qa/` just as well as from the project root.
         if walk_up_for_project_root() is not None:
+            console.print(
+                "[dim]no path given — defaulting to --all[/dim]",
+                highlight=False,
+            )
             _validate_all(strict=strict, run_linter=not no_lint)
             return
         console.print(
@@ -450,6 +455,13 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
                 f"{size:,} bytes — large contexts inflate token spend on every call."
             )
 
+    # Dataset JSONL validation — catches truncated / malformed lines
+    # before they silently zero the eval run.
+    if bundle.spec.evals.dataset:
+        dataset_path = bundle.agent_dir / bundle.spec.evals.dataset
+        if dataset_path.is_file():
+            _check_dataset_jsonl(dataset_path)
+
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
     # the operator sees lint findings even when the schema check
@@ -505,6 +517,50 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     has_warnings = any(i.severity == "warning" for i in lint_issues)
     if has_errors or (strict and has_warnings):
         raise typer.Exit(code=2)
+
+
+def _check_dataset_jsonl(path: Path) -> None:
+    """Validate that every non-blank line in a dataset JSONL file is a
+    parseable JSON object with at least an ``input`` key.
+
+    Malformed lines cause ``mdk eval`` to skip or crash that case at
+    eval time — better to surface them here when validate runs.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        console.print(
+            f"  [yellow]![/yellow] dataset [bold]{path.name}[/bold] "
+            f"unreadable: {exc}"
+        )
+        return
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        console.print(
+            f"  [yellow]![/yellow] dataset [bold]{path.name}[/bold] is empty — "
+            "no eval cases will run."
+        )
+        return
+    for i, line in enumerate(lines, start=1):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            console.print(
+                f"  [red]✗[/red] dataset [bold]{path.name}:{i}[/bold] "
+                f"invalid JSON: {exc}"
+            )
+            raise typer.Exit(code=2) from None
+        if not isinstance(obj, dict):
+            console.print(
+                f"  [red]✗[/red] dataset [bold]{path.name}:{i}[/bold] "
+                f"must be a JSON object, got {type(obj).__name__}"
+            )
+            raise typer.Exit(code=2)
+        if "input" not in obj:
+            console.print(
+                f"  [yellow]![/yellow] dataset [bold]{path.name}:{i}[/bold] "
+                "missing [bold]'input'[/bold] key — this case will be skipped by mdk eval."
+            )
 
 
 def _find_project_root_from_bundle(bundle: AgentBundle) -> Path | None:

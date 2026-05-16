@@ -460,6 +460,16 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
         _do_add_context(args[1:])
         return
 
+    # `mdk add kb` — scaffold kb/kb-lookup-corpus.json with an example entry.
+    if args and args[0] == "kb":
+        _do_add_kb(args[1:])
+        return
+
+    # `mdk add skill <name>` — scaffold a bare custom skill (not a curated template).
+    if args and args[0] == "skill":
+        _do_add_skill_bare(args[1:])
+        return
+
     if not args:
         err_console.print(
             "[red]✗[/red] template name required. "
@@ -1306,6 +1316,182 @@ def _do_add_context(args: list[str]) -> None:
     console.print(
         f"[dim]mdk_add_context_summary: "
         f"name={context_name} "
+        f"project={project_root.name} "
+        f"path={dest} "
+        f"ok=true[/dim]"
+    )
+
+
+_KB_CORPUS_EXAMPLE = """\
+[
+  {
+    "id": "KB-001",
+    "category": "general",
+    "title": "Example entry — replace with your content",
+    "symptom": "Describe the problem or trigger phrase here.",
+    "resolution": "Describe the answer or resolution here.",
+    "tags": ["example"]
+  }
+]
+"""
+
+_SKILL_YAML_TEMPLATE = """\
+api_version: movate/v1
+kind: Skill
+name: {name}
+version: 0.1.0
+description: ""
+schema:
+  input:
+    query: string
+  output:
+    result: string
+implementation:
+  kind: python
+  entry: {module}.impl:run
+side_effects: read-only
+"""
+
+_SKILL_IMPL_TEMPLATE = """\
+from __future__ import annotations
+
+from typing import Any
+
+
+async def run(input: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    \"\"\"Skill entry point. Replace with your implementation.
+
+    Args:
+        input: validated against the skill's input schema (query: string).
+        ctx:   SkillExecutionContext — call_ms_budget, trace_id, etc.
+
+    Returns:
+        dict matching the skill's output schema (result: string).
+    \"\"\"
+    return {"result": input.get("query", "")}
+"""
+
+
+def _do_add_kb(args: list[str]) -> None:
+    """Scaffold ``kb/kb-lookup-corpus.json`` with one example entry.
+
+    Called when the operator runs ``mdk add kb``. Creates the file at
+    ``<project>/kb/kb-lookup-corpus.json`` and prints a panel with the
+    required field schema.
+
+    Errors if the file already exists (won't silently overwrite).
+    """
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        err_console.print(
+            "[red]✗[/red] not inside a movate project. "
+            "[dim]Run [bold]mdk init --project <name>[/bold] first.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    kb_dir = project_root / "kb"
+    dest = kb_dir / "kb-lookup-corpus.json"
+    if dest.exists():
+        err_console.print(
+            f"[red]✗[/red] [bold]kb/kb-lookup-corpus.json[/bold] already exists "
+            f"at [dim]{dest}[/dim]. "
+            "Edit it directly, or run [bold]mdk knowledge validate[/bold] to check coverage."
+        )
+        raise typer.Exit(code=2)
+
+    kb_dir.mkdir(parents=True, exist_ok=True)
+    dest.write_text(_KB_CORPUS_EXAMPLE)
+
+    console.print(
+        Panel(
+            f"[bold]Path:[/bold]    [cyan]{dest}[/cyan]\n"
+            f"[bold]Project:[/bold] [dim]{project_root}[/dim]\n\n"
+            "[dim]Each entry requires:\n"
+            "  [bold]id[/bold]         unique identifier\n"
+            "  [bold]title[/bold]      short label (used for search scoring)\n"
+            "  [bold]symptom[/bold]    trigger phrase / problem description\n"
+            "  [bold]resolution[/bold] the answer (scored by kb-lookup at runtime)\n"
+            "  [bold]tags[/bold]       list of string labels\n\n"
+            "Check coverage with: [bold]mdk knowledge validate[/bold][/dim]",
+            title="[green]✓[/green] Created kb/kb-lookup-corpus.json",
+            title_align="left",
+            border_style="green",
+        )
+    )
+    console.print(
+        f"[dim]mdk_add_kb_summary: "
+        f"project={project_root.name} "
+        f"path={dest} "
+        f"ok=true[/dim]"
+    )
+
+
+def _do_add_skill_bare(args: list[str]) -> None:
+    """Scaffold a bare custom skill at ``skills/<name>/``.
+
+    Called when the operator runs ``mdk add skill <name>``. Creates
+    a minimal valid ``skill.yaml`` + stub ``impl.py``. The skill is
+    NOT wired to any curated template — it's a blank slate for a
+    custom implementation.
+
+    Errors if the skill directory already exists or the name is invalid.
+    """
+    import re as _re  # noqa: PLC0415
+
+    if not args:
+        err_console.print(
+            "[red]✗[/red] skill name required. "
+            "Usage: [bold]mdk add skill <name>[/bold]"
+        )
+        raise typer.Exit(code=2)
+
+    name = args[0]
+    if not _re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        err_console.print(
+            f"[red]✗[/red] skill name [bold]{name!r}[/bold] is invalid. "
+            "Must be lowercase alphanumeric with hyphens (e.g. [bold]my-skill[/bold])."
+        )
+        raise typer.Exit(code=2)
+
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        err_console.print(
+            "[red]✗[/red] not inside a movate project. "
+            "[dim]Run [bold]mdk init --project <name>[/bold] first.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    dest = project_root / "skills" / name
+    if dest.exists():
+        err_console.print(
+            f"[red]✗[/red] skill [bold]{name}[/bold] already exists "
+            f"at [dim]{dest}[/dim]. "
+            "Edit it directly, or delete the directory to start fresh."
+        )
+        raise typer.Exit(code=2)
+
+    dest.mkdir(parents=True)
+    module = name.replace("-", "_")
+    (dest / "skill.yaml").write_text(_SKILL_YAML_TEMPLATE.format(name=name, module=module))
+    (dest / "impl.py").write_text(_SKILL_IMPL_TEMPLATE)
+
+    console.print(
+        Panel(
+            f"[bold]Skill:[/bold]   [cyan]{name}[/cyan]\n"
+            f"[bold]Path:[/bold]    [cyan]{dest}[/cyan]\n"
+            f"[bold]Project:[/bold] [dim]{project_root}[/dim]\n\n"
+            f"[dim]Edit [bold]skills/{name}/impl.py[/bold] to implement the skill, "
+            f"then declare it in [bold]agent.yaml[/bold]:\n\n"
+            f"  skills:\n"
+            f"    - {name}[/dim]",
+            title=f"[green]✓[/green] Created skill {name!r}",
+            title_align="left",
+            border_style="green",
+        )
+    )
+    console.print(
+        f"[dim]mdk_add_skill_summary: "
+        f"name={name} "
         f"project={project_root.name} "
         f"path={dest} "
         f"ok=true[/dim]"
