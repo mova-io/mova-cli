@@ -142,6 +142,7 @@ from movate.cli.secrets_cmd import secrets_app  # noqa: E402
 from movate.cli.skills_cmd import skills_app  # noqa: E402
 from movate.cli.snapshot_cmd import snapshot_app  # noqa: E402
 from movate.cli.teams_bot import teams_bot_app  # noqa: E402
+from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
 
@@ -151,8 +152,51 @@ PANEL_DIAGNOSE = "Diagnose"
 PANEL_DEPLOY = "Deploy & operate"
 PANEL_MANAGE = "Manage"
 
+from typer.core import TyperGroup  # noqa: E402
+
+
+class FuzzySuggestionGroup(TyperGroup):
+    """Subgroup that suggests close matches when an unknown command runs.
+
+    Typer/Click's default for ``mdk rag-qa`` (operator meant ``mdk add
+    rag-qa``) is a bare "No such command 'rag-qa'." With ~50
+    subcommands and ~15 templates that get muddled together in muscle
+    memory, that's friction. Override ``resolve_command`` to inspect
+    the failure and emit a "Did you mean: X, Y?" hint via difflib's
+    edit-distance fuzzy match before re-raising.
+
+    Uses ``cutoff=0.5`` for a permissive match — false positives
+    ("did you mean: serve?" when you meant "deploy" by typing "delpoy")
+    are recoverable; missed matches force the operator back to
+    ``--help``.
+    """
+
+    def resolve_command(self, ctx, args):  # type: ignore[no-untyped-def, override]
+        from difflib import get_close_matches  # noqa: PLC0415
+
+        import click  # noqa: PLC0415
+
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as exc:
+            # Click 8.1+ ships its own "Did you mean" for high-confidence
+            # matches. Don't double up — only inject our suggestion when
+            # Click stayed silent (catches typos Click's tighter threshold
+            # missed, like `init-stuff` → `init`).
+            if "Did you mean" in (exc.message or ""):
+                raise
+            attempted = args[0] if args else ""
+            known = sorted(self.list_commands(ctx))
+            close = get_close_matches(attempted, known, n=3, cutoff=0.5)
+            if not close:
+                raise
+            hint = f"Did you mean: {', '.join(close)}?"
+            raise click.UsageError(f"{exc.message}\n  {hint}", ctx) from None
+
+
 app = typer.Typer(
     name="mdk",
+    cls=FuzzySuggestionGroup,
     help=(
         "[bold]mdk[/bold] — Movate Development Kit. Declarative platform for "
         "AI agents and workflows.\n\n"
@@ -266,6 +310,7 @@ app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
+app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
 app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
