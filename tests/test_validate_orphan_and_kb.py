@@ -9,6 +9,8 @@ Warnings / errors surface in mdk validate when:
 5. A Python skill directory has no impl.py → per-agent error.
 6. A context body exceeds _CTX_ADVISORY_BYTES → advisory; _CTX_ERROR_BYTES → error.
 7. An orphaned skill has a malformed skill.yaml → --all error.
+8. A declared skill has no skills/<name>/ directory → error with mdk add skill hint.
+9. A declared context file exists but is empty → yellow advisory with populate hint.
 """
 
 from __future__ import annotations
@@ -223,6 +225,90 @@ class TestContextSize:
         )
         assert result.exit_code != 0
         assert "exceeds" in result.stdout or "limit" in result.stdout
+
+
+@pytest.mark.unit
+class TestMissingSkillDirectory:
+    """Declared skill name has no skills/<name>/ directory on disk."""
+
+    def test_missing_skill_dir_errors_with_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = _scaffold_project(tmp_path, monkeypatch)
+        # Add a skill declaration to rag-qa that has no backing directory.
+        agent_yaml = project / "agents" / "rag-qa" / "agent.yaml"
+        content = agent_yaml.read_text()
+        if "skills:" not in content:
+            content += "\nskills:\n  - ghost-skill\n"
+        else:
+            content += "\n  - ghost-skill\n"
+        agent_yaml.write_text(content)
+        result = runner.invoke(
+            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
+        )
+        assert result.exit_code != 0
+        # Loader message surfaces the unknown skill name.
+        assert "ghost-skill" in result.stdout or "ghost-skill" in result.stderr
+        # Our new hint points to the fix command.
+        assert "mdk add skill" in result.stdout or "mdk add skill" in result.stderr
+
+    def test_all_skills_present_clean(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _scaffold_project(tmp_path, monkeypatch)
+        result = runner.invoke(
+            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+
+@pytest.mark.unit
+class TestEmptyContext:
+    """Declared context file exists but is empty (whitespace-only)."""
+
+    def test_empty_context_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = _scaffold_project(tmp_path, monkeypatch)
+        ctx_file = _declared_context_file(project, "rag-qa")
+        ctx_file.write_text("")
+        result = runner.invoke(
+            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
+        )
+        assert "empty" in result.stdout
+        assert "contributes nothing" in result.stdout
+
+    def test_whitespace_only_context_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = _scaffold_project(tmp_path, monkeypatch)
+        ctx_file = _declared_context_file(project, "rag-qa")
+        ctx_file.write_text("   \n\n   \n")
+        result = runner.invoke(
+            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
+        )
+        assert "empty" in result.stdout
+
+    def test_populated_context_clean(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _scaffold_project(tmp_path, monkeypatch)
+        result = runner.invoke(
+            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
+        )
+        assert "empty" not in result.stdout
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+    def test_hint_points_to_context_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = _scaffold_project(tmp_path, monkeypatch)
+        ctx_file = _declared_context_file(project, "rag-qa")
+        ctx_file.write_text("")
+        result = runner.invoke(
+            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
+        )
+        assert "contexts/" in result.stdout
 
 
 @pytest.mark.unit

@@ -354,6 +354,11 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
                 "[dim]  hint: run [bold]mdk add context <name>[/bold] "
                 "to create the missing context.[/dim]"
             )
+        elif "skills resolution failed" in str(exc):
+            console.print(
+                "[dim]  hint: run [bold]mdk add skill <name>[/bold] "
+                "to scaffold the missing skill directory.[/dim]"
+            )
         raise typer.Exit(code=2) from None
 
     spec = bundle.spec
@@ -480,9 +485,17 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
 
     _check_kb_corpus(bundle)
 
-    # Context size advisory. Contexts are prepended to the system prompt
-    # on every call; a large context silently inflates token spend.
+    # Context size + content advisory. Contexts are prepended to the system
+    # prompt on every call; empty or very large contexts are likely mistakes.
     for ctx_name, ctx_body in bundle.contexts:
+        if not ctx_body.strip():
+            console.print(
+                f"  [yellow]![/yellow] context [bold]{ctx_name!r}[/bold] is empty — "
+                "it contributes nothing to the system prompt. "
+                f"[dim]hint: populate [bold]contexts/{ctx_name}.md[/bold] "
+                "or remove the declaration.[/dim]"
+            )
+            continue
         size = len(ctx_body.encode())
         if size >= _CTX_ERROR_BYTES:
             console.print(
