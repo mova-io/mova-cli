@@ -177,6 +177,19 @@ class EvalCase:
     this; otherwise it falls back to the agent's ``timeouts.call_ms``.
     Lets operators flag latency-sensitive cases independent of the
     agent's overall timeout."""
+    skill_responses: dict[str, Any] | None = None
+    """Deterministic skill responses for this case.
+
+    Maps skill name → the dict the skill would return, e.g.
+    ``{"web-search": {"result": "Paris was founded in ..."}, ...}``.
+    When set, the executor short-circuits real skill dispatch and
+    returns the fixture response instead — making evals hermetic
+    (no network calls, no rate limits, exact same response every run).
+
+    Cases without this field use real skill dispatch (or the mock,
+    if ``--mock`` is set). Only meaningful for local evals; remote
+    evals skip fixtures (the runtime calls real skills).
+    """
 
 
 @dataclass
@@ -383,6 +396,15 @@ def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
                 f"{path}:{line_no} latency_budget_ms must be an int; "
                 f"got {type(latency_budget_ms).__name__}"
             )
+        skill_responses = d.get("skill_responses")
+        if skill_responses is not None and not (
+            isinstance(skill_responses, dict)
+            and all(isinstance(k, str) and isinstance(v, dict) for k, v in skill_responses.items())
+        ):
+            raise EvalConfigError(
+                f"{path}:{line_no} skill_responses must be a dict of "
+                f"{{skill_name: response_dict}}; got {type(skill_responses).__name__}"
+            )
         cases.append(
             EvalCase(
                 input=d.get("input", {}),
@@ -392,6 +414,7 @@ def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
                 grounding=grounding,
                 expected_coverage=expected_coverage,
                 latency_budget_ms=latency_budget_ms,
+                skill_responses=skill_responses,
             )
         )
     return cases, digest
@@ -727,7 +750,9 @@ class EvalEngine:
             runs: list[CaseRun] = []
             for _ in range(self._runs_per_case):
                 response = await self._executor.execute(
-                    bundle, RunRequest(agent=bundle.spec.name, input=case.input)
+                    bundle,
+                    RunRequest(agent=bundle.spec.name, input=case.input),
+                    skill_fixture=case.skill_responses,
                 )
                 if response.status != "success":
                     # Failed runs score 0 on every applicable dim. We

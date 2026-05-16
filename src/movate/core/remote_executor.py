@@ -22,7 +22,7 @@ score 0.0, rationale = error message, case fails.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from movate.core.client import MovateClient, MovateClientError
 from movate.core.models import (
@@ -80,6 +80,9 @@ class RemoteExecutor:
         self,
         bundle: AgentBundle,
         request: RunRequest,
+        *,
+        skill_fixture: dict[str, Any] | None = None,
+        **_kwargs: Any,
     ) -> RunResponse:
         """Run one case against the deployed agent and shape the result
         into a :class:`RunResponse` the eval engine can score.
@@ -88,10 +91,10 @@ class RemoteExecutor:
         — the kw-only fields that local execution uses (``model_override``,
         ``history``, ``on_token``, ``workflow_run_id``, ``node_id``,
         ``tenant_id_override``) have no meaning for a remote runtime
-        we don't control. The eval engine only passes positional args,
-        so this works as a drop-in. The trade-off: this isn't a real
-        :class:`Executor` and shouldn't be used outside of remote eval.
+        we don't control. ``skill_fixture`` is accepted for API compat
+        but silently ignored — the remote runtime calls real skills.
         """
+        _ = skill_fixture  # accepted for Executor API compat; unused for remote evals
         try:
             accepted = await self._client.submit_job(
                 kind=JobKind.AGENT,
