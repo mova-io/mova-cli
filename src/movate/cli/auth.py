@@ -546,6 +546,267 @@ def save_runtime_key(
     )
 
 
+@auth_app.command("refresh-runtime-key")
+def refresh_runtime_key(  # noqa: PLR0912 — orchestrator; az shell-out + parse + save reads clearer flat
+    target: str = typer.Argument(
+        ...,
+        help="Deployment target name (from `mdk config list-targets`).",
+    ),
+    tenant: str = typer.Option(
+        "demo",
+        "--tenant",
+        help=(
+            "Tenant id to mint the key for. Defaults to `demo` — the "
+            "bootstrap tenant the runtime is seeded with on first deploy."
+        ),
+    ),
+    env: str = typer.Option(
+        "live",
+        "--env",
+        help="Key env class: `live` for production deploys, `test` for staging.",
+    ),
+    label: str = typer.Option(
+        None,
+        "--label",
+        help="Optional human-readable note attached to the key.",
+    ),
+    container_app: str = typer.Option(
+        None,
+        "--container-app",
+        help=(
+            "Override the auto-derived Container App name. Default: "
+            "`movate-{azure_env}-api` (e.g. `movate-dev-api`)."
+        ),
+    ),
+) -> None:
+    """Mint + save a fresh runtime bearer in one step.
+
+    The two-step `create-key` → `save-runtime-key` flow has an
+    annoying failure mode: when the runtime is redeployed (or its
+    revision is recycled) the JWT secret rotates, which invalidates
+    every previously-minted key. The operator's saved bearer starts
+    returning 401 and they have to manually:
+
+    1. Find the right subscription / resource group / Container App.
+    2. Run `az containerapp exec ... mdk auth create-key`.
+    3. Copy the printed key.
+    4. Run `mdk auth save-runtime-key <target> <key>`.
+
+    This command does all four steps as one verb. Reads the target
+    config to derive the Azure addressing, shells out to
+    `az containerapp exec` to mint a fresh key inside the live pod,
+    parses the printed `mvt_...` value, and writes it to
+    `~/.movate/credentials` for autoload across shells.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Recover from 401 after a deploy:[/dim]
+      $ mdk auth refresh-runtime-key dev
+
+      [dim]# Mint for a non-default tenant:[/dim]
+      $ mdk auth refresh-runtime-key prod --tenant customer-acme --env live
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    # Resolve target → URL + key_env + Azure addressing.
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+    if target not in cfg.targets:
+        registered = sorted(cfg.targets) or ["<none>"]
+        error(
+            f"unknown target {target!r}. Registered: "
+            f"{', '.join(registered)}. Add one with `mdk config add-target`."
+        )
+        raise typer.Exit(code=2)
+    target_cfg = cfg.targets[target]
+    if not target_cfg.azure_resource_group:
+        error(
+            f"target {target!r} has no `azure_resource_group` configured. "
+            f"Re-register with `mdk config add-target` + the Azure fields, "
+            f"OR mint the key manually inside the Container App + use "
+            f"`mdk auth save-runtime-key`."
+        )
+        raise typer.Exit(code=2)
+
+    # Derive the Container App name. The Bicep template names it
+    # `movate-{env}-api`. Operators can override via --container-app
+    # for non-standard naming.
+    if container_app is None:
+        if not target_cfg.azure_env:
+            error(
+                f"target {target!r} has no `azure_env` configured. "
+                f"Pass --container-app <name> explicitly, or re-register "
+                f"the target with `--azure-env dev|staging|prod`."
+            )
+            raise typer.Exit(code=2)
+        container_app = f"movate-{target_cfg.azure_env}-api"
+
+    # Check `az` is available before we try to use it. Same defensive
+    # pattern deploy.py uses.
+    if shutil.which("az") is None:
+        error(
+            "`az` (Azure CLI) not found on PATH. Install it from "
+            "https://learn.microsoft.com/cli/azure/install-azure-cli, "
+            "OR mint the key manually inside the Container App + use "
+            "`mdk auth save-runtime-key` to persist it."
+        )
+        raise typer.Exit(code=2)
+
+    # If the target has a pinned subscription, switch to it BEFORE the
+    # exec call. Operators with multiple subscriptions hit this trap
+    # constantly otherwise — the exec lands in the wrong tenant.
+    if target_cfg.azure_subscription:
+        hint(f"[dim]→ az account set --subscription {target_cfg.azure_subscription[:8]}…[/dim]")
+        try:
+            subprocess.run(
+                ["az", "account", "set", "--subscription", target_cfg.azure_subscription],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            error(f"az account set failed: {exc.stderr.decode(errors='replace').strip()[:200]}")
+            raise typer.Exit(code=2) from None
+
+    # Build the inner mdk command run inside the Container App.
+    # --quiet keeps key_id on stdout + the full secret on stderr — we
+    # parse the secret out below.
+    inner_cmd_parts = [
+        "mdk",
+        "auth",
+        "create-key",
+        "--tenant-id",
+        tenant,
+        "--env",
+        env,
+    ]
+    if label:
+        inner_cmd_parts.extend(["--label", label])
+    inner_cmd_parts.append("--quiet")
+    inner_cmd = " ".join(inner_cmd_parts)
+
+    hint(
+        f"[dim]→ az containerapp exec -g {target_cfg.azure_resource_group} "
+        f"-n {container_app} --command {inner_cmd!r}[/dim]"
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                "az",
+                "containerapp",
+                "exec",
+                "-g",
+                target_cfg.azure_resource_group,
+                "-n",
+                container_app,
+                "--command",
+                inner_cmd,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        error(f"command not found: az ({exc})")
+        raise typer.Exit(code=2) from None
+
+    if result.returncode != 0:
+        error(
+            f"az containerapp exec failed (exit {result.returncode}):\n"
+            f"  stderr: {result.stderr.strip()[:400]}\n"
+            f"  hint: confirm the Container App {container_app!r} exists in "
+            f"resource group {target_cfg.azure_resource_group!r}, and that "
+            f"you have `Container Apps Contributor` or higher on it."
+        )
+        raise typer.Exit(code=2)
+
+    # Parse the minted key out of stderr (--quiet puts the secret on
+    # stderr + key_id on stdout). Container Apps' `exec` mixes the two
+    # streams in some Azure CLI versions — be defensive: scan BOTH
+    # streams for the `mvt_<env>_...` prefix.
+    minted_key = _extract_mvt_key(result.stdout + "\n" + result.stderr)
+    if minted_key is None:
+        error(
+            "could not find a `mvt_*` key in the az containerapp exec output. "
+            "Run the command manually to see the raw output, then use "
+            "`mdk auth save-runtime-key <target> <key>` directly:\n"
+            f"  az containerapp exec -g {target_cfg.azure_resource_group} "
+            f"-n {container_app} --command {inner_cmd!r}"
+        )
+        # Surface the captured output so the operator can debug.
+        if result.stdout.strip():
+            err.print(f"[dim]stdout (truncated):[/dim]\n{result.stdout[:500]}")
+        if result.stderr.strip():
+            err.print(f"[dim]stderr (truncated):[/dim]\n{result.stderr[:500]}")
+        raise typer.Exit(code=2)
+
+    # Save via the same code path as `save-runtime-key`.
+    env_var = target_cfg.key_env
+    if not env_var:
+        error(
+            f"target {target!r} has no `key_env` configured. Re-register "
+            f"the target with `--key-env MDK_{target.upper()}_KEY`."
+        )
+        raise typer.Exit(code=2)
+    store = CredentialsStore()
+    store.set(env_var, minted_key)
+    success(
+        f"minted + saved fresh runtime key for [bold]{target}[/bold] "
+        f"(tenant={tenant}, env={env}) → [cyan]{env_var}[/cyan] in "
+        f"[cyan]{store.path}[/cyan]."
+    )
+    hint(
+        f"[dim]Future shells autoload {env_var} automatically. For the "
+        f"current shell, run: [bold]export {env_var}=$(grep '^{env_var}=' "
+        f"{store.path} | cut -d= -f2-)[/bold] or open a new terminal. "
+        f"Then retry [bold]mdk deploy --target {target}[/bold].[/dim]"
+    )
+
+
+def _extract_mvt_key(text: str) -> str | None:
+    """Find the first `mvt_<env>_<tenant>_<keyid>_<secret>` token in
+    arbitrary text. Used to scrape the freshly-minted key out of
+    `az containerapp exec` output (which mixes the inner command's
+    stdout + stderr with Azure CLI's own noise).
+
+    Strategy: tokenize on whitespace + common quote/punctuation
+    boundaries, then keep tokens that start with `mvt_` and have at
+    least 4 underscore-separated segments after the prefix (the
+    canonical shape — env + tenant + keyid + secret). The secret
+    segment legitimately contains underscores, so we accept ≥ 4
+    rather than exactly 4 — the secret eats the remainder.
+
+    Returns the first matching token, or None.
+    """
+    import re  # noqa: PLC0415
+
+    # Token boundary: whitespace, quotes, parens, commas. Lets us scrape
+    # the key out of "secret: mvt_..." just as easily as a JSON-quoted
+    # "key": "mvt_..." line.
+    for token in re.split(r"[\s\"'(),]+", text):
+        if not token.startswith("mvt_"):
+            continue
+        # env + tenant + keyid + secret = 4 segments after `mvt`.
+        if token.count("_") < 4:  # noqa: PLR2004
+            continue
+        # Light shape check — env segment must be `live` or `test`.
+        parts = token.split("_", 2)
+        if len(parts) < 3 or parts[1] not in ("live", "test"):  # noqa: PLR2004
+            continue
+        return token
+    return None
+
+
 def _provider_is_configured(provider: str) -> bool:
     """Return True if the provider's API key(s) are already set.
 

@@ -560,10 +560,11 @@ def _deploy_agents(*, target: str | None, dry_run: bool) -> None:  # noqa: PLR09
     api_key = os.environ.get(target_cfg.key_env, "").strip()
     if not api_key:
         error(
-            f"env var ${target_cfg.key_env} is empty. Mint a key via: "
-            f"az containerapp exec -g <rg> -n <api-app> --command "
-            f"'mdk auth create-key --tenant-id <id> --env live'; then "
-            f"export {target_cfg.key_env}=mvt_live_..."
+            f"env var ${target_cfg.key_env} is empty. One-shot fix: "
+            f"`mdk auth refresh-runtime-key {target_name}` "
+            f"(mints + saves a fresh key inside the deployed Container "
+            f"App). Manual: `az containerapp exec ... mdk auth create-key "
+            f"...` then `mdk auth save-runtime-key {target_name} <key>`."
         )
         raise typer.Exit(code=2)
 
@@ -724,10 +725,12 @@ def _upload_one_agent_bundle(
         prefix = bearer_header.removeprefix("Bearer ").strip()[:16]
         return (
             f"runtime rejected the bearer token "
-            f"(value starts with: '{prefix}…'). Check your env: "
-            f"run `echo $MDK_DEV_KEY` — likely stale from .zshrc or a "
-            f"prior tenant. Fix: `mdk auth save-runtime-key dev <new-key>` "
-            f"to persist + autoload across shells."
+            f"(value starts with: '{prefix}…'). The runtime was likely "
+            f"redeployed (revision rotated → JWT secret rotated → your "
+            f"saved key expired). One-shot recovery: "
+            f"`mdk auth refresh-runtime-key dev` "
+            f"(mints + saves a fresh key in one step). "
+            f"Manual path: `mdk auth save-runtime-key dev <new-key>`."
         )
     # Try to surface the runtime's error body verbatim so the
     # operator sees the actual validation failure.
