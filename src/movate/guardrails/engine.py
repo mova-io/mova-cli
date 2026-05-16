@@ -244,7 +244,7 @@ def _orchestrate(text: str, config: GuardrailDirection) -> GuardrailVerdict:
             continue
         outcome = check_fn(working_text, cfg)  # type: ignore[operator]
         if outcome.terminate is not None:
-            return outcome.terminate
+            return outcome.terminate  # type: ignore[no-any-return]
         if outcome.new_text is not None:
             working_text = outcome.new_text
             redacted_text_out = outcome.new_text
