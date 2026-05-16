@@ -152,6 +152,34 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "args from a TTY inside a project."
         ),
     ),
+    gate_faithfulness: float = typer.Option(
+        None,
+        "--gate-faithfulness",
+        help=(
+            "Minimum mean faithfulness score (0.0-1.0) required to pass. "
+            "Only fires when the dataset has [bold]grounding[/bold] fields. "
+            "Exit 1 if faithfulness mean is below this threshold."
+        ),
+    ),
+    gate_coverage: float = typer.Option(
+        None,
+        "--gate-coverage",
+        help=(
+            "Minimum mean coverage score (0.0-1.0) required to pass. "
+            "Only fires when the dataset has [bold]expected_coverage[/bold] fields. "
+            "Exit 1 if coverage mean is below this threshold."
+        ),
+    ),
+    gate_latency: float = typer.Option(
+        None,
+        "--gate-latency",
+        help=(
+            "Minimum mean latency score (0.0-1.0) required to pass. "
+            "A score of 1.0 means every case completed within its budget; "
+            "decays linearly to 0.0 at 2x the budget. "
+            "Exit 1 if latency mean is below this threshold."
+        ),
+    ),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
 
@@ -221,14 +249,26 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             runs=runs,
             mock=mock,
             regression_tolerance=regression_tolerance,
+            gate_faithfulness=gate_faithfulness,
+            gate_coverage=gate_coverage,
+            gate_latency=gate_latency,
         )
         return
 
     if path is None:
-        err_console.print(
-            "[red]✗[/red] path required (or pass [bold]--all[/bold] to "
-            "evaluate every agent in the project)."
-        )
+        from movate.core.config import is_project_root  # noqa: PLC0415
+
+        if is_project_root(Path.cwd()):
+            err_console.print(
+                "[red]✗[/red] no path given and not in a TTY (wizard can't auto-start). "
+                "To evaluate all agents: [bold]mdk eval --all[/bold]. "
+                "To target one: [bold]mdk eval <agent-name>[/bold]."
+            )
+        else:
+            err_console.print(
+                "[red]✗[/red] path required (or pass [bold]--all[/bold] to "
+                "evaluate every agent in the project)."
+            )
         raise typer.Exit(code=2)
 
     # Bare-name resolution: `mdk eval rag-qa` → `mdk eval ./agents/rag-qa`
@@ -286,6 +326,9 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             output_format=output_format,
             remote_url=remote_url,
             remote_api_key=api_key if remote_url else None,
+            gate_faithfulness=gate_faithfulness,
+            gate_coverage=gate_coverage,
+            gate_latency=gate_latency,
         )
     )
 
@@ -529,6 +572,9 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
     runs: int,
     mock: bool,
     regression_tolerance: float,
+    gate_faithfulness: float | None = None,
+    gate_coverage: float | None = None,
+    gate_latency: float | None = None,
 ) -> None:
     """Evaluate every agent under ``./agents/`` in the current project.
 
@@ -611,6 +657,9 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
                     output_format=Report.TABLE,
                     remote_url=None,
                     remote_api_key=None,
+                    gate_faithfulness=gate_faithfulness,
+                    gate_coverage=gate_coverage,
+                    gate_latency=gate_latency,
                 )
             )
             rows.append((agent_dir.name, "[green]✓ ok[/green]"))
@@ -711,6 +760,9 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     output_format: Report = Report.TABLE,
     remote_url: str | None = None,
     remote_api_key: str | None = None,
+    gate_faithfulness: float | None = None,
+    gate_coverage: float | None = None,
+    gate_latency: float | None = None,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     # Dataset-aware mock (PR #104): when running --mock, configure
@@ -865,10 +917,19 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
             regression_tolerance=regression_tolerance,
         )
 
-    # Exit codes: gate failure OR baseline regression both fail the CLI.
+    # Dimensional gates — checked after the main accuracy gate so the
+    # operator sees the full report before any exit.
+    failed_dim = _check_dimensional_gates(
+        summary.dimensional_means,
+        gate_faithfulness=gate_faithfulness,
+        gate_coverage=gate_coverage,
+        gate_latency=gate_latency,
+    )
+
+    # Exit codes: gate failure OR baseline regression OR dim gate all fail.
     failed_gate = not overall_pass
     failed_regression = diff is not None and diff.is_regression(tolerance=regression_tolerance)
-    if failed_gate or failed_regression:
+    if failed_gate or failed_regression or failed_dim:
         raise typer.Exit(code=1)
 
 
@@ -1040,6 +1101,47 @@ def _emit_dimensional_breakdown(means: DimensionalMeans) -> None:
             continue
         table.add_row(name, f"{value:.3f}", note)
     console.print(table)
+
+
+def _check_dimensional_gates(
+    means: DimensionalMeans,
+    *,
+    gate_faithfulness: float | None,
+    gate_coverage: float | None,
+    gate_latency: float | None,
+) -> bool:
+    """Check per-dimension CI gates. Prints a verdict line for each and
+    returns True if any gate failed. Skips silently when the dataset
+    didn't score that dimension (no grounding / no expected_coverage).
+    """
+    failed = False
+    _dim_checks = [
+        ("faithfulness", gate_faithfulness, means.faithfulness, "grounding"),
+        ("coverage", gate_coverage, means.coverage, "expected_coverage"),
+        ("latency", gate_latency, means.latency, None),
+    ]
+    for dim_name, threshold, actual, field_hint in _dim_checks:
+        if threshold is None:
+            continue
+        if actual is None:
+            hint = f" (dataset has no [bold]{field_hint}[/bold] field)" if field_hint else ""
+            console.print(
+                f"[yellow]![/yellow] --gate-{dim_name} set but {dim_name} not scored{hint}; "
+                "gate skipped"
+            )
+            continue
+        if actual < threshold:
+            console.print(
+                f"[red]✗[/red] dimensional gate failed: "
+                f"{dim_name} {actual:.3f} < {threshold:.2f}"
+            )
+            failed = True
+        else:
+            console.print(
+                f"[green]✓[/green] dimensional gate passed: "
+                f"{dim_name} {actual:.3f} ≥ {threshold:.2f}"
+            )
+    return failed
 
 
 def _emit_objective_breakdown(summaries: list[ObjectiveSummary]) -> None:
