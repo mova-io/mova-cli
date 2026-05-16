@@ -65,6 +65,14 @@ class TestDetectFormat:
     def test_jsonl(self) -> None:
         assert detect_format(Path("evals/foo/dataset.jsonl")) is Format.JSONL
 
+    def test_context_md_detected_as_prompt(self) -> None:
+        assert detect_format(Path("contexts/style.md")) is Format.PROMPT
+        assert detect_format(Path("agents/rag-qa/contexts/rubric.md")) is Format.PROMPT
+
+    def test_kb_json_detected_as_jsonl(self) -> None:
+        assert detect_format(Path("kb/kb-lookup-corpus.json")) is Format.JSONL
+        assert detect_format(Path("agents/foo/kb/corpus.json")) is Format.JSONL
+
     def test_unknown_extension(self) -> None:
         assert detect_format(Path("README.md")) is None
         assert detect_format(Path("script.py")) is None
