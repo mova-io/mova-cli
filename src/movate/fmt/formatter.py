@@ -132,6 +132,8 @@ def detect_format(path: Path) -> Format | None:
         return Format.PROMPT
     if suffix == ".jsonl":
         return Format.JSONL
+    if suffix == ".json" and "kb" in path.parts:
+        return Format.JSONL
     return None
 
 
