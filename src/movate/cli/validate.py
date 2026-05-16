@@ -704,6 +704,31 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
                 f"(checked first {_CORPUS_MAX_REPORTED_ERRORS} offenders)[/dim]"
             )
 
+    # Duplicate id check — last-write-wins at runtime is a silent data hazard.
+    seen_ids: dict[str, int] = {}
+    duplicates: list[str] = []
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        eid = entry.get("id")
+        if eid is None:
+            continue
+        if eid in seen_ids:
+            duplicates.append(f"{eid!r} (rows {seen_ids[eid]} and {idx})")
+        else:
+            seen_ids[eid] = idx
+    if duplicates:
+        console.print(
+            "  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
+            "has duplicate entry ids (last entry wins at runtime — earlier ones are shadowed):"
+        )
+        for label in duplicates[:_CORPUS_MAX_REPORTED_ERRORS]:
+            console.print(f"    [dim]·[/dim] {label}")
+        console.print(
+            "    [dim]hint: run [bold]mdk knowledge list[/bold] to inspect "
+            "and [bold]mdk knowledge remove <id>[/bold] to delete the duplicate.[/dim]"
+        )
+
 
 _CTX_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 

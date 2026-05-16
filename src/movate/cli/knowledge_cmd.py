@@ -536,3 +536,74 @@ def knowledge_edit(
         f"[green]✓[/green] updated [bold]{entry_id!r}[/bold] "
         f"(fields: {fields_changed}) in [dim]{corpus_path}[/dim]."
     )
+
+
+@knowledge_app.command("list")
+def knowledge_list(
+    corpus: str = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help="Path to corpus JSON. Defaults to [bold]kb/kb-lookup-corpus.json[/bold].",
+    ),
+    project_root: str = typer.Option(
+        ".",
+        "--project-root",
+        envvar="MOVATE_PROJECT_ROOT",
+        hidden=True,
+    ),
+    limit: int = typer.Option(
+        0,
+        "--limit",
+        "-n",
+        help="Show only the first N entries (0 = all).",
+    ),
+) -> None:
+    """List KB corpus entries as a table.
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk knowledge list[/dim]
+      [dim]$ mdk knowledge list --limit 10[/dim]
+      [dim]$ mdk knowledge list --corpus kb/custom-corpus.json[/dim]
+    """
+    root = Path(project_root).resolve()
+    corpus_path = _resolve_corpus_path(corpus, root)
+    if not corpus_path.is_file():
+        err.print(f"[red]✗[/red] corpus not found: {corpus_path}")
+        raise typer.Exit(code=2)
+
+    entries = _load_corpus(corpus_path)
+    if not entries:
+        out.print(
+            "[yellow]![/yellow] corpus is empty. "
+            "Run [bold]mdk knowledge add[/bold] to add entries."
+        )
+        return
+
+    display = entries if not limit else entries[:limit]
+
+    table = Table(title=f"KB corpus — {corpus_path}", show_lines=False)
+    table.add_column("id", style="bold cyan", no_wrap=True)
+    table.add_column("title")
+    table.add_column("tags", style="dim")
+    table.add_column("resolution (preview)")
+
+    _max_res_preview = 60
+    for entry in display:
+        entry_id = str(entry.get("id", ""))
+        title = str(entry.get("title", ""))
+        tags_raw = entry.get("tags", [])
+        tags = ", ".join(str(t) for t in tags_raw) if isinstance(tags_raw, list) else str(tags_raw)
+        resolution = str(entry.get("resolution", ""))
+        if len(resolution) > _max_res_preview:
+            resolution = resolution[:_max_res_preview] + "…"
+        table.add_row(entry_id, title, tags, resolution)
+
+    out.print(table)
+    total = len(entries)
+    shown = len(display)
+    if shown < total:
+        out.print(f"[dim]Showing {shown} of {total} entries. Use --limit 0 to see all.[/dim]")
+    else:
+        out.print(f"[dim]{total} entr{'y' if total == 1 else 'ies'} total.[/dim]")
