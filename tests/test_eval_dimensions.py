@@ -658,3 +658,53 @@ def test_cli_eval_json_includes_dimensional_means(
     assert run_0_dims["accuracy"]["value"] == pytest.approx(1.0)
     assert run_0_dims["coverage"]["value"] == pytest.approx(1.0)
     assert run_0_dims["faithfulness"]["value"] is None
+
+
+# ---------------------------------------------------------------------------
+# --gate-context-compliance wired through _check_dimensional_gates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_gate_context_compliance_passes_when_above_threshold() -> None:
+    from movate.cli.eval import _check_dimensional_gates  # noqa: PLC0415
+
+    means = DimensionalMeans(context_compliance=0.9)
+    failed = _check_dimensional_gates(
+        means,
+        gate_faithfulness=None,
+        gate_coverage=None,
+        gate_latency=None,
+        gate_context_compliance=0.8,
+    )
+    assert not failed
+
+
+@pytest.mark.unit
+def test_gate_context_compliance_fails_when_below_threshold() -> None:
+    from movate.cli.eval import _check_dimensional_gates  # noqa: PLC0415
+
+    means = DimensionalMeans(context_compliance=0.5)
+    failed = _check_dimensional_gates(
+        means,
+        gate_faithfulness=None,
+        gate_coverage=None,
+        gate_latency=None,
+        gate_context_compliance=0.8,
+    )
+    assert failed
+
+
+@pytest.mark.unit
+def test_gate_context_compliance_skipped_when_not_scored() -> None:
+    from movate.cli.eval import _check_dimensional_gates  # noqa: PLC0415
+
+    means = DimensionalMeans(context_compliance=None)
+    failed = _check_dimensional_gates(
+        means,
+        gate_faithfulness=None,
+        gate_coverage=None,
+        gate_latency=None,
+        gate_context_compliance=0.8,
+    )
+    assert not failed  # skipped, not failed
