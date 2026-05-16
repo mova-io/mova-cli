@@ -540,6 +540,199 @@ def _find_existing_dataset(agent_dir: Path) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# `--all` project sweep  (PR #109)
+# ---------------------------------------------------------------------------
+
+
+def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state machine reads clearer flat
+    *,
+    num: int,
+    sample_input: str,
+    mock: bool,
+    force: bool,
+    project_root: str,
+) -> None:
+    """Generate eval cases for every agent in the project.
+
+    Walks ``<project>/agents/*/agent.yaml``, invokes the standard
+    per-agent generator once per agent, aggregates results into a
+    Rich summary table, and emits a greppable
+    ``mdk_eval_gen_all_summary:`` line. Same shape as
+    ``mdk_eval_all_summary:`` so CI workflows can scrape one line
+    format whether they're running eval or eval-gen.
+
+    Idempotent by default: agents that already have a
+    ``evals/<agent>/dataset.generated.jsonl`` are SKIPPED, not
+    overwritten. Pass ``--force`` to regenerate (matches the
+    per-agent ``mdk eval-gen --force`` semantics).
+
+    Why a separate sweep helper instead of looping over the
+    per-agent eval_gen command itself: the per-agent path raises
+    typer.Exit on file-already-exists, which would abort the whole
+    sweep on the first idempotent skip. We need clean per-agent
+    branching (generated / skipped / failed) which the standalone
+    helper provides.
+    """
+    from rich.table import Table  # noqa: PLC0415
+
+    from movate.core.config import is_project_root  # noqa: PLC0415
+
+    if num < 1:
+        err_console.print(f"[red]✗[/red] --num must be ≥ 1; got {num}")
+        raise typer.Exit(code=2)
+    if num > _MAX_GENERATE:
+        err_console.print(
+            f"[red]✗[/red] --num {num} exceeds the safety cap of "
+            f"{_MAX_GENERATE}. [dim]Bump _MAX_GENERATE in the source "
+            f"if you really mean it.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    parsed_sample: dict[str, Any] | None = None
+    if sample_input:
+        try:
+            parsed_sample = json.loads(sample_input)
+        except json.JSONDecodeError as exc:
+            err_console.print(f"[red]✗[/red] --sample-input is not valid JSON: {exc}")
+            raise typer.Exit(code=2) from None
+        if not isinstance(parsed_sample, dict):
+            err_console.print("[red]✗[/red] --sample-input must be a JSON object")
+            raise typer.Exit(code=2)
+
+    # Walk up to find the project root. Same convention `mdk eval --all`
+    # uses — operators can run `mdk eval-gen --all` from any subdir
+    # of the project, not just the root.
+    root = Path(project_root).resolve()
+    current = root
+    found_root: Path | None = None
+    while True:
+        if is_project_root(current):
+            found_root = current
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+    if found_root is None:
+        err_console.print(
+            "[red]✗[/red] not inside a movate project. "
+            "[dim]Run [bold]mdk init <name>[/bold] first, or pass an "
+            "AGENT name to generate for one agent.[/dim]"
+        )
+        raise typer.Exit(code=2)
+    root = found_root
+
+    agents_dir = root / "agents"
+    agent_dirs = (
+        sorted(p.parent for p in agents_dir.glob("*/agent.yaml")) if agents_dir.is_dir() else []
+    )
+    if not agent_dirs:
+        err_console.print(
+            "[yellow]⚠[/yellow] no agents found under "
+            f"[dim]{agents_dir}[/dim]. "
+            "[dim]Add agents via [bold]mdk add <template>[/bold] first.[/dim]"
+        )
+        # Not an error — empty project is valid. Greppable line fires
+        # so CI can branch on it cleanly.
+        console.print(
+            "[dim]mdk_eval_gen_all_summary: "
+            "agents_total=0 generated=0 skipped=0 failed=0 ok=true[/dim]"
+        )
+        return
+
+    # Per-agent state.
+    rows: list[tuple[str, str, str]] = []  # (name, status, detail)
+    generated_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    for agent_dir in agent_dirs:
+        agent_name = agent_dir.name
+        target = root / _DEFAULT_OUTPUT_SUFFIX.format(name=agent_name)
+        if target.exists() and not force:
+            rows.append(
+                (
+                    agent_name,
+                    "[yellow]⊝ skipped[/yellow]",
+                    "already exists — pass [bold]--force[/bold] to regenerate",
+                )
+            )
+            skipped_count += 1
+            continue
+
+        try:
+            bundle = load_agent(agent_dir)
+        except AgentLoadError as exc:
+            rows.append((agent_name, "[red]✗ load failed[/red]", str(exc)[:80]))
+            failed_count += 1
+            continue
+
+        try:
+            entries = asyncio.run(
+                _generate_entries(
+                    bundle,
+                    num=num,
+                    sample_input=parsed_sample,
+                    mock=mock,
+                )
+            )
+        except Exception as exc:  # last-resort guard for one-agent failures
+            rows.append((agent_name, "[red]✗ generator failed[/red]", str(exc)[:80]))
+            failed_count += 1
+            continue
+
+        if not entries:
+            rows.append(
+                (
+                    agent_name,
+                    "[red]✗ 0 valid entries[/red]",
+                    "schema mismatch or LLM failure — try --mock first",
+                )
+            )
+            failed_count += 1
+            continue
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        rows.append(
+            (
+                agent_name,
+                "[green]✓ generated[/green]",
+                f"{len(entries)}/{num} cases → {target.relative_to(root)}",
+            )
+        )
+        generated_count += 1
+
+    # Render summary table.
+    table = Table(
+        title=(f"Project eval-gen — [bold]{root.name}[/bold] [dim]({len(rows)} agent(s))[/dim]"),
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Agent", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Detail")
+    for name, status, detail in rows:
+        table.add_row(name, status, detail)
+    console.print()
+    console.print(table)
+
+    ok = failed_count == 0
+    console.print(
+        f"[dim]mdk_eval_gen_all_summary: "
+        f"agents_total={len(rows)} "
+        f"generated={generated_count} skipped={skipped_count} "
+        f"failed={failed_count} "
+        f"ok={'true' if ok else 'false'}[/dim]"
+    )
+
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
 
@@ -571,6 +764,17 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
             "input strategy — then runs the generator. Auto-triggered "
             "when [bold]mdk eval-gen[/bold] is invoked with no agent "
             "from a TTY inside a project."
+        ),
+    ),
+    all_in_project: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Sweep every agent under [bold]./agents/[/bold] in the "
+            "current project, generating [bold]--num[/bold] cases for "
+            "each. Skips agents that already have a generated dataset "
+            "unless [bold]--force[/bold] is passed. Emits "
+            "[bold]mdk_eval_gen_all_summary:[/bold] for CI scrapers."
         ),
     ),
     sample_input: str = typer.Option(
@@ -629,7 +833,34 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
       [dim]$ mdk eval-gen triage --num 10 -o evals/triage/cases.jsonl[/dim]
       [dim]$ mdk eval-gen triage --num 3 --mock     # offline test[/dim]
       [dim]$ mdk eval-gen --guided                  # interactive wizard[/dim]
+      [dim]$ mdk eval-gen --all --num 10 --mock     # sweep every agent[/dim]
     """
+    # --all sweep: handle BEFORE --guided / single-agent dispatch since
+    # the sweep is its own code path (no per-agent name resolution, no
+    # wizard). Mutex with explicit AGENT — passing both is ambiguous.
+    if all_in_project:
+        if name is not None:
+            err_console.print(
+                "[red]✗[/red] [bold]--all[/bold] and an explicit AGENT "
+                "argument are mutually exclusive."
+            )
+            raise typer.Exit(code=2)
+        if guided:
+            err_console.print(
+                "[red]✗[/red] [bold]--all[/bold] and [bold]--guided[/bold] "
+                "are mutually exclusive — guided picks one agent; --all "
+                "sweeps every agent."
+            )
+            raise typer.Exit(code=2)
+        _eval_gen_all_in_project(
+            num=num,
+            sample_input=sample_input,
+            mock=mock,
+            force=force,
+            project_root=project_root,
+        )
+        return
+
     # Guided wizard — explicit `--guided`, OR auto-trigger when an
     # operator typed bare `mdk eval-gen` with no agent name from a TTY
     # inside a project. CI / pipe / no-args-outside-project paths still
@@ -655,7 +886,8 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
     if name is None:
         err_console.print(
             "[red]✗[/red] AGENT required. Pass an agent name, or use "
-            "[bold]--guided[/bold] to pick interactively."
+            "[bold]--guided[/bold] to pick interactively, or "
+            "[bold]--all[/bold] to sweep every agent."
         )
         raise typer.Exit(code=2)
 
