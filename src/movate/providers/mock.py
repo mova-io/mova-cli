@@ -4,10 +4,23 @@ Used by the smoke test suite and the ``--mock`` flag. Default response is a
 minimal JSON object that satisfies the scaffolded agent template's output
 schema. Override with ``MOVATE_MOCK_RESPONSE`` or the ``response=`` arg.
 
+**Dataset-aware mode** (PR #104, May 2026): when configured with an
+agent's ``evals/dataset.jsonl[*].expected`` outputs via
+:meth:`configure_dataset`, the mock cycles through those expected
+outputs on each ``complete()`` call. Because the eval engine
+iterates the dataset in order, eval-with-mock produces
+schema-conforming responses that PASS validation — closes the
+demo-day annoyance where every ``mdk eval --mock <agent>`` failed
+with "model output failed schema." For single-shot ``mdk run
+--mock`` the mock returns the FIRST dataset row's expected (still
+schema-conforming).
+
 Special case: when the prompt looks like an LLM-as-judge prompt (contains
 ``Rubric:``), the mock returns a deterministic ``{"score": ..., "rationale":
 "mock"}`` payload so ``--mock`` works end-to-end through ``movate eval`` and
-``movate bench`` without a second env var.
+``movate bench`` without a second env var. The judge-response path is
+NOT subject to the dataset-cycle — judge prompts are independent of
+the agent's own dataset rows.
 """
 
 from __future__ import annotations
@@ -15,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import AsyncIterator
+from typing import Any
 
 from movate.core.models import TokenUsage
 from movate.providers.base import (
@@ -52,7 +66,14 @@ class MockProvider(BaseLLMProvider):
         decides "I need to call a tool" → "I have the result, here's
         my final answer."
         """
+        # Track whether the response was EXPLICITLY overridden. Explicit
+        # overrides defeat dataset-aware mode below — operators using
+        # `MOVATE_MOCK_RESPONSE` (or the `response=` constructor arg)
+        # clearly want a fixed canned response; respecting that lets
+        # tests force-fail scenarios still work after PR #104.
+        explicit_response = response is not None or _RESPONSE_ENV in os.environ
         self._response = response or os.environ.get(_RESPONSE_ENV, _DEFAULT_RESPONSE)
+        self._response_is_default = not explicit_response
         self._judge_response = judge_response or os.environ.get(
             _JUDGE_RESPONSE_ENV, _DEFAULT_JUDGE_RESPONSE
         )
@@ -61,6 +82,31 @@ class MockProvider(BaseLLMProvider):
         json.loads(self._judge_response)
         self._tool_script: list[tuple[str, dict[str, object]]] = list(tool_script or [])
         self._tool_calls_emitted = 0
+        # Dataset-aware mode (PR #104). Populated post-construction
+        # via :meth:`configure_dataset`. When non-empty AND no
+        # explicit response was set, ``complete()`` cycles through
+        # these on each call instead of returning the default response.
+        # Explicit `MOVATE_MOCK_RESPONSE` / `response=` overrides win.
+        self._dataset_expecteds: list[Any] = []
+        self._dataset_call_index = 0
+
+    def configure_dataset(self, expecteds: list[Any]) -> None:
+        """Switch the mock into dataset-aware mode.
+
+        ``expecteds`` is the list of ``dataset.jsonl[*].expected``
+        outputs, in dataset order. After this call, each invocation
+        of :meth:`complete` returns the next entry (cycling at end).
+        Pass an empty list to reset back to the canned ``response``.
+
+        Used by ``mdk run --mock`` and ``mdk eval --mock`` to make
+        the mock produce schema-conforming outputs that match what
+        the dataset says the agent SHOULD return. Without this, the
+        mock returns the canned ``{"message": "mock response"}``
+        which fails validation against any non-trivial output
+        schema (the previous demo annoyance).
+        """
+        self._dataset_expecteds = list(expecteds)
+        self._dataset_call_index = 0
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         body = request.messages[0].content if request.messages else ""
@@ -88,7 +134,29 @@ class MockProvider(BaseLLMProvider):
                 tool_input=args,
             )
 
-        text = self._judge_response if "Rubric:" in body else self._response
+        # Three-way choice for the response text:
+        # 1. Judge prompt → canned judge-response (rubric-aware)
+        # 2. Dataset-aware mode (PR #104) → next expected from dataset
+        # 3. Default → canned _response
+        is_judge_prompt = "Rubric:" in body
+        if is_judge_prompt:
+            text = self._judge_response
+        elif self._dataset_expecteds and self._response_is_default:
+            # Cycle through dataset rows in order. Wraps at the end so
+            # callers that exceed dataset length still get valid output
+            # (rather than IndexError or fallback to non-conforming
+            # default). Skipped when the operator explicitly overrode
+            # the response (env var or constructor arg) — they wanted
+            # a fixed value, respect that.
+            expected = self._dataset_expecteds[
+                self._dataset_call_index % len(self._dataset_expecteds)
+            ]
+            self._dataset_call_index += 1
+            # Serialize the expected dict to JSON — that's how the
+            # provider's text body crosses into the schema validator.
+            text = json.dumps(expected)
+        else:
+            text = self._response
         return CompletionResponse(
             text=text,
             tokens=TokenUsage(
@@ -122,3 +190,38 @@ class MockProvider(BaseLLMProvider):
 
     async def embed(self, text: str, *, model: str) -> list[float]:  # pragma: no cover
         raise NotImplementedError
+
+
+def load_dataset_expecteds(dataset_path: Any) -> list[Any]:
+    """Read an agent's ``evals/dataset.jsonl`` and return its
+    ``expected`` outputs in order.
+
+    Used by the CLI to switch :class:`MockProvider` into dataset-aware
+    mode just before running an agent or eval. Best-effort: a
+    missing / malformed dataset yields an empty list — the mock then
+    falls back to its canned response.
+
+    ``dataset_path`` is duck-typed (``pathlib.Path``-shaped object
+    expected). Lazy-typed because :mod:`movate.providers.mock`
+    shouldn't import pathlib just for this helper.
+    """
+    if dataset_path is None:
+        return []
+    try:
+        text = dataset_path.read_text()
+    except (OSError, AttributeError):
+        return []
+    expecteds: list[Any] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            # Malformed row — skip silently. The eval engine's own
+            # dataset loader surfaces the canonical error elsewhere.
+            continue
+        if isinstance(row, dict) and "expected" in row:
+            expecteds.append(row["expected"])
+    return expecteds
