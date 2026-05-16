@@ -577,9 +577,7 @@ def _validate_project(path: Path | None, *, strict: bool, run_linter: bool) -> N
         )
         raise typer.Exit(code=2)
 
-    display_root = (
-        root.relative_to(Path.cwd()) if root.is_relative_to(Path.cwd()) else root
-    )
+    display_root = root.relative_to(Path.cwd()) if root.is_relative_to(Path.cwd()) else root
     console.print(
         f"[bold]Validating[/bold] [cyan]{len(agents)}[/cyan] agent(s) "
         f"under [bold]{display_root}/agents/[/bold]"
