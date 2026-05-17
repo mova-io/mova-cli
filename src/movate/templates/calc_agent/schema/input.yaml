@@ -1,0 +1,18 @@
+version: 1
+type: object
+
+title: Arithmetic Expression
+description: An arithmetic expression to evaluate.
+
+fields:
+  expression:
+    type: string
+    description: >
+      A mathematical expression using +, -, *, /, (, ) and numbers.
+      Examples: "2 + 3", "(10 - 4) * 3 / 2", "100 / 4 + 7 * 3".
+    min_length: 1
+    max_length: 200
+    example: "(10 - 4) * 3 / 2"
+
+required:
+  - expression

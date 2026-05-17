@@ -1,0 +1,45 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: >-
+  Answers questions about users by calling a REST API lookup skill.
+  Demonstrates an HTTP skill wired to an agent — no API key required.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 15000
+  total_ms: 30000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - lookup
+  - http-skill
+  - demo
+  - skill-using
+
+# The `user-lookup` skill calls a public REST API to fetch a user record.
+# Swap the skill's `entry` URL in skills/user-lookup/skill.yaml to point
+# at your own CRM or user service — the agent.yaml stays unchanged.
+skills:
+  - user-lookup

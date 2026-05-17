@@ -1,0 +1,44 @@
+api_version: movate/v1
+kind: Skill
+
+name: user-lookup
+version: 0.1.0
+description: >-
+  Fetches a user record by ID from the JSONPlaceholder demo API
+  (jsonplaceholder.typicode.com). No API key required — use this as a
+  drop-in stand-in for your own CRM: swap the `entry` URL to point at
+  your real user service and update `schema.output` to match its shape.
+
+schema:
+  input:
+    user_id: integer
+  output:
+    # JSONPlaceholder returns these top-level string fields.
+    # The full response may contain additional nested fields (address,
+    # company) that are accessible but not declared here.
+    name: string
+    email: string
+    username: string
+    phone: string
+    website: string
+
+implementation:
+  kind: http
+  # URL template — `{{ input.user_id }}` is replaced at call time.
+  # Swap this to https://your-crm.example.com/api/users/{{ input.user_id }}
+  # to point at a real CRM. The agent.yaml and prompt need no changes.
+  entry: "https://jsonplaceholder.typicode.com/users/{{ input.user_id }}"
+  method: GET
+  # No auth — JSONPlaceholder is public. For a real CRM with bearer auth:
+  #   auth: bearer-from-env:CRM_API_KEY
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: network
+
+tags:
+  - crm
+  - lookup
+  - http
+  - demo

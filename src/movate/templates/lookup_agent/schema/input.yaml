@@ -1,0 +1,23 @@
+version: 1
+type: object
+
+title: User Lookup Request
+description: A user ID and a question about that user.
+
+fields:
+  user_id:
+    type: integer
+    description: Numeric user ID to look up (1-10 for the demo API).
+    min: 1
+    example: 1
+
+  question:
+    type: string
+    description: The question to answer about the user.
+    min_length: 1
+    max_length: 500
+    example: "What is their email address?"
+
+required:
+  - user_id
+  - question
