@@ -124,7 +124,7 @@ def test_eval_kickoff_returns_eval_id(client: TestClient, auth_setup) -> None:
     _create_agent(client, auth_header)
     r = client.post(
         "/api/v1/agents/eval-demo/evals",
-        json={"gate": 0.0, "runs": 1, "mock": True},
+        json={"gate": 0.0, "runs": 1, "mock": True, "wait": True},
         headers=auth_header,
     )
     assert r.status_code == 202, r.text
@@ -141,7 +141,7 @@ def test_eval_get_returns_scorecard(client: TestClient, auth_setup) -> None:
     _create_agent(client, auth_header)
     post = client.post(
         "/api/v1/agents/eval-demo/evals",
-        json={"gate": 0.0, "runs": 1, "mock": True},
+        json={"gate": 0.0, "runs": 1, "mock": True, "wait": True},
         headers=auth_header,
     )
     eval_id = post.json()["eval_id"]
@@ -166,7 +166,7 @@ def test_eval_list_includes_recent(client: TestClient, auth_setup) -> None:
     _create_agent(client, auth_header)
     post = client.post(
         "/api/v1/agents/eval-demo/evals",
-        json={"gate": 0.0, "runs": 1, "mock": True},
+        json={"gate": 0.0, "runs": 1, "mock": True, "wait": True},
         headers=auth_header,
     )
     eval_id = post.json()["eval_id"]
@@ -201,12 +201,12 @@ def test_eval_list_filter_isolates_per_agent(client: TestClient, auth_setup) -> 
 
     client.post(
         "/api/v1/agents/eval-demo/evals",
-        json={"gate": 0.0, "runs": 1, "mock": True},
+        json={"gate": 0.0, "runs": 1, "mock": True, "wait": True},
         headers=auth_header,
     )
     client.post(
         "/api/v1/agents/eval-demo-sibling/evals",
-        json={"gate": 0.0, "runs": 1, "mock": True},
+        json={"gate": 0.0, "runs": 1, "mock": True, "wait": True},
         headers=auth_header,
     )
 

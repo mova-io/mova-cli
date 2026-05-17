@@ -120,7 +120,10 @@ def _show_project() -> None:  # noqa: PLR0912 — three independent asset tables
     ctx_table.add_column("Declared by")
 
     ctx_root = project_root / "contexts"
-    ctx_files = sorted(ctx_root.glob("*.md")) if ctx_root.is_dir() else []
+    ctx_files = sorted(
+        f for f in (ctx_root.glob("*.md") if ctx_root.is_dir() else [])
+        if f.name.lower() != "readme.md"
+    )
     for ctx_file in ctx_files:
         size = ctx_file.stat().st_size
         agents_using = contexts_map.get(ctx_file.stem, [])
