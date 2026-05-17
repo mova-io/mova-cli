@@ -66,6 +66,23 @@ class EdgeSpec(BaseModel):
     to_id: str = Field(..., alias="to")
 
 
+class WorkflowEvalsSpec(BaseModel):
+    """Optional ``evals:`` stanza in ``workflow.yaml``.
+
+    Mirrors ``AgentSpec.evals`` so ``mdk eval <workflow-dir>`` can locate
+    the dataset and default gate without extra CLI flags.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: str = Field(
+        "evals/dataset.jsonl",
+        description="Path to the eval dataset, relative to workflow.yaml",
+    )
+    runs_per_case: int = Field(1, ge=1, description="How many times to run the workflow per case")
+    gate: float = Field(0.7, ge=0.0, le=1.0, description="Default accuracy gate (0.0-1.0)")
+
+
 class WorkflowSpec(BaseModel):
     """Top-level workflow.yaml contract."""
 
@@ -83,6 +100,7 @@ class WorkflowSpec(BaseModel):
         ..., description="Path to a JSON Schema file, relative to workflow.yaml"
     )
     entrypoint: str = Field(..., description="ID of the starting node")
+    evals: WorkflowEvalsSpec | None = None
 
     nodes: list[NodeSpec] = Field(..., min_length=1)
     edges: list[EdgeSpec] = Field(default_factory=list)

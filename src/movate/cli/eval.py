@@ -34,6 +34,7 @@ from movate.core.eval import (
     EvalEngine,
     EvalSummary,
     ObjectiveSummary,
+    WorkflowEvalEngine,
 )
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
@@ -315,6 +316,37 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
     path = resolve_agent_or_workflow_arg(path)
 
     remote_url = _resolve_remote_url(path)
+
+    # Workflow path: dispatch to workflow eval engine before attempting
+    # load_agent (which would fail with no agent.yaml for a workflow dir).
+    from movate.cli._workflow_path import is_workflow_path  # noqa: PLC0415
+
+    if remote_url is None and is_workflow_path(Path(path)):
+        if _compare_pending and baseline is None and baseline_file is None:
+            wf_last_run = Path(path) / "evals" / ".last-run.json"
+            if wf_last_run.is_file():
+                baseline_file = wf_last_run
+            output_baseline = wf_last_run
+        asyncio.run(
+            _run_workflow_eval(
+                Path(path),
+                gate=gate,
+                gate_mode=gate_mode,
+                runs=runs,
+                mock=mock,
+                output_format=output_format,
+                gate_faithfulness=gate_faithfulness,
+                gate_coverage=gate_coverage,
+                gate_latency=gate_latency,
+                gate_context_compliance=gate_context_compliance,
+                gate_refusal=gate_refusal,
+                baseline_file=baseline_file,
+                output_baseline=output_baseline,
+                regression_tolerance=regression_tolerance,
+            )
+        )
+        return
+
     if remote_url is not None:
         # Remote eval: dataset + schemas come from --agent-yaml, but
         # execution lands on the deployed runtime via MovateClient.
@@ -796,6 +828,153 @@ def _resolve_remote_url(path: str) -> str | None:
     if lower.startswith(("http://", "https://")):
         return path
     return None
+
+
+async def _run_workflow_eval(  # noqa: PLR0912 — orchestrator mirrors _run_eval
+    workflow_dir: Path,
+    *,
+    gate: float,
+    gate_mode: str,
+    runs: int,
+    mock: bool,
+    output_format: Report = Report.TABLE,
+    gate_faithfulness: float | None = None,
+    gate_coverage: float | None = None,
+    gate_latency: float | None = None,
+    gate_context_compliance: float | None = None,
+    gate_refusal: float | None = None,
+    baseline_file: Path | None = None,
+    output_baseline: Path | None = None,
+    regression_tolerance: float = 0.0,
+) -> None:
+    """Run a workflow eval end-to-end and apply accuracy + dimensional gates.
+
+    Mirrors :func:`_run_eval` but drives :class:`WorkflowEvalEngine` instead
+    of :class:`EvalEngine`. The same display / gate-check code runs on the
+    returned :class:`EvalSummary` so the operator sees the same Rich tables.
+    """
+    from movate.core.workflow.compiler import compile_workflow  # noqa: PLC0415
+    from movate.core.workflow.spec import WorkflowSpecLoadError, load_workflow_spec  # noqa: PLC0415
+
+    try:
+        spec, wf_dir = load_workflow_spec(workflow_dir)
+    except WorkflowSpecLoadError as exc:
+        err_console.print(f"[red]✗ workflow load failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    if spec.evals is None:
+        err_console.print(
+            f"[red]✗[/red] {spec.name} has no [bold]evals:[/bold] stanza in workflow.yaml. "
+            "Add an [bold]evals:[/bold] block with a [bold]dataset:[/bold] path."
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        graph = compile_workflow(spec, wf_dir)
+    except Exception as exc:
+        err_console.print(f"[red]✗ workflow compile failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    effective_gate = gate
+    effective_runs = runs
+
+    rt = await build_local_runtime(mock=mock)
+    baseline_record: EvalRecord | None = None
+    try:
+        show_progress = output_format == Report.TABLE and not mock
+        with _maybe_eval_progress(show_progress) as on_case:
+            engine = WorkflowEvalEngine(
+                executor=rt.executor,
+                storage=rt.storage,
+                runs_per_case=effective_runs,
+                gate_mode=gate_mode,
+                on_case_complete=on_case,
+            )
+            try:
+                summary = await engine.run(
+                    graph,
+                    wf_dir,
+                    spec.evals,
+                    workflow_name=spec.name,
+                    workflow_version=spec.version,
+                    threshold=effective_gate,
+                )
+            except EvalConfigError as exc:
+                err_console.print(f"[red]✗ eval config error:[/red] {exc}")
+                raise typer.Exit(code=2) from None
+
+        record = summary.to_record()
+        await rt.storage.save_eval(record)
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+    if baseline_file is not None:
+        baseline_record = _resolve_file_baseline(baseline_file)
+
+    if output_baseline is not None:
+        _write_baseline_file(output_baseline, record)
+
+    cases_passing = sum(1 for c in summary.cases if c.aggregated_score >= effective_gate)
+    overall_pass = summary.sample_count > 0 and cases_passing == summary.sample_count
+
+    diff: BaselineDiff | None = None
+    if baseline_record is not None:
+        diff = compute_baseline_diff(baseline_record, record)
+
+    if output_format == Report.JSON:
+        _emit_json(
+            summary,
+            record=record,
+            gate=effective_gate,
+            cases_passing=cases_passing,
+            overall_pass=overall_pass,
+            diff=diff,
+            regression_tolerance=regression_tolerance,
+        )
+    elif output_format == Report.MARKDOWN:
+        print(render_eval_markdown(summary, gate=effective_gate))
+    else:
+        _emit_header_line(
+            overall_pass=overall_pass,
+            cases_passing=cases_passing,
+            sample_count=summary.sample_count,
+            gate=effective_gate,
+            objective_filter=None,
+        )
+        _emit_table(
+            summary,
+            record=record,
+            gate=effective_gate,
+            cases_passing=cases_passing,
+            overall_pass=overall_pass,
+        )
+        if _has_extra_dims(summary.dimensional_means):
+            _emit_dimensional_breakdown(summary.dimensional_means)
+        if diff is not None:
+            _emit_diff_table(diff, regression_tolerance=regression_tolerance)
+        _print_eval_summary_line(
+            summary,
+            record=record,
+            gate=effective_gate,
+            cases_passing=cases_passing,
+            overall_pass=overall_pass,
+            diff=diff,
+            regression_tolerance=regression_tolerance,
+        )
+
+    failed_dim = _check_dimensional_gates(
+        summary.dimensional_means,
+        gate_faithfulness=gate_faithfulness,
+        gate_coverage=gate_coverage,
+        gate_latency=gate_latency,
+        gate_context_compliance=gate_context_compliance,
+        gate_refusal=gate_refusal,
+    )
+
+    failed_gate = not overall_pass
+    failed_regression = diff is not None and diff.is_regression(tolerance=regression_tolerance)
+    if failed_gate or failed_regression or failed_dim:
+        raise typer.Exit(code=1)
 
 
 async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
