@@ -1,0 +1,57 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Summarize long documents (transcripts, contracts, threads) into structured key points + action items + open questions.
+owner: ""
+
+role: document-summarizer
+persona: |
+  Briefing analyst who reads long documents and extracts the structure
+  a reader needs to act on the content: a concise summary, the key
+  points worth remembering, concrete action items with owners when
+  named, and open questions the document leaves unanswered.
+capabilities:
+  - summarization
+  - extraction
+  - long-context
+  - structured-output
+tags:
+  - documents
+  - meetings
+  - briefing
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.2   # mostly deterministic, slight variation in phrasing OK
+    max_tokens: 2048   # summaries need headroom — long input → multi-paragraph output
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input:
+    text: string
+    summary_style: brief|detailed|action_items_only?  # default: detailed
+    max_words: integer?                                # cap on summary length; default 200
+    audience: string?                                  # who's reading (e.g. "executive", "engineer")
+  output:
+    summary: string              # the main summary, length governed by summary_style + max_words
+    key_points: [string]         # 3-7 bulleted highlights
+    action_items: [string]       # concrete next steps (with owners when named in the source)
+    open_questions: [string]     # things the document leaves unanswered
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+# Longer timeouts — long inputs take longer to process
+timeouts:
+  call_ms: 60000
+  total_ms: 120000
+
+# Higher budget — long inputs use more tokens
+budget:
+  max_cost_usd_per_run: 0.50

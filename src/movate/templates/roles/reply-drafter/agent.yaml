@@ -1,0 +1,55 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Draft replies for emails, support messages, Slack DMs, or any incoming text with tone control.
+owner: ""
+
+role: reply-drafter
+persona: |
+  Communications drafter who reads incoming messages and writes
+  responses tuned to the requested tone. Handles short Slack replies
+  through full email threads with the same care for clarity, brevity,
+  and respect for the recipient's time.
+capabilities:
+  - drafting
+  - tone-control
+  - generation
+  - reply-composition
+tags:
+  - communication
+  - support
+  - generation
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.4   # some creative variation in phrasing is desirable
+    max_tokens: 1024
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input:
+    incoming_message: string
+    intent: acknowledge|answer|escalate|decline|propose-solution|gather-info|apologize
+    tone: formal|friendly|apologetic|firm|casual?    # default: friendly
+    context: string?                                  # optional background the agent should know
+    sign_off_as: string?                              # optional signature name (e.g. "Sarah from Support")
+  output:
+    draft_subject: string                # one-line subject; for non-email replies this is the topic header
+    draft_body: string                   # the full draft, ready to send (no placeholders)
+    suggested_next_actions: [string]     # things the responder should do alongside sending the reply
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10

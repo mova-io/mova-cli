@@ -74,22 +74,90 @@ SKILL_TEMPLATES: dict[str, str] = {
 }
 
 
+# Role templates — opinionated personas surfaced by ``mdk add``. These
+# differ from TEMPLATES (above) in two ways:
+#
+#   1. **Scope:** TEMPLATES are generic shapes (faq, summarizer,
+#      classifier). ROLE_TEMPLATES are specific personas built on top
+#      of those shapes (support-triage, sql-writer, etc.). The Mova
+#      iO catalog surfaces roles in the wizard's "Choose a template"
+#      dropdown — each one is a polished, ready-to-deploy agent.
+#
+#   2. **Discovery:** ``mdk add <name> --template <role>`` looks up
+#      this registry first; ``mdk init <name> --template <name>``
+#      stays on the legacy TEMPLATES registry. Both forms work for
+#      back-compat; the role flavor is the recommended path going
+#      forward.
+#
+# Each role's directory lives under ``roles/<name>/`` and ships:
+#   * agent.yaml      — fully-populated spec with marketplace metadata
+#   * prompt.md       — role-specific prompt with rubrics + examples
+#   * evals/dataset.jsonl — 2-3 sample cases for day-1 measurement
+#   * ROLE.md         — when-to-use + customization guidance
+ROLE_TEMPLATES: dict[str, str] = {
+    # Read incoming tickets, assign priority + team + category, decide
+    # escalation, write a 1-line summary. Strict enum output.
+    "support-triage": "roles/support-triage",
+    # Natural-language → SQL with dialect awareness + safety warnings
+    # on destructive ops. Generates queries; does not execute them.
+    "sql-writer": "roles/sql-writer",
+    # Draft replies for emails/Slack/tickets with explicit tone +
+    # intent control. No-placeholder rule (always ready to send).
+    "reply-drafter": "roles/reply-drafter",
+    # Classify text into a caller-provided taxonomy with confidence +
+    # reasoning. Strict label-from-taxonomy enforcement.
+    "text-classifier": "roles/text-classifier",
+    # Summarize long-form text into summary + key_points +
+    # action_items + open_questions. Audience-aware.
+    "document-summarizer": "roles/document-summarizer",
+}
+
+
 def list_templates() -> list[str]:
-    """Sorted list of template names."""
+    """Sorted list of (shape) template names."""
     return sorted(TEMPLATES.keys())
+
+
+def list_roles() -> list[str]:
+    """Sorted list of role-template names. Companion to
+    :func:`list_templates`; see :data:`ROLE_TEMPLATES` for the
+    distinction between shape templates and role templates."""
+    return sorted(ROLE_TEMPLATES.keys())
 
 
 def get_template_path(name: str) -> Path:
     """Resolve a friendly template name to its packaged directory.
 
-    Raises ``ValueError`` with the available list if ``name`` is unknown.
+    Looks up ``name`` in :data:`ROLE_TEMPLATES` first, falling back to
+    :data:`TEMPLATES`. This lets ``mdk add my-agent --template
+    support-triage`` resolve to the role template AND ``mdk init
+    my-agent --template faq`` still resolve to the shape template,
+    without users needing to know which registry the name lives in.
+
+    Raises ``ValueError`` with both available lists if ``name`` is
+    unknown.
     """
-    if name not in TEMPLATES:
-        raise ValueError(f"unknown template {name!r}; available: {', '.join(list_templates())}")
-    path = TEMPLATES_DIR / TEMPLATES[name]
+    if name in ROLE_TEMPLATES:
+        rel = ROLE_TEMPLATES[name]
+    elif name in TEMPLATES:
+        rel = TEMPLATES[name]
+    else:
+        roles = ", ".join(list_roles())
+        shapes = ", ".join(list_templates())
+        raise ValueError(
+            f"unknown template {name!r}; available roles: {roles}; available shapes: {shapes}"
+        )
+    path = TEMPLATES_DIR / rel
     if not path.is_dir():  # pragma: no cover — install-time invariant
         raise FileNotFoundError(f"template {name!r} dir missing on disk: {path}")
     return path
 
 
-__all__ = ["TEMPLATES", "TEMPLATES_DIR", "get_template_path", "list_templates"]
+__all__ = [
+    "ROLE_TEMPLATES",
+    "TEMPLATES",
+    "TEMPLATES_DIR",
+    "get_template_path",
+    "list_roles",
+    "list_templates",
+]
