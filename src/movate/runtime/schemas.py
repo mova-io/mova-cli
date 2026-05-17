@@ -371,6 +371,12 @@ class EvalSubmission(BaseModel):
     objective: str | None = Field(None)
     """Optional objective id to filter cases by (matches
     agent.yaml: objectives[].id)."""
+    skill_responses: dict[str, dict[str, Any]] | None = Field(None)
+    """Global skill stubs applied to every case when set. Same shape as
+    EvalCase.skill_responses — keyed by skill name, value is the stub
+    response dict. Per-case ``skill_responses`` in the dataset take
+    precedence. Useful for remote eval with mock=true so skill calls
+    return deterministic data rather than hitting live endpoints."""
 
 
 class EvalAcceptedView(BaseModel):

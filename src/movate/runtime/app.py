@@ -1941,6 +1941,7 @@ def build_app(
                 runs_per_case=body.runs,
                 gate_mode=body.gate_mode,
                 objective_filter=body.objective,
+                global_skill_responses=body.skill_responses,
             )
             # Synchronous: blocks the request until the eval finishes.
             # For mock + small datasets this is sub-second. Real LLM

@@ -6,6 +6,14 @@ Subject: {{ input.subject }}
 Body:
 {{ input.body }}
 
+{% if kb_lookup_output is defined and kb_lookup_output.matches %}
+# Similar past tickets (from KB)
+{% for match in kb_lookup_output.matches %}
+- **{{ match.title }}**: {{ match.resolution }}
+{% endfor %}
+Use these past resolutions to inform your routing and draft reply, but do not copy them verbatim.
+{% endif %}
+
 # Your job
 
 Read the ticket and produce a structured triage decision:

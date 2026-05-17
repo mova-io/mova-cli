@@ -382,3 +382,99 @@ async def test_summary_to_record_round_trips(
     assert record.runs_per_case == 1
     assert record.gate_mode == "mean"
     assert record.sample_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Multi-judge panel tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_panel_happy_path_low_variance(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """Three judges agree → panel mean returned, no escalation."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}}\n'
+    )
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: panel\n"
+        "rubric: 'score quality'\n"
+        "judges:\n"
+        "  - provider: anthropic/claude-sonnet-4-6\n"
+        "  - provider: gemini/gemini-1.5-pro\n"
+        "variance_threshold: 0.3\n"
+        "threshold: 0.7\n"
+    )
+    bundle = load_agent(agent_dir)
+
+    # All judge calls return 0.9 → std_dev = 0, no escalation
+    provider = JudgeStubProvider(agent_response='{"message": "good"}', judge_score=0.9)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+    summary = await engine.run(bundle)
+
+    assert summary.judge_provider == "anthropic/claude-sonnet-4-6+gemini/gemini-1.5-pro"
+    assert summary.cases[0].aggregated_score == pytest.approx(0.9)
+    assert summary.cases[0].passed
+    assert "panel:" in summary.cases[0].runs[0].rationale
+    assert "escalated" not in summary.cases[0].runs[0].rationale
+
+
+@pytest.mark.unit
+async def test_panel_rejects_fewer_than_two_judges(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: panel\nrubric: 'x'\njudges:\n  - provider: anthropic/claude-sonnet-4-6\n"
+    )
+    bundle = load_agent(agent_dir)
+    provider = JudgeStubProvider(agent_response='{"message": "x"}', judge_score=1.0)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+    with pytest.raises(EvalConfigError, match="at least 2 judges"):
+        await engine.run(bundle)
+
+
+@pytest.mark.unit
+async def test_panel_requires_rubric(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: panel\njudges:\n  - provider: anthropic/claude-sonnet-4-6\n"
+        "  - provider: gemini/gemini-1.5-pro\n"
+    )
+    bundle = load_agent(agent_dir)
+    provider = JudgeStubProvider(agent_response='{"message": "x"}', judge_score=1.0)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+    with pytest.raises(EvalConfigError, match="requires 'rubric'"):
+        await engine.run(bundle)
+
+
+@pytest.mark.unit
+async def test_global_skill_responses_fallback(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """global_skill_responses applies to all cases; per-case takes precedence."""
+    from movate.providers.mock import MockProvider
+
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "Hello!"}}\n'
+    )
+    bundle = load_agent(agent_dir)
+    provider = MockProvider(response='{"message": "Hello!"}')
+    executor = _executor(provider, pricing, storage, tracer)
+
+    engine = EvalEngine(
+        executor=executor,
+        provider=provider,
+        global_skill_responses={"kb-lookup": {"matches": []}},
+    )
+    summary = await engine.run(bundle)
+    # Exact-match passes: MockProvider returns the expected output
+    assert summary.cases[0].passed
