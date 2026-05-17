@@ -1480,6 +1480,143 @@ def _login_telegram(*, key: str | None, no_verify: bool, save_to: str) -> None:
         raise typer.Exit(code=2)
 
 
+class BootstrapSeedError(Exception):
+    """Raised by :func:`bootstrap_seed_inline` on any failure.
+
+    Carries an operator-actionable message in ``args[0]``. Callers
+    that want to chain bootstrap-seed into a larger flow (e.g. ``mdk
+    infra apply --target dev`` running it after a successful Bicep
+    deploy) catch this instead of ``typer.Exit``.
+    """
+
+
+def bootstrap_seed_inline(
+    target: str,
+    *,
+    keyvault: str,
+    tenant_id: str = "demotenant",
+    env: str = "live",
+    force: bool = False,
+) -> tuple[str, str]:
+    """Mint + upload bootstrap key to Key Vault + save locally; return ``(key, env_var)``.
+
+    Same mechanics as the ``mdk auth bootstrap-seed`` typer command,
+    but returns ``(minted_key, env_var)`` instead of printing-and-exiting.
+    Used by ``mdk infra apply`` to auto-chain after a successful
+    Bicep deployment so first-deploy is one command.
+
+    Raises :class:`BootstrapSeedError` on any failure.
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        raise BootstrapSeedError(str(exc)) from None
+    if target not in cfg.targets:
+        registered = sorted(cfg.targets) or ["<none>"]
+        raise BootstrapSeedError(
+            f"unknown target {target!r}. Registered: "
+            f"{', '.join(registered)}. Add one with `mdk config add-target`."
+        )
+    target_cfg = cfg.targets[target]
+    env_var = target_cfg.key_env
+    if not env_var:
+        raise BootstrapSeedError(
+            f"target {target!r} has no `key_env` configured. Re-register "
+            f"with `--key-env MDK_{target.upper()}_KEY`."
+        )
+
+    if shutil.which("az") is None:
+        raise BootstrapSeedError(
+            "`az` (Azure CLI) not found on PATH. Install it from "
+            "https://learn.microsoft.com/cli/azure/install-azure-cli."
+        )
+
+    if not force:
+        probe = subprocess.run(
+            [
+                "az",
+                "keyvault",
+                "secret",
+                "show",
+                "--vault-name",
+                keyvault,
+                "--name",
+                "bootstrap-api-key",
+                "--query",
+                "id",
+                "-o",
+                "tsv",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            raise BootstrapSeedError(
+                f"`bootstrap-api-key` already exists in {keyvault!r}. To "
+                f"rotate, re-run with --force. To recover its value "
+                f"locally without rotating, run: "
+                f"`mdk auth pull-runtime-key {target} --keyvault {keyvault}`"
+            )
+
+    try:
+        env_enum = ApiKeyEnv(env)
+    except ValueError as exc:
+        raise BootstrapSeedError(
+            f"--env must be one of {[e.value for e in ApiKeyEnv]}; got {env!r}"
+        ) from exc
+
+    try:
+        minted = mint_api_key(
+            tenant_id=tenant_id,
+            env=env_enum,
+            label="bootstrap-seed",
+            ttl_days=0,
+        )
+    except ValueError as exc:
+        raise BootstrapSeedError(str(exc)) from None
+    seed_key = minted.full_key
+
+    result = subprocess.run(
+        [
+            "az",
+            "keyvault",
+            "secret",
+            "set",
+            "--vault-name",
+            keyvault,
+            "--name",
+            "bootstrap-api-key",
+            "--value",
+            seed_key,
+            "--output",
+            "none",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BootstrapSeedError(
+            f"az keyvault secret set failed (exit {result.returncode}): "
+            f"{result.stderr.strip()[:400]}. Confirm {keyvault!r} exists "
+            f"and that you have `Key Vault Secrets Officer` on it."
+        )
+
+    store = CredentialsStore()
+    store.set(env_var, seed_key)
+    return seed_key, env_var
+
+
 @auth_app.command("bootstrap-seed")
 def bootstrap_seed(
     target: str = typer.Argument(
@@ -1538,11 +1675,12 @@ def bootstrap_seed(
       3. Save the same value to the local credentials store so
          `mdk deploy --target <name>` works immediately.
 
-    Run this ONCE per environment after `mdk infra apply` and
-    before the first `mdk deploy`. Subsequent deploys (and revision
-    recycles) keep working because the Bicep's secretRef + the
-    runtime's seed code together ensure the key is reseeded on
-    every cold start.
+    Run this ONCE per environment after `mdk infra apply` (which
+    chains into bootstrap-seed automatically by default, so most
+    operators never invoke this directly) and before the first
+    `mdk deploy`. Subsequent deploys (and revision recycles) keep
+    working because the Bicep's secretRef + the runtime's seed code
+    together ensure the key is reseeded on every cold start.
 
     [bold]Examples:[/bold]
 
@@ -1552,144 +1690,25 @@ def bootstrap_seed(
       [dim]# Rotate the bootstrap key (security event, etc.):[/dim]
       $ mdk auth bootstrap-seed dev --keyvault movate-dev-kv-mvt --force
     """
-    import shutil  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
-
-    from movate.core.user_config import (  # noqa: PLC0415
-        UserConfigError,
-        load_user_config,
-    )
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
-    # Resolve target → save_to env var name. We don't need the Azure
-    # subscription / RG for this command (KV is named explicitly) but
-    # we DO need the target's key_env so the saved local value lands
-    # in the right slot.
-    try:
-        cfg = load_user_config()
-    except UserConfigError as exc:
-        error(str(exc))
-        raise typer.Exit(code=2) from None
-    if target not in cfg.targets:
-        registered = sorted(cfg.targets) or ["<none>"]
-        error(
-            f"unknown target {target!r}. Registered: "
-            f"{', '.join(registered)}. Add one with `mdk config add-target`."
-        )
-        raise typer.Exit(code=2)
-    target_cfg = cfg.targets[target]
-    env_var = target_cfg.key_env
-    if not env_var:
-        error(
-            f"target {target!r} has no `key_env` configured. Re-register "
-            f"with `--key-env MDK_{target.upper()}_KEY`."
-        )
-        raise typer.Exit(code=2)
-
-    if shutil.which("az") is None:
-        error(
-            "`az` (Azure CLI) not found on PATH. Install it from "
-            "https://learn.microsoft.com/cli/azure/install-azure-cli."
-        )
-        raise typer.Exit(code=2)
-
-    # Idempotency guard: don't silently rotate a production bootstrap
-    # key. The `az keyvault secret show` exits non-zero if the secret
-    # doesn't exist, so we treat a successful response as "already
-    # present" and require --force to proceed.
-    if not force:
-        probe = subprocess.run(
-            [
-                "az",
-                "keyvault",
-                "secret",
-                "show",
-                "--vault-name",
-                keyvault,
-                "--name",
-                "bootstrap-api-key",
-                "--query",
-                "id",
-                "-o",
-                "tsv",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if probe.returncode == 0 and probe.stdout.strip():
-            error(
-                f"`bootstrap-api-key` already exists in {keyvault!r}. To "
-                f"rotate, re-run with --force. To recover its value "
-                f"locally without rotating, run: "
-                f"`mdk auth save-runtime-key {target} \"$(az keyvault "
-                f"secret show --vault-name {keyvault} --name "
-                f"bootstrap-api-key --query value -o tsv)\"`"
-            )
-            raise typer.Exit(code=2)
-
-    # Mint the key. ttl_days=0 means non-expiring — bootstrap keys are
-    # explicitly opt-in to "service account forever" semantics, which
-    # is the right default for the seeded key that the Bicep
-    # references. Operators rotate by re-running this with --force.
-    try:
-        env_enum = ApiKeyEnv(env)
-    except ValueError as exc:
-        error(f"--env must be one of {[e.value for e in ApiKeyEnv]}; got {env!r}")
-        raise typer.Exit(code=2) from exc
-
-    try:
-        minted = mint_api_key(
-            tenant_id=tenant_id,
-            env=env_enum,
-            label="bootstrap-seed",
-            ttl_days=0,
-        )
-    except ValueError as exc:
-        error(str(exc))
-        raise typer.Exit(code=2) from None
-    seed_key = minted.full_key
-
-    # Upload to Key Vault. `--value` puts the secret on the command
-    # line which would normally be a credential-leak concern, but
-    # this is the only invocation of the freshly-minted key before
-    # it's persisted — and the subprocess is direct, no shell glob
-    # expansion. The minted key is never echoed to stdout below.
     hint(
         f"[dim]→ az keyvault secret set --vault-name {keyvault} "
         f"--name bootstrap-api-key --value <minted-key>[/dim]"
     )
-    result = subprocess.run(
-        [
-            "az",
-            "keyvault",
-            "secret",
-            "set",
-            "--vault-name",
-            keyvault,
-            "--name",
-            "bootstrap-api-key",
-            "--value",
-            seed_key,
-            "--output",
-            "none",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        error(
-            f"az keyvault secret set failed (exit {result.returncode}): "
-            f"{result.stderr.strip()[:400]}. Confirm {keyvault!r} exists "
-            f"and that you have `Key Vault Secrets Officer` on it."
+    try:
+        _seed_key, env_var = bootstrap_seed_inline(
+            target,
+            keyvault=keyvault,
+            tenant_id=tenant_id,
+            env=env,
+            force=force,
         )
-        raise typer.Exit(code=2)
+    except BootstrapSeedError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
 
-    # Save the same value locally so `mdk deploy` works immediately.
-    store = CredentialsStore()
-    store.set(env_var, seed_key)
-
+    store_path = CredentialsStore().path
     success(
         f"bootstrap key minted + uploaded to [cyan]{keyvault}/bootstrap-api-key[/cyan] "
         f"+ saved locally as [cyan]{env_var}[/cyan]."
@@ -1701,7 +1720,7 @@ def bootstrap_seed(
     )
     hint(
         f"[dim]For the current shell, run: [bold]export {env_var}=$(grep "
-        f"'^{env_var}=' {store.path} | cut -d= -f2-)[/bold] or open a new "
+        f"'^{env_var}=' {store_path} | cut -d= -f2-)[/bold] or open a new "
         f"terminal.[/dim]"
     )
 
