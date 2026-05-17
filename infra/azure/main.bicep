@@ -311,10 +311,11 @@ resource caeAgentsStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01
   properties: {
     azureFile: {
       accountName: saName
-      // listKeys() is implicitly ordered after ``azfiles`` because we pass
-      // azfiles.outputs.storageAccountId as the resource id argument —
-      // Bicep registers it as a dependency edge in the ARM graph.
-      accountKey: listKeys(azfiles.outputs.storageAccountId, '2023-01-01').keys[0].value
+      // Use resourceId() directly (not azfiles.outputs.storageAccountId)
+      // because listKeys() requires a value calculable at deployment start —
+      // conditional module outputs are not guaranteed non-null (BCP181).
+      // The explicit dependsOn: [cae] below ensures ordering.
+      accountKey: listKeys(resourceId('Microsoft.Storage/storageAccounts', saName), '2023-01-01').keys[0].value
       shareName: 'movate-agents'
       accessMode: 'ReadWrite'
     }
