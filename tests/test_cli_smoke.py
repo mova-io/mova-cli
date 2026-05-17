@@ -196,11 +196,11 @@ def test_doctor_install_hint_for_missing_runtime_extra(
 @pytest.mark.parametrize(
     "command",
     [
-        ["logs", "x"],
         # `serve` (v0.5 stage 3b) and `worker` (v0.5 stage 4) both used
         # to be stubs; both have been replaced with real loops that
         # block forever, so neither can appear here. Their coverage
         # lives in tests/test_runtime_*.py + manual real-binary smoke.
+        # `logs` was a stub through v0.3; it is now a real command.
         ["deploy", "dev"],
     ],
 )
