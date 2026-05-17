@@ -38,6 +38,7 @@ import statistics
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -45,12 +46,14 @@ import yaml
 from pydantic import ValidationError
 
 from movate.core.models import (
+    ErrorInfo,
     EvalRecord,
     JudgeConfig,
     JudgeMethod,
     Metrics,
     RunRequest,
     RunResponse,
+    WorkflowStatus,
 )
 from movate.providers import provider_family
 from movate.providers.base import (
@@ -62,6 +65,9 @@ from movate.providers.base import (
 if TYPE_CHECKING:
     from movate.core.executor import Executor
     from movate.core.loader import AgentBundle
+    from movate.core.workflow.ir import WorkflowGraph
+    from movate.core.workflow.spec import WorkflowEvalsSpec
+    from movate.storage.base import StorageProvider
 
 
 class EvalConfigError(Exception):
@@ -385,11 +391,12 @@ class EvalSummary:
 # ---------------------------------------------------------------------------
 
 
-def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
-    """Read the agent's dataset; returns (cases, sha256-hex)."""
-    if not bundle.spec.evals.dataset:
-        raise EvalConfigError(f"agent {bundle.spec.name} has no evals.dataset configured")
-    path = (bundle.agent_dir / bundle.spec.evals.dataset).resolve()
+def _parse_dataset_path(path: Path) -> tuple[list[EvalCase], str]:
+    """Parse a dataset JSONL file into (cases, sha256-hex).
+
+    Shared by :func:`load_dataset` (agent) and :func:`load_workflow_dataset`
+    (workflow) so the field-validation rules stay in one place.
+    """
     if not path.exists():
         raise EvalConfigError(f"dataset not found: {path}")
     raw = path.read_bytes()
@@ -405,10 +412,6 @@ def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
             raise EvalConfigError(f"{path}:{line_no} invalid JSON: {exc}") from exc
         if not isinstance(d, dict):
             raise EvalConfigError(f"{path}:{line_no} each row must be a JSON object")
-        # Optional 4-dim fields. Each defaults to None; cases that
-        # don't carry the field skip the corresponding dimension at
-        # scoring time. expected_coverage MAY be a list of strings; if
-        # provided as anything else, fail at load with a readable error.
         expected_coverage = d.get("expected_coverage")
         if expected_coverage is not None and not (
             isinstance(expected_coverage, list)
@@ -458,6 +461,27 @@ def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
             )
         )
     return cases, digest
+
+
+def load_dataset(bundle: AgentBundle) -> tuple[list[EvalCase], str]:
+    """Read the agent's dataset; returns (cases, sha256-hex)."""
+    if not bundle.spec.evals.dataset:
+        raise EvalConfigError(f"agent {bundle.spec.name} has no evals.dataset configured")
+    path = (bundle.agent_dir / bundle.spec.evals.dataset).resolve()
+    return _parse_dataset_path(path)
+
+
+def load_workflow_dataset(
+    workflow_dir: Path,
+    evals_spec: WorkflowEvalsSpec,
+) -> tuple[list[EvalCase], str]:
+    """Read a workflow's eval dataset; returns (cases, sha256-hex).
+
+    The dataset path is relative to ``workflow_dir`` (where ``workflow.yaml``
+    lives). Same JSONL field rules as :func:`load_dataset`.
+    """
+    path = (workflow_dir / evals_spec.dataset).resolve()
+    return _parse_dataset_path(path)
 
 
 def load_judge_config(bundle: AgentBundle) -> JudgeConfig:
@@ -1115,6 +1139,194 @@ class EvalEngine:
         return DimensionScore(score, rationale)
 
 
+def _score_workflow_accuracy(
+    final_state: dict[str, Any],
+    expected: dict[str, Any],
+) -> DimensionScore:
+    """Partial-match accuracy for workflow evals.
+
+    Checks every key declared in ``expected`` against ``final_state``.
+    Extra keys in ``final_state`` (intermediate node outputs that aren't
+    part of the contract) are ignored — the workflow's external contract
+    is only the keys the dataset row asserts.
+
+    An empty ``expected`` dict scores 1.0 (trivially satisfied).
+    """
+    if not expected:
+        return DimensionScore(1.0, "no expected keys to check")
+    mismatches = [k for k, v in expected.items() if final_state.get(k) != v]
+    if not mismatches:
+        return DimensionScore(1.0, f"all {len(expected)} expected key(s) match")
+    return DimensionScore(0.0, f"mismatch on: {mismatches}")
+
+
+class WorkflowEvalEngine:
+    """Eval engine for multi-node workflows.
+
+    Mirrors :class:`EvalEngine` but calls :class:`WorkflowRunner` instead of
+    :class:`Executor`. Scoring targets ``WorkflowResult.final_state``;
+    per-node outputs are not scored individually.
+
+    Phase 1 (this implementation): accuracy + coverage + refusal + latency.
+    Faithfulness and context_compliance require an LLM judge and are deferred
+    to Phase 2.
+    """
+
+    def __init__(
+        self,
+        *,
+        executor: Executor,
+        storage: StorageProvider,
+        runs_per_case: int = 1,
+        gate_mode: str = "mean",
+        on_case_complete: Callable[[int, int, CaseSummary], None] | None = None,
+    ) -> None:
+        if runs_per_case < 1:
+            raise EvalConfigError("runs_per_case must be >= 1")
+        if gate_mode not in _GATE_MODES:
+            raise EvalConfigError(f"gate_mode {gate_mode!r} must be one of {_GATE_MODES}")
+        self._executor = executor
+        self._storage = storage
+        self._runs_per_case = runs_per_case
+        self._gate_mode = gate_mode
+        self._on_case_complete = on_case_complete
+
+    async def run(
+        self,
+        graph: WorkflowGraph,
+        workflow_dir: Path,
+        evals_spec: WorkflowEvalsSpec,
+        *,
+        workflow_name: str,
+        workflow_version: str,
+        threshold: float,
+    ) -> EvalSummary:
+        """Run the workflow eval suite and return an :class:`EvalSummary`.
+
+        ``workflow_name`` and ``workflow_version`` populate the
+        ``EvalSummary.agent`` / ``agent_version`` slots so the existing display
+        and persistence code works unmodified.
+        ``threshold`` is the per-case accuracy gate (``--gate`` flag value).
+        """
+        from movate.core.workflow.runner import WorkflowRunError, WorkflowRunner  # noqa: PLC0415
+
+        cases, dataset_hash = load_workflow_dataset(workflow_dir, evals_spec)
+        judge = JudgeConfig(method=JudgeMethod.EXACT)
+
+        runner = WorkflowRunner(
+            executor=self._executor,
+            storage=self._storage,
+        )
+
+        case_summaries: list[CaseSummary] = []
+        total = len(cases)
+
+        for case in cases:
+            runs: list[CaseRun] = []
+            for _ in range(self._runs_per_case):
+                try:
+                    result = await runner.run(graph, case.input)
+                except WorkflowRunError as exc:
+                    fail_response = RunResponse(
+                        status="error",
+                        error=ErrorInfo(type="workflow_run_error", message=str(exc)),
+                    )
+                    runs.append(
+                        CaseRun(
+                            response=fail_response,
+                            score=0.0,
+                            rationale=str(exc),
+                            dimensions=DimensionScores(
+                                accuracy=DimensionScore(0.0, str(exc))
+                            ),
+                        )
+                    )
+                    continue
+
+                total_cost = sum(r.metrics.cost_usd for r in result.runs)
+                synth_response = RunResponse(
+                    status="success" if result.status == WorkflowStatus.SUCCESS else "error",
+                    data=result.final_state,
+                    metrics=Metrics(latency_ms=result.duration_ms, cost_usd=total_cost),
+                    error=result.error,
+                )
+
+                if result.status != WorkflowStatus.SUCCESS:
+                    fail_reason = (
+                        result.error.message
+                        if result.error
+                        else f"workflow stopped at node {result.error_node_id!r}"
+                    )
+                    runs.append(
+                        CaseRun(
+                            response=synth_response,
+                            score=0.0,
+                            rationale=fail_reason,
+                            dimensions=DimensionScores(
+                                accuracy=DimensionScore(0.0, fail_reason)
+                            ),
+                        )
+                    )
+                    continue
+
+                accuracy = _score_workflow_accuracy(result.final_state, case.expected)
+                coverage = DimensionScore()
+                if case.expected_coverage is not None:
+                    coverage = _score_coverage(case.expected_coverage, result.final_state)
+                refusal = DimensionScore()
+                if case.refusal_expected is True:
+                    refusal = _score_refusal(result.final_state)
+                latency = DimensionScore()
+                if case.latency_budget_ms:
+                    latency = _score_latency(
+                        latency_ms=result.duration_ms,
+                        budget_ms=case.latency_budget_ms,
+                    )
+
+                dims = DimensionScores(
+                    accuracy=accuracy,
+                    coverage=coverage,
+                    refusal=refusal,
+                    latency=latency,
+                )
+                gate_score = accuracy.value if accuracy.value is not None else 0.0
+                runs.append(
+                    CaseRun(
+                        response=synth_response,
+                        score=gate_score,
+                        rationale=accuracy.rationale,
+                        dimensions=dims,
+                    )
+                )
+
+            agg = aggregate_scores([r.score for r in runs], self._gate_mode)
+            summary = CaseSummary(
+                case=case,
+                runs=runs,
+                aggregated_score=agg,
+                passed=agg >= threshold,
+            )
+            case_summaries.append(summary)
+            if self._on_case_complete is not None:
+                with contextlib.suppress(Exception):
+                    self._on_case_complete(len(case_summaries), total, summary)
+
+        dimensional_means = _compute_dimensional_means(case_summaries)
+
+        return EvalSummary(
+            agent=workflow_name,
+            agent_version=workflow_version,
+            dataset_hash=dataset_hash,
+            judge=judge,
+            judge_provider=None,
+            runs_per_case=self._runs_per_case,
+            gate_mode=self._gate_mode,
+            threshold=threshold,
+            cases=case_summaries,
+            dimensional_means=dimensional_means,
+        )
+
+
 def _parse_judge_response(text: str) -> tuple[float, str]:
     """Tolerant parser: strips fences, falls back to last `{...}` substring."""
     cleaned = text.strip()
@@ -1152,8 +1364,10 @@ __all__ = [
     "EvalEngine",
     "EvalSummary",
     "Metrics",
+    "WorkflowEvalEngine",
     "aggregate_scores",
     "assert_cross_family",
     "load_dataset",
     "load_judge_config",
+    "load_workflow_dataset",
 ]
