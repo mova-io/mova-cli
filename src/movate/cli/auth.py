@@ -947,9 +947,9 @@ def save_runtime_key(
     store.set(env_var, key)
     success(f"saved as [cyan]{env_var}[/cyan] in [cyan]{store.path}[/cyan].")
     hint(
-        f"[dim]Future shells autoload {env_var} automatically. "
-        f"For the current shell, run: [bold]export {env_var}={env_var}_VALUE[/bold] "
-        f"or open a new terminal.[/dim]"
+        f"[dim]Future shells autoload {env_var} automatically. For the "
+        f"current shell, run: [bold]export {env_var}=$(grep '^{env_var}=' "
+        f"{store.path} | cut -d= -f2-)[/bold] or open a new terminal.[/dim]"
     )
 
 
