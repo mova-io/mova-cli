@@ -886,6 +886,7 @@ async def _run_workflow_eval(  # noqa: PLR0912 — orchestrator mirrors _run_eva
             engine = WorkflowEvalEngine(
                 executor=rt.executor,
                 storage=rt.storage,
+                provider=rt.provider,
                 runs_per_case=effective_runs,
                 gate_mode=gate_mode,
                 on_case_complete=on_case,
