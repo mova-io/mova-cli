@@ -91,6 +91,11 @@ class SkillExecutionContext:
     effective timeout for this specific invocation, already resolved
     from skill override or agent inheritance.
 
+    ``mock`` signals that the calling agent was invoked in mock/eval
+    mode (``mdk eval --mock``). Backends that call external resources
+    (HTTP, MCP, remote agents) should short-circuit to a deterministic
+    stub response when this is ``True``.
+
     Kept narrow on purpose — the backend is a function, not a god
     object. If a backend needs more, we add a field deliberately.
     """
@@ -99,6 +104,7 @@ class SkillExecutionContext:
     tenant_id: str = "local"
     run_id: str = ""
     call_ms_budget: int = 30_000
+    mock: bool = False
 
 
 class SkillBackend(Protocol):

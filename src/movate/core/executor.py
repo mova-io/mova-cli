@@ -617,6 +617,7 @@ class Executor:
         # so these imports don't fire for agents without skills. Adding
         # a new backend is a single line + the new module — no other
         # wiring required.
+        from movate.core.skill_backend import agent as _agent_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
