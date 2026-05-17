@@ -311,16 +311,18 @@ resource caeAgentsStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01
   properties: {
     azureFile: {
       accountName: saName
-      // Use resourceId() directly (not azfiles.outputs.storageAccountId)
-      // because listKeys() requires a value calculable at deployment start —
-      // conditional module outputs are not guaranteed non-null (BCP181).
-      // The explicit dependsOn: [cae] below ensures ordering.
+      // resourceId() is used instead of azfiles.outputs.storageAccountId
+      // because Bicep BCP181 requires listKeys() arguments to be
+      // calculable at deployment start — conditional module outputs are not.
+      // saName is a plain variable so it satisfies the constraint.
+      // dependsOn: [azfiles] below restores the ordering that the module
+      // output reference previously provided implicitly.
       accountKey: listKeys(resourceId('Microsoft.Storage/storageAccounts', saName), '2023-01-01').keys[0].value
       shareName: 'movate-agents'
       accessMode: 'ReadWrite'
     }
   }
-  dependsOn: [cae]
+  dependsOn: [azfiles, cae]
 }
 
 // User-assigned managed identities for the api + worker apps.
