@@ -220,8 +220,10 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "[bold]anthropic/claude-opus-4-7[/bold]. "
             "Overrides [bold]judge.yaml[/bold] — no config file needed. "
             "Requires [bold]--judge-rubric[/bold]. "
-            "Repeat the flag twice for a two-judge panel "
-            "(requires [bold]--judge-rubric[/bold])."
+            "Repeat the flag twice or more for a multi-judge panel — "
+            "judges score independently and the panel mean is used "
+            "unless std-dev exceeds the variance threshold, in which "
+            "case [bold]--arbitrator-model[/bold] (if set) breaks the tie."
         ),
     ),
     judge_rubric: str = typer.Option(
@@ -231,6 +233,26 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "Scoring rubric passed verbatim to the LLM judge(s). "
             "Required when [bold]--judge-model[/bold] is set. "
             "Example: [dim]'Score 0-1: 1=all fields correct, 0=any field wrong'[/dim]"
+        ),
+    ),
+    arbitrator_model: str = typer.Option(
+        None,
+        "--arbitrator-model",
+        help=(
+            "Tiebreaker model used when panel judges disagree by more "
+            "than [bold]--variance-threshold[/bold]. Pick a high-capability "
+            "model from a family different from any panel judge. "
+            "Only meaningful when 2+ [bold]--judge-model[/bold] are set."
+        ),
+    ),
+    variance_threshold: float = typer.Option(
+        0.3,
+        "--variance-threshold",
+        help=(
+            "Std-dev threshold above which the arbitrator is consulted "
+            "(0.0-1.0). Lower = more sensitive to disagreement; default "
+            "0.3 catches roughly the 'mild divergence' case. Only used "
+            "in panel mode."
         ),
     ),
 ) -> None:
@@ -282,21 +304,42 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             )
             raise typer.Exit(code=2)
         if len(judge_model) == 1:
+            if arbitrator_model is not None:
+                err_console.print(
+                    "[red]✗[/red] --arbitrator-model requires a panel "
+                    "(pass --judge-model 2+ times); a single judge has "
+                    "nothing to arbitrate."
+                )
+                raise typer.Exit(code=2)
             judge_override = JudgeConfig(
                 method=JudgeMethod.LLM_JUDGE,
                 model=ModelConfig(provider=judge_model[0]),
                 rubric=judge_rubric,
             )
         else:
-            err_console.print(
-                "[red]✗[/red] multi-model panel (--judge-model x 2+) requires "
-                "the panel feature — upgrade to movate-cli v0.8 or later."
+            # Multi-judge panel: N >= 2 judges score concurrently;
+            # arbitrator breaks ties when std_dev > variance_threshold.
+            judge_override = JudgeConfig(
+                method=JudgeMethod.PANEL,
+                judges=[ModelConfig(provider=m) for m in judge_model],
+                rubric=judge_rubric,
+                variance_threshold=variance_threshold,
+                escalation=(
+                    ModelConfig(provider=arbitrator_model)
+                    if arbitrator_model
+                    else None
+                ),
             )
-            raise typer.Exit(code=2)
     elif judge_rubric:
         err_console.print(
             "[red]✗[/red] --judge-rubric requires --judge-model "
             "(specify which model should apply the rubric)"
+        )
+        raise typer.Exit(code=2)
+    elif arbitrator_model is not None:
+        err_console.print(
+            "[red]✗[/red] --arbitrator-model requires --judge-model "
+            "(at least 2; the arbitrator only fires inside a panel)"
         )
         raise typer.Exit(code=2)
 
