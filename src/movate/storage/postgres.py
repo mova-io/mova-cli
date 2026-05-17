@@ -176,6 +176,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
     expires_at    TIMESTAMPTZ,
     scope         TEXT
 );
+-- Idempotent self-healing migrations for tables that pre-date a
+-- column. `CREATE TABLE IF NOT EXISTS` is a no-op when the table is
+-- already there, so any column added after the table was first
+-- created has to be ALTERed in explicitly. Without this block,
+-- upgrading a runtime against a long-lived database surfaces as
+-- `UndefinedColumnError` on the first query that names the new
+-- column (caught live on dev when an older deployment had created
+-- `api_keys` without `expires_at` or `scope`).
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scope TEXT;
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active
     ON api_keys(tenant_id) WHERE revoked_at IS NULL;
 """
