@@ -781,13 +781,12 @@ def _check_marketplace_metadata(spec: AgentSpec) -> None:
     m = spec.metadata
 
     # owner check
-    if m.owner is not None:
-        if not m.owner.strip():
-            console.print(
-                "  [yellow]![/yellow] metadata.owner is set but empty — "
-                "use a non-empty email address or team name, "
-                "or omit the field entirely."
-            )
+    if m.owner is not None and not m.owner.strip():
+        console.print(
+            "  [yellow]![/yellow] metadata.owner is set but empty — "
+            "use a non-empty email address or team name, "
+            "or omit the field entirely."
+        )
 
     # examples check — each entry should have input + output keys
     for i, ex in enumerate(m.examples):
