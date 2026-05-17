@@ -423,6 +423,11 @@ class _FaithfulnessStubProvider(BaseLLMProvider):
             return CompletionResponse(
                 text=f'{{"score": {self._accuracy_score}, "rationale": "stub-acc"}}',
             )
+        if "specialist evaluator" in body:
+            # v0.8 specialist scorers (safety, completeness, tool-usage, ux-tone)
+            return CompletionResponse(
+                text='{"score": 1.0, "rationale": "stub-specialist"}',
+            )
         return CompletionResponse(text=self._agent_response)
 
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
