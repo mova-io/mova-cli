@@ -718,6 +718,18 @@ def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> 
 
     base_url = target_cfg.url.rstrip("/")
     headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Upload skills BEFORE agents: agent upload triggers scan_agents on
+    # the runtime, which validates skill references. Skills must already
+    # be in the registry at that point or agents that reference them 422.
+    with httpx.Client(timeout=httpx.Timeout(60.0)) as skill_client:
+        skill_uploaded, skill_failed = _upload_skills(
+            client=skill_client,
+            base_url=base_url,
+            headers=headers,
+            project_root=project_root,
+        )
+
     uploaded: list[str] = []
     failed: list[tuple[str, str]] = []  # (name, reason)
 
@@ -735,28 +747,16 @@ def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> 
             else:
                 failed.append((agent_dir.name, result))
 
-    # Upload custom skills to the global skill registry. Skills are
-    # registered separately from agents because the runtime resolves
-    # them by name from a shared skills_path, not per-agent-dir.
-    # Safe to call when skills/ is absent or empty — returns silently.
-    with httpx.Client(timeout=httpx.Timeout(60.0)) as skill_client:
-        skill_uploaded, skill_failed = _upload_skills(
-            client=skill_client,
-            base_url=base_url,
-            headers=headers,
-            project_root=project_root,
-        )
-
-    # Render summary.
+    # Render summary — skills first (they upload first).
     err.print()
-    for name in uploaded:
-        err.print(f"  [green]✓[/green] uploaded agent [bold]{name}[/bold]")
-    for name, reason in failed:
-        err.print(f"  [red]✗[/red] agent [bold]{name}[/bold] — {reason}")
     for name in skill_uploaded:
         err.print(f"  [green]✓[/green] uploaded skill [bold]{name}[/bold]")
     for name, reason in skill_failed:
         err.print(f"  [red]✗[/red] skill [bold]{name}[/bold] — {reason}")
+    for name in uploaded:
+        err.print(f"  [green]✓[/green] uploaded agent [bold]{name}[/bold]")
+    for name, reason in failed:
+        err.print(f"  [red]✗[/red] agent [bold]{name}[/bold] — {reason}")
     err.print()
     ok = not failed and not skill_failed
     err.print(
