@@ -131,8 +131,29 @@ psql "postgresql://movateadmin@${PG_FQDN}:5432/movate?sslmode=require" \
 
 ## Mint the first API key
 
-Once the API is up, mint a `mvt_live_...` key by running `movate auth
-create-key` against the deployed DB. There are two ways:
+The Container App's Bicep references a Key Vault secret called
+`bootstrap-api-key` and surfaces it as the `MOVATE_SEED_API_KEY` env
+var. On every pod start, the runtime's `_seed_bootstrap_key()` reads
+that value and idempotently inserts the matching row into the
+`api_keys` table. This is the recommended path because the key
+survives revision recycles AND is the same value the operator stores
+locally — no copy-paste, no `az containerapp exec` required.
+
+```bash
+# Recommended: one-line mint + Key Vault upload + local save.
+# Run this once per environment, before the first `mdk deploy`.
+mdk auth bootstrap-seed ${ENV} --keyvault movate-${ENV}-kv${SFX:-}
+
+# To rotate the bootstrap key later (security event, etc.):
+mdk auth bootstrap-seed ${ENV} --keyvault movate-${ENV}-kv${SFX:-} --force
+# Then restart the Container App so it re-seeds:
+az containerapp revision restart -g movate-${ENV}-rg -n movate-${ENV}-api \
+    --revision $(az containerapp show -g movate-${ENV}-rg -n movate-${ENV}-api \
+                   --query properties.latestRevisionName -o tsv)
+```
+
+If you'd rather mint tenant-scoped keys by hand (legacy flow, doesn't
+benefit from the seed key auto-reseed):
 
 ```bash
 # (a) From your laptop, with MOVATE_DB_URL pointing at the live DB:

@@ -30,6 +30,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import typer
@@ -503,6 +504,7 @@ def _resolve_deploy_mode(*, mode: str, cwd: Path) -> str:
 
 _HTTP_OK = 200
 _HTTP_CREATED = 201
+_HTTP_BAD_REQUEST = 400
 _HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
 _HTTP_SERVICE_UNAVAILABLE = 503
@@ -743,6 +745,20 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     base_url = target_cfg.url.rstrip("/")
     headers = {"Authorization": f"Bearer {api_key}"}
 
+    # Pre-deploy bearer validation. Catching a stale bearer with a
+    # single cheap GET is way better than failing mid-multipart-upload
+    # with ✗ on every skill + agent before the auto-recovery retry
+    # finally lands. The preflight either confirms the bearer works
+    # (silent), or auto-recovers up-front so the upload loop only ever
+    # sees a known-good token.
+    headers = _preflight_bearer(
+        base_url=base_url,
+        headers=headers,
+        target_name=target_name,
+        target_cfg=target_cfg,
+        auto_recover=auto_recover,
+    )
+
     # Upload skills BEFORE agents: agent upload triggers scan_agents on
     # the runtime, which validates skill references. Skills must already
     # be in the registry at that point or agents that reference them 422.
@@ -935,6 +951,77 @@ def _append_kb_files(
                     (f"kb/{kb_file.name}", kb_file.read_bytes(), "application/json"),
                 )
             )
+
+
+def _preflight_bearer(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    target_name: str,
+    target_cfg: Any,
+    auto_recover: bool,
+) -> dict[str, str]:
+    """Validate the saved bearer with one cheap authenticated call.
+
+    Issues a single ``GET /api/v1/agents`` against the deployed
+    runtime before the multipart upload loop starts. Three outcomes:
+
+    * ``200`` (or any 2xx) — bearer works; return ``headers`` unchanged.
+    * ``401`` and auto-recovery is enabled and the target has Azure
+      addressing — silently mint a fresh key inside the Container App
+      via :func:`_attempt_auto_recovery`, update the ``Authorization``
+      header, and return the new headers dict. The upload loop never
+      sees the original 401.
+    * Anything else — surface a descriptive error and ``typer.Exit``
+      so the operator doesn't burn bandwidth on a doomed upload.
+
+    Returns the (possibly-rotated) headers dict so the caller assigns
+    the result back. Mutates ``headers`` in-place as a no-op safety
+    net for the success path.
+    """
+    import httpx  # noqa: PLC0415
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+            resp = client.get(f"{base_url}/api/v1/agents", headers=headers)
+    except httpx.HTTPError as exc:
+        error(
+            f"preflight failed: cannot reach {base_url} ({type(exc).__name__}). "
+            f"Check the target URL and network."
+        )
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code < _HTTP_BAD_REQUEST:
+        return headers
+
+    if resp.status_code == _HTTP_UNAUTHORIZED:
+        azure_addressable = bool(
+            target_cfg.azure_resource_group and target_cfg.azure_env
+        )
+        if auto_recover and azure_addressable:
+            err.print(
+                f"  [yellow]⚠[/yellow] preflight: saved bearer rejected — minting "
+                f"a fresh one inside [bold]{target_name}[/bold] (this takes ~10s)…"
+            )
+            new_key = _attempt_auto_recovery(target_name=target_name)
+            if new_key is not None:
+                headers["Authorization"] = f"Bearer {new_key}"
+                return headers
+            # _attempt_auto_recovery already printed why; fall through
+            # to the descriptive error so the operator has one place
+            # to look.
+        error(_render_unauthorized_message(headers, target_name))
+        raise typer.Exit(code=2)
+
+    # Any other non-2xx — could be a 5xx from the runtime, a 4xx from
+    # a request shape issue, etc. Don't auto-recover (auth is not the
+    # problem here); surface the body so the operator can triage.
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text[:200]}
+    error(f"preflight failed: HTTP {resp.status_code} from {base_url}/api/v1/agents: {body!r}")
+    raise typer.Exit(code=2)
 
 
 def _attempt_auto_recovery(*, target_name: str) -> str | None:

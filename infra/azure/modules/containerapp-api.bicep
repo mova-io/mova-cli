@@ -152,6 +152,19 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: '${keyVaultUri}secrets/langfuse-public-key'
           identity: userAssignedIdentityId
         }
+        // The runtime's bootstrap key — populated by
+        // `mdk auth bootstrap-seed <target> --keyvault <name>` BEFORE
+        // the first runtime deploy. On every pod start,
+        // _seed_bootstrap_key() inserts the matching ApiKeyRecord
+        // into the api_keys table iff the row isn't already there.
+        // This is what breaks the chicken-and-egg of "need a bearer
+        // to mint a bearer" on fresh deployments and keeps the
+        // operator's saved local key valid across revision recycles.
+        {
+          name: 'bootstrap-api-key'
+          keyVaultUrl: '${keyVaultUri}secrets/bootstrap-api-key'
+          identity: userAssignedIdentityId
+        }
       ]
     }
     template: {
@@ -196,6 +209,16 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'LANGFUSE_PUBLIC_KEY'
               secretRef: 'langfuse-public-key'
+            }
+            // Bootstrap API key (see secrets[] above). The runtime's
+            // _seed_bootstrap_key() reads this on startup and inserts
+            // the matching ApiKeyRecord into Postgres if it isn't
+            // already present. Operators run `mdk auth bootstrap-seed
+            // <target>` once per environment to mint + upload this
+            // secret value.
+            {
+              name: 'MOVATE_SEED_API_KEY'
+              secretRef: 'bootstrap-api-key'
             }
             {
               name: 'MOVATE_AGENTS_PATH'
