@@ -19,7 +19,7 @@ the permissive default (everything allowed, no cost ceiling).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -369,6 +369,158 @@ class AgentDefaults(BaseModel):
     budget: BudgetDefaults = Field(default_factory=BudgetDefaults)
 
 
+class PiiGuardrailConfig(BaseModel):
+    """PII regex-based input/output guardrail.
+
+    ``types`` selects which PII categories to scan for; empty list
+    means "all supported types." Adding a new type to the underlying
+    regex pack (see :mod:`movate.guardrails.pii`) doesn't require a
+    config change — the type just becomes available in ``types``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mode: Literal["redact", "block", "warn"] = "redact"
+    types: list[Literal["email", "phone", "ssn", "credit_card"]] = Field(
+        default_factory=list,
+        description=(
+            "PII categories to scan for. Empty list = all supported "
+            "categories. Trim this list to reduce false positives on "
+            "inputs where (e.g.) order numbers look like credit cards."
+        ),
+    )
+
+
+class TopicGuardrailConfig(BaseModel):
+    """Topic restriction — allowlist (must contain) + denylist (must not).
+
+    Both lists are optional and combinable: an allowlist defines
+    "stay on topic" (text must mention at least one), a denylist
+    forbids specific topics. Terms may be substrings (matched
+    case-insensitively) or regex patterns prefixed with ``re:``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    allowed_topics: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Text must contain at least one of these terms/patterns. "
+            "Empty = no allowlist constraint."
+        ),
+    )
+    banned_topics: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Text must not contain any of these terms/patterns. Empty = no denylist constraint."
+        ),
+    )
+    on_violation: Literal["block", "warn"] = "block"
+
+
+class ContentGuardrailConfig(BaseModel):
+    """Banned-terms scan over the text.
+
+    Simpler than topic — no allowlist, just a denylist. Use this for
+    profanity, leaked internal labels, competitor names, etc.
+    Operator supplies their own list; we don't ship one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    banned_terms: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Substrings (case-insensitive) or regex patterns (prefix "
+            "with ``re:``) that may not appear in the text."
+        ),
+    )
+    on_violation: Literal["block", "warn"] = "block"
+
+
+class GuardrailDirection(BaseModel):
+    """The three guardrail modules, bundled for one direction
+    (input OR output).
+
+    Each direction has its own copy so an operator can tune them
+    independently — typical pattern is *stricter* on output (the
+    leaky model speaking to the customer) than on input (the
+    customer asking a question we then redact).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pii: PiiGuardrailConfig = Field(default_factory=PiiGuardrailConfig)
+    topic: TopicGuardrailConfig = Field(default_factory=TopicGuardrailConfig)
+    content: ContentGuardrailConfig = Field(default_factory=ContentGuardrailConfig)
+
+    def is_permissive(self) -> bool:
+        """True if every sub-guardrail is disabled — fast-path skip."""
+        return not self.pii.enabled and not self.topic.enabled and not self.content.enabled
+
+
+class GuardrailsConfig(BaseModel):
+    """Project-wide Safe-AI guardrails for input AND output text.
+
+    Loaded from ``movate.yaml`` (or ``policy.yaml``) under the
+    ``guardrails:`` key. The permissive default — every sub-block
+    ``enabled: false`` — leaves behavior unchanged from pre-v0.7,
+    so existing projects upgrade without action.
+
+    Enforced at two layers (same belt-and-braces shape as
+    :class:`ModelPolicy` / :class:`RuntimePolicy`):
+
+    * :meth:`movate.core.executor.Executor.execute` entry — input
+      guardrails run BEFORE prompt rendering, so a blocked request
+      doesn't bill latency or trigger side effects.
+    * :meth:`movate.core.executor.Executor.execute` exit — output
+      guardrails run AFTER completion lands but BEFORE schema
+      validation + persist, so a leaky output never reaches the
+      caller.
+
+    Blocking verdicts surface as
+    :class:`movate.core.failures.ContentFilterError` →
+    ``FailureType.CONTENT_FILTER`` → ``RunRecord.status="safety_blocked"``
+    — the same propagation path the rest of the pipeline already
+    treats as terminal-non-retryable.
+
+    Example ``movate.yaml``::
+
+        guardrails:
+          input:
+            pii:
+              enabled: true
+              mode: redact
+              types: [email, phone, ssn]
+            topic:
+              enabled: true
+              allowed_topics: ["Sandisk", "storage", "data backup"]
+              on_violation: block
+          output:
+            pii:
+              enabled: true
+              mode: redact
+            content:
+              enabled: true
+              banned_terms: ["internal only", "do not share"]
+              on_violation: block
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: GuardrailDirection = Field(default_factory=GuardrailDirection)
+    output: GuardrailDirection = Field(default_factory=GuardrailDirection)
+
+    def is_permissive(self) -> bool:
+        """True if BOTH directions are fully disabled. Lets the
+        executor short-circuit the guardrails calls entirely on
+        the common case (no guardrails configured)."""
+        return self.input.is_permissive() and self.output.is_permissive()
+
+
 class KnowledgeConfig(BaseModel):
     """Stub for v0.7+ RAG / knowledge-base configuration.
 
@@ -475,6 +627,15 @@ class ProjectConfig(BaseModel):
             "Operators can drop a ``knowledge.yaml`` in the project root "
             "today, but only forward-compatible fields are accepted "
             "until the schema firms up."
+        ),
+    )
+    guardrails: GuardrailsConfig = Field(
+        default_factory=GuardrailsConfig,
+        description=(
+            "Project-wide Safe-AI guardrails (PII / topic / content) for "
+            "input + output text. Empty/absent = permissive default. "
+            "Enforced at Executor.execute() entry (input) and exit "
+            "(output). See GuardrailsConfig for the full schema."
         ),
     )
 

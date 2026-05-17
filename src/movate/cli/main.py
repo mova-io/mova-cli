@@ -131,6 +131,7 @@ from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.doctor import doctor_app  # noqa: E402
 from movate.cli.export_oci_cmd import export_app  # noqa: E402
+from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
@@ -407,6 +408,7 @@ app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
 app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
 app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
+app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 # `memory` exposes the Sprint T MVP — list/get/set/evict/summarise/
 # query against the operator-facing memory store. Lives in MANAGE
