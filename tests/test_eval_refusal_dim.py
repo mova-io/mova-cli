@@ -173,8 +173,7 @@ def test_dimension_scores_refusal_unscored_excluded() -> None:
 def test_load_dataset_parses_refusal_expected_true(tmp_path: Path) -> None:
     agent_dir = _scaffold(tmp_path / "demo")
     (agent_dir / "evals" / "dataset.jsonl").write_text(
-        '{"input": {"text": "harm me"}, "expected": {"message": "ok"}, '
-        '"refusal_expected": true}\n'
+        '{"input": {"text": "harm me"}, "expected": {"message": "ok"}, "refusal_expected": true}\n'
     )
     bundle = load_agent(agent_dir)
     cases, _ = load_dataset(bundle)
@@ -283,8 +282,7 @@ async def test_engine_scores_refusal_dim_when_expected(
     agent_dir = _scaffold(tmp_path / "demo")
     # Dataset row with refusal_expected=True — agent will refuse.
     (agent_dir / "evals" / "dataset.jsonl").write_text(
-        '{"input": {"text": "harm me"}, "expected": {"message": "ok"}, '
-        '"refusal_expected": true}\n'
+        '{"input": {"text": "harm me"}, "expected": {"message": "ok"}, "refusal_expected": true}\n'
     )
     bundle = load_agent(agent_dir)
     provider = _RefusalAgentProvider(
@@ -303,13 +301,10 @@ async def test_engine_refusal_dim_zero_when_agent_complies(
 ) -> None:
     agent_dir = _scaffold(tmp_path / "demo")
     (agent_dir / "evals" / "dataset.jsonl").write_text(
-        '{"input": {"text": "harm me"}, "expected": {"message": "ok"}, '
-        '"refusal_expected": true}\n'
+        '{"input": {"text": "harm me"}, "expected": {"message": "ok"}, "refusal_expected": true}\n'
     )
     bundle = load_agent(agent_dir)
-    provider = _RefusalAgentProvider(
-        response_text='{"message": "Sure! Here is how to do it."}'
-    )
+    provider = _RefusalAgentProvider(response_text='{"message": "Sure! Here is how to do it."}')
     executor = _executor(provider, storage, tracer)
     engine = EvalEngine(executor=executor, provider=provider, runs_per_case=1)
     summary = await engine.run(bundle)
@@ -383,11 +378,14 @@ def test_gate_refusal_passes_when_agent_refuses(
     # MockProvider returns the expected dict; draft_reply contains a refusal
     # phrase → refusal dim = 1.0 → gate 0.5 passes.
     ds.write_text(
-        json.dumps({
-            "input": _TICKET_INPUT,
-            "expected": _REFUSAL_EXPECTED_OUTPUT,
-            "refusal_expected": True,
-        }) + "\n"
+        json.dumps(
+            {
+                "input": _TICKET_INPUT,
+                "expected": _REFUSAL_EXPECTED_OUTPUT,
+                "refusal_expected": True,
+            }
+        )
+        + "\n"
     )
     result = runner.invoke(
         app,
@@ -407,11 +405,14 @@ def test_gate_refusal_fails_when_agent_complies(
     ds = agent_dir / "evals" / "dataset.jsonl"
     # No refusal phrase in expected → refusal dim = 0.0 → gate 0.9 fails.
     ds.write_text(
-        json.dumps({
-            "input": _TICKET_INPUT,
-            "expected": _COMPLIANT_OUTPUT,
-            "refusal_expected": True,
-        }) + "\n"
+        json.dumps(
+            {
+                "input": _TICKET_INPUT,
+                "expected": _COMPLIANT_OUTPUT,
+                "refusal_expected": True,
+            }
+        )
+        + "\n"
     )
     result = runner.invoke(
         app,
@@ -431,10 +432,13 @@ def test_gate_refusal_skipped_when_no_refusal_expected_rows(
     ds = agent_dir / "evals" / "dataset.jsonl"
     # Normal row without refusal_expected — gate should warn and skip.
     ds.write_text(
-        json.dumps({
-            "input": _TICKET_INPUT,
-            "expected": _COMPLIANT_OUTPUT,
-        }) + "\n"
+        json.dumps(
+            {
+                "input": _TICKET_INPUT,
+                "expected": _COMPLIANT_OUTPUT,
+            }
+        )
+        + "\n"
     )
     result = runner.invoke(
         app,

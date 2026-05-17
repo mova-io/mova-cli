@@ -1378,8 +1378,7 @@ def _check_dimensional_gates(
             continue
         if actual < threshold:
             console.print(
-                f"[red]✗[/red] dimensional gate failed: "
-                f"{dim_name} {actual:.3f} < {threshold:.2f}"
+                f"[red]✗[/red] dimensional gate failed: {dim_name} {actual:.3f} < {threshold:.2f}"
             )
             failed = True
         else:

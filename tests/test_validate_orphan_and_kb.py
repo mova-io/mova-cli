@@ -120,9 +120,7 @@ class TestKBCorpusMissing:
         corpus = project / "kb" / "kb-lookup-corpus.json"
         if corpus.is_file():
             corpus.unlink()
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "kb-lookup-corpus.json" in result.stdout
         assert "demo corpus" in result.stdout
 
@@ -133,13 +131,9 @@ class TestKBCorpusMissing:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
-            json.dumps([
-                {"id": "1", "title": "T", "tags": [], "symptom": "", "resolution": ""}
-            ])
+            json.dumps([{"id": "1", "title": "T", "tags": [], "symptom": "", "resolution": ""}])
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "demo corpus" not in result.stdout
 
     def test_kb_corpus_missing_required_fields_warns(
@@ -152,9 +146,7 @@ class TestKBCorpusMissing:
         (kb_dir / "kb-lookup-corpus.json").write_text(
             json.dumps([{"id": "BAD-001", "title": "Missing resolution"}])
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "BAD-001" in result.stdout
         assert "missing" in result.stdout
 
@@ -165,14 +157,19 @@ class TestKBCorpusMissing:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
-            json.dumps([
-                {"id": "OK-001", "title": "Good entry", "resolution": "All good",
-                 "tags": [], "symptom": ""}
-            ])
+            json.dumps(
+                [
+                    {
+                        "id": "OK-001",
+                        "title": "Good entry",
+                        "resolution": "All good",
+                        "tags": [],
+                        "symptom": "",
+                    }
+                ]
+            )
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "missing" not in result.stdout
         assert "required fields" not in result.stdout
 
@@ -199,17 +196,13 @@ def _declared_context_file(project: Path, agent_name: str) -> Path:
 
 @pytest.mark.unit
 class TestContextSize:
-    def test_large_context_advisory(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_large_context_advisory(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from movate.cli.validate import _CTX_ADVISORY_BYTES  # noqa: PLC0415
 
         project = _scaffold_project(tmp_path, monkeypatch)
         ctx_file = _declared_context_file(project, "rag-qa")
         ctx_file.write_text("x" * (_CTX_ADVISORY_BYTES + 1))
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert "large" in result.stdout or "bytes" in result.stdout
 
     def test_oversized_context_errors(
@@ -220,9 +213,7 @@ class TestContextSize:
         project = _scaffold_project(tmp_path, monkeypatch)
         ctx_file = _declared_context_file(project, "rag-qa")
         ctx_file.write_text("x" * (_CTX_ERROR_BYTES + 1))
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code != 0
         assert "exceeds" in result.stdout or "limit" in result.stdout
 
@@ -243,9 +234,7 @@ class TestMissingSkillDirectory:
         else:
             content += "\n  - ghost-skill\n"
         agent_yaml.write_text(content)
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code != 0
         # Loader message surfaces the unknown skill name.
         assert "ghost-skill" in result.stdout or "ghost-skill" in result.stderr
@@ -256,9 +245,7 @@ class TestMissingSkillDirectory:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _scaffold_project(tmp_path, monkeypatch)
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.stdout + result.stderr
 
 
@@ -266,15 +253,11 @@ class TestMissingSkillDirectory:
 class TestEmptyContext:
     """Declared context file exists but is empty (whitespace-only)."""
 
-    def test_empty_context_warns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_empty_context_warns(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         project = _scaffold_project(tmp_path, monkeypatch)
         ctx_file = _declared_context_file(project, "rag-qa")
         ctx_file.write_text("")
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert "empty" in result.stdout
         assert "contributes nothing" in result.stdout
 
@@ -284,18 +267,12 @@ class TestEmptyContext:
         project = _scaffold_project(tmp_path, monkeypatch)
         ctx_file = _declared_context_file(project, "rag-qa")
         ctx_file.write_text("   \n\n   \n")
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert "empty" in result.stdout
 
-    def test_populated_context_clean(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_populated_context_clean(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         _scaffold_project(tmp_path, monkeypatch)
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert "empty" not in result.stdout
         assert result.exit_code == 0, result.stdout + result.stderr
 
@@ -305,31 +282,24 @@ class TestEmptyContext:
         project = _scaffold_project(tmp_path, monkeypatch)
         ctx_file = _declared_context_file(project, "rag-qa")
         ctx_file.write_text("")
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert "contexts/" in result.stdout
 
 
 @pytest.mark.unit
 class TestPythonSkillImplMissing:
-    def test_missing_impl_py_errors(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_missing_impl_py_errors(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A declared Python skill without impl.py should fail validate."""
         project = _scaffold_project(tmp_path, monkeypatch)
         # Find the first declared skill's dir and remove impl.py.
         skill_dirs = [
-            d for d in (project / "skills").iterdir()
-            if d.is_dir() and (d / "skill.yaml").is_file()
+            d for d in (project / "skills").iterdir() if d.is_dir() and (d / "skill.yaml").is_file()
         ]
         if not skill_dirs:
             pytest.skip("rag-qa has no local skills")
         impl = skill_dirs[0] / "impl.py"
         if impl.is_file():
             impl.unlink()
-        result = runner.invoke(
-            app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/rag-qa"], env={"COLUMNS": "200"})
         assert result.exit_code != 0
         assert "impl.py" in result.stdout

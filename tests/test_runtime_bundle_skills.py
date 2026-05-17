@@ -295,9 +295,7 @@ async def test_bundle_with_skills_but_no_skills_path_returns_503(
     skill files."""
     s = InMemoryStorage()
     await s.init()
-    minted = mint_api_key(
-        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-skills-path"
-    )
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-skills-path")
     await s.save_api_key(minted.record)
     # Pass agents_path so the POST /agents endpoint is reachable; but
     # explicitly nil skills_path via... actually build_app defaults

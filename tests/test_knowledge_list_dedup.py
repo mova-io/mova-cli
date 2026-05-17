@@ -63,12 +63,23 @@ class TestKnowledgeList:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         proj = _project(tmp_path)
-        _write_corpus(proj, [
-            {"id": "KB-1", "title": "Login fails", "tags": ["auth"],
-             "resolution": "Reset password"},
-            {"id": "KB-2", "title": "Slow query", "tags": ["db", "perf"],
-             "resolution": "Add index"},
-        ])
+        _write_corpus(
+            proj,
+            [
+                {
+                    "id": "KB-1",
+                    "title": "Login fails",
+                    "tags": ["auth"],
+                    "resolution": "Reset password",
+                },
+                {
+                    "id": "KB-2",
+                    "title": "Slow query",
+                    "tags": ["db", "perf"],
+                    "resolution": "Add index",
+                },
+            ],
+        )
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list"])
         assert result.exit_code == 0, result.stdout + result.stderr
@@ -81,10 +92,17 @@ class TestKnowledgeList:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         proj = _project(tmp_path)
-        _write_corpus(proj, [
-            {"id": "KB-3", "title": "Multi tag", "tags": ["billing", "refunds"],
-             "resolution": "Fix"},
-        ])
+        _write_corpus(
+            proj,
+            [
+                {
+                    "id": "KB-3",
+                    "title": "Multi tag",
+                    "tags": ["billing", "refunds"],
+                    "resolution": "Fix",
+                },
+            ],
+        )
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list"])
         assert result.exit_code == 0
@@ -96,9 +114,12 @@ class TestKnowledgeList:
     ) -> None:
         proj = _project(tmp_path)
         long_res = "A" * 200
-        _write_corpus(proj, [
-            {"id": "KB-4", "title": "Long one", "tags": [], "resolution": long_res},
-        ])
+        _write_corpus(
+            proj,
+            [
+                {"id": "KB-4", "title": "Long one", "tags": [], "resolution": long_res},
+            ],
+        )
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list"])
         assert result.exit_code == 0
@@ -106,9 +127,7 @@ class TestKnowledgeList:
         assert long_res not in result.stdout
         assert "…" in result.stdout
 
-    def test_list_empty_corpus_warns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_list_empty_corpus_warns(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         _write_corpus(proj, [])
         monkeypatch.chdir(proj)
@@ -125,9 +144,7 @@ class TestKnowledgeList:
         assert result.exit_code != 0
         assert "not found" in result.stderr or "not found" in result.stdout
 
-    def test_list_limit_flag(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_list_limit_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         entries = [
             {"id": f"KB-{i}", "title": f"Entry {i}", "tags": [], "resolution": f"Fix {i}"}
@@ -144,26 +161,25 @@ class TestKnowledgeList:
         assert "KB-9" not in result.stdout
         assert "3 of 10" in result.stdout
 
-    def test_list_entry_count_shown(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_list_entry_count_shown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
-        _write_corpus(proj, [
-            {"id": "KB-A", "title": "Alpha", "tags": [], "resolution": "Fix A"},
-        ])
+        _write_corpus(
+            proj,
+            [
+                {"id": "KB-A", "title": "Alpha", "tags": [], "resolution": "Fix A"},
+            ],
+        )
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list"])
         assert result.exit_code == 0
         assert "1 entry" in result.stdout or "1 entr" in result.stdout
 
-    def test_list_custom_corpus_path(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_list_custom_corpus_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         custom = proj / "custom.json"
-        custom.write_text(json.dumps([
-            {"id": "CX-1", "title": "Custom", "tags": [], "resolution": "Works"}
-        ]))
+        custom.write_text(
+            json.dumps([{"id": "CX-1", "title": "Custom", "tags": [], "resolution": "Works"}])
+        )
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list", "--corpus", str(custom)])
         assert result.exit_code == 0
@@ -184,16 +200,26 @@ class TestDuplicateKBId:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
-            json.dumps([
-                {"id": "DUP-001", "title": "First", "tags": [],
-                 "symptom": "", "resolution": "Fix A"},
-                {"id": "DUP-001", "title": "Dupe", "tags": [],
-                 "symptom": "", "resolution": "Fix B"},
-            ])
+            json.dumps(
+                [
+                    {
+                        "id": "DUP-001",
+                        "title": "First",
+                        "tags": [],
+                        "symptom": "",
+                        "resolution": "Fix A",
+                    },
+                    {
+                        "id": "DUP-001",
+                        "title": "Dupe",
+                        "tags": [],
+                        "symptom": "",
+                        "resolution": "Fix B",
+                    },
+                ]
+            )
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "DUP-001" in result.stdout
         assert "duplicate" in result.stdout
 
@@ -204,14 +230,14 @@ class TestDuplicateKBId:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
-            json.dumps([
-                {"id": "X-1", "title": "A", "tags": [], "symptom": "", "resolution": "a"},
-                {"id": "X-1", "title": "B", "tags": [], "symptom": "", "resolution": "b"},
-            ])
+            json.dumps(
+                [
+                    {"id": "X-1", "title": "A", "tags": [], "symptom": "", "resolution": "a"},
+                    {"id": "X-1", "title": "B", "tags": [], "symptom": "", "resolution": "b"},
+                ]
+            )
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "mdk knowledge remove" in result.stdout or "mdk knowledge list" in result.stdout
 
     def test_unique_ids_no_duplicate_warning(
@@ -221,14 +247,26 @@ class TestDuplicateKBId:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
-            json.dumps([
-                {"id": "OK-1", "title": "One", "tags": [], "symptom": "", "resolution": "fix 1"},
-                {"id": "OK-2", "title": "Two", "tags": [], "symptom": "", "resolution": "fix 2"},
-            ])
+            json.dumps(
+                [
+                    {
+                        "id": "OK-1",
+                        "title": "One",
+                        "tags": [],
+                        "symptom": "",
+                        "resolution": "fix 1",
+                    },
+                    {
+                        "id": "OK-2",
+                        "title": "Two",
+                        "tags": [],
+                        "symptom": "",
+                        "resolution": "fix 2",
+                    },
+                ]
+            )
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "duplicate" not in result.stdout
 
     def test_multiple_duplicates_all_reported(
@@ -238,15 +276,15 @@ class TestDuplicateKBId:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
-            json.dumps([
-                {"id": "A", "title": "A1", "tags": [], "symptom": "", "resolution": "a"},
-                {"id": "B", "title": "B1", "tags": [], "symptom": "", "resolution": "b"},
-                {"id": "A", "title": "A2", "tags": [], "symptom": "", "resolution": "aa"},
-                {"id": "B", "title": "B2", "tags": [], "symptom": "", "resolution": "bb"},
-            ])
+            json.dumps(
+                [
+                    {"id": "A", "title": "A1", "tags": [], "symptom": "", "resolution": "a"},
+                    {"id": "B", "title": "B1", "tags": [], "symptom": "", "resolution": "b"},
+                    {"id": "A", "title": "A2", "tags": [], "symptom": "", "resolution": "aa"},
+                    {"id": "B", "title": "B2", "tags": [], "symptom": "", "resolution": "bb"},
+                ]
+            )
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
-        assert "'A'" in result.stdout or "\"A\"" in result.stdout
-        assert "'B'" in result.stdout or "\"B\"" in result.stdout
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
+        assert "'A'" in result.stdout or '"A"' in result.stdout
+        assert "'B'" in result.stdout or '"B"' in result.stdout

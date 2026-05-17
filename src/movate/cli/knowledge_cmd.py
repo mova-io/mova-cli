@@ -47,11 +47,46 @@ knowledge_app = typer.Typer(
 
 _STOPWORDS = frozenset(
     {
-        "a", "an", "the", "is", "are", "was", "were", "be", "been",
-        "i", "we", "my", "our", "you", "your", "it", "they",
-        "to", "of", "in", "on", "for", "with", "at", "by", "from",
-        "and", "or", "but", "as", "if", "this", "that", "these", "those",
-        "how", "what", "why", "when", "where",
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "i",
+        "we",
+        "my",
+        "our",
+        "you",
+        "your",
+        "it",
+        "they",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "at",
+        "by",
+        "from",
+        "and",
+        "or",
+        "but",
+        "as",
+        "if",
+        "this",
+        "that",
+        "these",
+        "those",
+        "how",
+        "what",
+        "why",
+        "when",
+        "where",
     }
 )
 _TOKEN_RE = re.compile(r"\b[a-z0-9][a-z0-9_-]*\b")
@@ -107,9 +142,7 @@ def _load_corpus(corpus_path: Path) -> list[dict[str, Any]]:
 
 
 def _find_agent_dirs(agents_dir: Path) -> list[Path]:
-    return sorted(
-        p for p in agents_dir.iterdir() if p.is_dir() and (p / "agent.yaml").is_file()
-    )
+    return sorted(p for p in agents_dir.iterdir() if p.is_dir() and (p / "agent.yaml").is_file())
 
 
 def _extract_query_from_input(inp: dict[str, Any]) -> str | None:
@@ -448,9 +481,7 @@ def knowledge_remove(
                 abort=True,
             )
         else:
-            err.print(
-                "[red]✗[/red] not a TTY — pass [bold]--yes[/bold] to confirm removal."
-            )
+            err.print("[red]✗[/red] not a TTY — pass [bold]--yes[/bold] to confirm removal.")
             raise typer.Exit(code=2)
 
     remaining = [e for e in entries if not (isinstance(e, dict) and e.get("id") == entry_id)]
@@ -472,7 +503,7 @@ def knowledge_edit(
         "-s",
         help=(
             "JSON object of fields to update, e.g. "
-            "[bold]--set '{\"resolution\": \"New answer\"}' [/bold]. "
+            '[bold]--set \'{"resolution": "New answer"}\' [/bold]. '
             "Only listed keys are changed; others are preserved."
         ),
     ),
@@ -576,8 +607,7 @@ def knowledge_list(
     entries = _load_corpus(corpus_path)
     if not entries:
         out.print(
-            "[yellow]![/yellow] corpus is empty. "
-            "Run [bold]mdk knowledge add[/bold] to add entries."
+            "[yellow]![/yellow] corpus is empty. Run [bold]mdk knowledge add[/bold] to add entries."
         )
         return
 

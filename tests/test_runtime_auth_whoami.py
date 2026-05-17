@@ -33,18 +33,14 @@ def client(storage: InMemoryStorage) -> TestClient:
 
 @pytest.fixture
 async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
-    minted = mint_api_key(
-        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="whoami-test"
-    )
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="whoami-test")
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}
 
 
 @pytest.fixture
 async def minted_record(storage: InMemoryStorage):
-    minted = mint_api_key(
-        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="whoami-test-2"
-    )
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="whoami-test-2")
     await storage.save_api_key(minted.record)
     return minted
 
@@ -56,9 +52,7 @@ class TestAuthWhoami:
     ) -> None:
         import asyncio  # noqa: PLC0415
 
-        minted = mint_api_key(
-            tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="whoami-identity"
-        )
+        minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="whoami-identity")
         asyncio.get_event_loop().run_until_complete(storage.save_api_key(minted.record))
         resp = client.get(
             "/api/v1/auth/me",

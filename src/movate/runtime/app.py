@@ -991,8 +991,7 @@ def build_app(
         skills_path: Path | None = request.app.state.skills_path
         if skills_path is None:
             raise SkillCreationError(
-                "runtime was built without a skills_path; "
-                "POST /api/v1/skills is unavailable",
+                "runtime was built without a skills_path; POST /api/v1/skills is unavailable",
                 status_code=503,
             )
 
@@ -1928,9 +1927,7 @@ def build_app(
                     "revoked"
                     if r.revoked_at is not None
                     else (
-                        "expired"
-                        if r.expires_at is not None and r.expires_at < now
-                        else "active"
+                        "expired" if r.expires_at is not None and r.expires_at < now else "active"
                     )
                 ),
             )

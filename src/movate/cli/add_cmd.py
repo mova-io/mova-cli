@@ -1273,8 +1273,7 @@ def _do_add_context(args: list[str]) -> None:
     """
     if not args:
         err_console.print(
-            "[red]✗[/red] context name required. "
-            "Usage: [bold]mdk add context <name>[/bold]"
+            "[red]✗[/red] context name required. Usage: [bold]mdk add context <name>[/bold]"
         )
         raise typer.Exit(code=2)
 
@@ -1418,12 +1417,7 @@ def _do_add_kb(args: list[str]) -> None:
             border_style="green",
         )
     )
-    console.print(
-        f"[dim]mdk_add_kb_summary: "
-        f"project={project_root.name} "
-        f"path={dest} "
-        f"ok=true[/dim]"
-    )
+    console.print(f"[dim]mdk_add_kb_summary: project={project_root.name} path={dest} ok=true[/dim]")
 
 
 def _do_add_skill_bare(args: list[str]) -> None:
@@ -1440,8 +1434,7 @@ def _do_add_skill_bare(args: list[str]) -> None:
 
     if not args:
         err_console.print(
-            "[red]✗[/red] skill name required. "
-            "Usage: [bold]mdk add skill <name>[/bold]"
+            "[red]✗[/red] skill name required. Usage: [bold]mdk add skill <name>[/bold]"
         )
         raise typer.Exit(code=2)
 

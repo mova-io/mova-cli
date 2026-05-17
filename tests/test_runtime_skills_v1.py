@@ -177,9 +177,7 @@ def test_create_skill_twice_overwrites(
 # ---------------------------------------------------------------------------
 
 
-def test_create_skill_bad_yaml_returns_422(
-    client: TestClient, auth_header: dict[str, str]
-) -> None:
+def test_create_skill_bad_yaml_returns_422(client: TestClient, auth_header: dict[str, str]) -> None:
     r = client.post(
         "/api/v1/skills",
         files=[
@@ -242,9 +240,7 @@ async def test_create_skill_without_skills_path_returns_503() -> None:
     with --agents-path."""
     s = InMemoryStorage()
     await s.init()
-    minted = mint_api_key(
-        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-skills-path"
-    )
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-skills-path")
     await s.save_api_key(minted.record)
 
     app = build_app(s)  # no agents_path, no skills_path

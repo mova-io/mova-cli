@@ -48,11 +48,13 @@ def _make_bundle(
     return SimpleNamespace(
         prompt_template=prompt,
         skills=skills or [],
-        input_schema=input_schema or {
+        input_schema=input_schema
+        or {
             "type": "object",
             "properties": {"text": {"type": "string"}},
         },
-        output_schema=output_schema or {
+        output_schema=output_schema
+        or {
             "type": "object",
             "properties": {"reply": {"type": "string"}},
         },
@@ -101,16 +103,12 @@ class TestSkillOutputRefMismatch:
 
     def test_no_issues_on_correct_field_ref(self) -> None:
         skill = _make_skill("web-search", {"results": {}, "warning": {}})
-        bundle = _make_bundle(
-            "Results: {{ web_search_output.results }}", skills=[skill]
-        )
+        bundle = _make_bundle("Results: {{ web_search_output.results }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
     def test_mismatch_fires_for_unknown_field(self) -> None:
         skill = _make_skill("web-search", {"results": {}, "warning": {}})
-        bundle = _make_bundle(
-            "Data: {{ web_search_output.hits }}", skills=[skill]
-        )
+        bundle = _make_bundle("Data: {{ web_search_output.hits }}", skills=[skill])
         issues = lint_prompt(bundle)
         mismatch = [i for i in issues if i.code == "SKILL_OUTPUT_REF_MISMATCH"]
         assert mismatch, "expected SKILL_OUTPUT_REF_MISMATCH"
@@ -127,16 +125,12 @@ class TestSkillOutputRefMismatch:
 
     def test_hyphenated_skill_name_maps_to_underscored_var(self) -> None:
         skill = _make_skill("kb-lookup", {"answer": {}, "citations": {}})
-        bundle = _make_bundle(
-            "Answer: {{ kb_lookup_output.answer }}", skills=[skill]
-        )
+        bundle = _make_bundle("Answer: {{ kb_lookup_output.answer }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
     def test_hyphenated_skill_bad_field_caught(self) -> None:
         skill = _make_skill("kb-lookup", {"answer": {}})
-        bundle = _make_bundle(
-            "Score: {{ kb_lookup_output.score }}", skills=[skill]
-        )
+        bundle = _make_bundle("Score: {{ kb_lookup_output.score }}", skills=[skill])
         issues = [i for i in lint_prompt(bundle) if i.code == "SKILL_OUTPUT_REF_MISMATCH"]
         assert issues
         assert "score" in issues[0].message
@@ -161,9 +155,7 @@ class TestSkillOutputRefMismatch:
 
     def test_open_schema_no_properties_skipped(self) -> None:
         skill = _make_skill("my-skill", None)  # no properties → open schema
-        bundle = _make_bundle(
-            "{{ my_skill_output.anything }}", skills=[skill]
-        )
+        bundle = _make_bundle("{{ my_skill_output.anything }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
     def test_multiple_skills_only_mismatch_flagged(self) -> None:
@@ -179,9 +171,7 @@ class TestSkillOutputRefMismatch:
 
     def test_unrelated_var_not_flagged(self) -> None:
         skill = _make_skill("web-search", {"results": {}})
-        bundle = _make_bundle(
-            "{{ loop.index }}: {{ item.title }}", skills=[skill]
-        )
+        bundle = _make_bundle("{{ loop.index }}: {{ item.title }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
 

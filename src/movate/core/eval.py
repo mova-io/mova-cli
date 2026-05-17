@@ -143,8 +143,12 @@ class DimensionScores:
         return [
             d.value
             for d in (
-                self.accuracy, self.faithfulness, self.coverage,
-                self.latency, self.context_compliance, self.refusal,
+                self.accuracy,
+                self.faithfulness,
+                self.coverage,
+                self.latency,
+                self.context_compliance,
+                self.refusal,
             )
             if d.value is not None
         ]
@@ -1081,9 +1085,7 @@ class EvalEngine:
                 "skipped: context_compliance needs a judge model — add evals/judge.yaml",
             )
 
-        context_text = "\n\n---\n\n".join(
-            f"[{name}]\n{body}" for name, body in bundle.contexts
-        )
+        context_text = "\n\n---\n\n".join(f"[{name}]\n{body}" for name, body in bundle.contexts)
         prompt = _CONTEXT_COMPLIANCE_PROMPT.format(
             context_text=context_text,
             actual_json=json.dumps(actual),
@@ -1259,9 +1261,7 @@ class WorkflowEvalEngine:
                             response=fail_response,
                             score=0.0,
                             rationale=str(exc),
-                            dimensions=DimensionScores(
-                                accuracy=DimensionScore(0.0, str(exc))
-                            ),
+                            dimensions=DimensionScores(accuracy=DimensionScore(0.0, str(exc))),
                         )
                     )
                     continue
@@ -1285,9 +1285,7 @@ class WorkflowEvalEngine:
                             response=synth_response,
                             score=0.0,
                             rationale=fail_reason,
-                            dimensions=DimensionScores(
-                                accuracy=DimensionScore(0.0, fail_reason)
-                            ),
+                            dimensions=DimensionScores(accuracy=DimensionScore(0.0, fail_reason)),
                         )
                     )
                     continue
@@ -1355,7 +1353,6 @@ class WorkflowEvalEngine:
             cases=case_summaries,
             dimensional_means=dimensional_means,
         )
-
 
     async def _score_faithfulness(
         self,

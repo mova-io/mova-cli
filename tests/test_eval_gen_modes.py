@@ -102,8 +102,16 @@ class TestEvalGenModeFlag:
         project = _scaffold(tmp_path, monkeypatch)
         result = runner.invoke(
             app,
-            ["eval-gen", "ticket-triager", "--num", "2", "--mock", "--force",
-             "--mode", "adversarial"],
+            [
+                "eval-gen",
+                "ticket-triager",
+                "--num",
+                "2",
+                "--mock",
+                "--force",
+                "--mode",
+                "adversarial",
+            ],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
@@ -114,9 +122,7 @@ class TestEvalGenModeFlag:
             assert entry.get("mode") == "adversarial"
             assert "refusal_expected" not in entry
 
-    def test_edge_mode_tags_entries(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_edge_mode_tags_entries(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         project = _scaffold(tmp_path, monkeypatch)
         result = runner.invoke(
             app,
@@ -136,8 +142,7 @@ class TestEvalGenModeFlag:
         project = _scaffold(tmp_path, monkeypatch)
         result = runner.invoke(
             app,
-            ["eval-gen", "ticket-triager", "--num", "2", "--mock", "--force",
-             "--mode", "refusal"],
+            ["eval-gen", "ticket-triager", "--num", "2", "--mock", "--force", "--mode", "refusal"],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
@@ -154,8 +159,16 @@ class TestEvalGenModeFlag:
         _scaffold(tmp_path, monkeypatch)
         result = runner.invoke(
             app,
-            ["eval-gen", "ticket-triager", "--num", "1", "--mock", "--force",
-             "--mode", "not-a-mode"],
+            [
+                "eval-gen",
+                "ticket-triager",
+                "--num",
+                "1",
+                "--mock",
+                "--force",
+                "--mode",
+                "not-a-mode",
+            ],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code != 0
@@ -167,8 +180,16 @@ class TestEvalGenModeFlag:
         _scaffold(tmp_path, monkeypatch)
         result = runner.invoke(
             app,
-            ["eval-gen", "ticket-triager", "--num", "1", "--mock", "--force",
-             "--mode", "adversarial"],
+            [
+                "eval-gen",
+                "ticket-triager",
+                "--num",
+                "1",
+                "--mock",
+                "--force",
+                "--mode",
+                "adversarial",
+            ],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
