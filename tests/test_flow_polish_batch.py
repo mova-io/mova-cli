@@ -105,22 +105,21 @@ def test_add_prints_next_steps_once(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.unit
-def test_add_next_step_uses_real_dataset_example(
+def test_add_next_step_first_option_is_add_another(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`mdk add faq` next-step `mdk run` line should embed the actual
-    first-row input from `evals/dataset.jsonl`, not literal `{...}`."""
+    """After `mdk add`, the first next-step is 'Add another role agent' —
+    the role-catalog picker replaces the old static 'mdk run' line
+    to keep the momentum of discovery going."""
     proj = _bootstrap_with_agent(tmp_path, monkeypatch, template="faq")
-    # Re-add through CliRunner to capture stdout (bootstrap already ran).
-    # Trigger a fresh add of a different template so we can re-check
-    # the just-rendered output.
     result = runner.invoke(app, ["add", "summarizer"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
-    # Should NOT contain the literal '{...}' placeholder.
-    assert "'{...}'" not in result.stdout
-    # Should contain real JSON shape — keys from the summarizer dataset.
-    # (`text` is the field summarizer's dataset.jsonl[0].input has.)
-    assert '"text"' in result.stdout
+    # The 'Add another role agent' option appears as [1].
+    assert "Add another role agent" in result.stdout
+    assert "[1]" in result.stdout
+    # Eval and doctor options still present.
+    assert "mdk eval" in result.stdout
+    assert "mdk doctor" in result.stdout
     _ = proj  # silence unused
 
 
