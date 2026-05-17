@@ -93,6 +93,15 @@ _ROLE_DESCRIPTIONS: dict[str, tuple[str, str]] = {
     "classifier": ("Text + label list → chosen label.", "exact-match classification"),
     "chatbot": ("Single message → single reply (memory-aware).", "stateful chat"),
     "extractor": ("Free text → strict typed fields.", "structured extraction"),
+    # Skill-demo templates — show how to wire a skill to an agent.
+    "calc-agent": (
+        "Expression → result + explanation. Python skill (safe AST eval).",
+        "Python skill kind demo",
+    ),
+    "lookup-agent": (
+        "User ID + question → direct answer. HTTP skill calling a REST API.",
+        "HTTP skill kind demo",
+    ),
 }
 
 # Templates that ARE role-based (the post-v1.0 additions). Used by
@@ -138,6 +147,86 @@ _GROUP_COLORS: dict[str, str] = {
     "HR / Recruiting": "yellow",
     "Compliance / Ops": "red",
 }
+
+
+def _render_role_catalog_numbered(installed: set[str]) -> list[str]:
+    """Render the role catalog with [N] numbers for addable (uninstalled) templates.
+
+    Installed templates are shown dimmed with a ✓ and no number.
+    Returns the ordered list of addable template names (index 0 = [1]).
+    """
+    table = Table(
+        title="Role-based templates",
+        title_style="bold",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("#", no_wrap=True, justify="right")
+    table.add_column("Use case", no_wrap=True)
+    table.add_column("Name", no_wrap=True)
+    table.add_column("What it does")
+    table.add_column("Highlights", style="dim")
+
+    addable: list[str] = []
+    last_group = ""
+    counter = 0
+    for group, role_names in _ROLE_GROUPS:
+        for name in role_names:
+            color = _GROUP_COLORS.get(group, "white")
+            label = group if group != last_group else ""
+            label_cell = f"[{color}]{label}[/{color}]" if label else ""
+            desc, feature = _ROLE_DESCRIPTIONS.get(name, ("", ""))
+            if name in installed:
+                table.add_row(
+                    "[dim]✓[/dim]",
+                    label_cell,
+                    f"[dim]{name}[/dim]",
+                    f"[dim]{desc}[/dim]",
+                    "",
+                )
+            else:
+                counter += 1
+                table.add_row(
+                    f"[bold cyan][{counter}][/bold cyan]",
+                    label_cell,
+                    f"[{color}]{name}[/{color}]",
+                    desc,
+                    feature,
+                )
+                addable.append(name)
+            last_group = group
+    console.print(table)
+    return addable
+
+
+def _pick_and_add_role_agent(bin_name: str) -> None:
+    """Show the numbered role catalog and let the operator pick one to add."""
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    from rich.prompt import Prompt  # noqa: PLC0415
+
+    installed = _installed_templates()
+    addable = _render_role_catalog_numbered(installed)
+    if not addable:
+        console.print("[dim]All role templates are already in this project.[/dim]")
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    try:
+        choice = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=[str(i) for i in range(1, len(addable) + 1)] + ["s"],
+            default="s",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return
+    if choice == "s":
+        return
+    template = addable[int(choice) - 1]
+    console.print(f"\n[dim]$ {bin_name} add {template}[/dim]")
+    subprocess.run([bin_name, "add", template], check=False)
 
 
 def _default_target(project_root: Path) -> Path:
@@ -721,12 +810,6 @@ def _add_one(
         body += f"[bold]Contexts:[/bold] [cyan]{ctx_str}[/cyan] (auto-scaffolded)\n"
     if validation_status is not None:
         body += f"[bold]Validates:[/bold] {validation_status}\n"
-    # Real example payload for the interactive picker below. Templates
-    # without a dataset fall back to literal '{...}'. The picker
-    # itself is the next-steps surface — no static block in Panel
-    # body (would duplicate for TTY operators; the picker prints
-    # the same list in non-TTY mode too).
-    example_payload = _first_dataset_input(dest)
     rel = dest.relative_to(project_root)
     console.print(
         Panel(
@@ -763,9 +846,10 @@ def _add_one(
         console=console,
         steps=[
             NextStep(
-                label="Run with a sample input",
-                command=f"{bin_name} run ./{rel} --mock '{example_payload}'",
-                argv=[bin_name, "run", f"./{rel}", "--mock", example_payload],
+                label="Add another role agent",
+                command=f"{bin_name} add --list",
+                argv=[bin_name, "add", "--list"],
+                callback=lambda: _pick_and_add_role_agent(bin_name),
             ),
             NextStep(
                 label="Run the eval suite",

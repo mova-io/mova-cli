@@ -273,17 +273,47 @@ def _show_agent(path: Path) -> None:
 
 
 def _add_marketplace_metadata_rows(table: Table, spec: AgentSpec) -> None:
-    """Append role / persona / capabilities rows to the agent show table.
+    """Append marketplace metadata rows to the agent show table.
 
-    Only adds rows the agent actually populated, so pre-v0.8 agents
-    (where these fields default to empty) keep the same compact
-    table as before the marketplace-metadata extension landed. Pulled
-    out of ``_show_agent`` to keep that function's branch count under
-    the ruff PLR0912 ceiling.
+    Handles two cases:
 
-    See AgentSpec.persona / role / capabilities (item 29 from
-    BACKLOG.md Group F).
+    * **Nested ``metadata:`` block** (v0.8+): when ``spec.metadata`` is set,
+      renders a dedicated "Marketplace metadata" section showing all populated
+      sub-fields (persona, role, capabilities, tags, owner, example count).
+    * **Flat top-level fields** (pre-v0.8 flat style): when ``spec.metadata``
+      is absent but the flat ``persona`` / ``role`` / ``capabilities`` fields
+      are set (backward-compat path), renders those exactly as before.
+
+    Omits the section entirely when no marketplace metadata is present at all,
+    keeping the table compact for agents that don't opt into catalog metadata.
+
+    See AgentSpec.metadata / AgentMetadata (item 29, BACKLOG.md Group F).
     """
+    # --- Nested metadata block (v0.8+ preferred style) ---
+    if spec.metadata is not None:
+        m = spec.metadata
+        table.add_row("", "")
+        table.add_row("[bold]Marketplace metadata[/bold]", "")
+        if m.persona:
+            table.add_row("  metadata.persona", m.persona)
+        if m.role:
+            table.add_row("  metadata.role", m.role)
+        if m.capabilities:
+            table.add_row("  metadata.capabilities", ", ".join(m.capabilities))
+        if m.tags:
+            table.add_row("  metadata.tags", ", ".join(m.tags))
+        if m.owner:
+            table.add_row("  metadata.owner", m.owner)
+        if m.examples:
+            table.add_row("  metadata.examples", f"{len(m.examples)} example(s)")
+        table.add_row(
+            "",
+            "[dim]metadata fields are catalog discovery only; "
+            "execution routing is not implemented[/dim]",
+        )
+        return
+
+    # --- Flat top-level fields (pre-v0.8 backward-compat path) ---
     if spec.role:
         table.add_row("role", spec.role)
     if spec.persona:

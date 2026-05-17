@@ -35,3 +35,19 @@ budget:
 
 tags:
   - faq
+
+# Optional: populate the Mova iO marketplace catalog card.
+# All fields are optional — omit the entire block if not publishing to the catalog.
+# metadata:
+#   persona: "A friendly FAQ assistant for __ORG_NAME__"
+#   role: "customer-support"
+#   capabilities:
+#     - "question-answering"
+#     - "knowledge-retrieval"
+#   tags:
+#     - "faq"
+#     - "support"
+#   examples:
+#     - input: {question: "What is your return policy?"}
+#       output: {answer: "30 days, no questions asked.", confidence: 0.95}
+#   owner: "team@__ORG_NAME__.com"

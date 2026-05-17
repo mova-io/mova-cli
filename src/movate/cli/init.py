@@ -45,6 +45,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from movate.core.config import PROJECT_MARKER_FILES as _PROJECT_MARKERS
 from movate.templates import get_template_path, list_templates
 
 console = Console()
@@ -940,14 +941,12 @@ def _render_combined_init_summary(
     )
 
 
-_PROJECT_MARKERS = ("movate.yaml", "policy.yaml")
-
-
 def _find_project_root(from_dir: Path) -> Path | None:
     """Walk up from ``from_dir`` looking for a project root marker.
 
-    Returns the first ancestor that contains ``movate.yaml`` or
-    ``policy.yaml``, or ``None`` if no marker is found. Used by
+    Returns the first ancestor that contains any recognised project-root
+    marker (``project.yaml``, ``policy.yaml``, ``movate.yaml``), or
+    ``None`` if no marker is found. Used by
     :func:`_relocate_bundled_skills` to determine where the project-
     level ``skills/`` directory should live.
     """
