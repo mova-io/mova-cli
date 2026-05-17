@@ -102,11 +102,36 @@ def list_keys(
     tenant_id: str = typer.Option(
         None,
         "--tenant-id",
-        help="Filter to one tenant. Omit for all-tenants (operator-only).",
+        help="Filter to one tenant. Omit for all. Ignored when --target is used.",
     ),
     include_revoked: bool = typer.Option(False, "--include-revoked", help="Show revoked keys too."),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help=(
+            "Query a deployed runtime via HTTP instead of local storage. "
+            "Reads the bearer from the target's key_env. "
+            "Returns keys belonging to the calling tenant's identity."
+        ),
+    ),
 ) -> None:
-    """List API keys, newest first."""
+    """List API keys, newest first.
+
+    Without [bold]--target[/bold], reads local storage (operator tool).
+    With [bold]--target[/bold], calls [bold]GET /api/v1/auth/keys[/bold]
+    on the deployed runtime and shows keys for the calling tenant.
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk auth list-keys                     # local storage[/dim]
+      [dim]$ mdk auth list-keys --target dev        # deployed runtime[/dim]
+      [dim]$ mdk auth list-keys --target dev --include-revoked[/dim]
+    """
+    if target is not None:
+        _list_keys_remote(target=target, include_revoked=include_revoked)
+        return
+
     keys = asyncio.run(_load_keys(tenant_id=tenant_id, include_revoked=include_revoked))
 
     if not keys:
@@ -134,6 +159,94 @@ def list_keys(
             status,
         )
     stdout.print(table)
+
+
+def _list_keys_remote(*, target: str, include_revoked: bool) -> None:
+    """Call GET /api/v1/auth/keys on a deployed runtime and render the result."""
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.config import resolve_target  # noqa: PLC0415
+    from movate.core.user_config import UserConfigError  # noqa: PLC0415
+
+    try:
+        _, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    base_url = target_cfg.url.rstrip("/")
+    if not api_key:
+        error(
+            f"env var ${target_cfg.key_env} is empty. "
+            f"Run mdk auth refresh-runtime-key {target}."
+        )
+        raise typer.Exit(code=2)
+
+    params: dict[str, str] = {}
+    if include_revoked:
+        params["include_revoked"] = "true"
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+            resp = client.get(
+                f"{base_url}/api/v1/auth/keys",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params=params,
+            )
+    except httpx.HTTPError as exc:
+        error(f"could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code == httpx.codes.UNAUTHORIZED:
+        error("401 Unauthorized — key is invalid or expired.")
+        raise typer.Exit(code=2)
+    if resp.status_code != httpx.codes.OK:
+        error(f"HTTP {resp.status_code}: {resp.text[:200]!r}")
+        raise typer.Exit(code=2)
+
+    data = resp.json()
+    keys = data.get("keys", [])
+
+    if not keys:
+        hint("[dim]no keys found[/dim]")
+        return
+
+    table = Table(title=f"api keys on {target}")
+    table.add_column("key_id", style="bold")
+    table.add_column("tenant_id", style="dim")
+    table.add_column("env")
+    table.add_column("label")
+    table.add_column("created")
+    table.add_column("last_used")
+    table.add_column("expires")
+    table.add_column("status")
+
+    _status_style = {
+        "active": "[green]active[/green]",
+        "revoked": "[red]revoked[/red]",
+        "expired": "[yellow]expired[/yellow]",
+    }
+    for k in keys:
+        raw_status = k.get("status", "active")
+        status_cell = _status_style.get(raw_status, raw_status)
+        created = (k.get("created_at") or "")[:10]
+        last_used = (k.get("last_used_at") or "")[:10] or "—"
+        expires = (k.get("expires_at") or "")[:10] or "—"
+        table.add_row(
+            k.get("key_id", "?"),
+            k.get("tenant_id", "?"),
+            k.get("env", "?"),
+            k.get("label") or "",
+            created,
+            last_used,
+            expires,
+            status_cell,
+        )
+    stdout.print(table)
+    stdout.print(f"[dim]{data.get('count', len(keys))} key(s)[/dim]")
 
 
 @auth_app.command("whoami")
