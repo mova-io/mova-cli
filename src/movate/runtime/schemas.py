@@ -221,6 +221,51 @@ class AgentListView(BaseModel):
     agents: list[AgentView]
 
 
+class AgentCatalogItemView(BaseModel):
+    """One entry in the ``GET /api/v1/agents`` catalog response.
+
+    Richer than the legacy :class:`AgentView` (which is discovery-only
+    for the old ``GET /agents`` endpoint). Includes all marketplace
+    metadata so the Angular Agent Catalog page can render role chips,
+    capability badges, and tag filters without a follow-up
+    ``GET /api/v1/agents/{name}`` round-trip.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    owner: str = ""
+    role: str = ""
+    persona: str = ""
+    capabilities: list[str] = []
+    tags: list[str] = []
+
+
+class AgentCatalogView(BaseModel):
+    """``GET /api/v1/agents`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agents: list[AgentCatalogItemView]
+    count: int
+
+
+class AgentUpdatedView(BaseModel):
+    """``PUT /api/v1/agents/{name}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    agent_dir: str
+    files_persisted: list[str]
+    previous_version: str
+    """Version of the bundle that was replaced."""
+
+
 class AgentCreatedView(BaseModel):
     """``POST /api/v1/agents`` response — the canonical layout the
     runtime persisted to disk, plus the resolved spec metadata so
@@ -995,6 +1040,8 @@ class AgentDetailView(BaseModel):
 
 
 __all__ = [
+    "AgentCatalogItemView",
+    "AgentCatalogView",
     "AgentCommitView",
     "AgentCreatedView",
     "AgentDatasetInfo",
@@ -1005,6 +1052,7 @@ __all__ = [
     "AgentPublishSubmission",
     "AgentPublishedView",
     "AgentRunSubmission",
+    "AgentUpdatedView",
     "AgentValidationCostForecast",
     "AgentValidationIssue",
     "AgentValidationView",
