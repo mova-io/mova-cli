@@ -1160,6 +1160,26 @@ def _score_workflow_accuracy(
     return DimensionScore(0.0, f"mismatch on: {mismatches}")
 
 
+def load_workflow_judge_config(workflow_dir: Path) -> JudgeConfig:
+    """Resolve the judge config for a workflow.
+
+    Resolution order:
+      1. Convention: ``<workflow-dir>/evals/judge.yaml``
+      2. Default: exact-match scoring
+    """
+    path = (workflow_dir / "evals" / "judge.yaml").resolve()
+    if not path.exists():
+        return JudgeConfig(method=JudgeMethod.EXACT)
+    try:
+        data = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise EvalConfigError(f"invalid YAML in {path}: {exc}") from exc
+    try:
+        return JudgeConfig.model_validate(data)
+    except ValidationError as exc:
+        raise EvalConfigError(f"invalid judge config in {path}:\n{exc}") from exc
+
+
 class WorkflowEvalEngine:
     """Eval engine for multi-node workflows.
 
@@ -1167,9 +1187,10 @@ class WorkflowEvalEngine:
     :class:`Executor`. Scoring targets ``WorkflowResult.final_state``;
     per-node outputs are not scored individually.
 
-    Phase 1 (this implementation): accuracy + coverage + refusal + latency.
-    Faithfulness and context_compliance require an LLM judge and are deferred
-    to Phase 2.
+    Scored dimensions: accuracy, faithfulness (when grounding + judge
+    configured), coverage, refusal, latency.
+    Context_compliance is not scored (workflows span multiple agents; there
+    is no single context set that applies to the whole pipeline).
     """
 
     def __init__(
@@ -1177,6 +1198,7 @@ class WorkflowEvalEngine:
         *,
         executor: Executor,
         storage: StorageProvider,
+        provider: BaseLLMProvider,
         runs_per_case: int = 1,
         gate_mode: str = "mean",
         on_case_complete: Callable[[int, int, CaseSummary], None] | None = None,
@@ -1187,6 +1209,7 @@ class WorkflowEvalEngine:
             raise EvalConfigError(f"gate_mode {gate_mode!r} must be one of {_GATE_MODES}")
         self._executor = executor
         self._storage = storage
+        self._provider = provider
         self._runs_per_case = runs_per_case
         self._gate_mode = gate_mode
         self._on_case_complete = on_case_complete
@@ -1211,7 +1234,7 @@ class WorkflowEvalEngine:
         from movate.core.workflow.runner import WorkflowRunError, WorkflowRunner  # noqa: PLC0415
 
         cases, dataset_hash = load_workflow_dataset(workflow_dir, evals_spec)
-        judge = JudgeConfig(method=JudgeMethod.EXACT)
+        judge = load_workflow_judge_config(workflow_dir)
 
         runner = WorkflowRunner(
             executor=self._executor,
@@ -1270,6 +1293,9 @@ class WorkflowEvalEngine:
                     continue
 
                 accuracy = _score_workflow_accuracy(result.final_state, case.expected)
+                faithfulness = DimensionScore()
+                if case.grounding:
+                    faithfulness = await self._score_faithfulness(case, result.final_state, judge)
                 coverage = DimensionScore()
                 if case.expected_coverage is not None:
                     coverage = _score_coverage(case.expected_coverage, result.final_state)
@@ -1285,6 +1311,7 @@ class WorkflowEvalEngine:
 
                 dims = DimensionScores(
                     accuracy=accuracy,
+                    faithfulness=faithfulness,
                     coverage=coverage,
                     refusal=refusal,
                     latency=latency,
@@ -1312,19 +1339,54 @@ class WorkflowEvalEngine:
                     self._on_case_complete(len(case_summaries), total, summary)
 
         dimensional_means = _compute_dimensional_means(case_summaries)
+        judge_provider = (
+            judge.model.provider if judge.method == JudgeMethod.LLM_JUDGE and judge.model else None
+        )
 
         return EvalSummary(
             agent=workflow_name,
             agent_version=workflow_version,
             dataset_hash=dataset_hash,
             judge=judge,
-            judge_provider=None,
+            judge_provider=judge_provider,
             runs_per_case=self._runs_per_case,
             gate_mode=self._gate_mode,
             threshold=threshold,
             cases=case_summaries,
             dimensional_means=dimensional_means,
         )
+
+
+    async def _score_faithfulness(
+        self,
+        case: EvalCase,
+        actual: dict[str, Any],
+        judge: JudgeConfig,
+    ) -> DimensionScore:
+        """LLM-judge: does final_state stay faithful to the case's grounding?
+
+        Shares the same prompt and fallback behaviour as
+        :meth:`EvalEngine._score_faithfulness`. When no LLM judge model is
+        configured (exact-match mode), returns a no-score with a readable hint
+        so operators know how to enable faithfulness scoring.
+        """
+        if judge.model is None:
+            return DimensionScore(
+                None,
+                "skipped: faithfulness needs a judge model — add evals/judge.yaml",
+            )
+        prompt = _FAITHFULNESS_PROMPT.format(
+            grounding=case.grounding,
+            actual_json=json.dumps(actual),
+        )
+        req = CompletionRequest(
+            provider=judge.model.provider,
+            messages=[Message(role="user", content=prompt)],
+            params=dict(judge.model.params),
+        )
+        judge_response = await self._provider.complete(req)
+        score, rationale = _parse_judge_response(judge_response.text)
+        return DimensionScore(score, rationale)
 
 
 def _parse_judge_response(text: str) -> tuple[float, str]:
@@ -1370,4 +1432,5 @@ __all__ = [
     "load_dataset",
     "load_judge_config",
     "load_workflow_dataset",
+    "load_workflow_judge_config",
 ]

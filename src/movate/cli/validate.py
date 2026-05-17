@@ -865,3 +865,10 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  edges:       {len(graph.edges)}")
     chain = " → ".join(graph.topological_order())
     console.print(f"  topology:    {chain}")
+
+    if spec.evals is None:
+        console.print(
+            "[yellow]![/yellow] no [bold]evals:[/bold] stanza in workflow.yaml — "
+            "this workflow cannot be evaluated with [bold]mdk eval[/bold]. "
+            "[dim]Add an evals: block with a dataset: path.[/dim]"
+        )
