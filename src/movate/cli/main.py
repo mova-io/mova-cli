@@ -88,6 +88,7 @@ from movate.cli import (  # noqa: E402
     _console,
     add_cmd,
     audit_cmd,
+    compose_cmd,
     demo_cmd,
     diff_cmd,
     eval_gen_cmd,
@@ -310,6 +311,9 @@ app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 # Same Develop panel because it's a scaffold command; positioned right after
 # `init` so operators see the natural progression.
 app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
+# `compose` scaffolds a multi-agent workflow.yaml from a list of agents.
+# Sibling to `init` (single agent) and `demo` (full populated project).
+app.command("compose", rich_help_panel=PANEL_DEVELOP)(compose_cmd.compose)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
