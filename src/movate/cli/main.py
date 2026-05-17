@@ -116,6 +116,7 @@ from movate.cli import (  # noqa: E402
     import_openapi as _import_openapi,  # noqa: F401  -- registers `openapi` on import_app
 )
 from movate.cli import init as init_cmd  # noqa: E402
+from movate.cli import explain as explain_cmd  # noqa: E402
 from movate.cli import logs as logs_cmd  # noqa: E402
 from movate.cli import pricing as pricing_cmd  # noqa: E402
 from movate.cli import run as run_cmd  # noqa: E402
@@ -384,6 +385,10 @@ app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 # in via `from movate.cli import doctor`.
 _ = doctor_cmd
 app.add_typer(doctor_app, name="doctor", rich_help_panel=PANEL_DIAGNOSE)
+# `explain` renders the decision chain behind a completed run — answers
+# "what did the agent actually do?" and pairs naturally with `doctor`
+# (environment health) and `fix` (remediation).
+app.command("explain", rich_help_panel=PANEL_DIAGNOSE)(explain_cmd.explain)
 # `fix` is the repair-side companion to `doctor` — same panel.
 # Auto-remediates common diagnostic findings. Dry-run by default.
 app.command("fix", rich_help_panel=PANEL_DIAGNOSE)(fix_cmd.fix)
