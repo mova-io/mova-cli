@@ -8,7 +8,7 @@ the user-facing schema.
 v0.3 surface intentionally narrow:
 
 * one ``entrypoint`` node
-* node types limited to ``"agent"``
+* node types limited to ``"agent"`` and ``"intent-router"``
 * edges have ``from`` and ``to`` only — no ``when:``, no parallel fan-out
 
 Later phases relax these via separate validator passes.
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -30,12 +30,38 @@ class WorkflowSpecLoadError(Exception):
     """Raised when ``workflow.yaml`` cannot be parsed or fails Pydantic validation."""
 
 
-class NodeSpec(BaseModel):
-    """One workflow node as written in YAML.
+class IntentRouterConfig(BaseModel):
+    """Configuration for an ``intent-router`` workflow node.
 
-    v0.3 nodes are agents only. The Literal narrows the surface so a typo
-    like ``type: ageent`` fails at parse time, not at run time.
+    The router calls a classifier agent with the text from ``input_field``
+    and the list of intent labels drawn from ``routes``.  The classifier
+    returns ``{"label": "<one-of-the-keys>"}``; the router maps that label
+    to a downstream node id via ``routes``, falling back to ``fallback``
+    when no entry matches.
     """
+
+    model_config = ConfigDict(extra="forbid")
+
+    routes: dict[str, str] = Field(
+        ...,
+        description="Map of intent label → target node id",
+    )
+    fallback: str = Field(
+        ...,
+        description="Node id to route to when no intent label matches",
+    )
+    classifier_agent: str = Field(
+        ...,
+        description="Name (or relative path) of the classifier agent to invoke",
+    )
+    input_field: str = Field(
+        "text",
+        description="Key from the workflow state to pass as the classifier's ``text`` input",
+    )
+
+
+class AgentNodeSpec(BaseModel):
+    """One agent workflow node as written in YAML."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -51,6 +77,44 @@ class NodeSpec(BaseModel):
                 f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
             )
         return v
+
+
+class IntentRouterNodeSpec(BaseModel):
+    """One intent-router workflow node as written in YAML."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    type: Literal["intent-router"]
+    routes: dict[str, str] = Field(..., description="Intent label → target node id map")
+    fallback: str = Field(..., description="Node id to route to when no label matches")
+    classifier_agent: str = Field(..., description="Name of the classifier agent to use")
+    input_field: str = Field("text", description="Workflow state key to classify")
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", v):
+            raise ValueError(
+                f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
+            )
+        return v
+
+    @property
+    def intent_router_config(self) -> IntentRouterConfig:
+        return IntentRouterConfig(
+            routes=self.routes,
+            fallback=self.fallback,
+            classifier_agent=self.classifier_agent,
+            input_field=self.input_field,
+        )
+
+
+# NodeSpec is a discriminated union of agent and intent-router nodes.
+NodeSpec = Annotated[
+    Union[AgentNodeSpec, IntentRouterNodeSpec],
+    Field(discriminator="type"),
+]
 
 
 class EdgeSpec(BaseModel):
