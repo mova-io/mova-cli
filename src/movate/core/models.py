@@ -1093,6 +1093,9 @@ class FailureRecord(BaseModel):
 class JudgeMethod(StrEnum):
     EXACT = "exact"
     LLM_JUDGE = "llm_judge"
+    PANEL = "panel"
+    """Multi-judge panel: N judges score independently, variance check,
+    optional escalation to a tiebreaker when std_dev > variance_threshold."""
 
 
 class JudgeConfig(BaseModel):
@@ -1104,6 +1107,27 @@ class JudgeConfig(BaseModel):
     model: ModelConfig | None = None
     rubric: str | None = None
     threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+    # Panel-mode fields (ignored unless method == "panel")
+    judges: list[ModelConfig] = Field(default_factory=list)
+    """Panel judges. Requires >= 2 entries when method=panel.
+    All judges must be from different families than the agent (cross-family
+    enforcement applies individually to each panel member).
+    Example:
+      judges:
+        - provider: anthropic/claude-opus-4-7
+          params: {max_tokens: 256}
+        - provider: openai/gpt-4o
+          params: {max_tokens: 256}
+    """
+    variance_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    """Std-dev threshold above which the escalation judge is called.
+    E.g. 0.3 means: if judges disagree by more than 0.3 std-dev, escalate."""
+    escalation: ModelConfig | None = None
+    """Tiebreaker model called when judge std_dev > variance_threshold.
+    Should be a high-capability model from yet another family.
+    When None and variance exceeds threshold, the panel mean is used with
+    a 'high-variance' rationale annotation."""
 
     @field_validator("rubric")
     @classmethod

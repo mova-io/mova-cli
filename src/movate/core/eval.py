@@ -31,6 +31,7 @@ non-None dimensions) so callers that read ``score`` keep working.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -51,6 +52,7 @@ from movate.core.models import (
     JudgeConfig,
     JudgeMethod,
     Metrics,
+    ModelConfig,
     RunRequest,
     RunResponse,
     WorkflowStatus,
@@ -537,6 +539,7 @@ def assert_cross_family(agent_provider: str, judge_provider: str) -> None:
 
 
 _GATE_MODES = ("mean", "min", "p10")
+_PANEL_MIN_JUDGES = 2
 
 
 def _build_objective_summaries(
@@ -815,6 +818,7 @@ class EvalEngine:
         gate_mode: str = "mean",
         objective_filter: str | None = None,
         on_case_complete: Callable[[int, int, CaseSummary], None] | None = None,
+        global_skill_responses: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         if runs_per_case < 1:
             raise EvalConfigError("runs_per_case must be >= 1")
@@ -833,8 +837,13 @@ class EvalEngine:
         """Optional progress hook: ``(done, total, summary)``. Fires
         after each case finishes; CLI uses it to drive a Rich progress
         bar without coupling the engine to UI."""
+        self._global_skill_responses = global_skill_responses
+        """Global skill stub dict applied to every case as a fallback.
+        Per-case skill_responses take precedence. Populated by the
+        remote eval API when the caller passes skill_responses in the
+        EvalSubmission body."""
 
-    async def run(self, bundle: AgentBundle) -> EvalSummary:
+    async def run(self, bundle: AgentBundle) -> EvalSummary:  # noqa: PLR0912
         judge = load_judge_config(bundle)
         self._validate_judge(bundle, judge)
         cases, dataset_hash = load_dataset(bundle)
@@ -874,10 +883,17 @@ class EvalEngine:
         for case in cases:
             runs: list[CaseRun] = []
             for _ in range(self._runs_per_case):
+                # Merge global stubs with per-case stubs; per-case wins.
+                skill_fixture: dict[str, Any] | None = None
+                if self._global_skill_responses or case.skill_responses:
+                    skill_fixture = {
+                        **(self._global_skill_responses or {}),
+                        **(case.skill_responses or {}),
+                    }
                 response = await self._executor.execute(
                     bundle,
                     RunRequest(agent=bundle.spec.name, input=case.input),
-                    skill_fixture=case.skill_responses,
+                    skill_fixture=skill_fixture,
                 )
                 if response.status != "success":
                     # Failed runs score 0 on every applicable dim. We
@@ -933,9 +949,12 @@ class EvalEngine:
                 with contextlib.suppress(Exception):
                     self._on_case_complete(len(case_summaries), total, summary)
 
-        judge_provider = (
-            judge.model.provider if judge.method == JudgeMethod.LLM_JUDGE and judge.model else None
-        )
+        if judge.method == JudgeMethod.LLM_JUDGE and judge.model:
+            judge_provider: str | None = judge.model.provider
+        elif judge.method == JudgeMethod.PANEL and judge.judges:
+            judge_provider = "+".join(jm.provider for jm in judge.judges)
+        else:
+            judge_provider = None
 
         # Per-objective rollup. Build one summary per declared objective,
         # plus an implicit "default" bucket for cases that didn't declare
@@ -963,11 +982,19 @@ class EvalEngine:
     # ---------------------------------------------------------- private
 
     def _validate_judge(self, bundle: AgentBundle, judge: JudgeConfig) -> None:
-        if judge.method != JudgeMethod.LLM_JUDGE:
-            return
-        if judge.model is None or judge.rubric is None:
-            raise EvalConfigError("llm_judge requires both 'model' and 'rubric'")
-        assert_cross_family(bundle.spec.model.provider, judge.model.provider)
+        if judge.method == JudgeMethod.LLM_JUDGE:
+            if judge.model is None or judge.rubric is None:
+                raise EvalConfigError("llm_judge requires both 'model' and 'rubric'")
+            assert_cross_family(bundle.spec.model.provider, judge.model.provider)
+        elif judge.method == JudgeMethod.PANEL:
+            if len(judge.judges) < _PANEL_MIN_JUDGES:
+                raise EvalConfigError("panel requires at least 2 judges")
+            if judge.rubric is None:
+                raise EvalConfigError("panel requires 'rubric'")
+            for jm in judge.judges:
+                assert_cross_family(bundle.spec.model.provider, jm.provider)
+            if judge.escalation is not None:
+                assert_cross_family(bundle.spec.model.provider, judge.escalation.provider)
 
     async def _score_dimensions(
         self,
@@ -1037,17 +1064,20 @@ class EvalEngine:
         actual: dict[str, Any],
         judge: JudgeConfig,
     ) -> DimensionScore:
-        """Exact-match or LLM-as-judge scoring of accuracy vs expected.
+        """Exact-match, LLM-as-judge, or multi-judge panel scoring.
 
-        Exact-match is the v0.5 fast path: structured outputs (classifiers,
-        extractors) score 1.0 when the dict matches exactly and 0.0
-        otherwise. LLM-judge uses the configured rubric — costs one
-        judge-model call per case run.
+        Exact-match: structured outputs score 1.0 on exact dict equality.
+        LLM-judge: single model + rubric, one call per run.
+        Panel: N judges run concurrently; escalation model called when
+        std_dev > variance_threshold.
         """
         if judge.method == JudgeMethod.EXACT:
             if actual == case.expected:
                 return DimensionScore(1.0, "exact match")
             return DimensionScore(0.0, "mismatch")
+
+        if judge.method == JudgeMethod.PANEL:
+            return await self._score_panel_accuracy(case, actual, judge)
 
         assert judge.model is not None and judge.rubric is not None  # validated upstream
         prompt = _JUDGE_PROMPT.format(
@@ -1064,6 +1094,73 @@ class EvalEngine:
         judge_response = await self._provider.complete(req)
         score, rationale = _parse_judge_response(judge_response.text)
         return DimensionScore(score, rationale)
+
+    async def _score_panel_accuracy(
+        self,
+        case: EvalCase,
+        actual: dict[str, Any],
+        judge: JudgeConfig,
+    ) -> DimensionScore:
+        """Multi-judge panel scoring.
+
+        All judges in ``judge.judges`` are called concurrently via
+        ``asyncio.gather``. If their scores' std_dev exceeds
+        ``judge.variance_threshold``, the escalation model (if configured)
+        is called to produce a tiebreaker score; otherwise the panel mean
+        is used with a high-variance annotation.
+
+        Rationale format: ``"panel: [j1=0.8, j2=0.6, j3=0.9] mean=0.77"``
+        or ``"panel(escalated): 0.75 — variance 0.15 > threshold 0.10"``
+        """
+        assert judge.rubric is not None  # validated in _validate_judge
+
+        prompt = _JUDGE_PROMPT.format(
+            input_json=json.dumps(case.input),
+            expected_json=json.dumps(case.expected),
+            actual_json=json.dumps(actual),
+            rubric=judge.rubric,
+        )
+
+        async def _call_judge(jm: ModelConfig) -> tuple[float, str]:
+            req = CompletionRequest(
+                provider=jm.provider,
+                messages=[Message(role="user", content=prompt)],
+                params=dict(jm.params),
+            )
+            resp = await self._provider.complete(req)
+            return _parse_judge_response(resp.text)
+
+        results: list[tuple[float, str]] = await asyncio.gather(
+            *(_call_judge(jm) for jm in judge.judges)
+        )
+        scores = [r[0] for r in results]
+        mean_score = statistics.fmean(scores)
+        std_dev = statistics.stdev(scores) if len(scores) > 1 else 0.0
+
+        score_parts = ", ".join(
+            f"j{i + 1}={s:.2f}" for i, s in enumerate(scores)
+        )
+
+        if std_dev > judge.variance_threshold and judge.escalation is not None:
+            # High variance — call escalation tiebreaker
+            esc_score, esc_rationale = await _call_judge(judge.escalation)
+            rationale = (
+                f"panel(escalated): {esc_score:.2f} — [{score_parts}] "
+                f"std_dev={std_dev:.2f} > threshold={judge.variance_threshold:.2f}; "
+                f"escalation: {esc_rationale}"
+            )
+            return DimensionScore(esc_score, rationale)
+
+        if std_dev > judge.variance_threshold:
+            rationale = (
+                f"panel(high-variance): mean={mean_score:.2f} [{score_parts}] "
+                f"std_dev={std_dev:.2f} > threshold={judge.variance_threshold:.2f} "
+                f"(no escalation model configured)"
+            )
+        else:
+            rationale = f"panel: [{score_parts}] mean={mean_score:.2f} std_dev={std_dev:.2f}"
+
+        return DimensionScore(mean_score, rationale)
 
     async def _score_context_compliance(
         self,
@@ -1337,16 +1434,19 @@ class WorkflowEvalEngine:
                     self._on_case_complete(len(case_summaries), total, summary)
 
         dimensional_means = _compute_dimensional_means(case_summaries)
-        judge_provider = (
-            judge.model.provider if judge.method == JudgeMethod.LLM_JUDGE and judge.model else None
-        )
+        if judge.method == JudgeMethod.LLM_JUDGE and judge.model:
+            wf_judge_provider: str | None = judge.model.provider
+        elif judge.method == JudgeMethod.PANEL and judge.judges:
+            wf_judge_provider = "+".join(jm.provider for jm in judge.judges)
+        else:
+            wf_judge_provider = None
 
         return EvalSummary(
             agent=workflow_name,
             agent_version=workflow_version,
             dataset_hash=dataset_hash,
             judge=judge,
-            judge_provider=judge_provider,
+            judge_provider=wf_judge_provider,
             runs_per_case=self._runs_per_case,
             gate_mode=self._gate_mode,
             threshold=threshold,
