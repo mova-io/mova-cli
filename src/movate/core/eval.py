@@ -118,10 +118,19 @@ class DimensionScore:
     required input — e.g. faithfulness without a grounding context).
     ``rationale`` is empty for unscored dims and otherwise a 1-line
     human-readable explanation.
+
+    ``per_judge_scores`` is populated only by panel-mode scoring (see
+    :meth:`_score_panel_accuracy`). It carries the structured breakdown
+    of individual judge scores plus, when arbitration fired, the
+    arbitrator's score under the key ``"arbitrator"``. Callers that
+    just want the final number ignore it; report renderers + structured
+    EvalRecord consumers (Angular, dashboards) use it to show the
+    panel breakdown without parsing the rationale string.
     """
 
     value: float | None = None
     rationale: str = ""
+    per_judge_scores: dict[str, float] | None = None
 
 
 @dataclass
@@ -1578,6 +1587,13 @@ class EvalEngine:
         std_dev = statistics.stdev(scores) if len(scores) > 1 else 0.0
 
         score_parts = ", ".join(f"j{i + 1}={s:.2f}" for i, s in enumerate(scores))
+        # Structured per-judge breakdown so structured consumers (the
+        # report renderer, the Angular dashboard, EvalRecord JSON) don't
+        # have to parse the rationale string. Keyed by provider so
+        # dashboards can label each column by model name.
+        per_judge: dict[str, float] = {
+            jm.provider: s for jm, s in zip(judge.judges, scores, strict=True)
+        }
 
         if std_dev > judge.variance_threshold and judge.escalation is not None:
             # High variance — call escalation tiebreaker
@@ -1587,7 +1603,8 @@ class EvalEngine:
                 f"std_dev={std_dev:.2f} > threshold={judge.variance_threshold:.2f}; "
                 f"escalation: {esc_rationale}"
             )
-            return DimensionScore(esc_score, rationale)
+            per_judge["arbitrator"] = esc_score
+            return DimensionScore(esc_score, rationale, per_judge_scores=per_judge)
 
         if std_dev > judge.variance_threshold:
             rationale = (
@@ -1598,7 +1615,7 @@ class EvalEngine:
         else:
             rationale = f"panel: [{score_parts}] mean={mean_score:.2f} std_dev={std_dev:.2f}"
 
-        return DimensionScore(mean_score, rationale)
+        return DimensionScore(mean_score, rationale, per_judge_scores=per_judge)
 
     async def _score_context_compliance(
         self,
