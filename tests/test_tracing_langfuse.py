@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from movate.tracing import StdoutTracer, build_tracer
+from movate.tracing import SilentTracer, StdoutTracer, build_tracer
 from movate.tracing.langfuse import (
     LangfuseTracer,
     LangfuseUnavailableError,
@@ -71,12 +71,13 @@ class _FakeClient:
 
 
 @pytest.mark.unit
-def test_build_tracer_default_is_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_tracer_default_is_silent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MOVATE_TRACER", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     tracer = build_tracer()
-    assert isinstance(tracer, StdoutTracer)
+    assert isinstance(tracer, SilentTracer)
 
 
 @pytest.mark.unit

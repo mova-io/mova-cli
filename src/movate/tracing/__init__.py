@@ -3,21 +3,22 @@
 Selection precedence (lazy — optional deps only import when actually
 needed; tracing must never break a run):
 
-* ``MOVATE_TRACER=stdout`` → :class:`StdoutTracer` (testing/CI override).
-* ``MOVATE_TRACER=langfuse`` → :class:`LangfuseTracer` (or stdout if
+* ``MOVATE_TRACER=stdout`` → :class:`StdoutTracer` (debug / CI override).
+* ``MOVATE_TRACER=langfuse`` → :class:`LangfuseTracer` (or silent if
   package/keys unusable).
-* ``MOVATE_TRACER=otel`` → :class:`OtelTracer` (or stdout if
+* ``MOVATE_TRACER=otel`` → :class:`OtelTracer` (or silent if
   package/endpoint unusable).
 * ``MOVATE_TRACER=composite`` → fan out to every configured backend; if
-  none usable, stdout.
+  none usable, silent.
 * Auto (env unset):
   - both ``LANGFUSE_SECRET_KEY`` AND ``OTEL_EXPORTER_OTLP_ENDPOINT`` set →
     :class:`CompositeTracer` over both.
   - only ``LANGFUSE_SECRET_KEY`` set → :class:`LangfuseTracer`.
   - only ``OTEL_EXPORTER_OTLP_ENDPOINT`` set → :class:`OtelTracer`.
-  - neither → :class:`StdoutTracer`.
+  - neither → :class:`SilentTracer` (no output; set ``MOVATE_TRACER=stdout``
+    to see JSON spans on stderr).
 
-Every fallback emits a single line on stderr explaining why so a
+Every backend fallback emits a single line on stderr explaining why so a
 production misconfig is debuggable from the logs.
 """
 
@@ -28,10 +29,12 @@ import sys
 
 from movate.tracing.base import SpanCtx, Tracer
 from movate.tracing.composite import CompositeTracer
+from movate.tracing.null import SilentTracer
 from movate.tracing.stdout import StdoutTracer
 
 __all__ = [
     "CompositeTracer",
+    "SilentTracer",
     "SpanCtx",
     "StdoutTracer",
     "Tracer",
@@ -65,7 +68,7 @@ def build_tracer() -> Tracer:
     if has_otel:
         return _build_otel_or_fallback()
 
-    return StdoutTracer(stream=sys.stderr)
+    return SilentTracer()
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +90,7 @@ def _build_composite_or_fallback(*, explicit_request: bool) -> Tracer:
     """Build a composite over whatever backends are usable.
 
     If only one backend works, return it directly (no need to wrap a
-    single tracer). If none work, fall back to stdout.
+    single tracer). If none work, fall back to silent.
     """
     delegates: list[Tracer] = []
     lf = _try_build_langfuse()
