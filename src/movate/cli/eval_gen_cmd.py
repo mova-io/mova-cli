@@ -983,10 +983,7 @@ def _print_entries_preview(entries: list[dict[str, Any]]) -> None:
     total = len(entries)
 
     table = Table(
-        title=(
-            f"[bold]Generated cases[/bold] — preview "
-            f"({preview_count} of {total})"
-        ),
+        title=(f"[bold]Generated cases[/bold] — preview ({preview_count} of {total})"),
         title_style="bold",
         show_header=True,
         header_style="bold cyan",

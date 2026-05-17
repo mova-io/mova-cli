@@ -791,11 +791,7 @@ def build_app(
             if capabilities
             else None
         )
-        tag_filter = (
-            {t.strip().lower() for t in tags.split(",") if t.strip()}
-            if tags
-            else None
-        )
+        tag_filter = {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else None
 
         items: list[AgentCatalogItemView] = []
         for b in agents:
@@ -1879,38 +1875,26 @@ def build_app(
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
     ) -> EvalAcceptedView:
-        """Run an eval against an agent's dataset and persist the
-        EvalRecord.
+        """Run an eval against an agent's dataset and persist the EvalRecord.
 
-        For v0.7 the eval runs synchronously inside the request
-        handler. Wire contract identical to the eventual async-worker
-        semantics (item 89 will swap the implementation): 202 response
-        carries ``{eval_id, status}``, full scorecard retrievable via
-        ``GET /api/v1/evals/{eval_id}`` (item 84).
+        **Default (``wait=false``):** creates a ``JobRecord(kind=EVAL)``
+        and returns 202 immediately with ``{job_id, status: "queued"}``.
+        The worker process claims and executes the job; poll
+        ``GET /api/v1/jobs/{job_id}`` until terminal, then fetch the
+        scorecard from ``GET /api/v1/evals/{result_run_id}``.
 
-        Recommended for Friday demo: ``mock=true``. The MockProvider
-        is deterministic + fast (sub-second for a 10-case dataset);
-        real-LLM evals work but block the request for the full
-        duration (single-digit minutes for typical datasets). Full
-        async-worker path with progress reporting lands in v0.8.
+        **Synchronous (``wait=true``):** runs the eval inline and
+        returns ``{eval_id, status: "success"}`` directly. Convenient
+        for demos or CI scripts where a separate worker is not running.
+        Avoid for large datasets (risk of HTTP gateway timeout).
 
         Errors:
 
         * **401** — bad bearer token
         * **404** — agent not in the registry
-        * **422** — eval engine config / dataset error (no dataset
-          on the agent, invalid gate_mode, missing objective id, etc.)
+        * **422** — eval config / dataset error (``wait=true`` path only;
+          async path surfaces the error via the job's error field)
         """
-        # Lazy imports — eval engine has a non-trivial cost (executor,
-        # provider, judge). Hide it from cold-start latency for
-        # endpoints that don't touch evals.
-        from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
-        from movate.core.executor import Executor  # noqa: PLC0415
-        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
-        from movate.providers.mock import MockProvider  # noqa: PLC0415
-        from movate.providers.pricing import load_pricing  # noqa: PLC0415
-        from movate.tracing import build_tracer  # noqa: PLC0415
-
         agents: list[AgentBundle] = request.app.state.agents
         bundle = next((b for b in agents if b.spec.name == name), None)
         if bundle is None:
@@ -1918,14 +1902,39 @@ def build_app(
 
         store: StorageProvider = request.app.state.storage
 
-        # Pick the provider per the body's `mock` flag. Friday demo
-        # path uses mock; production-grade evals route through LiteLLM
-        # (which respects the agent's provider/params).
-        provider: object = MockProvider() if body.mock else LiteLLMProvider()
+        # ── Async path (default) ──────────────────────────────────────────
+        if not body.wait:
+            job = JobRecord(
+                job_id=str(uuid4()),
+                tenant_id=ctx.tenant_id,
+                kind=JobKind.EVAL,
+                target=name,
+                input={
+                    "mock": body.mock,
+                    "runs": body.runs,
+                    "gate_mode": body.gate_mode,
+                    "gate": body.gate,
+                    "objective": body.objective,
+                    "baseline_id": body.baseline_id,
+                    "regression_tolerance": body.regression_tolerance,
+                },
+                api_key_id=ctx.api_key_id,
+            )
+            await store.save_job(job)
+            return EvalAcceptedView(
+                job_id=job.job_id,
+                status="queued",
+            )
 
-        # Tenant-scoped executor with the same configuration the CLI's
-        # `mdk eval` uses. Storage + tracer are required collaborators;
-        # we re-use the runtime's storage and a stdout tracer.
+        # ── Sync path (wait=true) ─────────────────────────────────────────
+        from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        provider: object = MockProvider() if body.mock else LiteLLMProvider()
         executor = Executor(
             provider=provider,  # type: ignore[arg-type]
             pricing=load_pricing(),
@@ -1943,22 +1952,13 @@ def build_app(
                 objective_filter=body.objective,
                 global_skill_responses=body.skill_responses,
             )
-            # Synchronous: blocks the request until the eval finishes.
-            # For mock + small datasets this is sub-second. Real LLM
-            # evals block longer — Angular UI should show a spinner;
-            # async-worker path with progress reporting lands in v0.8
-            # (item 89).
             summary = await engine.run(bundle)
         except EvalConfigError as exc:
             return EvalAcceptedView(
-                eval_id="",
                 status="failed",
                 message=str(exc),
             )
 
-        # Persist the EvalRecord via the engine's canonical
-        # summary→record converter — same fields the CLI's
-        # `mdk eval` writes.
         record = summary.to_record(tenant_id=ctx.tenant_id)
         await store.save_eval(record)
 

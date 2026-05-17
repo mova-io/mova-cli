@@ -65,11 +65,18 @@ class WorkerDispatch:
         executor: Executor,
         agents: list[AgentBundle] | None = None,
         workflows: dict[str, WorkflowGraph] | None = None,
+        use_mock_for_eval: bool = False,
     ) -> None:
         self._storage = storage
         self._executor = executor
         self._agents: dict[str, AgentBundle] = {b.spec.name: b for b in (agents or [])}
         self._workflows: dict[str, WorkflowGraph] = workflows or {}
+        self._use_mock_for_eval = use_mock_for_eval
+        """When True, eval jobs always use MockProvider regardless of the
+        job's ``mock`` flag. Useful in test environments where real LLM
+        calls would be expensive. The app sets this from the server's
+        startup config; individual eval jobs can override per-job via
+        ``job.input["mock"]``."""
 
     async def execute_job(self, job: JobRecord) -> DispatchOutcome:
         """Execute one job. Returns a :class:`DispatchOutcome` regardless
@@ -78,8 +85,8 @@ class WorkerDispatch:
             return await self._execute_agent(job)
         if job.kind == JobKind.WORKFLOW:
             return await self._execute_workflow(job)
-        # Defensive — JobKind only has two members today, but covers
-        # forward compat if a future kind sneaks past Pydantic.
+        if job.kind == JobKind.EVAL:
+            return await self._execute_eval(job)
         return _error(
             "unknown_kind",
             f"unsupported JobKind {job.kind!r}",
@@ -152,6 +159,77 @@ class WorkerDispatch:
             status=JobStatus.ERROR,
             result_run_id=response.run_id,
             error=response.error.model_dump() if response.error else None,
+        )
+
+    async def _execute_eval(self, job: JobRecord) -> DispatchOutcome:
+        """Run an async eval job.
+
+        ``job.input`` carries the eval configuration dict (the same
+        fields as :class:`movate.runtime.schemas.EvalSubmission`):
+        ``mock``, ``runs``, ``gate_mode``, ``objective``,
+        ``skill_responses``. The completed :class:`EvalRecord` is
+        persisted via storage; ``result_run_id`` is set to the
+        ``eval_id`` so callers can retrieve it via
+        ``GET /api/v1/evals/{eval_id}``.
+        """
+        from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        bundle = self._agents.get(job.target)
+        if bundle is None:
+            return _error(
+                "unknown_agent",
+                f"agent {job.target!r} not registered on this worker",
+                retryable=False,
+            )
+
+        cfg = job.input
+        use_mock: bool = self._use_mock_for_eval or bool(cfg.get("mock", False))
+
+        if use_mock:
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        pricing = load_pricing()
+        executor = Executor(
+            provider=provider,
+            pricing=pricing,
+            storage=self._storage,
+            tracer=build_tracer(),
+            tenant_id=job.tenant_id,
+        )
+
+        try:
+            engine = EvalEngine(
+                executor=executor,
+                provider=provider,
+                runs_per_case=int(cfg.get("runs", 1)),
+                gate_mode=str(cfg.get("gate_mode", "mean")),
+                objective_filter=cfg.get("objective") or None,
+            )
+            summary = await engine.run(bundle)
+        except EvalConfigError as exc:
+            return _error("eval_config", str(exc), retryable=False)
+        except Exception as exc:
+            logger.exception("eval_execute_unhandled job_id=%s", job.job_id)
+            return _error("internal", str(exc), retryable=True)
+
+        record = summary.to_record(tenant_id=job.tenant_id)
+        await self._storage.save_eval(record)
+
+        # Store eval_id in result_run_id — field is a generic "result
+        # identifier"; the API contract documents this mapping for EVAL jobs.
+        return DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id=record.eval_id,
+            error=None,
         )
 
     async def _execute_workflow(self, job: JobRecord) -> DispatchOutcome:

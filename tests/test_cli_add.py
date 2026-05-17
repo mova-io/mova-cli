@@ -129,9 +129,7 @@ def test_add_scaffolds_under_project_agents_dir(
 
 
 @pytest.mark.unit
-def test_add_name_flag_renames_agent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_name_flag_renames_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``mdk add sql-writer --name my-sql-agent`` uses the explicit name."""
     project = tmp_path / "p"
     project.mkdir()
@@ -166,9 +164,7 @@ def test_add_template_name_is_default_agent_name(
 
 
 @pytest.mark.unit
-def test_add_walks_up_to_find_project_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_walks_up_to_find_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Running ``mdk add`` from a subdirectory still lands the agent at the
     project root's ``agents/`` dir, not in the nested cwd."""
     project = tmp_path / "myproject"
@@ -249,9 +245,7 @@ def test_add_no_args_exits_two(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.unit
-def test_add_unknown_template_exits_two(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_unknown_template_exits_two(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Unknown template name → exit 2 with 'unknown template'."""
     project = tmp_path / "p"
     project.mkdir()
@@ -265,9 +259,7 @@ def test_add_unknown_template_exits_two(
 
 
 @pytest.mark.unit
-def test_add_outside_project_exits_two(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_add_outside_project_exits_two(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Running ``mdk add`` outside any movate project exits 2 — no fallback
     to cwd in the current interface."""
     bare = tmp_path / "bare"

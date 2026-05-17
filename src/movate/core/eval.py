@@ -818,6 +818,7 @@ class EvalEngine:
         gate_mode: str = "mean",
         objective_filter: str | None = None,
         on_case_complete: Callable[[int, int, CaseSummary], None] | None = None,
+        judge_override: JudgeConfig | None = None,
         global_skill_responses: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         if runs_per_case < 1:
@@ -837,6 +838,9 @@ class EvalEngine:
         """Optional progress hook: ``(done, total, summary)``. Fires
         after each case finishes; CLI uses it to drive a Rich progress
         bar without coupling the engine to UI."""
+        self._judge_override = judge_override
+        """When set, bypasses judge.yaml and uses this config directly.
+        Populated by --judge-model / --judge-rubric CLI flags."""
         self._global_skill_responses = global_skill_responses
         """Global skill stub dict applied to every case as a fallback.
         Per-case skill_responses take precedence. Populated by the
@@ -844,7 +848,9 @@ class EvalEngine:
         EvalSubmission body."""
 
     async def run(self, bundle: AgentBundle) -> EvalSummary:  # noqa: PLR0912
-        judge = load_judge_config(bundle)
+        judge = (
+            self._judge_override if self._judge_override is not None else load_judge_config(bundle)
+        )
         self._validate_judge(bundle, judge)
         cases, dataset_hash = load_dataset(bundle)
 
@@ -1137,9 +1143,7 @@ class EvalEngine:
         mean_score = statistics.fmean(scores)
         std_dev = statistics.stdev(scores) if len(scores) > 1 else 0.0
 
-        score_parts = ", ".join(
-            f"j{i + 1}={s:.2f}" for i, s in enumerate(scores)
-        )
+        score_parts = ", ".join(f"j{i + 1}={s:.2f}" for i, s in enumerate(scores))
 
         if std_dev > judge.variance_threshold and judge.escalation is not None:
             # High variance — call escalation tiebreaker

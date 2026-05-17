@@ -340,15 +340,17 @@ class RunTraceView(BaseModel):
 class EvalSubmission(BaseModel):
     """``POST /api/v1/agents/{name}/evals`` request body.
 
-    Eval kickoff config. Mirrors the ``mdk eval`` CLI's flag set —
-    the Angular UI's "Run Eval" form translates to this shape.
+    Eval kickoff config. Mirrors the ``mdk eval`` CLI's flag set.
 
-    Note on execution: for v0.7 the eval runs synchronously inside
-    the request handler (small datasets + mock mode = sub-second
-    response). The wire contract — ``{eval_id, status}`` reply +
-    ``GET /api/v1/evals/{eval_id}`` retrieval — is the same as the
-    eventual async-job semantics (BACKLOG item 89), so the Angular
-    client doesn't change when we move to the worker-queue path.
+    Default execution is async: the endpoint creates a ``JobRecord``
+    and returns immediately with ``{job_id, status: "queued"}``. The
+    worker picks it up and persists the ``EvalRecord``; poll
+    ``GET /api/v1/jobs/{job_id}`` for completion and
+    ``GET /api/v1/evals/{result_run_id}`` for the scorecard.
+
+    Pass ``wait=true`` for synchronous in-request execution (useful
+    for demos or CI when a worker process is not running). For large
+    datasets or real-LLM evals the async path is strongly preferred.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -360,13 +362,15 @@ class EvalSubmission(BaseModel):
     runs: int = Field(1, ge=1, le=10)
     """Runs per case. Use 3+ for LLM-as-judge to defeat sampling variance."""
     mock: bool = Field(False)
-    """Use the deterministic MockProvider (no API keys, fast).
-    Required-true for the Friday demo path; real-LLM eval mode lands
-    once we wire the async-worker path (item 89)."""
+    """Use the deterministic MockProvider (no API keys, fast)."""
+    wait: bool = Field(False)
+    """If true, run the eval synchronously inside the request handler
+    and return the completed eval_id immediately. Convenient for CI
+    scripts or demos where a separate worker process is not running.
+    For datasets > 20 cases or real-LLM judges use the default async
+    path (``wait=false``) to avoid HTTP gateway timeouts."""
     baseline_id: str | None = Field(None)
-    """Optional EvalRecord id to diff against; CLI exits 1 on
-    regression beyond ``regression_tolerance``. Angular UI shows a
-    regression badge."""
+    """Optional EvalRecord id to diff against."""
     regression_tolerance: float = Field(0.0, ge=0.0, le=1.0)
     objective: str | None = Field(None)
     """Optional objective id to filter cases by (matches
@@ -382,24 +386,26 @@ class EvalSubmission(BaseModel):
 class EvalAcceptedView(BaseModel):
     """``POST /api/v1/agents/{name}/evals`` response.
 
-    Identifies the persisted ``EvalRecord``. Angular polls
-    ``GET /api/v1/evals/{eval_id}`` (item 84) to retrieve the
-    full scorecard.
+    Async path (default, ``wait=false``): returns immediately with
+    ``status="queued"`` and ``job_id``. Poll
+    ``GET /api/v1/jobs/{job_id}`` until terminal; use ``result_run_id``
+    from that response as the ``eval_id`` for the scorecard endpoint.
 
-    ``status`` is ``"success"`` (sync execution succeeded) or
-    ``"failed"`` (eval engine raised; check ``message``). Future
-    async path adds ``"queued"`` / ``"running"`` for in-flight evals
-    when the wire shape is identical but execution model differs.
+    Sync path (``wait=true``): returns ``status="success"`` (or
+    ``"failed"``) with ``eval_id`` populated directly.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    eval_id: str
-    status: str
-    """``success`` | ``failed`` (v0.7 sync) or ``queued`` |
-    ``running`` (future async)."""
+    eval_id: str = ""
+    """Populated on the sync (``wait=true``) success path; empty on the
+    async path (use the job's ``result_run_id`` once it completes)."""
+    status: str = "queued"
+    """``queued`` (async default) | ``success`` | ``failed`` (sync ``wait=true``)."""
+    job_id: str = ""
+    """Populated on the async path; empty on the sync path."""
     message: str = ""
-    """Failure message when ``status == "failed"``; empty on success."""
+    """Failure message when ``status == "failed"``; empty otherwise."""
 
 
 class EvalCaseView(BaseModel):

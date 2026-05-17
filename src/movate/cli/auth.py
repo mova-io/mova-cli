@@ -179,10 +179,7 @@ def _list_keys_remote(*, target: str, include_revoked: bool) -> None:
     api_key = os.environ.get(target_cfg.key_env, "").strip()
     base_url = target_cfg.url.rstrip("/")
     if not api_key:
-        error(
-            f"env var ${target_cfg.key_env} is empty. "
-            f"Run mdk auth refresh-runtime-key {target}."
-        )
+        error(f"env var ${target_cfg.key_env} is empty. Run mdk auth refresh-runtime-key {target}.")
         raise typer.Exit(code=2)
 
     params: dict[str, str] = {}

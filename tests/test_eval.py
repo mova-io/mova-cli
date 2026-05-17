@@ -16,7 +16,7 @@ from movate.core.eval import (
 )
 from movate.core.executor import Executor
 from movate.core.loader import load_agent
-from movate.core.models import JudgeMethod
+from movate.core.models import JudgeConfig, JudgeMethod, ModelConfig
 from movate.providers import provider_family
 from movate.providers.base import BaseLLMProvider
 from movate.providers.mock import MockProvider
@@ -385,8 +385,72 @@ async def test_summary_to_record_round_trips(
 
 
 # ---------------------------------------------------------------------------
-# Multi-judge panel tests
+# judge_override + multi-judge panel tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_judge_override_bypasses_judge_yaml(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """judge_override on EvalEngine skips judge.yaml (exact-match default) and
+    applies the supplied LLM judge config instead."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}}\n'
+    )
+    # No judge.yaml — engine would default to EXACT without the override.
+    bundle = load_agent(agent_dir)
+
+    override = JudgeConfig(
+        method=JudgeMethod.LLM_JUDGE,
+        model=ModelConfig(provider="anthropic/claude-opus-4-7"),
+        rubric="Score 0-1: 1=correct, 0=wrong",
+    )
+    provider = JudgeStubProvider(agent_response='{"message": "ok"}', judge_score=0.9)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(
+        executor=executor,
+        provider=provider,
+        judge_override=override,
+    )
+
+    summary = await engine.run(bundle)
+    # LLM judge fired (score comes from stub, not exact-match).
+    assert summary.judge.method is JudgeMethod.LLM_JUDGE
+    assert summary.judge_provider == "anthropic/claude-opus-4-7"
+    assert summary.cases[0].aggregated_score == pytest.approx(0.9)
+
+
+@pytest.mark.unit
+async def test_judge_override_takes_precedence_over_judge_yaml(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """When both judge.yaml and judge_override are present, override wins."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}}\n'
+    )
+    # judge.yaml says exact-match.
+    (agent_dir / "evals" / "judge.yaml").write_text("method: exact\n")
+    bundle = load_agent(agent_dir)
+
+    override = JudgeConfig(
+        method=JudgeMethod.LLM_JUDGE,
+        model=ModelConfig(provider="anthropic/claude-opus-4-7"),
+        rubric="Score 0-1",
+    )
+    provider = JudgeStubProvider(agent_response='{"message": "ok"}', judge_score=0.75)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(
+        executor=executor,
+        provider=provider,
+        judge_override=override,
+    )
+
+    summary = await engine.run(bundle)
+    assert summary.judge.method is JudgeMethod.LLM_JUDGE
+    assert summary.cases[0].aggregated_score == pytest.approx(0.75)
 
 
 @pytest.mark.unit
