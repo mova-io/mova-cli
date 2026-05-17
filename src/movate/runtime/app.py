@@ -44,6 +44,8 @@ from movate.runtime.errors import auth_required, not_found
 from movate.runtime.middleware import AuthContext, make_auth_dependency
 from movate.runtime.registry import scan_agents
 from movate.runtime.schemas import (
+    AgentCatalogItemView,
+    AgentCatalogView,
     AgentCommitView,
     AgentCreatedView,
     AgentDatasetInfo,
@@ -55,6 +57,7 @@ from movate.runtime.schemas import (
     AgentPublishedView,
     AgentPublishSubmission,
     AgentRunSubmission,
+    AgentUpdatedView,
     AgentValidationCostForecast,
     AgentValidationIssue,
     AgentValidationView,
@@ -745,6 +748,83 @@ def build_app(
     # ------------------------------------------------------------------
     v1 = APIRouter(prefix="/api/v1")
 
+    @v1.get(
+        "/agents",
+        response_model=AgentCatalogView,
+        tags=["agents-v1"],
+    )
+    async def v1_list_agents(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        role: str | None = None,
+        capabilities: str | None = None,
+        tags: str | None = None,
+    ) -> AgentCatalogView:
+        """List all agents in the catalog with marketplace metadata.
+
+        Supports optional query-param filters:
+
+        * ``?role=support-triage`` — exact match on the agent's ``role``
+          field (case-insensitive).
+        * ``?capabilities=pii-detection,summarisation`` — comma-separated;
+          agent must declare ALL listed capabilities (subset match).
+        * ``?tags=acme,production`` — comma-separated; agent must carry
+          ALL listed tags (subset match).
+
+        Filters are ANDed. Omitting a filter returns all agents.
+
+        Drives the Mova iO Angular Agent Catalog page — every card
+        on the catalog is rendered from entries in this list.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        _ = ctx.tenant_id  # future per-tenant isolation
+
+        agents: list[AgentBundle] = request.app.state.agents
+
+        # Normalise filter params.
+        role_filter = role.lower().strip() if role else None
+        cap_filter = (
+            {c.strip().lower() for c in capabilities.split(",") if c.strip()}
+            if capabilities
+            else None
+        )
+        tag_filter = (
+            {t.strip().lower() for t in tags.split(",") if t.strip()}
+            if tags
+            else None
+        )
+
+        items: list[AgentCatalogItemView] = []
+        for b in agents:
+            spec = b.spec
+            if role_filter and spec.role.lower() != role_filter:
+                continue
+            if cap_filter:
+                agent_caps = {c.lower() for c in spec.capabilities}
+                if not cap_filter.issubset(agent_caps):
+                    continue
+            if tag_filter:
+                agent_tags = {t.lower() for t in spec.tags}
+                if not tag_filter.issubset(agent_tags):
+                    continue
+            items.append(
+                AgentCatalogItemView(
+                    name=spec.name,
+                    version=spec.version,
+                    description=spec.description,
+                    owner=spec.owner,
+                    role=spec.role,
+                    persona=spec.persona,
+                    capabilities=list(spec.capabilities),
+                    tags=list(spec.tags),
+                )
+            )
+
+        return AgentCatalogView(agents=items, count=len(items))
+
     @v1.post(
         "/agents",
         response_model=AgentCreatedView,
@@ -1149,6 +1229,106 @@ def build_app(
         return AgentDeletedView(
             name=result.name,
             deleted_dir=result.deleted_dir.name,
+        )
+
+    @v1.put(
+        "/agents/{name}",
+        response_model=AgentUpdatedView,
+        tags=["agents-v1"],
+    )
+    async def v1_update_agent(
+        name: str,
+        request: Request,
+        agent_yaml: UploadFile | None = File(default=None),
+        prompt: UploadFile | None = File(default=None),
+        input_schema: UploadFile | None = File(default=None),
+        output_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        contexts: list[UploadFile] = File(default=[]),
+        kb: list[UploadFile] = File(default=[]),
+        bundle: UploadFile | None = File(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AgentUpdatedView:
+        """Replace an existing agent bundle in-place (item 57 / BACKLOG G).
+
+        Accepts the same multipart form as ``POST /api/v1/agents`` (either
+        individual files or a zipped bundle). The ``{name}`` path param
+        must match the ``name`` field in the uploaded ``agent.yaml``;
+        mismatches are rejected with 422.
+
+        Differences from POST:
+
+        * **404** if the agent does not already exist (use POST to create).
+        * Existing bundle is atomically replaced — never leaves partial
+          state on disk.
+        * ``previous_version`` in the response lets the caller detect the
+          diff without a round-trip.
+
+        Skills bundled inside the upload are persisted to the global
+        registry with PUT semantics (idempotent re-deploy).
+
+        Errors:
+
+        * **400** — neither mode supplied OR both modes supplied
+        * **404** — agent ``{name}`` is not registered (never created)
+        * **422** — bundle failed validation OR agent_yaml name ≠ path param
+        * **503** — runtime built without an ``agents_path``
+        """
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "PUT /api/v1/agents/{name} is unavailable",
+                status_code=503,
+            )
+
+        # 404 guard — the agent must already exist before we'll replace it.
+        agents: list[AgentBundle] = request.app.state.agents
+        existing = next((b for b in agents if b.spec.name == name), None)
+        if existing is None:
+            raise not_found("agent", name)
+        previous_version = existing.spec.version
+
+        _ = ctx.tenant_id  # future per-tenant audit log
+
+        files = await _collect_bundle_files(
+            agent_yaml=agent_yaml,
+            prompt=prompt,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            dataset=dataset,
+            bundle=bundle,
+            contexts=contexts,
+            kb=kb,
+        )
+
+        # Extract + persist bundled skills first (same as POST).
+        agent_files, skills_per_name = split_skills_from_bundle(files)
+        if skills_per_name:
+            skills_path: Path | None = request.app.state.skills_path
+            if skills_path is None:
+                raise AgentCreationError(
+                    "bundle ships skills/<name>/ entries but the runtime "
+                    "was built without a skills_path",
+                    status_code=503,
+                )
+            for skill_name, skill_files in skills_per_name.items():
+                if "skill.yaml" not in skill_files:
+                    continue
+                persist_skill_bundle(skill_files, skills_path=skills_path)
+                _ = skill_name
+
+        result = persist_bundle(agent_files, agents_path=agents_path, on_conflict="replace")
+        request.app.state.agents = scan_agents(agents_path)
+
+        spec = result.bundle.spec
+        return AgentUpdatedView(
+            name=spec.name,
+            version=spec.version,
+            description=spec.description,
+            agent_dir=result.agent_dir.name,
+            files_persisted=result.files_persisted,
+            previous_version=previous_version,
         )
 
     @v1.post(
