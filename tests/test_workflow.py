@@ -493,7 +493,7 @@ def test_validate_linear_rejects_non_agent_nodes() -> None:
         edges=[WorkflowEdge(from_id="a", to_id="b")],
         workflow_dir=Path("/"),
     )
-    with pytest.raises(WorkflowCompileError, match="only type=agent nodes"):
+    with pytest.raises(WorkflowCompileError, match="only type=agent and type=intent-router nodes"):
         validate_linear(g)
 
 
