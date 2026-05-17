@@ -1404,6 +1404,91 @@ class JudgeConfig(BaseModel):
         return v.strip() if v else v
 
 
+class KnowledgeRetrieverKind(StrEnum):
+    """Retriever family for an agent's declared knowledge source.
+
+    BM25 is the v0.7 surface default; embeddings + reranking land in
+    v0.8 as separate kinds (pgvector, azure_search). The interface
+    here is deliberately retriever-agnostic — same ``query()`` signature
+    regardless of backend so the agent's prompt template doesn't change
+    when the retriever swaps.
+    """
+
+    BM25 = "bm25"
+    """In-memory BM25 over a JSON corpus. No external deps; loads at
+    process start. The MVP / v0.7 default."""
+
+    SUBSTRING = "substring"
+    """Token-overlap scorer — even cheaper than BM25, useful when the
+    corpus is tiny (< 50 entries) and BM25's IDF is noisy."""
+
+
+class KnowledgeConfig(BaseModel):
+    """Per-agent knowledge declaration parsed from ``knowledge.yaml``.
+
+    The MVP surface (v0.7) locks the interface for v0.8's production
+    retrievers (pgvector / Azure AI Search). Agents reference a single
+    knowledge source by ``corpus`` path; the runtime loads it into the
+    chosen retriever at process start and exposes a uniform
+    ``retrieve(query, top_k)`` to skills + workflow nodes.
+
+    Example ``knowledge.yaml`` (agent-local):
+
+        api_version: movate/v1
+        kind: Knowledge
+        retriever: bm25
+        corpus: ./kb/kb-lookup-corpus.json
+        top_k: 5
+        body_fields: [title, symptom, resolution]
+        tag_field: tags
+
+    Embeddings + reranking + non-JSON ingestion land in v0.8 — this
+    config will gain ``embedding_model``, ``reranker``, and
+    ``chunker`` fields then. Existing agents won't need to migrate
+    because BM25 + ``top_k`` are sensible defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    retriever: KnowledgeRetrieverKind = KnowledgeRetrieverKind.BM25
+    """Which retriever to instantiate. Default ``bm25`` is the right
+    pick for any agent until corpus size + recall needs justify the
+    embedding-pipeline cost."""
+
+    corpus: str
+    """Path to the corpus file, relative to the agent directory. JSON
+    array of objects today; v0.8 will add ``.jsonl`` + markdown
+    directories. The retriever loads this exactly once at agent boot."""
+
+    top_k: int = Field(default=5, ge=1, le=50)
+    """Max documents the retriever returns per query. Tuned per agent —
+    too low misses context, too high pollutes the prompt window. 5 is
+    a reasonable default for most RAG-QA shapes."""
+
+    body_fields: list[str] = Field(default_factory=lambda: ["title", "body"])
+    """Corpus entry fields concatenated for the BM25 body index. The
+    default matches the canonical KB shape (``title`` + ``body``);
+    legacy KB-lookup corpora using ``symptom`` + ``resolution`` should
+    list those instead. Field weights are uniform in v0.7; the v0.8
+    config will add per-field weights."""
+
+    tag_field: str | None = "tags"
+    """Corpus entry field whose values are treated as exact-match tags
+    (high-weight matches when a query token equals one of them). Set
+    to None to disable tag matching."""
+
+    id_field: str = "id"
+    """Corpus entry field carrying the stable document id surfaced in
+    retrieval results. Defaults to ``id``."""
+
+    @field_validator("body_fields")
+    @classmethod
+    def _at_least_one_body_field(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("body_fields must contain at least one field name")
+        return v
+
+
 class WorkflowStatus(StrEnum):
     SUCCESS = "success"
     ERROR = "error"

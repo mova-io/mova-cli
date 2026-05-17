@@ -637,3 +637,164 @@ def knowledge_list(
         out.print(f"[dim]Showing {shown} of {total} entries. Use --limit 0 to see all.[/dim]")
     else:
         out.print(f"[dim]{total} entr{'y' if total == 1 else 'ies'} total.[/dim]")
+
+
+@knowledge_app.command("query")
+def knowledge_query(
+    query: str = typer.Argument(
+        ...,
+        help="Free-text search query. The retriever tokenizes + scores against the corpus.",
+    ),
+    corpus: str = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help="Path to corpus JSON. Defaults to [bold]kb/kb-lookup-corpus.json[/bold].",
+    ),
+    top_k: int = typer.Option(
+        5,
+        "--top-k",
+        "-k",
+        help="How many results to return (1-50).",
+    ),
+    retriever: str = typer.Option(
+        "bm25",
+        "--retriever",
+        "-r",
+        help=(
+            "Retriever kind. [bold]bm25[/bold] (default) — Robertson/Sparck-Jones "
+            "with IDF + length normalization, good for corpora over ~50 entries. "
+            "[bold]substring[/bold] — token-overlap baseline, cheaper + more "
+            "deterministic for tiny corpora."
+        ),
+    ),
+    body_fields: list[str] = typer.Option(
+        ["title", "symptom", "resolution"],
+        "--body-field",
+        help=(
+            "Corpus entry field(s) to index for body matching. Repeatable. "
+            "Default matches the canonical kb-lookup corpus shape "
+            "(title + symptom + resolution). Override with --body-field for "
+            "FAQ corpora ([bold]--body-field question --body-field answer[/bold])."
+        ),
+    ),
+    project_root: str = typer.Option(
+        ".",
+        "--project-root",
+        envvar="MOVATE_PROJECT_ROOT",
+        hidden=True,
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Emit results as a JSON array of {doc_id, score, entry} on stdout. "
+            "Used by scripts + the v0.8 workflow retriever node. Default is "
+            "the operator-friendly Rich table."
+        ),
+    ),
+) -> None:
+    """Query the KB corpus and show ranked results.
+
+    Wraps the same in-memory retrievers (:mod:`movate.knowledge`) the
+    v0.8 production engine will plug into — so what you see here is
+    what an agent's `retriever` workflow node would see at runtime,
+    minus embeddings/reranking (those land in v0.8).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Default BM25 against the canonical kb-lookup corpus:[/dim]
+      $ mdk knowledge query "login fails after restart"
+
+      [dim]# Substring retriever for a tiny corpus + structured output:[/dim]
+      $ mdk knowledge query "refund window" -r substring --json
+
+      [dim]# FAQ-shaped corpus with custom body fields:[/dim]
+      $ mdk knowledge query "shipping" \\
+          --body-field question --body-field answer \\
+          --corpus kb/faq.json
+    """
+    # Local imports keep the CLI cold-start cheap.
+    from movate.core.models import KnowledgeRetrieverKind  # noqa: PLC0415
+    from movate.knowledge import (  # noqa: PLC0415
+        BM25Retriever,
+        InMemoryCorpus,
+        KnowledgeStoreError,
+        SubstringRetriever,
+    )
+
+    root = Path(project_root).resolve()
+    corpus_path = _resolve_corpus_path(corpus, root)
+    try:
+        in_mem = InMemoryCorpus.from_path(corpus_path)
+    except KnowledgeStoreError as exc:
+        err.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    try:
+        kind = KnowledgeRetrieverKind(retriever)
+    except ValueError:
+        valid = ", ".join(k.value for k in KnowledgeRetrieverKind)
+        err.print(
+            f"[red]✗[/red] --retriever must be one of {valid}; got {retriever!r}"
+        )
+        raise typer.Exit(code=2) from None
+
+    if kind == KnowledgeRetrieverKind.BM25:
+        ret = BM25Retriever(in_mem, body_fields=body_fields)
+    else:
+        ret = SubstringRetriever(in_mem, body_fields=body_fields)
+
+    hits = ret.query(query, top_k=top_k)
+
+    if json_output:
+        import json as _json  # noqa: PLC0415
+
+        out.print(
+            _json.dumps(
+                [
+                    {"doc_id": h.doc_id, "score": h.score, "entry": h.entry}
+                    for h in hits
+                ],
+                indent=2,
+            ),
+            highlight=False,
+            soft_wrap=True,
+        )
+        return
+
+    if not hits:
+        out.print(
+            f"[yellow]![/yellow] no matches for {query!r} in "
+            f"[bold]{corpus_path}[/bold] (n={len(in_mem)} entries)."
+        )
+        return
+
+    table = Table(
+        title=f"knowledge query — {retriever}: {query!r}",
+        show_lines=False,
+    )
+    table.add_column("rank", justify="right", style="dim")
+    table.add_column("id", style="bold cyan", no_wrap=True)
+    table.add_column("score", justify="right", style="green")
+    table.add_column("title")
+    table.add_column("tags", style="dim")
+
+    max_title_preview = 80
+    for rank, h in enumerate(hits, start=1):
+        title = str(h.entry.get("title", ""))
+        if len(title) > max_title_preview:
+            title = title[: max_title_preview - 1] + "…"
+        tags_raw = h.entry.get("tags", [])
+        tags = (
+            ", ".join(str(t) for t in tags_raw)
+            if isinstance(tags_raw, list)
+            else str(tags_raw)
+        )
+        table.add_row(str(rank), h.doc_id, f"{h.score:.3f}", title, tags)
+
+    out.print(table)
+    out.print(
+        f"[dim]{len(hits)} hit(s) of n={len(in_mem)} entries. "
+        f"Use --top-k to widen or --retriever to switch backends.[/dim]"
+    )
