@@ -983,8 +983,7 @@ def _relocate_bundled_skills(bundled_skills_dir: Path, *, target: Path) -> None:
         return
 
     real_skills = [
-        d for d in bundled_skills_dir.iterdir()
-        if d.is_dir() and d.name != "example-skill"
+        d for d in bundled_skills_dir.iterdir() if d.is_dir() and d.name != "example-skill"
     ]
     if not real_skills:
         return

@@ -106,9 +106,6 @@ ROLE_TEMPLATES: dict[str, str] = {
     # Read incoming tickets, assign priority + team + category, decide
     # escalation, write a 1-line summary. Strict enum output.
     "support-triage": "roles/support-triage",
-    # Natural-language → SQL with dialect awareness + safety warnings
-    # on destructive ops. Generates queries; does not execute them.
-    "sql-writer": "roles/sql-writer",
     # Draft replies for emails/Slack/tickets with explicit tone +
     # intent control. No-placeholder rule (always ready to send).
     "reply-drafter": "roles/reply-drafter",
@@ -118,6 +115,12 @@ ROLE_TEMPLATES: dict[str, str] = {
     # Summarize long-form text into summary + key_points +
     # action_items + open_questions. Audience-aware.
     "document-summarizer": "roles/document-summarizer",
+    # NOTE: sql-writer was moved from roles/sql-writer to sql_writer_agent
+    # (the TEMPLATES registry) so it ships external schema files and
+    # a richer context bundle. get_template_path('sql-writer') now
+    # resolves via TEMPLATES. roles/sql-writer is kept on disk for
+    # reference but removed from ROLE_TEMPLATES to avoid the lookup
+    # collision (ROLE_TEMPLATES is checked first in get_template_path).
 }
 
 

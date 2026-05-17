@@ -72,6 +72,11 @@ _DEFAULT_OUTPUT_SUFFIX = "evals/{name}/dataset.generated.jsonl"
 # Hard cap on --num to prevent accidentally launching 10k LLM calls.
 _MAX_GENERATE = 200
 
+# Number of cases shown in the terminal preview after generation.
+_PREVIEW_MAX_CASES = 5
+# Max chars shown per field value in the preview table.
+_PREVIEW_FIELD_MAX = 60
+
 
 def _resolve_agent_path(name_or_path: str, project_root: Path) -> Path:
     """Same convention as `mdk inspect agent` / `mdk tune`."""
@@ -963,6 +968,77 @@ def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state
 
 
 # ---------------------------------------------------------------------------
+# Terminal preview
+# ---------------------------------------------------------------------------
+
+
+def _print_entries_preview(entries: list[dict[str, Any]]) -> None:
+    """Render a formatted table of generated cases so operators can review
+    before the file is written. Capped at _PREVIEW_MAX_CASES rows."""
+    from rich.table import Table  # noqa: PLC0415
+
+    shown = entries[:_PREVIEW_MAX_CASES]
+    has_dims = any("grounding" in e for e in shown)
+    preview_count = len(shown)
+    total = len(entries)
+
+    table = Table(
+        title=(f"[bold]Generated cases[/bold] — preview ({preview_count} of {total})"),
+        title_style="bold",
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=True,
+        expand=False,
+    )
+    table.add_column("#", style="dim", width=3, no_wrap=True)
+    table.add_column("Input", min_width=30, max_width=50)
+    table.add_column("Expected", min_width=30, max_width=50)
+    if has_dims:
+        table.add_column("Grounding / Coverage", min_width=25, max_width=45)
+
+    for i, entry in enumerate(shown, start=1):
+        inp = entry.get("input", {})
+        exp = entry.get("expected", {})
+
+        def _fmt_dict(d: Any) -> str:
+            if not isinstance(d, dict):
+                s = str(d)
+                return s[:_PREVIEW_FIELD_MAX] + "…" if len(s) > _PREVIEW_FIELD_MAX else s
+            lines = []
+            for k, v in d.items():
+                vstr = str(v)
+                vstr = vstr[:_PREVIEW_FIELD_MAX] + "…" if len(vstr) > _PREVIEW_FIELD_MAX else vstr
+                lines.append(f"[dim]{k}:[/dim] {vstr}")
+            return "\n".join(lines) if lines else "—"
+
+        row = [str(i), _fmt_dict(inp), _fmt_dict(exp)]
+
+        if has_dims:
+            grounding = str(entry.get("grounding", "")).strip()
+            coverage = entry.get("expected_coverage") or []
+            dim_parts = []
+            if grounding:
+                g = grounding[:80] + "…" if len(grounding) > 80 else grounding  # noqa: PLR2004
+                dim_parts.append(f"[dim]ground:[/dim] {g}")
+            if coverage:
+                dim_parts.append(
+                    "[dim]covers:[/dim] " + ", ".join(str(c) for c in list(coverage)[:4])
+                )
+            row.append("\n".join(dim_parts) if dim_parts else "[dim]—[/dim]")
+
+        table.add_row(*row)
+
+    console.print()
+    console.print(table)
+    if total > _PREVIEW_MAX_CASES:
+        console.print(
+            f"[dim]  … and {total - _PREVIEW_MAX_CASES} more case(s) not shown above. "
+            f"All {total} will be written to the output file.[/dim]"
+        )
+    console.print()
+
+
+# ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
 
@@ -1226,6 +1302,8 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
             "confirm the schema accepts synthetic inputs.[/dim]"
         )
         raise typer.Exit(code=1)
+
+    _print_entries_preview(entries)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as fh:

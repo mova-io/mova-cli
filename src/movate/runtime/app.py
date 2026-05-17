@@ -791,11 +791,7 @@ def build_app(
             if capabilities
             else None
         )
-        tag_filter = (
-            {t.strip().lower() for t in tags.split(",") if t.strip()}
-            if tags
-            else None
-        )
+        tag_filter = {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else None
 
         items: list[AgentCatalogItemView] = []
         for b in agents:
@@ -1954,6 +1950,7 @@ def build_app(
                 runs_per_case=body.runs,
                 gate_mode=body.gate_mode,
                 objective_filter=body.objective,
+                global_skill_responses=body.skill_responses,
             )
             summary = await engine.run(bundle)
         except EvalConfigError as exc:
