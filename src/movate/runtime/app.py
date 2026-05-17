@@ -40,7 +40,7 @@ from movate.runtime.agent_creation import (
     unzip_bundle,
     wizard_to_bundle_files,
 )
-from movate.runtime.errors import auth_required, not_found
+from movate.runtime.errors import auth_required, forbidden, not_found
 from movate.runtime.middleware import AuthContext, make_auth_dependency
 from movate.runtime.registry import scan_agents
 from movate.runtime.schemas import (
@@ -2025,14 +2025,20 @@ def build_app(
         return EvalListView(evals=views, count=len(views))
 
     # ------------------------------------------------------------------
-    # Auth key management — tenant-scoped (operators manage their own keys).
+    # Auth key management — admin-only (scope="fleet-admin" required).
+    #
+    # The calling key must carry scope="fleet-admin". Regular keys
+    # without that scope receive 403. Tenant isolation is still enforced:
+    # admin keys only see/manage keys for their own tenant.
     # ------------------------------------------------------------------
+
+    _ADMIN_SCOPE = "fleet-admin"
 
     @v1.post(
         "/auth/keys",
         response_model=ApiKeyMintedView,
         status_code=201,
-        summary="Mint a new API key for the calling tenant.",
+        summary="Mint a new API key for the calling tenant (admin only).",
     )
     async def v1_mint_key(
         request: Request,
@@ -2044,10 +2050,15 @@ def build_app(
         The ``full_key`` in the response is shown **once** — it cannot
         be recovered. Store it immediately in your secrets vault.
 
+        The calling key must have ``scope="fleet-admin"``.
+
         Errors:
 
         * **401** — bad or missing bearer token
+        * **403** — authenticated but key lacks ``fleet-admin`` scope
         """
+        if ctx.scope != _ADMIN_SCOPE:
+            raise forbidden()
         store: StorageProvider = request.app.state.storage
         try:
             env = ApiKeyEnv(ctx.env)
@@ -2072,7 +2083,7 @@ def build_app(
     @v1.get(
         "/auth/keys",
         response_model=ApiKeyListView,
-        summary="List API keys for the calling tenant.",
+        summary="List active API keys for the calling tenant (admin only).",
     )
     async def v1_list_keys(
         request: Request,
@@ -2083,10 +2094,16 @@ def build_app(
 
         Pass ``include_revoked=true`` to show revoked keys too.
 
+        The calling key must have ``scope="fleet-admin"``.
+
         Errors:
 
         * **401** — bad or missing bearer token
+        * **403** — authenticated but key lacks ``fleet-admin`` scope
         """
+        if ctx.scope != _ADMIN_SCOPE:
+            raise forbidden()
+
         from datetime import UTC, datetime  # noqa: PLC0415
 
         store: StorageProvider = request.app.state.storage
@@ -2119,7 +2136,7 @@ def build_app(
     @v1.delete(
         "/auth/keys/{key_id}",
         response_model=ApiKeyRevokedView,
-        summary="Revoke an API key.",
+        summary="Revoke an API key (admin only).",
     )
     async def v1_revoke_key(
         request: Request,
@@ -2129,13 +2146,18 @@ def build_app(
         """Revoke the API key with the given ``key_id``.
 
         Idempotent — revoking an already-revoked key returns 200.
-        Tenant-scoped: you can only revoke your own keys.
+        Tenant-scoped: you can only revoke keys belonging to your tenant.
+
+        The calling key must have ``scope="fleet-admin"``.
 
         Errors:
 
         * **401** — bad or missing bearer token
+        * **403** — authenticated but key lacks ``fleet-admin`` scope
         * **404** — key not found or belongs to a different tenant
         """
+        if ctx.scope != _ADMIN_SCOPE:
+            raise forbidden()
         store: StorageProvider = request.app.state.storage
         record = await store.get_api_key(key_id)
         if record is None or record.tenant_id != ctx.tenant_id:

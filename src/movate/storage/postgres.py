@@ -172,7 +172,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
     label         TEXT,
     created_at    TIMESTAMPTZ NOT NULL,
     last_used_at  TIMESTAMPTZ,
-    revoked_at    TIMESTAMPTZ
+    revoked_at    TIMESTAMPTZ,
+    expires_at    TIMESTAMPTZ,
+    scope         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active
     ON api_keys(tenant_id) WHERE revoked_at IS NULL;
@@ -654,8 +656,8 @@ class PostgresProvider:
             """
             INSERT INTO api_keys (
                 key_id, tenant_id, env, secret_hash, salt, label,
-                created_at, last_used_at, revoked_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                created_at, last_used_at, revoked_at, expires_at, scope
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             """,
             key.key_id,
             key.tenant_id,
@@ -666,6 +668,8 @@ class PostgresProvider:
             key.created_at,
             key.last_used_at,
             key.revoked_at,
+            key.expires_at,
+            key.scope,
         )
 
     async def get_api_key(self, key_id: str) -> ApiKeyRecord | None:
@@ -866,16 +870,19 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
 
 
 def _row_to_api_key(row: asyncpg.Record) -> ApiKeyRecord:
+    row_dict = dict(row)
     return ApiKeyRecord(
-        key_id=row["key_id"],
-        tenant_id=row["tenant_id"],
-        env=ApiKeyEnv(row["env"]),
-        secret_hash=row["secret_hash"],
-        salt=row["salt"],
-        label=row["label"],
-        created_at=row["created_at"],
-        last_used_at=row["last_used_at"],
-        revoked_at=row["revoked_at"],
+        key_id=row_dict["key_id"],
+        tenant_id=row_dict["tenant_id"],
+        env=ApiKeyEnv(row_dict["env"]),
+        secret_hash=row_dict["secret_hash"],
+        salt=row_dict["salt"],
+        label=row_dict["label"],
+        created_at=row_dict["created_at"],
+        last_used_at=row_dict["last_used_at"],
+        revoked_at=row_dict["revoked_at"],
+        expires_at=row_dict.get("expires_at"),
+        scope=row_dict.get("scope"),
     )
 
 
