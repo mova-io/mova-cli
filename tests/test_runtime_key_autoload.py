@@ -258,3 +258,111 @@ class TestSaveRuntimeKeyCommand:
         monkeypatch.delenv("MDK_DEV_KEY", raising=False)
         autoload_credentials()
         assert os.environ.get("MDK_DEV_KEY") == "mvt_live_demo_FRESHKEY_secret"
+
+
+# ---------------------------------------------------------------------------
+# `mdk auth save-runtime-key dev -` — read from stdin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSaveRuntimeKeyFromStdin:
+    """Piped recovery flow: the secret is read from stdin so it never
+    lands in shell history or `ps`. The intended usage is:
+
+        az containerapp exec ... 'mdk auth create-key ...' \
+          | mdk auth save-runtime-key dev -
+
+    where `-` is the conventional stdin sentinel.
+    """
+
+    def _bootstrap_target(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "add-target",
+                "dev",
+                "--url",
+                "https://fake.example.com",
+                "--key-env",
+                "MDK_DEV_KEY",
+                "--azure-subscription",
+                "00000000-0000-0000-0000-000000000000",
+                "--azure-resource-group",
+                "fake-rg",
+                "--azure-acr",
+                "fakeacr",
+                "--azure-env",
+                "dev",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+    def test_reads_bare_key_from_stdin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The simplest case: stdin contains exactly the mvt_… token
+        with a trailing newline (what `mdk auth create-key --quiet`
+        emits). Save it under the target's key_env."""
+        self._bootstrap_target(tmp_path, monkeypatch)
+        result = runner.invoke(
+            app,
+            ["auth", "save-runtime-key", "dev", "-"],
+            input="mvt_live_demotena_kid123abc_secretvalueXYZ\n",
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        store = CredentialsStore()
+        assert (
+            store.read().get("MDK_DEV_KEY")
+            == "mvt_live_demotena_kid123abc_secretvalueXYZ"
+        )
+
+    def test_scrapes_mvt_key_from_az_exec_output(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The realistic recovery case: stdin has the full `az
+        containerapp exec` output mixed with INFO lines + the
+        'save this now' preamble — our scraper extracts the first
+        `mvt_*` token regardless of surrounding noise."""
+        self._bootstrap_target(tmp_path, monkeypatch)
+        piped = (
+            "INFO: Connecting to the container 'movate-api'...\n"
+            "INFO: Successfully connected to container.\n"
+            "mvt_live_demotena_kid123abc_secretvalueXYZ\n"
+            "save this now — never shown again\n"
+        )
+        result = runner.invoke(
+            app,
+            ["auth", "save-runtime-key", "dev", "-"],
+            input=piped,
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        store = CredentialsStore()
+        # Only the mvt_ token, not the surrounding text.
+        assert (
+            store.read().get("MDK_DEV_KEY")
+            == "mvt_live_demotena_kid123abc_secretvalueXYZ"
+        )
+
+    def test_stdin_with_no_mvt_token_exits_2(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Piped garbage (network error before az emitted a key, etc.)
+        is a hard error — we don't want to save `INFO: connecting...`
+        as someone's MDK_DEV_KEY and confuse them later."""
+        self._bootstrap_target(tmp_path, monkeypatch)
+        result = runner.invoke(
+            app,
+            ["auth", "save-runtime-key", "dev", "-"],
+            input="some random text\nno key here\n",
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 2
+        combined = (result.stdout + result.stderr).replace("\n", " ")
+        assert "no `mvt_" in combined or "token found on stdin" in combined

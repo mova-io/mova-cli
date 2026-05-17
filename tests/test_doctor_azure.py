@@ -340,3 +340,209 @@ def test_cli_doctor_with_unknown_target_reports_resolver_error(tmp_path: Path, m
     # the resolver error inline and let the rest of the output stand.
     assert result.exit_code == 0
     assert "azure preflight skipped" in result.stdout.lower()
+
+
+# ---------------------------------------------------------------------------
+# _check_auth_roundtrip — operator's saved bearer roundtrip
+# ---------------------------------------------------------------------------
+
+
+def _patch_auth_roundtrip(monkeypatch, status_code: int) -> None:
+    """Patch httpx.Client inside _azure_doctor to return ``status_code``
+    on the auth-roundtrip GET. ``_patch_healthz_ok`` already returns 200
+    for /healthz + /ready; this composes on top of it so the
+    auth-roundtrip row gets the status we want."""
+
+    def handler(request):
+        if request.url.path == "/api/v1/agents":
+            return httpx.Response(status_code, json={"agents": []})
+        # /healthz, /ready
+        if request.url.path == "/ready":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ready",
+                    "version": "0.5.0",
+                    "checks": {"storage": "ok"},
+                    "storage_backend": "postgres",
+                    "storage_durable": True,
+                },
+            )
+        return httpx.Response(200, json={"status": "ok", "version": "0.5.0"})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr("movate.cli._azure_doctor.httpx.Client", factory)
+
+
+@pytest.mark.unit
+def test_auth_roundtrip_missing_env_var_reports_recovery_command(
+    monkeypatch,
+) -> None:
+    """The operator hasn't saved the bearer locally yet — surface the
+    one-command recovery path so they know exactly what to run."""
+    monkeypatch.delenv("MOVATE_PROD_KEY", raising=False)
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "account show": (
+                    0,
+                    '{"id": "00000000-0000-0000-0000-000000000000", "tenantId": "tenant-id"}',
+                ),
+                "group show": (0, '{"name": "movate-prod-rg", "location": "eastus2"}'),
+                "acr show": (0, '{"name": "movateprodacr", "sku": {"name": "Basic"}}'),
+                "containerapp show": (
+                    0,
+                    '{"properties": {"template": {"containers": '
+                    '[{"image": "movateprodacr.azurecr.io/movate:0.5.0-abc1234"}]}}}',
+                ),
+            }
+        ),
+    )
+    _patch_auth_roundtrip(monkeypatch, status_code=200)
+
+    rows = run_azure_preflight("prod", _target())
+    auth_row = next(r for r in rows if r.name == "auth roundtrip")
+    assert auth_row.status == "missing"
+    assert "MOVATE_PROD_KEY" in auth_row.detail
+    assert "mdk auth pull-runtime-key" in auth_row.detail
+
+
+@pytest.mark.unit
+def test_auth_roundtrip_200_reports_ok(monkeypatch) -> None:
+    """Bearer set + runtime accepts it = green row. This is what every
+    healthy environment looks like."""
+    monkeypatch.setenv("MOVATE_PROD_KEY", "mvt_live_demotena_keyid_secret")
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "account show": (
+                    0,
+                    '{"id": "00000000-0000-0000-0000-000000000000", "tenantId": "tenant-id"}',
+                ),
+                "group show": (0, '{"name": "movate-prod-rg", "location": "eastus2"}'),
+                "acr show": (0, '{"name": "movateprodacr", "sku": {"name": "Basic"}}'),
+                "containerapp show": (
+                    0,
+                    '{"properties": {"template": {"containers": '
+                    '[{"image": "movateprodacr.azurecr.io/movate:0.5.0-abc1234"}]}}}',
+                ),
+            }
+        ),
+    )
+    _patch_auth_roundtrip(monkeypatch, status_code=200)
+
+    rows = run_azure_preflight("prod", _target())
+    auth_row = next(r for r in rows if r.name == "auth roundtrip")
+    assert auth_row.status == "ok"
+    assert "saved bearer accepted" in auth_row.detail
+
+
+@pytest.mark.unit
+def test_auth_roundtrip_401_reports_stale_bearer_with_truncated_prefix(
+    monkeypatch,
+) -> None:
+    """Bearer set but runtime rejects it = the single most useful red
+    row in the doctor. Shows the first 16 chars (enough to spot
+    'wrong tenant', 'old key from yesterday') without leaking the
+    full secret to logs. Detail names the recovery command."""
+    monkeypatch.setenv(
+        "MOVATE_PROD_KEY", "mvt_live_demotena_0123456789abcdef_DEADBEEF"
+    )
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "account show": (
+                    0,
+                    '{"id": "00000000-0000-0000-0000-000000000000", "tenantId": "tenant-id"}',
+                ),
+                "group show": (0, '{"name": "movate-prod-rg", "location": "eastus2"}'),
+                "acr show": (0, '{"name": "movateprodacr", "sku": {"name": "Basic"}}'),
+                "containerapp show": (
+                    0,
+                    '{"properties": {"template": {"containers": '
+                    '[{"image": "movateprodacr.azurecr.io/movate:0.5.0-abc1234"}]}}}',
+                ),
+            }
+        ),
+    )
+    _patch_auth_roundtrip(monkeypatch, status_code=401)
+
+    rows = run_azure_preflight("prod", _target())
+    auth_row = next(r for r in rows if r.name == "auth roundtrip")
+    assert auth_row.status == "error"
+    # Bearer prefix shown — first 16 chars only.
+    assert "mvt_live_demoten" in auth_row.detail
+    # Tail (the actual secret) NOT shown.
+    assert "DEADBEEF" not in auth_row.detail
+    # Recovery command surfaced.
+    assert "mdk auth pull-runtime-key" in auth_row.detail
+
+
+@pytest.mark.unit
+def test_auth_roundtrip_network_error_reports_unreachable(monkeypatch) -> None:
+    """Transport-level error (DNS, TLS, etc.) is distinct from a 401 —
+    the bearer might be fine, the network isn't."""
+    monkeypatch.setenv("MOVATE_PROD_KEY", "mvt_live_demotena_keyid_secret")
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "account show": (
+                    0,
+                    '{"id": "00000000-0000-0000-0000-000000000000", "tenantId": "tenant-id"}',
+                ),
+                "group show": (0, '{"name": "movate-prod-rg", "location": "eastus2"}'),
+                "acr show": (0, '{"name": "movateprodacr", "sku": {"name": "Basic"}}'),
+                "containerapp show": (
+                    0,
+                    '{"properties": {"template": {"containers": '
+                    '[{"image": "movateprodacr.azurecr.io/movate:0.5.0-abc1234"}]}}}',
+                ),
+            }
+        ),
+    )
+
+    def handler(request):
+        # /healthz + /ready succeed so we reach the auth check; the
+        # auth GET is the one that blows up.
+        if request.url.path == "/api/v1/agents":
+            raise httpx.ConnectError("network unreachable")
+        if request.url.path == "/ready":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ready",
+                    "version": "0.5.0",
+                    "checks": {"storage": "ok"},
+                    "storage_backend": "postgres",
+                    "storage_durable": True,
+                },
+            )
+        return httpx.Response(200, json={"status": "ok", "version": "0.5.0"})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr("movate.cli._azure_doctor.httpx.Client", factory)
+
+    rows = run_azure_preflight("prod", _target())
+    auth_row = next(r for r in rows if r.name == "auth roundtrip")
+    assert auth_row.status == "error"
+    assert "ConnectError" in auth_row.detail or "unreachable" in auth_row.detail

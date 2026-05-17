@@ -234,6 +234,13 @@ def run_azure_preflight(target_name: str, target: TargetConfig) -> list[Check]:
     # cascade a confusing second red row.
     if healthz.status == "ok":
         checks.append(_check_storage_durability(target.url))
+        # Authenticated round-trip — the operator's saved bearer is the
+        # one that gets used at deploy time, so a green storage row
+        # + a red auth row means "infra is fine but YOUR copy of the
+        # key is stale." Closes the gap between Layer 1's unauthed
+        # health checks and the deploy-time 401 that would otherwise
+        # be the first signal something's wrong.
+        checks.append(_check_auth_roundtrip(target))
 
     return checks
 
@@ -323,6 +330,53 @@ def _check_storage_durability(url: str) -> Check:
         f"{backend} — NOT durable; revision recycles wipe keys. "
         "Set MOVATE_DB_URL=postgresql://... on the Container App and restart.",
     )
+
+
+def _check_auth_roundtrip(target: TargetConfig) -> Check:
+    """Hit ``GET /api/v1/agents`` with the operator's saved bearer.
+
+    This is the single most actionable doctor row: it answers "would
+    my next `mdk deploy` get a 401?" without actually attempting the
+    deploy. Three statuses:
+
+    * ``ok`` — bearer authenticates; ``mdk deploy`` will succeed.
+    * ``missing`` — env var unset; recovery is `mdk auth pull-runtime-key`
+      (preferred) or `mdk auth refresh-runtime-key`.
+    * ``error`` — bearer rejected with 401, or the request errored at
+      the transport layer. Detail names the recovery command.
+    """
+    import os  # noqa: PLC0415
+
+    api_key = os.environ.get(target.key_env, "").strip()
+    if not api_key:
+        return Check(
+            "auth roundtrip",
+            "missing",
+            f"${target.key_env} is empty — run `mdk auth pull-runtime-key "
+            f"<target>` or `mdk auth refresh-runtime-key <target>`",
+        )
+
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.get(
+                f"{target.url.rstrip('/')}/api/v1/agents",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except httpx.HTTPError as exc:
+        return Check(
+            "auth roundtrip", "error", f"unreachable: {exc.__class__.__name__}"
+        )
+    if r.status_code == httpx.codes.UNAUTHORIZED:
+        prefix = api_key[:16]
+        return Check(
+            "auth roundtrip",
+            "error",
+            f"401 (saved bearer starts '{prefix}…' — stale; run "
+            f"`mdk auth pull-runtime-key <target>` to refresh from KV)",
+        )
+    if r.status_code != httpx.codes.OK:
+        return Check("auth roundtrip", "error", f"HTTP {r.status_code}")
+    return Check("auth roundtrip", "ok", "saved bearer accepted")
 
 
 __all__ = ["Check", "run_azure_preflight"]
