@@ -213,9 +213,8 @@ class TestSearchFilter:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        # Both tiers should report no matches.
+        # Role tier reports no matches (core tier removed).
         assert "no role templates match" in result.stdout.lower()
-        assert "no core templates match" in result.stdout.lower()
 
     def test_search_matches_description_substring(self) -> None:
         """Search should hit the description, not just the name.
@@ -290,13 +289,9 @@ class TestGroupedList:
         ):
             assert group in result.stdout, f"expected group {group!r} in --list output"
 
-    def test_list_still_includes_core_table(self) -> None:
-        """Grouping applies to the role tier; the core templates table
-        should still render (alphabetical, no use-case column)."""
+    def test_list_shows_only_role_table(self) -> None:
+        """Core templates table was removed; only the role-based catalog renders."""
         result = runner.invoke(app, ["add", "--list"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
-        # Core tier header remains.
-        assert "Core templates" in result.stdout
-        # Core templates appear.
-        assert "faq" in result.stdout
-        assert "summarizer" in result.stdout
+        assert "Role-based templates" in result.stdout
+        assert "Core templates" not in result.stdout

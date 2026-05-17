@@ -46,19 +46,16 @@ def _bootstrap_project(tmp_path: Path) -> Path:
 
 
 @pytest.mark.unit
-def test_list_prints_role_and_core_tables() -> None:
-    """--list should show both the role-based templates AND the core
-    templates, with one-line descriptions."""
-    result = runner.invoke(app, ["add", "--list"], env={"COLUMNS": "200"})
-    assert result.exit_code == 0, result.stdout + result.stderr
-    # Both section headers present.
-    assert "Role-based templates" in result.stdout
-    assert "Core templates" in result.stdout
-    # At least one role + one core template surface.
-    assert "rag-qa" in result.stdout
-    assert "ticket-triager" in result.stdout
-    assert "faq" in result.stdout
-    assert "summarizer" in result.stdout
+def test_list_prints_role_table_only() -> None:
+    """--list (and 'mdk add list') shows the role-based catalog only;
+    the core templates table was removed to reduce noise."""
+    for invoke_args in (["add", "--list"], ["add", "list"]):
+        result = runner.invoke(app, invoke_args, env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Role-based templates" in result.stdout
+        assert "Core templates" not in result.stdout
+        assert "rag-qa" in result.stdout
+        assert "ticket-triager" in result.stdout
 
 
 # ---------------------------------------------------------------------------

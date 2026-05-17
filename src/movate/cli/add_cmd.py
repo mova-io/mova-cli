@@ -200,11 +200,14 @@ def _render_role_catalog_numbered(installed: set[str]) -> list[str]:
 
 
 def _pick_and_add_role_agent(bin_name: str) -> None:
-    """Show the numbered role catalog and let the operator pick one to add."""
+    """Show the numbered role catalog, add the chosen agent, then offer an
+    interactive sample run so the operator can see it working immediately."""
+    import json as _json  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
     from rich.prompt import Prompt  # noqa: PLC0415
+    from rich.syntax import Syntax  # noqa: PLC0415
 
     installed = _installed_templates()
     addable = _render_role_catalog_numbered(installed)
@@ -227,6 +230,78 @@ def _pick_and_add_role_agent(bin_name: str) -> None:
     template = addable[int(choice) - 1]
     console.print(f"\n[dim]$ {bin_name} add {template}[/dim]")
     subprocess.run([bin_name, "add", template], check=False)
+
+    # After the agent is added, offer a quick sample run so the operator
+    # can see it working before moving on.
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        return
+    agent_dir = _default_target(project_root) / template
+    default_payload = _first_dataset_input(agent_dir)
+
+    console.print(
+        f"\n[bold]Try it now[/bold] [dim](edit or press Enter to use the dataset example)[/dim]"
+    )
+    try:
+        user_input = Prompt.ask("  Input", default=default_payload, show_default=True)
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    rel = agent_dir.relative_to(project_root)
+    cmd = [bin_name, "run", f"./{rel}", "--mock", user_input]
+    console.print(f"\n[dim]$ {' '.join(cmd)}[/dim]")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    raw_stdout = result.stdout.strip()
+    raw_stderr = result.stderr.strip()
+    try:
+        data = _json.loads(raw_stdout)
+        status = data.get("status", "unknown")
+        output_data = data.get("data", {})
+        metrics = data.get("metrics", {})
+        run_id = data.get("run_id", "")
+        latency = metrics.get("latency_ms")
+        cost = metrics.get("cost_usd")
+
+        status_color = "green" if status == "success" else "red"
+        status_badge = f"[{status_color}]{status}[/{status_color}]"
+        body_parts: list[str] = [f"[bold]Status:[/bold] {status_badge}"]
+        if run_id:
+            body_parts.append(f"[bold]Run ID:[/bold] [dim]{run_id[:8]}…[/dim]")
+        if latency is not None:
+            body_parts.append(f"[bold]Latency:[/bold] [dim]{latency} ms[/dim]")
+        if cost is not None:
+            body_parts.append(f"[bold]Cost:[/bold] [dim]${cost:.6f}[/dim]")
+
+        console.print(
+            Panel(
+                "\n".join(body_parts),
+                title=f"[bold]mdk run[/bold] [dim]·[/dim] {template}",
+                title_align="left",
+                border_style=status_color,
+            )
+        )
+        if output_data:
+            console.print("[bold cyan]Output:[/bold cyan]")
+            console.print(
+                Syntax(
+                    _json.dumps(output_data, indent=2),
+                    "json",
+                    theme="monokai",
+                    word_wrap=True,
+                )
+            )
+        elif status != "success" and data.get("error"):
+            err_info = data["error"]
+            console.print(
+                f"[red]Error:[/red] {err_info.get('type', '?')}: "
+                f"{err_info.get('message', '?')}"
+            )
+    except (_json.JSONDecodeError, AttributeError):
+        if raw_stdout:
+            console.print(raw_stdout)
+        if raw_stderr:
+            console.print(f"[dim]{raw_stderr}[/dim]")
 
 
 def _default_target(project_root: Path) -> Path:
@@ -348,34 +423,6 @@ def _render_list(search: str | None = None) -> None:
     elif search:
         console.print(f"[yellow]⚠[/yellow] no role templates match [dim]{search!r}[/dim].")
 
-    # Core tier — minimal templates from the original set. Same
-    # filter logic; less interesting in demos so it renders below.
-    core_table = Table(
-        title="Core templates",
-        title_style="bold",
-        show_header=True,
-        header_style="bold",
-    )
-    core_table.add_column("Name", style="cyan", no_wrap=True)
-    core_table.add_column("What it does")
-    core_table.add_column("Highlights", style="dim")
-
-    core_names = sorted(set(TEMPLATES.keys()) - _ROLE_TEMPLATES)
-    core_rows_added = 0
-    for name in core_names:
-        if search and not _matches_search(name, search):
-            continue
-        desc, feature = _ROLE_DESCRIPTIONS.get(name, ("", ""))
-        # Same installed-marker treatment as the role tier.
-        tag = " [green]✓ installed[/green]" if name in installed else ""
-        core_table.add_row(f"{name}{tag}", desc, feature)
-        core_rows_added += 1
-
-    console.print()
-    if core_rows_added:
-        console.print(core_table)
-    elif search:
-        console.print(f"[dim]no core templates match {search!r}.[/dim]")
     console.print()
     console.print(
         "[dim]Use: [bold]mdk add <name>[/bold] inside a project. "
@@ -545,6 +592,11 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
     # `mdk add context <name>` — create a shared context file in the
     # current project. Intercepted before template validation so the
     # word "context" doesn't get flagged as an unknown template name.
+    # `mdk add list` — alias for `mdk add --list` so both spellings work.
+    if args and args[0] == "list":
+        _render_list(search=search)
+        return
+
     if args and args[0] == "context":
         _do_add_context(args[1:])
         return
