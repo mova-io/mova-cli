@@ -15,6 +15,7 @@ process.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import typer
@@ -130,6 +131,7 @@ async def _run_serve(
     """
     storage = build_storage()
     await storage.init()
+    await _seed_bootstrap_key(storage)
 
     agents = scan_agents(agents_path)
     if not agents:
@@ -187,3 +189,51 @@ async def _run_serve(
         await server.serve()
     finally:
         await storage.close()
+
+
+async def _seed_bootstrap_key(storage: object) -> None:
+    """Seed a known API key on startup if ``MOVATE_SEED_API_KEY`` is set.
+
+    Solves the chicken-and-egg bootstrap problem on fresh deployments
+    where no keys exist in the DB yet (e.g. ephemeral SQLite in a
+    container that has no persistent volume, or a Postgres DB on first
+    boot). The key is inserted exactly once; subsequent restarts find
+    it already present and skip.
+
+    The env var value must be a valid movate key string:
+        mvt_<env>_<tenant_prefix>_<key_id>_<secret>
+    """
+    seed_key = os.environ.get("MOVATE_SEED_API_KEY", "").strip()
+    if not seed_key:
+        return
+
+    from movate.core.auth import ApiKeyParseError, hash_secret, parse_api_key  # noqa: PLC0415
+    from movate.core.models import ApiKeyRecord  # noqa: PLC0415
+
+    try:
+        parsed = parse_api_key(seed_key)
+    except ApiKeyParseError as exc:
+        err.print(f"[yellow]⚠[/yellow] MOVATE_SEED_API_KEY is malformed, skipping: {exc}")
+        return
+
+    existing = await storage.get_api_key(parsed.key_id)  # type: ignore[attr-defined]
+    if existing is not None:
+        err.print(f"[dim]bootstrap key {parsed.key_id} already present — skipping seed[/dim]")
+        return
+
+    import base64  # noqa: PLC0415
+    import secrets as _secrets  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    salt = base64.urlsafe_b64encode(_secrets.token_bytes(16)).rstrip(b"=").decode("ascii")
+    record = ApiKeyRecord(
+        key_id=parsed.key_id,
+        tenant_id=parsed.tenant_prefix,
+        env=parsed.env,
+        secret_hash=hash_secret(parsed.secret, salt),
+        salt=salt,
+        label="seed",
+        created_at=datetime.now(UTC),
+    )
+    await storage.save_api_key(record)  # type: ignore[attr-defined]
+    err.print(f"[dim]seeded bootstrap key {parsed.key_id} from MOVATE_SEED_API_KEY[/dim]")
