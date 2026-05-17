@@ -947,14 +947,184 @@ def save_runtime_key(
     store.set(env_var, key)
     success(f"saved as [cyan]{env_var}[/cyan] in [cyan]{store.path}[/cyan].")
     hint(
-        f"[dim]Future shells autoload {env_var} automatically. "
-        f"For the current shell, run: [bold]export {env_var}={env_var}_VALUE[/bold] "
-        f"or open a new terminal.[/dim]"
+        f"[dim]Future shells autoload {env_var} automatically. For the "
+        f"current shell, run: [bold]export {env_var}=$(grep '^{env_var}=' "
+        f"{store.path} | cut -d= -f2-)[/bold] or open a new terminal.[/dim]"
     )
 
 
+class RefreshRuntimeKeyError(Exception):
+    """Raised by :func:`refresh_runtime_key_inline` on any failure.
+
+    Carries a single operator-actionable message in ``args[0]`` plus
+    optional ``stdout``/``stderr`` strings captured from the underlying
+    ``az containerapp exec`` call. Callers that want to treat refresh
+    failures as a soft fall-through (e.g. ``mdk deploy``'s 401 auto-
+    recovery) catch this rather than ``typer.Exit``; interactive
+    callers can surface the captured outputs for triage.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def refresh_runtime_key_inline(  # noqa: PLR0912 — orchestrator; az shell-out + parse + save reads clearer flat
+    target: str,
+    *,
+    tenant: str = "demo",
+    env: str = "live",
+    label: str | None = None,
+    container_app: str | None = None,
+) -> tuple[str, str]:
+    """Mint + save a fresh runtime bearer programmatically.
+
+    Same mechanics as the ``mdk auth refresh-runtime-key`` typer command,
+    but returns ``(minted_key, env_var)`` instead of printing and exits
+    nothing. Callers in non-interactive contexts (auto-recovery from
+    ``mdk deploy``'s 401 handler) use this to avoid shelling out to
+    another ``mdk`` process.
+
+    Returns:
+        ``(minted_key, env_var)`` — the new ``mvt_*`` bearer and the
+        credentials-store env var name where it was saved.
+
+    Raises:
+        RefreshRuntimeKeyError: on any failure, with an
+            operator-actionable message in ``args[0]``.
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        raise RefreshRuntimeKeyError(str(exc)) from None
+    if target not in cfg.targets:
+        registered = sorted(cfg.targets) or ["<none>"]
+        raise RefreshRuntimeKeyError(
+            f"unknown target {target!r}. Registered: "
+            f"{', '.join(registered)}. Add one with `mdk config add-target`."
+        )
+    target_cfg = cfg.targets[target]
+    if not target_cfg.azure_resource_group:
+        raise RefreshRuntimeKeyError(
+            f"target {target!r} has no `azure_resource_group` configured. "
+            f"Re-register with `mdk config add-target` + the Azure fields, "
+            f"OR mint the key manually inside the Container App + use "
+            f"`mdk auth save-runtime-key`."
+        )
+
+    if container_app is None:
+        if not target_cfg.azure_env:
+            raise RefreshRuntimeKeyError(
+                f"target {target!r} has no `azure_env` configured. "
+                f"Pass --container-app <name> explicitly, or re-register "
+                f"the target with `--azure-env dev|staging|prod`."
+            )
+        container_app = f"movate-{target_cfg.azure_env}-api"
+
+    if shutil.which("az") is None:
+        raise RefreshRuntimeKeyError(
+            "`az` (Azure CLI) not found on PATH. Install it from "
+            "https://learn.microsoft.com/cli/azure/install-azure-cli, "
+            "OR mint the key manually inside the Container App + use "
+            "`mdk auth save-runtime-key` to persist it."
+        )
+
+    if target_cfg.azure_subscription:
+        try:
+            subprocess.run(
+                ["az", "account", "set", "--subscription", target_cfg.azure_subscription],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RefreshRuntimeKeyError(
+                f"az account set failed: {exc.stderr.decode(errors='replace').strip()[:200]}"
+            ) from None
+
+    inner_cmd_parts = [
+        "mdk",
+        "auth",
+        "create-key",
+        "--tenant-id",
+        tenant,
+        "--env",
+        env,
+    ]
+    if label:
+        inner_cmd_parts.extend(["--label", label])
+    inner_cmd_parts.append("--quiet")
+    inner_cmd = " ".join(inner_cmd_parts)
+
+    try:
+        result = subprocess.run(
+            [
+                "az",
+                "containerapp",
+                "exec",
+                "-g",
+                target_cfg.azure_resource_group,
+                "-n",
+                container_app,
+                "--command",
+                inner_cmd,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RefreshRuntimeKeyError(f"command not found: az ({exc})") from None
+
+    if result.returncode != 0:
+        raise RefreshRuntimeKeyError(
+            f"az containerapp exec failed (exit {result.returncode}): "
+            f"{result.stderr.strip()[:400]} — confirm the Container App "
+            f"{container_app!r} exists in resource group "
+            f"{target_cfg.azure_resource_group!r}, and that you have "
+            f"`Container Apps Contributor` or higher on it."
+        )
+
+    minted_key = _extract_mvt_key(result.stdout + "\n" + result.stderr)
+    if minted_key is None:
+        raise RefreshRuntimeKeyError(
+            "could not find a `mvt_*` key in the az containerapp exec output. "
+            "Run the command manually to debug, then use "
+            f"`mdk auth save-runtime-key {target} <key>` directly: "
+            f"az containerapp exec -g {target_cfg.azure_resource_group} "
+            f"-n {container_app} --command {inner_cmd!r}",
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+    env_var = target_cfg.key_env
+    if not env_var:
+        raise RefreshRuntimeKeyError(
+            f"target {target!r} has no `key_env` configured. Re-register "
+            f"the target with `--key-env MDK_{target.upper()}_KEY`."
+        )
+    store = CredentialsStore()
+    store.set(env_var, minted_key)
+    return minted_key, env_var
+
+
 @auth_app.command("refresh-runtime-key")
-def refresh_runtime_key(  # noqa: PLR0912 — orchestrator; az shell-out + parse + save reads clearer flat
+def refresh_runtime_key(
     target: str = typer.Argument(
         ...,
         help="Deployment target name (from `mdk config list-targets`).",
@@ -988,11 +1158,16 @@ def refresh_runtime_key(  # noqa: PLR0912 — orchestrator; az shell-out + parse
 ) -> None:
     """Mint + save a fresh runtime bearer in one step.
 
-    The two-step `create-key` → `save-runtime-key` flow has an
-    annoying failure mode: when the runtime is redeployed (or its
-    revision is recycled) the JWT secret rotates, which invalidates
-    every previously-minted key. The operator's saved bearer starts
-    returning 401 and they have to manually:
+    Recovery path for the "my saved key returns 401 after a deploy"
+    failure mode. The auth design is opaque token + per-key
+    `secret_hash + salt` lookup against the runtime's storage (NOT
+    JWT signing — there is no shared signing secret to rotate). When
+    a Container App revision recycles and the runtime falls back to
+    a non-durable storage backend (SQLite-in-pod when MOVATE_DB_URL
+    isn't honored), the ApiKeyRecord table vanishes with the pod's
+    filesystem and every previously-minted key returns 401.
+
+    Without this command, the operator has to manually:
 
     1. Find the right subscription / resource group / Container App.
     2. Run `az containerapp exec ... mdk auth create-key`.
@@ -1005,6 +1180,11 @@ def refresh_runtime_key(  # noqa: PLR0912 — orchestrator; az shell-out + parse
     parses the printed `mvt_...` value, and writes it to
     `~/.movate/credentials` for autoload across shells.
 
+    Long-term fix is at the storage layer: `mdk doctor target <name>`
+    surfaces whether the runtime is on durable Postgres or
+    ephemeral SQLite. If it's the latter, recoveries like this one
+    will be needed on every revision recycle.
+
     [bold]Examples:[/bold]
 
       [dim]# Recover from 401 after a deploy:[/dim]
@@ -1013,169 +1193,38 @@ def refresh_runtime_key(  # noqa: PLR0912 — orchestrator; az shell-out + parse
       [dim]# Mint for a non-default tenant:[/dim]
       $ mdk auth refresh-runtime-key prod --tenant customer-acme --env live
     """
-    import shutil  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
-
-    from movate.core.user_config import (  # noqa: PLC0415
-        UserConfigError,
-        load_user_config,
-    )
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
-    # Resolve target → URL + key_env + Azure addressing.
     try:
-        cfg = load_user_config()
-    except UserConfigError as exc:
+        _minted_key, env_var = refresh_runtime_key_inline(
+            target,
+            tenant=tenant,
+            env=env,
+            label=label,
+            container_app=container_app,
+        )
+    except RefreshRuntimeKeyError as exc:
         error(str(exc))
-        raise typer.Exit(code=2) from None
-    if target not in cfg.targets:
-        registered = sorted(cfg.targets) or ["<none>"]
-        error(
-            f"unknown target {target!r}. Registered: "
-            f"{', '.join(registered)}. Add one with `mdk config add-target`."
-        )
-        raise typer.Exit(code=2)
-    target_cfg = cfg.targets[target]
-    if not target_cfg.azure_resource_group:
-        error(
-            f"target {target!r} has no `azure_resource_group` configured. "
-            f"Re-register with `mdk config add-target` + the Azure fields, "
-            f"OR mint the key manually inside the Container App + use "
-            f"`mdk auth save-runtime-key`."
-        )
-        raise typer.Exit(code=2)
-
-    # Derive the Container App name. The Bicep template names it
-    # `movate-{env}-api`. Operators can override via --container-app
-    # for non-standard naming.
-    if container_app is None:
-        if not target_cfg.azure_env:
-            error(
-                f"target {target!r} has no `azure_env` configured. "
-                f"Pass --container-app <name> explicitly, or re-register "
-                f"the target with `--azure-env dev|staging|prod`."
-            )
-            raise typer.Exit(code=2)
-        container_app = f"movate-{target_cfg.azure_env}-api"
-
-    # Check `az` is available before we try to use it. Same defensive
-    # pattern deploy.py uses.
-    if shutil.which("az") is None:
-        error(
-            "`az` (Azure CLI) not found on PATH. Install it from "
-            "https://learn.microsoft.com/cli/azure/install-azure-cli, "
-            "OR mint the key manually inside the Container App + use "
-            "`mdk auth save-runtime-key` to persist it."
-        )
-        raise typer.Exit(code=2)
-
-    # If the target has a pinned subscription, switch to it BEFORE the
-    # exec call. Operators with multiple subscriptions hit this trap
-    # constantly otherwise — the exec lands in the wrong tenant.
-    if target_cfg.azure_subscription:
-        hint(f"[dim]→ az account set --subscription {target_cfg.azure_subscription[:8]}…[/dim]")
-        try:
-            subprocess.run(
-                ["az", "account", "set", "--subscription", target_cfg.azure_subscription],
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            error(f"az account set failed: {exc.stderr.decode(errors='replace').strip()[:200]}")
-            raise typer.Exit(code=2) from None
-
-    # Build the inner mdk command run inside the Container App.
-    # --quiet keeps key_id on stdout + the full secret on stderr — we
-    # parse the secret out below.
-    inner_cmd_parts = [
-        "mdk",
-        "auth",
-        "create-key",
-        "--tenant-id",
-        tenant,
-        "--env",
-        env,
-    ]
-    if label:
-        inner_cmd_parts.extend(["--label", label])
-    inner_cmd_parts.append("--quiet")
-    inner_cmd = " ".join(inner_cmd_parts)
-
-    hint(
-        f"[dim]→ az containerapp exec -g {target_cfg.azure_resource_group} "
-        f"-n {container_app} --command {inner_cmd!r}[/dim]"
-    )
-
-    try:
-        result = subprocess.run(
-            [
-                "az",
-                "containerapp",
-                "exec",
-                "-g",
-                target_cfg.azure_resource_group,
-                "-n",
-                container_app,
-                "--command",
-                inner_cmd,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        error(f"command not found: az ({exc})")
+        # Dump the captured subprocess output when available — only
+        # populated for the "az exec returned 0 but no mvt_ key in
+        # output" path, where the raw streams are essential for
+        # operator triage.
+        if exc.stdout.strip():
+            err.print(f"[dim]stdout (truncated):[/dim]\n{exc.stdout[:500]}")
+        if exc.stderr.strip():
+            err.print(f"[dim]stderr (truncated):[/dim]\n{exc.stderr[:500]}")
         raise typer.Exit(code=2) from None
 
-    if result.returncode != 0:
-        error(
-            f"az containerapp exec failed (exit {result.returncode}):\n"
-            f"  stderr: {result.stderr.strip()[:400]}\n"
-            f"  hint: confirm the Container App {container_app!r} exists in "
-            f"resource group {target_cfg.azure_resource_group!r}, and that "
-            f"you have `Container Apps Contributor` or higher on it."
-        )
-        raise typer.Exit(code=2)
-
-    # Parse the minted key out of stderr (--quiet puts the secret on
-    # stderr + key_id on stdout). Container Apps' `exec` mixes the two
-    # streams in some Azure CLI versions — be defensive: scan BOTH
-    # streams for the `mvt_<env>_...` prefix.
-    minted_key = _extract_mvt_key(result.stdout + "\n" + result.stderr)
-    if minted_key is None:
-        error(
-            "could not find a `mvt_*` key in the az containerapp exec output. "
-            "Run the command manually to see the raw output, then use "
-            "`mdk auth save-runtime-key <target> <key>` directly:\n"
-            f"  az containerapp exec -g {target_cfg.azure_resource_group} "
-            f"-n {container_app} --command {inner_cmd!r}"
-        )
-        # Surface the captured output so the operator can debug.
-        if result.stdout.strip():
-            err.print(f"[dim]stdout (truncated):[/dim]\n{result.stdout[:500]}")
-        if result.stderr.strip():
-            err.print(f"[dim]stderr (truncated):[/dim]\n{result.stderr[:500]}")
-        raise typer.Exit(code=2)
-
-    # Save via the same code path as `save-runtime-key`.
-    env_var = target_cfg.key_env
-    if not env_var:
-        error(
-            f"target {target!r} has no `key_env` configured. Re-register "
-            f"the target with `--key-env MDK_{target.upper()}_KEY`."
-        )
-        raise typer.Exit(code=2)
-    store = CredentialsStore()
-    store.set(env_var, minted_key)
+    store_path = CredentialsStore().path
     success(
         f"minted + saved fresh runtime key for [bold]{target}[/bold] "
         f"(tenant={tenant}, env={env}) → [cyan]{env_var}[/cyan] in "
-        f"[cyan]{store.path}[/cyan]."
+        f"[cyan]{store_path}[/cyan]."
     )
     hint(
         f"[dim]Future shells autoload {env_var} automatically. For the "
         f"current shell, run: [bold]export {env_var}=$(grep '^{env_var}=' "
-        f"{store.path} | cut -d= -f2-)[/bold] or open a new terminal. "
+        f"{store_path} | cut -d= -f2-)[/bold] or open a new terminal. "
         f"Then retry [bold]mdk deploy --target {target}[/bold].[/dim]"
     )
 

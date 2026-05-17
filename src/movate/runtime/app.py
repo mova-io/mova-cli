@@ -590,11 +590,23 @@ def build_app(
             # class name + short message is operator-actionable.
             checks["storage"] = f"{type(exc).__name__}: {str(exc)[:120]}"
 
+        # Surface which backend was selected + whether it's durable
+        # across container restarts. Drives `mdk doctor target` and
+        # makes "Postgres intended, SQLite actually picked" debuggable
+        # from a single HTTP call.
+        from movate.storage import selected_backend  # noqa: PLC0415
+
+        backend_info = selected_backend()
+        storage_backend = backend_info[0] if backend_info else None
+        storage_durable = backend_info[2] if backend_info else None
+
         all_ok = all(v == "ok" for v in checks.values())
         body = ReadyView(
             status="ready" if all_ok else "not_ready",
             version=movate.__version__,
             checks=checks,
+            storage_backend=storage_backend,
+            storage_durable=storage_durable,
         )
         return JSONResponse(
             status_code=200 if all_ok else 503,

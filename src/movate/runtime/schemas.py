@@ -197,6 +197,19 @@ class ReadyView(BaseModel):
     values are ``"ok"`` or a short failure reason. ACA only cares
     about the HTTP status; the map is for human triage."""
 
+    storage_backend: str | None = None
+    """``"postgres"`` or ``"sqlite"`` — which provider :func:`build_storage`
+    selected from environment. ``None`` only if storage isn't initialized
+    yet (would be a bug). Drives ``mdk doctor target``'s durability check
+    and surfaces misconfigured Container Apps (Postgres intended, SQLite
+    actually picked) without needing pod log access."""
+
+    storage_durable: bool | None = None
+    """``True`` if the selected backend survives container restarts
+    (Postgres), ``False`` if it doesn't (SQLite in a pod filesystem).
+    A ``False`` here on a production deploy means every revision recycle
+    wipes the ApiKeyRecord table → operators lose their saved keys."""
+
 
 class AgentView(BaseModel):
     """One entry in the registry response.

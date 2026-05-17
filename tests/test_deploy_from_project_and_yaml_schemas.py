@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from movate.cli import deploy as deploy_mod
 from movate.cli.deploy import _resolve_deploy_mode
 from movate.cli.main import app
 from movate.core.loader import AgentLoadError, load_agent
@@ -207,6 +208,126 @@ def test_deploy_mode_invalid_value_errors(tmp_path: Path, monkeypatch: pytest.Mo
     assert result.exit_code == 2
     combined = result.stdout + result.stderr
     assert "must be" in combined.lower() and "bogus" in combined
+
+
+# ---------------------------------------------------------------------------
+# A — 401 auto-recovery: deploy mints a fresh key inside the pod + retries
+# ---------------------------------------------------------------------------
+
+
+def _scaffold_project_with_one_agent_and_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Init a project, add one agent, register the `fake` target.
+
+    Shared scaffold for the auto-recovery tests below. Caller is
+    expected to ``monkeypatch.chdir(tmp_path / "proj")`` afterward.
+    """
+    monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    monkeypatch.chdir(tmp_path / "proj")
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "add-target",
+            "fake",
+            "--url",
+            "https://fake.example.com",
+            "--key-env",
+            "FAKE_KEY",
+            "--azure-subscription",
+            "00000000-0000-0000-0000-000000000000",
+            "--azure-resource-group",
+            "fake-rg",
+            "--azure-acr",
+            "fakeacr",
+            "--azure-env",
+            "dev",
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+
+@pytest.mark.unit
+def test_deploy_agents_401_triggers_auto_recovery_and_retries_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On 401 from the runtime, deploy mints a fresh key inside the
+    Container App and retries the failed agent. The second attempt
+    succeeds and the overall exit code is 0."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
+
+    call_count = {"agent": 0, "refresh": 0}
+
+    def fake_upload_agent(
+        *, client: Any, base_url: str, headers: dict[str, str], agent_dir: Path, project_root: Any
+    ) -> str | None:
+        call_count["agent"] += 1
+        if call_count["agent"] == 1:
+            return deploy_mod._REASON_UNAUTHORIZED
+        # Bearer must have rotated by the second call — assert it.
+        assert headers["Authorization"] == "Bearer mvt_live_fresh_keyid_secret"
+        return None
+
+    def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
+        call_count["refresh"] += 1
+        return "mvt_live_fresh_keyid_secret", "FAKE_KEY"
+
+    monkeypatch.setattr(deploy_mod, "_upload_one_agent_bundle", fake_upload_agent)
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+    assert call_count["agent"] == 2, "expected one initial 401 + one retry"
+    assert call_count["refresh"] == 1, "expected exactly one refresh call"
+    assert "saved bearer rejected" in combined
+    assert "minted fresh key" in combined
+    assert "ok=true" in combined
+
+
+@pytest.mark.unit
+def test_deploy_agents_401_with_no_auto_recover_skips_refresh_and_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--no-auto-recover`` disables the refresh path: a 401 stays a
+    401, the deploy exits non-zero, and the descriptive message
+    points the operator at ``mdk doctor --target`` + manual refresh."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
+
+    call_count = {"agent": 0, "refresh": 0}
+
+    def fake_upload_agent(**_: Any) -> str | None:
+        call_count["agent"] += 1
+        return deploy_mod._REASON_UNAUTHORIZED
+
+    def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
+        call_count["refresh"] += 1
+        return "mvt_live_fresh_keyid_secret", "FAKE_KEY"
+
+    monkeypatch.setattr(deploy_mod, "_upload_one_agent_bundle", fake_upload_agent)
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+
+    result = runner.invoke(
+        app, ["deploy", "--target", "fake", "--no-auto-recover"], env={"COLUMNS": "200"}
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    assert call_count["agent"] == 1, "expected only the initial attempt, no retry"
+    assert call_count["refresh"] == 0, "refresh must not run with --no-auto-recover"
+    assert "saved bearer rejected" not in combined
+    assert "mdk doctor --target fake" in combined
+    assert "mdk auth refresh-runtime-key fake" in combined
 
 
 # ---------------------------------------------------------------------------

@@ -176,6 +176,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
     expires_at    TIMESTAMPTZ,
     scope         TEXT
 );
+-- Idempotent self-healing migrations for tables that pre-date a
+-- column. `CREATE TABLE IF NOT EXISTS` is a no-op when the table is
+-- already there, so any column added after the table was first
+-- created has to be ALTERed in explicitly. Without this block,
+-- upgrading a runtime against a long-lived database surfaces as
+-- `UndefinedColumnError` on the first query that names the new
+-- column (caught live on dev when an older deployment had created
+-- `api_keys` without `expires_at` or `scope`).
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scope TEXT;
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active
     ON api_keys(tenant_id) WHERE revoked_at IS NULL;
 """
@@ -224,12 +234,31 @@ class PostgresProvider:
         self._pool: asyncpg.Pool | None = None
 
     async def init(self) -> None:
-        self._pool = await asyncpg.create_pool(
-            self._dsn,
-            min_size=self._min_size,
-            max_size=self._max_size,
-            init=_init_connection,
-        )
+        # ACA wires the DSN with an empty password slot
+        # (``postgresql://user:@host/db``) and surfaces the actual
+        # password as a separate ``PGPASSWORD`` env var — see the
+        # comment block in
+        # ``infra/azure/modules/containerapp-api.bicep`` next to
+        # MOVATE_DB_URL. asyncpg's documented "fall back to
+        # PGPASSWORD" only fires when the DSN's password component
+        # is MISSING (``user@host``); when it's present-but-empty
+        # (``user:@host``) asyncpg authenticates with the empty
+        # string and the server rejects it as
+        # ``InvalidPasswordError``. We sidestep this by passing
+        # PGPASSWORD as an explicit kwarg — asyncpg uses the kwarg
+        # in preference to the DSN's password component, so the
+        # bicep keeps working with no infra changes.
+        import os  # noqa: PLC0415
+
+        kwargs: dict[str, Any] = {
+            "min_size": self._min_size,
+            "max_size": self._max_size,
+            "init": _init_connection,
+        }
+        env_password = os.environ.get("PGPASSWORD")
+        if env_password:
+            kwargs["password"] = env_password
+        self._pool = await asyncpg.create_pool(self._dsn, **kwargs)
         async with self._pool.acquire() as conn:
             await conn.execute(_SCHEMA)
 

@@ -908,6 +908,7 @@ track each slice; status here mirrors the v0.7 milestone.
 - [ ] **`docs/adr/001-cloud-portability.md`** `[HIGH] [v0.6] [≤2h]` — captures the principle: stay Azure-first today, but every new infrastructure decision must be cloud-portable in principle. Lists what we won't add (Cosmos DB, Azure-only auth, etc). Cheap, prevents future lock-in regret.
 - [ ] **GCP / AWS deployment runbooks** `[MED] [v1.1+] [1w each]` — Terraform modules for AWS (ECS + RDS) and GCP (Cloud Run + CloudSQL). Deferred until a real customer asks. Architecture's already portable; just need the IaC.
 - [ ] **Enterprise governance compliance (SOC2 audit trail)** `[LOW] [v1.1+] [—]` — most building blocks shipped (audit log via failures table, RunRecord, OTel). Formal SOC2 scoping when first enterprise customer asks.
+- [ ] **Asymmetric signing for runtime auth (RS256 / KV-HSM)** `[LOW] [v1.1+] [~1-2w]` — today's auth is opaque token + per-key `secret_hash + salt` in storage (NOT JWT — there's no shared signing secret to rotate). Works fine for single-tenant deployments. When we add agent-to-agent service auth or hosted multi-tenant SaaS, move to RS256 signed by Azure Key Vault HSM with deliberate Key Vault rotation operations, plus a short-lived-access + long-lived-refresh token split. Deferred until the use case actually shows up.
 
 ---
 
