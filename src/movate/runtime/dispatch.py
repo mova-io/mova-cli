@@ -173,7 +173,6 @@ class WorkerDispatch:
         ``GET /api/v1/evals/{eval_id}``.
         """
         from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
-        from movate.providers.mock import MockProvider  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
 
         bundle = self._agents.get(job.target)
@@ -188,9 +187,9 @@ class WorkerDispatch:
         use_mock: bool = self._use_mock_for_eval or bool(cfg.get("mock", False))
 
         if use_mock:
-            from movate.providers.mock import MockProvider as _Mock  # noqa: PLC0415
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
 
-            provider: Any = _Mock()
+            provider: Any = MockProvider()
         else:
             from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
 

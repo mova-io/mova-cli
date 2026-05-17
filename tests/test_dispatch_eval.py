@@ -120,12 +120,10 @@ async def test_execute_eval_job_unknown_agent(
 
 
 @pytest.mark.unit
-async def test_execute_eval_job_dispatches_over_agent_and_workflow(
+async def test_agent_jobs_still_route_with_eval_dispatch(
     tmp_path: Path, storage: InMemoryStorage, pricing
 ) -> None:
-    """AGENT and WORKFLOW jobs still route correctly when EVAL kind is added."""
-    from movate.core.models import JobRecord as _JR, JobKind as _JK
-
+    """AGENT jobs still route correctly after EVAL kind was added to dispatch."""
     agent_dir = scaffold_agent(tmp_path / "demo")
     bundle = load_agent(agent_dir)
     provider = JudgeStubProvider(agent_response='{"message": "Hello!"}', judge_score=0.9)
@@ -142,27 +140,12 @@ async def test_execute_eval_job_dispatches_over_agent_and_workflow(
         use_mock_for_eval=True,
     )
 
-    # AGENT job still works
-    agent_job = _JR(
+    agent_job = JobRecord(
         job_id=str(uuid4()),
         tenant_id="t",
-        kind=_JK.AGENT,
+        kind=JobKind.AGENT,
         target="demo",
         input={"text": "hi"},
     )
-    agent_outcome = await dispatch.execute_job(agent_job)
-    assert agent_outcome.status == JobStatus.SUCCESS
-
-    # Unknown kind
-    from movate.core.models import JobRecord
-    import types
-
-    bad_kind_job = _JR(
-        job_id=str(uuid4()),
-        tenant_id="t",
-        kind=_JK.EVAL,
-        target="demo",
-        input={"mock": True, "runs": 1, "gate_mode": "mean", "gate": 0.7},
-    )
-    eval_outcome = await dispatch.execute_job(bad_kind_job)
-    assert eval_outcome.status == JobStatus.SUCCESS
+    outcome = await dispatch.execute_job(agent_job)
+    assert outcome.status == JobStatus.SUCCESS

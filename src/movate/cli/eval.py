@@ -289,7 +289,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             )
         else:
             err_console.print(
-                "[red]✗[/red] multi-model panel (--judge-model × 2+) requires "
+                "[red]✗[/red] multi-model panel (--judge-model x 2+) requires "
                 "the panel feature — upgrade to movate-cli v0.8 or later."
             )
             raise typer.Exit(code=2)
@@ -1315,7 +1315,7 @@ def _emit_table(
     if summary.judge_provider:
         # Panel mode: judge_provider is "a+b+c" — truncate for display
         jp = summary.judge_provider
-        display_jp = jp if len(jp) <= 60 else jp[:57] + "…"
+        display_jp = jp if len(jp) <= 60 else jp[:57] + "…"  # noqa: PLR2004
         if "+" in jp:
             judges = jp.split("+")
             display_jp = f"{judges[0]} +{len(judges) - 1} more"
