@@ -15,13 +15,13 @@ Also verifies that:
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from movate.core.prompt_linter import LintIssue, lint_prompt, _skill_output_var_name
-
+from movate.core.prompt_linter import LintIssue, _skill_output_var_name, lint_prompt
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -170,7 +170,8 @@ class TestSkillOutputRefMismatch:
         skill_a = _make_skill("searcher", {"result": {}})
         skill_b = _make_skill("formatter", {"html": {}})
         bundle = _make_bundle(
-            "{{ searcher_output.result }} {{ formatter_output.bad_field }}", skills=[skill_a, skill_b]
+            "{{ searcher_output.result }} {{ formatter_output.bad_field }}",
+            skills=[skill_a, skill_b],
         )
         issues = [i for i in lint_prompt(bundle) if i.code == "SKILL_OUTPUT_REF_MISMATCH"]
         assert len(issues) == 1
@@ -193,7 +194,6 @@ class TestSkillOutputRefMismatch:
 def test_rag_qa_scaffold_clean(tmp_path: Path) -> None:
     """The rag-qa template's prompt does not use <skill>_output vars at
     all — so the rule should not fire, even with web-search skill present."""
-    from pathlib import Path  # noqa: PLC0415 — re-import for fixture scope
 
     from movate.core.loader import load_agent  # noqa: PLC0415
     from movate.testing import scaffold_agent  # noqa: PLC0415

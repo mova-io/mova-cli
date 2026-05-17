@@ -64,8 +64,10 @@ class TestKnowledgeList:
     ) -> None:
         proj = _project(tmp_path)
         _write_corpus(proj, [
-            {"id": "KB-1", "title": "Login fails", "tags": ["auth"], "resolution": "Reset password"},
-            {"id": "KB-2", "title": "Slow query", "tags": ["db", "perf"], "resolution": "Add index"},
+            {"id": "KB-1", "title": "Login fails", "tags": ["auth"],
+             "resolution": "Reset password"},
+            {"id": "KB-2", "title": "Slow query", "tags": ["db", "perf"],
+             "resolution": "Add index"},
         ])
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list"])
@@ -80,7 +82,8 @@ class TestKnowledgeList:
     ) -> None:
         proj = _project(tmp_path)
         _write_corpus(proj, [
-            {"id": "KB-3", "title": "Multi tag", "tags": ["billing", "refunds"], "resolution": "Fix"},
+            {"id": "KB-3", "title": "Multi tag", "tags": ["billing", "refunds"],
+             "resolution": "Fix"},
         ])
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "list"])
@@ -182,8 +185,10 @@ class TestDuplicateKBId:
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(
             json.dumps([
-                {"id": "DUP-001", "title": "First", "tags": [], "symptom": "", "resolution": "Fix A"},
-                {"id": "DUP-001", "title": "Dupe", "tags": [], "symptom": "", "resolution": "Fix B"},
+                {"id": "DUP-001", "title": "First", "tags": [],
+                 "symptom": "", "resolution": "Fix A"},
+                {"id": "DUP-001", "title": "Dupe", "tags": [],
+                 "symptom": "", "resolution": "Fix B"},
             ])
         )
         result = runner.invoke(

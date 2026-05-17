@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from movate.cli.eval_gen_cmd import _mode_system_prompt, _VALID_MODES
+from movate.cli.eval_gen_cmd import _VALID_MODES, _mode_system_prompt
 from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)

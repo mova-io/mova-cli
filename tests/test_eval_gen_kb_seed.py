@@ -26,7 +26,6 @@ runner = CliRunner(mix_stderr=False)
 
 def _make_bundle(tmp_path: Path, *, has_kb_skill: bool = True) -> object:
     """Build a minimal AgentBundle-like object for unit tests."""
-    from movate.cli.main import app  # noqa: PLC0415  — ensure app registered
 
     monkeypatch_path = tmp_path / "proj"
     monkeypatch_path.mkdir(exist_ok=True)
@@ -197,8 +196,10 @@ class TestEvalGenKbSeedIntegration:
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
         (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "title": "Auth error", "symptom": "Cannot log in", "resolution": "reset"},
-            {"id": "2", "title": "Slow API", "symptom": "Requests timing out", "resolution": "cache"},
+            {"id": "1", "title": "Auth error", "symptom": "Cannot log in",
+             "resolution": "reset"},
+            {"id": "2", "title": "Slow API", "symptom": "Requests timing out",
+             "resolution": "cache"},
         ]))
         result = runner.invoke(
             app,

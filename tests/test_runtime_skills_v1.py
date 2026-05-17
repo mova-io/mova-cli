@@ -303,11 +303,19 @@ skills:
             ("prompt", ("prompt.md", prompt, "text/markdown")),
             (
                 "input_schema",
-                ("input.json", b'{"type":"object","properties":{"query":{"type":"string"}}}', "application/json"),
+                (
+                    "input.json",
+                    b'{"type":"object","properties":{"query":{"type":"string"}}}',
+                    "application/json",
+                ),
             ),
             (
                 "output_schema",
-                ("output.json", b'{"type":"object","properties":{"answer":{"type":"string"}}}', "application/json"),
+                (
+                    "output.json",
+                    b'{"type":"object","properties":{"answer":{"type":"string"}}}',
+                    "application/json",
+                ),
             ),
         ],
         headers=auth_header,

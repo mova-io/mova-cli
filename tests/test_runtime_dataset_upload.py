@@ -32,7 +32,6 @@ from movate.core.auth import ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
-
 # ---------------------------------------------------------------------------
 # Fixtures  (mirror test_runtime_agents_v1.py so tests stay self-contained)
 # ---------------------------------------------------------------------------
