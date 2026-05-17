@@ -1,6 +1,6 @@
 # ADR 008 — Workflow-level evals
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-05-16
 **Deciders:** Engineering
 **Context window:** v0.8 (post-GA polish, Item 16)
