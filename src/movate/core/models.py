@@ -1014,6 +1014,21 @@ class AgentSpec(BaseModel):
         ),
     )
 
+    knowledge: str | None = Field(
+        default=None,
+        description=(
+            "Path (relative to the agent dir) to a `knowledge.yaml` "
+            "declaring a retriever + corpus this agent can query. When "
+            "set, the loader resolves the file into a `KnowledgeConfig`, "
+            "builds the configured retriever, and stashes it on the "
+            "loaded `AgentBundle` as `bundle.retriever`. v0.7 ships "
+            "BM25 + substring in-memory retrievers; v0.8 will add "
+            "embedding backends (pgvector / Azure AI Search) using the "
+            "same interface — agents won't need to migrate. "
+            "Omit (the default) for agents that don't need RAG."
+        ),
+    )
+
     @field_validator("name")
     @classmethod
     def _validate_name(cls, v: str) -> str:

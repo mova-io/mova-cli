@@ -419,6 +419,17 @@ mdk pricing --provider openai
 mdk pricing --output json
 ```
 
+### `mdk knowledge query <q>` — RAG retrieval over a corpus
+
+```bash
+mdk knowledge query "billing duplicate charge"
+mdk knowledge query "login fails" --retriever substring --top-k 3
+mdk knowledge query "shipping" --json                          # for scripts
+mdk knowledge query "x" --body-field question --body-field answer
+```
+
+Wraps the v0.7 in-memory retrievers (BM25 default + substring baseline) the same way an agent's RAG retrieval will at runtime. Declare a knowledge source on an agent via `agent.yaml: knowledge: ./knowledge.yaml` and the loader builds the configured retriever onto `bundle.retriever`. v0.8 will swap in pgvector / Azure AI Search behind the same interface.
+
 ---
 
 ## Snapshots, rollback, audit
@@ -539,14 +550,36 @@ mdk policy diff new-policy.yaml           # dry-run compare
 
 ### `mdk auth <verb>` — runtime API keys
 
+Per-tenant key management (operator + admin scoped):
+
 ```bash
 mdk auth create-key --tenant-id acme --env live --label ci-deployer
-mdk auth list-keys
+mdk auth list-keys                          # local storage
+mdk auth list-keys --target dev             # deployed runtime (HTTP)
 mdk auth list-keys --include-revoked
 mdk auth revoke-key key_abc12345
 ```
 
 Keys are `mvt_<env>_<tenant>_<keyid>_<secret>`. The secret is shown ONCE on create — there's no recovery.
+
+Per-target bearer lifecycle (the credentials the CLI uses against a deployed runtime):
+
+```bash
+# One-time bootstrap on a fresh environment — mints + uploads to KV
+# + saves locally. Usually run via `mdk infra apply` (chained
+# automatically); standalone form documented for re-bootstrap.
+mdk auth bootstrap-seed dev --keyvault movate-dev-kv-mvt
+
+# Recovery flows when local creds are stale or empty:
+mdk auth pull-runtime-key dev --keyvault movate-dev-kv-mvt   # KV → local
+mdk auth refresh-runtime-key dev                              # mint inside pod via az exec
+
+# Manual save (rarely needed — prefer the two above):
+mdk auth save-runtime-key dev "$KEY"
+echo "$KEY" | mdk auth save-runtime-key dev -                  # stdin (no shell history)
+```
+
+`mdk doctor --target dev` includes an `auth roundtrip` row that surfaces 401 BEFORE any deploy attempt, with the matching recovery command in the failure message.
 
 ### `mdk tenants <verb>` — operator tenant management
 
@@ -582,15 +615,26 @@ mdk worker --agents-path ./agents --workflows-path ./workflows
 
 Claim-next-job loop. Run alongside `mdk serve`; horizontally scale by booting more workers.
 
+### `mdk infra apply` — bootstrap Azure infrastructure
+
+```bash
+mdk infra apply dev --keyvault movate-dev-kv-mvt          # full bootstrap
+mdk infra apply dev --keyvault movate-dev-kv-mvt --dry-run
+mdk infra apply dev --no-seed                              # re-apply infra only
+```
+
+Wraps `az deployment group create` against `infra/azure/main.bicep` and auto-chains into `mdk auth bootstrap-seed` so a fresh environment becomes one command. Idempotent — re-running on an already-bootstrapped env detects the existing seed and skips. The summary line `mdk_infra_summary: target=… seeded=… ok=…` is greppable for CI.
+
 ### `mdk deploy` — push to Azure Container Apps
 
 ```bash
 mdk deploy --target prod
 mdk deploy --target prod --image-tag v1.2.3 --no-wait
 mdk deploy --target staging --skip-build         # reuse last image
+mdk deploy --target prod --no-auto-recover       # disable 401 inline recovery
 ```
 
-Requires a registered target (`mdk config add-target …`) with the Azure fields populated. Builds the container, pushes to ACR, updates the ACA revision. Run `mdk doctor --target prod` first to catch broken auth/permissions before deploy spins.
+Requires a registered target (`mdk config add-target …`) with the Azure fields populated. Builds the container, pushes to ACR, updates the ACA revision. A pre-deploy bearer preflight catches stale tokens before any upload (auto-recovers silently when possible); run `mdk doctor --target prod` first to audit storage durability + auth roundtrip independently.
 
 ### `mdk export oci-bundle <agent>` — portable artifact
 

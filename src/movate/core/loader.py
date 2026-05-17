@@ -92,6 +92,14 @@ class AgentBundle:
     at execution time, joined with a standard markdown separator. Empty
     list = the rendered prompt is exactly the agent's own ``prompt.md``
     (v0.5 behavior, bit-for-bit). See ADR 002.
+
+    ``retriever`` is the configured RAG backend when the agent's
+    ``spec.knowledge`` points at a ``knowledge.yaml``. ``None`` when
+    no knowledge source is declared. The type is ``Any`` to keep
+    :mod:`movate.knowledge` out of the loader's hot-path imports —
+    callers needing the precise type import :class:`movate.knowledge.Retriever`
+    directly. Skills + workflow nodes that want RAG read
+    ``bundle.retriever.query(...)``.
     """
 
     spec: AgentSpec
@@ -104,6 +112,7 @@ class AgentBundle:
     output_validator: Draft202012Validator
     skills: list[Any] = field(default_factory=list)
     contexts: list[tuple[str, str]] = field(default_factory=list)
+    retriever: Any = None
 
     def render_prompt(self, input_data: dict[str, Any]) -> str:
         """Render the prompt template with the ``input.*`` namespace,
@@ -252,6 +261,26 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
         except ContextLoadError as exc:
             raise AgentLoadError(f"contexts resolution failed: {exc}") from exc
 
+    # Resolve declared knowledge source (v0.7 RAG surface, PR #160).
+    # Lazy import so agents without ``spec.knowledge`` don't pay the
+    # cost of pulling in the retriever module + its dependencies.
+    retriever_resolved: Any = None
+    if spec.knowledge:
+        from movate.knowledge import (  # noqa: PLC0415
+            KnowledgeLoadError,
+            build_retriever,
+            load_knowledge_config,
+        )
+
+        knowledge_path = (agent_dir / spec.knowledge).resolve()
+        try:
+            knowledge_cfg = load_knowledge_config(knowledge_path)
+            retriever_resolved = build_retriever(
+                knowledge_cfg, base_dir=knowledge_path.parent
+            )
+        except KnowledgeLoadError as exc:
+            raise AgentLoadError(f"knowledge resolution failed: {exc}") from exc
+
     return AgentBundle(
         spec=spec,
         agent_dir=agent_dir,
@@ -263,6 +292,7 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
         output_validator=Draft202012Validator(output_schema),
         skills=skills_resolved,
         contexts=contexts_resolved,
+        retriever=retriever_resolved,
     )
 
 
