@@ -14,14 +14,10 @@ import pytest
 from movate.core.eval import (
     DIMENSION_WEIGHTS,
     DimensionalMeans,
-    DimensionScore,
-    EvalConfigError,
     EvalEngine,
-    WeightedScorecard,
     _build_weighted_scorecard,
     _compute_consistency,
     _score_required_fields,
-    load_dataset,
 )
 from movate.core.executor import Executor
 from movate.core.loader import load_agent
@@ -34,7 +30,6 @@ from movate.testing import (
     NullTracer,
     scaffold_agent,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -403,12 +403,12 @@ class JudgeStubProvider(BaseLLMProvider):
         body = request.messages[0].content if request.messages else ""
         # Detect any judge/specialist call by looking for the common score-response
         # contract phrase or any specialist evaluator pattern.
-        _JUDGE_SIGNALS = (
+        _judge_signals = (
             "Rubric:",
             "specialist evaluator",
             "Return ONLY a JSON object",
         )
-        if any(sig in body for sig in _JUDGE_SIGNALS):
+        if any(sig in body for sig in _judge_signals):
             self.judge_prompts.append(body)
             return CompletionResponse(
                 text=f'{{"score": {self._judge_score}, "rationale": "stub"}}',
