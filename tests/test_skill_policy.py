@@ -179,6 +179,7 @@ def _write_agent_with_skill(
         f"  entry: {skill_name}.impl:run\n"
         f"side_effects: {skill_side_effects.value}\n"
     )
+    (skill_dir / "impl.py").write_text("async def run(input, ctx): return {}")
 
     agent_dir = project_root / agent_name
     agent_dir.mkdir()
