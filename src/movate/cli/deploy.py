@@ -143,6 +143,16 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "Only applies to agents-mode."
         ),
     ),
+    no_auto_recover: bool = typer.Option(
+        False,
+        "--no-auto-recover",
+        help=(
+            "Disable the 401 auto-recovery path. Default behavior: on a "
+            "401 from the runtime, mint a fresh key inside the Container "
+            "App and retry once. Use this flag in CI or when debugging "
+            "key-storage issues directly."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -196,6 +206,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             target=target,
             dry_run=dry_run,
             diff=diff,
+            auto_recover=not no_auto_recover,
         )
         return
 
@@ -496,6 +507,13 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
 _HTTP_SERVICE_UNAVAILABLE = 503
 
+# Sentinel returned by the upload helpers when the runtime returns 401.
+# The outer `_deploy_agents` loop watches for this value so it can
+# decide whether to auto-recover (mint a fresh key inside the pod and
+# retry) or fall back to the human-readable message rendered by
+# :func:`_render_unauthorized_message`.
+_REASON_UNAUTHORIZED = "__unauthorized__"
+
 
 def _deploy_status(*, target: str | None) -> None:
     """List live agents on the target runtime via GET /api/v1/agents."""
@@ -562,7 +580,13 @@ def _deploy_status(*, target: str | None) -> None:
         )
 
 
-def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> None:  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
+def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per-agent state machine
+    *,
+    target: str | None,
+    dry_run: bool,
+    diff: bool = False,
+    auto_recover: bool = True,
+) -> None:
     """Upload every agent under ``<project>/agents/*/`` to the deployed
     runtime via ``POST /api/v1/agents``.
 
@@ -730,22 +754,95 @@ def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> 
             project_root=project_root,
         )
 
-    uploaded: list[str] = []
-    failed: list[tuple[str, str]] = []  # (name, reason)
+        uploaded: list[str] = []
+        failed: list[tuple[str, str]] = []  # (name, reason)
 
-    with httpx.Client(timeout=httpx.Timeout(60.0)) as client:
-        for agent_dir in agent_dirs:
-            result = _upload_one_agent_bundle(
-                client=client,
-                base_url=base_url,
-                headers=headers,
-                agent_dir=agent_dir,
-                project_root=project_root,
+        with httpx.Client(timeout=httpx.Timeout(60.0)) as client:
+            for agent_dir in agent_dirs:
+                result = _upload_one_agent_bundle(
+                    client=client,
+                    base_url=base_url,
+                    headers=headers,
+                    agent_dir=agent_dir,
+                    project_root=project_root,
+                )
+                if result is None:
+                    uploaded.append(agent_dir.name)
+                else:
+                    failed.append((agent_dir.name, result))
+
+            # Auto-recovery: if anything 401'd, try minting a fresh key
+            # inside the Container App + retry the failing items once.
+            # Only viable when the target has Azure addressing — for
+            # custom remotes / BYO Container Apps, fall through to the
+            # descriptive message.
+            had_unauthorized = (
+                any(r == _REASON_UNAUTHORIZED for _, r in skill_failed)
+                or any(r == _REASON_UNAUTHORIZED for _, r in failed)
             )
-            if result is None:
-                uploaded.append(agent_dir.name)
-            else:
-                failed.append((agent_dir.name, result))
+            azure_addressable = bool(
+                target_cfg.azure_resource_group and target_cfg.azure_env
+            )
+            if had_unauthorized and auto_recover and azure_addressable:
+                err.print(
+                    f"  [yellow]⚠[/yellow] saved bearer rejected — minting a "
+                    f"fresh one inside [bold]{target_name}[/bold] "
+                    f"(this takes ~10s)…"
+                )
+                new_key = _attempt_auto_recovery(target_name=target_name)
+                if new_key is not None:
+                    headers["Authorization"] = f"Bearer {new_key}"
+                    # Retry skills first if any 401'd, then retry agents.
+                    if any(r == _REASON_UNAUTHORIZED for _, r in skill_failed):
+                        re_uploaded, re_failed = _upload_skills(
+                            client=skill_client,
+                            base_url=base_url,
+                            headers=headers,
+                            project_root=project_root,
+                        )
+                        skill_uploaded = re_uploaded
+                        skill_failed = re_failed
+                    retry_failures: list[tuple[str, str]] = []
+                    retry_uploaded: list[str] = []
+                    for agent_dir in agent_dirs:
+                        # Only retry agents whose first attempt 401'd.
+                        prior = next(
+                            (r for n, r in failed if n == agent_dir.name),
+                            None,
+                        )
+                        if prior != _REASON_UNAUTHORIZED:
+                            continue
+                        result = _upload_one_agent_bundle(
+                            client=client,
+                            base_url=base_url,
+                            headers=headers,
+                            agent_dir=agent_dir,
+                            project_root=project_root,
+                        )
+                        if result is None:
+                            retry_uploaded.append(agent_dir.name)
+                        else:
+                            retry_failures.append((agent_dir.name, result))
+                    # Splice retry results into the original lists,
+                    # dropping the prior unauthorized entries.
+                    failed = [
+                        (n, r) for n, r in failed if r != _REASON_UNAUTHORIZED
+                    ] + retry_failures
+                    uploaded = [*uploaded, *retry_uploaded]
+                # If recovery failed, leave the sentinel rows in place
+                # so they get rendered as the descriptive message below.
+
+    # Translate any remaining sentinels into the operator-facing
+    # description so the summary table reads as English, not as the
+    # internal token.
+    failed = [
+        (n, _render_unauthorized_message(headers, target_name) if r == _REASON_UNAUTHORIZED else r)
+        for n, r in failed
+    ]
+    skill_failed = [
+        (n, _render_unauthorized_message(headers, target_name) if r == _REASON_UNAUTHORIZED else r)
+        for n, r in skill_failed
+    ]
 
     # Render summary — skills first (they upload first).
     err.print()
@@ -840,6 +937,57 @@ def _append_kb_files(
             )
 
 
+def _attempt_auto_recovery(*, target_name: str) -> str | None:
+    """Mint + save a fresh runtime key for ``target_name`` inside the pod.
+
+    Wraps :func:`movate.cli.auth.refresh_runtime_key_inline` so the
+    deploy 401 path can recover silently. Returns the new bearer on
+    success, ``None`` on any failure (prints the underlying reason to
+    stderr so the operator can act on it). Never raises — recovery is
+    best-effort.
+    """
+    from movate.cli.auth import (  # noqa: PLC0415
+        RefreshRuntimeKeyError,
+        refresh_runtime_key_inline,
+    )
+
+    try:
+        new_key, env_var = refresh_runtime_key_inline(target_name)
+    except RefreshRuntimeKeyError as exc:
+        err.print(
+            f"  [red]✗[/red] auto-recovery failed: {exc}. "
+            f"Run [bold]mdk auth refresh-runtime-key {target_name}[/bold] "
+            "manually to debug."
+        )
+        return None
+    err.print(
+        f"  [green]✓[/green] minted fresh key → [cyan]{env_var}[/cyan] "
+        "(saved to credentials store; new shells autoload it)."
+    )
+    return new_key
+
+
+def _render_unauthorized_message(headers: dict[str, str], target_name: str) -> str:
+    """Operator-facing description of a 401 the auto-recovery couldn't fix.
+
+    Shows the first 16 chars of the rejected bearer (enough to spot
+    "wrong tenant" / "stale shell rc") without leaking the secret, and
+    points at ``mdk doctor target`` for the underlying storage check
+    that explains WHY a freshly-minted key would also 401.
+    """
+    bearer_header = headers.get("Authorization", "")
+    prefix = bearer_header.removeprefix("Bearer ").strip()[:16]
+    return (
+        f"runtime rejected the bearer token "
+        f"(value starts with: '{prefix}…'). The saved key is not "
+        f"present in the runtime's ApiKeyRecord storage — typically "
+        f"because a revision recycle wiped a non-durable backend "
+        f"(SQLite-in-pod). Run `mdk doctor --target {target_name}` "
+        f"to confirm the storage backend. Manual one-shot recovery: "
+        f"`mdk auth refresh-runtime-key {target_name}`."
+    )
+
+
 def _upload_skills(
     *,
     client: object,  # httpx.Client
@@ -907,7 +1055,7 @@ def _upload_skills(
                 )
             )
         elif resp.status_code == _HTTP_UNAUTHORIZED:
-            failed.append((name, "unauthorized — check bearer token"))
+            failed.append((name, _REASON_UNAUTHORIZED))
         else:
             failed.append((name, f"HTTP {resp.status_code}: {resp.text[:120]}"))
 
@@ -1029,27 +1177,16 @@ def _upload_one_agent_bundle(
         # For now, treat 409 as a soft success (agent IS deployed,
         # just not from this exact bundle) so the demo keeps moving.
         return None
-    # 401 from the runtime means our bearer token was rejected. We
-    # already passed the "env var empty" preflight, so the value is
-    # set but wrong (stale key in shell rc, autoloaded value from a
-    # different tenant, etc). Point the operator at the env var
-    # rather than dumping the raw JSON body — the next thing they'd
-    # type is `echo $MDK_DEV_KEY` anyway.
+    # 401 from the runtime means our bearer token was rejected. The
+    # bearer was set (we passed the env-var-empty preflight) but the
+    # runtime has no matching ApiKeyRecord. The auth path is opaque
+    # token + DB lookup (no JWT signing), so a 401 here means the
+    # record is missing from storage — almost always because the
+    # ApiKeyRecord table didn't survive the last revision recycle
+    # (SQLite-in-pod fallback). Return the sentinel so the outer
+    # loop can decide between auto-recovery and reporting.
     if response.status_code == _HTTP_UNAUTHORIZED:
-        bearer_header = headers.get("Authorization", "")
-        # Show only the first 16 chars of the bearer (after "Bearer ")
-        # so the operator can spot whether it's the right key without
-        # leaking the secret into logs.
-        prefix = bearer_header.removeprefix("Bearer ").strip()[:16]
-        return (
-            f"runtime rejected the bearer token "
-            f"(value starts with: '{prefix}…'). The runtime was likely "
-            f"redeployed (revision rotated → JWT secret rotated → your "
-            f"saved key expired). One-shot recovery: "
-            f"`mdk auth refresh-runtime-key dev` "
-            f"(mints + saves a fresh key in one step). "
-            f"Manual path: `mdk auth save-runtime-key dev <new-key>`."
-        )
+        return _REASON_UNAUTHORIZED
     # Try to surface the runtime's error body verbatim so the
     # operator sees the actual validation failure.
     try:

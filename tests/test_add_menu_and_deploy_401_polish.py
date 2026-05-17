@@ -21,7 +21,11 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from movate.cli.deploy import _upload_one_agent_bundle
+from movate.cli.deploy import (
+    _REASON_UNAUTHORIZED,
+    _render_unauthorized_message,
+    _upload_one_agent_bundle,
+)
 from movate.cli.main import app
 from movate.menu.actions import _first_agent_dataset_input
 
@@ -141,12 +145,11 @@ def test_add_menu_renders_literal_s_bracket() -> None:
 
 
 @pytest.mark.unit
-def test_deploy_401_returns_actionable_hint() -> None:
-    """When the runtime returns 401, the per-agent error string should
-    name `$MDK_DEV_KEY` and point at `mdk auth save-runtime-key` —
-    NOT just dump the raw JSON body."""
-    # Mock httpx.Client.post to return a 401 with the runtime's
-    # canonical auth_required body.
+def test_deploy_401_returns_sentinel_for_outer_recovery() -> None:
+    """When the runtime returns 401, the helper returns the sentinel
+    string ``_REASON_UNAUTHORIZED`` so the outer ``_deploy_agents``
+    loop can decide between auto-recovery and the descriptive failure
+    message. The helper no longer renders the message itself."""
     mock_response = MagicMock()
     mock_response.status_code = 401
     mock_response.json.return_value = {
@@ -155,7 +158,6 @@ def test_deploy_401_returns_actionable_hint() -> None:
     mock_client = MagicMock()
     mock_client.post.return_value = mock_response
 
-    # Need a minimal agent dir on disk for the function to read files.
     with tempfile.TemporaryDirectory() as tmpdir:
         agent_dir = Path(tmpdir) / "ag"
         (agent_dir / "schema").mkdir(parents=True)
@@ -170,7 +172,6 @@ def test_deploy_401_returns_actionable_hint() -> None:
         (agent_dir / "schema" / "output.json").write_text(
             '{"type":"object","properties":{},"additionalProperties":false}'
         )
-        # Make the mock pass `isinstance(client, httpx.Client)` in deploy.py.
         mock_client.__class__ = httpx.Client
 
         result = _upload_one_agent_bundle(
@@ -179,18 +180,25 @@ def test_deploy_401_returns_actionable_hint() -> None:
             headers={"Authorization": "Bearer mvt_live_abcdef0123456789_DEADBEEF_secret"},
             agent_dir=agent_dir,
         )
-    assert result is not None
-    # Hint mentions the actionable recovery command. Post-PR-#111 the
-    # primary suggestion is `refresh-runtime-key` (one-shot mint+save);
-    # `save-runtime-key` is mentioned as the manual fallback.
-    assert "refresh-runtime-key" in result
-    assert "save-runtime-key" in result
-    # Hint surfaces WHY: revision rotation → JWT rotation → key expired.
-    assert "redeployed" in result.lower() or "JWT" in result
-    # Hint shows a TRUNCATED prefix of the bearer (first 16 chars
-    # after `Bearer `; not the whole thing — that would leak the
-    # secret into logs).
-    assert "mvt_live_abcdef0" in result  # `mvt_live_` (9) + `abcdef0` (7) = 16
-    # Full secret NOT echoed.
-    assert "DEADBEEF" not in result
-    assert "_secret" not in result
+    assert result == _REASON_UNAUTHORIZED
+
+
+@pytest.mark.unit
+def test_render_unauthorized_message_redacts_secret_and_points_to_recovery() -> None:
+    """The descriptive 401 message (rendered by the outer loop when
+    auto-recovery is disabled or fails) must surface the actionable
+    commands AND truncate the bearer to its first 16 chars so the
+    secret never ends up in logs."""
+    msg = _render_unauthorized_message(
+        headers={"Authorization": "Bearer mvt_live_abcdef0123456789_DEADBEEF_secret"},
+        target_name="dev",
+    )
+    # The primary recovery verb still appears, alongside the doctor
+    # check for the underlying storage problem.
+    assert "refresh-runtime-key dev" in msg
+    assert "mdk doctor --target dev" in msg
+    # Bearer prefix (first 16 chars after "Bearer ") is shown.
+    assert "mvt_live_abcdef0" in msg
+    # Secret tail is NOT echoed.
+    assert "DEADBEEF" not in msg
+    assert "_secret" not in msg

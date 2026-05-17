@@ -227,6 +227,14 @@ def run_azure_preflight(target_name: str, target: TargetConfig) -> list[Check]:
     healthz = _check_healthz(target.url)
     checks.append(healthz)
 
+    # ------------------------------------------------------------------
+    # /ready reports a durable storage backend
+    # ------------------------------------------------------------------
+    # If /healthz is unreachable, /ready will be too — skip rather than
+    # cascade a confusing second red row.
+    if healthz.status == "ok":
+        checks.append(_check_storage_durability(target.url))
+
     return checks
 
 
@@ -274,6 +282,47 @@ def _check_healthz(url: str) -> Check:
         return Check("/healthz", "error", "non-JSON response")
     version = body.get("version", "?")
     return Check("/healthz", "ok", f"serving v{version}")
+
+
+def _check_storage_durability(url: str) -> Check:
+    """``GET /ready`` against the deployed runtime, then surface whether
+    the chosen storage backend survives container restarts.
+
+    A red ✗ here is the single most important signal in the preflight:
+    if the backend isn't durable, every revision recycle wipes the
+    ApiKeyRecord table and the operator's saved bearer turns into a 401.
+    Catching this once via the doctor is much better than re-running
+    `mdk auth refresh-runtime-key` on every deploy.
+    """
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.get(f"{url.rstrip('/')}/ready")
+    except httpx.HTTPError as exc:
+        return Check("storage durability", "error", f"unreachable: {exc.__class__.__name__}")
+    # /ready returns 503 when storage ping fails; that's a separate
+    # signal from durability, so we still parse the body for the
+    # backend fields regardless of status code.
+    try:
+        body = r.json()
+    except ValueError:
+        return Check("storage durability", "error", "non-JSON /ready response")
+    backend = body.get("storage_backend")
+    durable = body.get("storage_durable")
+    if backend is None or durable is None:
+        # Older runtime that hasn't shipped the durability fields yet.
+        return Check(
+            "storage durability",
+            "missing",
+            "runtime predates storage durability reporting; upgrade the runtime image",
+        )
+    if durable:
+        return Check("storage durability", "ok", f"{backend} (durable across recycles)")
+    return Check(
+        "storage durability",
+        "error",
+        f"{backend} — NOT durable; revision recycles wipe keys. "
+        "Set MOVATE_DB_URL=postgresql://... on the Container App and restart.",
+    )
 
 
 __all__ = ["Check", "run_azure_preflight"]
