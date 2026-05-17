@@ -23,6 +23,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -254,15 +255,32 @@ def _scaffold_project_with_one_agent_and_target(
     assert result.exit_code == 0, result.stdout + result.stderr
 
 
+def _stub_preflight_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make :func:`deploy_mod._preflight_bearer` a pass-through.
+
+    The existing upload-loop auto-recovery tests cover the path where
+    the preflight passes (or wouldn't have caught the issue) but an
+    upload later returns 401 — race conditions between preflight and
+    upload, defense-in-depth, etc. Stubbing the preflight keeps those
+    tests focused on the upload-loop logic without dragging real
+    HTTP into the harness.
+    """
+    monkeypatch.setattr(
+        deploy_mod, "_preflight_bearer", lambda *, headers, **_: headers
+    )
+
+
 @pytest.mark.unit
-def test_deploy_agents_401_triggers_auto_recovery_and_retries_once(
+def test_deploy_agents_401_in_upload_loop_triggers_auto_recovery_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On 401 from the runtime, deploy mints a fresh key inside the
-    Container App and retries the failed agent. The second attempt
-    succeeds and the overall exit code is 0."""
+    """Defense in depth: even when the preflight passed (e.g. the token
+    was revoked between preflight and upload), an in-flight 401 still
+    triggers the same auto-recovery + retry path inside the upload
+    loop. Verifies that pathway hasn't regressed."""
     _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
+    _stub_preflight_ok(monkeypatch)
 
     call_count = {"agent": 0, "refresh": 0}
 
@@ -303,6 +321,7 @@ def test_deploy_agents_401_with_no_auto_recover_skips_refresh_and_fails(
     points the operator at ``mdk doctor --target`` + manual refresh."""
     _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
+    _stub_preflight_ok(monkeypatch)
 
     call_count = {"agent": 0, "refresh": 0}
 
@@ -328,6 +347,189 @@ def test_deploy_agents_401_with_no_auto_recover_skips_refresh_and_fails(
     assert "saved bearer rejected" not in combined
     assert "mdk doctor --target fake" in combined
     assert "mdk auth refresh-runtime-key fake" in combined
+
+
+# ---------------------------------------------------------------------------
+# A — Pre-deploy bearer preflight: catch a stale token BEFORE the upload loop
+# ---------------------------------------------------------------------------
+
+
+def _httpx_transport(handler: Any) -> Any:
+    """Build an ``httpx.Client`` subclass that pins a ``MockTransport``.
+
+    Each handler signature: ``(request: httpx.Request) -> httpx.Response``.
+    We subclass rather than replace ``httpx.Client`` with a factory
+    function because :func:`_upload_one_agent_bundle` calls
+    ``isinstance(client, httpx.Client)`` to verify the typing-as-Any
+    parameter is actually a Client — a bare function would break that
+    check. Subclassing preserves isinstance semantics.
+    """
+    transport = httpx.MockTransport(handler)
+
+    class _MockClient(httpx.Client):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs.pop("transport", None)
+            super().__init__(*args, transport=transport, **kwargs)
+
+    return _MockClient
+
+
+@pytest.mark.unit
+def test_preflight_401_with_auto_recovery_silently_refreshes_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preflight catches a stale bearer with one cheap GET, triggers
+    auto-recovery up front, and the upload loop only ever sees the
+    fresh bearer. The descriptive 401 message that the upload-loop path
+    would have printed never appears."""
+
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
+
+    seen = {"preflight_calls": 0, "refresh_calls": 0, "upload_calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents" and request.method == "GET":
+            seen["preflight_calls"] += 1
+            # First preflight call gets a stale bearer; reject. (We
+            # don't expect a second preflight — auto-recovery updates
+            # the in-memory headers and the upload loop is what runs
+            # next.)
+            return httpx.Response(401, json={"detail": "stale"})
+        # Skill and agent POSTs.
+        return httpx.Response(201, json={"ok": True})
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
+    )
+
+    def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
+        seen["refresh_calls"] += 1
+        return "mvt_live_fresh_keyid_secret", "FAKE_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+    assert seen["preflight_calls"] == 1, "expected exactly one preflight GET"
+    assert seen["refresh_calls"] == 1, "expected exactly one auto-refresh"
+    # The preflight is responsible for the user-visible recovery hint;
+    # the upload loop never logs its own 401 retry banner.
+    assert "preflight: saved bearer rejected" in combined
+    assert "minted fresh key" in combined
+    assert "ok=true" in combined
+
+
+@pytest.mark.unit
+def test_preflight_401_with_no_auto_recover_fails_fast_without_uploading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--no-auto-recover`` + a preflight 401 = exit 2 before any
+    multipart upload runs. The descriptive recovery message names the
+    target and points at the doctor + refresh commands."""
+
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
+
+    seen = {"preflight_calls": 0, "upload_calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents" and request.method == "GET":
+            seen["preflight_calls"] += 1
+            return httpx.Response(401, json={"detail": "stale"})
+        seen["upload_calls"] += 1
+        return httpx.Response(201, json={"ok": True})
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
+    )
+
+    result = runner.invoke(
+        app, ["deploy", "--target", "fake", "--no-auto-recover"], env={"COLUMNS": "200"}
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    assert seen["preflight_calls"] == 1
+    assert seen["upload_calls"] == 0, "must fail before any upload"
+    assert "mdk doctor --target fake" in combined
+    assert "mdk auth refresh-runtime-key fake" in combined
+
+
+@pytest.mark.unit
+def test_preflight_500_surfaces_runtime_error_without_attempting_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-401 non-2xx (e.g. a 5xx from a sick runtime) is not an
+    auth problem — preflight surfaces the body verbatim and exits
+    rather than triggering the auth recovery path, which would burn
+    a fresh key against a broken runtime."""
+
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_works_keyid_secret")
+
+    refresh_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents" and request.method == "GET":
+            return httpx.Response(500, json={"detail": "storage down"})
+        return httpx.Response(201, json={"ok": True})
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
+    )
+
+    def fake_refresh(*_a: Any, **_kw: Any) -> tuple[str, str]:
+        refresh_calls["n"] += 1
+        return "x", "FAKE_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    assert refresh_calls["n"] == 0, "must not try to refresh on 5xx"
+    assert "HTTP 500" in combined
+    assert "storage down" in combined
+
+
+@pytest.mark.unit
+def test_preflight_200_proceeds_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path: preflight returns 200, no warning printed, upload
+    loop runs against the original bearer unchanged."""
+
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_works_keyid_secret")
+
+    seen = {"preflight_calls": 0, "agent_posts": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents":
+            if request.method == "GET":
+                seen["preflight_calls"] += 1
+                return httpx.Response(200, json={"agents": []})
+            seen["agent_posts"] += 1
+            return httpx.Response(201, json={"ok": True})
+        return httpx.Response(201, json={"ok": True})
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
+    )
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+    assert seen["preflight_calls"] == 1
+    assert seen["agent_posts"] >= 1, "upload loop must run after a green preflight"
+    # No yellow ⚠ banner from the preflight on the happy path.
+    assert "preflight: saved bearer rejected" not in combined
+    assert "ok=true" in combined
 
 
 # ---------------------------------------------------------------------------
