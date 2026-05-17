@@ -79,9 +79,7 @@ class TestMintKey:
         )
         assert resp.status_code == 201
 
-    def test_mint_returns_key_fields(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_mint_returns_key_fields(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage, label="owner")
         resp = client.post(
             "/api/v1/auth/keys",
@@ -96,9 +94,7 @@ class TestMintKey:
         assert body["label"] == "ci-bot"
         assert body["expires_at"] is not None
 
-    def test_full_key_has_mvt_prefix(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_full_key_has_mvt_prefix(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.post(
             "/api/v1/auth/keys",
@@ -108,9 +104,7 @@ class TestMintKey:
         new_key = resp.json()["full_key"]
         assert new_key.startswith("mvt_")
 
-    def test_label_none_when_omitted(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_label_none_when_omitted(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.post(
             "/api/v1/auth/keys",
@@ -119,9 +113,7 @@ class TestMintKey:
         )
         assert resp.json()["label"] is None
 
-    def test_ttl_zero_means_no_expiry(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_ttl_zero_means_no_expiry(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.post(
             "/api/v1/auth/keys",
@@ -131,9 +123,7 @@ class TestMintKey:
         assert resp.status_code == 201
         assert resp.json()["expires_at"] is None
 
-    def test_ttl_30_sets_expires_at(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_ttl_30_sets_expires_at(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.post(
             "/api/v1/auth/keys",
@@ -147,9 +137,7 @@ class TestMintKey:
         resp = client.post("/api/v1/auth/keys", json={})
         assert resp.status_code == 401
 
-    def test_minted_key_is_usable(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_minted_key_is_usable(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.post(
             "/api/v1/auth/keys",
@@ -173,9 +161,7 @@ class TestMintKey:
 
 @pytest.mark.unit
 class TestListKeys:
-    def test_list_shows_own_key(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_list_shows_own_key(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage, label="my-key")
         resp = client.get(
             "/api/v1/auth/keys",
@@ -285,9 +271,7 @@ class TestRevokeKey:
         assert body["key_id"] == victim.record.key_id
         assert body["revoked"] is True
 
-    def test_revoke_idempotent(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_idempotent(self, client: TestClient, storage: InMemoryStorage) -> None:
         owner = _save_key(storage)
         victim = _save_key(storage, tenant_id=owner.record.tenant_id)
         client.delete(
@@ -301,9 +285,7 @@ class TestRevokeKey:
         )
         assert resp.status_code == 200
 
-    def test_revoke_404_key_not_found(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_404_key_not_found(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.delete(
             "/api/v1/auth/keys/no-such-key-id",
@@ -311,9 +293,7 @@ class TestRevokeKey:
         )
         assert resp.status_code == 404
 
-    def test_revoke_404_cross_tenant(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_404_cross_tenant(self, client: TestClient, storage: InMemoryStorage) -> None:
         tenant_a = _save_key(storage, label="a")
         tenant_b = _save_key(storage, label="b")
         # Tenant A tries to revoke tenant B's key → 404 (no info leakage).
@@ -323,9 +303,7 @@ class TestRevokeKey:
         )
         assert resp.status_code == 404
 
-    def test_revoke_401_without_bearer(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_401_without_bearer(self, client: TestClient, storage: InMemoryStorage) -> None:
         minted = _save_key(storage)
         resp = client.delete(f"/api/v1/auth/keys/{minted.record.key_id}")
         assert resp.status_code == 401
