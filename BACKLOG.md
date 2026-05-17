@@ -537,6 +537,56 @@ don't pick from this list unless the top 10 are blocked or context shifts.
 
 ---
 
+### Group J — Mova iO Mapping Push (2026-05-14)
+
+> _Tomorrow-demo push to close the 30% gap surfaced when Deva asked us
+> to map every Mova iO platform building-block to MDK. Two items
+> already shipped as pre-work (mdk add + role templates, project-mode
+> validate/eval); the remaining six phases are the active queue, sized
+> so the whole push fits in a focused day. Each phase = its own PR.
+> Phase 0 = biggest visible win (Safe AI MVP); RAG ships intentionally
+> minimal (surface only, real engine waits for the v0.8 RAG sprint)._
+
+**Reference:** the layer-by-layer Mova iO scorecard lives in `docs/mova-io-mapping.md` (Phase J-7 produces it).
+
+#### J-pre — Pre-work already shipped this session
+
+121. [x] **`mdk add` + 5 role templates** `[HIGH] [v0.7] [done 2026-05-14] [~1h]` — PR [#5](https://github.com/mova-io/mova-cli/pull/5). Project-aware role-based scaffolder (`mdk add <name> --template <role>`) + five day-one personas (support-triage, sql-writer, reply-drafter, text-classifier, document-summarizer). Each role ships marketplace metadata + rubric-driven prompt + 2-3 case eval dataset + ROLE.md. `--list-roles` / `--list-roles --json` powers the Mova iO wizard's "Choose a template" dropdown. Closes Deva's Tier-1 ask: "after `mdk init`, want to add agents by template type, e.g. `mdk add my-project my-role-agent-name --template ocr`."
+
+122. [x] **`mdk validate --project` / `mdk eval --project`** `[HIGH] [v0.7] [done 2026-05-14] [~1h]` — PR [#6](https://github.com/mova-io/mova-cli/pull/6). Team-level gates Deva asked for in the Mova iO mapping. Walks `<root>/agents/*`, runs validate (or eval) per-agent, prints a rolled-up summary table, exits non-zero if any fails. Per-agent failures don't abort the loop — operator sees ALL failures at once. Path defaults to walk-up from cwd for `movate.yaml`. CI-friendly: gate a whole project with one command + one exit code.
+
+#### J-0 to J-5 — Active queue (today)
+
+123. [ ] **Phase 0: Safe AI MVP (PII + topic + content guardrails)** `[HIGH] [v0.7] [next] [~3h]` — Lyzr-equivalence on the RAI tab. New `guardrails:` block in `movate.yaml` with three modules: PII (regex-based redact/block/warn for email/phone/SSN/credit-card), topic restriction (allowlist; LLM-judged on violation), content filter (profanity regex; off-topic flag). Wired at `Executor.execute()` entry (input) + exit (output). Reuses existing `safety_blocked` status — pipeline already propagates it through workflow runner / worker / RemoteExecutor / `RunRecord`. MVP tradeoffs: regex over spaCy/moderation-API; swap-in-able later via the same interface. Closes the biggest Mova iO mapping gap (Safe AI layer was 40% covered, this moves it to ~80%).
+
+124. [ ] **Phase 1: Reflection pattern (judge-in-the-loop)** `[MED] [v0.7] [~2h]` — New `reflection:` block in `AgentSpec`: `enabled`, `judge_model`, `rubric`, `max_iterations: 1` for MVP. After primary call, Executor calls the judge with output + rubric; if judge says "revise," loops once. Hooks into existing tracing — judge call is a separate span under the agent span. Demonstrates on `sql-writer` role (checks SQL is read-only + parses). Multi-turn reflection (3+ rounds) waits for the next iteration. Maps to Mova iO platform's "Reflection" box.
+
+125. [ ] **Phase 2: `mdk explain <run-id>`** `[MED] [v0.7] [~2h]` — Operator-facing run summarizer. Reads RunRecord from storage, renders a Rich panel showing prompt sent / response / retries / fallbacks fired / cost / latency / schema validation result / guardrail verdicts. Optional one-paragraph LLM-generated plain-English "why" summary (cheap call; `--no-summary` opt-out). Maps to Mova iO's "Explainability" box. Pairs with item 122 — `mdk eval --project` surfaces a failing agent; `mdk explain` zooms into the specific run.
+
+126. [ ] **Phase 3: `mdk plan --from "<description>"` MVP** `[HIGH] [v0.7] [~3h]` — The "wow demo" Deva put on the wishlist. Reads role + skill catalogs, calls a planner LLM, emits a JSON plan (`agents: [{name, template, purpose}], skills: [...], contexts: [...], workflow: [...]`). `--dry-run` (default) prints the plan + cost estimate + tree preview; `--apply` programmatically calls `mdk init` + `mdk add` + `mdk scaffold tool` to scaffold the project. MVP tradeoffs: no domain-specific prompt rewrite per agent (uses role-template prompts as-is); no HITL refinement loop; one planner call (no CoT decomposition). Maps to Mova iO's "Planning" box.
+
+127. [ ] **Phase 4: RAG surface (knowledge.yaml + in-memory retriever)** `[MED] [v0.7] [~3h, surface only]` — **Intentionally minimal**: 3-4 week sprint compressed to surface design. Promotes `KnowledgeConfig` from stub to working parser; `src/movate/knowledge/{loader,retriever,store}.py`; in-memory BM25/substring retriever (no embeddings); `mdk knowledge {add,list,query}` commands; workflow node type `retriever`. **Does NOT ship**: embeddings (TODO: pgvector / Azure AI Search in v0.8), reranking, PDF/Word/HTML ingestion (markdown only), semantic chunking, graph store. Locks in the interface so the production engine slots in without API breakage. Maps to most of Mova iO's "Data & Knowledge" column.
+
+128. [ ] **Phase 5: Mova iO mapping doc + PPT slide** `[HIGH] [v0.7] [~1h]` — `docs/mova-io-mapping.md` — the layer-by-layer scorecard mapping every Mova iO platform box to its MDK status (have / partial / roadmap / out-of-scope). Generated PPT slide via `scripts/build-deva-ppt.py` for the Friday meeting. Durable artifact: regenerates as features ship, replacing the version-of-truth from the on-the-fly mapping I gave Deva in chat.
+
+#### J-est — Pickup order
+
+**Tonight (Phase J-0 + J-1, ~5h):**
+* J-0 — Safe AI MVP (the show-stopper for the demo)
+* J-1 — Reflection pattern
+
+**Tomorrow AM (J-2 + J-3, ~5h):**
+* J-2 — `mdk explain`
+* J-3 — `mdk plan --from`
+
+**Tomorrow PM (J-4 + J-5, ~4h):**
+* J-4 — RAG surface
+* J-5 — Mapping doc + PPT
+
+**Total budget: 14h focused work** — doable for tomorrow if I commit. Each phase ships its own PR; if J-3 or J-4 bog down on prompt-engineering / interface design, ship strictly-scoped versions with `TODO: phase 2` markers rather than skip.
+
+---
+
 ## 1. Foundation — single agent (Phase 1 / v0.1)
 
 ### Already shipped

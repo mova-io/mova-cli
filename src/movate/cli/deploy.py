@@ -490,9 +490,11 @@ def _resolve_deploy_mode(*, mode: str, cwd: Path) -> str:
     return "runtime"
 
 
+_HTTP_OK = 200
 _HTTP_CREATED = 201
 _HTTP_UNAUTHORIZED = 401
 _HTTP_CONFLICT = 409
+_HTTP_SERVICE_UNAVAILABLE = 503
 
 
 def _deploy_status(*, target: str | None) -> None:
@@ -740,18 +742,35 @@ def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> 
             else:
                 failed.append((agent_dir.name, result))
 
+    # Upload custom skills to the global skill registry. Skills are
+    # registered separately from agents because the runtime resolves
+    # them by name from a shared skills_path, not per-agent-dir.
+    # Safe to call when skills/ is absent or empty — returns silently.
+    with httpx.Client(timeout=httpx.Timeout(60.0)) as skill_client:
+        skill_uploaded, skill_failed = _upload_skills(
+            client=skill_client,
+            base_url=base_url,
+            headers=headers,
+            project_root=project_root,
+        )
+
     # Render summary.
     err.print()
     for name in uploaded:
-        err.print(f"  [green]✓[/green] uploaded [bold]{name}[/bold]")
+        err.print(f"  [green]✓[/green] uploaded agent [bold]{name}[/bold]")
     for name, reason in failed:
-        err.print(f"  [red]✗[/red] [bold]{name}[/bold] — {reason}")
+        err.print(f"  [red]✗[/red] agent [bold]{name}[/bold] — {reason}")
+    for name in skill_uploaded:
+        err.print(f"  [green]✓[/green] uploaded skill [bold]{name}[/bold]")
+    for name, reason in skill_failed:
+        err.print(f"  [red]✗[/red] skill [bold]{name}[/bold] — {reason}")
     err.print()
-    ok = not failed
+    ok = not failed and not skill_failed
     err.print(
         f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
         f"agents={len(agent_dirs)} uploaded={len(uploaded)} "
         f"failed={len(failed)} "
+        f"skills_uploaded={len(skill_uploaded)} skills_failed={len(skill_failed)} "
         f"ok={'true' if ok else 'false'}[/dim]"
     )
     if not ok:
@@ -826,6 +845,79 @@ def _append_kb_files(
                     (f"kb/{kb_file.name}", kb_file.read_bytes(), "application/json"),
                 )
             )
+
+
+def _upload_skills(
+    *,
+    client: object,  # httpx.Client
+    base_url: str,
+    headers: dict[str, str],
+    project_root: Path,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Upload every skill under ``<project_root>/skills/*/`` to ``POST /api/v1/skills``.
+
+    Returns ``(uploaded_names, failed)`` where ``failed`` is a list of
+    ``(name, reason)`` pairs. The runtime endpoint uses PUT semantics —
+    re-uploading an existing skill overwrites it atomically, so this is
+    safe to call on every deploy.
+
+    Silently returns two empty lists if the project has no ``skills/``
+    directory (most demo projects don't have custom skills).
+    """
+    import httpx as _httpx  # noqa: PLC0415
+
+    assert isinstance(client, _httpx.Client)
+
+    skills_dir = project_root / "skills"
+    if not skills_dir.is_dir():
+        return [], []
+
+    skill_dirs = sorted(
+        d for d in skills_dir.iterdir()
+        if d.is_dir() and (d / "skill.yaml").is_file()
+    )
+    if not skill_dirs:
+        return [], []
+
+    uploaded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for skill_dir in skill_dirs:
+        name = skill_dir.name
+        files: list[tuple[str, tuple[str, bytes, str]]] = [
+            ("skill_yaml", ("skill.yaml", (skill_dir / "skill.yaml").read_bytes(), "text/yaml")),
+        ]
+        impl = skill_dir / "impl.py"
+        if impl.is_file():
+            files.append(("impl", ("impl.py", impl.read_bytes(), "text/x-python")))
+        for corpus_name in ("corpus.json", "kb-lookup-corpus.json"):
+            corpus = skill_dir / corpus_name
+            if corpus.is_file():
+                files.append(("corpus", (corpus_name, corpus.read_bytes(), "application/json")))
+                break
+        readme = skill_dir / "README.md"
+        if readme.is_file():
+            files.append(("readme", ("README.md", readme.read_bytes(), "text/markdown")))
+
+        try:
+            resp = client.post(f"{base_url}/api/v1/skills", files=files, headers=headers)
+        except _httpx.HTTPError as exc:
+            failed.append((name, f"network error: {exc}"))
+            continue
+
+        if resp.status_code in (_HTTP_OK, _HTTP_CREATED):
+            uploaded.append(name)
+        elif resp.status_code == _HTTP_SERVICE_UNAVAILABLE:
+            failed.append((
+                name,
+                "runtime has no skills_path — restart with skills_path configured",
+            ))
+        elif resp.status_code == _HTTP_UNAUTHORIZED:
+            failed.append((name, "unauthorized — check bearer token"))
+        else:
+            failed.append((name, f"HTTP {resp.status_code}: {resp.text[:120]}"))
+
+    return uploaded, failed
 
 
 def _upload_one_agent_bundle(

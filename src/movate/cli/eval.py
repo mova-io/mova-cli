@@ -180,6 +180,15 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "Exit 1 if latency mean is below this threshold."
         ),
     ),
+    gate_context_compliance: float = typer.Option(
+        None,
+        "--gate-context-compliance",
+        help=(
+            "Minimum mean context-compliance score (0.0-1.0) required to pass. "
+            "Only fires when the agent has declared contexts and a judge model. "
+            "Exit 1 if context_compliance mean is below this threshold."
+        ),
+    ),
     gate_refusal: float = typer.Option(
         None,
         "--gate-refusal",
@@ -278,6 +287,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             gate_faithfulness=gate_faithfulness,
             gate_coverage=gate_coverage,
             gate_latency=gate_latency,
+            gate_context_compliance=gate_context_compliance,
             gate_refusal=gate_refusal,
         )
         return
@@ -366,6 +376,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             gate_faithfulness=gate_faithfulness,
             gate_coverage=gate_coverage,
             gate_latency=gate_latency,
+            gate_context_compliance=gate_context_compliance,
             gate_refusal=gate_refusal,
         )
     )
@@ -613,6 +624,7 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
     gate_faithfulness: float | None = None,
     gate_coverage: float | None = None,
     gate_latency: float | None = None,
+    gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
 ) -> None:
     """Evaluate every agent under ``./agents/`` in the current project.
@@ -699,6 +711,7 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
                     gate_faithfulness=gate_faithfulness,
                     gate_coverage=gate_coverage,
                     gate_latency=gate_latency,
+                    gate_context_compliance=gate_context_compliance,
                     gate_refusal=gate_refusal,
                 )
             )
@@ -803,6 +816,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     gate_faithfulness: float | None = None,
     gate_coverage: float | None = None,
     gate_latency: float | None = None,
+    gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
@@ -965,6 +979,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
         gate_faithfulness=gate_faithfulness,
         gate_coverage=gate_coverage,
         gate_latency=gate_latency,
+        gate_context_compliance=gate_context_compliance,
         gate_refusal=gate_refusal,
     )
 
@@ -1112,7 +1127,10 @@ def _has_extra_dims(means: DimensionalMeans) -> bool:
     (via ``expected_coverage``). Legacy datasets keep the exact v0.5
     single-score view — no extra section.
     """
-    return any(v is not None for v in (means.faithfulness, means.coverage, means.refusal))
+    return any(
+        v is not None
+        for v in (means.faithfulness, means.coverage, means.context_compliance, means.refusal)
+    )
 
 
 def _emit_dimensional_breakdown(means: DimensionalMeans) -> None:
@@ -1137,6 +1155,7 @@ def _emit_dimensional_breakdown(means: DimensionalMeans) -> None:
         ("faithfulness", means.faithfulness, "answer grounded in context"),
         ("coverage", means.coverage, "expected substrings present"),
         ("latency", means.latency, "1.0 within budget, decays to 2x budget"),
+        ("context_compliance", means.context_compliance, "output respects context guidelines"),
         ("refusal", means.refusal, "1.0 = agent refused as expected"),
     ]
     for name, value, note in rows:
@@ -1152,6 +1171,7 @@ def _check_dimensional_gates(
     gate_faithfulness: float | None,
     gate_coverage: float | None,
     gate_latency: float | None,
+    gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
 ) -> bool:
     """Check per-dimension CI gates. Prints a verdict line for each and
@@ -1163,6 +1183,7 @@ def _check_dimensional_gates(
         ("faithfulness", gate_faithfulness, means.faithfulness, "grounding"),
         ("coverage", gate_coverage, means.coverage, "expected_coverage"),
         ("latency", gate_latency, means.latency, None),
+        ("context_compliance", gate_context_compliance, means.context_compliance, None),
         ("refusal", gate_refusal, means.refusal, "refusal_expected"),
     ]
     for dim_name, threshold, actual, field_hint in _dim_checks:

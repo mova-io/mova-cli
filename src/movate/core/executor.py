@@ -44,6 +44,7 @@ from movate.core.models import (
     RunResponse,
     TokenUsage,
 )
+from movate.core.reflection import build_revision_prompt, call_judge
 from movate.core.retry import RetryExhaustedError, run_with_retries
 from movate.providers.base import (
     BaseLLMProvider,
@@ -383,6 +384,43 @@ class Executor:
             except JsonSchemaError as exc:
                 raise SchemaError(f"model output failed schema: {exc.message}") from exc
 
+            # Reflection loop (Phase J-1). When the agent's
+            # ``reflection.enabled`` is true, run the output through a
+            # judge. On a ``revise`` verdict, re-prompt the same
+            # provider with the judge's feedback as a correction
+            # directive. Bounded by ``reflection.max_iterations`` — a
+            # judge that keeps rejecting can never block the run.
+            if spec.reflection.enabled:
+                # The agent-call params from the chain entry that
+                # succeeded — reflection uses the same agent config
+                # for the revision re-prompt (only the user message
+                # changes, not temperature/max_tokens).
+                successful_params = next(
+                    (p for prov, p in chain if prov == chosen_provider),
+                    chain[0][1],
+                )
+                output, reflection_cost = await self._reflect(
+                    spec=spec,
+                    bundle=bundle,
+                    provider_for_run=provider_for_run,
+                    provider_str=chosen_provider,
+                    params=successful_params,
+                    initial_output=output,
+                    initial_output_text=completion.text,
+                    user_message=rendered,
+                    history=history,
+                    span=span,
+                )
+                cost += reflection_cost
+                # Cost-cap re-check after reflection — a runaway loop
+                # would have blown the budget without this.
+                if cost > effective_ceiling:
+                    raise BudgetExceededError(
+                        f"run cost ${cost:.4f} exceeds ceiling "
+                        f"${effective_ceiling:.4f} after reflection "
+                        f"(agent budget ${spec.budget.max_cost_usd_per_run:.4f})"
+                    )
+
             metrics = Metrics(
                 latency_ms=int((time.monotonic() - started) * 1000),
                 tokens=completion.tokens,
@@ -684,6 +722,158 @@ class Executor:
             tokens=final_tokens or TokenUsage(),
             raw=raw,
         )
+
+    async def _reflect(
+        self,
+        *,
+        spec: object,
+        bundle: AgentBundle,
+        provider_for_run: BaseLLMProvider,
+        provider_str: str,
+        params: dict[str, Any],
+        initial_output: dict[str, Any],
+        initial_output_text: str,
+        user_message: str,
+        history: list[Message] | None,
+        span: SpanCtx,
+    ) -> tuple[dict[str, Any], float]:
+        """Run the reflection loop (judge → maybe revise) over the
+        primary completion.
+
+        Returns ``(final_output, reflection_cost_usd)``. The output
+        dict is either the original (judge accepted) or the revised
+        one (judge said revise + executor re-prompted + revision
+        re-validated).
+
+        Bounded by ``spec.reflection.max_iterations`` — the loop
+        terminates after that many AGENT calls (including the
+        original), regardless of whether the judge is still rejecting.
+        A flaky judge can never block the run.
+
+        Tracer spans: each judge call + each revision re-prompt
+        surface as separate events under the agent's main span so the
+        operator can see reflection overhead in Langfuse.
+        """
+        # mypy: AgentSpec for ``spec`` (typed as ``object`` here to
+        # avoid a circular type import). We access ``.reflection``
+        # which is the runtime contract.
+        reflect_cfg = spec.reflection  # type: ignore[attr-defined]
+        # Resolve the judge provider. For MVP we route every judge
+        # call through LiteLLM regardless of the agent's runtime —
+        # ``reflection.judge_model`` is documented as a LiteLLM-style
+        # ``<family>/<model>`` string. Native-SDK judges land later
+        # alongside the equivalent agent-side adapters.
+        from movate.core.models import AgentRuntime  # noqa: PLC0415  -- avoid TYPE_CHECKING
+
+        try:
+            judge_provider = self._registry.get(AgentRuntime.LITELLM)
+        except Exception:
+            log.warning("reflection: no LiteLLM provider in registry; skipping reflection")
+            return (initial_output, 0.0)
+
+        current_output = initial_output
+        current_output_text = initial_output_text
+        total_judge_cost = 0.0
+
+        # max_iterations = 1 means: judge ONCE, never re-prompt
+        # (audit-only). max_iterations = 2 means: judge, re-prompt
+        # once if revise, judge again, return whatever (don't loop
+        # past that). Etc.
+        for iteration in range(reflect_cfg.max_iterations):
+            verdict = await call_judge(
+                config=reflect_cfg,
+                output_text=current_output_text,
+                judge_provider=judge_provider,
+                pricing_lookup=self._pricing,
+            )
+            total_judge_cost += verdict.cost_usd
+            self._tracer.log_event(
+                span,
+                {
+                    "reflection.iteration": iteration,
+                    "reflection.verdict": verdict.verdict,
+                    "reflection.feedback": verdict.feedback[:200],
+                    "reflection.judge_cost_usd": verdict.cost_usd,
+                    "reflection.judge_tokens_in": verdict.tokens_in,
+                    "reflection.judge_tokens_out": verdict.tokens_out,
+                },
+            )
+
+            if verdict.verdict in {"accept", "parse_error"}:
+                # parse_error is treated as soft-accept (flaky judge
+                # shouldn't block the run; warning already logged in
+                # reflection.py).
+                break
+
+            # verdict == "revise". If we have iterations left, re-prompt
+            # the agent with the judge's feedback. The agent uses the
+            # SAME provider + params as the original call — only the
+            # user message changes.
+            if iteration + 1 >= reflect_cfg.max_iterations:
+                # No iterations left. Return the most recent output
+                # with a warning event — the operator sees the
+                # accumulated rejection trail.
+                self._tracer.log_event(
+                    span,
+                    {
+                        "reflection.exhausted": True,
+                        "reflection.final_verdict": "revise (returning anyway)",
+                    },
+                )
+                break
+
+            revision_prompt = build_revision_prompt(user_message, verdict.feedback)
+            revision_messages: list[Message] = [
+                *(history or []),
+                Message(role="user", content=user_message),
+                Message(role="assistant", content=current_output_text),
+                Message(role="user", content=revision_prompt),
+            ]
+            revision_request = CompletionRequest(
+                provider=provider_str,
+                messages=revision_messages,
+                params=params,
+            )
+            revision_response = await provider_for_run.complete(revision_request)
+            revision_cost = self._pricing.cost_for(
+                provider=provider_str,
+                tokens=revision_response.tokens,
+            )
+            total_judge_cost += revision_cost
+            self._tracer.log_event(
+                span,
+                {
+                    "reflection.revision_cost_usd": revision_cost,
+                    "reflection.revision_tokens_in": revision_response.tokens.input,
+                    "reflection.revision_tokens_out": revision_response.tokens.output,
+                },
+            )
+
+            # Parse + validate the revised output. If parsing or
+            # validation fails, we return the PREVIOUS (accepted by
+            # schema) output rather than a broken one — a revision
+            # that breaks schema is worse than no revision.
+            try:
+                revised_output = _parse_json_output(revision_response.text)
+                bundle.output_validator.validate(revised_output)
+            except (JsonSchemaError, ValueError) as exc:
+                log.warning(
+                    "reflection: revision failed schema/parse (%s); keeping previous output",
+                    exc,
+                )
+                self._tracer.log_event(
+                    span,
+                    {
+                        "reflection.revision_failed_validation": True,
+                        "reflection.revision_error": str(exc)[:200],
+                    },
+                )
+                break
+
+            current_output = revised_output
+            current_output_text = revision_response.text
+
+        return (current_output, total_judge_cost)
 
     async def _check_tenant_budget(self, tenant_id: str) -> None:
         """Abort the run if the tenant has hit its monthly cap.

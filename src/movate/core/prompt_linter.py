@@ -34,6 +34,12 @@ Rules
   non-whitespace content. Usually a scaffolding leftover that
   somehow shipped.
 
+* ``SKILL_OUTPUT_REF_MISMATCH`` (warning) — the prompt references
+  ``{{ <skill_name>_output.X }}`` but field ``X`` is not in the
+  skill's declared output schema. Operators who inject skill output
+  via the ``<name>_output`` naming convention get early feedback
+  instead of a silent ``undefined`` at render time.
+
 Future rules (not in this pass — add when they catch a real bug):
 
 * Floating temperature on a deterministic-eval agent
@@ -85,6 +91,7 @@ def lint_prompt(bundle: AgentBundle) -> list[LintIssue]:
     issues: list[LintIssue] = []
     issues.extend(_check_empty_prompt(bundle))
     issues.extend(_check_undeclared_input_refs(bundle))
+    issues.extend(_check_skill_output_refs(bundle))
     issues.extend(_check_json_instruction(bundle))
     issues.extend(_check_output_schema_reference(bundle))
     return issues
@@ -219,6 +226,99 @@ def _output_property_names(bundle: AgentBundle) -> list[str]:
     if not isinstance(props, dict):
         return []
     return [k for k in props if isinstance(k, str)]
+
+
+def _skill_output_var_name(skill_name: str) -> str:
+    """Canonical Jinja2 variable name for a skill's output.
+
+    Convention: replace non-identifier chars (``-``) with ``_`` and
+    append ``_output``. E.g. ``web-search`` → ``web_search_output``.
+    """
+    return re.sub(r"[^a-z0-9_]", "_", skill_name.lower()) + "_output"
+
+
+def _skill_output_property_names(skill: object) -> list[str]:
+    """Top-level keys of the skill's output schema ``properties``."""
+    props = getattr(skill, "output_schema", {}).get("properties")
+    if not isinstance(props, dict):
+        return []
+    return [k for k in props if isinstance(k, str)]
+
+
+def _check_skill_output_refs(bundle: AgentBundle) -> list[LintIssue]:
+    """``SKILL_OUTPUT_REF_MISMATCH`` (warning) — template references
+    ``{{ <skill_name>_output.X }}`` but field ``X`` is absent from the
+    skill's declared output schema.
+
+    Convention: a skill named ``web-search`` exposes its result under
+    ``{{ web_search_output.<field> }}`` in the Jinja2 template.
+    This rule catches typos and stale references before they produce
+    silent ``Undefined`` at render time.
+
+    The rule is a no-op when:
+    * the agent has no skills
+    * the skill has no declared output schema properties (open schema)
+    * the template doesn't reference the skill's output variable at all
+    """
+    if not bundle.skills:
+        return []
+
+    env = Environment()
+    try:
+        ast = env.parse(bundle.prompt_template)
+    except Exception:
+        return []
+
+    getattr_cls = _jinja_getattr_class()
+
+    # Build a map: var_name → (skill, declared_output_fields)
+    skill_vars: dict[str, tuple[object, set[str]]] = {}
+    for skill in bundle.skills:
+        var_name = _skill_output_var_name(skill.spec.name)
+        props = _skill_output_property_names(skill)
+        if props:  # skip skills with open / empty output schemas
+            skill_vars[var_name] = (skill, set(props))
+
+    if not skill_vars:
+        return []
+
+    # Walk AST: collect all Getattr nodes of the form `<var_name>.X`.
+    issues: list[LintIssue] = []
+    seen: set[tuple[str, str]] = set()
+    for node in ast.find_all((getattr_cls,)):  # type: ignore[var-annotated]
+        target = getattr(node, "node", None)
+        attr = getattr(node, "attr", None)
+        if target is None or not isinstance(attr, str):
+            continue
+        var_name = getattr(target, "name", None)
+        if var_name not in skill_vars:
+            continue
+        _, declared = skill_vars[var_name]
+        if attr in declared:
+            continue
+        key = (var_name, attr)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Recover the original skill name for the message.
+        skill = skill_vars[var_name][0]
+        skill_name = skill.spec.name
+        issues.append(
+            LintIssue(
+                code="SKILL_OUTPUT_REF_MISMATCH",
+                severity="warning",
+                message=(
+                    f"prompt references `{{{{ {var_name}.{attr} }}}}` "
+                    f"but {attr!r} is not in skill {skill_name!r}'s output schema "
+                    f"(declared: {sorted(declared)})"
+                ),
+                hint=(
+                    f"check the output schema in skills/{skill_name}/skill.yaml "
+                    f"or fix the field name in the prompt"
+                ),
+            )
+        )
+    return issues
 
 
 def _check_json_instruction(bundle: AgentBundle) -> list[LintIssue]:

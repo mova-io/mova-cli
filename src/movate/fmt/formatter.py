@@ -128,7 +128,9 @@ def detect_format(path: Path) -> Format | None:
         return Format.POLICY_YAML
     if suffix in {".yaml", ".yml"}:
         return Format.GENERIC_YAML
-    if name == "prompt.md" or (suffix == ".md" and "prompts" in path.parts):
+    if name == "prompt.md" or (suffix == ".md" and (
+        "prompts" in path.parts or "contexts" in path.parts
+    )):
         return Format.PROMPT
     if suffix == ".jsonl":
         return Format.JSONL

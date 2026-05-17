@@ -398,3 +398,212 @@ def knowledge_add(
         f"corpus now has {len(existing)} entr{'y' if len(existing) == 1 else 'ies'} "
         f"at [dim]{corpus_path}[/dim]"
     )
+
+
+@knowledge_app.command("remove")
+def knowledge_remove(
+    entry_id: str = typer.Argument(..., help="The [bold]id[/bold] of the entry to remove."),
+    corpus: str = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help="Path to corpus JSON. Defaults to [bold]kb/kb-lookup-corpus.json[/bold].",
+    ),
+    project_root: str = typer.Option(
+        ".",
+        "--project-root",
+        envvar="MOVATE_PROJECT_ROOT",
+        hidden=True,
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
+) -> None:
+    """Remove one entry from the KB corpus by id.
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk knowledge remove KB-042[/dim]
+      [dim]$ mdk knowledge remove KB-042 --yes[/dim]
+    """
+    root = Path(project_root).resolve()
+    corpus_path = _resolve_corpus_path(corpus, root)
+    if not corpus_path.is_file():
+        err.print(f"[red]✗[/red] corpus not found: {corpus_path}")
+        raise typer.Exit(code=2)
+
+    entries = _load_corpus(corpus_path)
+    matches = [e for e in entries if isinstance(e, dict) and e.get("id") == entry_id]
+    if not matches:
+        err.print(
+            f"[red]✗[/red] no entry with id [bold]{entry_id!r}[/bold] found in corpus "
+            f"([dim]{corpus_path}[/dim])."
+        )
+        raise typer.Exit(code=2)
+
+    if not yes:
+        import sys  # noqa: PLC0415
+
+        if sys.stdin.isatty():
+            typer.confirm(
+                f"Remove entry {entry_id!r} from corpus ({corpus_path.name})?",
+                abort=True,
+            )
+        else:
+            err.print(
+                "[red]✗[/red] not a TTY — pass [bold]--yes[/bold] to confirm removal."
+            )
+            raise typer.Exit(code=2)
+
+    remaining = [e for e in entries if not (isinstance(e, dict) and e.get("id") == entry_id)]
+    corpus_path.write_text(json.dumps(remaining, indent=2))
+    removed_n = len(entries) - len(remaining)
+    out.print(
+        f"[green]✓[/green] removed [bold]{entry_id!r}[/bold] "
+        f"({removed_n} entr{'y' if removed_n == 1 else 'ies'} deleted) — "
+        f"corpus now has {len(remaining)} entr{'y' if len(remaining) == 1 else 'ies'}."
+    )
+
+
+@knowledge_app.command("edit")
+def knowledge_edit(
+    entry_id: str = typer.Argument(..., help="The [bold]id[/bold] of the entry to edit."),
+    patch: str = typer.Option(
+        ...,
+        "--set",
+        "-s",
+        help=(
+            "JSON object of fields to update, e.g. "
+            "[bold]--set '{\"resolution\": \"New answer\"}' [/bold]. "
+            "Only listed keys are changed; others are preserved."
+        ),
+    ),
+    corpus: str = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help="Path to corpus JSON. Defaults to [bold]kb/kb-lookup-corpus.json[/bold].",
+    ),
+    project_root: str = typer.Option(
+        ".",
+        "--project-root",
+        envvar="MOVATE_PROJECT_ROOT",
+        hidden=True,
+    ),
+) -> None:
+    """Patch one entry in the KB corpus by id.
+
+    Only the fields listed in [bold]--set[/bold] are updated; all
+    other fields are preserved. Pass [bold]--set '{"id": "new-id"}'[/bold]
+    to rename an entry.
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk knowledge edit KB-042 --set '{"resolution": "Updated answer"}' [/dim]
+      [dim]$ mdk knowledge edit KB-042 --set '{"tags": ["billing", "refunds"]}' [/dim]
+    """
+    root = Path(project_root).resolve()
+    corpus_path = _resolve_corpus_path(corpus, root)
+    if not corpus_path.is_file():
+        err.print(f"[red]✗[/red] corpus not found: {corpus_path}")
+        raise typer.Exit(code=2)
+
+    try:
+        patch_dict: dict[str, Any] = json.loads(patch)
+    except json.JSONDecodeError as exc:
+        err.print(f"[red]✗[/red] --set value is not valid JSON: {exc}")
+        raise typer.Exit(code=2) from None
+    if not isinstance(patch_dict, dict):
+        err.print("[red]✗[/red] --set value must be a JSON object.")
+        raise typer.Exit(code=2)
+
+    entries = _load_corpus(corpus_path)
+    updated = False
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == entry_id:
+            entry.update(patch_dict)
+            updated = True
+            break
+
+    if not updated:
+        err.print(
+            f"[red]✗[/red] no entry with id [bold]{entry_id!r}[/bold] found in corpus "
+            f"([dim]{corpus_path}[/dim])."
+        )
+        raise typer.Exit(code=2)
+
+    corpus_path.write_text(json.dumps(entries, indent=2))
+    fields_changed = ", ".join(patch_dict.keys())
+    out.print(
+        f"[green]✓[/green] updated [bold]{entry_id!r}[/bold] "
+        f"(fields: {fields_changed}) in [dim]{corpus_path}[/dim]."
+    )
+
+
+@knowledge_app.command("list")
+def knowledge_list(
+    corpus: str = typer.Option(
+        None,
+        "--corpus",
+        "-c",
+        help="Path to corpus JSON. Defaults to [bold]kb/kb-lookup-corpus.json[/bold].",
+    ),
+    project_root: str = typer.Option(
+        ".",
+        "--project-root",
+        envvar="MOVATE_PROJECT_ROOT",
+        hidden=True,
+    ),
+    limit: int = typer.Option(
+        0,
+        "--limit",
+        "-n",
+        help="Show only the first N entries (0 = all).",
+    ),
+) -> None:
+    """List KB corpus entries as a table.
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk knowledge list[/dim]
+      [dim]$ mdk knowledge list --limit 10[/dim]
+      [dim]$ mdk knowledge list --corpus kb/custom-corpus.json[/dim]
+    """
+    root = Path(project_root).resolve()
+    corpus_path = _resolve_corpus_path(corpus, root)
+    if not corpus_path.is_file():
+        err.print(f"[red]✗[/red] corpus not found: {corpus_path}")
+        raise typer.Exit(code=2)
+
+    entries = _load_corpus(corpus_path)
+    if not entries:
+        out.print(
+            "[yellow]![/yellow] corpus is empty. "
+            "Run [bold]mdk knowledge add[/bold] to add entries."
+        )
+        return
+
+    display = entries if not limit else entries[:limit]
+
+    table = Table(title=f"KB corpus — {corpus_path}", show_lines=False)
+    table.add_column("id", style="bold cyan", no_wrap=True)
+    table.add_column("title")
+    table.add_column("tags", style="dim")
+    table.add_column("resolution (preview)")
+
+    _max_res_preview = 60
+    for entry in display:
+        entry_id = str(entry.get("id", ""))
+        title = str(entry.get("title", ""))
+        tags_raw = entry.get("tags", [])
+        tags = ", ".join(str(t) for t in tags_raw) if isinstance(tags_raw, list) else str(tags_raw)
+        resolution = str(entry.get("resolution", ""))
+        if len(resolution) > _max_res_preview:
+            resolution = resolution[:_max_res_preview] + "…"
+        table.add_row(entry_id, title, tags, resolution)
+
+    out.print(table)
+    total = len(entries)
+    shown = len(display)
+    if shown < total:
+        out.print(f"[dim]Showing {shown} of {total} entries. Use --limit 0 to see all.[/dim]")
+    else:
+        out.print(f"[dim]{total} entr{'y' if total == 1 else 'ies'} total.[/dim]")
