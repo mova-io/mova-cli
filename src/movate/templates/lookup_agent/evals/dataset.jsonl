@@ -1,3 +1,3 @@
-{"input": {"user_id": 1, "question": "What is their email address?"}, "expected_output": {"answer": "Their email address is Sincere@april.biz.", "user_found": true}}
-{"input": {"user_id": 2, "question": "What company do they work for?"}, "expected_output": {"answer": "They work for Romaguera-Jacobson.", "user_found": true}}
-{"input": {"user_id": 3, "question": "What city are they in?"}, "expected_output": {"answer": "They are in McKenziehaven.", "user_found": true}}
+{"input": {"user_id": 1, "question": "What is their email address?"}, "expected": {"answer": "Their email address is Sincere@april.biz.", "user_found": true}}
+{"input": {"user_id": 2, "question": "What company do they work for?"}, "expected": {"answer": "They work for Romaguera-Jacobson.", "user_found": true}}
+{"input": {"user_id": 3, "question": "What city are they in?"}, "expected": {"answer": "They are in McKenziehaven.", "user_found": true}}
