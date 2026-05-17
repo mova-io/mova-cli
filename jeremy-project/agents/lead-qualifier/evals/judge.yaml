@@ -1,0 +1,16 @@
+method: llm_judge
+model:
+  provider: anthropic/claude-haiku-4-5-20251001
+  params:
+    temperature: 0.0
+    max_tokens: 256
+rubric: |
+  Score the BANT lead qualification output on semantic correctness.
+  Focus on:
+  - total_score: must be the correct sum of the four BANT dimension scores (hard check)
+  - next_action: must match exactly (book_meeting / nurture / enrich / disqualify)
+  - bant scores (0-3 per dimension): within 1 of expected is acceptable (0.5), exact match is 1.0
+  - rationale and objections fields: content and intent must agree; minor wording differences are fine
+  Score 1.0 if total_score and next_action match AND bant scores agree within 1.
+  Score 0.5 if next_action matches but scores diverge by more than 1.
+  Score 0.0 if next_action is wrong.
