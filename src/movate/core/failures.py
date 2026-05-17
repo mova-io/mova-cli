@@ -22,6 +22,7 @@ class FailureType(StrEnum):
     COST_BUDGET_EXCEEDED = "cost_budget_exceeded"
     POLICY_VIOLATION = "policy_violation"
     TENANT_BUDGET_EXCEEDED = "tenant_budget_exceeded"
+    GUARDRAIL_VIOLATION = "guardrail_violation"
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,10 @@ DEFAULT_RETRY: dict[FailureType, RetryRule] = {
     # operator un-pauses by raising the budget or waiting for month
     # rollover. No retry, no fallback.
     FailureType.TENANT_BUDGET_EXCEEDED: RetryRule(1, (), fallback_on_exhaust=False),
+    # Guardrail violations are security blocks — the same injected input
+    # will always trigger the same pattern. Retrying or falling back to a
+    # different provider can't change the verdict. No retry, no fallback.
+    FailureType.GUARDRAIL_VIOLATION: RetryRule(1, (), fallback_on_exhaust=False),
 }
 
 
@@ -150,4 +155,24 @@ class TenantBudgetExceededError(MovateError):
     """
 
     failure_type = FailureType.TENANT_BUDGET_EXCEEDED
+    retryable = False
+
+
+class GuardrailViolationError(MovateError):
+    """An input guardrail blocked the request before any LLM call.
+
+    Raised at :meth:`Executor.execute` entry when the
+    ``prompt_injection`` (or future) guardrail detects a suspicious
+    pattern in the input dict. The run is aborted with zero token
+    cost — no provider call is ever made.
+
+    Security-block failures are deterministic: retrying the same
+    input will always produce the same verdict, so both
+    ``retryable`` and fallback are disabled. The operator (or a
+    caller-side rate-limit layer) should inspect the ``matched_pattern``
+    in the logged :class:`~movate.core.models.FailureRecord` to
+    understand which rule fired.
+    """
+
+    failure_type = FailureType.GUARDRAIL_VIOLATION
     retryable = False
