@@ -156,6 +156,7 @@ def _gen_user_message(
     *,
     index: int,
     sample_input: dict[str, Any] | None,
+    kb_seed: str | None = None,
 ) -> str:
     """Compose the user-side message asking the LLM to generate one input."""
     schema_json = json.dumps(bundle.input_schema, indent=2)
@@ -167,6 +168,13 @@ def _gen_user_message(
         schema_json,
         "",
     ]
+    if kb_seed is not None:
+        parts.append(
+            "Scenario from the knowledge base (write the input FROM THE USER'S PERSPECTIVE "
+            "describing this problem — do NOT copy verbatim):"
+        )
+        parts.append(kb_seed)
+        parts.append("")
     if sample_input is not None:
         parts.append("Reference example (vary off this style, don't copy verbatim):")
         parts.append(json.dumps(sample_input))
@@ -176,6 +184,42 @@ def _gen_user_message(
         "Reply with ONE JSON object that matches the schema."
     )
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# KB symptom seeding
+# ---------------------------------------------------------------------------
+
+
+def _load_kb_seeds(bundle: AgentBundle, project_root: Path) -> list[str]:
+    """Return symptom strings from the KB corpus when the agent has a kb skill.
+
+    Seeds are used to bias eval-gen inputs toward real scenarios the KB is
+    designed to handle. Falls back to `title` when `symptom` is blank.
+    Returns an empty list when the agent has no KB skill or the corpus is absent.
+    """
+    has_kb = any("kb" in s.spec.name.lower() for s in bundle.skills)
+    if not has_kb:
+        return []
+    corpus_path = project_root / "kb" / "kb-lookup-corpus.json"
+    if not corpus_path.is_file():
+        return []
+    try:
+        data = json.loads(corpus_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    seeds: list[str] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        symptom = str(entry.get("symptom", "")).strip()
+        title = str(entry.get("title", "")).strip()
+        seed = symptom or title
+        if seed:
+            seeds.append(seed)
+    return seeds
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +234,7 @@ async def _generate_entries(
     sample_input: dict[str, Any] | None,
     mock: bool,
     with_dimensions: bool = True,
+    kb_seeds: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build ``num`` ``{input, expected, generated: true}`` entries.
 
@@ -201,17 +246,22 @@ async def _generate_entries(
     ``grounding`` and ``expected_coverage`` fields populated via a
     second LLM call. These fields activate faithfulness and coverage
     scoring in ``mdk eval``.
+
+    When ``kb_seeds`` is provided (non-empty list of symptom strings from
+    the KB corpus), each generated input is seeded with a corpus scenario
+    rotating through the list, so generated cases map to real KB entries.
     """
     rt = await build_local_runtime(mock=mock)
     validator = Draft202012Validator(bundle.input_schema)
     entries: list[dict[str, Any]] = []
     try:
         for i in range(num):
+            kb_seed = kb_seeds[i % len(kb_seeds)] if kb_seeds else None
             if mock:
                 generated_input = _mock_input_for_schema(bundle.input_schema, seed=i)
             else:
                 generated_input = await _generate_one_input(
-                    rt, bundle, index=i, sample_input=sample_input
+                    rt, bundle, index=i, sample_input=sample_input, kb_seed=kb_seed
                 )
             # Validate before running the agent — a bad-schema input
             # blows up the executor with a confusing error. Skip + log.
@@ -329,6 +379,7 @@ async def _generate_one_input(
     *,
     index: int,
     sample_input: dict[str, Any] | None,
+    kb_seed: str | None = None,
 ) -> dict[str, Any]:
     """Ask the LLM for one input. Provider call goes through the
     same registry the agent uses, so OPENAI_API_KEY etc. follow the
@@ -338,13 +389,15 @@ async def _generate_one_input(
     Lifts yield on flaky-output models from ~80% to ~95% in
     practice — one extra call is cheap relative to the case it saves.
     """
-    parsed = await _attempt_generate(rt, bundle, index=index, sample_input=sample_input, nudge="")
+    parsed = await _attempt_generate(
+        rt, bundle, index=index, sample_input=sample_input, nudge="", kb_seed=kb_seed
+    )
     if parsed is not None:
         return parsed
 
     # One retry with a stricter system-prompt nudge.
     parsed = await _attempt_generate(
-        rt, bundle, index=index, sample_input=sample_input, nudge=_RETRY_NUDGE
+        rt, bundle, index=index, sample_input=sample_input, nudge=_RETRY_NUDGE, kb_seed=kb_seed
     )
     if parsed is not None:
         return parsed
@@ -362,6 +415,7 @@ async def _attempt_generate(
     index: int,
     sample_input: dict[str, Any] | None,
     nudge: str,
+    kb_seed: str | None = None,
 ) -> dict[str, Any] | None:
     """One LLM call + parse. Returns None on any failure so the caller
     can decide whether to retry."""
@@ -375,7 +429,9 @@ async def _attempt_generate(
             Message(role="system", content=system),
             Message(
                 role="user",
-                content=_gen_user_message(bundle, index=index, sample_input=sample_input),
+                content=_gen_user_message(
+                    bundle, index=index, sample_input=sample_input, kb_seed=kb_seed
+                ),
             ),
         ],
         params={"temperature": 0.9, "max_tokens": 512},
@@ -750,6 +806,8 @@ def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state
             failed_count += 1
             continue
 
+        agent_kb_seeds = _load_kb_seeds(bundle, root) or None
+
         try:
             entries = asyncio.run(
                 _generate_entries(
@@ -758,6 +816,7 @@ def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state
                     sample_input=parsed_sample,
                     mock=mock,
                     with_dimensions=with_dimensions,
+                    kb_seeds=agent_kb_seeds,
                 )
             )
         except Exception as exc:  # last-resort guard for one-agent failures
@@ -780,11 +839,12 @@ def _eval_gen_all_in_project(  # noqa: PLR0912 — orchestrator; per-agent state
         with target.open("w", encoding="utf-8") as fh:
             for entry in entries:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        seed_suffix = f", {len(agent_kb_seeds)} KB seeds" if agent_kb_seeds else ""
         rows.append(
             (
                 agent_name,
                 "[green]✓ generated[/green]",
-                f"{len(entries)}/{num} cases → {target.relative_to(root)}",
+                f"{len(entries)}/{num} cases → {target.relative_to(root)}{seed_suffix}",
             )
         )
         generated_count += 1
@@ -1030,9 +1090,11 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
         )
         raise typer.Exit(code=2)
 
+    kb_seeds = _load_kb_seeds(bundle, root)
+    seed_note = f", seeding from {len(kb_seeds)} KB symptom(s)" if kb_seeds else ""
     console.print(
         f"[dim]Generating {num} case(s) for [bold]{bundle.spec.name}[/bold]"
-        f"{' (mock)' if mock else ''}…[/dim]"
+        f"{' (mock)' if mock else ''}{seed_note}…[/dim]"
     )
 
     entries = asyncio.run(
@@ -1042,6 +1104,7 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
             sample_input=parsed_sample,
             mock=mock,
             with_dimensions=with_dimensions,
+            kb_seeds=kb_seeds or None,
         )
     )
 
