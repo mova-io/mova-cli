@@ -111,9 +111,7 @@ def _show_project() -> None:  # noqa: PLR0912 — three independent asset tables
         for skill in raw.get("skills") or []:
             skills_map.setdefault(skill, []).append(agent_dir.name)
 
-    console.print(
-        f"\n[bold]Project asset map — {project_root.name}[/bold]\n"
-    )
+    console.print(f"\n[bold]Project asset map — {project_root.name}[/bold]\n")
 
     # Contexts table.
     ctx_table = Table(title="Contexts", show_header=True, header_style="bold")
@@ -175,6 +173,7 @@ def _show_project() -> None:  # noqa: PLR0912 — three independent asset tables
     for kb_file in kb_files:
         try:
             import json as _json  # noqa: PLC0415
+
             data = _json.loads(kb_file.read_text())
             entry_count = str(len(data)) if isinstance(data, list) else "?"
         except Exception:

@@ -70,17 +70,13 @@ class TestAddKb:
         assert result.exit_code == 2
         assert "already exists" in result.stderr
 
-    def test_errors_outside_project(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_outside_project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["add", "kb"])
         assert result.exit_code == 2
         assert "not inside a movate project" in result.stderr
 
-    def test_greppable_summary_line(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_greppable_summary_line(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["add", "kb"])
@@ -107,18 +103,14 @@ class TestAddSkillBare:
         assert (skill_dir / "skill.yaml").is_file()
         assert (skill_dir / "impl.py").is_file()
 
-    def test_skill_yaml_has_name(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_skill_yaml_has_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         runner.invoke(app, ["add", "skill", "my-skill"])
         content = (proj / "skills" / "my-skill" / "skill.yaml").read_text()
         assert "my-skill" in content
 
-    def test_impl_has_run_function(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_impl_has_run_function(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         runner.invoke(app, ["add", "skill", "my-skill"])
@@ -136,35 +128,27 @@ class TestAddSkillBare:
         assert result.exit_code == 2
         assert "already exists" in result.stderr
 
-    def test_errors_on_invalid_name(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_on_invalid_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["add", "skill", "Bad_Name"])
         assert result.exit_code == 2
         assert "invalid" in result.stderr
 
-    def test_errors_on_missing_name(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_on_missing_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["add", "skill"])
         assert result.exit_code == 2
         assert "skill name required" in result.stderr
 
-    def test_errors_outside_project(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_outside_project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(app, ["add", "skill", "my-skill"])
         assert result.exit_code == 2
         assert "not inside a movate project" in result.stderr
 
-    def test_greppable_summary_line(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_greppable_summary_line(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["add", "skill", "my-skill"])
@@ -172,9 +156,7 @@ class TestAddSkillBare:
         assert "mdk_add_skill_summary:" in result.stdout
         assert "ok=true" in result.stdout
 
-    def test_hyphen_in_name_valid(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_hyphen_in_name_valid(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["add", "skill", "send-email"])
@@ -232,17 +214,13 @@ class TestKnowledgeAdd:
         assert result.exit_code == 2
         assert "id" in result.stderr.lower() or "required" in result.stderr.lower()
 
-    def test_errors_on_invalid_json(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_on_invalid_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         result = runner.invoke(app, ["knowledge", "add", "--json", "{not valid json}"])
         assert result.exit_code == 2
 
-    def test_prints_entry_count(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_prints_entry_count(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _bootstrap_project(tmp_path)
         monkeypatch.chdir(proj)
         entry = json.dumps({"id": "KB-1", "title": "T", "resolution": "R"})

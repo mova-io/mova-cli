@@ -664,9 +664,9 @@ def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> 
 
         with httpx.Client(timeout=httpx.Timeout(10.0)) as diff_client:
             for agent_dir in agent_dirs:
-                local_hash = hashlib.sha256(
-                    (agent_dir / "agent.yaml").read_bytes()
-                ).hexdigest()[:12]
+                local_hash = hashlib.sha256((agent_dir / "agent.yaml").read_bytes()).hexdigest()[
+                    :12
+                ]
                 try:
                     resp = diff_client.get(
                         f"{base_url_diff}/api/v1/agents/{agent_dir.name}",
@@ -677,30 +677,23 @@ def _deploy_agents(*, target: str | None, dry_run: bool, diff: bool = False) -> 
                         deployed_hash = (deployed.get("agent_yaml_hash") or "")[:12]
                         if deployed_hash and local_hash == deployed_hash:
                             diff_table.add_row(
-                                agent_dir.name, "[dim]unchanged[/dim]",
-                                f"hash={local_hash}"
+                                agent_dir.name, "[dim]unchanged[/dim]", f"hash={local_hash}"
                             )
                         else:
                             note = (
                                 f"local={local_hash} deployed={deployed_hash}"
-                                if deployed_hash else f"local={local_hash} (no hash in API)"
+                                if deployed_hash
+                                else f"local={local_hash} (no hash in API)"
                             )
-                            diff_table.add_row(
-                                agent_dir.name, "[yellow]changed[/yellow]", note
-                            )
+                            diff_table.add_row(agent_dir.name, "[yellow]changed[/yellow]", note)
                     elif resp.status_code == httpx.codes.NOT_FOUND:
-                        diff_table.add_row(
-                            agent_dir.name, "[green]new[/green]", "not yet deployed"
-                        )
+                        diff_table.add_row(agent_dir.name, "[green]new[/green]", "not yet deployed")
                     else:
                         diff_table.add_row(
-                            agent_dir.name, "[yellow]?[/yellow]",
-                            f"HTTP {resp.status_code}"
+                            agent_dir.name, "[yellow]?[/yellow]", f"HTTP {resp.status_code}"
                         )
                 except httpx.HTTPError:
-                    diff_table.add_row(
-                        agent_dir.name, "[yellow]?[/yellow]", "runtime unreachable"
-                    )
+                    diff_table.add_row(agent_dir.name, "[yellow]?[/yellow]", "runtime unreachable")
 
         err.print(diff_table)
         err.print(
@@ -873,8 +866,7 @@ def _upload_skills(
         return [], []
 
     skill_dirs = sorted(
-        d for d in skills_dir.iterdir()
-        if d.is_dir() and (d / "skill.yaml").is_file()
+        d for d in skills_dir.iterdir() if d.is_dir() and (d / "skill.yaml").is_file()
     )
     if not skill_dirs:
         return [], []
@@ -908,10 +900,12 @@ def _upload_skills(
         if resp.status_code in (_HTTP_OK, _HTTP_CREATED):
             uploaded.append(name)
         elif resp.status_code == _HTTP_SERVICE_UNAVAILABLE:
-            failed.append((
-                name,
-                "runtime has no skills_path — restart with skills_path configured",
-            ))
+            failed.append(
+                (
+                    name,
+                    "runtime has no skills_path — restart with skills_path configured",
+                )
+            )
         elif resp.status_code == _HTTP_UNAUTHORIZED:
             failed.append((name, "unauthorized — check bearer token"))
         else:
@@ -1095,8 +1089,22 @@ def _schema_bytes_for_upload(path: Path, *, label: str) -> tuple[bytes, str]:
         return path.read_bytes(), f"{label}.json"
     if not isinstance(data, dict):
         return path.read_bytes(), f"{label}.json"
-    # Shape-sniff: hand-written JSON Schema vs shorthand. Same heuristic
-    # as the loader (movate.core.loader._load_schema_doc).
+    # Shape-sniff: canonical MDK format (version: 1 + fields:) first, then
+    # hand-written JSON Schema, then shorthand. Same detection order as the
+    # loader (movate.core.loader._load_schema_doc).
+    from movate.core.canonical_schema import (  # noqa: PLC0415
+        CanonicalSchemaError,
+        compile_canonical,
+        is_canonical_format,
+    )
+
+    if is_canonical_format(data):
+        try:
+            data = compile_canonical(data)
+        except CanonicalSchemaError:
+            return path.read_bytes(), f"{label}.json"
+        return json.dumps(data, separators=(",", ":")).encode(), f"{label}.json"
+
     is_json_schema = "$schema" in data or (data.get("type") == "object" and "properties" in data)
     if not is_json_schema:
         # Shorthand → compile to JSON Schema via the same compiler the

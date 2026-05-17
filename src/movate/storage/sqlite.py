@@ -934,9 +934,7 @@ def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
             datetime.fromisoformat(row_dict["revoked_at"]) if row_dict["revoked_at"] else None
         ),
         expires_at=(
-            datetime.fromisoformat(row_dict["expires_at"])
-            if row_dict.get("expires_at")
-            else None
+            datetime.fromisoformat(row_dict["expires_at"]) if row_dict.get("expires_at") else None
         ),
     )
 

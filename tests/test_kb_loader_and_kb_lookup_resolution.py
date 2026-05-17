@@ -131,9 +131,7 @@ class TestResolveKbFile:
         result = resolve_kb_file("kb-lookup-corpus.json", start=skill_dir)
         assert result == corpus
 
-    def test_agent_local_falls_through_to_project_when_kb_absent(
-        self, tmp_path: Path
-    ) -> None:
+    def test_agent_local_falls_through_to_project_when_kb_absent(self, tmp_path: Path) -> None:
         """If the agent boundary is found but kb/<name> is missing,
         the walk continues and finds the project-level kb/ instead.
 

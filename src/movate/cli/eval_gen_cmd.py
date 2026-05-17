@@ -438,11 +438,7 @@ async def _enrich_with_dimensions(
                 text = text[4:]
             text = text.strip()
         parsed = json.loads(text)
-        if (
-            isinstance(parsed, dict)
-            and "grounding" in parsed
-            and "expected_coverage" in parsed
-        ):
+        if isinstance(parsed, dict) and "grounding" in parsed and "expected_coverage" in parsed:
             return {
                 "grounding": str(parsed["grounding"]),
                 "expected_coverage": list(parsed["expected_coverage"]),
@@ -477,7 +473,12 @@ async def _generate_one_input(
 
     # One retry with a stricter system-prompt nudge.
     parsed = await _attempt_generate(
-        rt, bundle, index=index, sample_input=sample_input, nudge=_RETRY_NUDGE, kb_seed=kb_seed,
+        rt,
+        bundle,
+        index=index,
+        sample_input=sample_input,
+        nudge=_RETRY_NUDGE,
+        kb_seed=kb_seed,
         mode=mode,
     )
     if parsed is not None:
@@ -1162,8 +1163,7 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
 
     if mode not in _VALID_MODES:
         err_console.print(
-            f"[red]✗[/red] unknown --mode {mode!r}. "
-            f"Valid values: {', '.join(_VALID_MODES)}."
+            f"[red]✗[/red] unknown --mode {mode!r}. Valid values: {', '.join(_VALID_MODES)}."
         )
         raise typer.Exit(code=2)
 

@@ -26,7 +26,6 @@ runner = CliRunner(mix_stderr=False)
 
 def _make_bundle(tmp_path: Path, *, has_kb_skill: bool = True) -> object:
     """Build a minimal AgentBundle-like object for unit tests."""
-    from movate.cli.main import app  # noqa: PLC0415  — ensure app registered
 
     monkeypatch_path = tmp_path / "proj"
     monkeypatch_path.mkdir(exist_ok=True)
@@ -56,21 +55,33 @@ class TestLoadKbSeeds:
     def _make_simple_bundle(self, skill_names: list[str]) -> object:
         """Minimal duck-typed bundle with just .skills."""
         from types import SimpleNamespace  # noqa: PLC0415
+
         return SimpleNamespace(
-            skills=[
-                SimpleNamespace(spec=SimpleNamespace(name=sn))
-                for sn in skill_names
-            ]
+            skills=[SimpleNamespace(spec=SimpleNamespace(name=sn)) for sn in skill_names]
         )
 
     def test_returns_symptoms_for_kb_agent(self, tmp_path: Path) -> None:
         bundle = self._make_simple_bundle(["kb-lookup"])
         kb_dir = tmp_path / "kb"
         kb_dir.mkdir()
-        (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "title": "Login fails", "symptom": "User cannot log in", "resolution": "x"},
-            {"id": "2", "title": "Slow API", "symptom": "API response is slow", "resolution": "y"},
-        ]))
+        (kb_dir / "kb-lookup-corpus.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "1",
+                        "title": "Login fails",
+                        "symptom": "User cannot log in",
+                        "resolution": "x",
+                    },
+                    {
+                        "id": "2",
+                        "title": "Slow API",
+                        "symptom": "API response is slow",
+                        "resolution": "y",
+                    },
+                ]
+            )
+        )
         seeds = _load_kb_seeds(bundle, tmp_path)
         assert seeds == ["User cannot log in", "API response is slow"]
 
@@ -78,10 +89,14 @@ class TestLoadKbSeeds:
         bundle = self._make_simple_bundle(["kb-lookup"])
         kb_dir = tmp_path / "kb"
         kb_dir.mkdir()
-        (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "title": "Login fails", "symptom": "", "resolution": "x"},
-            {"id": "2", "title": "Billing error", "resolution": "y"},  # no symptom key
-        ]))
+        (kb_dir / "kb-lookup-corpus.json").write_text(
+            json.dumps(
+                [
+                    {"id": "1", "title": "Login fails", "symptom": "", "resolution": "x"},
+                    {"id": "2", "title": "Billing error", "resolution": "y"},  # no symptom key
+                ]
+            )
+        )
         seeds = _load_kb_seeds(bundle, tmp_path)
         assert seeds == ["Login fails", "Billing error"]
 
@@ -89,9 +104,13 @@ class TestLoadKbSeeds:
         bundle = self._make_simple_bundle(["summarize", "translate"])
         kb_dir = tmp_path / "kb"
         kb_dir.mkdir()
-        (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "title": "T", "symptom": "S", "resolution": "R"},
-        ]))
+        (kb_dir / "kb-lookup-corpus.json").write_text(
+            json.dumps(
+                [
+                    {"id": "1", "title": "T", "symptom": "S", "resolution": "R"},
+                ]
+            )
+        )
         seeds = _load_kb_seeds(bundle, tmp_path)
         assert seeds == []
 
@@ -112,11 +131,20 @@ class TestLoadKbSeeds:
         bundle = self._make_simple_bundle(["kb-lookup"])
         kb_dir = tmp_path / "kb"
         kb_dir.mkdir()
-        (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "symptom": "Real symptom", "resolution": "x"},
-            {"id": "2", "resolution": "no title no symptom"},  # skipped
-            {"id": "3", "title": "", "symptom": "", "resolution": "empty strings"},  # skipped
-        ]))
+        (kb_dir / "kb-lookup-corpus.json").write_text(
+            json.dumps(
+                [
+                    {"id": "1", "symptom": "Real symptom", "resolution": "x"},
+                    {"id": "2", "resolution": "no title no symptom"},  # skipped
+                    {
+                        "id": "3",
+                        "title": "",
+                        "symptom": "",
+                        "resolution": "empty strings",
+                    },  # skipped
+                ]
+            )
+        )
         seeds = _load_kb_seeds(bundle, tmp_path)
         assert seeds == ["Real symptom"]
 
@@ -124,10 +152,14 @@ class TestLoadKbSeeds:
         bundle = self._make_simple_bundle(["kb-lookup"])
         kb_dir = tmp_path / "kb"
         kb_dir.mkdir()
-        (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "title": "A", "symptom": "Symptom A", "resolution": "x"},
-            {"id": "2", "title": "Title B", "resolution": "y"},  # fallback to title
-        ]))
+        (kb_dir / "kb-lookup-corpus.json").write_text(
+            json.dumps(
+                [
+                    {"id": "1", "title": "A", "symptom": "Symptom A", "resolution": "x"},
+                    {"id": "2", "title": "Title B", "resolution": "y"},  # fallback to title
+                ]
+            )
+        )
         seeds = _load_kb_seeds(bundle, tmp_path)
         assert seeds == ["Symptom A", "Title B"]
 
@@ -141,6 +173,7 @@ class TestLoadKbSeeds:
 class TestGenUserMessageKbSeed:
     def _make_bundle(self) -> object:
         from types import SimpleNamespace  # noqa: PLC0415
+
         return SimpleNamespace(
             spec=SimpleNamespace(name="triage", description="Triages tickets"),
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
@@ -162,9 +195,7 @@ class TestGenUserMessageKbSeed:
     def test_both_kb_seed_and_sample_input_included(self) -> None:
         bundle = self._make_bundle()
         sample = {"text": "example query"}
-        msg = _gen_user_message(
-            bundle, index=0, sample_input=sample, kb_seed="API timeout errors"
-        )
+        msg = _gen_user_message(bundle, index=0, sample_input=sample, kb_seed="API timeout errors")
         assert "API timeout errors" in msg
         assert "example query" in msg
 
@@ -176,9 +207,7 @@ class TestGenUserMessageKbSeed:
 
 @pytest.mark.unit
 class TestEvalGenKbSeedIntegration:
-    def _scaffold(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> Path:
+    def _scaffold(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
@@ -196,10 +225,24 @@ class TestEvalGenKbSeedIntegration:
         project = self._scaffold(tmp_path, monkeypatch)
         kb_dir = project / "kb"
         kb_dir.mkdir(exist_ok=True)
-        (kb_dir / "kb-lookup-corpus.json").write_text(json.dumps([
-            {"id": "1", "title": "Auth error", "symptom": "Cannot log in", "resolution": "reset"},
-            {"id": "2", "title": "Slow API", "symptom": "Requests timing out", "resolution": "cache"},
-        ]))
+        (kb_dir / "kb-lookup-corpus.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "1",
+                        "title": "Auth error",
+                        "symptom": "Cannot log in",
+                        "resolution": "reset",
+                    },
+                    {
+                        "id": "2",
+                        "title": "Slow API",
+                        "symptom": "Requests timing out",
+                        "resolution": "cache",
+                    },
+                ]
+            )
+        )
         result = runner.invoke(
             app,
             ["eval-gen", "ticket-triager", "--num", "2", "--mock", "--force"],

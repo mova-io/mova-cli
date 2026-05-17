@@ -268,8 +268,7 @@ def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) 
             "failed": failed,
             "ok": failed == 0,
             "items": [
-                {"kind": kind, "name": name, "ok": status == "ok"}
-                for kind, name, status, _ in rows
+                {"kind": kind, "name": name, "ok": status == "ok"} for kind, name, status, _ in rows
             ],
         }
         console.print_json(json.dumps(payload))
@@ -471,17 +470,17 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             skill.spec.implementation.kind == SkillImplementationKind.PYTHON
             and not (skill.skill_dir / "impl.py").is_file()
         ):
-                console.print(
-                    f"  [red]✗[/red] skill [bold]{skill.spec.name!r}[/bold]: "
-                    f"[bold]impl.py[/bold] not found in [dim]{skill.skill_dir}[/dim] — "
-                    "skill will raise ModuleNotFoundError at runtime."
-                )
-                console.print(
-                    "    [dim]hint: create [bold]impl.py[/bold] with an async "
-                    "[bold]run(input, ctx)[/bold] function, or use "
-                    "[bold]mdk add <template>[/bold] to scaffold one.[/dim]"
-                )
-                raise typer.Exit(code=2)
+            console.print(
+                f"  [red]✗[/red] skill [bold]{skill.spec.name!r}[/bold]: "
+                f"[bold]impl.py[/bold] not found in [dim]{skill.skill_dir}[/dim] — "
+                "skill will raise ModuleNotFoundError at runtime."
+            )
+            console.print(
+                "    [dim]hint: create [bold]impl.py[/bold] with an async "
+                "[bold]run(input, ctx)[/bold] function, or use "
+                "[bold]mdk add <template>[/bold] to scaffold one.[/dim]"
+            )
+            raise typer.Exit(code=2)
 
     _check_kb_corpus(bundle)
 
@@ -584,10 +583,7 @@ def _check_dataset_jsonl(path: Path) -> None:
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        console.print(
-            f"  [yellow]![/yellow] dataset [bold]{path.name}[/bold] "
-            f"unreadable: {exc}"
-        )
+        console.print(f"  [yellow]![/yellow] dataset [bold]{path.name}[/bold] unreadable: {exc}")
         return
     lines = [ln for ln in raw.splitlines() if ln.strip()]
     if not lines:
@@ -601,8 +597,7 @@ def _check_dataset_jsonl(path: Path) -> None:
             obj = json.loads(line)
         except json.JSONDecodeError as exc:
             console.print(
-                f"  [red]✗[/red] dataset [bold]{path.name}:{i}[/bold] "
-                f"invalid JSON: {exc}"
+                f"  [red]✗[/red] dataset [bold]{path.name}:{i}[/bold] invalid JSON: {exc}"
             )
             raise typer.Exit(code=2) from None
         if not isinstance(obj, dict):
@@ -651,10 +646,7 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
                 f"[bold]kb/kb-lookup-corpus.json[/bold] not found — "
                 "skill will use the bundled demo corpus at runtime."
             )
-        console.print(
-            f"    [dim]hint: drop your real corpus at "
-            f"[bold]{corpus_path}[/bold][/dim]"
-        )
+        console.print(f"    [dim]hint: drop your real corpus at [bold]{corpus_path}[/bold][/dim]")
         return
 
     # Corpus exists — validate entry fields.
@@ -662,14 +654,12 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
         entries = _json.loads(corpus_path.read_text())
     except (OSError, _json.JSONDecodeError) as exc:
         console.print(
-            f"  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
-            f"could not be parsed: {exc}"
+            f"  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] could not be parsed: {exc}"
         )
         return
     if not isinstance(entries, list):
         console.print(
-            "  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] "
-            "must be a JSON array."
+            "  [yellow]![/yellow] [bold]kb/kb-lookup-corpus.json[/bold] must be a JSON array."
         )
         return
     if len(entries) == 0:
@@ -770,7 +760,8 @@ def _check_orphaned_assets(project_root: Path, agent_dirs: list[Path]) -> None:
     ctx_dir = project_root / "contexts"
     if ctx_dir.is_dir():
         orphaned = sorted(
-            f for f in ctx_dir.glob("*.md")
+            f
+            for f in ctx_dir.glob("*.md")
             if _CTX_NAME_RE.match(f.stem) and f.stem not in declared_contexts
         )
         for f in orphaned:

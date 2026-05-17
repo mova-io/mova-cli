@@ -164,8 +164,7 @@ def whoami(
     import httpx  # noqa: PLC0415
 
     if target is not None:
-        from movate.config import resolve_target  # noqa: PLC0415
-        from movate.core.config import UserConfigError  # noqa: PLC0415
+        from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
 
         try:
             _, target_cfg = resolve_target(target)
@@ -184,14 +183,10 @@ def whoami(
         api_key = os.environ.get("MDK_API_KEY", os.environ.get("MOVATE_API_KEY", "")).strip()
         base_url = os.environ.get("MDK_RUNTIME_URL", "").rstrip("/")
         if not api_key:
-            error(
-                "no API key found. Pass --target or set MDK_API_KEY."
-            )
+            error("no API key found. Pass --target or set MDK_API_KEY.")
             raise typer.Exit(code=2)
         if not base_url:
-            error(
-                "no runtime URL found. Pass --target or set MDK_RUNTIME_URL."
-            )
+            error("no runtime URL found. Pass --target or set MDK_RUNTIME_URL.")
             raise typer.Exit(code=2)
 
     try:

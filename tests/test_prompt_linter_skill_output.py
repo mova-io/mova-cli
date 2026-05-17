@@ -15,13 +15,13 @@ Also verifies that:
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from movate.core.prompt_linter import LintIssue, lint_prompt, _skill_output_var_name
-
+from movate.core.prompt_linter import LintIssue, _skill_output_var_name, lint_prompt
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,11 +48,13 @@ def _make_bundle(
     return SimpleNamespace(
         prompt_template=prompt,
         skills=skills or [],
-        input_schema=input_schema or {
+        input_schema=input_schema
+        or {
             "type": "object",
             "properties": {"text": {"type": "string"}},
         },
-        output_schema=output_schema or {
+        output_schema=output_schema
+        or {
             "type": "object",
             "properties": {"reply": {"type": "string"}},
         },
@@ -101,16 +103,12 @@ class TestSkillOutputRefMismatch:
 
     def test_no_issues_on_correct_field_ref(self) -> None:
         skill = _make_skill("web-search", {"results": {}, "warning": {}})
-        bundle = _make_bundle(
-            "Results: {{ web_search_output.results }}", skills=[skill]
-        )
+        bundle = _make_bundle("Results: {{ web_search_output.results }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
     def test_mismatch_fires_for_unknown_field(self) -> None:
         skill = _make_skill("web-search", {"results": {}, "warning": {}})
-        bundle = _make_bundle(
-            "Data: {{ web_search_output.hits }}", skills=[skill]
-        )
+        bundle = _make_bundle("Data: {{ web_search_output.hits }}", skills=[skill])
         issues = lint_prompt(bundle)
         mismatch = [i for i in issues if i.code == "SKILL_OUTPUT_REF_MISMATCH"]
         assert mismatch, "expected SKILL_OUTPUT_REF_MISMATCH"
@@ -127,16 +125,12 @@ class TestSkillOutputRefMismatch:
 
     def test_hyphenated_skill_name_maps_to_underscored_var(self) -> None:
         skill = _make_skill("kb-lookup", {"answer": {}, "citations": {}})
-        bundle = _make_bundle(
-            "Answer: {{ kb_lookup_output.answer }}", skills=[skill]
-        )
+        bundle = _make_bundle("Answer: {{ kb_lookup_output.answer }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
     def test_hyphenated_skill_bad_field_caught(self) -> None:
         skill = _make_skill("kb-lookup", {"answer": {}})
-        bundle = _make_bundle(
-            "Score: {{ kb_lookup_output.score }}", skills=[skill]
-        )
+        bundle = _make_bundle("Score: {{ kb_lookup_output.score }}", skills=[skill])
         issues = [i for i in lint_prompt(bundle) if i.code == "SKILL_OUTPUT_REF_MISMATCH"]
         assert issues
         assert "score" in issues[0].message
@@ -161,16 +155,15 @@ class TestSkillOutputRefMismatch:
 
     def test_open_schema_no_properties_skipped(self) -> None:
         skill = _make_skill("my-skill", None)  # no properties → open schema
-        bundle = _make_bundle(
-            "{{ my_skill_output.anything }}", skills=[skill]
-        )
+        bundle = _make_bundle("{{ my_skill_output.anything }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
     def test_multiple_skills_only_mismatch_flagged(self) -> None:
         skill_a = _make_skill("searcher", {"result": {}})
         skill_b = _make_skill("formatter", {"html": {}})
         bundle = _make_bundle(
-            "{{ searcher_output.result }} {{ formatter_output.bad_field }}", skills=[skill_a, skill_b]
+            "{{ searcher_output.result }} {{ formatter_output.bad_field }}",
+            skills=[skill_a, skill_b],
         )
         issues = [i for i in lint_prompt(bundle) if i.code == "SKILL_OUTPUT_REF_MISMATCH"]
         assert len(issues) == 1
@@ -178,9 +171,7 @@ class TestSkillOutputRefMismatch:
 
     def test_unrelated_var_not_flagged(self) -> None:
         skill = _make_skill("web-search", {"results": {}})
-        bundle = _make_bundle(
-            "{{ loop.index }}: {{ item.title }}", skills=[skill]
-        )
+        bundle = _make_bundle("{{ loop.index }}: {{ item.title }}", skills=[skill])
         assert "SKILL_OUTPUT_REF_MISMATCH" not in _codes(lint_prompt(bundle))
 
 
@@ -193,7 +184,6 @@ class TestSkillOutputRefMismatch:
 def test_rag_qa_scaffold_clean(tmp_path: Path) -> None:
     """The rag-qa template's prompt does not use <skill>_output vars at
     all — so the rule should not fire, even with web-search skill present."""
-    from pathlib import Path  # noqa: PLC0415 — re-import for fixture scope
 
     from movate.core.loader import load_agent  # noqa: PLC0415
     from movate.testing import scaffold_agent  # noqa: PLC0415

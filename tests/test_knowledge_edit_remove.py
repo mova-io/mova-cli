@@ -43,14 +43,15 @@ def _write_corpus(proj: Path, entries: list[dict]) -> Path:
 @pytest.mark.unit
 class TestKnowledgeRemove:
     def _corpus_with_two(self, proj: Path) -> Path:
-        return _write_corpus(proj, [
-            {"id": "KB-1", "title": "First", "resolution": "Fix 1"},
-            {"id": "KB-2", "title": "Second", "resolution": "Fix 2"},
-        ])
+        return _write_corpus(
+            proj,
+            [
+                {"id": "KB-1", "title": "First", "resolution": "Fix 1"},
+                {"id": "KB-2", "title": "Second", "resolution": "Fix 2"},
+            ],
+        )
 
-    def test_removes_entry_with_yes(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_removes_entry_with_yes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         corpus = self._corpus_with_two(proj)
         monkeypatch.chdir(proj)
@@ -60,9 +61,7 @@ class TestKnowledgeRemove:
         assert len(remaining) == 1
         assert remaining[0]["id"] == "KB-2"
 
-    def test_output_confirms_removal(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_output_confirms_removal(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         self._corpus_with_two(proj)
         monkeypatch.chdir(proj)
@@ -70,9 +69,7 @@ class TestKnowledgeRemove:
         assert "KB-1" in result.stdout
         assert "removed" in result.stdout.lower() or "✓" in result.stdout
 
-    def test_errors_on_missing_id(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_on_missing_id(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         self._corpus_with_two(proj)
         monkeypatch.chdir(proj)
@@ -116,13 +113,14 @@ class TestKnowledgeRemove:
 @pytest.mark.unit
 class TestKnowledgeEdit:
     def _corpus(self, proj: Path) -> Path:
-        return _write_corpus(proj, [
-            {"id": "KB-1", "title": "Old title", "resolution": "Old fix", "tags": ["x"]},
-        ])
+        return _write_corpus(
+            proj,
+            [
+                {"id": "KB-1", "title": "Old title", "resolution": "Old fix", "tags": ["x"]},
+            ],
+        )
 
-    def test_patches_named_field(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_patches_named_field(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         corpus = self._corpus(proj)
         monkeypatch.chdir(proj)
@@ -132,9 +130,7 @@ class TestKnowledgeEdit:
         data = json.loads(corpus.read_text())
         assert data[0]["resolution"] == "New fix"
 
-    def test_preserves_other_fields(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_preserves_other_fields(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         corpus = self._corpus(proj)
         monkeypatch.chdir(proj)
@@ -144,9 +140,7 @@ class TestKnowledgeEdit:
         assert data[0]["title"] == "Old title"
         assert data[0]["tags"] == ["x"]
 
-    def test_can_rename_id(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_can_rename_id(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         corpus = self._corpus(proj)
         monkeypatch.chdir(proj)
@@ -156,9 +150,7 @@ class TestKnowledgeEdit:
         data = json.loads(corpus.read_text())
         assert data[0]["id"] == "KB-999"
 
-    def test_errors_on_missing_id(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_errors_on_missing_id(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         proj = _project(tmp_path)
         self._corpus(proj)
         monkeypatch.chdir(proj)
@@ -203,9 +195,7 @@ class TestKnowledgeEdit:
 
 @pytest.mark.unit
 class TestValidateEmptyCorpus:
-    def _scaffold_kb_agent(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> Path:
+    def _scaffold_kb_agent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
@@ -217,27 +207,19 @@ class TestValidateEmptyCorpus:
         monkeypatch.chdir(project)
         return project
 
-    def test_empty_corpus_warns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_empty_corpus_warns(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         project = self._scaffold_kb_agent(tmp_path, monkeypatch)
         (project / "kb").mkdir(exist_ok=True)
         (project / "kb" / "kb-lookup-corpus.json").write_text("[]")
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "empty" in result.stdout
         assert "mdk knowledge add" in result.stdout
 
-    def test_nonempty_corpus_clean(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_nonempty_corpus_clean(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         project = self._scaffold_kb_agent(tmp_path, monkeypatch)
         (project / "kb").mkdir(exist_ok=True)
         (project / "kb" / "kb-lookup-corpus.json").write_text(
             json.dumps([{"id": "KB-1", "title": "T", "resolution": "R", "tags": []}])
         )
-        result = runner.invoke(
-            app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"}
-        )
+        result = runner.invoke(app, ["validate", "agents/ticket-triager"], env={"COLUMNS": "200"})
         assert "empty" not in result.stdout

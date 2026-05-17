@@ -65,39 +65,45 @@ def _make_agent(agent_dir: Path, *, name: str, input_key: str, output_key: str) 
     (agent_dir / "schema").mkdir(exist_ok=True)
     (agent_dir / "evals").mkdir(exist_ok=True)
     (agent_dir / "agent.yaml").write_text(
-        yaml.safe_dump({
-            "api_version": "movate/v1",
-            "kind": "Agent",
-            "name": name,
-            "version": "0.1.0",
-            "description": f"reads {input_key}, writes {output_key}",
-            "model": {
-                "provider": "openai/gpt-4o-mini-2024-07-18",
-                "params": {"temperature": 0.0},
-            },
-            "prompt": "./prompt.md",
-            "schema": {"input": "./schema/input.json", "output": "./schema/output.json"},
-            "evals": {"dataset": "./evals/dataset.jsonl"},
-        })
+        yaml.safe_dump(
+            {
+                "api_version": "movate/v1",
+                "kind": "Agent",
+                "name": name,
+                "version": "0.1.0",
+                "description": f"reads {input_key}, writes {output_key}",
+                "model": {
+                    "provider": "openai/gpt-4o-mini-2024-07-18",
+                    "params": {"temperature": 0.0},
+                },
+                "prompt": "./prompt.md",
+                "schema": {"input": "./schema/input.json", "output": "./schema/output.json"},
+                "evals": {"dataset": "./evals/dataset.jsonl"},
+            }
+        )
     )
     (agent_dir / "prompt.md").write_text(f"echo {{{{ input.{input_key} }}}} as {output_key}\n")
     (agent_dir / "schema" / "input.json").write_text(
-        json.dumps({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "additionalProperties": False,
-            "required": [input_key],
-            "properties": {input_key: {"type": "string"}},
-        })
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": False,
+                "required": [input_key],
+                "properties": {input_key: {"type": "string"}},
+            }
+        )
     )
     (agent_dir / "schema" / "output.json").write_text(
-        json.dumps({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "object",
-            "additionalProperties": False,
-            "required": [output_key],
-            "properties": {output_key: {"type": "string"}},
-        })
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": False,
+                "required": [output_key],
+                "properties": {output_key: {"type": "string"}},
+            }
+        )
     )
     (agent_dir / "evals" / "dataset.jsonl").write_text(
         json.dumps({"input": {input_key: "x"}, "expected": {output_key: "x"}}) + "\n"
@@ -274,9 +280,7 @@ def test_load_workflow_dataset_parses_rows(tmp_path: Path) -> None:
 
     ds = tmp_path / "evals" / "dataset.jsonl"
     ds.parent.mkdir()
-    ds.write_text(
-        json.dumps({"input": {"text": "hello"}, "expected": {"step2": "hello"}}) + "\n"
-    )
+    ds.write_text(json.dumps({"input": {"text": "hello"}, "expected": {"step2": "hello"}}) + "\n")
     evals_spec = WorkflowEvalsSpec(dataset="evals/dataset.jsonl")
     cases, digest = load_workflow_dataset(tmp_path, evals_spec)
     assert len(cases) == 1
@@ -301,13 +305,16 @@ def test_load_workflow_dataset_parses_optional_fields(tmp_path: Path) -> None:
     ds = tmp_path / "evals" / "dataset.jsonl"
     ds.parent.mkdir()
     ds.write_text(
-        json.dumps({
-            "input": {"text": "harm"},
-            "expected": {"step2": "refused"},
-            "refusal_expected": True,
-            "expected_coverage": ["decline", "sorry"],
-            "latency_budget_ms": 5000,
-        }) + "\n"
+        json.dumps(
+            {
+                "input": {"text": "harm"},
+                "expected": {"step2": "refused"},
+                "refusal_expected": True,
+                "expected_coverage": ["decline", "sorry"],
+                "latency_budget_ms": 5000,
+            }
+        )
+        + "\n"
     )
     evals_spec = WorkflowEvalsSpec(dataset="evals/dataset.jsonl")
     cases, _ = load_workflow_dataset(tmp_path, evals_spec)
@@ -354,10 +361,13 @@ async def test_engine_score_zero_on_mismatch(
     await storage.init()
     wf_dir = _make_workflow(
         tmp_path / "wf",
-        dataset_content=json.dumps({
-            "input": {"text": "hello"},
-            "expected": {"step2": "WRONG"},  # provider returns "hello"
-        }) + "\n",
+        dataset_content=json.dumps(
+            {
+                "input": {"text": "hello"},
+                "expected": {"step2": "WRONG"},  # provider returns "hello"
+            }
+        )
+        + "\n",
     )
     spec, wf_path = load_workflow_spec(wf_dir)
     graph = compile_workflow(spec, wf_path)
@@ -435,18 +445,25 @@ async def test_engine_coverage_dim_scored(
     await storage.init()
     wf_dir = _make_workflow(
         tmp_path / "wf",
-        dataset_content=json.dumps({
-            "input": {"text": "hello"},
-            "expected": {"step2": "hello"},
-            "expected_coverage": ["hello", "missing-topic"],
-        }) + "\n",
+        dataset_content=json.dumps(
+            {
+                "input": {"text": "hello"},
+                "expected": {"step2": "hello"},
+                "expected_coverage": ["hello", "missing-topic"],
+            }
+        )
+        + "\n",
     )
     spec, wf_path = load_workflow_spec(wf_dir)
     graph = compile_workflow(spec, wf_path)
     engine = _make_engine(storage)
     summary = await engine.run(
-        graph, wf_path, spec.evals,
-        workflow_name=spec.name, workflow_version=spec.version, threshold=0.7,
+        graph,
+        wf_path,
+        spec.evals,
+        workflow_name=spec.name,
+        workflow_version=spec.version,
+        threshold=0.7,
     )
     cov = summary.dimensional_means.coverage
     assert cov is not None
@@ -464,8 +481,12 @@ async def test_engine_dimensional_means_none_when_not_scored(
     graph = compile_workflow(spec, wf_path)
     engine = _make_engine(storage)
     summary = await engine.run(
-        graph, wf_path, spec.evals,
-        workflow_name=spec.name, workflow_version=spec.version, threshold=0.7,
+        graph,
+        wf_path,
+        spec.evals,
+        workflow_name=spec.name,
+        workflow_version=spec.version,
+        threshold=0.7,
     )
     # No grounding / refusal_expected / coverage in dataset → all None
     assert summary.dimensional_means.faithfulness is None
@@ -501,16 +522,17 @@ def _scaffold_cli_workflow(
 
 
 @pytest.mark.unit
-def test_cli_eval_workflow_passes_on_match(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cli_eval_workflow_passes_on_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wf_dir = _scaffold_cli_workflow(
         tmp_path,
         monkeypatch,
-        dataset_content=json.dumps({
-            "input": {"text": "hello"},
-            "expected": {"step2": "hello"},
-        }) + "\n",
+        dataset_content=json.dumps(
+            {
+                "input": {"text": "hello"},
+                "expected": {"step2": "hello"},
+            }
+        )
+        + "\n",
     )
     result = runner.invoke(
         app,
@@ -552,18 +574,25 @@ async def test_engine_faithfulness_skipped_without_judge_model(
     await storage.init()
     wf_dir = _make_workflow(
         tmp_path / "wf",
-        dataset_content=json.dumps({
-            "input": {"text": "hello"},
-            "expected": {"step2": "hello"},
-            "grounding": "The workflow echoes the input through both nodes.",
-        }) + "\n",
+        dataset_content=json.dumps(
+            {
+                "input": {"text": "hello"},
+                "expected": {"step2": "hello"},
+                "grounding": "The workflow echoes the input through both nodes.",
+            }
+        )
+        + "\n",
     )
     spec, wf_path = load_workflow_spec(wf_dir)
     graph = compile_workflow(spec, wf_path)
     engine = _make_engine(storage)
     summary = await engine.run(
-        graph, wf_path, spec.evals,
-        workflow_name=spec.name, workflow_version=spec.version, threshold=0.7,
+        graph,
+        wf_path,
+        spec.evals,
+        workflow_name=spec.name,
+        workflow_version=spec.version,
+        threshold=0.7,
     )
     # No judge.yaml → exact-match judge → faithfulness skipped (None)
     assert summary.dimensional_means.faithfulness is None
@@ -584,11 +613,14 @@ async def test_engine_faithfulness_scored_with_judge_model(
     await storage.init()
     wf_dir = _make_workflow(
         tmp_path / "wf",
-        dataset_content=json.dumps({
-            "input": {"text": "hello"},
-            "expected": {"step2": "hello"},
-            "grounding": "The workflow echoes the input through both nodes.",
-        }) + "\n",
+        dataset_content=json.dumps(
+            {
+                "input": {"text": "hello"},
+                "expected": {"step2": "hello"},
+                "grounding": "The workflow echoes the input through both nodes.",
+            }
+        )
+        + "\n",
     )
     # Write a judge.yaml so the engine uses LLM_JUDGE mode.
     judge_yaml = {
@@ -600,6 +632,7 @@ async def test_engine_faithfulness_scored_with_judge_model(
         },
     }
     import yaml as _yaml  # noqa: PLC0415
+
     (wf_dir / "evals" / "judge.yaml").write_text(_yaml.safe_dump(judge_yaml))
 
     spec, wf_path = load_workflow_spec(wf_dir)
@@ -609,15 +642,17 @@ async def test_engine_faithfulness_scored_with_judge_model(
     mock_provider = MockProvider(response='{"score": 0.9, "rationale": "faithful"}')
     pricing = load_pricing()
     tracer = NullTracer()
-    executor = Executor(
-        provider=mock_provider, pricing=pricing, storage=storage, tracer=tracer
-    )
+    executor = Executor(provider=mock_provider, pricing=pricing, storage=storage, tracer=tracer)
     engine = WorkflowEvalEngine(
         executor=executor, storage=storage, provider=mock_provider, runs_per_case=1
     )
     summary = await engine.run(
-        graph, wf_path, spec.evals,
-        workflow_name=spec.name, workflow_version=spec.version, threshold=0.7,
+        graph,
+        wf_path,
+        spec.evals,
+        workflow_name=spec.name,
+        workflow_version=spec.version,
+        threshold=0.7,
     )
     # MockProvider returns the mock response for both agent calls and the
     # faithfulness judge call. Since the agent call response '{"score":...}'
@@ -646,14 +681,16 @@ def test_load_workflow_judge_config_reads_yaml(tmp_path: Path) -> None:
 
     (tmp_path / "evals").mkdir()
     (tmp_path / "evals" / "judge.yaml").write_text(
-        _yaml.safe_dump({
-            "method": "llm_judge",
-            "rubric": "Is it good?",
-            "model": {
-                "provider": "anthropic/claude-haiku-4-5-20251001",
-                "params": {"max_tokens": 128},
-            },
-        })
+        _yaml.safe_dump(
+            {
+                "method": "llm_judge",
+                "rubric": "Is it good?",
+                "model": {
+                    "provider": "anthropic/claude-haiku-4-5-20251001",
+                    "params": {"max_tokens": 128},
+                },
+            }
+        )
     )
     config = load_workflow_judge_config(tmp_path)
     assert config.method == JudgeMethod.LLM_JUDGE

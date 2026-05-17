@@ -32,7 +32,6 @@ from movate.core.auth import ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
-
 # ---------------------------------------------------------------------------
 # Fixtures  (mirror test_runtime_agents_v1.py so tests stay self-contained)
 # ---------------------------------------------------------------------------
@@ -92,15 +91,19 @@ schema:
 """
 
 _PROMPT = b"Hello {{ input.text }}!\n"
-_INPUT_SCHEMA = json.dumps({
-    "type": "object",
-    "properties": {"text": {"type": "string"}},
-    "required": ["text"],
-}).encode()
-_OUTPUT_SCHEMA = json.dumps({
-    "type": "object",
-    "properties": {"reply": {"type": "string"}},
-}).encode()
+_INPUT_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+).encode()
+_OUTPUT_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {"reply": {"type": "string"}},
+    }
+).encode()
 
 
 def _create_agent(client: TestClient, auth_header: dict[str, str]) -> None:
@@ -242,7 +245,7 @@ class TestDatasetUploadErrors:
         self, client: TestClient, agents_path: Path, auth_header: dict[str, str]
     ) -> None:
         _create_agent(client, auth_header)
-        bad = b'[1, 2, 3]\n'
+        bad = b"[1, 2, 3]\n"
         r = _upload(client, auth_header, bad)
         assert r.status_code == 400
         assert "object" in self._detail_message(r)
@@ -257,13 +260,12 @@ class TestDatasetUploadErrors:
         self, client_no_agents_path: TestClient, storage: InMemoryStorage
     ) -> None:
         async def _get_header() -> dict[str, str]:
-            minted = mint_api_key(
-                tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-path"
-            )
+            minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-path")
             await storage.save_api_key(minted.record)
             return {"Authorization": f"Bearer {minted.full_key}"}
 
         import asyncio  # noqa: PLC0415
+
         hdr = asyncio.run(_get_header())
         r = _upload(client_no_agents_path, hdr, _jsonl({"x": 1}))
         assert r.status_code == 503
