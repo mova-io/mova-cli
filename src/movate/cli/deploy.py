@@ -1244,7 +1244,9 @@ def _run_acr_build(plan: DeployPlan) -> None:
 
     Uses the multi-stage Dockerfile's ``runtime`` target (the worker
     Container App reuses the same image and overrides the command).
-    Output streams to stdout so operators see build progress.
+    Build log is captured and suppressed — the spinner conveys progress,
+    and the verbose build output (layer hashes, timing, etc.) is not
+    useful at deploy time. On failure, captured stderr is still shown.
     """
     cmd = [
         "az",
@@ -1264,6 +1266,7 @@ def _run_acr_build(plan: DeployPlan) -> None:
     ]
     with spinner(f"building {plan.image_tag} in ACR..."):
         _run_az(cmd, what="acr build")
+    err.print(f"  [green]✓[/green] image built: {plan.fq_image}")
 
 
 def _run_containerapp_update(plan: DeployPlan, app_name: str) -> None:
@@ -1284,28 +1287,53 @@ def _run_containerapp_update(plan: DeployPlan, app_name: str) -> None:
         plan.fq_image,
     ]
     with spinner(f"updating {app_name}..."):
-        _run_az(cmd, what=f"containerapp update {app_name}")
+        stdout = _run_az(cmd, what=f"containerapp update {app_name}")
 
-
-def _run_az(cmd: list[str], *, what: str) -> None:
-    """Run an ``az`` command. Streams output to the caller's stdout/stderr
-    so the operator sees progress. Non-zero exit → typer.Exit(1)."""
+    # Parse the JSON response and surface only the fields operators care about.
+    # The full blob (outbound IPs, all properties) is suppressed — it's noise
+    # at deploy time.
     try:
-        # check=False so we can render our own error message; az's
-        # default stderr is already noisy enough that wrapping with
-        # CalledProcessError adds nothing.
-        result = subprocess.run(cmd, check=False)
+        data = json.loads(stdout)
+        props = data.get("properties", {})
+        state = props.get("provisioningState", "?")
+        revision = props.get("latestRevisionName", "")
+        fqdn = (props.get("configuration") or {}).get("ingress", {}).get("fqdn", "")
+        detail = f"state={state}"
+        if revision:
+            # Trim "movate-prod-api--<sha>" → just the revision suffix
+            detail += f"  revision={revision.split('--')[-1]}"
+        if fqdn:
+            detail += f"  fqdn={fqdn}"
+        err.print(f"  [green]✓[/green] {app_name}: {detail}")
+    except (json.JSONDecodeError, AttributeError, KeyError):
+        err.print(f"  [green]✓[/green] {app_name} updated")
+
+
+def _run_az(cmd: list[str], *, what: str) -> str:
+    """Run an ``az`` command, capturing stdout. Returns the stdout text.
+
+    Capturing (rather than streaming) keeps the terminal clean — ``az
+    containerapp update`` returns hundreds of lines of JSON that would
+    swamp the spinner. Callers that want to surface key fields can parse
+    the returned text. On failure, captured stderr is printed before the
+    error line so operators still see the Azure error message.
+    """
+    try:
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     except FileNotFoundError as exc:
         # Caught upstream by shutil.which check, but defensive.
         error(f"command not found: {cmd[0]}")
         raise typer.Exit(code=2) from exc
 
     if result.returncode != 0:
+        if result.stderr:
+            err.print(result.stderr.strip())
         err.print(
             f"[red]✗ az command failed:[/red] {what} (exit {result.returncode})\n"
             f"[dim]command: {' '.join(cmd)}[/dim]"
         )
         raise typer.Exit(code=1)
+    return result.stdout
 
 
 async def _wait_for_healthz(*, url: str, expected_version: str, timeout: float) -> None:

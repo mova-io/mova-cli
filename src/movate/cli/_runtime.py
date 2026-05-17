@@ -90,7 +90,8 @@ async def build_local_runtime(*, mock: bool) -> LocalRuntime:
     """Construct the local runtime for a CLI invocation.
 
     Storage: SQLite at ``~/.movate/local.db``.
-    Tracer: stdout-on-stderr (Langfuse + OTel land via env opt-in).
+    Tracer: silent by default; set ``MOVATE_TRACER=stdout`` for JSON spans on
+    stderr, or configure Langfuse / OTel via env vars.
     Providers: a :class:`ProviderRegistry` with LiteLLM wired by default
     plus any native-SDK adapters whose extras are installed. ``mock=True``
     swaps every runtime for :class:`MockProvider` so offline dev / tests

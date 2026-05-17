@@ -791,11 +791,7 @@ def build_app(
             if capabilities
             else None
         )
-        tag_filter = (
-            {t.strip().lower() for t in tags.split(",") if t.strip()}
-            if tags
-            else None
-        )
+        tag_filter = {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else None
 
         items: list[AgentCatalogItemView] = []
         for b in agents:
@@ -1941,6 +1937,7 @@ def build_app(
                 runs_per_case=body.runs,
                 gate_mode=body.gate_mode,
                 objective_filter=body.objective,
+                global_skill_responses=body.skill_responses,
             )
             # Synchronous: blocks the request until the eval finishes.
             # For mock + small datasets this is sub-second. Real LLM

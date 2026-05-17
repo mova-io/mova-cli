@@ -155,6 +155,16 @@ CANONICAL: dict[str, tuple[dict, str]] = {
         '"key_points": [{"claim": "60% quality at 6% cost.", "citations": [1]}], '
         '"disagreements": [], "open_questions": []}',
     ),
+    # Skill-demo templates — MockProvider returns the output directly;
+    # skill execution (calculator Python impl / HTTP lookup) is bypassed.
+    "calc-agent": (
+        {"expression": "2 + 3"},
+        '{"result": 5.0, "explanation": "2 plus 3 equals 5."}',
+    ),
+    "lookup-agent": (
+        {"user_id": 1, "question": "What is their email address?"},
+        '{"answer": "Their email address is Sincere@april.biz.", "user_found": true}',
+    ),
 }
 
 
@@ -184,6 +194,9 @@ def test_template_registry_exposes_all_known() -> None:
         "resume-screener",
         "compliance-checker",
         "research-agent",
+        # Skill-demo templates (post-v1.1)
+        "calc-agent",
+        "lookup-agent",
     }
     assert list_templates() == sorted(TEMPLATES.keys())
 

@@ -109,9 +109,7 @@ def _mock_plan(description: str) -> dict[str, Any]:
     return {
         "project_name": slug,
         "description": description,
-        "agents": [
-            {"name": "primary-agent", "template": "faq", "purpose": "Primary agent (mock)"}
-        ],
+        "agents": [{"name": "primary-agent", "template": "faq", "purpose": "Primary agent (mock)"}],
         "skills": [],
         "contexts": [],
         "workflow": [],
@@ -123,9 +121,7 @@ def _mock_plan(description: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def _call_planner(
-    description: str, *, model: str, mock: bool
-) -> dict[str, Any]:
+async def _call_planner(description: str, *, model: str, mock: bool) -> dict[str, Any]:
     rt = await build_local_runtime(mock=mock)
     try:
         if mock:
@@ -265,9 +261,7 @@ def _apply_plan(plan: dict[str, Any], target: Path) -> None:
         if ctx_file.exists():
             continue
         console.print(f"  [dim]→[/dim] context [bold]{cname}[/bold]")
-        ctx_file.write_text(
-            f"# {cname}\n\n<!-- Add your {cname} context here. -->\n"
-        )
+        ctx_file.write_text(f"# {cname}\n\n<!-- Add your {cname} context here. -->\n")
 
     if len(agents) > 1 and workflow:
         _write_workflow(target, workflow, agents)
@@ -371,6 +365,4 @@ def plan(
         _apply_plan(plan_data, target=target)
         console.print("\n[green]✓[/green] plan applied — run [bold]mdk validate[/bold] to check.")
     else:
-        console.print(
-            "\n[dim]Dry-run. Pass [bold]--apply[/bold] to scaffold the project.[/dim]"
-        )
+        console.print("\n[dim]Dry-run. Pass [bold]--apply[/bold] to scaffold the project.[/dim]")

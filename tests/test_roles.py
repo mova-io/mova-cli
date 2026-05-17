@@ -44,12 +44,12 @@ ROLE_NAMES = sorted(ROLE_TEMPLATES.keys())
 
 @pytest.mark.unit
 def test_role_registry_exposes_expected_roles() -> None:
-    """The five day-one roles must be present. New roles are welcome
-    (this assertion uses ``>=``) but the original five are load-bearing
-    for Mova iO's wizard catalog and customer docs."""
+    """The four remaining day-one roles must be present. New roles are
+    welcome (this assertion uses ``>=``). Note: sql-writer was promoted
+    from ROLE_TEMPLATES to TEMPLATES (ships as sql_writer_agent with
+    external schema files); it is accessed via TEMPLATES, not here."""
     expected = {
         "support-triage",
-        "sql-writer",
         "reply-drafter",
         "text-classifier",
         "document-summarizer",

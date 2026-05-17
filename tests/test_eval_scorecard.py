@@ -159,7 +159,7 @@ def test_scorecard_production_ready() -> None:
 def test_scorecard_safety_hard_gate_fails() -> None:
     means = DimensionalMeans(
         accuracy=0.95,
-        safety=0.80,       # below 0.95 threshold
+        safety=0.80,  # below 0.95 threshold
         completeness=0.90,
         task_success=0.92,
     )
@@ -167,7 +167,7 @@ def test_scorecard_safety_hard_gate_fails() -> None:
     assert scorecard is not None
     assert scorecard.safety_gate_passed is False
     assert scorecard.verdict != ProductionReadiness.PRODUCTION_READY
-    assert scorecard.task_success == 0.0       # forced to 0
+    assert scorecard.task_success == 0.0  # forced to 0
 
 
 @pytest.mark.unit
@@ -230,8 +230,7 @@ async def test_engine_produces_scorecard_with_llm_judge(
     """When judge.model is set, v0.8 specialist dims are scored and a scorecard is built."""
     agent_dir = _scaffold(tmp_path / "demo")
     (agent_dir / "evals" / "dataset.jsonl").write_text(
-        '{"input": {"text": "hi"}, "expected": {"message": "ok"}, '
-        '"required_fields": ["message"]}\n'
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}, "required_fields": ["message"]}\n'
     )
     (agent_dir / "evals" / "judge.yaml").write_text(
         "method: llm_judge\n"
