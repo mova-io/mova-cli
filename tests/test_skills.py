@@ -341,6 +341,92 @@ async def test_dispatch_skill_unimportable_module(tmp_path: Path) -> None:
     assert info.value.type == SkillErrorType.BACKEND_ERROR
 
 
+@pytest.mark.asyncio
+async def test_dispatch_skill_hyphen_name_importable_via_skill_dir(tmp_path: Path) -> None:
+    """A skill directory named ``my-skill`` (with a hyphen) must be importable.
+
+    The ``import`` statement can't handle hyphens, but
+    ``importlib.import_module`` works when the parent directory is on
+    ``sys.path``. ``_resolve`` adds ``skill_dir.parent`` to sys.path so
+    operators can scaffold skills with hyphenated names (the default
+    convention: ``kb-lookup``, ``web-search``, etc.) without renaming
+    their directories.
+    """
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "skill.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Skill\n"
+        "name: my-skill\n"
+        "version: 0.1.0\n"
+        "description: hyphen test\n"
+        "schema:\n"
+        "  input:\n"
+        "    x: integer\n"
+        "  output:\n"
+        "    y: integer\n"
+        "implementation:\n"
+        "  kind: python\n"
+        "  entry: my-skill.impl:run\n"
+        "cost:\n"
+        "  per_call_usd: 0.0\n"
+        "side_effects: read-only\n"
+    )
+    (skill_dir / "impl.py").write_text(
+        "async def run(input, ctx):\n    return {'y': input['x'] + 1}\n"
+    )
+    from movate.core.skill_loader import load_skill  # noqa: PLC0415
+
+    bundle = load_skill(skill_dir)
+    ctx = SkillExecutionContext()
+    output = await dispatch_skill(bundle, {"x": 10}, ctx)
+    assert output == {"y": 11}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skill_syspath_not_duplicated(tmp_path: Path) -> None:
+    """Calling dispatch_skill twice for the same skill dir adds the parent
+    to sys.path exactly once — the membership check is idempotent."""
+    import sys  # noqa: PLC0415
+
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "skill.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Skill\n"
+        "name: my-skill\n"
+        "version: 0.1.0\n"
+        "description: hyphen test\n"
+        "schema:\n"
+        "  input:\n"
+        "    x: integer\n"
+        "  output:\n"
+        "    y: integer\n"
+        "implementation:\n"
+        "  kind: python\n"
+        "  entry: my-skill.impl:run\n"
+        "cost:\n"
+        "  per_call_usd: 0.0\n"
+        "side_effects: read-only\n"
+    )
+    (skill_dir / "impl.py").write_text(
+        "async def run(input, ctx):\n    return {'y': input['x'] * 2}\n"
+    )
+    from movate.core.skill_backend.python import PythonSkillBackend  # noqa: PLC0415
+    from movate.core.skill_loader import load_skill  # noqa: PLC0415
+
+    bundle = load_skill(skill_dir)
+    backend = PythonSkillBackend()
+    ctx = SkillExecutionContext()
+    parent = str(skill_dir.parent)
+    count_before = sys.path.count(parent)
+
+    await backend.execute(bundle, {"x": 3}, ctx)
+    await backend.execute(bundle, {"x": 5}, ctx)
+
+    assert sys.path.count(parent) == count_before + 1
+
+
 # ---------------------------------------------------------------------------
 # Executor tool-use loop
 # ---------------------------------------------------------------------------

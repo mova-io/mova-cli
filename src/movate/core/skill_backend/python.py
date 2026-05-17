@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from movate.core.models import SkillImplementationKind
@@ -45,6 +47,15 @@ class PythonSkillBackend:
     Python-kind skill in the project. We do cache the resolved
     callable per ``entry`` string because importlib has non-trivial
     overhead on every call.
+
+    Cache invalidation note: the resolved callable is cached for the
+    lifetime of the process. Re-uploading a skill's ``impl.py`` via
+    ``POST /api/v1/skills`` writes new bytes to disk but the cached
+    callable still points at the old module. A process restart is
+    required to pick up new skill code — this is an acceptable
+    trade-off for the runtime's operational model (redeploy = new
+    revision). Operators who need hot-reload during development should
+    use ``mdk serve`` locally (fresh process per session).
     """
 
     kind = SkillImplementationKind.PYTHON
@@ -59,7 +70,7 @@ class PythonSkillBackend:
         ctx: SkillExecutionContext,
     ) -> dict[str, Any]:
         entry = skill.spec.implementation.entry
-        func = self._resolve(entry)
+        func = self._resolve(entry, skill_dir=skill.skill_dir)
         result = func(input, ctx)
         # Tolerate both sync and async impls. Many simple skills
         # (calculator, JSON munging) are sync; HTTP-using ones are
@@ -77,17 +88,34 @@ class PythonSkillBackend:
             )
         return result
 
-    def _resolve(self, entry: str) -> Any:
+    def _resolve(self, entry: str, skill_dir: Path | None = None) -> Any:
         """Lazily resolve ``pkg.mod:func`` → the function object.
 
         Caches per-entry; importlib + getattr cost is measurable when
         a skill is invoked hundreds of times in a long-running worker.
         Validation of the ``:`` shape happens at SkillSpec parse time
         so by the time we get here it's already well-formed.
+
+        ``skill_dir`` is the directory containing the skill's files
+        (e.g. ``/app/agents/skills/kb-lookup/``). When provided, its
+        parent is prepended to ``sys.path`` if not already present,
+        enabling ``importlib.import_module('kb-lookup.impl')`` to
+        resolve ``/app/agents/skills/kb-lookup/impl.py``. Python
+        namespace packages (PEP 420) handle the hyphen in the
+        directory name — the ``import`` *statement* would reject a
+        hyphenated name, but ``importlib.import_module`` works fine.
+
+        The ``sys.path`` entry is added once and persists for the
+        process lifetime; repeated calls for the same parent are
+        no-ops due to the membership check.
         """
         if entry in self._resolved:
             return self._resolved[entry]
         module_name, attr_name = entry.split(":", 1)
+        if skill_dir is not None:
+            parent = str(skill_dir.parent)
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
         try:
             module = importlib.import_module(module_name)
         except ImportError as exc:
