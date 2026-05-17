@@ -97,6 +97,7 @@ from movate.cli import (  # noqa: E402
     menu_cmd,
     migrate_cmd,
     monitor_cmd,
+    plan_cmd,
     promote_cmd,
     replay_cmd,
     rollback_cmd,
@@ -314,6 +315,10 @@ app.command("add", rich_help_panel=PANEL_DEVELOP)(add_cmd.add)
 # `compose` scaffolds a multi-agent workflow.yaml from a list of agents.
 # Sibling to `init` (single agent) and `demo` (full populated project).
 app.command("compose", rich_help_panel=PANEL_DEVELOP)(compose_cmd.compose)
+# `plan` generates a full project plan from a natural-language description.
+# Sits next to `compose` (multi-agent) and `init` (single agent) since all
+# three answer "how do I scaffold a new thing?"
+app.command("plan", rich_help_panel=PANEL_DEVELOP)(plan_cmd.plan)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
