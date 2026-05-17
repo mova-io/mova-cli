@@ -48,7 +48,7 @@ class EvalDefaults(BaseModel):
 class ModelPolicy(BaseModel):
     """Project-wide model policy.
 
-    All three fields are optional; absent fields = no restriction. The
+    All fields are optional; absent fields = no restriction. The
     permissive default (everything empty / None) is equivalent to no
     ``policy:`` block at all, so projects without policy needs see zero
     behavior change.
@@ -61,6 +61,8 @@ class ModelPolicy(BaseModel):
             - openai/gpt-3.5-turbo
             - openai/gpt-4-0314          # superseded; deny pre-0314 fallbacks
           max_cost_per_run_usd: 0.50
+          input_guardrails:
+            - prompt_injection
 
     Fields:
 
@@ -75,6 +77,10 @@ class ModelPolicy(BaseModel):
       agent's ``budget.max_cost_usd_per_run`` is capped at this value
       at runtime (operator can't accidentally ship an agent with a
       higher cap than the org allows). ``None`` = no ceiling.
+    * ``input_guardrails``: list of named input-guardrail checks to run
+      BEFORE any provider call. Currently supports ``"prompt_injection"``.
+      A detection raises :class:`~movate.core.failures.GuardrailViolationError`
+      with zero LLM cost incurred.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -101,6 +107,14 @@ class ModelPolicy(BaseModel):
             "budget.max_cost_usd_per_run at runtime. None = no ceiling."
         ),
     )
+    input_guardrails: list[Literal["prompt_injection"]] = Field(
+        default_factory=list,
+        description=(
+            "Named input-guardrail checks executed BEFORE any provider call. "
+            "Supported values: ['prompt_injection']. "
+            "A detection raises GuardrailViolationError with zero LLM cost."
+        ),
+    )
 
     def is_permissive(self) -> bool:
         """True if the policy imposes no restrictions — handy for fast-paths."""
@@ -108,6 +122,7 @@ class ModelPolicy(BaseModel):
             not self.allowed_providers
             and not self.deny_models
             and self.max_cost_per_run_usd is None
+            and not self.input_guardrails
         )
 
     def check_model(self, provider: str) -> str | None:

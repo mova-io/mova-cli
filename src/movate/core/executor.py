@@ -27,6 +27,7 @@ from movate.core.failures import (
     DEFAULT_RETRY,
     BudgetExceededError,
     ContentFilterError,
+    GuardrailViolationError,
     MovateError,
     PolicyViolationError,
     SchemaError,
@@ -242,6 +243,32 @@ class Executor:
             # Cheap PK lookup + a single SUM aggregate; the index on
             # (tenant_id, created_at) is the perf path.
             await self._check_tenant_budget(tenant_id)
+
+            # Prompt-injection INPUT GUARDRAIL — runs BEFORE any provider
+            # call (and before schema validation / prompt rendering) so a
+            # detected injection incurs zero LLM cost. Enabled when the
+            # project policy lists "prompt_injection" in input_guardrails.
+            # The detector scans all string fields in the raw input dict
+            # recursively and raises GuardrailViolationError on first match.
+            if "prompt_injection" in self._policy.input_guardrails:
+                from movate.core.guardrails.prompt_injection import (  # noqa: PLC0415
+                    PromptInjectionDetector,
+                )
+
+                _detector = PromptInjectionDetector()
+                _result = _detector.detect(request.input)
+                if _result is not None:
+                    self._tracer.log_event(
+                        span,
+                        {
+                            "guardrail": "prompt_injection.block",
+                            "matched_pattern": _result.matched_pattern,
+                            "matched_value": _result.matched_value[:200],
+                        },
+                    )
+                    raise GuardrailViolationError(
+                        f"prompt injection detected: pattern={_result.matched_pattern!r}"
+                    )
 
             # Policy check happens BEFORE schema validation and prompt
             # rendering — a denied model shouldn't get to bill latency

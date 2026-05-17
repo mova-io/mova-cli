@@ -436,6 +436,21 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             )
             raise typer.Exit(code=2)
 
+    # input_guardrails advisory — warn if the policy lists an unknown
+    # guardrail name. The Pydantic Literal type catches this at parse
+    # time for typed values, but if the YAML contains a string that
+    # Pydantic can't parse we still surface a clear message here.
+    # This block runs even when ``policy.is_permissive()`` is False
+    # because a misspelled guardrail name silently does nothing (the
+    # executor skips guardrails it doesn't recognise).
+    for guardrail in project_cfg.policy.input_guardrails:
+        if guardrail not in _KNOWN_INPUT_GUARDRAILS:
+            console.print(
+                f"  [yellow]![/yellow] policy.input_guardrails: unknown guardrail "
+                f"[bold]{guardrail!r}[/bold] — will be silently ignored at runtime. "
+                f"Known values: {sorted(_KNOWN_INPUT_GUARDRAILS)}."
+            )
+
     # HTTP / MCP skill backend advisory. Both backends are implemented
     # but require external resources (a URL / a subprocess command) that
     # can't be validated statically. Warn the operator so they know a
@@ -726,6 +741,12 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
             "and [bold]mdk knowledge remove <id>[/bold] to delete the duplicate.[/dim]"
         )
 
+
+# Names of input guardrails the executor currently recognises. Used by
+# ``_validate_agent`` to warn on unknown strings in
+# ``policy.input_guardrails``. Keep in sync with
+# :class:`movate.core.config.ModelPolicy.input_guardrails` Literal type.
+_KNOWN_INPUT_GUARDRAILS: frozenset[str] = frozenset({"prompt_injection"})
 
 _CTX_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
