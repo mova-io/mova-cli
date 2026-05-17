@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from jinja2 import Environment
 
@@ -272,7 +272,7 @@ def _check_skill_output_refs(bundle: AgentBundle) -> list[LintIssue]:
     getattr_cls = _jinja_getattr_class()
 
     # Build a map: var_name → (skill, declared_output_fields)
-    skill_vars: dict[str, tuple[object, set[str]]] = {}
+    skill_vars: dict[str, tuple[Any, set[str]]] = {}
     for skill in bundle.skills:
         var_name = _skill_output_var_name(skill.spec.name)
         props = _skill_output_property_names(skill)
@@ -290,25 +290,25 @@ def _check_skill_output_refs(bundle: AgentBundle) -> list[LintIssue]:
         attr = getattr(node, "attr", None)
         if target is None or not isinstance(attr, str):
             continue
-        var_name = getattr(target, "name", None)
-        if var_name not in skill_vars:
+        node_var: str | None = getattr(target, "name", None)
+        if not isinstance(node_var, str) or node_var not in skill_vars:
             continue
-        _, declared = skill_vars[var_name]
+        _, declared = skill_vars[node_var]
         if attr in declared:
             continue
-        key = (var_name, attr)
+        key = (node_var, attr)
         if key in seen:
             continue
         seen.add(key)
         # Recover the original skill name for the message.
-        skill = skill_vars[var_name][0]
+        skill = skill_vars[node_var][0]
         skill_name = skill.spec.name
         issues.append(
             LintIssue(
                 code="SKILL_OUTPUT_REF_MISMATCH",
                 severity="warning",
                 message=(
-                    f"prompt references `{{{{ {var_name}.{attr} }}}}` "
+                    f"prompt references `{{{{ {node_var}.{attr} }}}}` "
                     f"but {attr!r} is not in skill {skill_name!r}'s output schema "
                     f"(declared: {sorted(declared)})"
                 ),
