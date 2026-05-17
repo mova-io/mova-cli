@@ -121,6 +121,7 @@ async def _run_worker(
         executor=rt.executor,
         agents=agents,
         workflows=workflows,
+        use_mock_for_eval=mock,
     )
     config = WorkerConfig(
         poll_interval_seconds=poll_interval,
