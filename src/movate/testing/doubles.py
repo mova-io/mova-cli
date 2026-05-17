@@ -401,7 +401,14 @@ class JudgeStubProvider(BaseLLMProvider):
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         self.calls.append(request.provider)
         body = request.messages[0].content if request.messages else ""
-        if "Rubric:" in body:
+        # Detect any judge/specialist call by looking for the common score-response
+        # contract phrase or any specialist evaluator pattern.
+        _JUDGE_SIGNALS = (
+            "Rubric:",
+            "specialist evaluator",
+            "Return ONLY a JSON object",
+        )
+        if any(sig in body for sig in _JUDGE_SIGNALS):
             self.judge_prompts.append(body)
             return CompletionResponse(
                 text=f'{{"score": {self._judge_score}, "rationale": "stub"}}',

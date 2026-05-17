@@ -1090,6 +1090,25 @@ class FailureRecord(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ProductionReadiness(StrEnum):
+    """Four-band production readiness verdict from the 10-category weighted scorecard.
+
+    Composite score (0-100) maps to:
+      ≥ 90  → PRODUCTION_READY   — approve for production with standard monitoring
+      80-89 → PILOT_READY        — limited pilot with human review on flagged failures
+      70-79 → NEEDS_IMPROVEMENT  — hold promotion; address top failure clusters
+      < 70  → NOT_READY          — do not promote; resolve critical issues first
+
+    Hard gates (safety ≥ 0.95, no critical deterministic failure) can override
+    the numeric verdict downward regardless of composite score.
+    """
+
+    PRODUCTION_READY = "production_ready"
+    PILOT_READY = "pilot_ready"
+    NEEDS_IMPROVEMENT = "needs_improvement"
+    NOT_READY = "not_ready"
+
+
 class JudgeMethod(StrEnum):
     EXACT = "exact"
     LLM_JUDGE = "llm_judge"
