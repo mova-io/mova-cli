@@ -1,0 +1,21 @@
+version: 1
+type: object
+
+title: User Lookup Answer
+description: The answer to the question plus whether the user was found.
+
+fields:
+  answer:
+    type: string
+    description: Direct answer to the question about the user.
+    min_length: 1
+    example: "Their email address is Sincere@april.biz."
+
+  user_found:
+    type: boolean
+    description: Whether the user ID resolved to a valid record.
+    example: true
+
+required:
+  - answer
+  - user_found

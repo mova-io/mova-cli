@@ -940,6 +940,70 @@ def _render_combined_init_summary(
     )
 
 
+_PROJECT_MARKERS = ("movate.yaml", "policy.yaml")
+
+
+def _find_project_root(from_dir: Path) -> Path | None:
+    """Walk up from ``from_dir`` looking for a project root marker.
+
+    Returns the first ancestor that contains ``movate.yaml`` or
+    ``policy.yaml``, or ``None`` if no marker is found. Used by
+    :func:`_relocate_bundled_skills` to determine where the project-
+    level ``skills/`` directory should live.
+    """
+    for parent in from_dir.resolve().parents:
+        if any((parent / m).is_file() for m in _PROJECT_MARKERS):
+            return parent
+    return None
+
+
+def _relocate_bundled_skills(bundled_skills_dir: Path, *, target: Path) -> None:
+    """Move real skills from the agent's ``skills/`` dir to the project root.
+
+    When a template ships skill files inside its directory (e.g.
+    ``templates/calc_agent/skills/calculator/``), ``shutil.copytree``
+    places them under ``<agent_dir>/skills/``. The skill loader only
+    scans ``<project_root>/skills/`` — so skills inside the agent dir
+    are never found.
+
+    This function relocates every skill directory EXCEPT ``example-skill``
+    (the default scaffold's reference template, which stays in-place
+    intentionally) to the project-level ``skills/`` directory:
+
+    * In **project mode** (``movate.yaml`` found ancestor): the project root
+      is the ancestor containing the marker.
+    * In **standalone mode** (no marker found): ``target`` itself is treated
+      as the project root (consistent with :func:`_resolve_project_root`
+      fallback in the loader).
+
+    Skips skills that already exist at the destination (idempotent on
+    ``--force`` re-runs).
+    """
+    if not bundled_skills_dir.is_dir():
+        return
+
+    real_skills = [
+        d for d in bundled_skills_dir.iterdir()
+        if d.is_dir() and d.name != "example-skill"
+    ]
+    if not real_skills:
+        return
+
+    # Determine destination project root.
+    project_root = _find_project_root(target) or target.resolve()
+    project_skills = project_root / "skills"
+    project_skills.mkdir(parents=True, exist_ok=True)
+
+    for skill_dir in real_skills:
+        dest_skill = project_skills / skill_dir.name
+        if dest_skill.exists():
+            # Already present (e.g. shared skill used by multiple agents).
+            shutil.rmtree(skill_dir)
+            continue
+        shutil.copytree(skill_dir, dest_skill)
+        shutil.rmtree(skill_dir)
+
+
 def _init_agent(
     *,
     name: str,
@@ -975,6 +1039,16 @@ def _init_agent(
     yaml_path = dest / "agent.yaml"
     contents = yaml_path.read_text().replace("__AGENT_NAME__", name)
     yaml_path.write_text(contents)
+
+    # Move bundled skills (those NOT named "example-skill") to the
+    # project-level skills/ directory so the skill loader can find
+    # them. Canonical layout: <project>/skills/<name>/ — skill files
+    # inside an agent dir are NOT auto-discovered by load_skill_registry.
+    #
+    # "example-skill" is a reference template in the default scaffold;
+    # it stays inside the agent dir intentionally.
+    bundled_skills_dir = dest / "skills"
+    _relocate_bundled_skills(bundled_skills_dir, target=target)
 
     if quiet:
         return

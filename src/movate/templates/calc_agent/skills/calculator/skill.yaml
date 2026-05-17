@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: calculator
+version: 0.1.0
+description: >-
+  Safely evaluates arithmetic expressions (+, -, *, /, parentheses) using
+  Python's AST parser — no exec(), no eval(). Returns the numeric result
+  plus a step-by-step trace. Use when the agent needs exact arithmetic.
+
+schema:
+  input:
+    expression: string
+  output:
+    result: number
+    steps:
+      - string
+
+implementation:
+  kind: python
+  entry: calculator.impl:run
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: read-only
+
+tags:
+  - math
+  - arithmetic
+  - demo

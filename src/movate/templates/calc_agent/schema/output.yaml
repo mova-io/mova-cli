@@ -1,0 +1,21 @@
+version: 1
+type: object
+
+title: Calculation Result
+description: The evaluated result with a plain-English explanation.
+
+fields:
+  result:
+    type: number
+    description: The numeric result of the expression.
+    example: 9.0
+
+  explanation:
+    type: string
+    description: One sentence describing how the answer was reached.
+    min_length: 1
+    example: "The expression evaluates to 9.0: first (10 - 4) = 6, then 6 * 3 = 18, then 18 / 2 = 9."
+
+required:
+  - result
+  - explanation

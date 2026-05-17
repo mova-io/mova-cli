@@ -51,6 +51,14 @@ TEMPLATES: dict[str, str] = {
     "compliance-checker": "compliance_checker_agent",
     # Research agent: topic + sources → executive summary with citations.
     "research-agent": "research_agent",
+    # --- Skill-using demo templates ---
+    # calc-agent: arithmetic agent wired to a Python calculator skill.
+    # Ships with the skill impl — demonstrates Python skill kind.
+    "calc-agent": "calc_agent",
+    # lookup-agent: user-lookup agent wired to an HTTP skill calling
+    # JSONPlaceholder (public, no API key). Swap the URL to use a real
+    # CRM — demonstrates HTTP skill kind.
+    "lookup-agent": "lookup_agent",
 }
 
 # Skill templates live alongside agent templates but are reached via
