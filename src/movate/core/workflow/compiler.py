@@ -27,7 +27,7 @@ from movate.core.workflow.ir import (
     WorkflowGraph,
     WorkflowNode,
 )
-from movate.core.workflow.spec import WorkflowSpec
+from movate.core.workflow.spec import AgentNodeSpec, IntentRouterNodeSpec, WorkflowSpec
 
 
 class WorkflowCompileError(Exception):
@@ -59,17 +59,36 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
     for ns in spec.nodes:
         if ns.id in nodes:
             raise WorkflowCompileError(f"duplicate node id: {ns.id!r}")
-        resolved_ref = (workflow_dir / ns.ref).resolve()
-        # We don't load the agent here — that's the runner's job. But we
-        # at least make sure the path exists so a typo in workflow.yaml
-        # fails loud at compile time.
-        if not resolved_ref.exists():
-            raise WorkflowCompileError(f"node {ns.id!r}: ref path does not exist: {resolved_ref}")
-        nodes[ns.id] = WorkflowNode(
-            id=ns.id,
-            type=NodeType(ns.type),
-            ref=str(resolved_ref),
-        )
+        if isinstance(ns, AgentNodeSpec):
+            resolved_ref = (workflow_dir / ns.ref).resolve()
+            # We don't load the agent here — that's the runner's job. But we
+            # at least make sure the path exists so a typo in workflow.yaml
+            # fails loud at compile time.
+            if not resolved_ref.exists():
+                raise WorkflowCompileError(
+                    f"node {ns.id!r}: ref path does not exist: {resolved_ref}"
+                )
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.AGENT,
+                ref=str(resolved_ref),
+            )
+        elif isinstance(ns, IntentRouterNodeSpec):
+            # intent-router nodes don't have a file-system ref — they carry
+            # their config in ``metadata`` so the runner can dispatch them.
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.INTENT_ROUTER,
+                ref="",  # unused for intent-router
+                metadata={
+                    "routes": ns.routes,
+                    "fallback": ns.fallback,
+                    "classifier_agent": ns.classifier_agent,
+                    "input_field": ns.input_field,
+                },
+            )
+        else:
+            raise WorkflowCompileError(f"node {ns.id!r}: unknown node type {ns.type!r}")
 
     # 2. Entrypoint must exist.
     if spec.entrypoint not in nodes:
@@ -77,7 +96,23 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
             f"entrypoint {spec.entrypoint!r} not in nodes (available: {', '.join(sorted(nodes))})"
         )
 
-    # 3. Edges — endpoints must exist + no self-loops in v0.3.
+    # 3. Validate intent-router route targets. All route values + fallback must
+    # name valid node ids so we can catch typos at compile time rather than
+    # at run time.
+    for ns in spec.nodes:
+        if not isinstance(ns, IntentRouterNodeSpec):
+            continue
+        all_targets = list(ns.routes.values()) + [ns.fallback]
+        for target in all_targets:
+            if target not in nodes:
+                raise WorkflowCompileError(
+                    f"intent-router node {ns.id!r}: route target {target!r} "
+                    f"is not a valid node id (known: {', '.join(sorted(nodes))})"
+                )
+
+    # 4. Edges — explicit edges must exist + no self-loops; then inject synthetic
+    # CONDITIONAL edges from each intent-router to its route targets so that the
+    # IR graph correctly models reachability and topological order.
     edges: list[WorkflowEdge] = []
     for es in spec.edges:
         if es.from_id not in nodes:
@@ -97,6 +132,28 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
                 kind=EdgeKind.SEQUENTIAL,
             )
         )
+
+    # Inject synthetic edges for intent-router route targets so the graph
+    # correctly reflects reachability. We use CONDITIONAL kind to distinguish
+    # them from user-declared sequential edges (validate_linear skips routers).
+    seen_router_edges: set[tuple[str, str]] = set()
+    for ns in spec.nodes:
+        if not isinstance(ns, IntentRouterNodeSpec):
+            continue
+        all_targets = list(ns.routes.values()) + [ns.fallback]
+        for target in all_targets:
+            pair = (ns.id, target)
+            if pair in seen_router_edges:
+                continue
+            seen_router_edges.add(pair)
+            edges.append(
+                WorkflowEdge(
+                    from_id=ns.id,
+                    to_id=target,
+                    kind=EdgeKind.CONDITIONAL,
+                    metadata={"synthetic": True, "source": "intent-router"},
+                )
+            )
 
     # 4. State schema — load + validate.
     schema_path = (workflow_dir / spec.state_schema).resolve()
@@ -166,33 +223,50 @@ def validate_linear(graph: WorkflowGraph) -> None:
     types all fail here with a phase-aware message pointing the user at
     when the feature is expected to land.
 
+    Exception: ``intent-router`` nodes (``NodeType.INTENT_ROUTER``) are
+    explicitly permitted — they are the branching primitive for v0.4.
+    Synthetic CONDITIONAL edges injected by the compiler for intent-router
+    route targets are also exempt from the sequential-only edge check.
+
     Replaceable: v0.4+ phases can call a different validator (or none)
     against the same :class:`WorkflowGraph` without modifying the IR or
     the structural compiler.
     """
-    # Node types — agent only. Most specific user-facing failure first.
-    bad_types = sorted(n.id for n in graph.nodes.values() if n.type is not NodeType.AGENT)
+    # Node types — agent + intent-router. Most specific user-facing failure first.
+    _allowed_types = {NodeType.AGENT, NodeType.INTENT_ROUTER}
+    bad_types = sorted(n.id for n in graph.nodes.values() if n.type not in _allowed_types)
     if bad_types:
         raise WorkflowCompileError(
-            f"v0.3 supports only type=agent nodes; offenders: {', '.join(bad_types)}. "
+            f"v0.3 supports only type=agent and type=intent-router nodes; "
+            f"offenders: {', '.join(bad_types)}. "
             f"Tools/HITL/sub-workflows land in v1.1+."
         )
 
-    # Edge kinds — sequential only.
-    bad_edges = [e for e in graph.edges if e.kind is not EdgeKind.SEQUENTIAL]
+    # Edge kinds — sequential only, EXCEPT synthetic conditional edges from
+    # intent-router nodes (those are injected by compile_workflow).
+    bad_edges = [
+        e
+        for e in graph.edges
+        if e.kind is not EdgeKind.SEQUENTIAL
+        and not (e.kind is EdgeKind.CONDITIONAL and e.metadata.get("synthetic"))
+    ]
     if bad_edges:
         raise WorkflowCompileError(
             f"v0.3 supports only sequential edges; got {len(bad_edges)} non-sequential. "
             f"Conditional / parallel edges land in v1.1+."
         )
 
-    # Branching / joining — checked before source/sink count so the user gets
-    # the most pointed message (a branch implicitly creates >1 sink; we'd rather
-    # say "no branches" than "exactly one sink").
-    branching = sorted(nid for nid in graph.nodes if len(graph.successors(nid)) > 1)
+    # Branching / joining — intent-router nodes are allowed to branch (that's
+    # their whole purpose). We only flag non-router agent nodes that branch.
+    branching = sorted(
+        nid
+        for nid in graph.nodes
+        if len(graph.successors(nid)) > 1 and graph.nodes[nid].type is not NodeType.INTENT_ROUTER
+    )
     if branching:
         raise WorkflowCompileError(
-            f"v0.3 forbids branches (>1 successor); offenders: {', '.join(branching)}. "
+            f"v0.3 forbids branches (>1 successor) on non-router nodes; "
+            f"offenders: {', '.join(branching)}. "
             f"Parallel fan-out lands in v1.1+."
         )
     joining = sorted(nid for nid in graph.nodes if len(graph.predecessors(nid)) > 1)
@@ -215,10 +289,14 @@ def validate_linear(graph: WorkflowGraph) -> None:
             f"the source node {sources[0]!r} must be the declared entrypoint {graph.entrypoint!r}"
         )
 
-    # Sink — exactly one.
-    sinks = graph.sinks()
-    if len(sinks) != 1:
-        raise WorkflowCompileError(
-            f"v0.3 workflows must have exactly one sink node; got {len(sinks)}: "
-            f"{', '.join(sinks) or '(none)'}"
-        )
+    # Sink — for linear workflows exactly one; intent-router workflows may have
+    # multiple sinks (each route target that has no successor). We only enforce
+    # single-sink on pure-linear (no intent-router) workflows.
+    router_nodes = {nid for nid, n in graph.nodes.items() if n.type is NodeType.INTENT_ROUTER}
+    if not router_nodes:
+        sinks = graph.sinks()
+        if len(sinks) != 1:
+            raise WorkflowCompileError(
+                f"v0.3 workflows must have exactly one sink node; got {len(sinks)}: "
+                f"{', '.join(sinks) or '(none)'}"
+            )

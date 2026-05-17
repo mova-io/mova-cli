@@ -43,7 +43,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
-from movate.core.workflow.ir import WorkflowGraph
+from movate.core.workflow.ir import NodeType, WorkflowGraph
 from movate.storage.base import StorageProvider
 
 
@@ -111,7 +111,14 @@ class WorkflowRunner:
         initial_state: dict[str, Any],
         *,
         workflow_run_id: str | None = None,
+        mock: bool = False,
     ) -> WorkflowResult:
+        """Run the workflow from the entrypoint.
+
+        ``mock`` skips real classifier calls in ``intent-router`` nodes —
+        the first route key is chosen deterministically so the whole
+        workflow can be exercised under ``mdk run --mock``.
+        """
         wf_id = workflow_run_id or str(uuid4())
         started = time.monotonic()
 
@@ -125,11 +132,68 @@ class WorkflowRunner:
 
         state: dict[str, Any] = dict(initial_state)
         runs: list[RunRecord] = []
-        order = graph.topological_order()
 
-        for node_id in order:
-            node = graph.nodes[node_id]
+        # Dynamic traversal: start at entrypoint, follow each node's single
+        # sequential successor (for agent nodes) or the router's chosen
+        # branch (for intent-router nodes).  We track visited ids to guard
+        # against pathological graph shapes that bypass the compiler's cycle
+        # detector.
+        current_id: str | None = graph.entrypoint
+        visited: set[str] = set()
 
+        while current_id is not None:
+            if current_id in visited:
+                raise WorkflowRunError(
+                    f"cycle detected at node {current_id!r} during execution"
+                )
+            visited.add(current_id)
+
+            node = graph.nodes[current_id]
+            node_id = current_id
+
+            if node.type is NodeType.INTENT_ROUTER:
+                # --- intent-router dispatch -----------------------------------
+                result = await self._run_intent_router(
+                    node_id=node_id,
+                    node=node,
+                    state=state,
+                    graph=graph,
+                    wf_id=wf_id,
+                    mock=mock,
+                )
+                if isinstance(result, WorkflowResult):
+                    # Propagate partial failure from within the router.
+                    await self._storage.save_workflow_run(
+                        WorkflowRunRecord(
+                            workflow_run_id=wf_id,
+                            tenant_id=self._tenant_id,
+                            workflow=graph.name,
+                            workflow_version=graph.version,
+                            status=WorkflowStatus.ERROR,
+                            initial_state=initial_state,
+                            final_state=state,
+                            error_node_id=result.error_node_id,
+                            error=result.error,
+                        )
+                    )
+                    return WorkflowResult(
+                        workflow_run_id=wf_id,
+                        status=WorkflowStatus.ERROR,
+                        initial_state=initial_state,
+                        final_state=state,
+                        runs=runs + result.runs,
+                        error_node_id=result.error_node_id,
+                        error=result.error,
+                        started_at=started,
+                        finished_at=time.monotonic(),
+                    )
+                # result is (chosen_node_id, classifier_run_records)
+                chosen_next, router_runs = result
+                runs.extend(router_runs)
+                current_id = chosen_next
+                continue
+
+            # --- agent node --------------------------------------------------
             # Load agent — runner-level error if the bundle won't parse.
             try:
                 bundle = load_agent(node.ref)
@@ -202,6 +266,12 @@ class WorkflowRunner:
             # Merge agent output into state.
             state.update(response.data)
 
+            # Advance: follow the single sequential successor (or None at sink).
+            seq_successors = [
+                e.to_id for e in graph.successors(node_id) if not e.metadata.get("synthetic")
+            ]
+            current_id = seq_successors[0] if seq_successors else None
+
         finished = time.monotonic()
         wf_record = WorkflowRunRecord(
             workflow_run_id=wf_id,
@@ -223,6 +293,102 @@ class WorkflowRunner:
             started_at=started,
             finished_at=finished,
         )
+
+    async def _run_intent_router(
+        self,
+        *,
+        node_id: str,
+        node: Any,
+        state: dict[str, Any],
+        graph: WorkflowGraph,
+        wf_id: str,
+        mock: bool,
+    ) -> tuple[str | None, list[RunRecord]] | WorkflowResult:
+        """Dispatch an ``intent-router`` node.
+
+        Returns either:
+        - ``(chosen_node_id, [classifier_run_records])`` on success, where
+          ``chosen_node_id`` is the next node to execute (or ``None`` if the
+          chosen branch has no further successors — treated as end-of-chain).
+        - A partial :class:`WorkflowResult` on classifier failure (the caller
+          propagates this as a workflow-level error).
+
+        Under ``mock=True`` the real classifier call is skipped; the first
+        route key is chosen deterministically so the whole pipeline can be
+        exercised with ``mdk run --mock``.
+        """
+        routes: dict[str, str] = node.metadata["routes"]
+        fallback: str = node.metadata["fallback"]
+        classifier_agent_name: str = node.metadata["classifier_agent"]
+        input_field: str = node.metadata["input_field"]
+
+        if mock:
+            # Pick the first route key deterministically (sorted for
+            # stability) so --mock gives a predictable path through the
+            # workflow regardless of key insertion order.
+            chosen_label = next(iter(sorted(routes))) if routes else None
+            chosen_node = routes.get(chosen_label, fallback) if chosen_label else fallback
+            return chosen_node, []
+
+        # Real path: resolve the classifier agent and call it.
+        # The classifier agent may be a bare name (looked up relative to the
+        # workflow dir) or an absolute path.
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        clf_path = _Path(classifier_agent_name)
+        if not clf_path.is_absolute():
+            clf_path = (graph.workflow_dir / classifier_agent_name).resolve()
+
+        try:
+            clf_bundle = load_agent(clf_path)
+        except AgentLoadError as exc:
+            raise WorkflowRunError(
+                f"intent-router {node_id!r}: classifier agent {classifier_agent_name!r} "
+                f"failed to load: {exc}"
+            ) from exc
+
+        # Build classifier input: {text: <state[input_field]>, labels: [<route keys>]}
+        text_value = state.get(input_field, "")
+        labels = list(routes.keys())
+        clf_input = {"text": str(text_value), "labels": labels}
+
+        clf_response: RunResponse = await self._executor.execute(
+            clf_bundle,
+            RunRequest(agent=clf_bundle.spec.name, input=clf_input),
+            workflow_run_id=wf_id,
+            node_id=node_id,
+            tenant_id_override=self._tenant_id,
+        )
+
+        clf_summary = _summarize_run(
+            clf_response,
+            tenant_id=self._tenant_id,
+            bundle=clf_bundle,
+            wf_id=wf_id,
+            node_id=node_id,
+        )
+        clf_runs = [clf_summary]
+
+        if clf_response.status != "success":
+            await self._storage.save_run(clf_summary)
+            # Return a partial WorkflowResult-like object the caller will wrap.
+            return WorkflowResult(
+                workflow_run_id=wf_id,
+                status=WorkflowStatus.ERROR,
+                initial_state=state,
+                final_state=state,
+                runs=clf_runs,
+                error_node_id=node_id,
+                error=clf_response.error,
+                started_at=0.0,
+                finished_at=time.monotonic(),
+            )
+
+        # Extract the label from the classifier's output.
+        chosen_label = clf_response.data.get("label", "")
+        chosen_node = routes.get(str(chosen_label), fallback)
+
+        return chosen_node, clf_runs
 
 
 # ---------------------------------------------------------------------------

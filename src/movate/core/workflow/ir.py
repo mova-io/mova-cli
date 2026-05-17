@@ -22,6 +22,7 @@ from typing import Any
 
 class NodeType(StrEnum):
     AGENT = "agent"  # v0.3
+    INTENT_ROUTER = "intent-router"  # v0.4 — classifier-driven intent branching
     # Future variants — declared so the IR doesn't need a breaking change
     # when these phases ship. Compiler validators reject them today.
     TOOL = "tool"  # v1.1 — registered tool/function call
