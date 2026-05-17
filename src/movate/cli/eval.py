@@ -38,7 +38,7 @@ from movate.core.eval import (
 )
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
-from movate.core.models import EvalRecord
+from movate.core.models import EvalRecord, JudgeConfig, JudgeMethod, ModelConfig
 from movate.core.remote_executor import RemoteExecutor
 from movate.core.reporters import render_eval_markdown
 from movate.storage.base import StorageProvider
@@ -212,6 +212,27 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "--output-baseline evals/.last-run.json[/bold]."
         ),
     ),
+    judge_model: list[str] = typer.Option(
+        [],
+        "--judge-model",
+        help=(
+            "LiteLLM model string for the LLM-as-judge, e.g. "
+            "[bold]anthropic/claude-opus-4-7[/bold]. "
+            "Overrides [bold]judge.yaml[/bold] — no config file needed. "
+            "Requires [bold]--judge-rubric[/bold]. "
+            "Repeat the flag twice for a two-judge panel "
+            "(requires [bold]--judge-rubric[/bold])."
+        ),
+    ),
+    judge_rubric: str = typer.Option(
+        None,
+        "--judge-rubric",
+        help=(
+            "Scoring rubric passed verbatim to the LLM judge(s). "
+            "Required when [bold]--judge-model[/bold] is set. "
+            "Example: [dim]'Score 0-1: 1=all fields correct, 0=any field wrong'[/dim]"
+        ),
+    ),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
 
@@ -238,9 +259,45 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
 
       [dim]# Inside a project, bare names resolve to ./agents/<name>:[/dim]
       $ mdk eval rag-qa --gate 0.7
+
+      [dim]# Inline LLM judge — no judge.yaml needed:[/dim]
+      $ mdk eval ./ticket-triager \\
+          --judge-model anthropic/claude-opus-4-7 \\
+          --judge-rubric 'Score 0-1: 1=correct routing, 0=wrong' \\
+          --runs 3
     """
     if baseline is not None and baseline_file is not None:
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
+        raise typer.Exit(code=2)
+
+    # --judge-model / --judge-rubric: build an inline JudgeConfig that
+    # bypasses judge.yaml. Validated here so errors surface before any
+    # network / dataset work begins.
+    judge_override: JudgeConfig | None = None
+    if judge_model:
+        if not judge_rubric:
+            err_console.print(
+                "[red]✗[/red] --judge-model requires --judge-rubric "
+                "(provide a scoring rubric, e.g. 'Score 0-1: 1=correct, 0=wrong')"
+            )
+            raise typer.Exit(code=2)
+        if len(judge_model) == 1:
+            judge_override = JudgeConfig(
+                method=JudgeMethod.LLM_JUDGE,
+                model=ModelConfig(provider=judge_model[0]),
+                rubric=judge_rubric,
+            )
+        else:
+            err_console.print(
+                "[red]✗[/red] multi-model panel (--judge-model × 2+) requires "
+                "the panel feature — upgrade to movate-cli v0.8 or later."
+            )
+            raise typer.Exit(code=2)
+    elif judge_rubric:
+        err_console.print(
+            "[red]✗[/red] --judge-rubric requires --judge-model "
+            "(specify which model should apply the rubric)"
+        )
         raise typer.Exit(code=2)
 
     # --compare: auto-read+write evals/.last-run.json in the agent dir (or
@@ -410,6 +467,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             gate_latency=gate_latency,
             gate_context_compliance=gate_context_compliance,
             gate_refusal=gate_refusal,
+            judge_override=judge_override,
         )
     )
 
@@ -998,6 +1056,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     gate_latency: float | None = None,
     gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
+    judge_override: JudgeConfig | None = None,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     # Dataset-aware mock (PR #104): when running --mock, configure
@@ -1040,6 +1099,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
                 gate_mode=gate_mode,
                 objective_filter=objective,
                 on_case_complete=on_case,
+                judge_override=judge_override,
             )
             try:
                 summary = await engine.run(bundle)
@@ -1253,7 +1313,13 @@ def _emit_table(
     head.add_row("eval_id", record.eval_id)
     head.add_row("judge", f"{summary.judge.method.value}")
     if summary.judge_provider:
-        head.add_row("judge.provider", summary.judge_provider)
+        # Panel mode: judge_provider is "a+b+c" — truncate for display
+        jp = summary.judge_provider
+        display_jp = jp if len(jp) <= 60 else jp[:57] + "…"
+        if "+" in jp:
+            judges = jp.split("+")
+            display_jp = f"{judges[0]} +{len(judges) - 1} more"
+        head.add_row("judge.provider", display_jp)
     head.add_row("dataset.hash", summary.dataset_hash[:12] + "…")
     head.add_row("runs/case", str(summary.runs_per_case))
     head.add_row("gate_mode", summary.gate_mode)

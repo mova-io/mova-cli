@@ -51,11 +51,12 @@ def render_eval_markdown(summary: EvalSummary, *, gate: float) -> str:
     lines.append(f"| Pass rate | {cases_passing}/{summary.sample_count} ({pass_pct:.0%}) |")
     lines.append(f"| Gate | {gate:.2f} ({summary.gate_mode}) |")
     lines.append(f"| Runs/case | {summary.runs_per_case} |")
-    judge_str = (
-        f"{summary.judge.method.value} ({summary.judge_provider})"
-        if summary.judge_provider
-        else summary.judge.method.value
-    )
+    if summary.judge_provider:
+        jp = summary.judge_provider
+        jp_display = f"{jp.split('+')[0]} +{len(jp.split('+')) - 1} more" if "+" in jp else jp
+        judge_str = f"{summary.judge.method.value} ({jp_display})"
+    else:
+        judge_str = summary.judge.method.value
     lines.append(f"| Judge | {judge_str} |")
     lines.append(f"| Dataset hash | `{summary.dataset_hash[:12]}…` |")
     lines.append(f"| Total cost | ${summary.total_cost_usd:.6f} |")

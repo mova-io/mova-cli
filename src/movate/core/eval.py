@@ -51,6 +51,7 @@ from movate.core.models import (
     JudgeConfig,
     JudgeMethod,
     Metrics,
+    ModelConfig,
     RunRequest,
     RunResponse,
     WorkflowStatus,
@@ -815,6 +816,7 @@ class EvalEngine:
         gate_mode: str = "mean",
         objective_filter: str | None = None,
         on_case_complete: Callable[[int, int, CaseSummary], None] | None = None,
+        judge_override: JudgeConfig | None = None,
     ) -> None:
         if runs_per_case < 1:
             raise EvalConfigError("runs_per_case must be >= 1")
@@ -833,9 +835,12 @@ class EvalEngine:
         """Optional progress hook: ``(done, total, summary)``. Fires
         after each case finishes; CLI uses it to drive a Rich progress
         bar without coupling the engine to UI."""
+        self._judge_override = judge_override
+        """When set, bypasses judge.yaml and uses this config directly.
+        Populated by --judge-model / --judge-rubric CLI flags."""
 
     async def run(self, bundle: AgentBundle) -> EvalSummary:
-        judge = load_judge_config(bundle)
+        judge = self._judge_override if self._judge_override is not None else load_judge_config(bundle)
         self._validate_judge(bundle, judge)
         cases, dataset_hash = load_dataset(bundle)
 
