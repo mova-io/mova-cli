@@ -164,8 +164,11 @@ def test_bootstrap_seed_blocks_when_secret_already_exists(
     assert len(captures["calls"]) == 1
     assert captures["calls"][0][:4] == ["az", "keyvault", "secret", "show"]
     # The error names a recovery command so the operator can pull the
-    # existing value locally without rotating it.
-    assert "save-runtime-key dev" in result.stderr
+    # existing value locally without rotating it. Post-PR-#158 the
+    # recommended recovery is `pull-runtime-key`, which reads from
+    # Key Vault and writes to local creds in one step (was: a manual
+    # `az keyvault secret show` piped into `save-runtime-key`).
+    assert "pull-runtime-key dev" in result.stderr
     assert "already exists" in result.stderr
     # And nothing was written locally.
     creds_path = tmp_path / ".movate" / "credentials"

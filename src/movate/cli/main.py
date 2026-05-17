@@ -109,6 +109,7 @@ from movate.cli import chat as chat_cmd  # noqa: E402
 from movate.cli import deploy as deploy_cmd  # noqa: E402
 from movate.cli import doctor as doctor_cmd  # noqa: E402
 from movate.cli import eval as eval_cmd  # noqa: E402
+from movate.cli import explain as explain_cmd  # noqa: E402
 from movate.cli import (  # noqa: E402
     import_json as _import_json,  # noqa: F401  -- registers `json` on import_app
 )
@@ -116,7 +117,6 @@ from movate.cli import (  # noqa: E402
     import_openapi as _import_openapi,  # noqa: F401  -- registers `openapi` on import_app
 )
 from movate.cli import init as init_cmd  # noqa: E402
-from movate.cli import explain as explain_cmd  # noqa: E402
 from movate.cli import logs as logs_cmd  # noqa: E402
 from movate.cli import pricing as pricing_cmd  # noqa: E402
 from movate.cli import run as run_cmd  # noqa: E402
@@ -136,6 +136,7 @@ from movate.cli.doctor import doctor_app  # noqa: E402
 from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
+from movate.cli.infra_cmd import infra_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
@@ -410,6 +411,10 @@ app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
 app.command("serve", rich_help_panel=PANEL_DEPLOY)(serve_cmd.serve)
 app.command("worker", rich_help_panel=PANEL_DEPLOY)(worker_cmd.worker)
 app.command("deploy", rich_help_panel=PANEL_DEPLOY)(deploy_cmd.deploy)
+# `infra apply` wraps the Bicep deploy + auto-chains into the
+# bootstrap-seed flow so first-deploy on a fresh Azure environment is
+# one command. Lives next to `deploy` since both target shared infra.
+app.add_typer(infra_app, name="infra", rich_help_panel=PANEL_DEPLOY)
 # `export` packages primitives for portability — adjacent to deploy
 # (both ship things off-host).
 app.add_typer(export_app, name="export", rich_help_panel=PANEL_DEPLOY)
