@@ -47,6 +47,9 @@ class AuthContext:
     tenant_id: str
     api_key_id: str
     env: str
+    scope: str | None = None
+    """Permission scope from the ApiKeyRecord. ``"fleet-admin"`` grants
+    access to admin-only endpoints. ``None`` = standard tenant key."""
 
 
 # ----------------------------------------------------------------------
@@ -149,6 +152,7 @@ def make_auth_dependency(
             tenant_id=record.tenant_id,
             api_key_id=record.key_id,
             env=record.env.value,
+            scope=record.scope,
         )
 
     return auth_dependency

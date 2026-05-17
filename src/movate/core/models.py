@@ -1581,6 +1581,9 @@ class ApiKeyRecord(BaseModel):
     expires_at: datetime | None = None
     """UTC expiry. None = no expiry (legacy keys minted before v0.7.1).
     New keys default to 90 days from mint time via :func:`movate.core.auth.mint_api_key`."""
+    scope: str | None = None
+    """Permission scope. ``"fleet-admin"`` grants access to admin-only endpoints
+    (POST/GET/DELETE /api/v1/auth/keys). ``None`` = standard tenant key."""
 
 
 # Forward ref resolution

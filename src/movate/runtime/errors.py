@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict
 
 class ErrorCode(StrEnum):
     AUTH_REQUIRED = "auth_required"
+    FORBIDDEN = "forbidden"
     NOT_FOUND = "not_found"
     BAD_REQUEST = "bad_request"
     INTERNAL = "internal"
@@ -81,6 +82,15 @@ def auth_required() -> HTTPException:
     )
 
 
+def forbidden(message: str = "admin scope required") -> HTTPException:
+    """403 for callers that are authenticated but lack the required scope."""
+    return http_error(
+        ErrorCode.FORBIDDEN,
+        status_code=status.HTTP_403_FORBIDDEN,
+        message=message,
+    )
+
+
 def not_found(resource: str, identifier: str) -> HTTPException:
     """404 with a narrowly-scoped message — safe to include the id since
     the caller already knew it."""
@@ -127,6 +137,7 @@ __all__ = [
     "ErrorCode",
     "ErrorResponse",
     "auth_required",
+    "forbidden",
     "http_error",
     "not_found",
     "rate_limited",

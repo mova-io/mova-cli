@@ -209,6 +209,9 @@ _MIGRATIONS = [
     # v0.7.1: key expiry. NULL = no expiry (legacy keys keep working).
     # New keys written by mint_api_key get a 90-day default.
     "ALTER TABLE api_keys ADD COLUMN expires_at TEXT",
+    # v0.8: permission scope. NULL = standard tenant key;
+    # "fleet-admin" = admin-only endpoint access.
+    "ALTER TABLE api_keys ADD COLUMN scope TEXT",
 ]
 
 
@@ -677,8 +680,8 @@ class SqliteProvider:
             """
             INSERT INTO api_keys (
                 key_id, tenant_id, env, secret_hash, salt, label,
-                created_at, last_used_at, revoked_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, last_used_at, revoked_at, expires_at, scope
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 key.key_id,
@@ -691,6 +694,7 @@ class SqliteProvider:
                 key.last_used_at.isoformat() if key.last_used_at else None,
                 key.revoked_at.isoformat() if key.revoked_at else None,
                 key.expires_at.isoformat() if key.expires_at else None,
+                key.scope,
             ),
         )
         await self._db.commit()
@@ -915,9 +919,9 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
 
 
 def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
-    # expires_at may be absent on rows from pre-v0.7.1 schemas (before
-    # the ALTER TABLE migration ran). dict() access raises KeyError for
-    # missing columns; use .get() via the keys() approach instead.
+    # expires_at and scope may be absent on rows from pre-migration schemas
+    # (before the ALTER TABLE migrations ran). dict() access raises KeyError
+    # for missing columns; use .get() via the keys() approach instead.
     row_dict = dict(row)
     return ApiKeyRecord(
         key_id=row_dict["key_id"],
@@ -936,6 +940,7 @@ def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
         expires_at=(
             datetime.fromisoformat(row_dict["expires_at"]) if row_dict.get("expires_at") else None
         ),
+        scope=row_dict.get("scope"),
     )
 
 
