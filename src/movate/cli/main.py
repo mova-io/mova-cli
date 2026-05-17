@@ -139,6 +139,7 @@ from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
+from movate.cli.models_cmd import models_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
@@ -388,6 +389,11 @@ app.add_typer(doctor_app, name="doctor", rich_help_panel=PANEL_DIAGNOSE)
 # Auto-remediates common diagnostic findings. Dry-run by default.
 app.command("fix", rich_help_panel=PANEL_DIAGNOSE)(fix_cmd.fix)
 app.command("pricing", rich_help_panel=PANEL_DIAGNOSE)(pricing_cmd.pricing)
+# `models` is the model catalog — list all known models with pricing,
+# context windows, and capability flags, or drill into one model.
+# Sits alongside `pricing` (per-1k cost table) since both answer
+# "what models can I use and what do they cost?".
+app.add_typer(models_app, name="models", rich_help_panel=PANEL_DIAGNOSE)
 # `costs` reports on historical spend (different from `pricing` which
 # shows the live tariff). Both share the Diagnose panel since they
 # answer adjacent operator questions ("what does this cost?" vs
