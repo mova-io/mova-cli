@@ -25,7 +25,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from rich.console import Console
 from rich.prompt import Prompt
@@ -35,17 +36,18 @@ from rich.prompt import Prompt
 class NextStep:
     """One row in a 'what next?' menu.
 
-    ``label`` is the short human-readable description ("Run with a
-    sample input"). ``command`` is the resolved CLI string shown to
-    the operator as documentation ("mdk run ./agents/faq --mock
-    '...'"). ``argv`` is what gets executed when the operator picks
-    this entry — passed straight to :func:`subprocess.run` so shell
-    quoting is never an issue.
+    ``label`` is the short human-readable description. ``command`` is
+    the resolved CLI string shown as documentation. ``argv`` is what
+    gets executed when the operator picks this entry — passed straight
+    to :func:`subprocess.run`. ``callback``, when set, is called
+    instead of ``subprocess.run`` (used for interactive sub-flows that
+    need to stay in-process, like the role-catalog picker).
     """
 
     label: str
     command: str
     argv: list[str]
+    callback: Callable[[], None] | None = field(default=None, repr=False)
 
 
 def prompt_next_step(
@@ -97,6 +99,9 @@ def prompt_next_step(
         return
 
     chosen = steps[int(choice) - 1]
+    if chosen.callback is not None:
+        chosen.callback()
+        return
     c.print(f"\n[dim]$ {chosen.command}[/dim]")
     try:
         subprocess.run(chosen.argv, check=False)

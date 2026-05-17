@@ -79,8 +79,8 @@ def test_add_panel_still_includes_static_next_steps(
     assert result.exit_code == 0
     # Helper-printed Next: surface.
     assert "Next:" in result.stdout
-    # The three suggested commands appear in the list.
-    assert "mdk run" in result.stdout
+    # First step is now the role-catalog picker; remaining steps still appear.
+    assert "Add another role agent" in result.stdout
     assert "mdk eval" in result.stdout
     assert "mdk doctor agent faq" in result.stdout
 
