@@ -77,6 +77,102 @@ def test_build_storage_picks_postgres_when_db_url_set(
 
 
 @pytest.mark.unit
+async def test_postgres_provider_passes_pgpassword_as_kwarg_when_dsn_password_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Azure Container Apps Bicep wires the DSN as
+    ``postgresql://user:@host/db`` (empty password slot) and the
+    password as a separate ``PGPASSWORD`` env var. asyncpg's documented
+    PGPASSWORD fallback only fires when the DSN's password component is
+    MISSING, not when it's present-but-empty — so without this shim the
+    pod startup dies with ``InvalidPasswordError: password
+    authentication failed`` (caught in the wild on dev,
+    revision movate-dev-api--0000010, May 2026). Pass PGPASSWORD as an
+    explicit kwarg to sidestep it.
+    """
+    captured: dict[str, Any] = {}
+
+    async def fake_create_pool(dsn: str, **kwargs: Any) -> Any:
+        captured["dsn"] = dsn
+        captured["kwargs"] = kwargs
+        # Return a stub pool whose acquire() context manager returns a
+        # stub conn whose execute() coroutine is a no-op — enough to let
+        # init() complete past the _SCHEMA execute.
+        class _Conn:
+            async def execute(self, *_a: Any, **_kw: Any) -> None:
+                return None
+
+        class _Acq:
+            async def __aenter__(self) -> _Conn:
+                return _Conn()
+
+            async def __aexit__(self, *_a: Any) -> None:
+                return None
+
+        class _Pool:
+            def acquire(self) -> _Acq:
+                return _Acq()
+
+        return _Pool()
+
+    monkeypatch.setattr("asyncpg.create_pool", fake_create_pool)
+    monkeypatch.setenv("PGPASSWORD", "s3cret-from-keyvault")
+
+    provider = PostgresProvider(
+        dsn="postgresql://movateadmin:@db.example.internal:5432/movate?sslmode=require",
+    )
+    await provider.init()
+
+    assert captured["kwargs"].get("password") == "s3cret-from-keyvault", (
+        "PGPASSWORD env var must be passed as the password kwarg so "
+        "asyncpg doesn't auth with the DSN's empty-string password"
+    )
+
+
+@pytest.mark.unit
+async def test_postgres_provider_omits_password_kwarg_when_pgpassword_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When PGPASSWORD is NOT set, don't pass a password kwarg at all —
+    that way asyncpg falls back to whatever IS in the DSN (e.g.
+    ``postgresql://user:pw@host/db``) without being overridden."""
+    captured: dict[str, Any] = {}
+
+    async def fake_create_pool(dsn: str, **kwargs: Any) -> Any:
+        captured["kwargs"] = kwargs
+
+        class _Conn:
+            async def execute(self, *_a: Any, **_kw: Any) -> None:
+                return None
+
+        class _Acq:
+            async def __aenter__(self) -> _Conn:
+                return _Conn()
+
+            async def __aexit__(self, *_a: Any) -> None:
+                return None
+
+        class _Pool:
+            def acquire(self) -> _Acq:
+                return _Acq()
+
+        return _Pool()
+
+    monkeypatch.setattr("asyncpg.create_pool", fake_create_pool)
+    monkeypatch.delenv("PGPASSWORD", raising=False)
+
+    provider = PostgresProvider(
+        dsn="postgresql://user:dsnpw@host/db",
+    )
+    await provider.init()
+
+    assert "password" not in captured["kwargs"], (
+        "without PGPASSWORD set, leave the password kwarg unspecified "
+        "so asyncpg uses whatever's in the DSN"
+    )
+
+
+@pytest.mark.unit
 def test_ready_endpoint_surfaces_backend_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
