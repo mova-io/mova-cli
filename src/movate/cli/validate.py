@@ -21,7 +21,7 @@ from movate.cli._workflow_path import is_workflow_path
 from movate.core.config import PROJECT_MARKER_FILES, load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
-from movate.core.models import AgentRuntime, SkillImplementationKind, SkillSpec
+from movate.core.models import AgentRuntime, AgentSpec, SkillImplementationKind, SkillSpec
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
@@ -483,6 +483,7 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             raise typer.Exit(code=2)
 
     _check_kb_corpus(bundle)
+    _check_marketplace_metadata(spec)
 
     # Context size + content advisory. Contexts are prepended to the system
     # prompt on every call; empty or very large contexts are likely mistakes.
@@ -734,6 +735,57 @@ _CTX_ERROR_BYTES: int = 16_384
 # causes a KeyError or empty-match at eval/run time.
 _CORPUS_REQUIRED_FIELDS: frozenset[str] = frozenset({"id", "title", "resolution"})
 _CORPUS_MAX_REPORTED_ERRORS: int = 3
+
+
+def _check_marketplace_metadata(spec: AgentSpec) -> None:
+    """Validate the optional ``metadata:`` block on an AgentSpec.
+
+    Lightweight advisory checks — none of these are hard errors:
+
+    1. **no metadata block** — emits a dim discovery hint (exit 0, no color).
+       Non-intrusive; purely a discovery prompt for operators who haven't
+       heard of the catalog feature yet.
+
+    2. **owner** — if set to an empty string, emits a yellow warning.
+       A non-empty string (email or team name) is accepted without further
+       validation.
+
+    3. **examples** — if non-empty, each entry should have both ``input`` and
+       ``output`` keys. Missing keys emit a yellow advisory (not a hard error)
+       because the marketplace can still render the card; only the example
+       gallery is degraded.
+    """
+    if spec.metadata is None:
+        console.print(
+            "  [dim]hint: add a [bold]metadata:[/bold] block to agent.yaml to "
+            "populate the Mova iO marketplace catalog "
+            "(persona, role, capabilities, owner, examples).[/dim]"
+        )
+        return
+
+    m = spec.metadata
+
+    # owner check
+    if m.owner is not None and not m.owner.strip():
+        console.print(
+            "  [yellow]![/yellow] metadata.owner is set but empty — "
+            "use a non-empty email address or team name, "
+            "or omit the field entirely."
+        )
+
+    # examples check — each entry should have input + output keys
+    for i, ex in enumerate(m.examples):
+        missing = []
+        if "input" not in ex:
+            missing.append("input")
+        if "output" not in ex:
+            missing.append("output")
+        if missing:
+            console.print(
+                f"  [yellow]![/yellow] metadata.examples[{i}] is missing "
+                f"key(s): {missing} — the marketplace example gallery "
+                "expects both 'input' and 'output'."
+            )
 
 
 def _check_orphaned_assets(project_root: Path, agent_dirs: list[Path]) -> None:
