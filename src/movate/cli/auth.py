@@ -875,7 +875,9 @@ def save_runtime_key(
         help=(
             "The full `mvt_<env>_<tenant>_<keyid>_<secret>` value printed "
             "by `mdk auth create-key`. Quote it if your shell would otherwise "
-            "interpret special characters."
+            "interpret special characters. Pass `-` to read the key from "
+            "stdin instead — recommended for piped recovery flows so the "
+            "secret never lands in shell history or `ps` output."
         ),
     ),
 ) -> None:
@@ -891,23 +893,50 @@ def save_runtime_key(
     automatically (the loader pattern-matches ``MDK_*_KEY`` entries —
     see :mod:`movate.credentials.loader`).
 
-    Example:
+    Examples:
 
-      [dim]$ az containerapp exec -g movate-dev-rg -n movate-dev-api \\\\
-          --command "mdk auth create-key --tenant-id demo --env live"[/dim]
-      [dim]# copy the printed mvt_live_... value[/dim]
+      [dim]# Inline (works but leaks the secret to shell history):[/dim]
+      $ mdk auth save-runtime-key dev mvt_live_demotena_…_…
 
-      [dim]# locally:[/dim]
-      $ mdk auth save-runtime-key dev mvt_live_demodevt_…_…
-      ✓ saved as MDK_DEV_KEY in ~/.movate/credentials
+      [dim]# Piped — preferred for the recovery flow (no shell history,[/dim]
+      [dim]# no `ps` exposure):[/dim]
+      $ az containerapp exec -g movate-dev-rg -n movate-dev-api \\\\
+          --command "mdk auth create-key --tenant-id demotenant \\\\
+                       --env live --quiet" \\\\
+        | mdk auth save-runtime-key dev -
     """
     # Local imports keep CLI cold-start cheap (config + credentials
     # are only needed when this command actually runs).
+    import sys  # noqa: PLC0415
+
     from movate.core.user_config import (  # noqa: PLC0415
         UserConfigError,
         load_user_config,
     )
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    # `-` is the conventional stdin sentinel. Read the entire pipe
+    # (callers typically pipe a single line) and scrape the first
+    # `mvt_*` token out — robust against trailing newlines, ANSI
+    # color codes, and az-exec's "save this now" preamble.
+    if key == "-":
+        if sys.stdin.isatty():
+            error(
+                "key is `-` but stdin is a tty — nothing to read. "
+                "Pipe the output of `mdk auth create-key` or pass the "
+                "key directly as the second argument."
+            )
+            raise typer.Exit(code=2)
+        piped = sys.stdin.read()
+        scraped = _extract_mvt_key(piped)
+        if scraped is None:
+            error(
+                "no `mvt_<env>_<tenant>_<keyid>_<secret>` token found "
+                "on stdin. Pipe the output of `mdk auth create-key` "
+                "(with or without --quiet) or paste the value directly."
+            )
+            raise typer.Exit(code=2)
+        key = scraped
 
     try:
         cfg = load_user_config()
@@ -979,7 +1008,7 @@ class RefreshRuntimeKeyError(Exception):
 def refresh_runtime_key_inline(  # noqa: PLR0912 — orchestrator; az shell-out + parse + save reads clearer flat
     target: str,
     *,
-    tenant: str = "demo",
+    tenant: str = "demotenant",
     env: str = "live",
     label: str | None = None,
     container_app: str | None = None,
@@ -1130,11 +1159,14 @@ def refresh_runtime_key(
         help="Deployment target name (from `mdk config list-targets`).",
     ),
     tenant: str = typer.Option(
-        "demo",
+        "demotenant",
         "--tenant",
         help=(
-            "Tenant id to mint the key for. Defaults to `demo` — the "
-            "bootstrap tenant the runtime is seeded with on first deploy."
+            "Tenant id to mint the key for. Defaults to `demotenant` "
+            "(matches the default used by `mdk auth bootstrap-seed`). "
+            "Must be at least TENANT_PREFIX_LEN (8) chars — the wire "
+            "format embeds the first 8 characters as the tenant_prefix "
+            "segment, so anything shorter fails validation."
         ),
     ),
     env: str = typer.Option(
@@ -1666,6 +1698,142 @@ def bootstrap_seed(
         f"[dim]Next: run [bold]mdk deploy --target {target} --mode runtime[/bold] "
         f"(or restart the Container App) so the runtime picks up the "
         f"new MOVATE_SEED_API_KEY value and seeds the ApiKeyRecord row.[/dim]"
+    )
+    hint(
+        f"[dim]For the current shell, run: [bold]export {env_var}=$(grep "
+        f"'^{env_var}=' {store.path} | cut -d= -f2-)[/bold] or open a new "
+        f"terminal.[/dim]"
+    )
+
+
+@auth_app.command("pull-runtime-key")
+def pull_runtime_key(
+    target: str = typer.Argument(
+        ...,
+        help="Deployment target name (from `mdk config list-targets`).",
+    ),
+    keyvault: str = typer.Option(
+        ...,
+        "--keyvault",
+        help=(
+            "Azure Key Vault name (no FQDN — e.g. `movate-dev-kv-mvt`). "
+            "The same vault where `bootstrap-seed` uploaded the secret."
+        ),
+    ),
+    secret_name: str = typer.Option(
+        "bootstrap-api-key",
+        "--secret-name",
+        help=(
+            "Key Vault secret name to read. Defaults to `bootstrap-api-key` "
+            "(the value `mdk auth bootstrap-seed` uploads)."
+        ),
+    ),
+) -> None:
+    """Pull the bootstrap key from Key Vault into the local credentials store.
+
+    Recovery path when ``~/.movate/credentials`` has been cleared (new
+    laptop, new shell user, deliberate rotation of local state) and
+    the deployed Container App's `bootstrap-api-key` secret is the
+    canonical source of truth. One `az keyvault secret show` + one
+    `CredentialsStore.set` — no minting, no `az containerapp exec`,
+    no chicken-and-egg.
+
+    Use this AFTER `mdk auth bootstrap-seed <target>` has been run
+    once for the environment. To rotate the bootstrap key itself,
+    use `mdk auth bootstrap-seed <target> --force` instead.
+
+    [bold]Examples:[/bold]
+
+      [dim]# New laptop, dev already provisioned:[/dim]
+      $ mdk auth pull-runtime-key dev --keyvault movate-dev-kv-mvt
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+    if target not in cfg.targets:
+        registered = sorted(cfg.targets) or ["<none>"]
+        error(
+            f"unknown target {target!r}. Registered: "
+            f"{', '.join(registered)}. Add one with `mdk config add-target`."
+        )
+        raise typer.Exit(code=2)
+    target_cfg = cfg.targets[target]
+    env_var = target_cfg.key_env
+    if not env_var:
+        error(
+            f"target {target!r} has no `key_env` configured. Re-register "
+            f"with `--key-env MDK_{target.upper()}_KEY`."
+        )
+        raise typer.Exit(code=2)
+
+    if shutil.which("az") is None:
+        error(
+            "`az` (Azure CLI) not found on PATH. Install it from "
+            "https://learn.microsoft.com/cli/azure/install-azure-cli."
+        )
+        raise typer.Exit(code=2)
+
+    # `--query value -o tsv` returns the bare secret on stdout. Capture
+    # to a Python str rather than letting it land in shell scope.
+    result = subprocess.run(
+        [
+            "az",
+            "keyvault",
+            "secret",
+            "show",
+            "--vault-name",
+            keyvault,
+            "--name",
+            secret_name,
+            "--query",
+            "value",
+            "-o",
+            "tsv",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # `SecretNotFound` from KV vs other failures — surface the
+        # underlying stderr so the operator can tell whether the
+        # secret name is wrong, the vault is wrong, or RBAC is wrong.
+        error(
+            f"az keyvault secret show failed (exit {result.returncode}): "
+            f"{result.stderr.strip()[:400]}. Confirm `{secret_name}` exists "
+            f"in {keyvault!r} (run `mdk auth bootstrap-seed {target} "
+            f"--keyvault {keyvault}` first) and that you have `Key Vault "
+            f"Secrets User` on the vault."
+        )
+        raise typer.Exit(code=2)
+
+    secret_value = result.stdout.strip()
+    if not secret_value.startswith("mvt_"):
+        error(
+            f"value pulled from {keyvault}/{secret_name} doesn't look like "
+            f"a movate bearer (expected `mvt_<env>_<tenant>_<keyid>_<secret>`). "
+            f"Did `bootstrap-seed` actually populate this secret? Read the "
+            f"value manually with `az keyvault secret show --vault-name "
+            f"{keyvault} --name {secret_name} --query value -o tsv` to debug."
+        )
+        raise typer.Exit(code=2)
+
+    store = CredentialsStore()
+    store.set(env_var, secret_value)
+    success(
+        f"pulled [cyan]{keyvault}/{secret_name}[/cyan] → saved as "
+        f"[cyan]{env_var}[/cyan] in [cyan]{store.path}[/cyan]."
     )
     hint(
         f"[dim]For the current shell, run: [bold]export {env_var}=$(grep "

@@ -176,8 +176,11 @@ def test_refresh_happy_path_writes_credentials(
     assert "-n" in calls[1] and "movate-dev-api" in calls[1]  # auto-derived
     assert "--command" in calls[1]
     # The inner command includes the right tenant + env + --quiet.
+    # Default tenant is `demotenant` — 8+ chars so it satisfies the
+    # library's TENANT_PREFIX_LEN minimum (4-char `demo` was a bug
+    # that made the documented recovery flow fail at validation).
     inner = next(part for part in calls[1] if "mdk auth create-key" in part)
-    assert "--tenant-id demo" in inner
+    assert "--tenant-id demotenant" in inner
     assert "--env live" in inner
     assert "--quiet" in inner
 
