@@ -539,6 +539,7 @@ def assert_cross_family(agent_provider: str, judge_provider: str) -> None:
 
 
 _GATE_MODES = ("mean", "min", "p10")
+_PANEL_MIN_JUDGES = 2
 
 
 def _build_objective_summaries(
@@ -842,7 +843,7 @@ class EvalEngine:
         remote eval API when the caller passes skill_responses in the
         EvalSubmission body."""
 
-    async def run(self, bundle: AgentBundle) -> EvalSummary:
+    async def run(self, bundle: AgentBundle) -> EvalSummary:  # noqa: PLR0912
         judge = load_judge_config(bundle)
         self._validate_judge(bundle, judge)
         cases, dataset_hash = load_dataset(bundle)
@@ -885,7 +886,10 @@ class EvalEngine:
                 # Merge global stubs with per-case stubs; per-case wins.
                 skill_fixture: dict[str, Any] | None = None
                 if self._global_skill_responses or case.skill_responses:
-                    skill_fixture = {**(self._global_skill_responses or {}), **(case.skill_responses or {})}
+                    skill_fixture = {
+                        **(self._global_skill_responses or {}),
+                        **(case.skill_responses or {}),
+                    }
                 response = await self._executor.execute(
                     bundle,
                     RunRequest(agent=bundle.spec.name, input=case.input),
@@ -983,7 +987,7 @@ class EvalEngine:
                 raise EvalConfigError("llm_judge requires both 'model' and 'rubric'")
             assert_cross_family(bundle.spec.model.provider, judge.model.provider)
         elif judge.method == JudgeMethod.PANEL:
-            if len(judge.judges) < 2:
+            if len(judge.judges) < _PANEL_MIN_JUDGES:
                 raise EvalConfigError("panel requires at least 2 judges")
             if judge.rubric is None:
                 raise EvalConfigError("panel requires 'rubric'")

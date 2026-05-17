@@ -460,8 +460,6 @@ async def test_global_skill_responses_fallback(
     tmp_path: Path, pricing: PricingTable, storage, tracer
 ) -> None:
     """global_skill_responses applies to all cases; per-case takes precedence."""
-    from movate.providers.mock import MockProvider
-
     agent_dir = _scaffold(tmp_path / "demo")
     (agent_dir / "evals" / "dataset.jsonl").write_text(
         '{"input": {"text": "hi"}, "expected": {"message": "Hello!"}}\n'
