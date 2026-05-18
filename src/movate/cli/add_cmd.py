@@ -200,14 +200,20 @@ def _render_role_catalog_numbered(installed: set[str]) -> list[str]:
 
 
 def _pick_and_add_role_agent(bin_name: str) -> None:
-    """Show the numbered role catalog, add the chosen agent, then offer an
-    interactive sample run so the operator can see it working immediately."""
-    import json as _json  # noqa: PLC0415
+    """Show the numbered role catalog and shell out to ``mdk add <template>``.
+
+    The downstream ``mdk add`` invocation runs its own post-add menu
+    (see :func:`_post_add_menu`) which offers "Run with sample input"
+    as an explicit option — the picker doesn't fire that smoke test
+    on its own anymore. Previously the picker unconditionally ran
+    ``mdk run --mock`` after returning from the inner menu, which
+    confused operators who had picked ``[3] Check wiring`` and got
+    a surprise model invocation.
+    """
     import subprocess  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
     from rich.prompt import Prompt  # noqa: PLC0415
-    from rich.syntax import Syntax  # noqa: PLC0415
 
     installed = _installed_templates()
     addable = _render_role_catalog_numbered(installed)
@@ -231,16 +237,30 @@ def _pick_and_add_role_agent(bin_name: str) -> None:
     console.print(f"\n[dim]$ {bin_name} add {template}[/dim]")
     subprocess.run([bin_name, "add", template], check=False)
 
-    # After the agent is added, offer a quick sample run so the operator
-    # can see it working before moving on.
-    project_root = walk_up_for_project_root()
-    if project_root is None:
-        return
-    agent_dir = _default_target(project_root) / template
-    default_payload = _first_dataset_input(agent_dir)
 
+def _run_with_sample_input(
+    *,
+    bin_name: str,
+    template_or_name: str,
+    agent_dir: Path,
+    project_root: Path,
+) -> None:
+    """Interactive sample-input smoke test: prompt for input, run
+    ``mdk run --mock``, render a Rich panel with status + latency + cost.
+
+    Extracted from the old auto-smoke in :func:`_pick_and_add_role_agent`
+    so it can be offered as an opt-in ``[Run with sample input]``
+    option in the post-add menu instead of firing as a surprise.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from rich.prompt import Prompt  # noqa: PLC0415
+    from rich.syntax import Syntax  # noqa: PLC0415
+
+    default_payload = _first_dataset_input(agent_dir)
     console.print(
-        f"\n[bold]Try it now[/bold] [dim](edit or press Enter to use the dataset example)[/dim]"
+        "\n[bold]Try it now[/bold] [dim](edit or press Enter to use the dataset example)[/dim]"
     )
     try:
         user_input = Prompt.ask("  Input", default=default_payload, show_default=True)
@@ -250,7 +270,7 @@ def _pick_and_add_role_agent(bin_name: str) -> None:
     rel = agent_dir.relative_to(project_root)
     cmd = [bin_name, "run", f"./{rel}", "--mock", user_input]
     console.print(f"\n[dim]$ {' '.join(cmd)}[/dim]")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     raw_stdout = result.stdout.strip()
     raw_stderr = result.stderr.strip()
@@ -276,7 +296,7 @@ def _pick_and_add_role_agent(bin_name: str) -> None:
         console.print(
             Panel(
                 "\n".join(body_parts),
-                title=f"[bold]mdk run[/bold] [dim]·[/dim] {template}",
+                title=f"[bold]mdk run[/bold] [dim]·[/dim] {template_or_name}",
                 title_align="left",
                 border_style=status_color,
             )
@@ -898,10 +918,15 @@ def _add_one(
         console=console,
         steps=[
             NextStep(
-                label="Add another role agent",
-                command=f"{bin_name} add --list",
-                argv=[bin_name, "add", "--list"],
-                callback=lambda: _pick_and_add_role_agent(bin_name),
+                label="Run with sample input",
+                command=f"{bin_name} run ./{rel} --mock <input>",
+                argv=[bin_name, "run", f"./{rel}", "--mock"],
+                callback=lambda: _run_with_sample_input(
+                    bin_name=bin_name,
+                    template_or_name=agent_name,
+                    agent_dir=dest,
+                    project_root=project_root,
+                ),
             ),
             NextStep(
                 label="Run the eval suite",
@@ -912,6 +937,12 @@ def _add_one(
                 label="Check wiring + setup",
                 command=f"{bin_name} doctor agent {agent_name}",
                 argv=[bin_name, "doctor", "agent", agent_name],
+            ),
+            NextStep(
+                label="Add another role agent",
+                command=f"{bin_name} add --list",
+                argv=[bin_name, "add", "--list"],
+                callback=lambda: _pick_and_add_role_agent(bin_name),
             ),
             NextStep(
                 label="Deploy to Azure",
