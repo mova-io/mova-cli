@@ -66,9 +66,7 @@ def _materialize_bicep(tmp_path: Path) -> None:
 
 
 class _FakeCompleted:
-    def __init__(
-        self, returncode: int = 0, stdout: str = "", stderr: str = ""
-    ) -> None:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
@@ -195,9 +193,7 @@ def test_apply_passes_target_subscription_rg_and_param_file_to_az(
 
 
 @pytest.mark.unit
-def test_apply_dry_run_makes_no_az_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_apply_dry_run_makes_no_az_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Dry-run prints the command preview but executes nothing."""
     _isolate(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
@@ -234,9 +230,7 @@ def test_apply_dry_run_makes_no_az_calls(
 
 
 @pytest.mark.unit
-def test_apply_no_seed_skips_the_chain(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_apply_no_seed_skips_the_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``--no-seed`` runs the Bicep deploy and stops — no probe, no
     mint, no upload. The summary reports seeded=false ok=true."""
     _isolate(tmp_path, monkeypatch)
@@ -358,9 +352,7 @@ def test_apply_missing_keyvault_without_no_seed_errors_with_hint(
     monkeypatch.chdir(tmp_path)
     _patch_az(monkeypatch)
 
-    result = runner.invoke(
-        app, ["infra", "apply", "dev"], env={"COLUMNS": "200"}
-    )
+    result = runner.invoke(app, ["infra", "apply", "dev"], env={"COLUMNS": "200"})
     assert result.exit_code == 2
     combined = (result.stdout + result.stderr).replace("\n", " ")
     assert "--keyvault is required" in combined

@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -119,20 +118,24 @@ def _caps_for(model_id: str) -> _ModelCaps:
     """Return capability metadata for *model_id*, falling back to provider defaults."""
     if model_id in _CAPABILITY_CATALOGUE:
         return _CAPABILITY_CATALOGUE[model_id]
-    provider = model_id.split("/")[0] if "/" in model_id else ""
+    provider = model_id.split("/", maxsplit=1)[0] if "/" in model_id else ""
     return _PROVIDER_DEFAULTS.get(
         provider,
         _ModelCaps(context_window=0, supports_tools=False, supports_vision=False),
     )
 
 
+_ONE_MILLION = 1_000_000
+_ONE_THOUSAND = 1_000
+
+
 def _fmt_context(tokens: int) -> str:
     if tokens == 0:
         return "—"
-    if tokens >= 1_000_000:
-        return f"{tokens // 1_000_000}M"
-    if tokens >= 1_000:
-        return f"{tokens // 1_000}k"
+    if tokens >= _ONE_MILLION:
+        return f"{tokens // _ONE_MILLION}M"
+    if tokens >= _ONE_THOUSAND:
+        return f"{tokens // _ONE_THOUSAND}k"
     return str(tokens)
 
 
@@ -157,7 +160,7 @@ class _ModelRow:
     context_window: int
     input_per_1m: float
     output_per_1m: float
-    cached_input_per_1m: Optional[float]
+    cached_input_per_1m: float | None
     supports_tools: bool
     supports_vision: bool
     notes: str = field(default="")
@@ -229,10 +232,7 @@ def models_list(
         None,
         "--provider",
         "-p",
-        help=(
-            "Only show models from this provider "
-            "(e.g. ``anthropic``, ``openai``, ``azure``)."
-        ),
+        help=("Only show models from this provider (e.g. ``anthropic``, ``openai``, ``azure``)."),
     ),
     has_tools: bool = typer.Option(
         False,
@@ -366,7 +366,7 @@ def models_show(
         )
         raise typer.Exit(code=1)
 
-    provider = model_id.split("/")[0] if "/" in model_id else model_id
+    provider = model_id.split("/", maxsplit=1)[0] if "/" in model_id else model_id
     model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
 
     row = _ModelRow(
@@ -376,9 +376,7 @@ def models_show(
         input_per_1m=price.input_per_1k * 1000,
         output_per_1m=price.output_per_1k * 1000,
         cached_input_per_1m=(
-            price.cached_input_per_1k * 1000
-            if price.cached_input_per_1k is not None
-            else None
+            price.cached_input_per_1k * 1000 if price.cached_input_per_1k is not None else None
         ),
         supports_tools=caps.supports_tools,
         supports_vision=caps.supports_vision,

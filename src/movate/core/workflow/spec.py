@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -112,7 +112,7 @@ class IntentRouterNodeSpec(BaseModel):
 
 # NodeSpec is a discriminated union of agent and intent-router nodes.
 NodeSpec = Annotated[
-    Union[AgentNodeSpec, IntentRouterNodeSpec],
+    AgentNodeSpec | IntentRouterNodeSpec,
     Field(discriminator="type"),
 ]
 

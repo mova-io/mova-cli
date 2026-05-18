@@ -275,9 +275,7 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
         knowledge_path = (agent_dir / spec.knowledge).resolve()
         try:
             knowledge_cfg = load_knowledge_config(knowledge_path)
-            retriever_resolved = build_retriever(
-                knowledge_cfg, base_dir=knowledge_path.parent
-            )
+            retriever_resolved = build_retriever(knowledge_cfg, base_dir=knowledge_path.parent)
         except KnowledgeLoadError as exc:
             raise AgentLoadError(f"knowledge resolution failed: {exc}") from exc
 

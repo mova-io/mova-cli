@@ -260,9 +260,7 @@ def apply(  # noqa: PLR0912 — orchestrator; validation + az + optional seed re
         str(param_file_path),
     ]
 
-    seed_summary = (
-        "skipped (--no-seed)" if no_seed else f"{keyvault}/bootstrap-api-key"
-    )
+    seed_summary = "skipped (--no-seed)" if no_seed else f"{keyvault}/bootstrap-api-key"
     hint(
         f"\n[bold]mdk infra apply[/bold] → {target}\n"
         f"  subscription:   {target_cfg.azure_subscription}\n"
@@ -277,10 +275,7 @@ def apply(  # noqa: PLR0912 — orchestrator; validation + az + optional seed re
 
     if dry_run:
         if not no_seed:
-            hint(
-                f"[dim]→ (chain) mdk auth bootstrap-seed {target} "
-                f"--keyvault {keyvault}[/dim]"
-            )
+            hint(f"[dim]→ (chain) mdk auth bootstrap-seed {target} --keyvault {keyvault}[/dim]")
         success("dry-run complete — nothing applied.")
         _emit_summary(
             target=target,
@@ -361,9 +356,7 @@ def apply(  # noqa: PLR0912 — orchestrator; validation + az + optional seed re
     _emit_summary(target=target, ok=True, dry_run=False, seeded=True)
 
 
-def _emit_summary(
-    *, target: str, ok: bool, dry_run: bool, seeded: bool
-) -> None:
+def _emit_summary(*, target: str, ok: bool, dry_run: bool, seeded: bool) -> None:
     """Emit the greppable ``mdk_infra_summary:`` line for CI scrapers.
 
     Format mirrors ``mdk_deploy_summary:`` so the same CI shell

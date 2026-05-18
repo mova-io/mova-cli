@@ -87,13 +87,13 @@ class AgentSkillBackend:
         # import time without forcing MovateClient's httpx dependency into
         # every process that loads the skill registry — only processes that
         # actually execute an agent-kind skill pay the import cost.
-        from movate.core.client import MovateClient, MovateClientError  # noqa: PLC0415
-
         # Resolve connection details from the runtime configuration.
         # The base URL and API key must be set in the environment; in a
         # deployed movate worker they're injected via secrets. Local
         # development should use --mock to avoid needing a live runtime.
         import os  # noqa: PLC0415
+
+        from movate.core.client import MovateClient, MovateClientError  # noqa: PLC0415
 
         base_url = os.environ.get("MOVATE_RUNTIME_URL", "")
         api_key = os.environ.get("MOVATE_API_KEY", "")

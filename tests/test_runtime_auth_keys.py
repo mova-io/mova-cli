@@ -7,7 +7,8 @@ requests get 401.
 Coverage:
 * POST /auth/keys — 201 for admin, 403 for non-admin, 401 for unauthed.
 * GET /auth/keys — 200 for admin (masked keys), 403 for non-admin, 401 for unauthed.
-* DELETE /auth/keys/{key_id} — 204/200 for admin, 403 for non-admin, 401 for unauthed, 404 not found.
+* DELETE /auth/keys/{key_id} — 204/200 for admin, 403 for non-admin, 401 for unauthed,
+  404 for not-found.
 * Happy path: admin mints → list shows it → delete → list gone.
 * Tenant isolation: admin from tenant A cannot see or delete tenant B's keys.
 * Idempotent revoke returns success even when key is already revoked.
@@ -22,7 +23,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from movate.core.auth import ApiKeyEnv, mint_api_key
-from movate.core.models import ApiKeyRecord
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
@@ -191,9 +191,7 @@ class TestMintKey:
 
 @pytest.mark.unit
 class TestListKeys:
-    def test_admin_list_shows_own_keys(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_admin_list_shows_own_keys(self, client: TestClient, storage: InMemoryStorage) -> None:
         admin = _save_key(storage, scope=_ADMIN_SCOPE, label="admin-key")
         resp = client.get(
             "/api/v1/auth/keys",
@@ -326,9 +324,7 @@ class TestRevokeKey:
         )
         assert resp.status_code in (200, 204)
 
-    def test_revoke_404_key_not_found(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_404_key_not_found(self, client: TestClient, storage: InMemoryStorage) -> None:
         admin = _save_key(storage, scope=_ADMIN_SCOPE)
         resp = client.delete(
             "/api/v1/auth/keys/no-such-key-id",
@@ -336,9 +332,7 @@ class TestRevokeKey:
         )
         assert resp.status_code == 404
 
-    def test_revoke_404_cross_tenant(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_404_cross_tenant(self, client: TestClient, storage: InMemoryStorage) -> None:
         admin_a = _save_key(storage, scope=_ADMIN_SCOPE)
         key_b = _save_key(storage, label="b")  # different tenant
         # Admin A cannot revoke tenant B's key — 404 (no info leakage).
@@ -357,9 +351,7 @@ class TestRevokeKey:
         )
         assert resp.status_code == 403
 
-    def test_revoke_401_without_bearer(
-        self, client: TestClient, storage: InMemoryStorage
-    ) -> None:
+    def test_revoke_401_without_bearer(self, client: TestClient, storage: InMemoryStorage) -> None:
         key = _save_key(storage)
         resp = client.delete(f"/api/v1/auth/keys/{key.record.key_id}")
         assert resp.status_code == 401
@@ -461,7 +453,8 @@ class TestTenantIsolation:
         assert all(
             storage.api_keys[
                 next(i for i, k in enumerate(storage.api_keys) if k.key_id == kid)
-            ].tenant_id == admin_a.record.tenant_id
+            ].tenant_id
+            == admin_a.record.tenant_id
             for kid in returned_ids
         )
 

@@ -324,11 +324,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
                 judges=[ModelConfig(provider=m) for m in judge_model],
                 rubric=judge_rubric,
                 variance_threshold=variance_threshold,
-                escalation=(
-                    ModelConfig(provider=arbitrator_model)
-                    if arbitrator_model
-                    else None
-                ),
+                escalation=(ModelConfig(provider=arbitrator_model) if arbitrator_model else None),
             )
     elif judge_rubric:
         err_console.print(

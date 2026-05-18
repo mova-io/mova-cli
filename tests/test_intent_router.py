@@ -24,10 +24,8 @@ import pytest
 import yaml
 
 from movate.core.executor import Executor
-from movate.core.loader import AgentLoadError
 from movate.core.models import (
     ErrorInfo,
-    JobStatus,
     Metrics,
     RunResponse,
     TokenUsage,
@@ -494,9 +492,7 @@ async def test_runner_mock_picks_first_sorted_route(
     # Mock the executor: when called for billing-agent return valid output.
     mock_executor = MagicMock(spec=Executor)
     # billing is sorted first; billing-agent returns {"answer": "billing reply"}
-    mock_executor.execute = AsyncMock(
-        return_value=_success_response({"answer": "billing reply"})
-    )
+    mock_executor.execute = AsyncMock(return_value=_success_response({"answer": "billing reply"}))
 
     runner = WorkflowRunner(executor=mock_executor, storage=storage)
     result = await runner.run(graph, initial_state={"question": "need help"}, mock=True)

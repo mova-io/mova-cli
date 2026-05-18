@@ -317,10 +317,7 @@ class TestSaveRuntimeKeyFromStdin:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         store = CredentialsStore()
-        assert (
-            store.read().get("MDK_DEV_KEY")
-            == "mvt_live_demotena_kid123abc_secretvalueXYZ"
-        )
+        assert store.read().get("MDK_DEV_KEY") == "mvt_live_demotena_kid123abc_secretvalueXYZ"
 
     def test_scrapes_mvt_key_from_az_exec_output(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -345,10 +342,7 @@ class TestSaveRuntimeKeyFromStdin:
         assert result.exit_code == 0, result.stdout + result.stderr
         store = CredentialsStore()
         # Only the mvt_ token, not the surrounding text.
-        assert (
-            store.read().get("MDK_DEV_KEY")
-            == "mvt_live_demotena_kid123abc_secretvalueXYZ"
-        )
+        assert store.read().get("MDK_DEV_KEY") == "mvt_live_demotena_kid123abc_secretvalueXYZ"
 
     def test_stdin_with_no_mvt_token_exits_2(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -212,8 +212,8 @@ class BM25Retriever:
                 dl = self._doc_len[i]
                 # BM25 numerator + denominator. b=0.75 length-normalizes;
                 # b=0 would skip length normalization entirely.
-                norm = 1.0 - _BM25_B + _BM25_B * (
-                    dl / self._avg_doc_len if self._avg_doc_len else 0
+                norm = (
+                    1.0 - _BM25_B + _BM25_B * (dl / self._avg_doc_len if self._avg_doc_len else 0)
                 )
                 score += idf * (f * (_BM25_K1 + 1)) / (f + _BM25_K1 * norm)
             # Tag bonus — flat per matching tag; not affected by IDF
@@ -288,9 +288,7 @@ class SubstringRetriever:
             if self._tag_field is not None:
                 raw_tags = self._corpus.entries[i].get(self._tag_field, [])
                 if isinstance(raw_tags, list):
-                    entry_tags = {
-                        str(t).lower().strip() for t in raw_tags if str(t).strip()
-                    }
+                    entry_tags = {str(t).lower().strip() for t in raw_tags if str(t).strip()}
                     overlap += int(_TAG_BONUS) * len(q_tokens & entry_tags)
             if overlap > 0:
                 scored.append((overlap, i))

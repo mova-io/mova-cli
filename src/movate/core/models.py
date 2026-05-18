@@ -631,113 +631,12 @@ class SkillSpec(BaseModel):
                     "of the tool to invoke on the MCP server); empty tool "
                     "would mean 'no tool selected'"
                 )
-        if v.kind == SkillImplementationKind.AGENT:
-            if not v.target_agent:
-                raise ValueError(
-                    "agent skill implementation.target_agent is required "
-                    "(the name of the deployed MDK agent to call); "
-                    "empty target_agent would mean 'no agent selected'"
-                )
-        return v
-
-
-class AgentMetadata(BaseModel):
-    """Optional marketplace metadata block for an agent (``metadata:`` in agent.yaml).
-
-    All fields are optional with defaults of ``None`` / ``[]`` so existing
-    ``agent.yaml`` files that omit the block continue to load unchanged
-    (backward-compatible).
-
-    The Mova iO Agent Marketplace UI reads these fields as the source of truth
-    for catalog cards, profile pages, search facets, and the example gallery.
-    ``mdk show`` renders a "Marketplace metadata" section when the block is
-    present; ``mdk validate`` type-checks the field values and emits
-    advisory warnings for common mistakes (missing ``output`` key in examples,
-    etc.).
-
-    Usage in agent.yaml::
-
-        metadata:
-          persona: "A friendly FAQ bot for Acme Corp"
-          role: "customer-support"
-          capabilities:
-            - "question-answering"
-            - "knowledge-retrieval"
-          tags:
-            - "faq"
-            - "support"
-          examples:
-            - input: {question: "What is your return policy?"}
-              output: {answer: "30 days, no questions asked."}
-          owner: "team-support@acme.com"
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    persona: str | None = Field(
-        default=None,
-        max_length=512,
-        description=(
-            "One-line description of the agent's role and voice. "
-            "Example: 'A friendly FAQ bot for Acme Corp'. "
-            "Rendered on the marketplace card; used by prompt-authoring "
-            "tooling as a style anchor."
-        ),
-    )
-    role: str | None = Field(
-        default=None,
-        max_length=128,
-        description=(
-            "Taxonomy tag for the agent's job category. "
-            "Example: 'customer-support', 'data-analysis'. "
-            "Used by the marketplace for grouping and filtering. "
-            "Execution-semantic: none — catalog metadata only."
-        ),
-    )
-    capabilities: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Slug-style list of capabilities. "
-            "Example: ['question-answering', 'knowledge-retrieval']. "
-            "Each entry must be lowercase alphanumeric with hyphens "
-            "(URL-safe search facets). Use 'tags' for free-form labels."
-        ),
-    )
-    tags: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Free-form searchable tags. No slug constraint — any string accepted. "
-            "Example: ['faq', 'support', 'acme-corp']."
-        ),
-    )
-    examples: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description=(
-            "Sample input/output pairs for the marketplace card. "
-            "Each entry must have 'input' and 'output' keys. "
-            "Example: [{'input': {'q': 'What is ...?'}, 'output': {'a': '...'}}]"
-        ),
-    )
-    owner: str | None = Field(
-        default=None,
-        description=(
-            "Owner email address or team name. "
-            "Example: 'team-support@acme.com' or 'Platform Team'. "
-            "Displayed on the marketplace card for accountability."
-        ),
-    )
-
-    @field_validator("capabilities")
-    @classmethod
-    def _validate_capabilities(cls, v: list[str]) -> list[str]:
-        """Each capability must be a URL-safe slug (lowercase alphanumeric + hyphens)."""
-        for cap in v:
-            if not re.match(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$", cap):
-                raise ValueError(
-                    f"capability {cap!r} must be lowercase alphanumeric "
-                    f"with hyphens (e.g. 'question-answering'); use 'tags' for "
-                    f"free-form labels"
-                )
+        if v.kind == SkillImplementationKind.AGENT and not v.target_agent:
+            raise ValueError(
+                "agent skill implementation.target_agent is required "
+                "(the name of the deployed MDK agent to call); "
+                "empty target_agent would mean 'no agent selected'"
+            )
         return v
 
 

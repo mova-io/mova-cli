@@ -80,9 +80,7 @@ class TestOutputSchemaInPrompt:
 
     def test_include_output_schema_false_opts_out(self) -> None:
         b = _bundle(output_schema={"type": "object"})
-        msg = _gen_user_message(
-            b, index=0, sample_input=None, include_output_schema=False
-        )
+        msg = _gen_user_message(b, index=0, sample_input=None, include_output_schema=False)
         assert "Output schema" not in msg
 
 
@@ -176,9 +174,7 @@ class TestContextsInPrompt:
 class TestTargetDimsInPrompt:
     def test_single_target_dim_injects_dimension_hint(self) -> None:
         b = _bundle()
-        msg = _gen_user_message(
-            b, index=0, sample_input=None, target_dims=["safety"]
-        )
+        msg = _gen_user_message(b, index=0, sample_input=None, target_dims=["safety"])
         assert "Target evaluation dimension" in msg
         assert "safety" in msg
         # The hint string for safety mentions guardrails / unsafe output.
@@ -203,9 +199,7 @@ class TestTargetDimsInPrompt:
         will surface unknown-dim errors at scoring time. Falling back
         cleanly keeps eval-gen robust."""
         b = _bundle()
-        msg = _gen_user_message(
-            b, index=0, sample_input=None, target_dims=["totally-not-a-dim"]
-        )
+        msg = _gen_user_message(b, index=0, sample_input=None, target_dims=["totally-not-a-dim"])
         # The header line still appears (operator sees what we did),
         # but no per-dim hint is added.
         assert "totally-not-a-dim" in msg

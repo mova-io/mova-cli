@@ -31,9 +31,7 @@ import pytest
 from movate.core.loader import AgentLoadError, load_agent
 from movate.knowledge import BM25Retriever, SubstringRetriever
 
-_TEMPLATE = (
-    Path(__file__).parent.parent / "src" / "movate" / "templates" / "agent_init"
-)
+_TEMPLATE = Path(__file__).parent.parent / "src" / "movate" / "templates" / "agent_init"
 
 
 def _scaffold_agent(dst: Path, name: str = "test-agent") -> Path:
@@ -54,9 +52,7 @@ def _write_corpus(path: Path, docs: list[dict[str, Any]]) -> None:
 def _append_knowledge_field(agent_dir: Path, knowledge_path: str) -> None:
     """Append a ``knowledge:`` field to the scaffolded agent.yaml."""
     yaml_path = agent_dir / "agent.yaml"
-    yaml_path.write_text(
-        yaml_path.read_text() + f"\nknowledge: {knowledge_path}\n"
-    )
+    yaml_path.write_text(yaml_path.read_text() + f"\nknowledge: {knowledge_path}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +130,7 @@ def test_agent_can_select_substring_retriever_via_knowledge_yaml(
         [{"id": "A", "title": "first", "body": "alpha beta"}],
     )
     (agent_dir / "knowledge.yaml").write_text(
-        "retriever: substring\n"
-        "corpus: ./kb/corpus.json\n"
-        "body_fields: [title, body]\n"
+        "retriever: substring\ncorpus: ./kb/corpus.json\nbody_fields: [title, body]\n"
     )
     _append_knowledge_field(agent_dir, "./knowledge.yaml")
 

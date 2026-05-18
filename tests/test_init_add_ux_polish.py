@@ -51,11 +51,11 @@ def test_picker_does_not_unconditionally_run_mdk_run_after_add(
     inner post-add menu. New behavior: only the ``mdk add`` subprocess
     runs; ``mdk run`` is now an opt-in menu option."""
 
-
     invocations: list[list[str]] = []
 
     def fake_subprocess_run(cmd, *args, **kwargs):
         invocations.append(list(cmd))
+
         # Return a stub CompletedProcess so the caller doesn't blow up.
         class _Stub:
             returncode = 0
@@ -150,7 +150,6 @@ def test_init_project_auto_launches_editor_when_on_path(
     (which would override our ``sys.stdout.isatty`` patch). The full
     CliRunner path is exercised in the menu-shape tests below."""
 
-
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
     monkeypatch.chdir(tmp_path)
 
@@ -177,9 +176,7 @@ def test_init_project_auto_launches_editor_when_on_path(
     )
 
     code_calls = [c for c in popen_calls if c and c[0] == "code"]
-    assert len(code_calls) == 1, (
-        f"expected one `code` Popen invocation, got: {popen_calls}"
-    )
+    assert len(code_calls) == 1, f"expected one `code` Popen invocation, got: {popen_calls}"
     assert str(tmp_path / "demo") in code_calls[0]
 
 
@@ -190,7 +187,6 @@ def test_init_project_no_open_editor_flag_skips_auto_launch(
     """``--no-open-editor`` (open_editor=False) must skip the Popen
     call even when `code` is on PATH and stdout is a tty. Operators
     in CI / headless / SSH sessions rely on this."""
-
 
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
     monkeypatch.chdir(tmp_path)
@@ -218,9 +214,7 @@ def test_init_project_no_open_editor_flag_skips_auto_launch(
     )
 
     code_calls = [c for c in popen_calls if c and c[0] == "code"]
-    assert code_calls == [], (
-        f"open_editor=False must NOT launch the editor; got: {popen_calls}"
-    )
+    assert code_calls == [], f"open_editor=False must NOT launch the editor; got: {popen_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +235,8 @@ def test_init_post_menu_uses_browse_and_add_agents_picker(
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(
-        app, ["init", "demo", "--skip-snapshot", "--no-open-editor"],
+        app,
+        ["init", "demo", "--skip-snapshot", "--no-open-editor"],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -255,9 +250,7 @@ def test_init_post_menu_uses_browse_and_add_agents_picker(
 
 
 @pytest.mark.unit
-def test_init_prints_cd_reminder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_init_prints_cd_reminder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Since a child process can't change the parent shell's cwd, the
     next-best thing is printing the ``cd <project>`` command
     prominently. Operators paste it; we move on."""

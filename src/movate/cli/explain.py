@@ -42,9 +42,7 @@ _STEP_TRACER_HINT = (
 def explain(
     run_id: Annotated[
         str | None,
-        typer.Argument(
-            help="Run ID to explain.  Omit with --last to explain the most-recent run."
-        ),
+        typer.Argument(help="Run ID to explain.  Omit with --last to explain the most-recent run."),
     ] = None,
     last: Annotated[
         bool,
@@ -177,8 +175,7 @@ def _render_chain(record: RunRecord) -> None:
     if m.tokens.input or m.tokens.output:
         cached_note = f" (cached: {m.tokens.cached_input})" if m.tokens.cached_input else ""
         console.print(
-            f"  [dim]Tokens:[/dim]  {m.tokens.input} in "
-            f"→ {m.tokens.output} out{cached_note}"
+            f"  [dim]Tokens:[/dim]  {m.tokens.input} in → {m.tokens.output} out{cached_note}"
         )
 
     if m.cost_usd:
@@ -195,10 +192,7 @@ def _render_chain(record: RunRecord) -> None:
     elif record.error:
         console.print()
         error = record.error
-        console.print(
-            f"[red bold]Error[/red bold]  "
-            f"[dim]{error.type}[/dim]\n  {error.message}"
-        )
+        console.print(f"[red bold]Error[/red bold]  [dim]{error.type}[/dim]\n  {error.message}")
         if error.hint:
             console.print(f"  [dim]Hint:[/dim] {error.hint}")
 

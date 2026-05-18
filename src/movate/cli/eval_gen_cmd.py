@@ -309,11 +309,7 @@ def _gen_user_message(
             snippet = body.strip()
             ctx_chunks.append(
                 f"## Context: {name}\n{snippet[:_CONTEXT_BODY_MAX_CHARS]}"
-                + (
-                    "\n... (truncated)"
-                    if len(snippet) > _CONTEXT_BODY_MAX_CHARS
-                    else ""
-                )
+                + ("\n... (truncated)" if len(snippet) > _CONTEXT_BODY_MAX_CHARS else "")
             )
         parts.extend(
             [
@@ -362,12 +358,10 @@ _CONTEXT_BODY_MAX_CHARS = 600
 # Aligned to the 10-category movate-evals scorecard in core/eval.py.
 _DIMENSION_GEN_HINTS: dict[str, str] = {
     "task_success": (
-        "Produce an input where success is well-defined "
-        "(a clear correct answer exists)."
+        "Produce an input where success is well-defined (a clear correct answer exists)."
     ),
     "accuracy": (
-        "Produce an input where a factually-incorrect agent response "
-        "would be obviously wrong."
+        "Produce an input where a factually-incorrect agent response would be obviously wrong."
     ),
     "faithfulness": (
         "Produce an input whose grounding context is testable (the "
@@ -407,9 +401,7 @@ def _dim_generation_hint(dims: list[str]) -> str:
     """Compose a short hint string for the generator covering the
     named dimensions. Unknown dim names fall through silently — the
     eval engine validates them separately when the case is scored."""
-    lines = [
-        _DIMENSION_GEN_HINTS[d] for d in dims if d in _DIMENSION_GEN_HINTS
-    ]
+    lines = [_DIMENSION_GEN_HINTS[d] for d in dims if d in _DIMENSION_GEN_HINTS]
     return "\n".join(lines) if lines else ""
 
 

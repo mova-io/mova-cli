@@ -455,9 +455,7 @@ def test_auth_roundtrip_401_reports_stale_bearer_with_truncated_prefix(
     row in the doctor. Shows the first 16 chars (enough to spot
     'wrong tenant', 'old key from yesterday') without leaking the
     full secret to logs. Detail names the recovery command."""
-    monkeypatch.setenv(
-        "MOVATE_PROD_KEY", "mvt_live_demotena_0123456789abcdef_DEADBEEF"
-    )
+    monkeypatch.setenv("MOVATE_PROD_KEY", "mvt_live_demotena_0123456789abcdef_DEADBEEF")
     _patch_az_present(monkeypatch)
     monkeypatch.setattr(
         "movate.cli._azure_doctor.subprocess.run",

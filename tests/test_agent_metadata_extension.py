@@ -54,8 +54,7 @@ def _minimal_agent_yaml(
         "prompt: ./prompt.md\n"
         "schema:\n"
         "  input: { who: string }\n"
-        "  output: { greeting: string }\n"
-        + extra
+        "  output: { greeting: string }\n" + extra
     )
 
 
@@ -209,9 +208,7 @@ class TestAgentSpecBackwardCompat:
     def test_metadata_capabilities_slug_validated(self) -> None:
         """Invalid capability slug inside metadata: block raises ValidationError."""
         raw = yaml.safe_load(
-            _minimal_agent_yaml(
-                extra="metadata:\n  capabilities:\n    - 'bad slug with spaces'\n"
-            )
+            _minimal_agent_yaml(extra="metadata:\n  capabilities:\n    - 'bad slug with spaces'\n")
         )
         with pytest.raises(ValidationError, match="lowercase alphanumeric"):
             AgentSpec.model_validate(raw)
@@ -241,11 +238,7 @@ class TestShowRendering:
         monkeypatch.chdir(tmp_path)
         agent_dir = _write_agent(
             tmp_path,
-            extra_yaml=(
-                "metadata:\n"
-                "  persona: A friendly FAQ bot\n"
-                "  role: customer-support\n"
-            ),
+            extra_yaml=("metadata:\n  persona: A friendly FAQ bot\n  role: customer-support\n"),
         )
         result = runner.invoke(app, ["show", str(agent_dir)])
         assert result.exit_code == 0, result.stdout + (result.stderr or "")
@@ -261,10 +254,7 @@ class TestShowRendering:
         agent_dir = _write_agent(
             tmp_path,
             extra_yaml=(
-                "metadata:\n"
-                "  capabilities:\n"
-                "    - question-answering\n"
-                "    - ticket-routing\n"
+                "metadata:\n  capabilities:\n    - question-answering\n    - ticket-routing\n"
             ),
         )
         result = runner.invoke(app, ["show", str(agent_dir)])
@@ -273,9 +263,7 @@ class TestShowRendering:
         assert "question-answering" in cleaned
         assert "ticket-routing" in cleaned
 
-    def test_show_metadata_owner(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_show_metadata_owner(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         agent_dir = _write_agent(
             tmp_path,
@@ -311,18 +299,11 @@ class TestShowRendering:
         cleaned = _strip_ansi(result.stdout)
         assert "2 example" in cleaned
 
-    def test_show_metadata_tags(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_show_metadata_tags(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)
         agent_dir = _write_agent(
             tmp_path,
-            extra_yaml=(
-                "metadata:\n"
-                "  tags:\n"
-                "    - faq\n"
-                "    - support\n"
-            ),
+            extra_yaml=("metadata:\n  tags:\n    - faq\n    - support\n"),
         )
         result = runner.invoke(app, ["show", str(agent_dir)])
         assert result.exit_code == 0
@@ -377,10 +358,7 @@ class TestValidateMetadataChecks:
         agent_dir = _write_agent(
             tmp_path,
             extra_yaml=(
-                "metadata:\n"
-                "  examples:\n"
-                "    - output:\n"
-                "        answer: 30 days\n"
+                "metadata:\n  examples:\n    - output:\n        answer: 30 days\n"
                 # deliberately no 'input' key
             ),
         )

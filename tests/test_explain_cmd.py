@@ -111,9 +111,9 @@ def test_explain_known_run_shows_decision_chain(monkeypatch: pytest.MonkeyPatch)
     # Step 1 LLM call
     assert "Step 1" in result.stdout
     assert "gpt-4o-mini" in result.stdout
-    assert "312" in result.stdout   # tokens_in
-    assert "87" in result.stdout    # tokens_out
-    assert "42" in result.stdout    # latency_ms
+    assert "312" in result.stdout  # tokens_in
+    assert "87" in result.stdout  # tokens_out
+    assert "42" in result.stdout  # latency_ms
     # Output section
     assert "return policy is 30 days" in result.stdout
 

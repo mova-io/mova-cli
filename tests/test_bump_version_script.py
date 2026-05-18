@@ -87,9 +87,7 @@ def test_check_mode_reports_current_version_without_bumping(tmp_path: Path) -> N
 
     # Files should be byte-identical (no bump happened).
     assert 'version = "0.8.0"' in (tmp_path / "pyproject.toml").read_text()
-    assert '__version__ = "0.8.0"' in (
-        tmp_path / "src" / "movate" / "__init__.py"
-    ).read_text()
+    assert '__version__ = "0.8.0"' in (tmp_path / "src" / "movate" / "__init__.py").read_text()
 
 
 @pytest.mark.unit
@@ -140,6 +138,4 @@ def test_repo_state_is_in_sync_today() -> None:
         text=True,
         check=False,
     )
-    assert result.returncode == 0, (
-        f"version drift in the actual repo: {result.stderr}"
-    )
+    assert result.returncode == 0, f"version drift in the actual repo: {result.stderr}"

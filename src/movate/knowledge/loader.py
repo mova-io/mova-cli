@@ -58,18 +58,14 @@ def load_knowledge_config(path: str | Path) -> KnowledgeConfig:
         )
     # Strip api_version + kind — they're declarative labels, not
     # KnowledgeConfig fields, and `extra='forbid'` would reject them.
-    payload: dict[str, Any] = {
-        k: v for k, v in raw.items() if k not in ("api_version", "kind")
-    }
+    payload: dict[str, Any] = {k: v for k, v in raw.items() if k not in ("api_version", "kind")}
     try:
         return KnowledgeConfig.model_validate(payload)
     except Exception as exc:
         raise KnowledgeLoadError(f"knowledge config {p} is invalid: {exc}") from exc
 
 
-def build_retriever(
-    cfg: KnowledgeConfig, *, base_dir: Path | None = None
-) -> Retriever:
+def build_retriever(cfg: KnowledgeConfig, *, base_dir: Path | None = None) -> Retriever:
     """Construct the retriever the config asks for.
 
     ``cfg.corpus`` is resolved relative to ``base_dir`` (typically the

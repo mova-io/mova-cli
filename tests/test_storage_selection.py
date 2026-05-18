@@ -95,6 +95,7 @@ async def test_postgres_provider_passes_pgpassword_as_kwarg_when_dsn_password_em
     async def fake_create_pool(dsn: str, **kwargs: Any) -> Any:
         captured["dsn"] = dsn
         captured["kwargs"] = kwargs
+
         # Return a stub pool whose acquire() context manager returns a
         # stub conn whose execute() coroutine is a no-op — enough to let
         # init() complete past the _SCHEMA execute.
