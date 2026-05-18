@@ -108,18 +108,22 @@ def test_add_prints_next_steps_once(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 def test_add_next_step_first_option_is_add_another(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After `mdk add`, the first next-step is 'Add another role agent' —
-    the role-catalog picker replaces the old static 'mdk run' line
-    to keep the momentum of discovery going."""
+    """After ``mdk add``, the first (and only) next-step is "Add another
+    role agent". The menu was trimmed to role-agent management only;
+    Run / Eval / Doctor / Deploy used to live here but were dropped
+    to avoid interrupting the scaffold flow with context-switch
+    prompts the operator almost always wanted to defer."""
     proj = _bootstrap_with_agent(tmp_path, monkeypatch, template="faq")
     result = runner.invoke(app, ["add", "summarizer"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
-    # The 'Add another role agent' option appears as [1].
+    # The 'Add another role agent' option appears as [1] + Skip.
     assert "Add another role agent" in result.stdout
     assert "[1]" in result.stdout
-    # Eval and doctor options still present.
-    assert "mdk eval" in result.stdout
-    assert "mdk doctor" in result.stdout
+    assert "Skip" in result.stdout
+    # The trimmed options must NOT leak back into the menu.
+    assert "mdk eval" not in result.stdout
+    assert "mdk doctor" not in result.stdout
+    assert "mdk deploy" not in result.stdout
     _ = proj  # silence unused
 
 
