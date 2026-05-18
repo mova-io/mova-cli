@@ -284,6 +284,120 @@ def test_cli_command_surfaces_in_help() -> None:
 
 
 @pytest.mark.unit
+def test_mdk_eval_scorecard_flag_surfaces_in_eval_help() -> None:
+    """``mdk eval --help`` must list the ``--scorecard`` flag — that's
+    how operators discover the new flow from the existing ``mdk eval``
+    surface. Pin the substring so a future refactor of the help text
+    can't accidentally drop the discovery path."""
+    result = runner.invoke(app, ["eval", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "--scorecard" in plain
+    # The two paired knobs that only matter with --scorecard.
+    assert "--scorecard-count" in plain
+    assert "--scorecard-mix" in plain
+
+
+@pytest.mark.unit
+def test_mdk_eval_scorecard_requires_an_agent_path(tmp_path: Path) -> None:
+    """``mdk eval --scorecard`` with no agent path is a clean operator
+    error — emit a hint pointing at the right shape rather than
+    falling into the scorecard flow with no target."""
+    result = runner.invoke(
+        app,
+        ["eval", "--scorecard"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    combined = result.stdout + result.stderr
+    assert "--scorecard requires an agent path" in combined
+
+
+@pytest.mark.unit
+def test_mdk_eval_scorecard_dispatches_to_scorecard_function(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``--scorecard`` is set, the eval command must route directly
+    to ``eval_scorecard_cmd.eval_scorecard`` with the scorecard-specific
+    kwargs (count, mix, mock, judge_model) and skip the dataset.jsonl
+    code path entirely. Pin the dispatch so a future refactor of the
+    eval orchestrator can't accidentally fall back to the old flow."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_scorecard(**kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd.eval_scorecard", fake_scorecard)
+
+    # Scaffold a minimal agent so the path arg resolves.
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "agent.yaml").write_text(
+        "name: demo\nmodel:\n  provider: openai/gpt-4o-mini-2024-07-18\n"
+    )
+    (agent_dir / "prompt.md").write_text("You are a demo agent.\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            str(agent_dir),
+            "--scorecard",
+            "--scorecard-count",
+            "5",
+            "--scorecard-mix",
+            "edge",
+            "--mock",
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["agent"] == str(agent_dir)
+    assert call["count"] == 5
+    assert call["mix"] == "edge"
+    assert call["mock"] is True
+
+
+@pytest.mark.unit
+def test_mdk_eval_without_scorecard_flag_uses_old_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag is opt-in (Phase 3a). Bare ``mdk eval <agent>`` must
+    NOT route to the scorecard — existing CI scripts that assume
+    dataset.jsonl-based scoring keep working unchanged. Phase 3b
+    will flip this default after the scorecard is battle-tested."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_scorecard(**kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd.eval_scorecard", fake_scorecard)
+
+    # Scaffold a project with one agent + a dataset row so the old
+    # flow can complete cleanly.
+    monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    monkeypatch.chdir(tmp_path / "proj")
+    runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+
+    # No --scorecard flag → old flow.
+    result = runner.invoke(
+        app,
+        ["eval", "faq", "--mock", "--gate", "0.0"],
+        env={"COLUMNS": "200"},
+    )
+    # Old flow's greppable line, NOT the scorecard's.
+    combined = result.stdout + result.stderr
+    assert "mdk_eval_summary:" in combined
+    # The scorecard dispatch must NOT have fired.
+    assert len(calls) == 0
+
+
+@pytest.mark.unit
 def test_eval_scorecard_dedicated_help_describes_categories() -> None:
     """The command's own --help must list all 10 categories so an
     operator can decide whether the rubric matches their needs

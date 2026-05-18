@@ -255,6 +255,46 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "in panel mode."
         ),
     ),
+    scorecard: bool = typer.Option(
+        False,
+        "--scorecard",
+        help=(
+            "Switch to the new LLM-generated test cases + 10-category "
+            "scorecard flow (same as [bold]mdk eval-scorecard[/bold]). "
+            "Skips the dataset.jsonl-based scoring entirely; instead "
+            "Anthropic generates [bold]--scorecard-count[/bold] test "
+            "inputs in the chosen [bold]--scorecard-mix[/bold] and "
+            "scores each against accuracy / faithfulness / format / "
+            "safety / refusal / hallucination / completeness / "
+            "instruction_following / latency / cost. Other flags "
+            "(--gate, --baseline, --runs, etc.) are ignored when "
+            "--scorecard is set."
+        ),
+    ),
+    scorecard_count: int = typer.Option(
+        10,
+        "--scorecard-count",
+        min=1,
+        max=100,
+        help=("Number of LLM-generated cases when --scorecard is set (1-100). Ignored otherwise."),
+    ),
+    scorecard_mix: str = typer.Option(
+        "standard",
+        "--scorecard-mix",
+        help=(
+            "Test-case mix when --scorecard is set: standard | edge | "
+            "adversarial | domain. Ignored otherwise."
+        ),
+    ),
+    scorecard_judge_model: str | None = typer.Option(
+        None,
+        "--scorecard-judge-model",
+        help=(
+            "Override the LLM judge provider/model for the 10-category "
+            "rubric when --scorecard is set. Defaults to the agent's own "
+            "model."
+        ),
+    ),
 ) -> None:
     """Run the eval suite for an agent and gate on a threshold.
 
@@ -287,7 +327,34 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
           --judge-model anthropic/claude-opus-4-7 \\
           --judge-rubric 'Score 0-1: 1=correct routing, 0=wrong' \\
           --runs 3
+
+      [dim]# NEW: LLM-generated cases + 10-category scorecard (opt-in):[/dim]
+      $ mdk eval ./rag-qa --scorecard
+      $ mdk eval ./rag-qa --scorecard --scorecard-count 25 --scorecard-mix domain
     """
+    # --scorecard short-circuits everything else. Route directly to the
+    # new scorecard flow (Phase 1 + Phase 2). Other flags (--gate,
+    # --baseline, --runs, etc.) are not meaningful in the scorecard
+    # world — emit a warning if any non-default values were supplied
+    # so operators don't think they took effect, then dispatch.
+    if scorecard:
+        if path is None:
+            err_console.print(
+                "[red]✗[/red] --scorecard requires an agent path (e.g. "
+                "[bold]mdk eval agents/rag-qa --scorecard[/bold])"
+            )
+            raise typer.Exit(code=2)
+        from movate.cli.eval_scorecard_cmd import eval_scorecard  # noqa: PLC0415
+
+        eval_scorecard(
+            agent=path,
+            count=scorecard_count,
+            mix=scorecard_mix,
+            mock=mock,
+            judge_model=scorecard_judge_model,
+        )
+        return
+
     if baseline is not None and baseline_file is not None:
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
