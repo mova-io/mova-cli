@@ -745,9 +745,8 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
         )
         if auto_recover and azure_addressable:
             err.print(
-                f"  [yellow]⚠[/yellow] env var [bold]${target_cfg.key_env}[/bold] "
-                f"is empty — minting a fresh key inside "
-                f"[bold]{target_name}[/bold] (this takes ~10s)…"
+                f"  [dim]Minting fresh bearer key for "
+                f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
             )
             new_key = _attempt_auto_recovery(target_name=target_name)
             if new_key is not None:
@@ -821,9 +820,8 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             )
             if had_unauthorized and auto_recover and azure_addressable:
                 err.print(
-                    f"  [yellow]⚠[/yellow] saved bearer rejected — minting a "
-                    f"fresh one inside [bold]{target_name}[/bold] "
-                    f"(this takes ~10s)…"
+                    f"  [dim]Minting fresh bearer key for "
+                    f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
                 )
                 new_key = _attempt_auto_recovery(target_name=target_name)
                 if new_key is not None:
@@ -1020,8 +1018,8 @@ def _preflight_bearer(
         )
         if auto_recover and azure_addressable:
             err.print(
-                f"  [yellow]⚠[/yellow] preflight: saved bearer rejected — minting "
-                f"a fresh one inside [bold]{target_name}[/bold] (this takes ~10s)…"
+                f"  [dim]Minting fresh bearer key for "
+                f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
             )
             new_key = _attempt_auto_recovery(target_name=target_name)
             if new_key is not None:
@@ -1068,8 +1066,7 @@ def _attempt_auto_recovery(*, target_name: str) -> str | None:
         )
         return None
     err.print(
-        f"  [green]✓[/green] minted fresh key → [cyan]{env_var}[/cyan] "
-        "(saved to credentials store; new shells autoload it)."
+        f"  [green]✓[/green] bearer key ready (saved as [cyan]{env_var}[/cyan])."
     )
     return new_key
 

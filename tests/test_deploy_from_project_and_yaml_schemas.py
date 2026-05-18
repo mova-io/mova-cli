@@ -308,8 +308,10 @@ def test_deploy_agents_401_in_upload_loop_triggers_auto_recovery_and_retries(
     assert result.exit_code == 0, combined
     assert call_count["agent"] == 2, "expected one initial 401 + one retry"
     assert call_count["refresh"] == 1, "expected exactly one refresh call"
-    assert "saved bearer rejected" in combined
-    assert "minted fresh key" in combined
+    # Friendly recovery messaging: dim spinner + green check, no
+    # "saved bearer rejected" jargon.
+    assert "Minting fresh bearer key" in combined
+    assert "bearer key ready" in combined
     assert "ok=true" in combined
 
 
@@ -345,7 +347,7 @@ def test_deploy_agents_401_with_no_auto_recover_skips_refresh_and_fails(
     assert result.exit_code == 2, combined
     assert call_count["agent"] == 1, "expected only the initial attempt, no retry"
     assert call_count["refresh"] == 0, "refresh must not run with --no-auto-recover"
-    assert "saved bearer rejected" not in combined
+    assert "Minting fresh bearer key" not in combined
     assert "mdk doctor --target fake" in combined
     assert "mdk auth refresh-runtime-key fake" in combined
 
@@ -417,9 +419,10 @@ def test_preflight_401_with_auto_recovery_silently_refreshes_then_succeeds(
     assert seen["preflight_calls"] == 1, "expected exactly one preflight GET"
     assert seen["refresh_calls"] == 1, "expected exactly one auto-refresh"
     # The preflight is responsible for the user-visible recovery hint;
-    # the upload loop never logs its own 401 retry banner.
-    assert "preflight: saved bearer rejected" in combined
-    assert "minted fresh key" in combined
+    # the upload loop never logs its own 401 retry banner. Friendly
+    # wording: "Minting fresh bearer key" + "bearer key ready".
+    assert "Minting fresh bearer key" in combined
+    assert "bearer key ready" in combined
     assert "ok=true" in combined
 
 
@@ -528,8 +531,8 @@ def test_preflight_200_proceeds_silently(
     assert result.exit_code == 0, combined
     assert seen["preflight_calls"] == 1
     assert seen["agent_posts"] >= 1, "upload loop must run after a green preflight"
-    # No yellow ⚠ banner from the preflight on the happy path.
-    assert "preflight: saved bearer rejected" not in combined
+    # No recovery banner on the happy path.
+    assert "Minting fresh bearer key" not in combined
     assert "ok=true" in combined
 
 
@@ -574,7 +577,10 @@ def test_empty_env_var_auto_recovers_then_completes_deploy(
     combined = result.stdout + result.stderr
     assert result.exit_code == 0, combined
     assert refresh_calls["n"] == 1, "expected exactly one refresh call"
-    assert "is empty — minting a fresh key" in combined
+    # Friendly wording — no "env var is empty" or "rejected" jargon
+    # surfaces to operators on the happy recovery path.
+    assert "Minting fresh bearer key" in combined
+    assert "bearer key ready" in combined
     assert "ok=true" in combined
 
 
@@ -629,9 +635,10 @@ def test_empty_env_var_recovery_failure_falls_through_to_error(
 
     combined = result.stdout + result.stderr
     assert result.exit_code == 2, combined
-    # Recovery was attempted (the user sees the yellow ⚠) before
-    # falling through to the actionable error.
-    assert "minting a fresh key" in combined
+    # Recovery was attempted (the user sees the "Minting fresh
+    # bearer key" line) before falling through to the actionable
+    # error.
+    assert "Minting fresh bearer key" in combined
     assert "$FAKE_KEY is empty" in combined
     assert "refresh-runtime-key" in combined
 
