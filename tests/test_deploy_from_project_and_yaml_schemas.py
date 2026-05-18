@@ -640,28 +640,38 @@ def _capture_post_deploy_block(
     target_name: str,
     uploaded: list[str],
     project_root: Path,
+    base_url: str = "https://demo.example.com",
+    key_env: str = "MDK_DEV_KEY",
 ) -> str:
     """Call ``_render_post_deploy_next_steps`` with a Rich console pinned
     to a StringIO so the test can read what the operator would have
     seen on stderr. Avoids spinning up the full deploy machinery just
-    to exercise the rendering branch."""
+    to exercise the rendering branch.
+
+    ``base_url`` + ``key_env`` mirror what's resolved from the target
+    config in production — they're test-tunable so we can pin both
+    the URL and the env-var-name rendering in the curl example."""
     buf = io.StringIO()
     monkeypatch.setattr(deploy_mod, "err", Console(file=buf, force_terminal=False))
     deploy_mod._render_post_deploy_next_steps(
         target_name=target_name,
         uploaded=uploaded,
         project_root=project_root,
+        base_url=base_url,
+        key_env=key_env,
     )
     return buf.getvalue()
 
 
 @pytest.mark.unit
-def test_post_deploy_block_renders_header_and_submit_example_for_first_agent(
+def test_post_deploy_block_renders_curl_per_uploaded_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Picks the first uploaded agent alphabetically and emits a
-    ``mdk submit <agent> '<input>' --target <target> --wait`` example
-    so the operator has a one-liner to copy."""
+    """The block emits one ``curl`` command per uploaded agent (sorted
+    alphabetically) so operators can copy-paste against the deployed
+    runtime without needing a working ``mdk`` install on the box doing
+    the inference. Each curl targets ``POST <base_url>/run`` with the
+    canonical ``{"agent": "<name>", "input": {...}}`` body shape."""
     (tmp_path / "agents" / "zebra").mkdir(parents=True)
     (tmp_path / "agents" / "alpha").mkdir(parents=True)
 
@@ -670,11 +680,39 @@ def test_post_deploy_block_renders_header_and_submit_example_for_first_agent(
         target_name="dev",
         uploaded=["zebra", "alpha"],
         project_root=tmp_path,
+        base_url="https://api.example.com",
     )
 
     assert "Next: run inference against the deployed runtime" in out
-    assert "mdk submit alpha" in out
-    assert "--target dev --wait" in out
+    # One curl per agent; both names appear as # comment + in the body.
+    assert "# alpha" in out
+    assert "# zebra" in out
+    assert "curl -sS -X POST https://api.example.com/run" in out
+    assert '"agent": "alpha"' in out
+    assert '"agent": "zebra"' in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_curl_includes_content_type_and_api_key_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every curl must surface the two required headers — content-type
+    (so the runtime parses the body as JSON) and x-api-key (so the
+    bearer auth passes). The api-key value renders as a shell
+    expansion of the target's key_env so the operator's shell pulls
+    the actual key at curl-time."""
+    (tmp_path / "agents" / "alpha").mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="prod",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+        key_env="MDK_PROD_KEY",
+    )
+
+    assert "content-type: application/json" in out
+    assert '"x-api-key: $MDK_PROD_KEY"' in out
 
 
 @pytest.mark.unit
@@ -682,9 +720,8 @@ def test_post_deploy_block_uses_dataset_first_row_input_when_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When the agent has an ``evals/dataset.jsonl`` with a row that
-    has an ``input`` object, the submit example uses that JSON. This
-    makes the copy-paste actually work against the operator's schema
-    instead of forcing them to look it up."""
+    has an ``input`` object, the curl body uses that JSON. Makes the
+    copy-paste exercise the operator's real schema."""
     agent = tmp_path / "agents" / "alpha"
     (agent / "evals").mkdir(parents=True)
     (agent / "evals" / "dataset.jsonl").write_text(
@@ -699,9 +736,10 @@ def test_post_deploy_block_uses_dataset_first_row_input_when_available(
         project_root=tmp_path,
     )
 
-    assert '{"question": "What is our refund window?"}' in out
+    # The first row's input is embedded inside the curl body.
+    assert '"question": "What is our refund window?"' in out
     # The fallback shouldn't appear when a real input is available.
-    assert '{"text":"..."}' not in out
+    assert '"text": "..."' not in out
 
 
 @pytest.mark.unit
@@ -709,8 +747,8 @@ def test_post_deploy_block_falls_back_when_no_dataset_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No dataset.jsonl, no problem — fall back to a generic
-    ``{"text":"..."}`` placeholder so the block still renders. The
-    operator at least sees the shape of the command."""
+    ``{"text":"..."}`` placeholder inside the curl body so the block
+    still renders. The operator at least sees the shape of the request."""
     (tmp_path / "agents" / "alpha").mkdir(parents=True)
 
     out = _capture_post_deploy_block(
@@ -720,16 +758,18 @@ def test_post_deploy_block_falls_back_when_no_dataset_present(
         project_root=tmp_path,
     )
 
-    assert '{"text":"..."}' in out
+    # The fallback input shape ({"text":"..."}) appears inside the
+    # curl body — after json.dumps round-trip it renders with a
+    # space after the colon ("text": "...").
+    assert '"text": "..."' in out
 
 
 @pytest.mark.unit
 def test_post_deploy_block_falls_back_when_dataset_first_row_has_no_input_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A malformed first row (missing ``input``, non-dict ``input``,
-    invalid JSON) shouldn't crash the block — fall back to the
-    placeholder rather than printing garbage."""
+    """A malformed first row (missing ``input``) falls through to the
+    placeholder rather than crashing the block."""
     agent = tmp_path / "agents" / "alpha"
     (agent / "evals").mkdir(parents=True)
     (agent / "evals" / "dataset.jsonl").write_text('{"expected": {"answer": "no input field"}}\n')
@@ -741,7 +781,7 @@ def test_post_deploy_block_falls_back_when_dataset_first_row_has_no_input_key(
         project_root=tmp_path,
     )
 
-    assert '{"text":"..."}' in out
+    assert '"text": "..."' in out
 
 
 @pytest.mark.unit
@@ -749,8 +789,8 @@ def test_post_deploy_block_tolerates_invalid_jsonl_without_raising(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Defense in depth: a JSON parse error on the first row falls
-    through silently. We don't want a corrupt dataset.jsonl to wedge
-    the post-deploy summary."""
+    through silently. A corrupt dataset.jsonl mustn't wedge the
+    post-deploy summary."""
     agent = tmp_path / "agents" / "alpha"
     (agent / "evals").mkdir(parents=True)
     (agent / "evals" / "dataset.jsonl").write_text("not json at all\n")
@@ -762,17 +802,20 @@ def test_post_deploy_block_tolerates_invalid_jsonl_without_raising(
         project_root=tmp_path,
     )
 
-    assert '{"text":"..."}' in out
-    assert "mdk submit alpha" in out
+    assert '"text": "..."' in out
+    # And the curl example for that agent still renders.
+    assert "# alpha" in out
+    assert "curl -sS -X POST" in out
 
 
 @pytest.mark.unit
-def test_post_deploy_block_lists_other_agents_when_multiple_uploaded(
+def test_post_deploy_block_renders_all_agents_alphabetically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Multi-agent deploys get a ``other agents: …`` line so the
-    operator knows the remaining names without having to scroll back
-    through the upload log."""
+    """All uploaded agents get their own curl (no truncation, no
+    'other agents:' summary line) so a multi-agent deploy doesn't
+    hide some agents from the operator's copy-paste options. Sort
+    alphabetically for deterministic output ordering."""
     for name in ["alpha", "beta", "gamma"]:
         (tmp_path / "agents" / name).mkdir(parents=True)
 
@@ -783,46 +826,12 @@ def test_post_deploy_block_lists_other_agents_when_multiple_uploaded(
         project_root=tmp_path,
     )
 
-    assert "mdk submit alpha" in out  # first alphabetically
-    assert "other agents: beta, gamma" in out
-
-
-@pytest.mark.unit
-def test_post_deploy_block_omits_other_agents_line_for_single_agent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Single-agent deploys skip the ``other agents:`` line entirely —
-    don't print a noisy empty list."""
-    (tmp_path / "agents" / "solo").mkdir(parents=True)
-
-    out = _capture_post_deploy_block(
-        monkeypatch,
-        target_name="dev",
-        uploaded=["solo"],
-        project_root=tmp_path,
-    )
-
-    assert "other agents:" not in out
-
-
-@pytest.mark.unit
-def test_post_deploy_block_includes_jobs_list_and_show_hints(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The two ``mdk jobs`` verbs that complete the inference loop —
-    ``jobs list`` (browse) + ``jobs show`` (inspect one run) — must
-    both appear so operators can follow up without grepping docs."""
-    (tmp_path / "agents" / "alpha").mkdir(parents=True)
-
-    out = _capture_post_deploy_block(
-        monkeypatch,
-        target_name="prod",
-        uploaded=["alpha"],
-        project_root=tmp_path,
-    )
-
-    assert "mdk jobs list --target prod" in out
-    assert "mdk jobs show <id> --target prod" in out
+    # All three get a curl block.
+    assert "# alpha" in out
+    assert "# beta" in out
+    assert "# gamma" in out
+    # Output order is alphabetical (deterministic).
+    assert out.index("# alpha") < out.index("# beta") < out.index("# gamma")
 
 
 @pytest.mark.unit
@@ -830,8 +839,9 @@ def test_post_deploy_block_renders_on_successful_e2e_deploy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End-to-end: a happy-path deploy (preflight 200 + upload 201)
-    surfaces the post-deploy block. Verifies the orchestrator wires
-    the rendering call into the success branch."""
+    surfaces the post-deploy block with the curl example. Verifies the
+    orchestrator wires base_url + key_env from the target config into
+    the rendering call."""
     _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_KEY", "mvt_live_works_keyid_secret")
 
@@ -847,9 +857,13 @@ def test_post_deploy_block_renders_on_successful_e2e_deploy(
     combined = result.stdout + result.stderr
     assert result.exit_code == 0, combined
     assert "Next: run inference against the deployed runtime" in combined
-    assert "mdk submit faq" in combined
-    assert "--target fake --wait" in combined
-    assert "mdk jobs list --target fake" in combined
+    # curl with the target's base_url + key_env both surfaced.
+    assert "curl -sS -X POST https://fake.example.com/run" in combined
+    assert '"x-api-key: $FAKE_KEY"' in combined
+    assert '"agent": "faq"' in combined
+    # The old mdk-submit / mdk-jobs lines must NOT appear.
+    assert "mdk submit" not in combined
+    assert "mdk jobs" not in combined
 
 
 @pytest.mark.unit
