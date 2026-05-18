@@ -183,7 +183,13 @@ jobs:
         run: |
           set -euo pipefail
           new_version='${{ steps.bump.outputs.new_version }}'
-          branch="bot/bump-v${new_version}"
+          # Suffix the branch with the GHA run ID so each attempt gets
+          # its own branch. Without this, a previous failed run (one
+          # that pushed the branch but failed before opening the PR)
+          # leaves bot/bump-vN.N.N on remote, and every subsequent
+          # push fails with "non-fast-forward". Run IDs are guaranteed
+          # unique per workflow execution.
+          branch="bot/bump-v${new_version}-${{ github.run_id }}"
           parent_sha=$(git rev-parse --short HEAD)
           parent_subject=$(git log -1 --pretty=%s HEAD)
 
