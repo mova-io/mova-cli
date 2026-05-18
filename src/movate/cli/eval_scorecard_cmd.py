@@ -204,7 +204,7 @@ async def _score_one_case(
     # ``--judge-model anthropic/claude-haiku-4-5-20251001`` explicitly.
     provider_str = judge_model or bundle.spec.model.provider
     user_message = (
-        f"Agent system prompt:\n```\n{bundle.system_prompt[:2000]}\n```\n\n"
+        f"Agent system prompt:\n```\n{bundle.prompt_template[:2000]}\n```\n\n"
         f"Input:\n```json\n{json.dumps(input_data, indent=2)[:1000]}\n```\n\n"
         f"Agent response:\n```json\n{json.dumps(output_data, indent=2)[:2000]}\n```\n\n"
         "Score the response on all 8 categories per the system prompt."

@@ -323,7 +323,7 @@ async def test_score_one_case_parses_bare_json(monkeypatch: pytest.MonkeyPatch) 
     fake_rt.provider.complete = mock.AsyncMock(return_value=fake_response)
     fake_bundle = mock.Mock()
     fake_bundle.spec.model.provider = "openai/gpt-4o-mini-2024-07-18"
-    fake_bundle.system_prompt = "You are a demo agent."
+    fake_bundle.prompt_template = "You are a demo agent."
 
     scores, rationales = await _score_one_case(fake_rt, fake_bundle, {"q": "hi"}, {"a": "hello"})
     assert scores["accuracy"] == 0.95
@@ -354,7 +354,7 @@ async def test_score_one_case_strips_code_fences(monkeypatch: pytest.MonkeyPatch
     fake_rt.provider.complete = mock.AsyncMock(return_value=fake_response)
     fake_bundle = mock.Mock()
     fake_bundle.spec.model.provider = "openai/gpt-4o-mini-2024-07-18"
-    fake_bundle.system_prompt = "..."
+    fake_bundle.prompt_template = "..."
 
     scores, _ = await _score_one_case(fake_rt, fake_bundle, {}, {})
     assert all(s == 1.0 for s in scores.values())
@@ -380,7 +380,7 @@ async def test_score_one_case_tolerates_missing_category(
     fake_rt.provider.complete = mock.AsyncMock(return_value=fake_response)
     fake_bundle = mock.Mock()
     fake_bundle.spec.model.provider = "openai/gpt-4o-mini-2024-07-18"
-    fake_bundle.system_prompt = "..."
+    fake_bundle.prompt_template = "..."
 
     scores, rationales = await _score_one_case(fake_rt, fake_bundle, {}, {})
     # All 8 keys must be present even though judge sent only 3.
@@ -403,7 +403,7 @@ async def test_score_one_case_judge_failure_returns_zeros(
     fake_rt.provider.complete = mock.AsyncMock(side_effect=RuntimeError("network down"))
     fake_bundle = mock.Mock()
     fake_bundle.spec.model.provider = "openai/gpt-4o-mini-2024-07-18"
-    fake_bundle.system_prompt = "..."
+    fake_bundle.prompt_template = "..."
 
     scores, rationales = await _score_one_case(fake_rt, fake_bundle, {}, {})
     assert all(s == 0.0 for s in scores.values())
