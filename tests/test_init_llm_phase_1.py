@@ -37,14 +37,19 @@ def test_llm_flag_appears_in_help() -> None:
     can discover it. Phase 2 will keep the help text; Phase 1 just
     locks in that it's present.
 
-    Pinning COLUMNS=200 so Rich doesn't line-wrap the flag name in
-    CI's narrow default terminal — without it, ``--llm`` can end up
-    split across two output lines and the substring assertion fails."""
+    We strip ANSI escapes before substring-checking because CI runs
+    with ``FORCE_COLOR=1``, which causes Rich to insert escape
+    sequences *inside* the option name (``--`` and ``llm`` get
+    styled as separate spans). A raw substring check on the styled
+    output misses the flag entirely."""
+    import re  # noqa: PLC0415
+
     result = runner.invoke(app, ["init", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    assert "--llm" in result.stdout
-    assert "--llm-model" in result.stdout
-    assert "--dry-run" in result.stdout
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.stdout)
+    assert "--llm" in plain
+    assert "--llm-model" in plain
+    assert "--dry-run" in plain
 
 
 @pytest.mark.unit
