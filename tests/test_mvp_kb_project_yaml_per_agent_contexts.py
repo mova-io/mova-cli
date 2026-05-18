@@ -161,7 +161,9 @@ class TestProjectYamlCanonical:
         any marker file already exists."""
         (tmp_path / "project.yaml").write_text("existing: true\n")
         monkeypatch.chdir(tmp_path)
-        result = runner.invoke(app, ["init", "--project"])
+        # COLUMNS=200 so Rich doesn't wrap "project.yaml" and
+        # "already exists" across a newline in CI's narrow terminal.
+        result = runner.invoke(app, ["init", "--project"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         combined = result.stdout + result.stderr
         assert "project.yaml already exists" in combined
