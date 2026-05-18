@@ -43,3 +43,13 @@ class _LiteLLMBotocoreNoiseFilter(logging.Filter):
 _litellm_logger = logging.getLogger("LiteLLM")
 if not any(isinstance(f, _LiteLLMBotocoreNoiseFilter) for f in _litellm_logger.filters):
     _litellm_logger.addFilter(_LiteLLMBotocoreNoiseFilter())
+
+# Raise the LiteLLM logger's threshold to WARNING so per-completion
+# ``LiteLLM:INFO: utils.py:4053 - LiteLLM completion() model=…``
+# lines don't flood stderr during ``mdk eval`` / ``mdk run`` — the
+# progress bar repaints get interleaved with these lines and become
+# unreadable. WARNING+ records (rate limits, model-not-found, etc.)
+# still surface; the botocore-probe WARNINGs above are filtered too.
+# Operators who want the verbose log can re-enable per-call via
+# ``logging.getLogger("LiteLLM").setLevel(logging.INFO)``.
+_litellm_logger.setLevel(logging.WARNING)
