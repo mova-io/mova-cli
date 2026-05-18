@@ -315,21 +315,20 @@ class TestInitProjectNextSteps:
         """The next-steps Panel includes a `cd <name>` line so the
         operator can copy-paste their way into the new project.
 
-        Post-flow-polish (PR #93) the discovery surface is
-        `mdk templates list` rather than the legacy
-        `mdk add --list`; the cd line moved to its own row for
-        readability."""
+        Post-init-add-ux polish: discovery surface moved to
+        `mdk add --list` (numbered table + interactive add); the
+        legacy read-only `mdk templates list` is still available
+        but the menu points at the new flow."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
-            ["init", "--project", "smooth-test", "--skip-snapshot"],
+            ["init", "--project", "smooth-test", "--skip-snapshot", "--no-open-editor"],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        # `cd <name>` and `mdk templates list` both render — they're now
-        # on separate lines instead of `&&`-chained.
+        # `cd <name>` and `mdk add --list` both render on separate lines.
         assert "cd smooth-test" in result.stdout
-        assert "mdk templates list" in result.stdout
+        assert "mdk add --list" in result.stdout
 
     def test_obsolete_env_step_dropped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

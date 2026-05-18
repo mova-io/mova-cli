@@ -288,13 +288,15 @@ class TestSmartNextStepsAfterWithAgents:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
-            ["init", "--project", "fresh", "--skip-snapshot"],
+            ["init", "--project", "fresh", "--skip-snapshot", "--no-open-editor"],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0
-        # Post-PR-#93 the discovery surface is `mdk templates list` —
-        # `mdk add --list` was the pre-MVP discovery path.
-        assert "mdk templates list" in result.stdout
+        # Post-init-add-ux polish: the discovery surface is `mdk add
+        # --list` (interactive numbered picker that adds in one step).
+        # The legacy `mdk templates list` is read-only and still available
+        # but no longer the recommended next step.
+        assert "mdk add --list" in result.stdout
         # Tip about --with-agents next time:
         assert "--with-agents" in result.stdout
 

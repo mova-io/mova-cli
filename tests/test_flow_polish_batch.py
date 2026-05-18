@@ -266,13 +266,18 @@ def test_first_agent_name_helper() -> None:
 
 
 @pytest.mark.unit
-def test_init_project_mentions_templates_list(
+def test_init_project_mentions_add_list_discovery_surface(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`mdk init <name>` (project mode, no agents) Next-steps Panel
-    should mention `mdk templates list` as the discovery surface
-    — pre-fix it pointed at the legacy `mdk add --list` (or none)."""
+    should mention the role-template discovery surface. Post-init-add-ux
+    polish the canonical surface is `mdk add --list` (numbered table
+    + interactive add); the older `mdk templates list` is a read-only
+    catalog that's still available but no longer the recommended path."""
     monkeypatch.chdir(tmp_path)
-    result = runner.invoke(app, ["init", "myproj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    result = runner.invoke(
+        app, ["init", "myproj", "--skip-snapshot", "--no-open-editor"],
+        env={"COLUMNS": "200"},
+    )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert "mdk templates list" in result.stdout
+    assert "mdk add --list" in result.stdout

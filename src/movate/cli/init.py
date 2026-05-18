@@ -539,6 +539,7 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
     skip_snapshot: bool,
     with_agents: str | None = None,
     quiet: bool = False,
+    open_editor: bool = True,
 ) -> tuple[str, Path, str | None]:
     """Bootstrap a fresh movate workspace.
 
@@ -756,32 +757,68 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
         editor_argv = ["open", str(project_root)]
         editor_label = "Reveal project in Finder"
 
-    next_steps = []
-    if editor_cmd is not None:
-        next_steps.append(NextStep(label=editor_label, command=editor_cmd, argv=editor_argv))
-    next_steps.extend(
-        [
-            NextStep(
-                label="Browse role templates",
-                command=f"{bin_name} templates list",
-                argv=[bin_name, "templates", "list"],
-            ),
-            NextStep(
-                label="Add the FAQ agent",
-                command=f"cd {cd_to} && {bin_name} add faq",
-                argv=["sh", "-c", f"cd {cd_to} && {bin_name} add faq"],
-            ),
-            NextStep(
-                label="Add two role agents (rag-qa + ticket-triager)",
-                command=f"cd {cd_to} && {bin_name} add rag-qa ticket-triager",
-                argv=[
-                    "sh",
-                    "-c",
-                    f"cd {cd_to} && {bin_name} add rag-qa ticket-triager",
-                ],
-            ),
-        ]
+    # Auto-launch the detected editor on the new project — operators
+    # almost always want this as the immediate next step. Gated on
+    # ``open_editor`` (CLI flag) AND on stdout being a tty (CI never
+    # wants a GUI launched). We use Popen-with-DEVNULL so the editor
+    # stays detached from the CLI's lifecycle — closing the terminal
+    # doesn't close VS Code.
+    import sys as _sys  # noqa: PLC0415
+
+    editor_auto_launched = False
+    # `open` on macOS opens Finder, not an editor — skip the
+    # auto-launch path in that case so the operator's terminal
+    # doesn't get displaced by a Finder window.
+    if (
+        open_editor
+        and editor_argv is not None
+        and editor_argv[0] != "open"
+        and _sys.stdout.isatty()
+    ):
+        import subprocess as _subprocess  # noqa: PLC0415
+
+        try:
+            _subprocess.Popen(
+                editor_argv,
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                stdin=_subprocess.DEVNULL,
+            )
+            console.print(
+                f"\n[green]✓[/green] launched [bold]{editor_label}[/bold] "
+                f"on [cyan]{project_root}[/cyan]"
+            )
+            editor_auto_launched = True
+        except (OSError, ValueError):
+            # Best-effort — fall through to the menu pick if launch fails.
+            editor_auto_launched = False
+
+    # `cd <project>` reminder. We can't change the parent shell's cwd
+    # from a child process, but printing the command prominently makes
+    # the next step obvious. The post-init menu shortcuts use `sh -c`
+    # to chdir internally so menu picks still land in the right place.
+    console.print(
+        f"\n[dim]Next: [bold]cd {cd_to}[/bold] to start working in the new project.[/dim]"
     )
+
+    next_steps = []
+    # Only offer the manual editor-launch step when we DIDN'T auto-launch.
+    if editor_cmd is not None and not editor_auto_launched:
+        next_steps.append(NextStep(label=editor_label, command=editor_cmd, argv=editor_argv))
+    # Replaces the old fixed `[3] Add FAQ` / `[4] Add rag-qa+ticket-triager`
+    # shortcuts with a single dynamic picker — same numbered role table
+    # the user sees in `mdk add --list`. Operators who know exactly
+    # which template they want can still type `mdk add <name>` directly;
+    # this menu just covers "I want to see what's available."
+    next_steps.append(
+        NextStep(
+            label="Browse + add agents (numbered role catalog)",
+            command=f"cd {cd_to} && {bin_name} add --list",
+            argv=["sh", "-c", f"cd {cd_to} && {bin_name} add --list"],
+        )
+    )
+    # `prompt_next_step` auto-renders `[s] Skip`; no need for an
+    # explicit skip step. Operators who decline get a plain shell back.
     prompt_next_step(console=console, steps=next_steps)
 
     return project_name, project_root, snapshot_short
@@ -1646,6 +1683,19 @@ def init(
             "[bold]--llm[/bold]; ignored otherwise."
         ),
     ),
+    open_editor: bool = typer.Option(
+        True,
+        "--open-editor/--no-open-editor",
+        help=(
+            "After project mode creates the workspace, launch VS Code "
+            "(or Cursor, or open the folder in Finder on macOS) on the "
+            "new project. Default ON when an editor is on PATH and "
+            "stdout is a tty; pass [bold]--no-open-editor[/bold] in CI / "
+            "headless environments. The same option is offered as a "
+            "menu pick afterwards so the operator can still launch it "
+            "manually if auto-launch was skipped."
+        ),
+    ),
 ) -> None:
     """Scaffold a new agent, or bootstrap a fresh project workspace.
 
@@ -1732,6 +1782,7 @@ def init(
             skip_snapshot=skip_snapshot,
             with_agents=with_agents,
             quiet=bool(with_agents),
+            open_editor=open_editor,
         )
         # --with-agents X,Y,Z: scaffold each role template inside the
         # freshly-bootstrapped project. Skipped when the operator is
