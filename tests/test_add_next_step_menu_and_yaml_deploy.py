@@ -62,27 +62,30 @@ def test_add_does_not_render_menu_under_non_tty(
 
 
 @pytest.mark.unit
-def test_add_panel_still_includes_static_next_steps(
+def test_add_panel_still_includes_scoped_next_steps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: even on non-TTY (no interactive prompt), the
     next-steps list must keep rendering — operators reading the
-    output (esp. in CI logs) still need the commands surfaced.
+    output (esp. in CI logs) still need the action surfaced.
 
-    Post-PR-#106 the single next-steps surface is the `Next:` block
-    printed by the shared menu helper (renders in both modes; only
-    prompts under TTY). The legacy `Next steps:` block inside the
-    Panel body was dropped — it duplicated the helper's output.
+    The post-add menu was trimmed to role-agent-management actions
+    only ("Add another role agent" + Skip). ``mdk eval`` and
+    ``mdk doctor`` used to appear here but were dropped — they
+    interrupted the operator's natural scaffold flow with a
+    context-switch prompt they almost always wanted to defer.
     """
     _bootstrap(tmp_path, monkeypatch)
     result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     # Helper-printed Next: surface.
     assert "Next:" in result.stdout
-    # First step is now the role-catalog picker; remaining steps still appear.
+    # Scoped surface: only role-agent management + skip.
     assert "Add another role agent" in result.stdout
-    assert "mdk eval" in result.stdout
-    assert "mdk doctor agent faq" in result.stdout
+    assert "Skip" in result.stdout
+    # The removed options must NOT leak back in.
+    assert "mdk eval" not in result.stdout
+    assert "mdk doctor agent faq" not in result.stdout
 
 
 # ---------------------------------------------------------------------------

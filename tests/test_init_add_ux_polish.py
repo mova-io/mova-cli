@@ -111,12 +111,21 @@ def test_run_with_sample_input_helper_exists_and_is_importable() -> None:
 
 
 @pytest.mark.unit
-def test_post_add_menu_includes_run_with_sample_input_as_first_option(
+def test_post_add_menu_is_scoped_to_role_agent_management(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After ``mdk add <template>`` completes, the post-add menu must
-    offer "Run with sample input" — that's the new replacement for
-    the old surprise smoke test."""
+    only surface role-agent-management actions ("Add another role
+    agent") + Skip. Earlier iterations of this menu offered
+    Run / Eval / Doctor / Deploy, but those drowned out the natural
+    next step during project scaffolding (add another agent) and
+    interrupted the operator's flow with a context-switch prompt
+    they almost always wanted to defer.
+
+    Run / Eval / Doctor / Deploy remain one keystroke away via the
+    direct ``mdk <cmd>`` invocations and via ``mdk menu`` once the
+    project is set up. Pin the scoped surface here so a future edit
+    can't accidentally re-stuff the menu."""
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
     monkeypatch.chdir(tmp_path)
     runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
@@ -125,13 +134,18 @@ def test_post_add_menu_includes_run_with_sample_input_as_first_option(
     result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
 
     combined = result.stdout + result.stderr
-    # The new option appears, and the four pre-existing options stay
-    # (so we didn't accidentally drop functionality).
-    assert "Run with sample input" in combined
-    assert "Run the eval suite" in combined
-    assert "Check wiring + setup" in combined
+    # The role-agent option remains + Skip is always there.
     assert "Add another role agent" in combined
-    assert "Deploy to Azure" in combined
+    assert "Skip" in combined
+    # The four removed options must NOT appear in the menu — pinning
+    # their absence prevents a regression.
+    assert "Run with sample input" not in combined, (
+        "post-add menu must not offer Run — that's an interrupting "
+        "context-switch during project scaffolding"
+    )
+    assert "Run the eval suite" not in combined
+    assert "Check wiring + setup" not in combined
+    assert "Deploy to Azure" not in combined
 
 
 # ---------------------------------------------------------------------------

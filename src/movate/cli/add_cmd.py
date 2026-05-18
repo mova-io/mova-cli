@@ -241,12 +241,9 @@ def _pick_and_add_role_agent(bin_name: str) -> None:
     summary panel + one post-add menu at the end.
 
     The downstream ``mdk add`` invocation runs its own post-add menu
-    (see ``_post_add_menu``) which offers "Run with sample input" as
-    an explicit option — the picker doesn't fire that smoke test on
-    its own. Previously the picker unconditionally ran ``mdk run
-    --mock`` after returning from the inner menu, which confused
-    operators who had picked ``[3] Check wiring`` and got a surprise
-    model invocation.
+    that's now scoped to role-agent management only ("Add another
+    role agent" + Skip). Run / Eval / Doctor / Deploy used to live
+    here but were dropped — see the comment in :func:`add` for why.
     """
     import subprocess  # noqa: PLC0415
     import sys  # noqa: PLC0415
@@ -302,9 +299,12 @@ def _run_with_sample_input(
     """Interactive sample-input smoke test: prompt for input, run
     ``mdk run --mock``, render a Rich panel with status + latency + cost.
 
-    Extracted from the old auto-smoke in :func:`_pick_and_add_role_agent`
-    so it can be offered as an opt-in ``[Run with sample input]``
-    option in the post-add menu instead of firing as a surprise.
+    Originally extracted from the auto-smoke in
+    :func:`_pick_and_add_role_agent` to become a menu option. The
+    post-add menu has since been scoped down to role-agent management
+    only, so this helper is no longer wired into the menu — but it's
+    kept as an importable helper for tests + potential future
+    re-wiring (e.g. a dedicated ``mdk run-sample`` command).
     """
     import json as _json  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -969,7 +969,6 @@ def _add_one(
         body += f"[bold]Contexts:[/bold] [cyan]{ctx_str}[/cyan] (auto-scaffolded)\n"
     if validation_status is not None:
         body += f"[bold]Validates:[/bold] {validation_status}\n"
-    rel = dest.relative_to(project_root)
     console.print(
         Panel(
             body,
@@ -997,44 +996,28 @@ def _add_one(
     # Interactive 'What next?' picker — TTY-gated, shared with init/
     # validate/eval. The helper renders the menu and shells out; this
     # call site just assembles the per-agent step list.
+    #
+    # Scope: this menu is intentionally scoped to ROLE-AGENT
+    # MANAGEMENT actions only — picking another template from the
+    # catalog. Run / Eval / Doctor / Deploy used to surface here too,
+    # but operators in the middle of scaffolding a project rarely
+    # want to context-switch into one of those flows mid-stream; the
+    # noise drowned out the natural next step (add another agent).
+    # Those commands are still one keystroke away via `mdk run`,
+    # `mdk eval`, `mdk doctor`, `mdk deploy` from the shell, and
+    # `mdk menu` surfaces them as workspace-level actions once the
+    # project is set up.
     from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
 
     bin_name = mdk_bin_name()
-    rel = dest.relative_to(project_root)
     prompt_next_step(
         console=console,
         steps=[
-            NextStep(
-                label="Run with sample input",
-                command=f"{bin_name} run ./{rel} --mock <input>",
-                argv=[bin_name, "run", f"./{rel}", "--mock"],
-                callback=lambda: _run_with_sample_input(
-                    bin_name=bin_name,
-                    template_or_name=agent_name,
-                    agent_dir=dest,
-                    project_root=project_root,
-                ),
-            ),
-            NextStep(
-                label="Run the eval suite",
-                command=f"{bin_name} eval ./{rel} --mock --gate 0.7",
-                argv=[bin_name, "eval", f"./{rel}", "--mock", "--gate", "0.7"],
-            ),
-            NextStep(
-                label="Check wiring + setup",
-                command=f"{bin_name} doctor agent {agent_name}",
-                argv=[bin_name, "doctor", "agent", agent_name],
-            ),
             NextStep(
                 label="Add another role agent",
                 command=f"{bin_name} add --list",
                 argv=[bin_name, "add", "--list"],
                 callback=lambda: _pick_and_add_role_agent(bin_name),
-            ),
-            NextStep(
-                label="Deploy to Azure",
-                command=f"{bin_name} deploy --target dev",
-                argv=[bin_name, "deploy", "--target", "dev"],
             ),
         ],
     )
