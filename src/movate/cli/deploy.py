@@ -895,6 +895,8 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             target_name=target_name,
             uploaded=uploaded,
             project_root=project_root,
+            base_url=target_cfg.url.rstrip("/"),
+            key_env=target_cfg.key_env,
         )
 
     err.print(
@@ -913,48 +915,58 @@ def _render_post_deploy_next_steps(
     target_name: str,
     uploaded: list[str],
     project_root: Path,
+    base_url: str,
+    key_env: str,
 ) -> None:
-    """Print a tight "Next: run inference" block after a successful deploy.
+    """Print a "Next: run inference" block after a successful deploy.
 
-    Shows one ``mdk submit`` example using the first uploaded agent
-    (alphabetical for determinism — operators with a favorite can
-    re-target by name), plus the two ``mdk jobs`` verbs that complete
-    the inference loop. Uses the agent's first dataset row as the
-    sample input when one is available so the example is
-    copy-pasteable against the operator's actual schema.
+    Emits one ``curl`` command per uploaded agent, copy-pasteable
+    against the operator's shell. The body of each request uses the
+    first row of the agent's ``evals/dataset.jsonl`` as the sample
+    input so the example actually exercises the agent's real schema
+    (falls back to ``{"text":"..."}`` if no dataset row is available).
+
+    Previously emitted ``mdk submit`` invocations + ``mdk jobs list``
+    hints, but operators consistently wanted curl — it's portable
+    across shells, scriptable in any language, and doesn't require
+    a working ``mdk`` install on the box doing the inference.
     """
-    sample_agent = sorted(uploaded)[0]
-    sample_dir = project_root / "agents" / sample_agent
-    sample_input_json: str = '{"text":"..."}'
-    dataset_path = sample_dir / "evals" / "dataset.jsonl"
-    if dataset_path.is_file():
-        try:
-            first_line = next(
-                (line for line in dataset_path.read_text().splitlines() if line.strip()),
-                "",
-            )
-            row = json.loads(first_line) if first_line else None
-            if isinstance(row, dict) and isinstance(row.get("input"), dict):
-                sample_input_json = json.dumps(row["input"])
-        except (OSError, ValueError):
-            pass
-
     err.print("[bold]Next:[/bold] run inference against the deployed runtime")
-    err.print(
-        f"  [cyan]mdk submit {sample_agent}[/cyan] "
-        f"[yellow]'{sample_input_json}'[/yellow] "
-        f"--target {target_name} --wait"
-    )
-    if len(uploaded) > 1:
-        others = ", ".join(sorted(uploaded)[1:])
-        err.print(f"  [dim]other agents: {others}[/dim]")
-    err.print(
-        f"  [dim]mdk jobs list --target {target_name}[/dim]           [dim]# recent jobs[/dim]"
-    )
-    err.print(
-        f"  [dim]mdk jobs show <id> --target {target_name}[/dim]       [dim]# inspect one run[/dim]"
-    )
     err.print()
+
+    for agent_name in sorted(uploaded):
+        sample_input_json = _sample_input_for_agent(project_root, agent_name)
+        body = json.dumps({"agent": agent_name, "input": json.loads(sample_input_json)})
+        err.print(f"  [dim]# {agent_name}[/dim]")
+        err.print(
+            f"  [cyan]curl -sS -X POST {base_url}/run \\[/cyan]\n"
+            f"  [cyan]  -H 'content-type: application/json' \\[/cyan]\n"
+            f'  [cyan]  -H "x-api-key: ${key_env}" \\[/cyan]\n'
+            f"  [cyan]  -d [/cyan][yellow]'{body}'[/yellow]"
+        )
+        err.print()
+
+
+def _sample_input_for_agent(project_root: Path, agent_name: str) -> str:
+    """Return a JSON string for the first dataset.jsonl row's ``input``
+    field, or ``{"text":"..."}`` if no dataset / no valid row."""
+    fallback = '{"text":"..."}'
+    dataset_path = project_root / "agents" / agent_name / "evals" / "dataset.jsonl"
+    if not dataset_path.is_file():
+        return fallback
+    try:
+        first_line = next(
+            (line for line in dataset_path.read_text().splitlines() if line.strip()),
+            "",
+        )
+        if not first_line:
+            return fallback
+        row = json.loads(first_line)
+        if isinstance(row, dict) and isinstance(row.get("input"), dict):
+            return json.dumps(row["input"])
+    except (OSError, ValueError):
+        return fallback
+    return fallback
 
 
 def _append_context_files(
