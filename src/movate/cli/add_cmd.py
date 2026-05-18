@@ -199,16 +199,54 @@ def _render_role_catalog_numbered(installed: set[str]) -> list[str]:
     return addable
 
 
+def _parse_pick_input(raw: str, max_index: int) -> list[int] | None:
+    """Parse a picker input string into a list of 1-based indexes.
+
+    Accepts any combination of:
+    * Single integer: ``"3"`` → ``[3]``
+    * Comma-separated: ``"1,3,5"`` → ``[1, 3, 5]``
+    * Space-separated: ``"1 3 5"`` → ``[1, 3, 5]``
+    * Mixed: ``"1, 3 5"`` → ``[1, 3, 5]``
+
+    Returns ``None`` for the skip sentinel (``"s"`` or empty), or
+    when any token is non-numeric or out of range. De-duplicates while
+    preserving first-occurrence order so ``"1 1 3"`` adds each
+    template exactly once.
+    """
+    text = raw.strip().lower()
+    if not text or text == "s":
+        return None
+    # Allow commas + whitespace as separators interchangeably.
+    tokens = text.replace(",", " ").split()
+    seen: set[int] = set()
+    out: list[int] = []
+    for tok in tokens:
+        if not tok.isdigit():
+            return None
+        idx = int(tok)
+        if idx < 1 or idx > max_index:
+            return None
+        if idx not in seen:
+            seen.add(idx)
+            out.append(idx)
+    return out or None
+
+
 def _pick_and_add_role_agent(bin_name: str) -> None:
-    """Show the numbered role catalog and shell out to ``mdk add <template>``.
+    """Show the numbered role catalog + add the chosen agents.
+
+    Supports both single-pick (``3``) and multi-pick (``1 3 5`` or
+    ``1,3,5``); each picked template is added in one ``mdk add``
+    batch invocation so the operator gets exactly one combined
+    summary panel + one post-add menu at the end.
 
     The downstream ``mdk add`` invocation runs its own post-add menu
-    (see :func:`_post_add_menu`) which offers "Run with sample input"
-    as an explicit option — the picker doesn't fire that smoke test
-    on its own anymore. Previously the picker unconditionally ran
-    ``mdk run --mock`` after returning from the inner menu, which
-    confused operators who had picked ``[3] Check wiring`` and got
-    a surprise model invocation.
+    (see ``_post_add_menu``) which offers "Run with sample input" as
+    an explicit option — the picker doesn't fire that smoke test on
+    its own. Previously the picker unconditionally ran ``mdk run
+    --mock`` after returning from the inner menu, which confused
+    operators who had picked ``[3] Check wiring`` and got a surprise
+    model invocation.
     """
     import subprocess  # noqa: PLC0415
     import sys  # noqa: PLC0415
@@ -222,20 +260,36 @@ def _pick_and_add_role_agent(bin_name: str) -> None:
         return
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
-    try:
-        choice = Prompt.ask(
-            "\n[bold]Pick[/bold]",
-            choices=[str(i) for i in range(1, len(addable) + 1)] + ["s"],
-            default="s",
-            show_choices=False,
+
+    # Free-form Prompt.ask (no choices=…) — operators can type a
+    # single number, comma- or space-separated numbers, or `s` to
+    # skip. Invalid input re-prompts via the loop below so the
+    # operator doesn't lose their place.
+    while True:
+        try:
+            raw = Prompt.ask(
+                "\n[bold]Pick[/bold] [dim](one or more numbers — "
+                "e.g. [bold]3[/bold] or [bold]1 3 5[/bold] — "
+                "or [bold]s[/bold] to skip)[/dim]",
+                default="s",
+                show_default=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return
+        picks = _parse_pick_input(raw, max_index=len(addable))
+        if picks is None and raw.strip().lower() in ("", "s"):
+            return
+        if picks:
+            break
+        console.print(
+            f"[yellow]⚠[/yellow] couldn't parse {raw!r} — enter one or more "
+            f"numbers between 1 and {len(addable)} (space or comma "
+            f"separated), or [bold]s[/bold] to skip."
         )
-    except (KeyboardInterrupt, EOFError):
-        return
-    if choice == "s":
-        return
-    template = addable[int(choice) - 1]
-    console.print(f"\n[dim]$ {bin_name} add {template}[/dim]")
-    subprocess.run([bin_name, "add", template], check=False)
+
+    templates = [addable[i - 1] for i in picks]
+    console.print(f"\n[dim]$ {bin_name} add {' '.join(templates)}[/dim]")
+    subprocess.run([bin_name, "add", *templates], check=False)
 
 
 def _run_with_sample_input(
@@ -594,7 +648,21 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
       $ mdk add --update rag-qa --apply
     """
     if list_only:
-        _render_list(search=search)
+        # `--list` (and the `mdk add list` subcommand alias below)
+        # historically just rendered the catalog and exited. Operators
+        # consistently typed `mdk add --list` expecting to add an agent
+        # afterward — so when stdin/stdout are both ttys, follow the
+        # render with the numbered picker. Scripts piping the output
+        # still get the plain table because the picker short-circuits
+        # on non-tty inside `_pick_and_add_role_agent`.
+        import sys  # noqa: PLC0415
+
+        if sys.stdin.isatty() and sys.stdout.isatty() and search is None:
+            from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+            _pick_and_add_role_agent(mdk_bin_name())
+        else:
+            _render_list(search=search)
         return
 
     if preview:
@@ -612,9 +680,18 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
     # `mdk add context <name>` — create a shared context file in the
     # current project. Intercepted before template validation so the
     # word "context" doesn't get flagged as an unknown template name.
-    # `mdk add list` — alias for `mdk add --list` so both spellings work.
+    # `mdk add list` — alias for `mdk add --list` so both spellings
+    # work. Same TTY/script split: interactive operators get the
+    # picker, pipes see the plain catalog.
     if args and args[0] == "list":
-        _render_list(search=search)
+        import sys  # noqa: PLC0415
+
+        if sys.stdin.isatty() and sys.stdout.isatty() and search is None:
+            from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+            _pick_and_add_role_agent(mdk_bin_name())
+        else:
+            _render_list(search=search)
         return
 
     if args and args[0] == "context":
@@ -632,6 +709,17 @@ def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
         return
 
     if not args:
+        # Interactive operators get the numbered picker — same flow
+        # as `mdk add --list` / `mdk add list`. Scripted callers (no
+        # tty) still see the original "name required" error so the
+        # exit code stays diagnostic for CI.
+        import sys  # noqa: PLC0415
+
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+            _pick_and_add_role_agent(mdk_bin_name())
+            return
         err_console.print(
             "[red]✗[/red] template name required. "
             "Run [bold]mdk add --list[/bold] to see options, or "
