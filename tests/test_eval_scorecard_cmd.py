@@ -25,12 +25,14 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.eval_scorecard_cmd import (
+    _VALID_MIXES,
     ALL_CATEGORIES,
     LLM_JUDGED_CATEGORIES,
     PROGRAMMATIC_CATEGORIES,
     CaseScore,
     ScorecardSummary,
     _emit_summary_line,
+    _find_project_root,
     _measure_programmatic,
     _render_scorecard,
     _score_color,
@@ -186,6 +188,62 @@ class TestScoreColor:
     def test_red_below_60(self) -> None:
         assert _score_color(0.59) == "red"
         assert _score_color(0.00) == "red"
+
+
+# ---------------------------------------------------------------------------
+# Mix allowlist (Phase 2 added "domain")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestValidMixes:
+    def test_all_four_mixes_present(self) -> None:
+        """Phase 2 adds 'domain' to the existing three mixes. Pin the
+        full set so a future edit can't silently drop one."""
+        assert set(_VALID_MIXES) == {"standard", "edge", "adversarial", "domain"}
+
+    def test_domain_mix_listed_after_phase_1_three(self) -> None:
+        """Domain is the new addition; the other three shipped in
+        Phase 1 (PR #178). Order doesn't matter for the allowlist
+        check above, but ``--help`` renders this tuple in order, so
+        new mixes should append rather than reorder."""
+        assert _VALID_MIXES[:3] == ("standard", "edge", "adversarial")
+        assert _VALID_MIXES[3] == "domain"
+
+
+# ---------------------------------------------------------------------------
+# _find_project_root (used by domain-mix to locate kb/)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestFindProjectRoot:
+    def test_walks_up_to_project_yaml(self, tmp_path: Path) -> None:
+        """``agents/<name>/`` → walk up to find ``project.yaml`` at
+        the project root. Domain-mix needs this to locate the kb/
+        corpus."""
+        (tmp_path / "project.yaml").write_text("name: demo\n")
+        agent_dir = tmp_path / "agents" / "rag-qa"
+        agent_dir.mkdir(parents=True)
+        assert _find_project_root(agent_dir) == tmp_path.resolve()
+
+    def test_accepts_legacy_movate_yaml(self, tmp_path: Path) -> None:
+        """Pre-#85 projects used movate.yaml. Loader still accepts
+        both — the project-root detector must too."""
+        (tmp_path / "movate.yaml").write_text("name: demo\n")
+        agent_dir = tmp_path / "agents" / "rag-qa"
+        agent_dir.mkdir(parents=True)
+        assert _find_project_root(agent_dir) == tmp_path.resolve()
+
+    def test_falls_back_to_parent_when_no_marker(self, tmp_path: Path) -> None:
+        """Outside a project (no marker anywhere up the tree), return
+        the agent's parent directory rather than erroring. Domain-mix
+        then just won't find KB seeds — degenerate but non-fatal."""
+        agent_dir = tmp_path / "rogue-agent"
+        agent_dir.mkdir()
+        result = _find_project_root(agent_dir)
+        # The fallback is .parent of the agent dir.
+        assert result == agent_dir.parent
 
 
 # ---------------------------------------------------------------------------

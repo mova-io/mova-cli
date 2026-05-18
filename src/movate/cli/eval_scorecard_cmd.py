@@ -44,7 +44,7 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
-from movate.cli.eval_gen_cmd import _generate_entries
+from movate.cli.eval_gen_cmd import _generate_entries, _load_kb_seeds
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import RunRequest
 from movate.providers.base import Message
@@ -268,8 +268,27 @@ async def _run_scorecard(
     mix: str,
     mock: bool,
     judge_model: str | None,
+    project_root: Path | None = None,
 ) -> ScorecardSummary:
     """End-to-end: generate cases, run agent, score, aggregate."""
+    # KB seeds: domain-mix wants generated cases grounded in the
+    # agent's actual knowledge base scenarios — pulled from the
+    # project's kb/ corpus when the agent has a KB skill wired. For
+    # other mixes we deliberately skip seeding so the generation
+    # stays broad. ``_load_kb_seeds`` returns [] cleanly when no
+    # KB is configured, so domain mix is safe to use on any agent
+    # (it just becomes equivalent to standard if there's no KB).
+    kb_seeds: list[str] | None = None
+    if mix == "domain" and project_root is not None:
+        kb_seeds = _load_kb_seeds(bundle, project_root) or None
+        if not kb_seeds:
+            err_console.print(
+                "[yellow]⚠[/yellow] mix=domain requested but this agent has no "
+                "KB skill / kb-lookup-corpus.json — generation will fall back "
+                "to the domain prompt without explicit seeds (still uses the "
+                "agent's contexts)."
+            )
+
     # Step 1: generate test cases via the existing eval-gen primitives.
     # Returns entries with .input and .expected (the agent's response).
     entries = await _generate_entries(
@@ -279,6 +298,7 @@ async def _run_scorecard(
         mock=mock,
         with_dimensions=False,
         mode=mix,
+        kb_seeds=kb_seeds,
     )
     if not entries:
         raise typer.Exit(code=2)
@@ -409,7 +429,25 @@ def _emit_summary_line(summary: ScorecardSummary) -> None:
 # ---------------------------------------------------------------------------
 
 
-_VALID_MIXES = ("standard", "edge", "adversarial")  # "domain" lands in Phase 2.
+_VALID_MIXES = ("standard", "edge", "adversarial", "domain")
+
+
+def _find_project_root(agent_path: Path) -> Path:
+    """Walk up from *agent_path* until we find a project.yaml or
+    movate.yaml; return that directory. Falls back to ``agent_path.parent``
+    if no marker is found anywhere up the tree.
+
+    Domain-mix needs the project root to locate the kb/ corpus
+    (``<root>/kb/kb-lookup-corpus.json``); other mixes ignore it.
+    Falling back to the agent's parent dir keeps the call site
+    no-op-safe even outside a project — domain-mix just won't find
+    seeds (which it already handles gracefully).
+    """
+    here = agent_path.resolve()
+    for candidate in [here, *here.parents]:
+        if (candidate / "project.yaml").is_file() or (candidate / "movate.yaml").is_file():
+            return candidate
+    return agent_path.parent
 
 
 def eval_scorecard(
@@ -429,9 +467,10 @@ def eval_scorecard(
         "standard",
         "--mix",
         help=(
-            "Test-case mix: standard (typical inputs), edge (boundary/malformed), "
-            "adversarial (red-team / prompt injection). Phase 2 will add 'domain' "
-            "(KB-aware)."
+            "Test-case mix: standard (typical inputs), edge (boundary/"
+            "malformed), adversarial (red-team / prompt injection), "
+            "domain (KB-aware — seeds inputs from the agent's knowledge "
+            "base and contexts)."
         ),
     ),
     mock: bool = typer.Option(
@@ -475,11 +514,24 @@ def eval_scorecard(
         err_console.print(f"[red]✗[/red] could not load agent at {agent}: {exc}")
         raise typer.Exit(code=2) from None
 
+    # Resolve the project root by walking up from the agent dir until
+    # we find a project.yaml / movate.yaml. Domain-mix uses it to find
+    # the kb/ corpus; other mixes ignore it. Falls back to the agent
+    # dir's parent if no marker found — domain still works degradedly.
+    project_root = _find_project_root(agent_path)
+
     console.print(
         f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
     )
     summary = asyncio.run(
-        _run_scorecard(bundle, count=count, mix=mix, mock=mock, judge_model=judge_model)
+        _run_scorecard(
+            bundle,
+            count=count,
+            mix=mix,
+            mock=mock,
+            judge_model=judge_model,
+            project_root=project_root,
+        )
     )
 
     console.print()

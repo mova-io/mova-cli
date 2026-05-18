@@ -208,4 +208,13 @@ class TestEvalGenModeFlag:
         assert "mode=" not in result.stdout
 
     def test_valid_modes_list(self) -> None:
-        assert set(_VALID_MODES) == {"standard", "adversarial", "edge", "refusal"}
+        # ``domain`` joined the family in Phase 2 of the eval-scorecard
+        # work — adds a KB-aware system prompt that pairs with the
+        # kb_seeds plumbing already in place.
+        assert set(_VALID_MODES) == {
+            "standard",
+            "adversarial",
+            "edge",
+            "refusal",
+            "domain",
+        }

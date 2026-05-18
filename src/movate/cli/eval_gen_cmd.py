@@ -209,11 +209,32 @@ genuine user request, not an obviously absurd prompt.
 Respond with a single JSON object — NO PROSE, NO MARKDOWN, NO CODE FENCES.
 """
 
+_GEN_SYSTEM_PROMPT_DOMAIN = """\
+You generate DOMAIN-SPECIFIC test inputs for an AI agent — inputs grounded in
+the agent's actual knowledge base + declared context documents.
+
+The agent's behavior is described by its prompt; the input schema describes
+the JSON shape; the user message includes a "Scenario from the knowledge
+base" line when KB seeds are available.
+
+Your task: produce ONE input that a real end-user might send while interacting
+with this agent's actual subject matter — drawing on the KB scenario / context
+documents so the input exercises the retrieval + grounding path the agent was
+designed for. Avoid generic small-talk; favor questions or requests that would
+require the agent to consult its KB or apply its declared rubrics.
+
+The input must still satisfy the JSON schema.
+
+Respond with a single JSON object — NO PROSE, NO MARKDOWN, NO CODE FENCES.
+"""
+
+
 _MODE_PROMPTS: dict[str, str] = {
     "standard": _GEN_SYSTEM_PROMPT,
     "adversarial": _GEN_SYSTEM_PROMPT_ADVERSARIAL,
     "edge": _GEN_SYSTEM_PROMPT_EDGE,
     "refusal": _GEN_SYSTEM_PROMPT_REFUSAL,
+    "domain": _GEN_SYSTEM_PROMPT_DOMAIN,
 }
 _VALID_MODES = list(_MODE_PROMPTS)
 
