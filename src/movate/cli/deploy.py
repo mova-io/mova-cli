@@ -890,6 +890,19 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
         err.print(f"  [red]✗[/red] agent [bold]{name}[/bold] — {reason}")
     err.print()
     ok = not failed and not skill_failed
+
+    # Post-deploy "now what?" block — surfaces the smallest set of
+    # commands an operator needs to invoke the just-deployed agents.
+    # Renders only on successful deploys (no point if nothing landed)
+    # and only when at least one agent uploaded (a skills-only deploy
+    # has nothing to submit against).
+    if ok and uploaded:
+        _render_post_deploy_next_steps(
+            target_name=target_name,
+            uploaded=uploaded,
+            project_root=project_root,
+        )
+
     err.print(
         f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
         f"agents={len(agent_dirs)} uploaded={len(uploaded)} "
@@ -899,6 +912,57 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     )
     if not ok:
         raise typer.Exit(code=2)
+
+
+def _render_post_deploy_next_steps(
+    *,
+    target_name: str,
+    uploaded: list[str],
+    project_root: Path,
+) -> None:
+    """Print a tight "Next: run inference" block after a successful deploy.
+
+    Shows one ``mdk submit`` example using the first uploaded agent
+    (alphabetical for determinism — operators with a favorite can
+    re-target by name), plus the two ``mdk jobs`` verbs that complete
+    the inference loop. Uses the agent's first dataset row as the
+    sample input when one is available so the example is
+    copy-pasteable against the operator's actual schema.
+    """
+    sample_agent = sorted(uploaded)[0]
+    sample_dir = project_root / "agents" / sample_agent
+    sample_input_json: str = '{"text":"..."}'
+    dataset_path = sample_dir / "evals" / "dataset.jsonl"
+    if dataset_path.is_file():
+        try:
+            first_line = next(
+                (line for line in dataset_path.read_text().splitlines() if line.strip()),
+                "",
+            )
+            row = json.loads(first_line) if first_line else None
+            if isinstance(row, dict) and isinstance(row.get("input"), dict):
+                sample_input_json = json.dumps(row["input"])
+        except (OSError, ValueError):
+            pass
+
+    err.print("[bold]Next:[/bold] run inference against the deployed runtime")
+    err.print(
+        f"  [cyan]mdk submit {sample_agent}[/cyan] "
+        f"[yellow]'{sample_input_json}'[/yellow] "
+        f"--target {target_name} --wait"
+    )
+    if len(uploaded) > 1:
+        others = ", ".join(sorted(uploaded)[1:])
+        err.print(f"  [dim]other agents: {others}[/dim]")
+    err.print(
+        f"  [dim]mdk jobs list --target {target_name}[/dim]"
+        f"           [dim]# recent jobs[/dim]"
+    )
+    err.print(
+        f"  [dim]mdk jobs show <id> --target {target_name}[/dim]"
+        f"       [dim]# inspect one run[/dim]"
+    )
+    err.print()
 
 
 def _append_context_files(
