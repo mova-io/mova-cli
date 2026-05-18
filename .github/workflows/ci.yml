@@ -140,9 +140,16 @@ jobs:
   # Auto-bump the patch component of the version on every push to main.
   # Lets operators tell at a glance whether `mdk --version` reflects
   # the latest merged code — a stale install shows an older patch
-  # number than the README/GitHub release tag. The `[skip ci]` marker
-  # in the commit message prevents this job from triggering itself
-  # into an infinite loop on its own push.
+  # number than the README/GitHub release tag.
+  #
+  # Why the PR dance instead of a direct push: main is a protected
+  # branch with "Require PR before merging" enabled, so even the
+  # github-actions[bot] (with contents:write) can't push directly.
+  # The bot opens a tiny bump-only PR and enables auto-merge; the
+  # `[skip ci]` in the PR title becomes the squash-merge commit
+  # message, which our own `if:` condition uses to break the
+  # otherwise-infinite loop (push to main → fires this workflow →
+  # opens bump PR → merges → push to main → ...).
   auto-version-bump:
     needs: [lint-and-test]
     runs-on: ubuntu-latest
@@ -152,11 +159,10 @@ jobs:
       && !contains(github.event.head_commit.message, '[skip ci]')
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
-          # fetch-depth: 0 + persist-credentials: true so we can push
-          # back to the same branch we checked out.
           fetch-depth: 0
           persist-credentials: true
 
@@ -171,16 +177,36 @@ jobs:
           new_version=$(python scripts/bump_version.py)
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and push
+      - name: Open + auto-merge bump PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          new_version='${{ steps.bump.outputs.new_version }}'
+          branch="bot/bump-v${new_version}"
+          parent_sha=$(git rev-parse --short HEAD)
+          parent_subject=$(git log -1 --pretty=%s HEAD)
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Order matters: commit BEFORE rebase. `git pull --rebase`
-          # refuses to run while the index has uncommitted changes
-          # (which the bump step just produced). Commit first, then
-          # rebase to absorb anything that landed during lint-and-test
-          # (rare two-PRs-in-quick-succession race), then push.
+          git checkout -b "$branch"
           git add pyproject.toml src/movate/__init__.py
-          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          git commit -m "chore: bump version to ${new_version} [skip ci]"
+          git push origin "$branch"
+
+          pr_url=$(gh pr create \
+            --base main --head "$branch" \
+            --title "chore: bump version to ${new_version} [skip ci]" \
+            --body "Automated patch bump after \`${parent_sha} ${parent_subject}\`.
+
+          The \`[skip ci]\` marker in the title prevents the squash-merge
+          commit (whose message becomes the title) from re-triggering
+          this workflow.")
+          echo "Opened: $pr_url"
+
+          # Try auto-merge first (queues until any required checks pass).
+          # If branch protection prevents auto-merge from being enabled,
+          # fall back to an immediate squash-merge (which works because
+          # the bot's own PR has no required reviews).
+          gh pr merge --squash --auto "$pr_url" \
+            || gh pr merge --squash "$pr_url"
