@@ -161,12 +161,18 @@ class TestProjectYamlCanonical:
         any marker file already exists."""
         (tmp_path / "project.yaml").write_text("existing: true\n")
         monkeypatch.chdir(tmp_path)
-        # COLUMNS=200 so Rich doesn't wrap "project.yaml" and
-        # "already exists" across a newline in CI's narrow terminal.
+        # CI runs with FORCE_COLOR=1 and a narrow default terminal,
+        # so Rich both inserts ANSI escapes and wraps long lines.
+        # Strip ANSI + flatten whitespace before substring-checking
+        # so the assertion isn't tangled in either issue.
+        import re  # noqa: PLC0415
+
         result = runner.invoke(app, ["init", "--project"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
-        combined = result.stdout + result.stderr
-        assert "project.yaml already exists" in combined
+        raw = result.stdout + result.stderr
+        plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
+        flat = " ".join(plain.split())
+        assert "project.yaml already exists" in flat
 
     def test_in_place_bootstrap_refuses_legacy_marker(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

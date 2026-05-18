@@ -67,30 +67,34 @@ class TestVerbosePreserved:
         """The help table should show `-v` paired with `--version`,
         NOT with `--verbose` anymore.
 
-        Wrap-tolerant: we join the entire stdout into a single string
-        before substring-checking. CliRunner's ``env={"COLUMNS": …}``
-        argument is reliably honored by Rich locally but NOT in CI
-        (Rich falls back to a narrower default there), so a per-line
-        assertion will spuriously fail when ``--verbose`` wraps to
-        ``--verbo\\nse``. Joining sidesteps the wrap question entirely."""
+        Two CI-specific gotchas the test has to defeat:
+
+        1. **ANSI escapes inside option names**: CI runs with
+           ``FORCE_COLOR=1``, so Rich styles ``--`` and ``verbose`` as
+           separate spans. A raw substring search for ``--verbose``
+           misses them entirely. Strip ANSI before checking.
+
+        2. **Narrow-terminal line wrap**: ``env={"COLUMNS": …}`` isn't
+           reliably honored in CI, so option/short-form pairs can land
+           on separate lines. Flatten to a single string before
+           checking — sidesteps the wrap question entirely."""
+        import re  # noqa: PLC0415
+
         result = runner.invoke(app, ["--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
-        # Collapse all whitespace (including the wrap newlines that Rich
-        # inserts when it picks a narrower width than we asked for).
-        flat = " ".join(result.stdout.split())
+        # Strip ANSI escapes first (CI sets FORCE_COLOR=1).
+        plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.stdout)
+        # Then collapse all whitespace (wrap newlines + multi-space
+        # padding from Rich's table layout).
+        flat = " ".join(plain.split())
         assert "--verbose" in flat, "expected --verbose mentioned in help"
         assert "--version" in flat, "expected --version mentioned in help"
         # `-v` and `-V` are both paired with --version (not --verbose).
-        # Pin that with the same flat string.
         assert "-V" in flat
         assert "-v" in flat
-        # Defensive: anywhere ``--verbose`` is followed by ``-v`` (on
-        # the same row) means we regressed the short-form re-pairing.
-        # Use a non-greedy capture to look at the immediate-after window.
-        import re  # noqa: PLC0415
-
-        # Walk every `--verbose ...` window and ensure no `-v ` short
-        # form follows before the next flag (--something) appears.
+        # Defensive: anywhere ``--verbose`` is followed by ``-v`` before
+        # the next ``--`` flag would mean we regressed the short-form
+        # re-pairing.
         for match in re.finditer(r"--verbose(.*?)(?=--|\Z)", flat):
             window = match.group(1)
             assert " -v " not in window, f"--verbose row still claims -v: window={window!r}"
