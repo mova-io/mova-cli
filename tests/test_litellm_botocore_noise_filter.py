@@ -109,6 +109,66 @@ def test_filter_is_installed_on_litellm_logger_after_import() -> None:
 
 
 @pytest.mark.unit
+def test_filter_is_installed_at_package_import_not_provider_import() -> None:
+    """Defense in depth: the filter must be installed on ``LiteLLM``
+    by the time ``import movate`` returns — BEFORE any provider
+    module is touched. Otherwise a future code path that triggers
+    ``import litellm`` before importing ``movate.providers.litellm``
+    would leak the botocore warnings.
+
+    Verified via subprocess so the LiteLLM logger isn't polluted by
+    a filter another test already installed."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import movate, logging; "
+                "from movate import _LiteLLMBotocoreNoiseFilter; "
+                "filters = logging.getLogger('LiteLLM').filters; "
+                "assert any(isinstance(f, _LiteLLMBotocoreNoiseFilter) for f in filters), "
+                "'filter not installed by movate package import'; "
+                "print('ok')"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ok" in result.stdout
+
+
+@pytest.mark.unit
+def test_filter_install_is_idempotent_across_reimports() -> None:
+    """Re-importing ``movate`` (e.g. during a test reload) must not
+    stack duplicate filter instances on the ``LiteLLM`` logger. A
+    growing filter list would compound startup cost over a long
+    test session."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import movate, importlib, logging; "
+                "from movate import _LiteLLMBotocoreNoiseFilter; "
+                "importlib.reload(movate); "
+                "importlib.reload(movate); "
+                "count = sum(1 for f in logging.getLogger('LiteLLM').filters "
+                "if isinstance(f, _LiteLLMBotocoreNoiseFilter)); "
+                "assert count == 1, f'expected 1 filter, got {count}'; "
+                "print('ok')"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ok" in result.stdout
+
+
+@pytest.mark.unit
 def test_mdk_version_subprocess_emits_no_botocore_warnings() -> None:
     """End-to-end via subprocess: ``mdk --version`` is one of the
     cheapest CLI commands. Its stderr/stdout must not contain either

@@ -18,47 +18,16 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+import litellm
+from litellm import exceptions as lle
 
-class _LiteLLMBotocoreNoiseFilter(logging.Filter):
-    """Drop LiteLLM's import-time botocore-probe warnings.
-
-    LiteLLM emits two WARNING-level records at import time when
-    ``boto3`` / ``botocore`` aren't installed — one for
-    ``bedrock-runtime`` and one for ``sagemaker-runtime``. The
-    messages claim those decoders will be "unavailable", but every
-    movate provider call routes through native HTTP clients
-    (OpenAI / Anthropic / Google), so Bedrock and SageMaker decoding
-    simply isn't on the path. The warnings fire on every ``mdk``
-    invocation and add ~2 lines of noise above every command's
-    actual output.
-
-    Installing the boto3 dependency just to silence them would add
-    ~10MB+ of AWS SDK code that movate never uses. Filtering the
-    specific two log records instead is the proportionate response —
-    other LiteLLM WARNINGs (rate limits, model-not-found, etc.)
-    still pass through unchanged.
-    """
-
-    _SILENT_NEEDLES = (
-        "bedrock-runtime response stream shape",
-        "sagemaker-runtime response stream shape",
-    )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        return not any(needle in msg for needle in self._SILENT_NEEDLES)
-
-
-# Install the filter BEFORE `import litellm`. LiteLLM's
-# ``common_utils`` probes for botocore at module-import time and
-# logs the warning under the ``LiteLLM`` logger — so the filter has
-# to be in place by the time the `import litellm` line below runs.
-logging.getLogger("LiteLLM").addFilter(_LiteLLMBotocoreNoiseFilter())
-
-import litellm  # noqa: E402
-from litellm import exceptions as lle  # noqa: E402
-
-from movate.core.failures import (  # noqa: E402
+# Re-export so existing imports + tests continue to work. The actual
+# filter install happens at ``movate/__init__.py`` import time so the
+# filter is on the ``LiteLLM`` logger BEFORE any code path could
+# trigger ``import litellm`` (this module is one such path, but not
+# the only one).
+from movate import _LiteLLMBotocoreNoiseFilter  # noqa: F401
+from movate.core.failures import (
     AuthError,
     ContentFilterError,
     ContextLengthError,
@@ -67,8 +36,8 @@ from movate.core.failures import (  # noqa: E402
     RateLimitError,
     SchemaError,
 )
-from movate.core.models import TokenUsage  # noqa: E402
-from movate.providers.base import (  # noqa: E402
+from movate.core.models import TokenUsage
+from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
     CompletionResponse,
