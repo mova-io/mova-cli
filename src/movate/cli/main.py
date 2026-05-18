@@ -92,6 +92,7 @@ from movate.cli import (  # noqa: E402
     demo_cmd,
     diff_cmd,
     eval_gen_cmd,
+    eval_scorecard_cmd,
     fix_cmd,
     fmt_cmd,
     menu_cmd,
@@ -366,6 +367,10 @@ app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
 # Sibling (not subcommand) because restructuring `eval` to a Typer
 # sub-app would break ~30 test callsites. See eval_gen_cmd docstring.
 app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
+# `eval-scorecard` is the Phase 1 of the new eval flow: LLM-generated
+# test cases + 10-category scorecard. Sibling pattern like eval-gen.
+# Phase 3 will swap bare `mdk eval` to use this flow as the default.
+app.command("eval-scorecard", rich_help_panel=PANEL_RUN)(eval_scorecard_cmd.eval_scorecard)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /
