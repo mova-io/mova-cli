@@ -733,14 +733,34 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     # string — same one used for `Authorization: Bearer ...`.
     api_key = os.environ.get(target_cfg.key_env, "").strip()
     if not api_key:
-        error(
-            f"env var ${target_cfg.key_env} is empty. One-shot fix: "
-            f"`mdk auth refresh-runtime-key {target_name}` "
-            f"(mints + saves a fresh key inside the deployed Container "
-            f"App). Manual: `az containerapp exec ... mdk auth create-key "
-            f"...` then `mdk auth save-runtime-key {target_name} <key>`."
+        # Empty env var = same operator pain as a 401 from the
+        # runtime: there's a deployed environment + Azure addressing
+        # in the target config; we know how to mint a fresh key
+        # inside the pod. Run the same auto-recovery the 401 path
+        # uses, then continue with the freshly-minted bearer.
+        # Targets without Azure addressing OR with --no-auto-recover
+        # fall through to the original error message.
+        azure_addressable = bool(
+            target_cfg.azure_resource_group and target_cfg.azure_env
         )
-        raise typer.Exit(code=2)
+        if auto_recover and azure_addressable:
+            err.print(
+                f"  [yellow]⚠[/yellow] env var [bold]${target_cfg.key_env}[/bold] "
+                f"is empty — minting a fresh key inside "
+                f"[bold]{target_name}[/bold] (this takes ~10s)…"
+            )
+            new_key = _attempt_auto_recovery(target_name=target_name)
+            if new_key is not None:
+                api_key = new_key
+        if not api_key:
+            error(
+                f"env var ${target_cfg.key_env} is empty. One-shot fix: "
+                f"`mdk auth refresh-runtime-key {target_name}` "
+                f"(mints + saves a fresh key inside the deployed Container "
+                f"App). Or if `bootstrap-api-key` is already in Key Vault: "
+                f"`mdk auth pull-runtime-key {target_name} --keyvault <name>`."
+            )
+            raise typer.Exit(code=2)
 
     base_url = target_cfg.url.rstrip("/")
     headers = {"Authorization": f"Bearer {api_key}"}

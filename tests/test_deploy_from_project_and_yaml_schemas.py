@@ -28,6 +28,7 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli import deploy as deploy_mod
+from movate.cli.auth import RefreshRuntimeKeyError
 from movate.cli.deploy import _resolve_deploy_mode
 from movate.cli.main import app
 from movate.core.loader import AgentLoadError, load_agent
@@ -530,6 +531,109 @@ def test_preflight_200_proceeds_silently(
     # No yellow ⚠ banner from the preflight on the happy path.
     assert "preflight: saved bearer rejected" not in combined
     assert "ok=true" in combined
+
+
+# ---------------------------------------------------------------------------
+# A — Empty $MDK_<TARGET>_KEY: auto-recover the same way 401 does
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_empty_env_var_auto_recovers_then_completes_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the bearer env var is empty AND the target has Azure
+    addressing AND --no-auto-recover isn't set, deploy now mints a
+    fresh key inside the pod via the same `refresh_runtime_key_inline`
+    code path the 401 handler uses. After recovery the upload loop
+    runs to completion with the freshly-minted bearer."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.delenv("FAKE_KEY", raising=False)  # empty env var
+
+    refresh_calls = {"n": 0}
+
+    def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
+        refresh_calls["n"] += 1
+        return "mvt_live_fresh_keyid_secret", "FAKE_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+    # Preflight returns 200 so we don't double-recover.
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client",
+        _httpx_transport(lambda req: httpx.Response(200, json={"ok": True}))
+        if False
+        else _httpx_transport(
+            lambda req: httpx.Response(
+                201 if req.method == "POST" else 200, json={"ok": True}
+            )
+        ),
+    )
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+    assert refresh_calls["n"] == 1, "expected exactly one refresh call"
+    assert "is empty — minting a fresh key" in combined
+    assert "ok=true" in combined
+
+
+@pytest.mark.unit
+def test_empty_env_var_with_no_auto_recover_fails_with_helpful_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--no-auto-recover` opts out: empty env var stays an exit-2
+    error with the actionable recovery commands surfaced."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+
+    refresh_calls = {"n": 0}
+
+    def fake_refresh(*_a: Any, **_kw: Any) -> tuple[str, str]:
+        refresh_calls["n"] += 1
+        return "x", "FAKE_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+
+    result = runner.invoke(
+        app, ["deploy", "--target", "fake", "--no-auto-recover"], env={"COLUMNS": "200"}
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    assert refresh_calls["n"] == 0, "must not refresh under --no-auto-recover"
+    assert "$FAKE_KEY is empty" in combined
+    assert "refresh-runtime-key" in combined
+    assert "pull-runtime-key" in combined
+
+
+@pytest.mark.unit
+def test_empty_env_var_recovery_failure_falls_through_to_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If `az containerapp exec` is flaky (Legion 500s) and recovery
+    can't mint a key, the deploy must fall through to the original
+    actionable error — operators see the manual recovery commands
+    instead of a silent hang."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.delenv("FAKE_KEY", raising=False)
+
+    def fake_refresh_fails(*_a: Any, **_kw: Any) -> tuple[str, str]:
+        raise RefreshRuntimeKeyError("az containerapp exec returned 500")
+
+    monkeypatch.setattr(
+        "movate.cli.auth.refresh_runtime_key_inline", fake_refresh_fails
+    )
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    # Recovery was attempted (the user sees the yellow ⚠) before
+    # falling through to the actionable error.
+    assert "minting a fresh key" in combined
+    assert "$FAKE_KEY is empty" in combined
+    assert "refresh-runtime-key" in combined
 
 
 # ---------------------------------------------------------------------------
