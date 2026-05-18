@@ -27,6 +27,7 @@ import subprocess
 import sys
 
 import typer
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -155,22 +156,32 @@ def _db_row(status: WorkspaceStatus) -> tuple[str, str]:
 def _render_actions(actions: list, console_: Console = console) -> None:
     """Render the numbered action menu.
 
-    Two columns: the human label on the left, the literal command
-    on the right (dimmed). The dimmed-command column is the
-    *educational* part — operators learn the surface area without
-    having to mash Tab through ``mdk --help``.
+    Three columns inside a visible bordered panel: a prominent ``#``
+    number column (what the operator types at the prompt), a ``Step``
+    description, and the literal ``mdk`` ``Command`` (dimmed). The
+    bordered + header layout makes the number-to-row mapping
+    self-evident — operators don't have to guess that the prompt
+    expects the first column's value.
     """
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="bold cyan", no_wrap=True)
-    table.add_column()
-    table.add_column(style="dim", no_wrap=True)
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        box=box.SIMPLE_HEAVY,
+        padding=(0, 2),
+        expand=True,
+    )
+    # The Command column gets a long-JSON example for `mdk run …` —
+    # use overflow="ellipsis" so it truncates inside its column instead
+    # of crowding the "#" and "Step" columns out of the rendered width.
+    table.add_column("#", style="bold cyan", justify="right", no_wrap=True, width=4)
+    table.add_column("Step", style="white", ratio=2)
+    table.add_column("Command", style="dim cyan", overflow="ellipsis", no_wrap=True, ratio=3)
 
     for idx, action in enumerate(actions, start=1):
-        marker = f"[{idx}]"
         suffix = "  [yellow](needs input)[/yellow]" if action.needs_user_input else ""
-        table.add_row(marker, action.label + suffix, action.command)
+        table.add_row(f"[bold cyan]{idx}[/bold cyan]", action.label + suffix, action.command)
 
-    table.add_row("[bold cyan][q][/bold cyan]", "Quit", "[dim]exit menu[/dim]")
+    table.add_row("[bold cyan]q[/bold cyan]", "Quit", "[dim]exit menu[/dim]")
     console_.print()
     console_.print(table)
 

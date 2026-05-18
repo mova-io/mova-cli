@@ -340,3 +340,97 @@ def test_action_is_immutable() -> None:
     a = Action(label="x", command="y", argv=("y",))
     with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
         a.label = "z"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Action table rendering — visible numbers + headers + bordered layout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_menu_action_table_renders_column_headers(
+    project_with_agents: Path,
+) -> None:
+    """The action table renders ``#``, ``Step``, and ``Command`` as
+    visible column headers so operators understand the number-row
+    mapping at a glance (no need to guess that the first column
+    drives the prompt)."""
+    result = runner.invoke(
+        app, ["menu", "--dry-run", "--project-root", str(project_with_agents)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Header row content
+    assert "#" in result.stdout
+    assert "Step" in result.stdout
+    assert "Command" in result.stdout
+
+
+@pytest.mark.unit
+def test_menu_action_table_renders_plain_digit_numbers_not_brackets(
+    project_with_agents: Path,
+) -> None:
+    """The number column shows ``1``, ``2``, ``3`` as plain digits
+    (with the visible ``#`` header carrying the semantic). Previously
+    we used ``[1]`` brackets inline, which buried the number among
+    other punctuation. Pin the new layout."""
+    result = runner.invoke(
+        app, ["menu", "--dry-run", "--project-root", str(project_with_agents)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    # Plain digits + q row are present
+    assert " 1 " in result.stdout or " 1\n" in result.stdout or "  1 " in result.stdout
+    # The old `[1]` marker form must NOT regress
+    assert "[1]" not in result.stdout
+    assert "[q]" not in result.stdout
+
+
+@pytest.mark.unit
+def test_menu_action_table_renders_q_row_for_quit(
+    project_with_agents: Path,
+) -> None:
+    """A ``q``-row at the bottom is the only way an operator quits
+    without picking an action. Make sure it still surfaces in the
+    new table layout."""
+    result = runner.invoke(
+        app, ["menu", "--dry-run", "--project-root", str(project_with_agents)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    assert "Quit" in result.stdout
+    assert "exit menu" in result.stdout
+
+
+@pytest.mark.unit
+def test_menu_action_table_does_not_drop_number_column_for_long_commands(
+    tmp_path: Path,
+) -> None:
+    """A long ``mdk run`` command (with embedded JSON) used to crowd
+    the ``#`` and ``Step`` columns out of the rendered width — Rich
+    would silently drop them to fit. The new table caps the Command
+    column with overflow=ellipsis so the number is always visible."""
+    # Scaffold a project + add an agent so the Run action surfaces
+    # with its full dataset-derived command.
+    (tmp_path / "project.yaml").write_text("api_version: movate/v1\nname: demo\n")
+    agents = tmp_path / "agents" / "rag-qa"
+    (agents / "evals").mkdir(parents=True)
+    (agents / "agent.yaml").write_text("name: rag-qa\n")
+    (agents / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"question": "x" * 500}, "expected": {}}\n'
+    )
+
+    result = runner.invoke(
+        app, ["menu", "--dry-run", "--project-root", str(tmp_path)],
+        env={"COLUMNS": "80"},  # narrow terminal — the failure mode
+    )
+    assert result.exit_code == 0
+    # Header row must still render under 80 cols (regression guard).
+    assert "#" in result.stdout
+    assert "Step" in result.stdout
+    # And the digit column must still surface — pick any of 1/2/3 since
+    # the exact action ordering depends on workspace state.
+    has_digit = any(
+        f" {d} " in result.stdout or f"  {d} " in result.stdout for d in "12345"
+    )
+    assert has_digit, "no digit visible in the # column — Rich likely dropped it"
