@@ -18,6 +18,7 @@ B. **YAML shorthand schemas** — extend the existing
 
 from __future__ import annotations
 
+import io
 import json
 import textwrap
 from pathlib import Path
@@ -25,6 +26,7 @@ from typing import Any
 
 import httpx
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from movate.cli import deploy as deploy_mod
@@ -641,6 +643,260 @@ def test_empty_env_var_recovery_failure_falls_through_to_error(
     assert "Minting fresh bearer key" in combined
     assert "$FAKE_KEY is empty" in combined
     assert "refresh-runtime-key" in combined
+
+
+# ---------------------------------------------------------------------------
+# A — post-deploy "Next: run inference" block
+# ---------------------------------------------------------------------------
+
+
+def _capture_post_deploy_block(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target_name: str,
+    uploaded: list[str],
+    project_root: Path,
+) -> str:
+    """Call ``_render_post_deploy_next_steps`` with a Rich console pinned
+    to a StringIO so the test can read what the operator would have
+    seen on stderr. Avoids spinning up the full deploy machinery just
+    to exercise the rendering branch."""
+    buf = io.StringIO()
+    monkeypatch.setattr(deploy_mod, "err", Console(file=buf, force_terminal=False))
+    deploy_mod._render_post_deploy_next_steps(
+        target_name=target_name,
+        uploaded=uploaded,
+        project_root=project_root,
+    )
+    return buf.getvalue()
+
+
+@pytest.mark.unit
+def test_post_deploy_block_renders_header_and_submit_example_for_first_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Picks the first uploaded agent alphabetically and emits a
+    ``mdk submit <agent> '<input>' --target <target> --wait`` example
+    so the operator has a one-liner to copy."""
+    (tmp_path / "agents" / "zebra").mkdir(parents=True)
+    (tmp_path / "agents" / "alpha").mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["zebra", "alpha"],
+        project_root=tmp_path,
+    )
+
+    assert "Next: run inference against the deployed runtime" in out
+    assert "mdk submit alpha" in out
+    assert "--target dev --wait" in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_uses_dataset_first_row_input_when_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the agent has an ``evals/dataset.jsonl`` with a row that
+    has an ``input`` object, the submit example uses that JSON. This
+    makes the copy-paste actually work against the operator's schema
+    instead of forcing them to look it up."""
+    agent = tmp_path / "agents" / "alpha"
+    (agent / "evals").mkdir(parents=True)
+    (agent / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"question": "What is our refund window?"}, "expected": {"answer": "30 days"}}\n'
+        '{"input": {"question": "second row"}, "expected": {}}\n'
+    )
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+    )
+
+    assert '{"question": "What is our refund window?"}' in out
+    # The fallback shouldn't appear when a real input is available.
+    assert '{"text":"..."}' not in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_falls_back_when_no_dataset_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No dataset.jsonl, no problem — fall back to a generic
+    ``{"text":"..."}`` placeholder so the block still renders. The
+    operator at least sees the shape of the command."""
+    (tmp_path / "agents" / "alpha").mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+    )
+
+    assert '{"text":"..."}' in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_falls_back_when_dataset_first_row_has_no_input_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed first row (missing ``input``, non-dict ``input``,
+    invalid JSON) shouldn't crash the block — fall back to the
+    placeholder rather than printing garbage."""
+    agent = tmp_path / "agents" / "alpha"
+    (agent / "evals").mkdir(parents=True)
+    (agent / "evals" / "dataset.jsonl").write_text(
+        '{"expected": {"answer": "no input field"}}\n'
+    )
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+    )
+
+    assert '{"text":"..."}' in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_tolerates_invalid_jsonl_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defense in depth: a JSON parse error on the first row falls
+    through silently. We don't want a corrupt dataset.jsonl to wedge
+    the post-deploy summary."""
+    agent = tmp_path / "agents" / "alpha"
+    (agent / "evals").mkdir(parents=True)
+    (agent / "evals" / "dataset.jsonl").write_text("not json at all\n")
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+    )
+
+    assert '{"text":"..."}' in out
+    assert "mdk submit alpha" in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_lists_other_agents_when_multiple_uploaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multi-agent deploys get a ``other agents: …`` line so the
+    operator knows the remaining names without having to scroll back
+    through the upload log."""
+    for name in ["alpha", "beta", "gamma"]:
+        (tmp_path / "agents" / name).mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["beta", "alpha", "gamma"],
+        project_root=tmp_path,
+    )
+
+    assert "mdk submit alpha" in out  # first alphabetically
+    assert "other agents: beta, gamma" in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_omits_other_agents_line_for_single_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-agent deploys skip the ``other agents:`` line entirely —
+    don't print a noisy empty list."""
+    (tmp_path / "agents" / "solo").mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["solo"],
+        project_root=tmp_path,
+    )
+
+    assert "other agents:" not in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_includes_jobs_list_and_show_hints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two ``mdk jobs`` verbs that complete the inference loop —
+    ``jobs list`` (browse) + ``jobs show`` (inspect one run) — must
+    both appear so operators can follow up without grepping docs."""
+    (tmp_path / "agents" / "alpha").mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="prod",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+    )
+
+    assert "mdk jobs list --target prod" in out
+    assert "mdk jobs show <id> --target prod" in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_renders_on_successful_e2e_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a happy-path deploy (preflight 200 + upload 201)
+    surfaces the post-deploy block. Verifies the orchestrator wires
+    the rendering call into the success branch."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_works_keyid_secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents" and request.method == "GET":
+            return httpx.Response(200, json={"agents": []})
+        return httpx.Response(201, json={"ok": True})
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
+    )
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+    assert "Next: run inference against the deployed runtime" in combined
+    assert "mdk submit faq" in combined
+    assert "--target fake --wait" in combined
+    assert "mdk jobs list --target fake" in combined
+
+
+@pytest.mark.unit
+def test_post_deploy_block_suppressed_on_failed_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the upload loop fails (e.g. a 5xx from the runtime), the
+    operator has nothing to invoke — don't render a misleading
+    'Next: run inference' block on top of an error summary."""
+    _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_KEY", "mvt_live_works_keyid_secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents" and request.method == "GET":
+            return httpx.Response(200, json={"agents": []})
+        # All POSTs fail.
+        return httpx.Response(500, json={"detail": "upload failed"})
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
+    )
+
+    result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
+
+    combined = result.stdout + result.stderr
+    assert result.exit_code != 0
+    assert "Next: run inference against the deployed runtime" not in combined
 
 
 # ---------------------------------------------------------------------------
