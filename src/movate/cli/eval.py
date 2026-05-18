@@ -18,7 +18,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from movate.cli._completion import complete_agent_path
@@ -601,16 +601,12 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
         return None
     chosen_agent = agent_choices[int(agent_idx) - 1]
 
-    # Q2: Mock or real provider?
-    console.print()
-    try:
-        use_mock = Confirm.ask(
-            "[bold]Use mock provider?[/bold] [dim](deterministic, free; no API keys "
-            "needed — recommended for CI / iteration)[/dim]",
-            default=True,
-        )
-    except (KeyboardInterrupt, EOFError):
-        return None
+    # Mock vs real provider: previously a wizard question, but operators
+    # running `mdk eval` interactively almost always want real models
+    # (mocks are a CI / hermetic-testing concern, surfaced via the
+    # `--mock` CLI flag). Defaulting to real-provider drops one prompt
+    # without losing functionality.
+    use_mock = False
 
     # Q3: Gate threshold.
     gate_choices = {
@@ -821,6 +817,9 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
         # Run eval; capture pass/fail from the same async path that the
         # single-agent `mdk eval` uses. Re-raises typer.Exit on gate
         # failure — catch and record per-agent rather than aborting.
+        # ``compact=True`` skips the per-agent verbose tables (head,
+        # cases, dimensional, objectives, diff) — we only want the
+        # one-line greppable summary per agent + the final rollup.
         try:
             asyncio.run(
                 _run_eval(
@@ -842,6 +841,7 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
                     gate_latency=gate_latency,
                     gate_context_compliance=gate_context_compliance,
                     gate_refusal=gate_refusal,
+                    compact=True,
                 )
             )
             rows.append((agent_dir.name, "[green]✓ ok[/green]"))
@@ -1096,6 +1096,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
     judge_override: JudgeConfig | None = None,
+    compact: bool = False,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     # Dataset-aware mock (PR #104): when running --mock, configure
@@ -1205,6 +1206,23 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
         )
     elif output_format == Report.MARKDOWN:
         print(render_eval_markdown(summary, gate=effective_gate))
+    elif compact:
+        # Compact mode (used by ``mdk eval --all`` for per-agent runs).
+        # The per-agent verbose tables (head + cases + dimensional +
+        # objectives + diff) used to flood the terminal — N agents
+        # produced N full tables before the rollup summary. Now each
+        # per-agent run is silent at the table layer; only the
+        # greppable summary line emits so CI grep + the orchestrator's
+        # rollup row both still work.
+        _print_eval_summary_line(
+            summary,
+            record=record,
+            gate=effective_gate,
+            cases_passing=cases_passing,
+            overall_pass=overall_pass,
+            diff=diff,
+            regression_tolerance=regression_tolerance,
+        )
     else:
         # Eye-catching banner BEFORE the table — operators scrolling
         # through CI logs see PASS/FAIL at a glance without parsing

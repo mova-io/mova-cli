@@ -65,6 +65,39 @@ class TestEvalAllSweepsProject:
         combined = result.stdout + result.stderr
         assert "not inside a movate project" in combined.lower()
 
+    def test_eval_all_suppresses_per_agent_verbose_tables(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``mdk eval --all`` used to print a full per-agent verbose
+        block (PASS/FAIL banner, head table, cases table, dimensional
+        breakdown, objectives) BEFORE the project rollup — for N agents,
+        N full panels of noise. Now per-agent runs use ``compact=True``:
+        only the greppable ``mdk_eval_summary:`` line per agent + the
+        final ``Project eval`` rollup table.
+
+        Pin the regression so a future edit can't accidentally restore
+        the per-agent table flood."""
+        _bootstrap_with_agent(tmp_path, monkeypatch, "faq")
+        result = runner.invoke(
+            app,
+            ["eval", "--all", "--mock", "--gate", "0.0"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # Per-agent greppable summary fires (compact-mode keeps this).
+        assert "mdk_eval_summary: agent=faq" in result.stdout
+        # The final rollup table renders (always).
+        assert "Project eval" in result.stdout
+        # The per-agent "eval results" head-table title that used to
+        # flood the terminal in --all mode must NOT appear.
+        assert "faq v" not in result.stdout, (
+            "per-agent verbose head table leaked through compact mode"
+        )
+        assert "Eval PASSED" not in result.stdout and "Eval FAILED" not in result.stdout, (
+            "per-agent PASS/FAIL banner leaked through compact mode "
+            "(should only appear for single-agent `mdk eval <name>`)"
+        )
+
     def test_eval_all_empty_project_warns_not_errors(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

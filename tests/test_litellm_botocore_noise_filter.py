@@ -182,3 +182,20 @@ def test_mdk_version_subprocess_emits_no_botocore_warnings() -> None:
     combined = result.stdout + result.stderr
     assert "bedrock-runtime response stream shape" not in combined
     assert "sagemaker-runtime response stream shape" not in combined
+
+
+@pytest.mark.unit
+def test_litellm_logger_level_is_warning_after_package_import() -> None:
+    """The per-completion ``LiteLLM:INFO: utils.py:4053 - LiteLLM
+    completion() model=…`` lines flood stderr during ``mdk eval`` /
+    ``mdk run`` and get interleaved with the progress bar repaint,
+    making the output unreadable. ``movate/__init__.py`` raises the
+    ``LiteLLM`` logger threshold to WARNING so those INFO records are
+    dropped at the logger level (still cheap: no formatter runs).
+
+    Regression guard: verify the level is WARNING (30) after import."""
+    assert logging.getLogger("LiteLLM").level == logging.WARNING, (
+        "movate package import must raise LiteLLM logger to WARNING "
+        "to keep per-completion INFO logs from corrupting the eval "
+        "progress bar"
+    )
