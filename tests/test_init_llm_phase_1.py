@@ -35,8 +35,12 @@ runner = CliRunner(mix_stderr=False)
 def test_llm_flag_appears_in_help() -> None:
     """The --llm option must surface in `mdk init --help` so operators
     can discover it. Phase 2 will keep the help text; Phase 1 just
-    locks in that it's present."""
-    result = runner.invoke(app, ["init", "--help"])
+    locks in that it's present.
+
+    Pinning COLUMNS=200 so Rich doesn't line-wrap the flag name in
+    CI's narrow default terminal — without it, ``--llm`` can end up
+    split across two output lines and the substring assertion fails."""
+    result = runner.invoke(app, ["init", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     assert "--llm" in result.stdout
     assert "--llm-model" in result.stdout
