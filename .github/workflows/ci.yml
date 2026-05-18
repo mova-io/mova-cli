@@ -136,3 +136,49 @@ jobs:
         # `bicep lint` runs the linter ruleset (no-unused-params,
         # secure-secrets-in-params, etc.) and fails on errors.
         run: bicep lint infra/azure/main.bicep
+
+  # Auto-bump the patch component of the version on every push to main.
+  # Lets operators tell at a glance whether `mdk --version` reflects
+  # the latest merged code — a stale install shows an older patch
+  # number than the README/GitHub release tag. The `[skip ci]` marker
+  # in the commit message prevents this job from triggering itself
+  # into an infinite loop on its own push.
+  auto-version-bump:
+    needs: [lint-and-test]
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && !contains(github.event.head_commit.message, '[skip ci]')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 + persist-credentials: true so we can push
+          # back to the same branch we checked out.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bump patch version
+        id: bump
+        run: |
+          new_version=$(python scripts/bump_version.py)
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml src/movate/__init__.py
+          # Pull any commits that landed during the lint-and-test run
+          # (rare but possible when two PRs merge close in time) so
+          # the push isn't rejected as non-fast-forward.
+          git pull --rebase origin main
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
+          git push origin HEAD:main
