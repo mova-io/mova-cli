@@ -194,14 +194,22 @@ jobs:
           git commit -m "chore: bump version to ${new_version} [skip ci]"
           git push origin "$branch"
 
+          # IMPORTANT: don't write the literal "[ skip ci ]" string
+          # (without the spaces) in the body — GitHub Actions scans the
+          # ENTIRE commit message (title + body) of the squash-merge
+          # commit for that marker. Repeating it in explanatory text
+          # would cause the merge commit to silently skip CI, which
+          # would also skip this workflow on the next push to main and
+          # break the auto-bump chain. The title carries the marker;
+          # the body must not.
           pr_url=$(gh pr create \
             --base main --head "$branch" \
             --title "chore: bump version to ${new_version} [skip ci]" \
             --body "Automated patch bump after \`${parent_sha} ${parent_subject}\`.
 
-          The \`[skip ci]\` marker in the title prevents the squash-merge
-          commit (whose message becomes the title) from re-triggering
-          this workflow.")
+          The CI-skip marker is intentionally only in the title — see
+          the workflow comments in \`.github/workflows/ci.yml\` for why
+          the body must not repeat it.")
           echo "Opened: $pr_url"
 
           # Try auto-merge first (queues until any required checks pass).
