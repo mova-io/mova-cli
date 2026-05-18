@@ -102,7 +102,7 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
     for ns in spec.nodes:
         if not isinstance(ns, IntentRouterNodeSpec):
             continue
-        all_targets = list(ns.routes.values()) + [ns.fallback]
+        all_targets = [*ns.routes.values(), ns.fallback]
         for target in all_targets:
             if target not in nodes:
                 raise WorkflowCompileError(
@@ -140,7 +140,7 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
     for ns in spec.nodes:
         if not isinstance(ns, IntentRouterNodeSpec):
             continue
-        all_targets = list(ns.routes.values()) + [ns.fallback]
+        all_targets = [*ns.routes.values(), ns.fallback]
         for target in all_targets:
             pair = (ns.id, target)
             if pair in seen_router_edges:

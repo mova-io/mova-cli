@@ -48,9 +48,7 @@ def _isolate_credentials(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _FakeCompleted:
-    def __init__(
-        self, returncode: int = 0, stdout: str = "", stderr: str = ""
-    ) -> None:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
@@ -83,9 +81,7 @@ def _patch_az(
                     stdout="https://example.vault.azure.net/secrets/bootstrap-api-key/abc\n",
                     stderr="",
                 )
-            return _FakeCompleted(
-                returncode=1, stdout="", stderr="SecretNotFound"
-            )
+            return _FakeCompleted(returncode=1, stdout="", stderr="SecretNotFound")
         # Upload: `az keyvault secret set ... --name bootstrap-api-key --value <key>`
         if cmd[:4] == ["az", "keyvault", "secret", "set"]:
             return _FakeCompleted(returncode=secret_set_rc, stderr=secret_set_stderr)
@@ -94,9 +90,7 @@ def _patch_az(
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(
         "shutil.which",
-        lambda cmd: "/usr/local/bin/az"
-        if (az_on_path and cmd == "az")
-        else None,
+        lambda cmd: "/usr/local/bin/az" if (az_on_path and cmd == "az") else None,
     )
     return captures
 

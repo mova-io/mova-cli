@@ -44,9 +44,7 @@ def _isolate_credentials(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _FakeCompleted:
-    def __init__(
-        self, returncode: int = 0, stdout: str = "", stderr: str = ""
-    ) -> None:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr

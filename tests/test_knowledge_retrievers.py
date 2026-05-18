@@ -88,9 +88,7 @@ class TestInMemoryCorpus:
         assert len(c) == 3
         assert c.entries[0]["id"] == "KB-001"
 
-    def test_missing_file_raises_with_path_in_message(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_file_raises_with_path_in_message(self, tmp_path: Path) -> None:
         with pytest.raises(KnowledgeStoreError, match="not found"):
             InMemoryCorpus.from_path(tmp_path / "nope.json")
 
@@ -158,17 +156,13 @@ class TestBM25Retriever:
                 "tags": ["performance"],
             },
         ]
-        r = BM25Retriever(
-            InMemoryCorpus(entries=docs), body_fields=["title", "body"]
-        )
+        r = BM25Retriever(InMemoryCorpus(entries=docs), body_fields=["title", "body"])
         hits = r.query("performance", top_k=2)
         assert hits[0].doc_id == "B"
         assert hits[0].score > (hits[1].score if len(hits) > 1 else 0)
 
     def test_empty_query_returns_no_hits(self) -> None:
-        r = BM25Retriever(
-            InMemoryCorpus(entries=_DOCS), body_fields=["title", "body"]
-        )
+        r = BM25Retriever(InMemoryCorpus(entries=_DOCS), body_fields=["title", "body"])
         assert r.query("", top_k=5) == []
         assert r.query("   ", top_k=5) == []
 
@@ -196,9 +190,7 @@ class TestBM25Retriever:
             {"title": "first", "body": "alpha beta"},
             {"title": "second", "body": "gamma delta"},
         ]
-        r = BM25Retriever(
-            InMemoryCorpus(entries=docs), body_fields=["title", "body"]
-        )
+        r = BM25Retriever(InMemoryCorpus(entries=docs), body_fields=["title", "body"])
         hits = r.query("alpha", top_k=1)
         assert hits[0].doc_id == "0"
 
@@ -221,9 +213,7 @@ class TestSubstringRetriever:
         assert hits[0].score >= 1
 
     def test_empty_query_returns_no_hits(self) -> None:
-        r = SubstringRetriever(
-            InMemoryCorpus(entries=_DOCS), body_fields=["title", "body"]
-        )
+        r = SubstringRetriever(InMemoryCorpus(entries=_DOCS), body_fields=["title", "body"])
         assert r.query("", top_k=5) == []
 
 
@@ -246,9 +236,7 @@ class TestKnowledgeConfig:
         assert cfg.id_field == "id"
 
     def test_empty_body_fields_rejected(self) -> None:
-        with pytest.raises(
-            ValueError, match="body_fields must contain at least one"
-        ):
+        with pytest.raises(ValueError, match="body_fields must contain at least one"):
             KnowledgeConfig(corpus="./kb/corpus.json", body_fields=[])
 
     def test_top_k_outside_1_to_50_rejected(self) -> None:
@@ -261,9 +249,7 @@ class TestKnowledgeConfig:
         """``extra='forbid'`` so typos in the YAML surface as clean
         errors instead of silently being ignored."""
         with pytest.raises(ValueError):
-            KnowledgeConfig.model_validate(
-                {"corpus": "./kb/corpus.json", "bogus": True}
-            )
+            KnowledgeConfig.model_validate({"corpus": "./kb/corpus.json", "bogus": True})
 
 
 @pytest.mark.unit
@@ -289,9 +275,7 @@ class TestLoadKnowledgeConfig:
         YAML; the strict ``extra='forbid'`` model would reject them
         unless the loader strips them first."""
         p = tmp_path / "k.yaml"
-        p.write_text(
-            "api_version: movate/v1\nkind: Knowledge\ncorpus: ./x.json\n"
-        )
+        p.write_text("api_version: movate/v1\nkind: Knowledge\ncorpus: ./x.json\n")
         cfg = load_knowledge_config(p)
         assert cfg.corpus == "./x.json"
 
@@ -326,9 +310,7 @@ class TestBuildRetriever:
         hits = r.query("billing duplicate charge", top_k=1)
         assert hits[0].doc_id == "KB-003"
 
-    def test_substring_kind_returns_substring_retriever(
-        self, tmp_path: Path
-    ) -> None:
+    def test_substring_kind_returns_substring_retriever(self, tmp_path: Path) -> None:
         corpus_path = _write_corpus(tmp_path, _DOCS)
         cfg = KnowledgeConfig(
             corpus=str(corpus_path),
@@ -338,9 +320,7 @@ class TestBuildRetriever:
         r = build_retriever(cfg)
         assert isinstance(r, SubstringRetriever)
 
-    def test_relative_corpus_resolved_against_base_dir(
-        self, tmp_path: Path
-    ) -> None:
+    def test_relative_corpus_resolved_against_base_dir(self, tmp_path: Path) -> None:
         """When ``base_dir`` is given, a relative corpus path is
         resolved against it (typical: the agent directory holding
         knowledge.yaml)."""
@@ -354,9 +334,7 @@ class TestBuildRetriever:
         hits = r.query("login", top_k=1)
         assert hits[0].doc_id == "KB-001"
 
-    def test_missing_corpus_surfaces_as_load_error(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_corpus_surfaces_as_load_error(self, tmp_path: Path) -> None:
         cfg = KnowledgeConfig(corpus=str(tmp_path / "missing.json"))
         with pytest.raises(KnowledgeLoadError, match="not found"):
             build_retriever(cfg)
@@ -367,9 +345,7 @@ class TestBuildRetriever:
 # ---------------------------------------------------------------------------
 
 
-def _scaffold_project_with_corpus(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Path:
+def _scaffold_project_with_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Init a project + drop the canonical kb-lookup corpus at
     ``kb/kb-lookup-corpus.json`` so the bare ``mdk knowledge query``
     invocation hits the default path."""

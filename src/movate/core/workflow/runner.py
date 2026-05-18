@@ -143,9 +143,7 @@ class WorkflowRunner:
 
         while current_id is not None:
             if current_id in visited:
-                raise WorkflowRunError(
-                    f"cycle detected at node {current_id!r} during execution"
-                )
+                raise WorkflowRunError(f"cycle detected at node {current_id!r} during execution")
             visited.add(current_id)
 
             node = graph.nodes[current_id]

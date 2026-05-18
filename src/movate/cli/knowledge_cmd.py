@@ -735,9 +735,7 @@ def knowledge_query(
         kind = KnowledgeRetrieverKind(retriever)
     except ValueError:
         valid = ", ".join(k.value for k in KnowledgeRetrieverKind)
-        err.print(
-            f"[red]✗[/red] --retriever must be one of {valid}; got {retriever!r}"
-        )
+        err.print(f"[red]✗[/red] --retriever must be one of {valid}; got {retriever!r}")
         raise typer.Exit(code=2) from None
 
     if kind == KnowledgeRetrieverKind.BM25:
@@ -752,10 +750,7 @@ def knowledge_query(
 
         out.print(
             _json.dumps(
-                [
-                    {"doc_id": h.doc_id, "score": h.score, "entry": h.entry}
-                    for h in hits
-                ],
+                [{"doc_id": h.doc_id, "score": h.score, "entry": h.entry} for h in hits],
                 indent=2,
             ),
             highlight=False,
@@ -786,11 +781,7 @@ def knowledge_query(
         if len(title) > max_title_preview:
             title = title[: max_title_preview - 1] + "…"
         tags_raw = h.entry.get("tags", [])
-        tags = (
-            ", ".join(str(t) for t in tags_raw)
-            if isinstance(tags_raw, list)
-            else str(tags_raw)
-        )
+        tags = ", ".join(str(t) for t in tags_raw) if isinstance(tags_raw, list) else str(tags_raw)
         table.add_row(str(rank), h.doc_id, f"{h.score:.3f}", title, tags)
 
     out.print(table)

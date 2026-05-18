@@ -86,9 +86,7 @@ def test_template_ships_bundled_skill(
     """
     template_dir = get_template_path(template)
     skill_dir = template_dir / "skills" / expected_skill
-    assert skill_dir.is_dir(), (
-        f"{template}: missing bundled skill dir skills/{expected_skill}/"
-    )
+    assert skill_dir.is_dir(), f"{template}: missing bundled skill dir skills/{expected_skill}/"
     for required_file in expected_skill_files:
         assert (skill_dir / required_file).is_file(), (
             f"{template}: bundled skill missing {required_file}"
@@ -151,9 +149,7 @@ def test_calc_agent_skill_yaml_is_python_kind() -> None:
     data = yaml.safe_load(skill_yaml.read_text())
     assert data["implementation"]["kind"] == "python"
     # Entry must point to a Python callable.
-    assert ":" in data["implementation"]["entry"], (
-        "Python skill entry must be 'module:func' format"
-    )
+    assert ":" in data["implementation"]["entry"], "Python skill entry must be 'module:func' format"
 
 
 @pytest.mark.unit
@@ -163,9 +159,7 @@ def test_lookup_agent_skill_yaml_is_http_kind() -> None:
     data = yaml.safe_load(skill_yaml.read_text())
     assert data["implementation"]["kind"] == "http"
     entry = data["implementation"]["entry"]
-    assert entry.startswith("http"), (
-        f"HTTP skill entry must be a URL, got: {entry!r}"
-    )
+    assert entry.startswith("http"), f"HTTP skill entry must be a URL, got: {entry!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -259,9 +253,7 @@ class TestMdkAddCalcAgent:
 
         # Calculator skill is in the project-level skills/ dir.
         calc_skill = project / "skills" / "calculator"
-        assert calc_skill.is_dir(), (
-            "calculator skill not relocated to project/skills/calculator/"
-        )
+        assert calc_skill.is_dir(), "calculator skill not relocated to project/skills/calculator/"
         assert (calc_skill / "skill.yaml").is_file()
         assert (calc_skill / "impl.py").is_file()
 
@@ -322,9 +314,7 @@ class TestMdkAddLookupAgent:
 
         # HTTP skill is in the project-level skills/ dir.
         skill_dir = project / "skills" / "user-lookup"
-        assert skill_dir.is_dir(), (
-            "user-lookup skill not relocated to project/skills/user-lookup/"
-        )
+        assert skill_dir.is_dir(), "user-lookup skill not relocated to project/skills/user-lookup/"
         assert (skill_dir / "skill.yaml").is_file()
 
         # skill.yaml must declare kind: http.

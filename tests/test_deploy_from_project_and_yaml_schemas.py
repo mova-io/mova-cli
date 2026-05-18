@@ -268,9 +268,7 @@ def _stub_preflight_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     tests focused on the upload-loop logic without dragging real
     HTTP into the harness.
     """
-    monkeypatch.setattr(
-        deploy_mod, "_preflight_bearer", lambda *, headers, **_: headers
-    )
+    monkeypatch.setattr(deploy_mod, "_preflight_bearer", lambda *, headers, **_: headers)
 
 
 @pytest.mark.unit
@@ -404,9 +402,7 @@ def test_preflight_401_with_auto_recovery_silently_refreshes_then_succeeds(
         # Skill and agent POSTs.
         return httpx.Response(201, json={"ok": True})
 
-    monkeypatch.setattr(
-        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
-    )
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(handler))
 
     def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
         seen["refresh_calls"] += 1
@@ -448,9 +444,7 @@ def test_preflight_401_with_no_auto_recover_fails_fast_without_uploading(
         seen["upload_calls"] += 1
         return httpx.Response(201, json={"ok": True})
 
-    monkeypatch.setattr(
-        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
-    )
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(handler))
 
     result = runner.invoke(
         app, ["deploy", "--target", "fake", "--no-auto-recover"], env={"COLUMNS": "200"}
@@ -483,9 +477,7 @@ def test_preflight_500_surfaces_runtime_error_without_attempting_recovery(
             return httpx.Response(500, json={"detail": "storage down"})
         return httpx.Response(201, json={"ok": True})
 
-    monkeypatch.setattr(
-        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
-    )
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(handler))
 
     def fake_refresh(*_a: Any, **_kw: Any) -> tuple[str, str]:
         refresh_calls["n"] += 1
@@ -503,9 +495,7 @@ def test_preflight_500_surfaces_runtime_error_without_attempting_recovery(
 
 
 @pytest.mark.unit
-def test_preflight_200_proceeds_silently(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_preflight_200_proceeds_silently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Happy path: preflight returns 200, no warning printed, upload
     loop runs against the original bearer unchanged."""
 
@@ -523,9 +513,7 @@ def test_preflight_200_proceeds_silently(
             return httpx.Response(201, json={"ok": True})
         return httpx.Response(201, json={"ok": True})
 
-    monkeypatch.setattr(
-        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
-    )
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(handler))
 
     result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
 
@@ -568,9 +556,7 @@ def test_empty_env_var_auto_recovers_then_completes_deploy(
         _httpx_transport(lambda req: httpx.Response(200, json={"ok": True}))
         if False
         else _httpx_transport(
-            lambda req: httpx.Response(
-                201 if req.method == "POST" else 200, json={"ok": True}
-            )
+            lambda req: httpx.Response(201 if req.method == "POST" else 200, json={"ok": True})
         ),
     )
 
@@ -629,9 +615,7 @@ def test_empty_env_var_recovery_failure_falls_through_to_error(
     def fake_refresh_fails(*_a: Any, **_kw: Any) -> tuple[str, str]:
         raise RefreshRuntimeKeyError("az containerapp exec returned 500")
 
-    monkeypatch.setattr(
-        "movate.cli.auth.refresh_runtime_key_inline", fake_refresh_fails
-    )
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh_fails)
 
     result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
 
@@ -748,9 +732,7 @@ def test_post_deploy_block_falls_back_when_dataset_first_row_has_no_input_key(
     placeholder rather than printing garbage."""
     agent = tmp_path / "agents" / "alpha"
     (agent / "evals").mkdir(parents=True)
-    (agent / "evals" / "dataset.jsonl").write_text(
-        '{"expected": {"answer": "no input field"}}\n'
-    )
+    (agent / "evals" / "dataset.jsonl").write_text('{"expected": {"answer": "no input field"}}\n')
 
     out = _capture_post_deploy_block(
         monkeypatch,
@@ -858,9 +840,7 @@ def test_post_deploy_block_renders_on_successful_e2e_deploy(
             return httpx.Response(200, json={"agents": []})
         return httpx.Response(201, json={"ok": True})
 
-    monkeypatch.setattr(
-        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
-    )
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(handler))
 
     result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
 
@@ -888,9 +868,7 @@ def test_post_deploy_block_suppressed_on_failed_deploy(
         # All POSTs fail.
         return httpx.Response(500, json={"detail": "upload failed"})
 
-    monkeypatch.setattr(
-        "movate.cli.deploy.httpx.Client", _httpx_transport(handler)
-    )
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(handler))
 
     result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
 

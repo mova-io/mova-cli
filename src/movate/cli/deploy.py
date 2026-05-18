@@ -740,13 +740,10 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
         # uses, then continue with the freshly-minted bearer.
         # Targets without Azure addressing OR with --no-auto-recover
         # fall through to the original error message.
-        azure_addressable = bool(
-            target_cfg.azure_resource_group and target_cfg.azure_env
-        )
+        azure_addressable = bool(target_cfg.azure_resource_group and target_cfg.azure_env)
         if auto_recover and azure_addressable:
             err.print(
-                f"  [dim]Minting fresh bearer key for "
-                f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
+                f"  [dim]Minting fresh bearer key for [bold]{target_name}[/bold] (~10 sec.)…[/dim]"
             )
             new_key = _attempt_auto_recovery(target_name=target_name)
             if new_key is not None:
@@ -811,13 +808,10 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             # Only viable when the target has Azure addressing — for
             # custom remotes / BYO Container Apps, fall through to the
             # descriptive message.
-            had_unauthorized = (
-                any(r == _REASON_UNAUTHORIZED for _, r in skill_failed)
-                or any(r == _REASON_UNAUTHORIZED for _, r in failed)
+            had_unauthorized = any(r == _REASON_UNAUTHORIZED for _, r in skill_failed) or any(
+                r == _REASON_UNAUTHORIZED for _, r in failed
             )
-            azure_addressable = bool(
-                target_cfg.azure_resource_group and target_cfg.azure_env
-            )
+            azure_addressable = bool(target_cfg.azure_resource_group and target_cfg.azure_env)
             if had_unauthorized and auto_recover and azure_addressable:
                 err.print(
                     f"  [dim]Minting fresh bearer key for "
@@ -955,12 +949,10 @@ def _render_post_deploy_next_steps(
         others = ", ".join(sorted(uploaded)[1:])
         err.print(f"  [dim]other agents: {others}[/dim]")
     err.print(
-        f"  [dim]mdk jobs list --target {target_name}[/dim]"
-        f"           [dim]# recent jobs[/dim]"
+        f"  [dim]mdk jobs list --target {target_name}[/dim]           [dim]# recent jobs[/dim]"
     )
     err.print(
-        f"  [dim]mdk jobs show <id> --target {target_name}[/dim]"
-        f"       [dim]# inspect one run[/dim]"
+        f"  [dim]mdk jobs show <id> --target {target_name}[/dim]       [dim]# inspect one run[/dim]"
     )
     err.print()
 
@@ -1077,13 +1069,10 @@ def _preflight_bearer(
         return headers
 
     if resp.status_code == _HTTP_UNAUTHORIZED:
-        azure_addressable = bool(
-            target_cfg.azure_resource_group and target_cfg.azure_env
-        )
+        azure_addressable = bool(target_cfg.azure_resource_group and target_cfg.azure_env)
         if auto_recover and azure_addressable:
             err.print(
-                f"  [dim]Minting fresh bearer key for "
-                f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
+                f"  [dim]Minting fresh bearer key for [bold]{target_name}[/bold] (~10 sec.)…[/dim]"
             )
             new_key = _attempt_auto_recovery(target_name=target_name)
             if new_key is not None:
@@ -1129,9 +1118,7 @@ def _attempt_auto_recovery(*, target_name: str) -> str | None:
             "manually to debug."
         )
         return None
-    err.print(
-        f"  [green]✓[/green] bearer key ready (saved as [cyan]{env_var}[/cyan])."
-    )
+    err.print(f"  [green]✓[/green] bearer key ready (saved as [cyan]{env_var}[/cyan]).")
     return new_key
 
 

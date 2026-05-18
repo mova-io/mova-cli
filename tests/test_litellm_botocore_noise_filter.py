@@ -100,9 +100,7 @@ def test_filter_is_installed_on_litellm_logger_after_import() -> None:
     Python's ``LiteLLM`` logger. Pin this so a future refactor can't
     accidentally drop the install hook."""
     handlers_and_filters = logging.getLogger("LiteLLM").filters
-    assert any(
-        isinstance(f, _LiteLLMBotocoreNoiseFilter) for f in handlers_and_filters
-    ), (
+    assert any(isinstance(f, _LiteLLMBotocoreNoiseFilter) for f in handlers_and_filters), (
         "_LiteLLMBotocoreNoiseFilter not attached to the LiteLLM logger; "
         "the install hook in movate.providers.litellm must run at import time"
     )

@@ -276,7 +276,8 @@ def test_init_project_mentions_add_list_discovery_surface(
     catalog that's still available but no longer the recommended path."""
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(
-        app, ["init", "myproj", "--skip-snapshot", "--no-open-editor"],
+        app,
+        ["init", "myproj", "--skip-snapshot", "--no-open-editor"],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0, result.stdout + result.stderr

@@ -356,7 +356,8 @@ def test_menu_action_table_renders_column_headers(
     mapping at a glance (no need to guess that the first column
     drives the prompt)."""
     result = runner.invoke(
-        app, ["menu", "--dry-run", "--project-root", str(project_with_agents)],
+        app,
+        ["menu", "--dry-run", "--project-root", str(project_with_agents)],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -375,7 +376,8 @@ def test_menu_action_table_renders_plain_digit_numbers_not_brackets(
     we used ``[1]`` brackets inline, which buried the number among
     other punctuation. Pin the new layout."""
     result = runner.invoke(
-        app, ["menu", "--dry-run", "--project-root", str(project_with_agents)],
+        app,
+        ["menu", "--dry-run", "--project-root", str(project_with_agents)],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0
@@ -394,7 +396,8 @@ def test_menu_action_table_renders_q_row_for_quit(
     without picking an action. Make sure it still surfaces in the
     new table layout."""
     result = runner.invoke(
-        app, ["menu", "--dry-run", "--project-root", str(project_with_agents)],
+        app,
+        ["menu", "--dry-run", "--project-root", str(project_with_agents)],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0
@@ -421,7 +424,8 @@ def test_menu_action_table_does_not_drop_number_column_for_long_commands(
     )
 
     result = runner.invoke(
-        app, ["menu", "--dry-run", "--project-root", str(tmp_path)],
+        app,
+        ["menu", "--dry-run", "--project-root", str(tmp_path)],
         env={"COLUMNS": "80"},  # narrow terminal — the failure mode
     )
     assert result.exit_code == 0
@@ -430,7 +434,5 @@ def test_menu_action_table_does_not_drop_number_column_for_long_commands(
     assert "Step" in result.stdout
     # And the digit column must still surface — pick any of 1/2/3 since
     # the exact action ordering depends on workspace state.
-    has_digit = any(
-        f" {d} " in result.stdout or f"  {d} " in result.stdout for d in "12345"
-    )
+    has_digit = any(f" {d} " in result.stdout or f"  {d} " in result.stdout for d in "12345")
     assert has_digit, "no digit visible in the # column — Rich likely dropped it"

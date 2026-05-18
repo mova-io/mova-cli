@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -27,7 +27,6 @@ from movate.core.skill_backend import (
     SkillErrorType,
     SkillExecutionContext,
 )
-from movate.core.skill_backend import agent as _agent_backend_module  # side-effect import
 from movate.core.skill_backend.agent import AgentSkillBackend
 from movate.core.skill_loader import load_skill
 
@@ -214,11 +213,13 @@ class TestAgentSkillBackendLive:
             )
         )
 
-        with patch("movate.core.client.MovateClient", return_value=mock_client_instance):
-            with pytest.raises(SkillError) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
-                    backend.execute(bundle, {"text": "hello"}, ctx)
-                )
+        with (
+            patch("movate.core.client.MovateClient", return_value=mock_client_instance),
+            pytest.raises(SkillError) as exc_info,
+        ):
+            asyncio.get_event_loop().run_until_complete(
+                backend.execute(bundle, {"text": "hello"}, ctx)
+            )
 
         err = exc_info.value
         assert err.type == SkillErrorType.BACKEND_ERROR
@@ -305,7 +306,9 @@ class TestValidateAgentSkillAdvisory:
         assert "summarizer-call" in result.stdout
         assert "kind: agent" in result.stdout
         assert "summarizer" in result.stdout
-        assert "ensure it's deployed" in result.stdout.lower() or "deployed" in result.stdout.lower()
+        assert (
+            "ensure it's deployed" in result.stdout.lower() or "deployed" in result.stdout.lower()
+        )
 
     def test_validate_advisory_is_not_an_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

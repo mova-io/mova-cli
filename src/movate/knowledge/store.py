@@ -64,19 +64,15 @@ class InMemoryCorpus:
         try:
             raw = json.loads(p.read_text())
         except json.JSONDecodeError as exc:
-            raise KnowledgeStoreError(
-                f"corpus file {p} is not valid JSON: {exc}"
-            ) from exc
+            raise KnowledgeStoreError(f"corpus file {p} is not valid JSON: {exc}") from exc
         if not isinstance(raw, list):
             raise KnowledgeStoreError(
-                f"corpus file {p} must contain a JSON array at the root, "
-                f"got {type(raw).__name__}"
+                f"corpus file {p} must contain a JSON array at the root, got {type(raw).__name__}"
             )
         for i, entry in enumerate(raw):
             if not isinstance(entry, dict):
                 raise KnowledgeStoreError(
-                    f"corpus file {p} entry [{i}] must be a JSON object, "
-                    f"got {type(entry).__name__}"
+                    f"corpus file {p} entry [{i}] must be a JSON object, got {type(entry).__name__}"
                 )
         return cls(entries=raw)
 

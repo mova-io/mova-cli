@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import re
 
-import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
@@ -198,9 +197,7 @@ def test_show_json_output_is_valid() -> None:
 
 def test_show_json_output_has_cached_pricing() -> None:
     """Models with a cached_input price surface it in JSON output."""
-    result = runner.invoke(
-        app, ["models", "show", "openai/gpt-4o-2024-08-06", "-o", "json"]
-    )
+    result = runner.invoke(app, ["models", "show", "openai/gpt-4o-2024-08-06", "-o", "json"])
     assert result.exit_code == 0
     row = json.loads(result.stdout)
     assert row["cached_input_per_1m"] is not None

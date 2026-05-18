@@ -2044,7 +2044,7 @@ def build_app(
     # admin keys only see/manage keys for their own tenant.
     # ------------------------------------------------------------------
 
-    _ADMIN_SCOPE = "fleet-admin"
+    _ADMIN_SCOPE = "fleet-admin"  # noqa: N806 — local constant inside register-routes
 
     @v1.post(
         "/auth/keys",

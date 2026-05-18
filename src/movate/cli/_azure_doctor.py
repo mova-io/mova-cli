@@ -363,9 +363,7 @@ def _check_auth_roundtrip(target: TargetConfig) -> Check:
                 headers={"Authorization": f"Bearer {api_key}"},
             )
     except httpx.HTTPError as exc:
-        return Check(
-            "auth roundtrip", "error", f"unreachable: {exc.__class__.__name__}"
-        )
+        return Check("auth roundtrip", "error", f"unreachable: {exc.__class__.__name__}")
     if r.status_code == httpx.codes.UNAUTHORIZED:
         prefix = api_key[:16]
         return Check(

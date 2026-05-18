@@ -368,8 +368,7 @@ def _run_with_sample_input(
         elif status != "success" and data.get("error"):
             err_info = data["error"]
             console.print(
-                f"[red]Error:[/red] {err_info.get('type', '?')}: "
-                f"{err_info.get('message', '?')}"
+                f"[red]Error:[/red] {err_info.get('type', '?')}: {err_info.get('message', '?')}"
             )
     except (_json.JSONDecodeError, AttributeError):
         if raw_stdout:

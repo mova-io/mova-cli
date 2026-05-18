@@ -121,7 +121,8 @@ def _show_project() -> None:  # noqa: PLR0912 — three independent asset tables
 
     ctx_root = project_root / "contexts"
     ctx_files = sorted(
-        f for f in (ctx_root.glob("*.md") if ctx_root.is_dir() else [])
+        f
+        for f in (ctx_root.glob("*.md") if ctx_root.is_dir() else [])
         if f.name.lower() != "readme.md"
     )
     for ctx_file in ctx_files:

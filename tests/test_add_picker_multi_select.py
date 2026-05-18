@@ -168,9 +168,7 @@ def test_picker_comma_separated_input_also_works(
 def test_picker_skip_input_runs_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    invocations = _stub_picker_deps(
-        monkeypatch, pick_input="s", addable=["faq", "rag-qa"]
-    )
+    invocations = _stub_picker_deps(monkeypatch, pick_input="s", addable=["faq", "rag-qa"])
     add_cmd._pick_and_add_role_agent("mdk")
 
     assert invocations == []
@@ -187,6 +185,7 @@ def test_picker_short_circuits_on_non_tty(
 
     def fake_run(cmd, *args, **kwargs):
         invocations.append(list(cmd))
+
         class _Stub:
             returncode = 0
 
