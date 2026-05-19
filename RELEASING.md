@@ -30,14 +30,28 @@ Every release:
        --baseline-file "$tmp/baseline.json" -o json | jq .baseline.regression
    ```
    The last command must exit 1 with `regression: true`.
-6. Bump version in `pyproject.toml` AND `src/movate/__init__.py` (these
-   must match — no auto-sync today).
+6. Bump version in `pyproject.toml` AND `src/movate/__init__.py`
+   (these must match — no auto-sync today). One-liner that does the
+   patch bump + lockfile refresh + ready-to-commit staging:
+   ```bash
+   new=$(python scripts/bump_version.py) && uv lock \
+     && git add pyproject.toml src/movate/__init__.py uv.lock \
+     && echo "Bumped to $new — review with 'git diff --cached' and commit."
+   ```
+   For a minor/major bump, edit `pyproject.toml` + `__init__.py` by
+   hand and run `uv lock` afterward. The previous CI-driven
+   per-merge auto-bump was removed in 2026-05 (the mova-io org
+   policy blocks GitHub Actions from opening PRs, so the bump never
+   landed and dangling `bot/bump-v*` branches accumulated on origin).
 7. Move `[Unreleased]` content in `CHANGELOG.md` under a new
    `[X.Y.Z] — YYYY-MM-DD` heading; update the link refs at the bottom
    of the file.
-8. `git tag -a vX.Y.Z -m "vX.Y.Z: <one-line summary>"` (annotated, not
+8. Commit the bump (e.g. `chore: bump version to X.Y.Z`), open a PR,
+   merge to main.
+9. `git tag -a vX.Y.Z -m "vX.Y.Z: <one-line summary>"` (annotated, not
    lightweight — annotated tags carry author, date, and message and
-   show up in GitHub Releases).
+   show up in GitHub Releases) on the merge commit, then `git push
+   origin vX.Y.Z`.
 
 ## Distribution targets (pick one)
 
