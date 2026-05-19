@@ -642,10 +642,13 @@ def test_all_flag_and_positional_agent_are_mutex(tmp_path: Path) -> None:
 def test_no_agent_and_no_all_errors_with_hint(tmp_path: Path) -> None:
     """Bare ``mdk eval-scorecard`` (no positional, no --all) must
     error with a hint, not crash. Operators new to the command
-    should land on the help, not a stack trace."""
+    should land on the help, not a stack trace.
+
+    Uses --mock to skip the live-verify pre-flight — the test
+    subject is the no-agent error path, not key verification."""
     result = runner.invoke(
         app,
-        ["eval-scorecard"],
+        ["eval-scorecard", "--mock"],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 2
@@ -659,11 +662,13 @@ def test_all_outside_project_errors_with_hint(
 ) -> None:
     """``--all`` from a directory with no ./agents/ subdir must
     error with a hint pointing at the project-init flow, not crash
-    on a missing-dir traceback."""
+    on a missing-dir traceback.
+
+    Uses --mock to skip the live-verify pre-flight."""
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(
         app,
-        ["eval-scorecard", "--all"],
+        ["eval-scorecard", "--all", "--mock"],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 2
@@ -675,12 +680,14 @@ def test_all_outside_project_errors_with_hint(
 def test_all_empty_agents_dir_vacuous_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A project with ./agents/ but zero agents under it is a
     vacuous-pass (ok=true, agents=0), not an error. Mirrors how
-    ``mdk eval --all`` handles the same edge case."""
+    ``mdk eval --all`` handles the same edge case.
+
+    Uses --mock to skip the live-verify pre-flight."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "agents").mkdir()
     result = runner.invoke(
         app,
-        ["eval-scorecard", "--all"],
+        ["eval-scorecard", "--all", "--mock"],
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0
@@ -700,11 +707,24 @@ def _scaffold_project_with_agents(
     accepts — same path the operator's project goes through.
 
     Also injects a fake ``OPENAI_API_KEY`` so the eval-scorecard
-    pre-flight check (added 2026-05-19) passes without CI needing
-    real keys. The value is non-empty; downstream LLM calls in
-    tests are always mocked."""
+    pre-flight check passes without CI needing real keys. Stubs
+    ``verify_provider_key`` so the stricter live-verify pre-flight
+    (PR #223) doesn't reject the fake key — that strictness is what
+    we want in production, but in tests the fake would always fail a
+    real HTTP probe against OpenAI."""
+    from movate.cli import auth as auth_mod  # noqa: PLC0415
+    from movate.credentials.verify import VerifyResult  # noqa: PLC0415
+
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key-for-precheck-only")
+    # Stub the verifier so live-verify returns OK without HTTP.
+    monkeypatch.setattr(
+        "movate.credentials.verify_provider_key",
+        lambda provider, key: VerifyResult(ok=True, detail="OK (test stub)"),
+    )
+    # Clear the per-process verify cache so the stub wins over any
+    # cached real-verify result from an earlier test in this session.
+    auth_mod._verify_cache.clear()
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr

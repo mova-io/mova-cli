@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -1660,6 +1661,113 @@ def _prompt_scorecard_gate() -> float | None:
     return choices[idx][0]
 
 
+class _GenLogCapture(logging.Handler):
+    """Capture ``movate.cli.eval_gen_cmd`` log records during the
+    wizard's preview-gen spinner block.
+
+    The generator emits ``log.warning(...)`` for every per-case
+    failure (schema validation, non-JSON response, AuthError,
+    generator-call exception). Those records normally propagate to
+    the root logger and print to stderr — which clobbers the
+    spinner line and floods the operator's terminal with multi-line
+    log records.
+
+    This handler buffers the records so the spinner stays clean.
+    ``_render_generation_summary`` then folds them into one
+    summary line categorized by reason — "5 requested → 4 generated,
+    1 skipped (schema_validation)" — much more readable than the
+    raw multi-line WARNING dump.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _classify_gen_record(message: str) -> str:
+    """Bucket a captured generator-log message into a stable category
+    so the summary line aggregates by REASON, not by raw text.
+
+    Categories (matched on substrings emitted by ``_generate_entries``
+    / ``_generate_one_input`` in eval_gen_cmd.py):
+
+    * ``schema_validation`` — generated input didn't match the
+      agent's input schema (e.g. extra fields, wrong enum value).
+    * ``non_json`` — model returned text that isn't parseable JSON.
+    * ``non_dict`` — JSON parsed but wasn't a dict at the top level.
+    * ``auth_error`` — provider rejected the key mid-generation.
+    * ``generator_call`` — any other generator-call exception
+      (network, timeout, content filter, etc.).
+    * ``other`` — uncategorized; surfaces a raw count without
+      mis-labeling the cause.
+    """
+    msg = message.lower()
+    if "schema validation" in msg or "failed schema validation" in msg:
+        return "schema_validation"
+    if "non-json" in msg:
+        return "non_json"
+    if "non-dict" in msg:
+        return "non_dict"
+    if "autherror" in msg or "authentication" in msg:
+        return "auth_error"
+    if "generator call failed" in msg:
+        return "generator_call"
+    return "other"
+
+
+def _render_generation_summary(
+    *, requested: int, generated: int, captured: list[logging.LogRecord]
+) -> None:
+    """One-line clean summary after generation.
+
+    Replaces the previous interleaved-with-spinner per-case warnings
+    with a single greppable line operators can read at a glance:
+
+        ↳ requested 5 → generated 4, skipped 1 (schema_validation)
+
+    When everything succeeds it stays quiet (no false positives in
+    the success path). The original raw warnings are NOT lost — they
+    were captured by ``_GenLogCapture`` and can be surfaced via
+    ``MDK_VERBOSE_GEN_WARNINGS=1`` for debugging (future toggle).
+    """
+    skipped = max(0, requested - generated)
+    if skipped == 0 and not captured:
+        # Clean success — keep the wizard tight, no extra noise.
+        return
+
+    # Aggregate by reason. Captured records may exceed the
+    # ``skipped`` count if a single case triggered retry +
+    # eventually failed (each attempt logs). Show the distinct
+    # reasons; suppress duplicates from retry chains.
+    reasons: dict[str, int] = {}
+    for record in captured:
+        reasons[_classify_gen_record(record.getMessage())] = (
+            reasons.get(_classify_gen_record(record.getMessage()), 0) + 1
+        )
+    if reasons:
+        # Sort by count desc so the dominant cause leads.
+        reason_str = ", ".join(
+            f"{cat}={n}" if n > 1 else cat
+            for cat, n in sorted(reasons.items(), key=lambda kv: -kv[1])
+        )
+        detail = f" ([yellow]{reason_str}[/yellow])"
+    else:
+        detail = ""
+
+    # Color the headline by ratio: all green if everything succeeded
+    # (we returned early above), yellow if some skipped, red if all
+    # failed (caught by the empty-entries branch).
+    headline_color = "yellow" if generated > 0 else "red"
+    console.print(
+        f"  [dim]↳[/dim] [bold]requested[/bold] {requested} → "
+        f"[bold]generated[/bold] [{headline_color}]{generated}[/{headline_color}], "
+        f"[bold]skipped[/bold] {skipped}{detail}"
+    )
+
+
 def _generate_preview_and_gate(
     chosen_agent: str,
     *,
@@ -1693,21 +1801,48 @@ def _generate_preview_and_gate(
 
     while True:
         # Generate with a spinner so the operator sees something
-        # happening during the 10-30s LLM call.
-        with console.status(
-            f"[bold cyan]Generating {count} {mix} cases for "
-            f"[white]{chosen_agent}[/white]…[/bold cyan]",
-            spinner="dots",
-        ):
-            try:
-                entries = asyncio.run(
-                    _generate_cases_for_preview(
-                        bundle, count=count, mix=mix, mock=mock, project_root=cwd
+        # happening during the 10-30s LLM call. Capture per-case
+        # warnings from ``movate.cli.eval_gen_cmd`` (schema-validation
+        # fails, non-JSON responses, generator-call errors) so they
+        # DON'T interleave with the spinner line — instead they get
+        # rolled up into the clean post-generation summary below.
+        capture = _GenLogCapture()
+        gen_logger = logging.getLogger("movate.cli.eval_gen_cmd")
+        # Suppress propagation to the root logger (whose default
+        # handler prints to stderr) for the duration of the spinner.
+        original_propagate = gen_logger.propagate
+        gen_logger.addHandler(capture)
+        gen_logger.propagate = False
+        try:
+            with console.status(
+                f"[bold cyan]Generating {count} {mix} cases for "
+                f"[white]{chosen_agent}[/white]…[/bold cyan]",
+                spinner="dots",
+            ):
+                try:
+                    entries = asyncio.run(
+                        _generate_cases_for_preview(
+                            bundle, count=count, mix=mix, mock=mock, project_root=cwd
+                        )
                     )
-                )
-            except Exception as exc:
-                err_console.print(f"[red]✗[/red] generation failed: {type(exc).__name__}: {exc}")
-                return None
+                except Exception as exc:
+                    err_console.print(
+                        f"[red]✗[/red] generation failed: {type(exc).__name__}: {exc}"
+                    )
+                    return None
+        finally:
+            gen_logger.removeHandler(capture)
+            gen_logger.propagate = original_propagate
+
+        # Render a clean summary line BEFORE the preview table —
+        # operator sees at a glance "requested N → got M, K skipped:
+        # schema_validation=2 non_json=1" instead of N raw warning
+        # lines clobbering the spinner.
+        _render_generation_summary(
+            requested=count,
+            generated=len(entries),
+            captured=capture.records,
+        )
 
         if not entries:
             err_console.print(

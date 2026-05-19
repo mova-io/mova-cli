@@ -426,6 +426,93 @@ async def _score_one_case(
 # ---------------------------------------------------------------------------
 
 
+def _color_for_overall(overall: float) -> str:
+    """Map an overall score to a Rich color for live-stats display.
+
+    Same thresholds as ``_score_color`` (the post-eval scorecard
+    table renderer) so a score that's green during the live bar
+    stays green in the final table — operators don't have to
+    re-orient between two color scales.
+    """
+    if overall >= _GREEN_THRESHOLD:
+        return "green"
+    if overall >= _YELLOW_THRESHOLD:
+        return "yellow"
+    return "red"
+
+
+# Score color thresholds — green = >= 0.8 (pass), yellow = >= 0.6
+# (warn), red = below. Defined here so both ``_color_for_overall``
+# (live-stats path) AND ``_score_color`` (post-eval table) share
+# them — moving the constants up here from their original spot
+# below ``_render_scorecard`` so the live-stats helper at the top
+# of the module can reach them. The original ``_score_color`` /
+# ``_score_bar`` further down still use the same constants
+# imported into local scope.
+_GREEN_THRESHOLD = 0.8
+_YELLOW_THRESHOLD = 0.6
+
+
+def _format_live_stats(
+    *,
+    case_idx: int,
+    total_cases: int,
+    run_idx: int,
+    n_runs: int,
+    last_run_overall: float,
+    completed_case_overalls: list[float],
+) -> str:
+    """Build the Rich-markup string for the scorecard progress bar's
+    live ``stats`` field.
+
+    Layout depends on whether ``n_runs > 1`` (multi-run averaging
+    operator wanted to see the distribution as it grows) and whether
+    at least one prior case has fully completed (running aggregate
+    only meaningful then).
+
+    Examples (rendered without markup for readability):
+
+    * Single-run, first case still in progress::
+
+        case 1/5 · last=0.85
+
+    * Single-run, third case in progress + two completed::
+
+        case 3/5 · last=0.92 · mean=0.88
+
+    * Multi-run (N=3), case 2 mid-roll (run 2 of 3), one prior case::
+
+        case 2/5 run 2/3 · last=0.67 · cases mean=0.92 min=0.85 max=0.99
+
+    Returns a Rich-markup string. The caller plugs it into the
+    Progress task's ``stats`` field via ``progress.update``.
+    """
+    color = _color_for_overall(last_run_overall)
+    if n_runs > 1:
+        position = f"case [bold]{case_idx}[/bold]/{total_cases} run [bold]{run_idx}[/bold]/{n_runs}"
+    else:
+        position = f"case [bold]{case_idx}[/bold]/{total_cases}"
+
+    last_token = f"last=[{color}]{last_run_overall:.2f}[/{color}]"
+
+    if not completed_case_overalls:
+        # Mid-first-case: no completed-case aggregate to show yet.
+        return f"{position} · {last_token}"
+
+    running_mean = sum(completed_case_overalls) / len(completed_case_overalls)
+    if n_runs > 1:
+        running_min = min(completed_case_overalls)
+        running_max = max(completed_case_overalls)
+        agg = (
+            f"[dim]cases mean=[/dim]{running_mean:.2f} "
+            f"[dim]min=[/dim]{running_min:.2f} "
+            f"[dim]max=[/dim]{running_max:.2f}"
+        )
+    else:
+        agg = f"[dim]mean=[/dim]{running_mean:.2f}"
+    return f"{position} · {last_token} · {agg}"
+
+
 async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; splitting hides shared setup
     bundle: AgentBundle,
     *,
@@ -568,20 +655,23 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
     # Rich progress bar around the per-case x per-run scoring loop.
     # Total ticks = ``len(entries) * n_runs`` so each run advances
     # the bar by 1 — at N=3 with 10 cases the operator sees 0/30
-    # → 30/30 over the ~3-5 minute scoring window, which beats the
-    # old "silent for 3 minutes" UX. Progress is one shared instance
-    # across the case + run nested loops so the bar updates per
-    # judge-call rather than per-case.
+    # → 30/30 over the ~3-5 minute scoring window.
+    #
+    # Per-tick description carries the OPERATOR-VISIBLE live signal
+    # (2026-05-19): which case + run is in progress, the last roll's
+    # overall score, and a running aggregate across completed cases.
+    # When ``n_runs > 1`` the aggregate widens to mean + min + max so
+    # the operator sees the score distribution as it grows (a
+    # uniformly 1.00 sample looks DIFFERENT from 0.65-1.00 spread).
     #
     # ``transient=False`` keeps the bar visible after completion so
-    # the operator can confirm the total + elapsed time; ``redirect_*``
-    # routes stray stdout/stderr (e.g. cost-drift warnings from the
-    # executor) through the Progress renderer rather than clobbering
-    # the bar with raw log lines.
+    # the operator can confirm the total + elapsed time.
     progress = Progress(
         TextColumn("    [bold cyan]{task.description}[/bold cyan]"),
         BarColumn(bar_width=None),
         MofNCompleteColumn(),
+        TextColumn("[dim]·[/dim]"),
+        TextColumn("{task.fields[stats]}"),
         TextColumn("[dim]·[/dim]"),
         TimeElapsedColumn(),
         TextColumn("[dim]/[/dim]"),
@@ -591,10 +681,21 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
     )
     total_ticks = len(entries) * n_runs
     runs_suffix = f" x {n_runs} run(s)" if n_runs > 1 else ""
-    task_id = progress.add_task(f"scoring {len(entries)} cases{runs_suffix}", total=total_ticks)
+    task_id = progress.add_task(
+        f"scoring {len(entries)} cases{runs_suffix}",
+        total=total_ticks,
+        # ``stats`` is the dynamic right-side text — empty before
+        # the first run completes, then per-run / per-case overall
+        # + running aggregate.
+        stats="",
+    )
+    # Per-case overall scores (mean of per-category scores), one
+    # entry per FULLY-COMPLETED case. Used to compute running mean /
+    # min / max across cases. Populated after the N inner runs collapse.
+    case_overalls: list[float] = []
     try:
         progress.start()
-        for entry in entries:
+        for case_idx, entry in enumerate(entries, start=1):
             input_data = entry["input"]
             # Per-case accumulators across the N runs. Each run
             # produces a (latency, cost, scores, rationales, output)
@@ -606,9 +707,13 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
             run_costs: list[float] = []
             # Map category -> list of scores across runs.
             run_scores_by_cat: dict[str, list[float]] = {}
+            # Per-run overall (mean of categories), this case only.
+            # Reset per entry so the case-mean we publish in the
+            # progress description reflects ONLY this case's runs.
+            this_case_run_overalls: list[float] = []
             last_output: Any = None
             last_rationales: dict[str, str] = {}
-            for _run_idx in range(n_runs):
+            for run_idx in range(1, n_runs + 1):
                 t0 = time.perf_counter()
                 request = RunRequest(agent=bundle.spec.name, input=input_data)
                 response = await executor.execute(bundle, request)
@@ -661,10 +766,31 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
                     run_scores_by_cat.setdefault(cat, []).append(float(val))
                 last_output = output_data
                 last_rationales = rationales
+
+                # Live-stats: per-run overall = mean of this run's
+                # per-category scores. Used to colorize the bar's
+                # ``last=X.XX`` token + (when N>1) build the
+                # min/max distribution across cases.
+                run_overall = sum(scores.values()) / len(scores) if scores else 0.0
+                this_case_run_overalls.append(run_overall)
+
+                # Build the dynamic ``stats`` field. Format depends
+                # on n_runs (single vs multi-run) and whether at
+                # least one prior case has fully completed.
+                stats = _format_live_stats(
+                    case_idx=case_idx,
+                    total_cases=len(entries),
+                    run_idx=run_idx,
+                    n_runs=n_runs,
+                    last_run_overall=run_overall,
+                    completed_case_overalls=case_overalls,
+                )
                 # Tick the progress bar AFTER the run completes — each
                 # tick represents one (case, run) pair fully scored
-                # (agent execution + LLM judge round-trip).
-                progress.advance(task_id)
+                # (agent execution + LLM judge round-trip). Update
+                # the ``stats`` field in the same call so the bar's
+                # live text refreshes in lockstep.
+                progress.update(task_id, advance=1, stats=stats)
 
             # Aggregate across runs into ONE CaseScore per entry.
             mean_latency = sum(run_latencies) / len(run_latencies)
@@ -683,6 +809,11 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
                     rationales=last_rationales,
                 )
             )
+            # Record this case's overall (mean across runs) so the
+            # running mean/min/max in the live stats reflects
+            # COMPLETED cases as the loop progresses.
+            if this_case_run_overalls:
+                case_overalls.append(sum(this_case_run_overalls) / len(this_case_run_overalls))
     finally:
         # Stop the Progress display BEFORE shutting down the runtime
         # so the bar's final state is flushed before any post-eval
@@ -1446,12 +1577,11 @@ def _render_scorecard(summary: ScorecardSummary) -> None:
     console.print(table)
 
 
-# Score color thresholds — green = >= 0.8 (pass), yellow = >= 0.6
-# (warn), red = below (fail). Matched against the existing eval
-# gate-threshold semantics so the colors mean the same thing across
-# `mdk eval` and `mdk eval-scorecard`.
-_GREEN_THRESHOLD = 0.8
-_YELLOW_THRESHOLD = 0.6
+# ``_GREEN_THRESHOLD`` / ``_YELLOW_THRESHOLD`` are defined at the top
+# of the module so the live-stats helper (``_format_live_stats``) can
+# reach them. ``_score_color`` keeps using them — same semantics
+# (>= 0.8 green, >= 0.6 yellow, else red) so post-eval table colors
+# match the live progress bar.
 
 
 def _score_color(score: float) -> str:

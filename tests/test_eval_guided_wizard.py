@@ -362,11 +362,16 @@ def test_guided_does_not_auto_trigger_outside_project(
     """Bare `mdk eval` outside any project should error with the
     canonical "path required" message, NOT drop into the wizard
     (no agents to choose from). Same as pre-wizard behavior for the
-    no-project case."""
+    no-project case.
+
+    Uses --mock to skip the live-verify pre-flight (PR #223) — that
+    pre-flight isn't the subject of this test, and without --mock
+    the env's stale OPENAI_API_KEY would block before the path
+    check even runs."""
     monkeypatch.chdir(tmp_path)
     # CliRunner's stdin is a pipe (not a TTY) so auto-trigger wouldn't
     # fire anyway. Confirm the error path still works.
-    result = runner.invoke(app, ["eval"], env={"COLUMNS": "200"})
+    result = runner.invoke(app, ["eval", "--mock"], env={"COLUMNS": "200"})
     assert result.exit_code == 2
     combined = result.stdout + result.stderr
     # Canonical error or wizard rejection — either is acceptable,
@@ -387,11 +392,14 @@ def test_guided_does_not_auto_trigger_outside_project(
 def test_guided_errors_on_empty_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Wizard requires at least one agent in `agents/`. An empty
     project should error with a "no agents" hint, not present a
-    choiceless picker."""
+    choiceless picker.
+
+    Uses --mock to skip the live-verify pre-flight — the test
+    subject is the empty-agents path, not key verification."""
     monkeypatch.chdir(tmp_path)
     runner.invoke(app, ["init", "empty", "--skip-snapshot"], env={"COLUMNS": "200"})
     monkeypatch.chdir(tmp_path / "empty")
-    result = runner.invoke(app, ["eval", "--guided"], env={"COLUMNS": "200"})
+    result = runner.invoke(app, ["eval", "--guided", "--mock"], env={"COLUMNS": "200"})
     combined = result.stdout + result.stderr
     assert "no agents" in combined.lower()
     assert "mdk add" in combined.lower()

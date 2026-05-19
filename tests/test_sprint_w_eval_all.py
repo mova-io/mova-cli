@@ -137,9 +137,13 @@ class TestEvalAllMutex:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """`mdk eval` with no path AND no --all errors with a hint
-        that mentions both alternatives."""
+        that mentions both alternatives.
+
+        Uses --mock to skip the live-verify pre-flight (PR #223) —
+        otherwise the env's stale OPENAI_API_KEY would block before
+        the mutex check fires."""
         _bootstrap_with_agent(tmp_path, monkeypatch)
-        result = runner.invoke(app, ["eval"], env={"COLUMNS": "200"})
+        result = runner.invoke(app, ["eval", "--mock"], env={"COLUMNS": "200"})
         assert result.exit_code == 2
         combined = result.stdout + result.stderr
         assert "--all" in combined
