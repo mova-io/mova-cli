@@ -12,8 +12,15 @@ dropped in a future major release). Every example in this README uses `mdk`; sub
 
 ## Status
 
+**Current: `0.8.2.7`** (May 2026) — eval wizard polish cascade. Per-PR
+micro version bumps (PEP 440 4-part) ride inside each feature PR so
+`mdk --version` matches the merge ordinal between tagged releases.
+
 | version | tag | what landed |
 |---|---|---|
+| 0.8.x | — | Guided `mdk eval` wizard: generate-and-preview test cases, runs-per-case averaging, 10-category scorecard, live progress bar with score min/max, live-verify API keys before eval starts. Domain-scoped post-success menus. |
+| 0.7.x | — | Microsoft Teams bot (alpha — slices 3.1.a–3.1.d): bot framework integration, per-user identity binding, file uploads. See [ADR 003](docs/adr/003-teams-integration.md). |
+| 0.6.x | — | Canonical config split (`policy.yaml` + `runtime.yaml` + `movate.yaml`), four-dimension eval scoring (accuracy + faithfulness + coverage + latency). |
 | 0.5.0 | [`v0.5.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.5.0) | HTTP runtime + worker + Postgres — movate is now a service |
 | 0.4.0 | [`v0.4.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.4.0) | Observability + regression-detection (Langfuse, OTel, trace replay, eval baseline diff, run replay, CI eval-gate) |
 | 0.3.1 | [`v0.3.1`](https://github.com/mova-io/mova-cli/releases/tag/v0.3.1) | Workflow runner double-save fix |
@@ -26,11 +33,6 @@ enforcement, tenant isolation audit. See
 [docs/v0.5-design.md](docs/v0.5-design.md) for the v0.5 architecture
 that v1.0 builds on.
 
-**v0.7 planned** — Microsoft Teams app for non-technical users: run +
-eval Movate agents from inside a Teams channel, no CLI required.
-Design captured in
-[ADR 003 — Teams integration](docs/adr/003-teams-integration.md).
-
 ## What works today
 
 | capability | command | status |
@@ -42,6 +44,11 @@ Design captured in
 | Per-provider pricing introspection | `mdk pricing` | ✓ v0.1 |
 | Multi-model bench | `mdk bench <path>` | ✓ v0.2 |
 | Eval suite + gating | `mdk eval <path> --gate 0.7` | ✓ v0.2 |
+| Guided eval wizard (generate + preview + score) | `mdk eval` (bare; auto-wizard) | ✓ v0.8 |
+| 10-category LLM-judged scorecard | `mdk eval-scorecard <path> [--runs N]` | ✓ v0.8 |
+| Multi-run scoring with min/max distribution | `--runs 3` (CLI) or wizard `[c]` custom | ✓ v0.8 |
+| Live-verify API keys before eval starts | (automatic in `mdk eval`; `--mock` skips) | ✓ v0.8 |
+| Provider key picker + live verify markers | `mdk auth login` / `mdk auth status` | ✓ v0.8 |
 | Sequential workflow execution | `mdk run <workflow-path>` | ✓ v0.3 |
 | Trace replay (agent + workflow) | `mdk trace replay <id>` | ✓ v0.4 |
 | Regression detection vs baseline | `mdk eval --baseline <id>` <br> `mdk eval --baseline-file <path>` | ✓ v0.4 |
@@ -137,6 +144,67 @@ mdk eval ./faq-agent --mock --gate 0.7
 Rich table with per-case scores, mean, pass-rate, total cost, and a
 verdict. Exits 1 if the gate fails — wire this into CI to block bad
 PRs.
+
+#### Guided eval wizard (v0.8+)
+
+Type `mdk eval` with no arguments inside a project and the CLI drops
+into an interactive wizard that walks you through agent selection,
+test-case generation, scoring strictness, and gate threshold — no
+flags to memorize:
+
+```
+$ mdk eval
+
+Which agent(s)?
+  [1] all  (every agent in project — 10 total)
+  [2] faq-agent
+  ...
+
+Test cases?  (generate fresh cases for every agent, or score each agent's existing dataset.jsonl)
+  [1] keep existing dataset (3 cases) — legacy scoring
+  [2] generate fresh cases via LLM — 10-category scorecard
+
+How many cases?       [1] 5  [2] 10  [3] 25  [4] 50  [c] custom
+Which mix?            [1] standard  [2] edge  [3] adversarial  [4] domain
+Runs per case?        [1] 1  [2] 3  [3] 5  [c] custom
+Gate threshold?       [1] 0.0  [2] 0.5  [3] 0.7  [4] 0.9
+```
+
+If you pick **generate fresh cases**, the wizard:
+
+1. Calls an LLM to produce N test cases against the agent's input
+   schema (mix = standard / edge / adversarial / domain-from-KB)
+2. Shows the cases in a scannable preview table (color-coded
+   key:value lines — not raw JSON)
+3. Asks **continue / regenerate / cancel** before any scoring
+4. Runs each approved case `runs_per_case` times against the agent
+5. Scores every (case, run) pair on a **10-category rubric**:
+   `accuracy / faithfulness / format / safety / refusal /
+   hallucination / completeness / instruction_following / latency /
+   cost` (8 LLM-judged + 2 programmatic)
+6. Averages per-category scores across runs, then aggregates to a
+   composite overall
+
+The live progress bar shows position + last score + running mean
+(and min/max when N>1) so you can see the distribution widen as
+cases complete:
+
+```
+scoring 5 cases x 3 run(s) · case 3/5 run 2/3 · last=0.92 · cases mean=0.88 min=0.85 max=0.99 · 0:01:42 / 0:00:58
+```
+
+CI-friendly equivalent without the wizard:
+
+```bash
+mdk eval-scorecard agents/faq-agent --count 10 --mix standard --runs 3 --gate-overall 0.7
+mdk eval-scorecard --all --count 10 --gate-overall 0.7   # every agent in project
+```
+
+The wizard always **live-verifies** OpenAI / Anthropic keys before
+prompting — a stale stub like `sk-test-*2345` in your shell gets
+caught up front with an offer to run `mdk auth login` inline,
+instead of letting the wizard burn 5 prompts then crash on the
+first `acompletion`.
 
 #### Four-dimension scoring (v0.6+)
 
