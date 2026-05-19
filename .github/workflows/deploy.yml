@@ -55,7 +55,8 @@ on:
 # OIDC needs id-token: write. contents: read is enough for the checkout.
 permissions:
   id-token: write
-  contents: read
+  contents: write
+  pull-requests: write
 
 jobs:
   # Resolve the target env name (e.g. "prod") from the branch or input.
