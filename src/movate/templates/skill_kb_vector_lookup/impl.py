@@ -30,9 +30,7 @@ if TYPE_CHECKING:
 _DEFAULT_K = 5
 
 
-async def run(
-    inputs: dict[str, Any], ctx: SkillExecutionContext | None = None
-) -> dict[str, Any]:
+async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) -> dict[str, Any]:
     """Skill entry point. Returns ``{chunks: [...], chunks_found: N}``.
 
     The ``inputs`` dict comes from the LLM's tool-use call; ``ctx``

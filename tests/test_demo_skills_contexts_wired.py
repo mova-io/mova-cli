@@ -226,7 +226,15 @@ class TestDemoAgentsDeclareSkillsAndContexts:
     @pytest.mark.parametrize(
         "agent,expected_skills,expected_contexts",
         [
-            ("rag-qa", ["web-search"], ["grounded-qa-rubric"]),
+            # rag-qa: ``kb-vector-lookup`` added 0.8.2.14 — agent now
+            # retrieves its own context via the new ``mdk kb ingest``
+            # pipeline. ``web-search`` kept as the fallback when KB
+            # doesn't cover the question.
+            (
+                "rag-qa",
+                ["kb-vector-lookup", "web-search"],
+                ["grounded-qa-rubric"],
+            ),
             (
                 "ticket-triager",
                 ["kb-lookup"],

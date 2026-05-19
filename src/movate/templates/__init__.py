@@ -74,11 +74,14 @@ TEMPLATES: dict[str, str] = {
 # * web-search — DuckDuckGo HTML scrape (rag-qa)
 # * lint-runner — subprocess `ruff check` (code-reviewer)
 # * kb-lookup — mock-data corpus search (ticket-triager)
+# * kb-vector-lookup — semantic search via OpenAI embeddings +
+#   ``mdk kb ingest <agent>`` pipeline (rag-qa, post-0.8.2.13)
 SKILL_TEMPLATES: dict[str, str] = {
     "default": "skill_init",
     "web-search": "skill_web_search",
     "lint-runner": "skill_lint_runner",
     "kb-lookup": "skill_kb_lookup",
+    "kb-vector-lookup": "skill_kb_vector_lookup",
 }
 
 
