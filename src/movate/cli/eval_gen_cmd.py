@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import string
 import sys
@@ -60,6 +61,7 @@ from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import RunRequest
 
+log = logging.getLogger(__name__)
 console = Console()
 err_console = Console(stderr=True)
 
@@ -477,6 +479,7 @@ async def _generate_entries(
     kb_seeds: list[str] | None = None,
     mode: str = "standard",
     target_dims: list[str] | None = None,
+    generator_model: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build ``num`` ``{input, expected, generated: true}`` entries.
 
@@ -517,6 +520,7 @@ async def _generate_entries(
                     kb_seed=kb_seed,
                     mode=mode,
                     target_dims=target_dims,
+                    generator_model=generator_model,
                 )
             # Validate before running the agent — a bad-schema input
             # blows up the executor with a confusing error. Skip + log.
@@ -637,10 +641,15 @@ async def _generate_one_input(
     kb_seed: str | None = None,
     mode: str = "standard",
     target_dims: list[str] | None = None,
+    generator_model: str | None = None,
 ) -> dict[str, Any]:
     """Ask the LLM for one input. Provider call goes through the
     same registry the agent uses, so OPENAI_API_KEY etc. follow the
     operator's existing setup.
+
+    ``generator_model`` (optional) overrides the agent's declared
+    provider — useful when operators have keys for a different model
+    family than the agent uses in production.
 
     Retries once on JSON parse failure with a stricter prompt.
     Lifts yield on flaky-output models from ~80% to ~95% in
@@ -655,6 +664,7 @@ async def _generate_one_input(
         kb_seed=kb_seed,
         mode=mode,
         target_dims=target_dims,
+        generator_model=generator_model,
     )
     if parsed is not None:
         return parsed
@@ -669,6 +679,7 @@ async def _generate_one_input(
         kb_seed=kb_seed,
         mode=mode,
         target_dims=target_dims,
+        generator_model=generator_model,
     )
     if parsed is not None:
         return parsed
@@ -689,15 +700,28 @@ async def _attempt_generate(
     kb_seed: str | None = None,
     mode: str = "standard",
     target_dims: list[str] | None = None,
+    generator_model: str | None = None,
 ) -> dict[str, Any] | None:
     """One LLM call + parse. Returns None on any failure so the caller
-    can decide whether to retry."""
+    can decide whether to retry.
+
+    ``generator_model`` (optional) overrides the agent's declared
+    provider for the generator call. Useful when the operator has
+    keys for a different family than the agent uses in production
+    (e.g. agent is openai/gpt-4o-mini but operator has only
+    ANTHROPIC_API_KEY). Falls back to the agent's own model.
+
+    Exceptions used to be silently swallowed (bare ``except Exception:
+    return None``); now we log them at WARNING level so operators
+    don't have to wonder why generation is failing — the most common
+    cause is missing API keys for the agent's declared provider."""
     from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
 
     provider = rt.provider
     system = _mode_system_prompt(mode) + nudge
+    provider_str = generator_model or bundle.spec.model.provider
     request = CompletionRequest(
-        provider=bundle.spec.model.provider,
+        provider=provider_str,
         messages=[
             Message(role="system", content=system),
             Message(
@@ -715,7 +739,14 @@ async def _attempt_generate(
     )
     try:
         response = await provider.complete(request)
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "generator call failed for case #%d (provider=%s): %s: %s",
+            index + 1,
+            provider_str,
+            type(exc).__name__,
+            exc,
+        )
         return None
 
     text = (response.text or "").strip()
@@ -729,9 +760,20 @@ async def _attempt_generate(
 
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "generator returned non-JSON for case #%d: %s (text preview: %r)",
+            index + 1,
+            exc,
+            text[:200],
+        )
         return None
     if not isinstance(parsed, dict):
+        log.warning(
+            "generator returned non-dict for case #%d: %s",
+            index + 1,
+            type(parsed).__name__,
+        )
         return None
     return parsed
 

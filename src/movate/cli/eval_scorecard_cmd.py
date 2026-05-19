@@ -425,6 +425,7 @@ async def _run_scorecard(
     mix: str,
     mock: bool,
     judge_model: str | None,
+    generator_model: str | None = None,
     project_root: Path | None = None,
     effective: EffectiveCategories | None = None,
 ) -> ScorecardSummary:
@@ -432,7 +433,12 @@ async def _run_scorecard(
 
     ``effective`` (optional) restricts the scoring + aggregation to
     a per-project-configured subset of categories (Gap 3e). Defaults
-    to the full 10."""
+    to the full 10.
+
+    ``generator_model`` (optional) overrides the LLM model used for
+    case generation — handy when the agent's own model isn't
+    available in the operator's shell (e.g. agent is openai/... but
+    only ANTHROPIC_API_KEY is set)."""
     if effective is None:
         effective = _resolve_effective_categories()
     # KB seeds: domain-mix wants generated cases grounded in the
@@ -463,8 +469,25 @@ async def _run_scorecard(
         with_dimensions=False,
         mode=mix,
         kb_seeds=kb_seeds,
+        generator_model=generator_model,
     )
     if not entries:
+        # Surface a clear hint rather than the empty Exit(2). The most
+        # common cause is missing API keys for the agent's declared
+        # provider — operators routinely have ANTHROPIC_API_KEY but the
+        # agent defaults to openai/... and the generator silently auth-
+        # errors. Tell them about --generator-model + suggest a model.
+        provider_str = generator_model or bundle.spec.model.provider
+        err_console.print(
+            f"[red]✗[/red] generated 0/{count} cases for "
+            f"[bold]{bundle.spec.name}[/bold] using provider "
+            f"[bold]{provider_str}[/bold]. The most common cause is "
+            "missing API keys for that provider. Workarounds:\n"
+            "  • [bold]--generator-model anthropic/claude-haiku-4-5-20251001[/bold] "
+            "(routes generation through Anthropic if you have ANTHROPIC_API_KEY)\n"
+            "  • [bold]--mock[/bold] (offline; deterministic shape-only generation)\n"
+            "  • Run [bold]mdk doctor[/bold] to see which provider keys are loaded."
+        )
         raise typer.Exit(code=2)
 
     # Step 2: re-execute each to capture per-case latency + cost (the
@@ -747,6 +770,19 @@ def eval_scorecard(
             "model. Example: --judge-model anthropic/claude-haiku-4-5-20251001."
         ),
     ),
+    generator_model: str | None = typer.Option(
+        None,
+        "--generator-model",
+        help=(
+            "Override the LLM provider/model used to GENERATE test cases. "
+            "Defaults to the agent's own model — but if your shell only has "
+            "an Anthropic key and the agent uses openai/..., generation "
+            "fails silently with auth errors. Setting this flag (or its "
+            "alias --judge-model) routes generation through a provider you "
+            "actually have keys for. Example: --generator-model "
+            "anthropic/claude-haiku-4-5-20251001."
+        ),
+    ),
     output_format: Report = typer.Option(
         Report.TABLE,
         "--output",
@@ -895,6 +931,13 @@ def eval_scorecard(
         cost=gate_cost,
     )
 
+    # If the operator set --judge-model but not --generator-model, reuse
+    # the judge model for generation. Almost always the operator has
+    # keys for one family + wants both calls to land on it; we shouldn't
+    # make them type the same string twice.
+    if generator_model is None and judge_model is not None:
+        generator_model = judge_model
+
     # Resolve effective categories: union of project.yaml's
     # ``scorecard.disabled_categories`` + the per-invocation
     # ``--disable-category`` CLI flags. Project root is the cwd in
@@ -921,6 +964,7 @@ def eval_scorecard(
             mix=mix,
             mock=mock,
             judge_model=judge_model,
+            generator_model=generator_model,
             output_format=output_format,
             gates=gates,
             baseline_file=baseline_file,
@@ -943,6 +987,7 @@ def eval_scorecard(
         mix=mix,
         mock=mock,
         judge_model=judge_model,
+        generator_model=generator_model,
         output_format=output_format,
         gates=gates,
         effective=effective,
@@ -959,6 +1004,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     mix: str,
     mock: bool,
     judge_model: str | None,
+    generator_model: str | None = None,
     output_format: Report = Report.TABLE,
     gates: GateConfig | None = None,
     effective: EffectiveCategories | None = None,
@@ -1003,6 +1049,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             mix=mix,
             mock=mock,
             judge_model=judge_model,
+            generator_model=generator_model,
             project_root=project_root,
             effective=effective,
         )
@@ -1275,6 +1322,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
     mix: str,
     mock: bool,
     judge_model: str | None,
+    generator_model: str | None = None,
     output_format: Report = Report.TABLE,
     gates: GateConfig | None = None,
     effective: EffectiveCategories | None = None,
@@ -1363,6 +1411,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
                     mix=mix,
                     mock=mock,
                     judge_model=judge_model,
+                    generator_model=generator_model,
                     project_root=project_root,
                     effective=effective,
                 )
