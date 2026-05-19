@@ -42,6 +42,14 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from movate.cli._output import Report
@@ -557,7 +565,35 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
     n_runs = max(1, min(int(runs_per_case), 10))
 
     cases: list[CaseScore] = []
+    # Rich progress bar around the per-case x per-run scoring loop.
+    # Total ticks = ``len(entries) * n_runs`` so each run advances
+    # the bar by 1 — at N=3 with 10 cases the operator sees 0/30
+    # → 30/30 over the ~3-5 minute scoring window, which beats the
+    # old "silent for 3 minutes" UX. Progress is one shared instance
+    # across the case + run nested loops so the bar updates per
+    # judge-call rather than per-case.
+    #
+    # ``transient=False`` keeps the bar visible after completion so
+    # the operator can confirm the total + elapsed time; ``redirect_*``
+    # routes stray stdout/stderr (e.g. cost-drift warnings from the
+    # executor) through the Progress renderer rather than clobbering
+    # the bar with raw log lines.
+    progress = Progress(
+        TextColumn("    [bold cyan]{task.description}[/bold cyan]"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("[dim]·[/dim]"),
+        TimeElapsedColumn(),
+        TextColumn("[dim]/[/dim]"),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    )
+    total_ticks = len(entries) * n_runs
+    runs_suffix = f" x {n_runs} run(s)" if n_runs > 1 else ""
+    task_id = progress.add_task(f"scoring {len(entries)} cases{runs_suffix}", total=total_ticks)
     try:
+        progress.start()
         for entry in entries:
             input_data = entry["input"]
             # Per-case accumulators across the N runs. Each run
@@ -625,6 +661,10 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
                     run_scores_by_cat.setdefault(cat, []).append(float(val))
                 last_output = output_data
                 last_rationales = rationales
+                # Tick the progress bar AFTER the run completes — each
+                # tick represents one (case, run) pair fully scored
+                # (agent execution + LLM judge round-trip).
+                progress.advance(task_id)
 
             # Aggregate across runs into ONE CaseScore per entry.
             mean_latency = sum(run_latencies) / len(run_latencies)
@@ -644,6 +684,11 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
                 )
             )
     finally:
+        # Stop the Progress display BEFORE shutting down the runtime
+        # so the bar's final state is flushed before any post-eval
+        # log lines from runtime shutdown (storage close, tracer
+        # flush) get interleaved.
+        progress.stop()
         await shutdown_runtime(rt.storage, rt.tracer)
 
     # Step 3: aggregate per-category means over the active set.

@@ -88,11 +88,25 @@ def test_validate_all_renders_static_next_under_non_tty(
 
 
 @pytest.mark.unit
-def test_eval_all_renders_static_next_under_non_tty(
+def test_eval_all_does_not_render_next_step_menu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Under non-TTY, `mdk eval --all` should still print the
-    `Next:` block (Quick-run / Serve / Deploy) as static text."""
+    """Post-2026-05-19, ``mdk eval --all`` does NOT render the
+    Quick-run / Serve / Deploy next-step menu.
+
+    Operators reported the menu was noise after a green eval — they
+    already know what comes next (run, serve, deploy) and the extra
+    prompt cluttered the scrollback right when the agents-table was
+    the most interesting thing on screen. The greppable
+    ``mdk_eval_all_summary`` line is the only post-eval output now;
+    CI scripts that scrape it are unaffected.
+
+    NB: ``mdk validate --all``'s next-step menu is unchanged — that
+    one points at ``mdk eval --all`` which IS the next step, and
+    surfaces the gate-threshold question for operators who haven't
+    used eval before. The eval-itself menu was the one with no
+    obvious follow-up to nudge toward.
+    """
     monkeypatch.chdir(tmp_path)
     runner.invoke(app, ["init", "p", "--skip-snapshot"], env={"COLUMNS": "200"})
     monkeypatch.chdir(tmp_path / "p")
@@ -101,11 +115,15 @@ def test_eval_all_renders_static_next_under_non_tty(
         app, ["eval", "--all", "--mock", "--gate", "0.7"], env={"COLUMNS": "200"}
     )
     assert result.exit_code == 0
-    assert "Next:" in result.stdout
-    # Three suggested follow-ups appear.
-    assert "mdk run" in result.stdout
-    assert "mdk serve" in result.stdout
-    assert "mdk deploy" in result.stdout
+    # ``Next:`` block intentionally absent — the agents table + the
+    # ``mdk_eval_all_summary`` line are the whole post-eval output.
+    assert "Quick-run" not in result.stdout, (
+        "Quick-run/Serve/Deploy menu should be suppressed after eval (operator-reported noise)"
+    )
+    assert "Serve runtime locally" not in result.stdout
+    assert "Deploy agents to Azure dev" not in result.stdout
+    # The summary line MUST still surface (CI scrapers depend on it).
+    assert "mdk_eval_all_summary" in result.stdout
 
 
 @pytest.mark.unit

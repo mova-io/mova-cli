@@ -176,11 +176,19 @@ def test_validate_all_silent_on_failure(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 @pytest.mark.unit
-def test_eval_all_suggests_run_serve_deploy(
+def test_eval_all_no_longer_suggests_run_serve_deploy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After an all-pass `mdk eval --all`, the success block lists
-    three natural follow-ups: run, serve, deploy."""
+    """Post-2026-05-19, ``mdk eval --all`` does NOT render the
+    Quick-run / Serve / Deploy next-step menu. Operators reported
+    it was noise after a green eval — they already know what comes
+    next, and the prompt cluttered the scrollback right when the
+    agents-table was the most interesting thing on screen.
+
+    The companion suppression test lives in
+    ``test_next_steps_menu_everywhere.py``; this one stays as a
+    second-source regression guard so a future "let's add the menu
+    back" change has to flip both."""
     _bootstrap_with_agent(tmp_path, monkeypatch)
     result = runner.invoke(
         app,
@@ -188,11 +196,12 @@ def test_eval_all_suggests_run_serve_deploy(
         env={"COLUMNS": "200"},
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert "Next:" in result.stdout
-    # All three follow-up paths appear.
-    assert "mdk run" in result.stdout
-    assert "mdk serve" in result.stdout
-    assert "mdk deploy" in result.stdout
+    # The menu's three labels MUST NOT surface.
+    assert "Quick-run" not in result.stdout
+    assert "Serve runtime locally" not in result.stdout
+    assert "Deploy agents to Azure dev" not in result.stdout
+    # The greppable summary line stays (CI scrapers depend on it).
+    assert "mdk_eval_all_summary" in result.stdout
 
 
 # ---------------------------------------------------------------------------

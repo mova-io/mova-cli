@@ -532,6 +532,111 @@ def test_eval_skips_precheck_under_mock(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 @pytest.mark.unit
+def test_guided_custom_count_typed_by_operator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator picks the ``c`` (custom) row in the count prompt and
+    types a specific number (e.g. 8). The wizard should accept any
+    integer in [1, 100], not just 5/10/25/50.
+
+    Added 2026-05-19 after operator feedback that ``--count 8`` had
+    to be set via the CLI flag because the wizard's 4 preset options
+    didn't include it."""
+    _bootstrap(tmp_path, monkeypatch)
+
+    dispatch_calls: list[dict[str, object]] = []
+
+    def fake_run_all(**kwargs: object) -> None:
+        dispatch_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "movate.cli.eval_scorecard_cmd._run_scorecard_all_in_project",
+        fake_run_all,
+    )
+
+    # Seven answers: 1=all, 1=generate, c=custom count, 8=type "8" in
+    # the IntPrompt, 1=standard mix, 1=1 run, 1=0.0 gate.
+    result = runner.invoke(
+        app,
+        ["eval", "--guided"],
+        input="1\n1\nc\n8\n1\n1\n1\n",
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+
+    # The custom row label surfaced.
+    assert "custom — type a number" in combined or "custom" in combined.lower()
+    # Dispatch received the typed count, not a preset.
+    assert len(dispatch_calls) == 1
+    assert dispatch_calls[0]["count"] == 8
+
+
+@pytest.mark.unit
+def test_guided_custom_runs_per_case_typed_by_operator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator picks ``c`` in the runs-per-case prompt and types
+    a specific number (e.g. 4). Same UX as custom count — bypasses
+    the 1/3/5 presets."""
+    _bootstrap(tmp_path, monkeypatch)
+
+    dispatch_calls: list[dict[str, object]] = []
+
+    def fake_run_all(**kwargs: object) -> None:
+        dispatch_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "movate.cli.eval_scorecard_cmd._run_scorecard_all_in_project",
+        fake_run_all,
+    )
+
+    # Seven answers: 1=all, 1=generate, 2=10 cases, 1=standard mix,
+    # c=custom runs, 4=type "4", 1=0.0 gate.
+    result = runner.invoke(
+        app,
+        ["eval", "--guided"],
+        input="1\n1\n2\n1\nc\n4\n1\n",
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+    # Dispatch received the typed runs value, not a preset.
+    assert len(dispatch_calls) == 1
+    assert dispatch_calls[0]["runs_per_case"] == 4
+
+
+@pytest.mark.unit
+def test_guided_custom_count_clamps_to_safe_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Typing a number outside [1, 100] for cases (or [1, 10] for
+    runs) gets clamped, not rejected — operators who expect
+    "more thorough" by typing 500 get a useful default instead
+    of a re-prompt loop."""
+    _bootstrap(tmp_path, monkeypatch)
+
+    dispatch_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "movate.cli.eval_scorecard_cmd._run_scorecard_all_in_project",
+        lambda **kwargs: dispatch_calls.append(kwargs),
+    )
+
+    # 1=all, 1=generate, c=custom count, 500=type "500" (will clamp
+    # to 100), 1=standard mix, 1=1 run, 1=0.0 gate.
+    result = runner.invoke(
+        app,
+        ["eval", "--guided"],
+        input="1\n1\nc\n500\n1\n1\n1\n",
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(dispatch_calls) == 1
+    # Clamped to the upper bound (100) rather than re-prompting.
+    assert dispatch_calls[0]["count"] == 100
+
+
+@pytest.mark.unit
 def test_eval_precheck_passes_when_one_key_is_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
