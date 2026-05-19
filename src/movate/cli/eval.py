@@ -624,9 +624,10 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
     console.print(
         Panel(
             "[bold]mdk eval — guided setup[/bold]\n"
-            "[dim]Five questions; press Ctrl-C any time to quit. "
-            "The resolved command is shown before it runs so you can "
-            "copy-paste it next time.[/dim]",
+            "[dim]A few questions; press Ctrl-C any time to quit. "
+            "We generate fresh test cases first (via LLM), then ask "
+            "how strictly to score them. The resolved command is shown "
+            "before it runs so you can copy-paste it next time.[/dim]",
             border_style="cyan",
             title_align="left",
         )
@@ -674,6 +675,16 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
     # `--mock` CLI flag). Defaulting to real-provider drops one prompt
     # without losing functionality.
     use_mock = False
+
+    # Q2 (NEW): Generate fresh test cases.
+    # Operators of the scorecard workflow expect the wizard to produce
+    # cases on the fly, not score against a pre-existing dataset.jsonl.
+    # If the agent has an existing dataset, ask whether to keep or
+    # regenerate (regeneration overwrites in place). In --all mode we
+    # skip the per-agent prompt and just leave existing datasets alone
+    # — too many decisions otherwise.
+    if chosen_agent != "all" and not _prompt_generate_cases(cwd, chosen_agent):
+        return None
 
     # Q3: Gate threshold.
     gate_choices = {
@@ -804,6 +815,173 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
         baseline_file=baseline_file_arg,
         output_baseline=output_baseline_arg,
     )
+
+
+def _prompt_generate_cases(cwd: Path, agent_name: str) -> bool:
+    """Wizard step: offer to generate fresh test cases via LLM.
+
+    Returns False on Ctrl-C / quit; True otherwise (including when
+    the operator chooses to keep an existing dataset). Side effect:
+    writes generated cases to ``agents/<agent>/evals/dataset.jsonl``
+    when the operator opts to regenerate.
+
+    Two flows:
+
+    * No existing dataset → default to "generate fresh". Ask count
+      + mix, then run generation showing progress.
+    * Existing dataset → ask whether to keep or regenerate. Keep is
+      the safe default (regeneration overwrites in place).
+
+    Reuses :func:`movate.cli.eval_gen_cmd._generate_entries` so the
+    generation logic stays in one place. Falls back gracefully if the
+    agent can't be loaded — wizard continues with whatever dataset
+    is already there.
+    """
+    dataset_path = cwd / "agents" / agent_name / "evals" / "dataset.jsonl"
+    existing_count = _count_dataset_rows(dataset_path) if dataset_path.is_file() else 0
+
+    console.print()
+    if existing_count > 0:
+        console.print(
+            f"[bold]Test cases?[/bold]  "
+            f"[dim](existing dataset has {existing_count} case(s) "
+            f"at {dataset_path.relative_to(cwd)})[/dim]"
+        )
+        choices = {
+            "1": ("keep", f"keep existing dataset ({existing_count} cases)"),
+            "2": ("generate", "generate fresh cases via LLM (overwrites dataset)"),
+        }
+        default = "1"
+    else:
+        console.print(
+            "[bold]Test cases?[/bold]  [dim](no dataset found — recommend generating)[/dim]"
+        )
+        choices = {
+            "1": ("generate", "generate fresh cases via LLM"),
+            "2": ("keep", "skip generation (eval against empty dataset)"),
+        }
+        default = "1"
+
+    for key, (_, label) in choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {label}")
+    try:
+        action_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(choices.keys()),
+            default=default,
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return False
+
+    if choices[action_idx][0] == "keep":
+        return True
+
+    return _do_generate_cases(cwd, agent_name, dataset_path)
+
+
+def _count_dataset_rows(dataset_path: Path) -> int:
+    """Number of non-blank lines in a JSONL dataset, or 0 on read error."""
+    try:
+        return sum(1 for line in dataset_path.read_text().splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
+def _do_generate_cases(cwd: Path, agent_name: str, dataset_path: Path) -> bool:
+    """Drive the count + mix sub-prompts, then run generation.
+
+    Returns False on Ctrl-C / quit; True on success or on a generation
+    error (the wizard continues with whatever dataset exists so the
+    operator can still proceed to scoring)."""
+    # Sub-Q: count.
+    count_choices = {
+        "1": (5, "5 cases — fast iteration / quick demo"),
+        "2": (10, "10 cases — recommended for first pass"),
+        "3": (25, "25 cases — tighter coverage, more tokens"),
+        "4": (50, "50 cases — exhaustive sweep"),
+    }
+    console.print()
+    console.print("[bold]How many cases?[/bold]")
+    for key, (n, label) in count_choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {n}  [dim]{label}[/dim]")
+    try:
+        count_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(count_choices.keys()),
+            default="2",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return False
+    count = count_choices[count_idx][0]
+
+    # Sub-Q: mix.
+    mix_choices = {
+        "1": ("standard", "typical happy-path inputs"),
+        "2": ("edge", "boundary / malformed / max-length inputs"),
+        "3": ("adversarial", "red-team / prompt injection / jailbreak attempts"),
+        "4": ("domain", "KB-aware — seeded from agent's contexts + knowledge files"),
+    }
+    console.print()
+    console.print("[bold]Which mix?[/bold]")
+    for key, (m, label) in mix_choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {m}  [dim]{label}[/dim]")
+    try:
+        mix_idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(mix_choices.keys()),
+            default="1",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return False
+    mix = mix_choices[mix_idx][0]
+
+    # Run generation.
+    console.print()
+    console.print(f"[dim]Generating {count} {mix} cases for [bold]{agent_name}[/bold]…[/dim]")
+    try:
+        from movate.cli.eval_gen_cmd import _generate_entries  # noqa: PLC0415
+        from movate.core.loader import AgentLoadError, load_agent  # noqa: PLC0415
+
+        bundle = load_agent(cwd / "agents" / agent_name)
+        entries = asyncio.run(
+            _generate_entries(
+                bundle,
+                num=count,
+                sample_input=None,
+                mock=False,
+                with_dimensions=False,
+                mode=mix,
+            )
+        )
+        if not entries:
+            err_console.print(
+                "[yellow]⚠[/yellow] generation produced no cases — "
+                "continuing with existing dataset (if any)"
+            )
+            return True
+
+        # Write entries to dataset.jsonl. Existing file (if any) is
+        # overwritten — the operator opted into that path explicitly.
+        dataset_path.parent.mkdir(parents=True, exist_ok=True)
+        dataset_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        console.print(
+            f"[green]✓[/green] wrote {len(entries)} cases to "
+            f"[bold]{dataset_path.relative_to(cwd)}[/bold]"
+        )
+    except AgentLoadError as exc:
+        err_console.print(
+            f"[yellow]⚠[/yellow] could not load agent for generation: {exc}. "
+            "Continuing with existing dataset (if any)."
+        )
+    except Exception as exc:
+        err_console.print(
+            f"[yellow]⚠[/yellow] case generation failed ({type(exc).__name__}: "
+            f"{exc}). Continuing with existing dataset (if any)."
+        )
+    return True
 
 
 def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflects the per-agent state machine
