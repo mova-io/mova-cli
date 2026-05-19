@@ -33,6 +33,7 @@ from movate.core.models import (
     ErrorInfo,
     EvalRecord,
     FailureRecord,
+    FeedbackRecord,
     JobKind,
     JobRecord,
     JobStatus,
@@ -188,6 +189,31 @@ ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scope TEXT;
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active
     ON api_keys(tenant_id) WHERE revoked_at IS NULL;
+
+-- Operator feedback on runs. Captured by the Chainlit playground
+-- (or any client POSTing to /api/v1/runs/{id}/feedback). Mirrored
+-- to Langfuse as a score when Langfuse is configured.
+CREATE TABLE IF NOT EXISTS run_feedback (
+    feedback_id        TEXT PRIMARY KEY,
+    run_id             TEXT NOT NULL,
+    tenant_id          TEXT NOT NULL,
+    agent              TEXT NOT NULL,
+    user_id            TEXT NOT NULL,
+    score              SMALLINT NOT NULL,
+    dimensions         JSONB,
+    comment            TEXT,
+    langfuse_score_id  TEXT,
+    created_at         TIMESTAMPTZ NOT NULL
+);
+-- Per-run lookup (playground re-opening a rated run).
+CREATE INDEX IF NOT EXISTS idx_run_feedback_run_id
+    ON run_feedback(run_id);
+-- Per-agent + time aggregation (dashboard: "agent X over last 30d").
+CREATE INDEX IF NOT EXISTS idx_run_feedback_agent_created
+    ON run_feedback(agent, created_at DESC);
+-- Per-tenant listing (analytics scoped to a workspace).
+CREATE INDEX IF NOT EXISTS idx_run_feedback_tenant_created
+    ON run_feedback(tenant_id, created_at DESC);
 """
 
 
@@ -796,6 +822,78 @@ class PostgresProvider:
             for r in rows
         ]
 
+    # ------------------------------------------------------------------
+    # Run feedback (Chainlit playground writes here)
+    # ------------------------------------------------------------------
+
+    async def save_feedback(self, feedback: FeedbackRecord) -> None:
+        # ON CONFLICT: operators can edit their feedback (replace
+        # score / comment / dimensions). The primary key is the
+        # feedback_id so re-saving with the same id updates in place.
+        # ``run_id`` + ``tenant_id`` + ``agent`` + ``user_id`` +
+        # ``created_at`` are intentionally NOT updated on conflict —
+        # those identify the feedback row's provenance and shouldn't
+        # mutate post-create.
+        await self._db.execute(
+            """
+            INSERT INTO run_feedback (
+                feedback_id, run_id, tenant_id, agent, user_id,
+                score, dimensions, comment, langfuse_score_id, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (feedback_id) DO UPDATE
+                SET score = EXCLUDED.score,
+                    dimensions = EXCLUDED.dimensions,
+                    comment = EXCLUDED.comment,
+                    langfuse_score_id = EXCLUDED.langfuse_score_id
+            """,
+            feedback.feedback_id,
+            feedback.run_id,
+            feedback.tenant_id,
+            feedback.agent,
+            feedback.user_id,
+            feedback.score,
+            feedback.dimensions,
+            feedback.comment,
+            feedback.langfuse_score_id,
+            feedback.created_at,
+        )
+
+    async def list_feedback(
+        self,
+        *,
+        run_id: str | None = None,
+        agent: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FeedbackRecord]:
+        # Build WHERE clauses dynamically — keeps the indexed paths
+        # (run_id, agent+created_at, tenant_id+created_at) usable
+        # depending on which filters are set.
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            params.append(run_id)
+            clauses.append(f"run_id = ${len(params)}")
+        if agent is not None:
+            params.append(agent)
+            clauses.append(f"agent = ${len(params)}")
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
+        if user_id is not None:
+            params.append(user_id)
+            clauses.append(f"user_id = ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        sql = (
+            "SELECT feedback_id, run_id, tenant_id, agent, user_id, score, "
+            "dimensions, comment, langfuse_score_id, created_at "
+            "FROM run_feedback" + where + " ORDER BY created_at DESC LIMIT $" + str(len(params))
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_feedback(r) for r in rows]
+
     async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
         # ``date_trunc('month', now() at time zone 'utc')`` returns the
         # 1st-of-month UTC. The ``metrics->>'cost_usd'`` extraction is
@@ -895,6 +993,22 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         notify_email=row["notify_email"],
         attempt_count=row["attempt_count"],
         next_retry_at=row["next_retry_at"],
+    )
+
+
+def _row_to_feedback(row: asyncpg.Record) -> FeedbackRecord:
+    row_dict = dict(row)
+    return FeedbackRecord(
+        feedback_id=row_dict["feedback_id"],
+        run_id=row_dict["run_id"],
+        tenant_id=row_dict["tenant_id"],
+        agent=row_dict["agent"],
+        user_id=row_dict["user_id"],
+        score=row_dict["score"],
+        dimensions=row_dict.get("dimensions"),
+        comment=row_dict.get("comment"),
+        langfuse_score_id=row_dict.get("langfuse_score_id"),
+        created_at=row_dict["created_at"],
     )
 
 

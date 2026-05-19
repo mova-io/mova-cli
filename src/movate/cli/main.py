@@ -187,6 +187,7 @@ from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.models_cmd import models_app  # noqa: E402
+from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
@@ -468,6 +469,7 @@ app.add_typer(infra_app, name="infra", rich_help_panel=PANEL_DEPLOY)
 # (both ship things off-host).
 app.add_typer(export_app, name="export", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
+app.add_typer(playground_app, name="playground", rich_help_panel=PANEL_DEPLOY)
 
 # ----- Manage ---------------------------------------------------------------
 

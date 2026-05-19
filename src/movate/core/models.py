@@ -1585,5 +1585,89 @@ class ApiKeyRecord(BaseModel):
     (POST/GET/DELETE /api/v1/auth/keys). ``None`` = standard tenant key."""
 
 
+class FeedbackRecord(BaseModel):
+    """Operator-supplied feedback for a single run.
+
+    Captured via the Chainlit playground (or any client that POSTs to
+    ``/api/v1/runs/{run_id}/feedback``). Stored in Postgres for
+    aggregation + analysis. Optionally mirrored to Langfuse as a score
+    attached to the matching trace so traces + feedback can be queried
+    side-by-side in the Langfuse UI.
+
+    The feedback is intentionally schemaless on ``dimensions`` so each
+    agent role can score what matters to it (e.g. RAG agents may
+    capture ``faithfulness`` + ``citation_quality``; lead-qualifier
+    might capture ``next_action_correctness``). The top-level ``score``
+    is the single 👍/👎 (thumbs) or 1-5 (stars) signal that aggregates
+    cleanly across all agents.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    feedback_id: str = Field(default_factory=lambda: uuid4().hex)
+    """Stable id; doubles as the table primary key."""
+
+    run_id: str
+    """References ``runs.run_id``. The run must exist before feedback
+    can be attached — enforced at the endpoint, not the schema."""
+
+    tenant_id: str
+    """Tenant that owns the run. Mirrored on the feedback row so
+    list_feedback can stay tenant-scoped without joining ``runs``."""
+
+    agent: str
+    """Denormalized from the referenced run for fast per-agent
+    aggregation queries. Set at write time; trusts ``runs.agent``."""
+
+    user_id: str
+    """Identity of the operator giving feedback. Azure AD object_id /
+    email / SSO subject — whatever the auth layer surfaces. Free-text
+    in the schema to keep auth-mechanism choice open."""
+
+    score: int
+    """Single composite signal. Two conventions supported:
+
+    * ``-1`` = 👎, ``+1`` = 👍 (binary thumbs)
+    * ``1..5`` = star rating
+
+    Callers stay consistent within their UI; aggregation queries
+    bucket on the convention they care about. Validation pins to
+    ``[-1, 5]`` (covers both shapes without forcing a discriminator
+    column)."""
+
+    dimensions: dict[str, float] | None = None
+    """Optional per-dimension scores keyed by free-text dimension name
+    (``{"helpfulness": 0.8, "accuracy": 1.0, "format": 0.6}``). Each
+    value is a float in [0, 1] by convention. JSONB in Postgres so
+    queries can pivot any dimension without schema migrations."""
+
+    comment: str | None = None
+    """Optional free-text comment from the operator. The most useful
+    field for qualitative analysis — sample these for tuning the
+    agent's prompt or refining the eval rubric."""
+
+    langfuse_score_id: str | None = None
+    """When Langfuse is configured AND a trace exists for the run,
+    the feedback is mirrored as a Langfuse score and the returned id
+    is persisted here. Lets the dashboard cross-link Postgres rows
+    back to Langfuse traces."""
+
+    created_at: datetime = Field(default_factory=_now)
+
+    @field_validator("score")
+    @classmethod
+    def _score_in_range(cls, v: int) -> int:
+        """Accept the two supported conventions: ``-1`` / ``+1`` thumbs
+        OR ``1..5`` stars. Any other value (e.g. 0, 6, -5) is rejected
+        at the schema layer so bad clients fail fast."""
+        # Thumbs: -1 or +1. Stars: 2-5 (1 already covered as "thumbs up").
+        star_min, star_max = 2, 5
+        if v in (-1, 1) or star_min <= v <= star_max:
+            return v
+        raise ValueError(
+            f"score must be -1 (thumbs down), 1 (thumbs up), or 1-5 (star rating); got {v}"
+        )
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

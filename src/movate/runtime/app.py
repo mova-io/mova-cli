@@ -72,6 +72,9 @@ from movate.runtime.schemas import (
     EvalListView,
     EvalScorecardView,
     EvalSubmission,
+    FeedbackListView,
+    FeedbackSubmission,
+    FeedbackView,
     HealthView,
     JobListView,
     JobView,
@@ -737,6 +740,127 @@ def build_app(
         if record is None:
             raise not_found("run", run_id)
         return RunView.from_record(record)
+
+    # ------------------------------------------------------------------
+    # Run feedback (Chainlit playground / operators rating outputs) —
+    # 0.8.2.11. Two endpoints: POST creates / updates a feedback row;
+    # GET lists feedback for a run so the UI can re-open prior ratings.
+    #
+    # Lives on the pre-v1 unversioned path because clients tend to
+    # treat feedback as part of the run resource (same tenancy +
+    # auth shape as ``GET /runs/{id}``).
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/runs/{run_id}/feedback",
+        response_model=FeedbackView,
+        status_code=201,
+        tags=["runs", "feedback"],
+    )
+    async def post_run_feedback(
+        run_id: str,
+        submission: FeedbackSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> FeedbackView:
+        """Create (or update) an operator feedback row for ``run_id``.
+
+        Auth: the authenticated tenant must own the underlying run —
+        404 on cross-tenant attempts (mirrors ``GET /runs/{id}``).
+
+        ``user_id`` precedence: when the auth context carries an
+        identity (sub claim / Azure AD object_id), it wins over any
+        ``user_id`` the client supplied. When auth is anonymous
+        (dev mode), the client-supplied ``user_id`` is used; if
+        neither is set, the row is rejected with 422.
+
+        Feedback is persisted via ``StorageProvider.save_feedback``
+        with upsert semantics (same ``feedback_id`` overwrites). When
+        Langfuse is configured AND the run has a trace, the score is
+        also pushed to Langfuse via ``langfuse.score()`` and the
+        returned id is stored alongside the row.
+        """
+        from movate.core.models import FeedbackRecord  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_run(run_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            # Tenant-scoped 404 — never leak that the run exists for
+            # another tenant. Mirrors GET /runs/{id} above.
+            raise not_found("run", run_id)
+
+        # User identity: auth context wins. Falls back to client-
+        # supplied user_id only when the context has no identity
+        # (e.g. dev mode with auth disabled).
+        ctx_identity = getattr(ctx, "user_id", None) or getattr(ctx, "subject", None)
+        user_id = ctx_identity or submission.user_id
+        if not user_id:
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "feedback requires a user_id — either authenticate or pass "
+                    "``user_id`` in the request body (dev mode only)."
+                ),
+            )
+
+        feedback = FeedbackRecord(
+            run_id=run_id,
+            tenant_id=ctx.tenant_id,
+            agent=record.agent,
+            user_id=user_id,
+            score=submission.score,
+            dimensions=submission.dimensions,
+            comment=submission.comment,
+        )
+
+        # Best-effort Langfuse mirror — when the tracer is the Langfuse
+        # variant, push the feedback as a trace-level score. Never let
+        # a Langfuse failure block the feedback save (the row is the
+        # source of truth; Langfuse is the analytics cross-link).
+        tracer = getattr(request.app.state, "tracer", None)
+        if tracer is not None:
+            push = getattr(tracer, "push_run_feedback_score", None)
+            if callable(push):
+                try:
+                    langfuse_score_id = await push(record, feedback)
+                    if langfuse_score_id:
+                        feedback.langfuse_score_id = langfuse_score_id
+                except Exception:
+                    # Langfuse client failure: log + proceed. We don't
+                    # have a logger reference here at this layer; the
+                    # tracer's own diagnostics surface it.
+                    pass
+
+        await store.save_feedback(feedback)
+        return FeedbackView.from_record(feedback)
+
+    @app.get(
+        "/runs/{run_id}/feedback",
+        response_model=FeedbackListView,
+        tags=["runs", "feedback"],
+    )
+    async def list_run_feedback(
+        run_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 100,
+    ) -> FeedbackListView:
+        """List feedback for ``run_id``, newest-first. Tenant-scoped:
+        404 if the run doesn't belong to the authenticated tenant.
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_run(run_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("run", run_id)
+        rows = await store.list_feedback(
+            run_id=run_id,
+            tenant_id=ctx.tenant_id,
+            limit=int(limit),
+        )
+        views = [FeedbackView.from_record(r) for r in rows]
+        return FeedbackListView(feedback=views, count=len(views))
 
     # ------------------------------------------------------------------
     # /api/v1/* — versioned API surface for the Mova iO Angular front

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -19,6 +20,7 @@ from movate.core.models import (
     ErrorInfo,
     EvalRecord,
     FailureRecord,
+    FeedbackRecord,
     JobKind,
     JobRecord,
     JobStatus,
@@ -212,6 +214,33 @@ _MIGRATIONS = [
     # v0.8: permission scope. NULL = standard tenant key;
     # "fleet-admin" = admin-only endpoint access.
     "ALTER TABLE api_keys ADD COLUMN scope TEXT",
+    # 0.8.2.11: operator feedback on runs. Chainlit playground writes
+    # here; the analytics dashboard reads. Sqlite uses TEXT for the
+    # JSONB-equivalent dimensions column (we serialize via json.dumps
+    # on save + json.loads on read, same pattern as runs.metrics).
+    """
+    CREATE TABLE IF NOT EXISTS run_feedback (
+        feedback_id        TEXT PRIMARY KEY,
+        run_id             TEXT NOT NULL,
+        tenant_id          TEXT NOT NULL,
+        agent              TEXT NOT NULL,
+        user_id            TEXT NOT NULL,
+        score              INTEGER NOT NULL,
+        dimensions         TEXT,
+        comment            TEXT,
+        langfuse_score_id  TEXT,
+        created_at         TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_run_feedback_run_id ON run_feedback(run_id)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_run_feedback_agent_created "
+        "ON run_feedback(agent, created_at DESC)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_run_feedback_tenant_created "
+        "ON run_feedback(tenant_id, created_at DESC)"
+    ),
 ]
 
 
@@ -804,6 +833,90 @@ class SqliteProvider:
                 monthly_usd_limit=r["monthly_usd_limit"],
                 created_at=datetime.fromisoformat(r["created_at"]),
                 updated_at=datetime.fromisoformat(r["updated_at"]),
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Run feedback (Chainlit playground writes here)
+    # ------------------------------------------------------------------
+
+    async def save_feedback(self, feedback: FeedbackRecord) -> None:
+        # INSERT OR REPLACE: operators can edit their feedback. The
+        # primary key is feedback_id; same-id re-saves overwrite.
+        # ``dimensions`` is JSON-serialized to TEXT (sqlite has no
+        # native JSON column — matches the runs.metrics pattern).
+        import json as _json  # noqa: PLC0415
+
+        dims = _json.dumps(feedback.dimensions) if feedback.dimensions is not None else None
+        await self._db.execute(
+            """
+            INSERT OR REPLACE INTO run_feedback (
+                feedback_id, run_id, tenant_id, agent, user_id,
+                score, dimensions, comment, langfuse_score_id, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                feedback.feedback_id,
+                feedback.run_id,
+                feedback.tenant_id,
+                feedback.agent,
+                feedback.user_id,
+                feedback.score,
+                dims,
+                feedback.comment,
+                feedback.langfuse_score_id,
+                feedback.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def list_feedback(
+        self,
+        *,
+        run_id: str | None = None,
+        agent: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FeedbackRecord]:
+        import json as _json  # noqa: PLC0415
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if agent is not None:
+            clauses.append("agent = ?")
+            params.append(agent)
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        sql = (
+            "SELECT feedback_id, run_id, tenant_id, agent, user_id, score, "
+            "dimensions, comment, langfuse_score_id, created_at "
+            "FROM run_feedback" + where + " ORDER BY created_at DESC LIMIT ?"
+        )
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            FeedbackRecord(
+                feedback_id=r["feedback_id"],
+                run_id=r["run_id"],
+                tenant_id=r["tenant_id"],
+                agent=r["agent"],
+                user_id=r["user_id"],
+                score=r["score"],
+                dimensions=(_json.loads(r["dimensions"]) if r["dimensions"] else None),
+                comment=r["comment"],
+                langfuse_score_id=r["langfuse_score_id"],
+                created_at=datetime.fromisoformat(r["created_at"]),
             )
             for r in rows
         ]

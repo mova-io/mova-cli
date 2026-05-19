@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.10"
+version = "0.8.2.11"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -85,6 +85,26 @@ github = [
     # running JUST the runtime + github integration (no Teams) only
     # install what they need.
     "cryptography>=42",
+]
+playground = [
+    # Chainlit gives us a Python-native chat/form UI for testing
+    # deployed agents from a browser. Operators run
+    # ``mdk playground serve --runtime-url ...`` to launch it; the
+    # UI renders an input form per agent (from agent.yaml's input
+    # schema), POSTs to the runtime's /run endpoint, and captures
+    # 👍/👎/comment feedback that the runtime persists to Postgres.
+    #
+    # Version range deliberately loose (>=1.3): Chainlit pulls in
+    # specific FastAPI / starlette pins that conflict with the
+    # [teams] extra at narrower ranges. Operators installing the
+    # playground typically install JUST playground (not with teams)
+    # — pin tighter only if the floor version surfaces breakage.
+    "chainlit>=1.3",
+    # httpx is the async HTTP client used to call the runtime API.
+    # It's already a transitive dep via FastAPI on the runtime side,
+    # but operators running JUST the playground (no runtime) need it
+    # explicitly listed.
+    "httpx>=0.27",
 ]
 
 [dependency-groups]
@@ -172,6 +192,7 @@ module = [
     "langfuse.*",
     "opentelemetry.*",
     "asyncpg.*",
+    "chainlit.*",
 ]
 ignore_missing_imports = true
 
@@ -196,11 +217,17 @@ module = [
     "movate.cli.memory_cmd",
     "movate.cli.menu_cmd",
     "movate.cli.models_cmd",
+    "movate.cli.playground",
     "movate.cli.run",
     "movate.cli.simulate_cmd",
     "movate.cli.tune_cmd",
     "movate.core.skill_backend.agent",
     "movate.fmt.formatter",
+    # Chainlit's decorator-heavy API has no type stubs; the playground
+    # app module is a thin glue layer over those decorators. Adding to
+    # the grandfather list keeps strict-mode on the rest of the
+    # codebase while letting Chainlit's untyped decorators work.
+    "movate.playground.app",
     "movate.knowledge.loader",
     "movate.snapshot.manifest",
     "movate.templates.calc_agent.skills.calculator.impl",
@@ -216,6 +243,8 @@ disable_error_code = [
     "operator",
     "unused-ignore",
     "import-untyped",
+    # Chainlit's decorators are untyped (no stubs available).
+    "untyped-decorator",
 ]
 
 [tool.pytest.ini_options]
