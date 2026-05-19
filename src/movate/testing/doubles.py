@@ -15,6 +15,7 @@ from movate.core.models import (
     ApiKeyRecord,
     EvalRecord,
     FailureRecord,
+    FeedbackRecord,
     JobRecord,
     JobStatus,
     RunRecord,
@@ -47,6 +48,7 @@ class InMemoryStorage:
         self.jobs: list[JobRecord] = []
         self.api_keys: list[ApiKeyRecord] = []
         self.tenant_budgets: dict[str, TenantBudget] = {}
+        self.feedback: list[FeedbackRecord] = []
 
     async def init(self) -> None:
         return None
@@ -336,6 +338,34 @@ class InMemoryStorage:
                 continue
             total += run.metrics.cost_usd
         return total
+
+    async def save_feedback(self, feedback: FeedbackRecord) -> None:
+        # In-memory upsert: replace any existing row with the same
+        # feedback_id (matches Postgres ON CONFLICT and sqlite INSERT
+        # OR REPLACE semantics).
+        self.feedback = [f for f in self.feedback if f.feedback_id != feedback.feedback_id]
+        self.feedback.append(feedback)
+
+    async def list_feedback(
+        self,
+        *,
+        run_id: str | None = None,
+        agent: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FeedbackRecord]:
+        rows = self.feedback
+        if run_id is not None:
+            rows = [f for f in rows if f.run_id == run_id]
+        if agent is not None:
+            rows = [f for f in rows if f.agent == agent]
+        if tenant_id is not None:
+            rows = [f for f in rows if f.tenant_id == tenant_id]
+        if user_id is not None:
+            rows = [f for f in rows if f.user_id == user_id]
+        rows = sorted(rows, key=lambda f: f.created_at, reverse=True)
+        return rows[: int(limit)]
 
     async def close(self) -> None:
         return None

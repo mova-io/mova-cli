@@ -15,9 +15,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from movate.core.models import ErrorInfo, JobKind, JobRecord, JobStatus, Metrics, RunRecord
+from movate.core.models import (
+    ErrorInfo,
+    FeedbackRecord,
+    JobKind,
+    JobRecord,
+    JobStatus,
+    Metrics,
+    RunRecord,
+)
 
 
 class RunSubmission(BaseModel):
@@ -1087,6 +1095,9 @@ __all__ = [
     "EvalListView",
     "EvalScorecardView",
     "EvalSubmission",
+    "FeedbackListView",
+    "FeedbackSubmission",
+    "FeedbackView",
     "HealthView",
     "JobListView",
     "JobView",
@@ -1098,3 +1109,94 @@ __all__ = [
     "SkillCreatedView",
     "WizardAgentSubmission",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Feedback (Chainlit playground — added 2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+class FeedbackSubmission(BaseModel):
+    """Payload for ``POST /api/v1/runs/{run_id}/feedback``.
+
+    ``user_id`` is set server-side from the authenticated context when
+    auth is on — the client must NOT supply one. If your deployment
+    doesn't require auth (rare in production), the client supplies
+    ``user_id`` directly. The endpoint enforces this either way.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(
+        ...,
+        description="Thumbs (-1 or +1) OR star rating (1-5). Other values rejected.",
+    )
+    dimensions: dict[str, float] | None = Field(
+        default=None,
+        description="Optional per-dimension scores (e.g. {helpfulness: 0.8}). Each value in [0,1].",
+    )
+    comment: str | None = Field(
+        default=None,
+        max_length=4000,
+        description="Optional free-text comment.",
+    )
+    user_id: str | None = Field(
+        default=None,
+        description="Operator id. Optional — auth context overrides this when present.",
+    )
+
+    @field_validator("score")
+    @classmethod
+    def _score_in_range(cls, v: int) -> int:
+        """Mirror FeedbackRecord's validator at the HTTP boundary so
+        bad scores surface as 422 (validation error) instead of 500
+        (downstream pydantic error during record construction).
+        """
+        star_min, star_max = 2, 5
+        if v in (-1, 1) or star_min <= v <= star_max:
+            return v
+        raise ValueError(
+            f"score must be -1 (thumbs down), 1 (thumbs up), or 1-5 (star rating); got {v}"
+        )
+
+
+class FeedbackView(BaseModel):
+    """Response shape after creating / listing feedback. 1:1 with
+    :class:`movate.core.models.FeedbackRecord`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feedback_id: str
+    run_id: str
+    tenant_id: str
+    agent: str
+    user_id: str
+    score: int
+    dimensions: dict[str, float] | None = None
+    comment: str | None = None
+    langfuse_score_id: str | None = None
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, record: FeedbackRecord) -> FeedbackView:
+        return cls(
+            feedback_id=record.feedback_id,
+            run_id=record.run_id,
+            tenant_id=record.tenant_id,
+            agent=record.agent,
+            user_id=record.user_id,
+            score=record.score,
+            dimensions=record.dimensions,
+            comment=record.comment,
+            langfuse_score_id=record.langfuse_score_id,
+            created_at=record.created_at,
+        )
+
+
+class FeedbackListView(BaseModel):
+    """Multiple feedback rows for a run (or filtered query)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feedback: list[FeedbackView]
+    count: int

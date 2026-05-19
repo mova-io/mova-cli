@@ -30,6 +30,7 @@ from movate.core.models import (
     ApiKeyRecord,
     EvalRecord,
     FailureRecord,
+    FeedbackRecord,
     JobRecord,
     JobStatus,
     RunRecord,
@@ -288,6 +289,30 @@ class StorageProvider(Protocol):
         against the budget; the cost-drift + per-run budget checks
         later in execute() are independent of this. Index on
         ``(tenant_id, created_at)`` is the perf path.
+        """
+
+    # ------------------------------------------------------------------
+    # Run feedback (added 2026-05-19) — Chainlit playground writes here.
+    # ------------------------------------------------------------------
+
+    async def save_feedback(self, feedback: FeedbackRecord) -> None:
+        """Persist a :class:`FeedbackRecord`. Idempotent on
+        ``feedback_id``: re-saving the same id updates score / comment
+        / dimensions in place (operators can edit their feedback).
+        """
+
+    async def list_feedback(
+        self,
+        *,
+        run_id: str | None = None,
+        agent: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[FeedbackRecord]:
+        """List feedback rows ordered created_at DESC. Filters AND
+        together. Used by the analytics dashboard + by the playground
+        when the operator re-opens a run they previously rated.
         """
 
     async def close(self) -> None: ...
