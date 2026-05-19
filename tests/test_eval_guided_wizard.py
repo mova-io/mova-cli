@@ -108,79 +108,102 @@ def test_guided_picks_single_agent_gate_07_runs_3(
 
 
 @pytest.mark.unit
-def test_guided_single_agent_generate_dispatches_to_scorecard(
+def test_guided_single_agent_generate_previews_and_dispatches_to_scorecard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Gap 1: picking "generate fresh" in the wizard must dispatch to
-    the scorecard flow (10-category rubric), NOT the legacy gate /
-    runs / baseline dispatch. The 10-cat rubric pairs naturally with
-    LLM-generated cases; gate/runs/baseline questions don't map onto
-    it. So:
+    """Picking "generate fresh" in the wizard runs the preview flow
+    (PR #212): generate cases NOW, show them in a Rich table, ask
+    continue/regenerate/cancel, ask gate threshold, then dispatch
+    to ``_run_scorecard_single_agent`` with the approved cases
+    pre-generated.
 
-    * The wizard SKIPS the gate / runs / baseline prompts entirely
-      when "generate" is picked.
-    * ``eval_scorecard`` is called with the chosen count + mix.
-    * Generation happens exactly once (inside the scorecard) — the
-      wizard itself does not call _generate_entries (avoiding the
-      double-generation a naive design would produce).
+    Before PR #212 the wizard skipped the gate question + did NOT
+    generate (the scorecard generated internally later). Both
+    invariants reversed:
 
-    Pin all three behaviors so a future refactor can't regress the
-    scorecard dispatch."""
+    * Wizard now ASKS the gate threshold even in scorecard mode
+      (operator wants one knob for CI gating).
+    * Wizard now CALLS ``_generate_entries`` once (for the preview).
+      The scorecard receives those entries via ``pre_generated_entries``
+      and skips its own generation — so total generation count is
+      still ONE (no double-gen).
+    """
     _bootstrap(tmp_path, monkeypatch)
 
-    # Mock the scorecard entry point so we don't need API keys + so
-    # we can assert the wizard dispatches to it with the right kwargs.
-    scorecard_calls: list[dict[str, object]] = []
+    # Mock the orchestrator the wizard now dispatches to directly
+    # (post-PR #212 — was ``eval_scorecard`` Typer command before).
+    dispatch_calls: list[dict[str, object]] = []
 
-    def fake_eval_scorecard(**kwargs: object) -> None:
-        scorecard_calls.append(kwargs)
+    def fake_run_scorecard_single_agent(**kwargs: object) -> None:
+        dispatch_calls.append(kwargs)
 
-    monkeypatch.setattr("movate.cli.eval_scorecard_cmd.eval_scorecard", fake_eval_scorecard)
+    monkeypatch.setattr(
+        "movate.cli.eval_scorecard_cmd._run_scorecard_single_agent",
+        fake_run_scorecard_single_agent,
+    )
 
-    # Pin that the OLD generation path is NOT invoked from the wizard
-    # (that would mean double-generation).
+    # Track generator invocations — the wizard NOW calls
+    # _generate_entries once (for the preview); the scorecard
+    # receives the result via pre_generated_entries.
     gen_calls: list[object] = []
 
-    async def fake_generate_entries(*args: object, **kwargs: object) -> list[object]:
+    async def fake_generate_entries(*args: object, **kwargs: object) -> list[dict[str, object]]:
         gen_calls.append(kwargs)
-        return []
+        # Return a realistic-shaped entry so the preview table can
+        # render + the operator's "continue" choice has something
+        # to forward to the scorecard.
+        return [
+            {"input": {"question": f"q{i}"}, "expected": {"answer": f"a{i}"}} for i in range(10)
+        ]
 
     monkeypatch.setattr("movate.cli.eval_gen_cmd._generate_entries", fake_generate_entries)
+    # The wizard imports _generate_entries inside the preview helper;
+    # patch that namespace too so the import resolves to the fake.
+    monkeypatch.setattr(
+        "movate.cli.eval._generate_cases_for_preview",
+        # Use a thin re-import wrapper so the test doesn't need to
+        # know the helper's internal _resolve_generator_model call.
+        lambda bundle, *, count, mix, mock, project_root: fake_generate_entries(
+            bundle, num=count, mode=mix, mock=mock
+        ),
+    )
 
-    # Four answers: 2=faq, 2=generate fresh, 2=10 cases, 1=standard mix.
-    # (Note: no gate/runs/baseline answers needed — the wizard skips
-    # those questions when scorecard mode is selected.)
+    # Six answers: 2=faq, 2=generate, 2=10 cases, 1=standard mix,
+    # 1=continue (after preview table), 3=gate 0.7 (CI default).
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="2\n2\n2\n1\n",
+        input="2\n2\n2\n1\n1\n3\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
     assert result.exit_code == 0, combined
-    # Scorecard sub-prompts surfaced.
+
+    # Wizard sub-prompts all surfaced.
     assert "Test cases?" in combined
     assert "How many cases?" in combined
     assert "Which mix?" in combined
-    # Gate/runs/baseline questions did NOT surface in scorecard mode.
-    assert "Gate threshold?" not in combined, (
-        "scorecard branch must skip the gate/runs/baseline questions"
-    )
+    # NEW: preview "Looks good?" + gate threshold prompts.
+    assert "Looks good?" in combined
+    assert "Gate threshold?" in combined
+    # Runs / Baseline questions still skipped (scorecard doesn't
+    # have those concepts — only the gate carries over).
     assert "Runs per case?" not in combined
     assert "Baseline behavior?" not in combined
-    # Scorecard dispatch happened exactly once with the chosen params.
-    assert len(scorecard_calls) == 1, f"expected one dispatch, got {scorecard_calls}"
-    call = scorecard_calls[0]
+
+    # Dispatch fired exactly once, against the right agent, with
+    # pre_generated_entries forwarded + gates carrying the 0.7 floor.
+    assert len(dispatch_calls) == 1, f"expected one dispatch, got {dispatch_calls}"
+    call = dispatch_calls[0]
     assert call["count"] == 10
     assert call["mix"] == "standard"
-    assert call["agent"].endswith("agents/faq")
-    # Wizard itself did NOT call _generate_entries — that would be
-    # double-generation (scorecard does it once internally).
-    assert len(gen_calls) == 0, (
-        "wizard should NOT call _generate_entries directly when "
-        "dispatching to scorecard — generation belongs inside the "
-        "scorecard flow exactly once"
-    )
+    assert call["agent_path_str"].endswith("agents/faq")
+    # Pre-generated entries forwarded → no double-generation.
+    assert call["pre_generated_entries"] is not None
+    assert len(call["pre_generated_entries"]) == 10
+    # Gate config carries the operator's 0.7 choice on the overall
+    # composite (matches PR #212's ``GateConfig(overall=...)`` shape).
+    assert call["gates"].overall == 0.7
 
 
 @pytest.mark.unit
