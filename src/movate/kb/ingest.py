@@ -55,22 +55,26 @@ class IngestSummary:
 def find_files(path: Path) -> list[Path]:
     """Return all ingestible files under ``path``.
 
-    Directory: walks recursively, returns .md + .txt files.
-    File: returns [path] if its extension is supported, else [].
-    Symlinks resolved; hidden directories (``.git``, ``.venv``) skipped.
+    Directory: walks recursively, returns files whose extension is
+    in :data:`movate.kb.parsers.SUPPORTED_EXTENSIONS`
+    (.md / .markdown / .txt / .pdf as of PR-G).
+    File: returns ``[path]`` if its extension is supported, else
+    ``[]``. Symlinks resolved; hidden directories (``.git``,
+    ``.venv``) skipped.
     """
+    from movate.kb.parsers import SUPPORTED_EXTENSIONS  # noqa: PLC0415 — keep parsers import lazy
+
     if not path.exists():
         return []
-    supported = {".md", ".txt", ".markdown"}
     if path.is_file():
-        return [path] if path.suffix.lower() in supported else []
+        return [path] if path.suffix.lower() in SUPPORTED_EXTENSIONS else []
 
     out: list[Path] = []
     for p in sorted(path.rglob("*")):
         # Skip dotted directories (.git, .venv, etc.) and dotted files.
         if any(part.startswith(".") for part in p.relative_to(path).parts):
             continue
-        if p.is_file() and p.suffix.lower() in supported:
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
             out.append(p)
     return out
 
@@ -117,8 +121,21 @@ async def _ingest_one_file(
     embedding_model: str,
     api_key: str | None,
 ) -> IngestSummary | None:
-    text = file_path.read_text(encoding="utf-8")
+    """Read + parse + ingest a single file.
+
+    Dispatches via :func:`movate.kb.parsers.parse_document` so PDFs
+    + future formats flow through the same code path as plain text.
+    Parser failures (corrupt PDF, encrypted PDF, non-UTF8 .txt)
+    return ``None`` — the orchestrator skips silently rather than
+    surfacing one bad file as a batch-wide error.
+    """
+    from movate.kb.parsers import parse_document  # noqa: PLC0415 — keep parsers import lazy
+
+    content = file_path.read_bytes()
     source = str(file_path.resolve())
+    text = parse_document(file_path.name, content)
+    if text is None:
+        return None
     return await ingest_text(
         storage=storage,
         text=text,

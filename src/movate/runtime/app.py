@@ -1578,8 +1578,11 @@ def build_app(
         ``(agent, tenant_id, content_hash)`` constraint — re-uploading
         the same document is a no-op).
 
-        Supported extensions: ``.md``, ``.markdown``, ``.txt``.
-        Files with unsupported extensions get ``status="skipped"``
+        Supported extensions: ``.md``, ``.markdown``, ``.txt``,
+        ``.pdf`` (text-based PDFs only — scanned-image PDFs need
+        OCR, deferred to a future extras flag). Files with
+        unsupported extensions OR parser failures (corrupt PDF,
+        non-UTF-8 text, encrypted PDF) get ``status="skipped"``
         in the per-file result but the overall upload still returns
         200 — the operator sees the mix instead of getting a 400 that
         blocks the whole batch.
@@ -1617,14 +1620,20 @@ def build_app(
             raise not_found("agent", name)
 
         store: StorageProvider = request.app.state.storage
-        supported = {".md", ".markdown", ".txt"}
+
+        # Dispatch table for per-extension parsers lives in
+        # ``movate.kb.parsers`` — extends to PDF (PR-G) and future
+        # DOCX / HTML without touching the endpoint code.
+        from movate.kb.parsers import (  # noqa: PLC0415 — lazy: KB upload path only
+            is_supported_extension,
+            parse_document,
+        )
 
         per_file: list[KbIngestFileResult] = []
         total_saved = 0
         for upload in files:
             raw_name = (upload.filename or "").lstrip("/")
             basename = Path(raw_name).name
-            ext = Path(basename).suffix.lower()
             if not basename:
                 # Unnamed multipart part — skip silently with a
                 # placeholder source so the operator sees something.
@@ -1635,7 +1644,7 @@ def build_app(
                     )
                 )
                 continue
-            if ext not in supported:
+            if not is_supported_extension(basename):
                 per_file.append(
                     KbIngestFileResult(
                         source=basename,
@@ -1644,11 +1653,11 @@ def build_app(
                 )
                 continue
             raw = await upload.read()
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                # Non-UTF8 file — skip rather than 400, so a single
-                # bad encoding doesn't sink a 10-file upload.
+            text = parse_document(basename, raw)
+            if text is None:
+                # Parser returned None — corrupt PDF, non-UTF8 .txt,
+                # encrypted PDF, scanned-image PDF, etc. Skip the
+                # file rather than 400'ing the whole batch.
                 per_file.append(
                     KbIngestFileResult(
                         source=basename,

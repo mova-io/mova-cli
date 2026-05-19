@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.19"
+version = "0.8.2.20"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -22,6 +22,14 @@ dependencies = [
     "aiosqlite>=0.20",
     "structlog>=24.1",
     "jsonschema>=4.21",
+    # PDF text extraction for KB ingest. Pure-Python, ~250KB on disk,
+    # no system-level dependencies. Handles text-based PDFs (NOT
+    # scanned-image PDFs — that needs OCR, deferred to a separate
+    # extras flag). Listed as a core dep rather than a [pdf] extra
+    # because the alternative — "drag a PDF into Chainlit, get a
+    # cryptic ImportError" — is bad UX for the operator's first
+    # encounter with the KB upload flow.
+    "pypdf>=4.0,<6",
 ]
 
 [project.optional-dependencies]
@@ -245,6 +253,14 @@ disable_error_code = [
     "import-untyped",
     # Chainlit's decorators are untyped (no stubs available).
     "untyped-decorator",
+    # Chainlit's Message.send / AskFileMessage.send are also untyped.
+    # The grandfather override above already covers the playground app,
+    # but mypy strict-mode flags every `await msg.send()` call there.
+    "no-untyped-call",
+    # Chainlit's Action signature in newer versions tightened; cl.Action(
+    # value=..., description=...) raises call-arg even though the runtime
+    # accepts both. Until Chainlit ships stubs, suppress.
+    "call-arg",
 ]
 
 [tool.pytest.ini_options]
