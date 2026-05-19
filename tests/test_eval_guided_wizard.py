@@ -26,12 +26,26 @@ runner = CliRunner(mix_stderr=False)
 def _bootstrap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Init a project + add one agent. Returns project root.
 
-    Also injects a fake ``OPENAI_API_KEY`` into the test env so the
-    new pre-flight check (PR added 2026-05-19) — which requires at
-    least one of OpenAI / Anthropic to be configured — passes
-    without forcing CI to provide real keys. The value only needs
-    to be non-empty; downstream calls are mocked in each test."""
+    Injects a fake ``OPENAI_API_KEY`` into the test env so the
+    pre-flight check (PR #215) passes without forcing CI to provide
+    real keys. Also stubs ``verify_provider_key`` to return OK so
+    the stricter live-verify pre-flight (added 2026-05-19) doesn't
+    block tests with a "key rejected" panel — that strictness is
+    exactly the thing we WANT in production, but in tests the fake
+    key would always fail a real verify call against OpenAI."""
+    from movate.cli import auth as auth_mod  # noqa: PLC0415
+    from movate.credentials.verify import VerifyResult  # noqa: PLC0415
+
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key-for-precheck-only")
+    # Stub the verifier so live-verify returns OK without HTTP.
+    monkeypatch.setattr(
+        "movate.credentials.verify_provider_key",
+        lambda provider, key: VerifyResult(ok=True, detail="OK (test stub)"),
+    )
+    # Clear the per-process verify cache so the new stub is the one
+    # that gets consulted (a prior test in the same session may have
+    # cached a real-verify result before the stub was installed).
+    auth_mod._verify_cache.clear()
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -634,6 +648,90 @@ def test_guided_custom_count_clamps_to_safe_range(
     assert len(dispatch_calls) == 1
     # Clamped to the upper bound (100) rather than re-prompting.
     assert dispatch_calls[0]["count"] == 100
+
+
+@pytest.mark.unit
+def test_eval_precheck_blocks_when_key_set_but_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-verify (added 2026-05-19): a key that's SET but the
+    provider rejects on a metadata probe (e.g. a stale stub like
+    ``sk-test-*2345`` lingering in the shell) must block eval at
+    the pre-flight rather than letting the operator walk through
+    5+ wizard prompts and then hit AuthError mid-generation."""
+    from movate.cli import auth as auth_mod  # noqa: PLC0415
+    from movate.credentials.verify import VerifyResult  # noqa: PLC0415
+
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    # Set ONE key (openai) but make verify reject it.
+    empty_creds = tmp_path / "empty-credentials"
+    empty_creds.write_text("")
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(empty_creds))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-rejected-2345")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(
+        "movate.credentials.verify_provider_key",
+        lambda provider, key: VerifyResult(ok=False, detail="401 Unauthorized — key rejected"),
+    )
+
+    # Non-TTY (CliRunner): no place to prompt, should exit 2 directly.
+    result = runner.invoke(
+        app,
+        ["eval", "--all", "--gate", "0.0"],
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    # The new rejected-keys panel surfaces.
+    assert "All configured LLM keys rejected" in combined or "rejected" in combined.lower(), (
+        combined
+    )
+    # Hint points at the fix.
+    assert "mdk auth login" in combined
+
+
+@pytest.mark.unit
+def test_eval_precheck_passes_when_one_key_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At least one verified key (added 2026-05-19) → eval proceeds.
+    The auto-detect downstream routes around rejected providers."""
+    from movate.cli import auth as auth_mod  # noqa: PLC0415
+    from movate.credentials.verify import VerifyResult  # noqa: PLC0415
+
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-works")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(
+        "movate.credentials.verify_provider_key",
+        lambda provider, key: VerifyResult(ok=True, detail="OK — 47 models available"),
+    )
+
+    # --mock so we don't actually call an LLM; the test asserts the
+    # pre-flight live-verify let us through, NOT eval results.
+    result = runner.invoke(
+        app,
+        ["eval", "--all", "--mock", "--gate", "0.0"],
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    # Neither panel fires — at least one key verified.
+    assert "No OpenAI or Anthropic key configured" not in combined
+    assert "All configured LLM keys rejected" not in combined
 
 
 @pytest.mark.unit

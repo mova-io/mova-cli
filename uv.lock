@@ -1661,7 +1661,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "0.8.2.5"
+version = "0.8.2.6"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
