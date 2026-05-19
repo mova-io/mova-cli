@@ -36,8 +36,11 @@ def _bootstrap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from movate.cli import auth as auth_mod  # noqa: PLC0415
     from movate.credentials.verify import VerifyResult  # noqa: PLC0415
 
+    # Set BOTH keys so the stricter "BOTH required" pre-flight passes
+    # (2026-05-19). Stub verify to OK so the live-verify probe doesn't
+    # actually hit OpenAI / Anthropic with these fake values.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key-for-precheck-only")
-    # Stub the verifier so live-verify returns OK without HTTP.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-test-key-for-precheck-only")
     monkeypatch.setattr(
         "movate.credentials.verify_provider_key",
         lambda provider, key: VerifyResult(ok=True, detail="OK (test stub)"),
@@ -513,8 +516,11 @@ def test_eval_warns_and_exits_when_no_provider_key_in_non_tty(
     result = runner.invoke(app, ["eval", "--all"], env={"COLUMNS": "200"})
     combined = result.stdout + result.stderr
     assert result.exit_code == 2, combined
-    # Warning panel surfaced.
-    assert "No OpenAI or Anthropic key configured" in combined or "no LLM" in combined.lower()
+    # New "BOTH required" panel surfaces (2026-05-19).
+    assert (
+        "Eval needs BOTH OpenAI and Anthropic" in combined
+        or "BOTH OpenAI and Anthropic" in combined
+    )
     # Hint points at the fix.
     assert "mdk auth login" in combined
 
@@ -545,12 +551,12 @@ def test_eval_skips_precheck_under_mock(tmp_path: Path, monkeypatch: pytest.Monk
     )
     combined = result.stdout + result.stderr
     # Pre-flight warning panel must NOT fire under --mock.
-    assert "No OpenAI or Anthropic key configured" not in combined
+    assert "Eval needs BOTH" not in combined
     # Eval ran (or attempted to run) past the precheck.
     assert result.exit_code in (0, 2), combined  # 0 = pass, 2 = mock data missing
     # If it failed, it's NOT because of the precheck.
     if result.exit_code != 0:
-        assert "mdk auth login" not in combined or "No OpenAI" not in combined
+        assert "mdk auth login" not in combined or "BOTH" not in combined
 
 
 @pytest.mark.unit
@@ -662,11 +668,11 @@ def test_guided_custom_count_clamps_to_safe_range(
 def test_eval_precheck_blocks_when_key_set_but_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Live-verify (added 2026-05-19): a key that's SET but the
-    provider rejects on a metadata probe (e.g. a stale stub like
-    ``sk-test-*2345`` lingering in the shell) must block eval at
-    the pre-flight rather than letting the operator walk through
-    5+ wizard prompts and then hit AuthError mid-generation."""
+    """Live-verify: a key that's SET but the provider rejects on a
+    metadata probe (e.g. a stale stub like ``sk-test-*2345`` lingering
+    in the shell) must block eval at the pre-flight rather than letting
+    the operator walk through 5+ wizard prompts and then hit AuthError
+    mid-generation."""
     from movate.cli import auth as auth_mod  # noqa: PLC0415
     from movate.credentials.verify import VerifyResult  # noqa: PLC0415
 
@@ -697,20 +703,21 @@ def test_eval_precheck_blocks_when_key_set_but_rejected(
     )
     combined = result.stdout + result.stderr
     assert result.exit_code == 2, combined
-    # The new rejected-keys panel surfaces.
-    assert "All configured LLM keys rejected" in combined or "rejected" in combined.lower(), (
-        combined
-    )
+    # New "BOTH required" panel surfaces (2026-05-19).
+    assert "Eval needs BOTH OpenAI and Anthropic" in combined or "BOTH" in combined, combined
     # Hint points at the fix.
     assert "mdk auth login" in combined
 
 
 @pytest.mark.unit
-def test_eval_precheck_passes_when_one_key_verifies(
+def test_eval_precheck_blocks_when_only_one_key_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """At least one verified key (added 2026-05-19) → eval proceeds.
-    The auto-detect downstream routes around rejected providers."""
+    """Strictness lifted 2026-05-19: ONE verified key is NO LONGER
+    enough. Eval needs BOTH OpenAI AND Anthropic because the
+    scorecard's LLM-as-judge runs in a different family from the
+    case generator to defeat same-family bias. With only OpenAI
+    verified (Anthropic unset), pre-flight must block."""
     from movate.cli import auth as auth_mod  # noqa: PLC0415
     from movate.credentials.verify import VerifyResult  # noqa: PLC0415
 
@@ -721,12 +728,54 @@ def test_eval_precheck_passes_when_one_key_verifies(
     monkeypatch.chdir(proj)
     result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
+    empty_creds = tmp_path / "empty-credentials"
+    empty_creds.write_text("")
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(empty_creds))
     monkeypatch.setenv("OPENAI_API_KEY", "sk-works")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(
         "movate.credentials.verify_provider_key",
-        lambda provider, key: VerifyResult(ok=True, detail="OK — 47 models available"),
+        lambda provider, key: VerifyResult(ok=True, detail="OK"),
+    )
+
+    # Non-TTY: should exit 2 with the BOTH-required panel.
+    result = runner.invoke(
+        app,
+        ["eval", "--all", "--gate", "0.0"],
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    # Panel names BOTH providers; anthropic shows as not configured.
+    assert "Eval needs BOTH OpenAI and Anthropic" in combined or "BOTH" in combined, combined
+    assert "anthropic" in combined.lower()
+    # Hint points at the missing one specifically.
+    assert "mdk auth login anthropic" in combined
+
+
+@pytest.mark.unit
+def test_eval_precheck_passes_when_both_keys_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both verified (2026-05-19) → eval proceeds with no warning."""
+    from movate.cli import auth as auth_mod  # noqa: PLC0415
+    from movate.credentials.verify import VerifyResult  # noqa: PLC0415
+
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    # Set BOTH keys + stub verify to OK for both.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-works")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-works")
+    auth_mod._verify_cache.clear()
+    monkeypatch.setattr(
+        "movate.credentials.verify_provider_key",
+        lambda provider, key: VerifyResult(ok=True, detail="OK"),
     )
 
     # --mock so we don't actually call an LLM; the test asserts the
@@ -737,18 +786,16 @@ def test_eval_precheck_passes_when_one_key_verifies(
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
-    # Neither panel fires — at least one key verified.
-    assert "No OpenAI or Anthropic key configured" not in combined
-    assert "All configured LLM keys rejected" not in combined
+    # No panel fires — both keys verified.
+    assert "Eval needs BOTH" not in combined
 
 
 @pytest.mark.unit
-def test_eval_precheck_passes_when_one_key_is_set(
+def test_eval_precheck_proceeds_under_mock_even_if_only_one_key_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If at least one of OpenAI / Anthropic is configured, the
-    pre-flight check is silent + eval proceeds. The auto-detect
-    handles routing around whichever provider is missing."""
+    """``--mock`` skips the pre-flight entirely, so one-key-only
+    setups still work for offline iteration (no real LLM calls)."""
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
@@ -760,13 +807,12 @@ def test_eval_precheck_passes_when_one_key_is_set(
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    # Use --mock so we don't actually try to call an LLM; the test
-    # is about the pre-flight check passing, not about eval results.
+    # --mock skips the pre-flight, so one-key-only is fine.
     result = runner.invoke(
         app,
         ["eval", "--all", "--mock", "--gate", "0.0"],
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
-    # No pre-flight panel — at least one key configured.
-    assert "No OpenAI or Anthropic key configured" not in combined
+    # No pre-flight panel — --mock skipped the check entirely.
+    assert "Eval needs BOTH" not in combined
