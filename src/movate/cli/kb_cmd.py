@@ -293,6 +293,20 @@ def search(
             "No extra API cost (BM25 runs locally)."
         ),
     ),
+    rewrite: int = typer.Option(
+        0,
+        "--rewrite",
+        min=0,
+        max=8,
+        help=(
+            "Expand the query into N alternative paraphrases via a "
+            "small LLM, run retrieval for each, fuse the rankings "
+            "with RRF. Catches vague queries that miss specific KB "
+            "terminology (e.g. 'refunds?' → KB chunks talking about "
+            "'return policy'). Adds ~200ms latency + ~$0.0001/query. "
+            "Stacks with --hybrid. 0 = disabled (default)."
+        ),
+    ),
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
@@ -303,7 +317,9 @@ def search(
     Default mode is vector-only (cosine similarity over OpenAI
     embeddings). ``--hybrid`` adds a parallel BM25 lexical search
     + reciprocal rank fusion; recommended for queries containing
-    product names, error codes, or other rare terms.
+    product names, error codes, or other rare terms. ``--rewrite N``
+    fans out across N+1 LLM-generated paraphrases — best on vague
+    or under-specified questions.
     """
     import os  # noqa: PLC0415
 
@@ -325,6 +341,7 @@ def search(
                 limit=k,
                 api_key=api_key,
                 hybrid=hybrid,
+                rewrite_variants=rewrite,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
@@ -337,7 +354,10 @@ def search(
             )
             return
 
-        mode_label = "[bold magenta]hybrid[/bold magenta]" if hybrid else "vector"
+        mode_parts = ["hybrid" if hybrid else "vector"]
+        if rewrite > 0:
+            mode_parts.append(f"rewrite={rewrite}")
+        mode_label = f"[bold magenta]{' + '.join(mode_parts)}[/bold magenta]"
         table = Table(
             title=(
                 f'[bold]Top {len(results)} chunks[/bold] for "[italic]{question}[/italic]"'
