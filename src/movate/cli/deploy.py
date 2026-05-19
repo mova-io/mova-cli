@@ -926,23 +926,50 @@ def _render_post_deploy_next_steps(
     input so the example actually exercises the agent's real schema
     (falls back to ``{"text":"..."}`` if no dataset row is available).
 
+    The curl block is intentionally emitted WITHOUT Rich markup
+    (uses ``markup=False``) — color is decoration only, but operators
+    want to copy this verbatim into a shell. Two ways the old
+    markup-wrapped form bit operators:
+
+    * ``\\[/cyan]`` made Rich's parser treat ``\\[`` as an escape
+      for the literal bracket, so the close tag never fired and
+      ``[/cyan]`` ended up in the rendered output → zsh threw
+      ``no matches found: [/cyan]`` when pasted.
+    * Even when markup parsed correctly, terminals that don't
+      render ANSI escapes (CI logs, pipes, ``script -q``) saw the
+      raw escape sequences in the curl body.
+
+    The JSON body is shell-quoted via :func:`shlex.quote` so
+    apostrophes in the dataset rows (e.g. ``"We're evaluating…"``)
+    don't break the single-quote wrap. ``shlex.quote`` produces
+    POSIX-portable output that works in bash, zsh, sh.
+
     Previously emitted ``mdk submit`` invocations + ``mdk jobs list``
     hints, but operators consistently wanted curl — it's portable
     across shells, scriptable in any language, and doesn't require
     a working ``mdk`` install on the box doing the inference.
     """
+    import shlex  # noqa: PLC0415
+
     err.print("[bold]Next:[/bold] run inference against the deployed runtime")
     err.print()
 
     for agent_name in sorted(uploaded):
         sample_input_json = _sample_input_for_agent(project_root, agent_name)
         body = json.dumps({"agent": agent_name, "input": json.loads(sample_input_json)})
-        err.print(f"  [dim]# {agent_name}[/dim]")
+        # shlex.quote returns a POSIX-safe shell-quoted string that
+        # round-trips through any POSIX shell. For typical JSON it
+        # produces 'json-here'; for JSON containing apostrophes it
+        # produces a four-segment dance (close, escape, open) that
+        # works correctly across bash/zsh/sh.
+        body_shell = shlex.quote(body)
+        err.print(f"  # {agent_name}", markup=False)
         err.print(
-            f"  [cyan]curl -sS -X POST {base_url}/run \\[/cyan]\n"
-            f"  [cyan]  -H 'content-type: application/json' \\[/cyan]\n"
-            f'  [cyan]  -H "x-api-key: ${key_env}" \\[/cyan]\n'
-            f"  [cyan]  -d [/cyan][yellow]'{body}'[/yellow]"
+            f"  curl -sS -X POST {base_url}/run \\\n"
+            f"    -H 'content-type: application/json' \\\n"
+            f'    -H "x-api-key: ${key_env}" \\\n'
+            f"    -d {body_shell}",
+            markup=False,
         )
         err.print()
 

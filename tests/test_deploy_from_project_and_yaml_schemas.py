@@ -835,6 +835,74 @@ def test_post_deploy_block_renders_all_agents_alphabetically(
 
 
 @pytest.mark.unit
+def test_post_deploy_block_emits_no_rich_markup_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an earlier rev wrapped each curl line in
+    ``[cyan]…\\[/cyan]`` for styling. Rich's parser saw ``\\[`` as
+    an escape for the literal bracket, so the close tag never fired
+    and ``[/cyan]`` ended up as literal text in the rendered output.
+    Operators who copy-pasted into a shell got
+    ``zsh: no matches found: [/cyan]``.
+
+    Pin the regression: the curl block must contain ZERO ``[/cyan]``
+    or ``[cyan]`` substrings in the rendered output."""
+    (tmp_path / "agents" / "alpha").mkdir(parents=True)
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["alpha"],
+        project_root=tmp_path,
+    )
+
+    assert "[/cyan]" not in out, "Rich close tag leaked as literal text"
+    assert "[cyan]" not in out, "Rich open tag leaked as literal text"
+    assert "[/yellow]" not in out
+    assert "[yellow]" not in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_shell_quotes_apostrophes_in_dataset_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: when dataset rows contain apostrophes (e.g.
+    ``"We're evaluating MDK"``), wrapping the JSON body in single
+    quotes naively cuts the body at every internal apostrophe —
+    zsh hangs on ``dquote>`` waiting for the matching quote.
+
+    Fix: shlex.quote the body so apostrophes get the POSIX-portable
+    ``'\\''`` escape (close-quote, escaped-apostrophe, open-quote).
+    Round-trips through bash, zsh, sh — verified separately by
+    piping the rendered output through real shells."""
+    agent = tmp_path / "agents" / "lead-qualifier"
+    (agent / "evals").mkdir(parents=True)
+    (agent / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"name": "Sarah", "message": '
+        '"We\\u0027re evaluating MDK. It\\u0027s promising."}}\n'
+    )
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["lead-qualifier"],
+        project_root=tmp_path,
+    )
+
+    # The POSIX-portable apostrophe escape is `'"'"'` (close-quote,
+    # double-quoted-apostrophe, open-quote). Pin that the output
+    # uses this idiom rather than the broken naive form.
+    assert "'\"'\"'" in out, (
+        "shlex.quote should produce the POSIX '\\\"'\\\"' escape for "
+        "embedded apostrophes — got naive single-quote wrap that "
+        "would break shell parsing"
+    )
+    # And the original apostrophe-containing text shouldn't appear
+    # in its raw single-quoted form (which would be broken).
+    assert "'We're evaluating" not in out
+
+
+@pytest.mark.unit
 def test_post_deploy_block_renders_on_successful_e2e_deploy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
