@@ -171,11 +171,25 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+
       - name: Bump patch version
         id: bump
         run: |
           new_version=$(python scripts/bump_version.py)
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh uv.lock with new package version
+        # The bump touches pyproject.toml's [project].version; without
+        # also regenerating uv.lock the next CI run fails the lockfile
+        # freshness gate (`uv lock --check`) and silently skips the
+        # next auto-bump (and any other lint-and-test-dependent job).
+        # `uv lock` recomputes the lockfile in place — for a version-
+        # only bump this is fast because no dependency graph changes.
+        run: uv lock
 
       - name: Open + auto-merge bump PR
         env:
@@ -196,7 +210,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add pyproject.toml src/movate/__init__.py
+          git add pyproject.toml src/movate/__init__.py uv.lock
           git commit -m "chore: bump version to ${new_version} [skip ci]"
           git push origin "$branch"
 
