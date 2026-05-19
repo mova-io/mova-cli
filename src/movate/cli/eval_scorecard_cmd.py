@@ -429,6 +429,7 @@ async def _run_scorecard(
     project_root: Path | None = None,
     effective: EffectiveCategories | None = None,
     remote_client: Any = None,
+    pre_generated_entries: list[dict[str, Any]] | None = None,
 ) -> ScorecardSummary:
     """End-to-end: generate cases, run agent, score, aggregate.
 
@@ -447,7 +448,16 @@ async def _run_scorecard(
     runtime is STILL built — we need its provider (for the LLM
     judge), storage (trace + eval-record persistence), and tracer.
     Only the agent-execution seam changes. ``None`` (default) =
-    in-process execution exactly as before."""
+    in-process execution exactly as before.
+
+    ``pre_generated_entries`` (optional) skips the internal
+    ``_generate_entries`` call and uses the provided list instead.
+    Powers ``mdk eval``'s guided wizard preview flow: the wizard
+    generates + shows the cases in a table for operator approval,
+    then dispatches to the scorecard with the same entries (avoids
+    double-generation that would otherwise produce different cases
+    than what the operator saw). Each entry must have ``input`` +
+    ``expected`` keys, matching ``_generate_entries`` shape."""
     if effective is None:
         effective = _resolve_effective_categories()
     # KB seeds: domain-mix wants generated cases grounded in the
@@ -468,18 +478,26 @@ async def _run_scorecard(
                 "agent's contexts)."
             )
 
-    # Step 1: generate test cases via the existing eval-gen primitives.
-    # Returns entries with .input and .expected (the agent's response).
-    entries = await _generate_entries(
-        bundle,
-        num=count,
-        sample_input=None,
-        mock=mock,
-        with_dimensions=False,
-        mode=mix,
-        kb_seeds=kb_seeds,
-        generator_model=generator_model,
-    )
+    # Step 1: generate test cases via the existing eval-gen primitives,
+    # OR adopt pre-generated entries the caller already produced (e.g.
+    # the ``mdk eval`` wizard's preview-then-confirm flow).
+    if pre_generated_entries is not None:
+        # Wizard-preview path: the entries the operator just saw in
+        # the Rich preview table ARE the entries we score. Skip the
+        # generator call entirely — re-generating would produce a
+        # DIFFERENT set of cases than what the operator approved.
+        entries = pre_generated_entries
+    else:
+        entries = await _generate_entries(
+            bundle,
+            num=count,
+            sample_input=None,
+            mock=mock,
+            with_dimensions=False,
+            mode=mix,
+            kb_seeds=kb_seeds,
+            generator_model=generator_model,
+        )
     if not entries:
         # Surface a clear hint rather than the empty Exit(2). The most
         # common cause is missing API keys for the agent's declared
@@ -1239,6 +1257,7 @@ async def _run_scorecard_single_async(
     effective: EffectiveCategories | None,
     remote_url: str | None = None,
     remote_api_key: str | None = None,
+    pre_generated_entries: list[dict[str, Any]] | None = None,
 ) -> ScorecardSummary:
     """Async core of the single-agent path — preflight + scorecard
     run in one event loop. See :func:`_run_scorecard_sweep_async`
@@ -1272,6 +1291,7 @@ async def _run_scorecard_single_async(
             project_root=project_root,
             effective=effective,
             remote_client=remote_client,
+            pre_generated_entries=pre_generated_entries,
         )
     finally:
         if remote_client is not None:
@@ -1801,6 +1821,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     remote_url: str | None = None,
     remote_api_key: str | None = None,
     target_name: str | None = None,
+    pre_generated_entries: list[dict[str, Any]] | None = None,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
@@ -1834,7 +1855,10 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     # can re-resolve when a provider's key turns out to be set-but-
     # invalid (e.g. a placeholder ``sk-test-*2345``).
 
-    if output_format == Report.TABLE:
+    if output_format == Report.TABLE and pre_generated_entries is None:
+        # The wizard-preview path already showed + confirmed the cases;
+        # don't print a redundant "Generating ..." line right after the
+        # operator already saw the preview table.
         console.print(
             f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
         )
@@ -1850,6 +1874,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             effective=effective,
             remote_url=remote_url,
             remote_api_key=remote_api_key,
+            pre_generated_entries=pre_generated_entries,
         )
     )
 

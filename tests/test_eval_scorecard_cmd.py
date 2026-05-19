@@ -29,6 +29,7 @@ import typer
 from typer.testing import CliRunner
 
 from movate.cli import eval_scorecard_cmd
+from movate.cli.eval import _render_cases_preview_table, _truncate_json
 from movate.cli.eval_scorecard_cmd import (
     _VALID_MIXES,
     ALL_CATEGORIES,
@@ -4179,3 +4180,250 @@ class TestInlineAuthRecovery:
             )
         # Caller surfaces the standard exit hint.
         assert excinfo.value.exit_code == 2
+
+
+# ---------------------------------------------------------------------------
+# Pre-generated entries (wizard-preview flow, 2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPreGeneratedEntries:
+    """``mdk eval`` wizard generates + previews cases for operator
+    approval, then dispatches to the scorecard with the same cases.
+    The scorecard must skip its internal ``_generate_entries`` call
+    when ``pre_generated_entries`` is provided — otherwise it would
+    score a DIFFERENT set of cases than what the operator saw + ok'd.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_uses_pre_generated_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive ``_run_scorecard`` with explicit pre-generated entries;
+        assert ``_generate_entries`` is NEVER called + the scored
+        cases match the provided entries exactly."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        # If anything calls _generate_entries the test fails — the
+        # whole point of the pre-generated path is to skip it.
+        async def fail_generate(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail(
+                "_generate_entries must not be called when pre_generated_entries is provided"
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._generate_entries", fail_generate)
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                return RunResponse(
+                    status="success",
+                    data={"answer": "stubbed"},
+                    metrics=Metrics(cost_usd=0.0001, latency_ms=42),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        # The wizard previously gathered + showed these entries to
+        # the operator; we pass them through verbatim.
+        pre_generated = [
+            {"input": {"question": "q1"}, "expected": {"answer": "a1"}},
+            {"input": {"question": "q2"}, "expected": {"answer": "a2"}},
+            {"input": {"question": "q3"}, "expected": {"answer": "a3"}},
+        ]
+
+        summary = await _run_scorecard(
+            bundle,
+            count=99,  # deliberately != len(pre_generated) — count is
+            # ignored when entries are provided
+            mix="standard",
+            mock=False,
+            judge_model=None,
+            pre_generated_entries=pre_generated,
+        )
+        # Scorecard scored exactly the 3 cases we passed in.
+        assert summary.count == 3
+        assert len(summary.cases) == 3
+        assert [c.input for c in summary.cases] == [e["input"] for e in pre_generated]
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_still_generates_when_no_pre_entries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: when ``pre_generated_entries`` is None
+        (the default; non-wizard CLI invocations), the scorecard
+        STILL calls _generate_entries as before."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        generate_call_count = 0
+
+        async def counting_generate(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            nonlocal generate_call_count
+            generate_call_count += 1
+            return [{"input": {"q": "x"}, "expected": {"a": "y"}}]
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._generate_entries", counting_generate)
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                return RunResponse(
+                    status="success",
+                    data={"a": "y"},
+                    metrics=Metrics(cost_usd=0.0, latency_ms=10),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        # Default path: no pre-generated entries → must invoke
+        # _generate_entries exactly once.
+        await _run_scorecard(
+            bundle,
+            count=1,
+            mix="standard",
+            mock=False,
+            judge_model=None,
+        )
+        assert generate_call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Wizard preview helpers (2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestWizardPreviewHelpers:
+    """Pure helpers used by the ``mdk eval`` wizard's preview flow:
+    JSON truncation for table cells, table rendering smoke test, and
+    the regenerate/continue/cancel choice mapper."""
+
+    def test_truncate_json_short_values_pass_through(self) -> None:
+
+        assert _truncate_json({"q": "hi"}, max_chars=100) == '{"q": "hi"}'
+        # Empty dict still serializes.
+        assert _truncate_json({}, max_chars=100) == "{}"
+        # ``None`` → empty string (table cell stays clean).
+        assert _truncate_json(None, max_chars=100) == ""
+
+    def test_truncate_json_collapses_whitespace(self) -> None:
+        """Generated JSON may have embedded newlines from the
+        operator's content (e.g. a diff value). Tables can't render
+        raw newlines; collapse them before measuring length."""
+
+        value = {"diff": "line1\nline2\n  line3"}
+        out = _truncate_json(value, max_chars=100)
+        assert "\n" not in out
+        # The diff content is preserved (just whitespace-collapsed).
+        assert "line1" in out
+        assert "line2" in out
+
+    def test_truncate_json_long_values_truncate_with_ellipsis(self) -> None:
+
+        long = {"x": "a" * 500}
+        out = _truncate_json(long, max_chars=50)
+        assert len(out) == 50
+        assert out.endswith("…")
+
+    def test_truncate_json_falls_back_to_str_for_non_serializable(self) -> None:
+        """Some values may be non-JSON-serializable (custom objects,
+        sets). The helper should still return a string."""
+
+        class _Weird:
+            def __str__(self) -> str:
+                return "weird-thing"
+
+        # Pydantic-style objects + sets aren't JSON-serializable.
+        out = _truncate_json({_Weird()}, max_chars=100)
+        assert out  # something rendered, didn't raise
+
+    def test_render_cases_preview_table_renders_without_crashing(self, capsys: Any) -> None:
+        """Smoke test: the table renders with realistic entries +
+        the title carries the count + mix annotation."""
+
+        entries = [
+            {"input": {"question": "What's our refund window?"}, "expected": {"answer": "30 days"}},
+            {"input": {"question": "What's our SSO posture?"}, "expected": None},
+        ]
+        _render_cases_preview_table(entries, mix="standard")
+        captured = capsys.readouterr()
+        out = captured.out + captured.err
+        # Title shows count and mix.
+        assert "2" in out
+        assert "standard" in out
+        # Both inputs render (truncated or not).
+        assert "refund window" in out
+        assert "SSO posture" in out
