@@ -1009,17 +1009,26 @@ def _offer_inline_auth_recovery() -> bool:
     Triggered by the common operator footgun: stale / placeholder /
     never-set provider keys make the auto-detect's retry loop
     exhaust. Rather than dump the exit hint and force the operator
-    to ``Ctrl+C → mdk auth login → re-run``, ask inline: which
-    provider do you want to set up now? Verify + save + inject into
-    the current process's env, then signal the caller to restart
-    the retry loop with the freshly-saved key.
+    to ``Ctrl+C → mdk auth login → re-run``, **delegate to the
+    existing ``mdk auth login`` flow inline** — the operator gets
+    the polished provider picker (with PR #207's live-verify
+    markers showing ``✓ verified`` / ``✗ set but rejected`` per
+    provider), the same key-prompt-and-verify UX, and the same
+    credentials-file save — all without exiting.
 
-    Returns ``True`` if a key was saved (caller should retry).
-    Returns ``False`` if the operator declined OR if we're in a
-    non-TTY context (CI, piped output) where prompting would block.
-    JSON-output mode is the caller's responsibility — this function
-    is only invoked from non-JSON paths.
+    Why delegate instead of reinventing: this used to be a custom
+    prompt with hand-rolled letter choices (``a``/``o``/``s``).
+    ``typer.prompt`` doesn't render Rich markup, so the prompt
+    literally rendered as ``[bold]a[/bold]nthropic`` (raw tags) on
+    operator screens — ugly and confusing. The auth-login flow has
+    the polished picker already, so use it directly.
+
+    Returns ``True`` if a key was saved (caller should re-resolve
+    + retry preflight). Returns ``False`` if the operator declined,
+    verify failed, or we're in a non-TTY context (CI, piped output)
+    where prompting would block.
     """
+    import os  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
     if not sys.stdin.isatty():
@@ -1029,91 +1038,51 @@ def _offer_inline_auth_recovery() -> bool:
 
     err_console.print()
     err_console.print(
-        "[bold yellow]→[/bold yellow] No working LLM provider key found "
-        "(every configured key was rejected by its provider). Would you "
-        "like to set up a key now? This is the same flow as "
-        "[bold]mdk auth login[/bold] — just inline so you don't have to "
-        "exit and re-run."
+        "[bold yellow]→[/bold yellow] No working LLM provider key found. "
+        "Launching [bold]mdk auth login[/bold] inline so you can set "
+        "one up now, then we'll retry the eval automatically."
     )
-    choice = typer.prompt(
-        "Provider to configure ([bold]a[/bold]nthropic / [bold]o[/bold]penai / [bold]s[/bold]kip)",
-        default="a",
-        show_default=False,
-    )
-    normalized = (choice or "").strip().lower()
-    if normalized in {"s", "skip", "n", "no", ""}:
-        return False
-    provider_map = {
-        "a": "anthropic",
-        "anthropic": "anthropic",
-        "o": "openai",
-        "openai": "openai",
-    }
-    provider = provider_map.get(normalized)
-    if provider is None:
-        err_console.print(f"[yellow]→[/yellow] unrecognized choice {choice!r}; skipping.")
-        return False
+    err_console.print()
 
-    return _save_provider_key_interactive(provider)
-
-
-def _save_provider_key_interactive(provider: str) -> bool:
-    """Prompt for + verify + save one provider's API key, then inject
-    it into the current process's ``os.environ`` so the in-flight
-    retry picks it up.
-
-    Returns ``True`` on success. Returns ``False`` on empty input,
-    verification failure (when the network reached the provider),
-    or operator decline of a network-error-then-save-anyway fallback.
-    """
-    import os  # noqa: PLC0415
-
-    from movate.cli.auth import _PROVIDER_TO_ENV_VAR  # noqa: PLC0415
-    from movate.credentials import verify_provider_key  # noqa: PLC0415
+    from movate.cli.auth import login  # noqa: PLC0415
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
-    env_var = _PROVIDER_TO_ENV_VAR.get(provider)
-    if env_var is None:
-        # Shouldn't reach here from the picker, but defensive.
-        err_console.print(f"[red]✗[/red] unknown provider {provider!r}.")
+    # Snapshot credentials BEFORE the login flow so we can tell what
+    # the operator actually saved (the login flow writes one entry;
+    # we diff to find which env var).
+    before = CredentialsStore().read()
+
+    try:
+        # No args → auth login launches its provider picker (the
+        # one with PR #207's live-verify markers showing ``✓
+        # verified`` / ``✗ set but rejected`` per provider).
+        # The Typer command's ``provider: str = typer.Argument(None)``
+        # + ``key: str = typer.Option(None)`` defaults make calling
+        # with no args equivalent to ``mdk auth login`` standalone:
+        # interactive picker, hidden key prompt, live verify, save
+        # to ``~/.movate/credentials``.
+        login()
+    except typer.Exit:
+        # Operator cancelled the picker, entered an empty key, or
+        # verify hard-failed (real 401, not network). Caller will
+        # fall through to the standard exit hint.
         return False
 
-    key = typer.prompt(f"{provider.title()} API key", hide_input=True)
-    key = (key or "").strip()
-    if not key:
-        err_console.print("[yellow]→[/yellow] no key entered; skipping.")
-        return False
+    # Login flow completed — a key was saved to ``~/.movate/credentials``.
+    # The in-flight CLI process's ``os.environ`` may STILL have stale
+    # values: autoload ran at CLI startup BEFORE this prompt fired,
+    # and the operator's shell may have a placeholder export
+    # (e.g. ``OPENAI_API_KEY=sk-test-*****2345``) that blocked
+    # autoload from picking the file value originally. Diff the
+    # credentials file against the snapshot and inject any new/
+    # changed values into ``os.environ`` so the retry loop's
+    # ``_provider_has_key`` lookup sees them.
+    after = CredentialsStore().read()
+    for env_var, value in after.items():
+        before_value = before.get(env_var, "")
+        if value and value.strip() and value != before_value:
+            os.environ[env_var] = value.strip()
 
-    err_console.print("[dim]→ verifying with the provider…[/dim]")
-    result = verify_provider_key(provider, key)
-    if not result.ok:
-        err_console.print(f"[red]✗[/red] {result.detail}")
-        if not result.network_error:
-            # Authentic verification failure (401 etc.) — the key is
-            # wrong. Don't save it.
-            return False
-        # Network glitch — the key MIGHT be valid. Let the operator
-        # decide. Default to NOT saving so a typo doesn't sneak
-        # through.
-        save_anyway = typer.prompt(
-            "Couldn't reach the provider to verify — save the key anyway? [y/N]",
-            default="n",
-            show_default=False,
-        )
-        if not (save_anyway or "").strip().lower().startswith("y"):
-            return False
-    else:
-        err_console.print(f"[green]✓[/green] {result.detail}")
-
-    CredentialsStore().set(env_var, key)
-    # The autoload already ran (at CLI startup, BEFORE this prompt
-    # could possibly fire). Set os.environ directly so the in-flight
-    # retry loop sees the new key without a CLI restart.
-    os.environ[env_var] = key
-    err_console.print(
-        f"[green]✓[/green] saved [bold]{env_var}[/bold] to "
-        f"~/.movate/credentials (mode 0600). Retrying preflight…"
-    )
     return True
 
 

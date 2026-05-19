@@ -45,7 +45,6 @@ from movate.cli.eval_scorecard_cmd import (
 )
 from movate.cli.main import app
 from movate.core.failures import AuthError
-from movate.credentials.verify import VerifyResult
 
 runner = CliRunner(mix_stderr=False)
 
@@ -4052,46 +4051,20 @@ class TestInlineAuthRecovery:
 
     @pytest.mark.no_preflight_stub
     @pytest.mark.asyncio
-    async def test_tty_offers_recovery_user_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Interactive shell + operator chooses ``s`` (skip) → caller
-        emits standard exit hint."""
-        import sys  # noqa: PLC0415
-
-        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
-
-        async def fake_preflight(*, models: set[str], mock: bool) -> None:
-            raise eval_scorecard_cmd._PreflightAuthError(
-                model=next(iter(models)), message="rejected"
-            )
-
-        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
-
-        monkeypatch.setattr(typer, "prompt", lambda *a, **kw: "s")
-
-        with pytest.raises(typer.Exit) as excinfo:
-            await eval_scorecard_cmd._preflight_with_retry(
-                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
-                generator_model_flag=None,
-                mock=False,
-                is_json=False,
-            )
-        assert excinfo.value.exit_code == 2
-
-    @pytest.mark.no_preflight_stub
-    @pytest.mark.asyncio
-    async def test_tty_recovery_saves_key_and_continues(
+    async def test_tty_recovery_delegates_to_auth_login(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Interactive shell + operator picks ``a`` (anthropic) +
-        enters a key → verify succeeds → key saved + injected into
-        env → retry loop continues → preflight ultimately succeeds."""
+        """Interactive shell + operator's stuck preflight invokes the
+        existing ``mdk auth login`` flow (with its polished provider
+        picker carrying PR #207's live-verify markers) — instead of
+        a custom letter-choice prompt that rendered raw Rich markup.
+        After login() saves a key, retry restarts and finds the new
+        provider.
+        """
         import os  # noqa: PLC0415
         import sys  # noqa: PLC0415
 
         monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-        # Save the original ANTHROPIC_API_KEY (if any) so we can
-        # restore after — the test temporarily injects a value.
         original_anthropic = os.environ.get("ANTHROPIC_API_KEY")
 
         configured: set[str] = {"openai"}
@@ -4105,25 +4078,44 @@ class TestInlineAuthRecovery:
             for m in models:
                 if "openai" in m:
                     raise eval_scorecard_cmd._PreflightAuthError(model=m, message="rejected")
-            # Anthropic probe silently passes.
 
         monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
 
-        prompt_responses = iter(["a", "sk-ant-fake-but-passes-verify"])
-        monkeypatch.setattr(typer, "prompt", lambda *a, **kw: next(prompt_responses))
+        # Simulate the ``mdk auth login`` flow: when called with no
+        # provider arg, it would show the picker, prompt for a key,
+        # verify it, and save it. We stub that whole sequence with
+        # a side-effecting fake that updates the credentials file
+        # the same way the real flow would.
+        login_invoked = False
 
-        def fake_verify(provider: str, key: str) -> VerifyResult:
+        def fake_login(
+            provider: str | None = None,
+            key: str | None = None,
+            no_verify: bool = False,
+            save_to: str = "global",
+        ) -> None:
+            nonlocal login_invoked
+            login_invoked = True
+            # Mimic what login() does on success: writes to the
+            # credentials file (via CredentialsStore.set).
             configured.add("anthropic")
-            return VerifyResult(ok=True, detail="OK — messages endpoint reachable")
+            from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
-        monkeypatch.setattr("movate.credentials.verify_provider_key", fake_verify)
+            CredentialsStore().set("ANTHROPIC_API_KEY", "sk-ant-fake-saved-by-login")
 
+        # Stub the CredentialsStore so we don't actually write to
+        # ~/.movate/credentials during tests.
         saved: dict[str, str] = {}
 
         def fake_set(self: Any, key: str, value: str) -> None:
             saved[key] = value
 
+        def fake_read(self: Any) -> dict[str, str]:
+            return dict(saved)
+
         monkeypatch.setattr("movate.credentials.store.CredentialsStore.set", fake_set)
+        monkeypatch.setattr("movate.credentials.store.CredentialsStore.read", fake_read)
+        monkeypatch.setattr("movate.cli.auth.login", fake_login)
 
         try:
             resolved = await eval_scorecard_cmd._preflight_with_retry(
@@ -4132,12 +4124,14 @@ class TestInlineAuthRecovery:
                 mock=False,
                 is_json=False,
             )
-            assert saved.get("ANTHROPIC_API_KEY") == "sk-ant-fake-but-passes-verify"
-            assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-fake-but-passes-verify"
+            # The auth login flow was invoked inline.
+            assert login_invoked, "auth login should be called for recovery"
+            # The newly-saved key got injected into os.environ for
+            # the in-flight retry (autoload already ran at startup).
+            assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-fake-saved-by-login"
+            # Retry succeeded, resolved to the new provider.
             assert resolved == {"faq": "anthropic/claude-haiku-4-5-20251001"}
         finally:
-            # Don't leak the test's fake ANTHROPIC_API_KEY into the
-            # rest of the suite (other tests may inspect env state).
             if original_anthropic is None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
             else:
@@ -4145,9 +4139,13 @@ class TestInlineAuthRecovery:
 
     @pytest.mark.no_preflight_stub
     @pytest.mark.asyncio
-    async def test_tty_recovery_rejects_invalid_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """If verify fails with a real 401 (not network), the bad
-        key is NOT saved — caller falls through to the exit hint."""
+    async def test_tty_recovery_user_cancels_auth_login(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the operator cancels out of the picker (or login()
+        raises typer.Exit for any reason — verify failure, empty
+        key, etc.), the caller falls through to the standard exit
+        hint without retrying."""
         import sys  # noqa: PLC0415
 
         monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
@@ -4160,28 +4158,24 @@ class TestInlineAuthRecovery:
 
         monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
 
-        prompt_responses = iter(["a", "sk-ant-wrong"])
-        monkeypatch.setattr(typer, "prompt", lambda *a, **kw: next(prompt_responses))
+        # Login flow exits with code 2 (e.g. operator hit Ctrl+C
+        # during the key prompt, or verify failed).
+        def fake_login_cancels(
+            provider: str | None = None,
+            key: str | None = None,
+            no_verify: bool = False,
+            save_to: str = "global",
+        ) -> None:
+            raise typer.Exit(code=2)
 
-        def fake_verify_fails(provider: str, key: str) -> VerifyResult:
-            return VerifyResult(ok=False, detail="401 Unauthorized — key rejected")
+        monkeypatch.setattr("movate.cli.auth.login", fake_login_cancels)
 
-        monkeypatch.setattr("movate.credentials.verify_provider_key", fake_verify_fails)
-
-        save_count = 0
-
-        def fake_set(self: Any, key: str, value: str) -> None:
-            nonlocal save_count
-            save_count += 1
-
-        monkeypatch.setattr("movate.credentials.store.CredentialsStore.set", fake_set)
-
-        with pytest.raises(typer.Exit):
+        with pytest.raises(typer.Exit) as excinfo:
             await eval_scorecard_cmd._preflight_with_retry(
                 declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
                 generator_model_flag=None,
                 mock=False,
                 is_json=False,
             )
-        # Bad key was NOT saved.
-        assert save_count == 0
+        # Caller surfaces the standard exit hint.
+        assert excinfo.value.exit_code == 2
