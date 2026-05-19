@@ -55,6 +55,9 @@ async def search(
     rerank: bool = False,
     rerank_model: str | None = None,
     rerank_candidate_multiplier: int = 3,
+    multi_hop: int = 0,
+    multi_hop_model: str | None = None,
+    multi_hop_max_total_chunks: int = 15,
 ) -> list[KbChunkWithScore]:
     """Embed ``question`` + return the top-``limit`` chunks ranked.
 
@@ -83,6 +86,13 @@ async def search(
       that don't actually answer the question. ~200ms latency
       + ~$0.0002/query overhead. Falls back to upstream order on
       any LLM failure.
+    * ``multi_hop > 0``: iterative retrieve → reason → retrieve loop.
+      Each hop runs the full pipeline (the other stages) for the
+      current sub-query, then a planner LLM decides "done" or
+      generates a refined sub-query. Best on questions that chain
+      multiple facts ("how does X interact with Y?"). Caps at
+      ``multi_hop`` hops + ``multi_hop_max_total_chunks`` aggregated
+      chunks. Falls back to single-pass on planner failure.
 
     The ``embedding_model`` MUST match what was used at ingest time —
     different models produce incomparable vector spaces. The storage
@@ -92,6 +102,49 @@ async def search(
     """
     if not question.strip():
         return []
+
+    # Multi-hop wraps the rest of the pipeline. Each hop runs
+    # rewriter + retrieval + RRF + rerank (whatever's enabled) for
+    # the CURRENT sub-query, then asks the planner LLM whether to
+    # continue. Composes with all the other stages — each hop gets
+    # the full retrieval pipeline.
+    if multi_hop > 0:
+        from movate.kb.multi_hop import (  # noqa: PLC0415 — lazy import
+            DEFAULT_TERMINATION_MODEL,
+            multi_hop_search,
+        )
+
+        async def _one_hop(sub_query: str) -> list[KbChunkWithScore]:
+            # Recurse into search() but with multi_hop=0 to avoid
+            # infinite recursion. Each hop gets the full retrieval
+            # stack (vector / hybrid / rewriter / rerank) tuned by
+            # the same flags the caller passed.
+            return await search(
+                storage=storage,
+                question=sub_query,
+                agent=agent,
+                tenant_id=tenant_id,
+                limit=limit,
+                embedding_model=embedding_model,
+                api_key=api_key,
+                hybrid=hybrid,
+                fetch_multiplier=fetch_multiplier,
+                rewrite_variants=rewrite_variants,
+                rewriter_model=rewriter_model,
+                rerank=rerank,
+                rerank_model=rerank_model,
+                rerank_candidate_multiplier=rerank_candidate_multiplier,
+                multi_hop=0,  # break recursion
+            )
+
+        return await multi_hop_search(
+            question=question,
+            retrieve_fn=_one_hop,
+            max_hops=multi_hop,
+            max_total_chunks=multi_hop_max_total_chunks,
+            model=multi_hop_model or DEFAULT_TERMINATION_MODEL,
+            api_key=api_key,
+        )
 
     # Query rewriting expands ``question`` into N+1 variants. The
     # original is always the first variant, even when the rewriter

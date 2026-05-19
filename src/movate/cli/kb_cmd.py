@@ -319,6 +319,20 @@ def search(
             "--hybrid and --rewrite."
         ),
     ),
+    multi_hop: int = typer.Option(
+        0,
+        "--multi-hop",
+        min=0,
+        max=5,
+        help=(
+            "Iterative retrieve → reason → retrieve loop. Each hop "
+            "runs the full retrieval pipeline (--hybrid / --rewrite / "
+            "--rerank apply per-hop), then a planner LLM decides "
+            "'done' or generates a refined sub-query. Best on multi-fact "
+            "questions ('how does X interact with Y?'). Adds N "
+            "planner calls + N retrieval passes. 0 = disabled (default)."
+        ),
+    ),
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
@@ -355,6 +369,7 @@ def search(
                 hybrid=hybrid,
                 rewrite_variants=rewrite,
                 rerank=rerank,
+                multi_hop=multi_hop,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
@@ -372,6 +387,8 @@ def search(
             mode_parts.append(f"rewrite={rewrite}")
         if rerank:
             mode_parts.append("rerank")
+        if multi_hop > 0:
+            mode_parts.append(f"multi-hop={multi_hop}")
         mode_label = f"[bold magenta]{' + '.join(mode_parts)}[/bold magenta]"
         table = Table(
             title=(

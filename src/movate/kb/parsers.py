@@ -159,8 +159,7 @@ def parse_pdf(content: bytes) -> str | None:
         import pypdf  # noqa: PLC0415 — lazy: only paid for when an operator uploads a PDF
     except ImportError:
         logger.warning(
-            "pypdf is not installed — PDF parsing unavailable. "
-            "Install via: uv pip install pypdf"
+            "pypdf is not installed — PDF parsing unavailable. Install via: uv pip install pypdf"
         )
         return None
 
