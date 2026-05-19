@@ -1,6 +1,6 @@
 """Search pipeline: question text → top-K retrieved chunks.
 
-Three composable modes:
+Four composable stages (each opt-in, compounding):
 
 * **Vector-only** (default) — embed the question via the same model
   used at ingest time, return cosine-ranked chunks. Best for
@@ -17,6 +17,13 @@ Three composable modes:
   where the user's wording doesn't match the KB's terminology even
   for the lexical path (e.g. "refunds?" → KB chunks talking about
   "return policy"). Stacks with ``hybrid=True``.
+* **LLM rerank** (``rerank=True``) — fetch a wider candidate pool
+  from the upstream stages (``limit * rerank_candidate_multiplier``),
+  then ask a small LLM to score each candidate's relevance to the
+  query. The reranker corrects "noisy top-K" — chunks with high
+  cosine/BM25 scores that don't actually answer the question.
+  The third stage in the standard retrieve → rerank → generate
+  pipeline.
 
 Powers ``mdk kb search`` (the CLI command) AND the
 ``kb-vector-lookup`` skill (invoked at agent run time).
@@ -45,13 +52,17 @@ async def search(
     fetch_multiplier: int = 4,
     rewrite_variants: int = 0,
     rewriter_model: str | None = None,
+    rerank: bool = False,
+    rerank_model: str | None = None,
+    rerank_candidate_multiplier: int = 3,
 ) -> list[KbChunkWithScore]:
     """Embed ``question`` + return the top-``limit`` chunks ranked.
 
-    Modes (composable — both flags can be active simultaneously):
+    Modes (composable — flags can be combined):
 
-    * ``hybrid=False``, ``rewrite_variants=0`` (default): pure vector
-      / cosine similarity via the storage layer.
+    * ``hybrid=False``, ``rewrite_variants=0``, ``rerank=False``
+      (default): pure vector / cosine similarity via the storage
+      layer.
     * ``hybrid=True``: fetch ``limit * fetch_multiplier`` candidates
       via BOTH vector and BM25 lexical paths, then fuse with
       reciprocal rank fusion (RRF) and return the top ``limit``.
@@ -65,6 +76,13 @@ async def search(
       N+1 ranked lists. The rewriter never blocks retrieval — on
       any LLM failure we degrade to single-query behavior with a
       warning log. Capped at :data:`movate.kb.rewrite.MAX_VARIANTS`.
+    * ``rerank=True``: fetch ``limit * rerank_candidate_multiplier``
+      candidates from the upstream stages, then ask a small LLM
+      to score each by relevance and return the top ``limit``.
+      Catches "noisy top-K" — chunks the upstream stages rank high
+      that don't actually answer the question. ~200ms latency
+      + ~$0.0002/query overhead. Falls back to upstream order on
+      any LLM failure.
 
     The ``embedding_model`` MUST match what was used at ingest time —
     different models produce incomparable vector spaces. The storage
@@ -95,6 +113,12 @@ async def search(
         if not variants:
             variants = [question]
 
+    # When reranking is enabled, fetch a wider candidate pool from
+    # the upstream stages so the reranker has options to choose
+    # from. Default 3x means a 5-result query collects 15 candidates,
+    # which the LLM scores down to the final 5.
+    upstream_limit = limit * rerank_candidate_multiplier if rerank else limit
+
     # Fan-out retrieval: run the configured pipeline once per
     # variant. For the single-variant case (default), this is
     # exactly equivalent to the previous behavior — no LLM call,
@@ -106,7 +130,7 @@ async def search(
             question=variant,
             agent=agent,
             tenant_id=tenant_id,
-            limit=limit,
+            limit=upstream_limit,
             embedding_model=embedding_model,
             api_key=api_key,
             hybrid=hybrid,
@@ -114,16 +138,40 @@ async def search(
         )
         per_variant_results.append(results)
 
-    # Single-variant case: skip the RRF round-trip; just clamp +
-    # return. Preserves byte-for-byte behavior for non-rewriter
-    # callers (so the existing snapshot tests don't shift).
+    # Fuse across variants (single-variant case skips the round-trip).
+    # Output of THIS stage is the candidate set for the reranker
+    # (when enabled) — so we keep the wider ``upstream_limit`` here,
+    # not the final ``limit``.
     if len(per_variant_results) == 1:
-        return per_variant_results[0][:limit]
+        upstream_results = per_variant_results[0][:upstream_limit]
+    else:
+        # Multi-variant case: RRF-fuse across all variant result
+        # lists. Chunks that match multiple variants accumulate
+        # score, so the "agrees across paraphrases" signal floats
+        # to the top.
+        upstream_results = rrf_fuse(*per_variant_results, limit=upstream_limit)
 
-    # Multi-variant case: RRF-fuse across all variant result lists.
-    # Chunks that match multiple variants accumulate score, so the
-    # "agrees across paraphrases" signal floats to the top.
-    return rrf_fuse(*per_variant_results, limit=limit)
+    # Final stage: LLM rerank. The reranker scores each candidate's
+    # relevance to the ORIGINAL question (not rewritten variants —
+    # the user's original phrasing is the source of truth for what
+    # they want answered).
+    if rerank and upstream_results:
+        from movate.kb.rerank import (  # noqa: PLC0415 — lazy import keeps litellm off the default hot path
+            DEFAULT_RERANKER_MODEL,
+            llm_rerank,
+        )
+
+        return await llm_rerank(
+            question=question,
+            candidates=upstream_results,
+            limit=limit,
+            model=rerank_model or DEFAULT_RERANKER_MODEL,
+            api_key=api_key,
+        )
+
+    # No rerank: clamp the upstream results to the final limit
+    # and return.
+    return upstream_results[:limit]
 
 
 async def _retrieve_one(

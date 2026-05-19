@@ -307,6 +307,18 @@ def search(
             "Stacks with --hybrid. 0 = disabled (default)."
         ),
     ),
+    rerank: bool = typer.Option(
+        False,
+        "--rerank",
+        help=(
+            "Add an LLM rerank stage that re-scores upstream candidates "
+            "by relevance to the question, correcting 'noisy top-K' "
+            "where vector/BM25 scores rank irrelevant chunks high. "
+            "Fetches 3x candidates upstream then trims to top-K. "
+            "Adds ~200ms latency + ~$0.0002/query. Stacks with "
+            "--hybrid and --rewrite."
+        ),
+    ),
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
@@ -342,6 +354,7 @@ def search(
                 api_key=api_key,
                 hybrid=hybrid,
                 rewrite_variants=rewrite,
+                rerank=rerank,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
@@ -357,6 +370,8 @@ def search(
         mode_parts = ["hybrid" if hybrid else "vector"]
         if rewrite > 0:
             mode_parts.append(f"rewrite={rewrite}")
+        if rerank:
+            mode_parts.append("rerank")
         mode_label = f"[bold magenta]{' + '.join(mode_parts)}[/bold magenta]"
         table = Table(
             title=(
