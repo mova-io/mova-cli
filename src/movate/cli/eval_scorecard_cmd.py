@@ -151,6 +151,58 @@ class ScorecardSummary:
     overall_mean: float
 
 
+@dataclass(frozen=True)
+class GateConfig:
+    """Per-category + overall gate thresholds for CI gating.
+
+    Each field is optional (``None`` = no gate). Operators pick the
+    floors that matter for their workflow — typical patterns:
+
+    * ``--gate-safety 1.0 --gate-overall 0.7`` — never allow unsafe
+      output; otherwise require a quality floor.
+    * ``--gate-accuracy 0.85 --gate-faithfulness 0.85`` — RAG agents
+      where grounded correctness is the only thing that matters.
+    * ``--gate-overall 0.8`` — coarse gate, lets individual
+      categories vary as long as the agent averages well.
+
+    Unset gates produce no check + no PASS/FAIL annotation. Set gates
+    that fail emit a red line + flip the overall verdict to FAIL +
+    exit 2.
+    """
+
+    overall: float | None = None
+    accuracy: float | None = None
+    faithfulness: float | None = None
+    format: float | None = None
+    safety: float | None = None
+    refusal: float | None = None
+    hallucination: float | None = None
+    completeness: float | None = None
+    instruction_following: float | None = None
+    latency: float | None = None
+    cost: float | None = None
+
+    def has_any_gate(self) -> bool:
+        """True if at least one gate is set."""
+        return any(getattr(self, f) is not None for f in ("overall", *ALL_CATEGORIES))
+
+    def check(self, summary: ScorecardSummary) -> list[tuple[str, float, float]]:
+        """Return a list of (category, actual, threshold) for each
+        gate that the summary fails. Empty list means all gates pass
+        (or no gates set)."""
+        failures: list[tuple[str, float, float]] = []
+        if self.overall is not None and summary.overall_mean < self.overall:
+            failures.append(("overall", summary.overall_mean, self.overall))
+        for cat in ALL_CATEGORIES:
+            threshold = getattr(self, cat)
+            if threshold is None:
+                continue
+            actual = summary.category_means.get(cat, 0.0)
+            if actual < threshold:
+                failures.append((cat, actual, threshold))
+        return failures
+
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
@@ -512,6 +564,50 @@ def eval_scorecard(
             "summary line."
         ),
     ),
+    # ---- Per-category gates (Gap 3c) ---------------------------------
+    # Each gate is optional (None = no check). Set the ones that
+    # matter for your CI; failures emit a red line + exit 2.
+    gate_overall: float | None = typer.Option(
+        None,
+        "--gate-overall",
+        min=0.0,
+        max=1.0,
+        help="Minimum overall mean across all 10 categories (0.0-1.0).",
+    ),
+    gate_accuracy: float | None = typer.Option(
+        None, "--gate-accuracy", min=0.0, max=1.0, help="Accuracy floor."
+    ),
+    gate_faithfulness: float | None = typer.Option(
+        None, "--gate-faithfulness", min=0.0, max=1.0, help="Faithfulness floor."
+    ),
+    gate_format: float | None = typer.Option(
+        None, "--gate-format", min=0.0, max=1.0, help="Format-compliance floor."
+    ),
+    gate_safety: float | None = typer.Option(
+        None, "--gate-safety", min=0.0, max=1.0, help="Safety floor."
+    ),
+    gate_refusal: float | None = typer.Option(
+        None, "--gate-refusal", min=0.0, max=1.0, help="Refusal-appropriateness floor."
+    ),
+    gate_hallucination: float | None = typer.Option(
+        None, "--gate-hallucination", min=0.0, max=1.0, help="Hallucination floor."
+    ),
+    gate_completeness: float | None = typer.Option(
+        None, "--gate-completeness", min=0.0, max=1.0, help="Completeness floor."
+    ),
+    gate_instruction_following: float | None = typer.Option(
+        None,
+        "--gate-instruction-following",
+        min=0.0,
+        max=1.0,
+        help="Instruction-following floor.",
+    ),
+    gate_latency: float | None = typer.Option(
+        None, "--gate-latency", min=0.0, max=1.0, help="Latency-score floor."
+    ),
+    gate_cost: float | None = typer.Option(
+        None, "--gate-cost", min=0.0, max=1.0, help="Cost-score floor."
+    ),
 ) -> None:
     """Generate test cases on the fly and score against a 10-category scorecard.
 
@@ -543,6 +639,20 @@ def eval_scorecard(
         )
         raise typer.Exit(code=2)
 
+    gates = GateConfig(
+        overall=gate_overall,
+        accuracy=gate_accuracy,
+        faithfulness=gate_faithfulness,
+        format=gate_format,
+        safety=gate_safety,
+        refusal=gate_refusal,
+        hallucination=gate_hallucination,
+        completeness=gate_completeness,
+        instruction_following=gate_instruction_following,
+        latency=gate_latency,
+        cost=gate_cost,
+    )
+
     if all_in_project:
         _run_scorecard_all_in_project(
             count=count,
@@ -550,6 +660,7 @@ def eval_scorecard(
             mock=mock,
             judge_model=judge_model,
             output_format=output_format,
+            gates=gates,
         )
         return
 
@@ -567,6 +678,7 @@ def eval_scorecard(
         mock=mock,
         judge_model=judge_model,
         output_format=output_format,
+        gates=gates,
     )
 
 
@@ -578,6 +690,7 @@ def _run_scorecard_single_agent(
     mock: bool,
     judge_model: str | None,
     output_format: Report = Report.TABLE,
+    gates: GateConfig | None = None,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
@@ -585,7 +698,12 @@ def _run_scorecard_single_agent(
     ``output_format=Report.JSON`` swaps the Rich table + greppable
     summary line for a single-document JSON emission on stdout. The
     "Generating…" status line is also suppressed so the JSON is the
-    only thing on stdout — pipe-safe for CI scrapers."""
+    only thing on stdout — pipe-safe for CI scrapers.
+
+    ``gates`` (optional) lets the operator enforce per-category +
+    overall floors. Any gate failure emits a red line + exits 2."""
+    if gates is None:
+        gates = GateConfig()
     agent_path = Path(agent_path_str)
     try:
         bundle = load_agent(agent_path)
@@ -610,13 +728,55 @@ def _run_scorecard_single_agent(
         )
     )
 
+    gate_failures = gates.check(summary)
+
     if output_format == Report.JSON:
-        print(json.dumps(_summary_to_json(summary), indent=2))
+        doc = _summary_to_json(summary)
+        doc["gates"] = _gates_to_json(gates)
+        doc["gate_failures"] = [
+            {"category": cat, "actual": actual, "threshold": threshold}
+            for cat, actual, threshold in gate_failures
+        ]
+        doc["gates_passed"] = not gate_failures
+        print(json.dumps(doc, indent=2))
+        if gate_failures:
+            raise typer.Exit(code=2)
         return
 
     console.print()
     _render_scorecard(summary)
     _emit_summary_line(summary)
+    if gates.has_any_gate():
+        _render_gate_results(gate_failures, gates)
+    if gate_failures:
+        raise typer.Exit(code=2)
+
+
+def _gates_to_json(gates: GateConfig) -> dict[str, float | None]:
+    """Serialize the GateConfig for JSON output. None values are
+    preserved so the consumer can tell which categories were
+    unenforced vs which were set to 0.0."""
+    return {
+        "overall": gates.overall,
+        **{cat: getattr(gates, cat) for cat in ALL_CATEGORIES},
+    }
+
+
+def _render_gate_results(failures: list[tuple[str, float, float]], gates: GateConfig) -> None:
+    """Print a compact PASS/FAIL block for the gates the operator
+    set. Categories with no gate (None) are silent."""
+    if not gates.has_any_gate():
+        return
+    console.print()
+    if not failures:
+        n = sum(1 for f in ("overall", *ALL_CATEGORIES) if getattr(gates, f) is not None)
+        console.print(f"[bold green]✓ Gates PASSED[/bold green]  [dim]({n} gate(s) set)[/dim]")
+        return
+    console.print(f"[bold red]✗ Gates FAILED[/bold red]  [dim]({len(failures)} gate(s))[/dim]")
+    for cat, actual, threshold in failures:
+        console.print(
+            f"  [red]✗[/red] {cat}: [bold red]{actual:.2f}[/bold red] < gate {threshold:.2f}"
+        )
 
 
 def _summary_to_json(summary: ScorecardSummary) -> dict[str, Any]:
@@ -660,6 +820,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
     mock: bool,
     judge_model: str | None,
     output_format: Report = Report.TABLE,
+    gates: GateConfig | None = None,
 ) -> None:
     """Project-wide sweep: discover all agents under ./agents/, run the
     scorecard against each, then render a project-level rollup table.
@@ -672,7 +833,13 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
     ``output_format=Report.JSON`` emits a single document at the end
     containing per-agent summaries + project-level aggregates. Status
     output during the sweep is suppressed (routed to stderr or
-    omitted) so the JSON on stdout stays pipe-clean."""
+    omitted) so the JSON on stdout stays pipe-clean.
+
+    ``gates`` (optional) lets the operator enforce per-category +
+    overall floors across every agent. Any agent failing any gate
+    flips ``ok`` to false + exits 2."""
+    if gates is None:
+        gates = GateConfig()
     is_json = output_format == Report.JSON
     cwd = Path.cwd()
     agents_dir = cwd / "agents"
@@ -757,6 +924,14 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
 
     project_mean = sum(s.overall_mean for s in summaries) / len(summaries) if summaries else 0.0
 
+    # Per-agent gate evaluation. agents_failing_gate is the set of
+    # agent names that failed at least one gate; per_agent_gate is
+    # keyed by agent name → list of (cat, actual, threshold) tuples.
+    per_agent_gate: dict[str, list[tuple[str, float, float]]] = {
+        s.agent: gates.check(s) for s in summaries
+    }
+    agents_failing_gate = {a for a, fs in per_agent_gate.items() if fs}
+
     if is_json:
         # Single-document emission on stdout. Stable shape — adding
         # new keys is OK (additive), renaming would break CI scrapers.
@@ -768,19 +943,32 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
                     "failed": len(failed),
                     "project_mean": project_mean,
                     "mix": mix,
-                    "ok": not failed,
-                    "summaries": [_summary_to_json(s) for s in summaries],
+                    "ok": not failed and not agents_failing_gate,
+                    "summaries": [
+                        {
+                            **_summary_to_json(s),
+                            "gate_failures": [
+                                {"category": c, "actual": a, "threshold": t}
+                                for c, a, t in per_agent_gate.get(s.agent, [])
+                            ],
+                            "gates_passed": not per_agent_gate.get(s.agent, []),
+                        }
+                        for s in summaries
+                    ],
                     "failures": [{"agent": name, "reason": reason} for name, reason in failed],
+                    "gates": _gates_to_json(gates),
+                    "agents_failing_gate": sorted(agents_failing_gate),
                 },
                 indent=2,
             )
         )
-        if failed:
+        if failed or agents_failing_gate:
             raise typer.Exit(code=2)
         return
 
     # Project-level rollup table for table mode.
     console.print()
+    has_gates = gates.has_any_gate()
     rollup = Table(
         title=(
             f"[bold]Project scorecard[/bold] — {cwd.name} "
@@ -793,28 +981,44 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
     rollup.add_column("Cases", justify="right", no_wrap=True)
     rollup.add_column("Overall", justify="right", no_wrap=True)
     rollup.add_column("Verdict", no_wrap=True)
+    if has_gates:
+        rollup.add_column("Gates", no_wrap=True)
     for s in summaries:
         color = _score_color(s.overall_mean)
-        rollup.add_row(
-            s.agent,
-            str(s.count),
-            f"[{color}]{s.overall_mean:.2f}[/{color}]",
+        verdict = (
             "[green]ok[/green]"
             if s.overall_mean >= _GREEN_THRESHOLD
             else "[yellow]warn[/yellow]"
             if s.overall_mean >= _YELLOW_THRESHOLD
-            else "[red]fail[/red]",
+            else "[red]fail[/red]"
         )
+        row = [
+            s.agent,
+            str(s.count),
+            f"[{color}]{s.overall_mean:.2f}[/{color}]",
+            verdict,
+        ]
+        if has_gates:
+            agent_fails = per_agent_gate.get(s.agent, [])
+            if not agent_fails:
+                row.append("[green]✓ passed[/green]")
+            else:
+                cats = ", ".join(c for c, _, _ in agent_fails)
+                row.append(f"[red]✗ {cats}[/red]")
+        rollup.add_row(*row)
     for name, reason in failed:
-        rollup.add_row(name, "—", "—", f"[red]✗ {reason}[/red]")
+        empty_gates = ["—"] if has_gates else []
+        rollup.add_row(name, "—", "—", f"[red]✗ {reason}[/red]", *empty_gates)
     console.print(rollup)
 
     # Greppable project-level summary line for CI scraping.
+    overall_ok = not failed and not agents_failing_gate
+    gate_part = f" gate_failures={len(agents_failing_gate)}" if has_gates else ""
     console.print(
         f"[dim]mdk_eval_scorecard_all_summary: "
         f"agents={len(agent_dirs)} succeeded={len(summaries)} "
-        f"failed={len(failed)} project_mean={project_mean:.3f} "
-        f"mix={mix} ok={'true' if not failed else 'false'}[/dim]"
+        f"failed={len(failed)}{gate_part} project_mean={project_mean:.3f} "
+        f"mix={mix} ok={'true' if overall_ok else 'false'}[/dim]"
     )
-    if failed:
+    if failed or agents_failing_gate:
         raise typer.Exit(code=2)

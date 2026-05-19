@@ -911,3 +911,305 @@ def test_all_json_output_captures_per_agent_failures(
     assert len(parsed["failures"]) == 1
     assert parsed["failures"][0]["agent"] == "summarizer"
     assert parsed["failures"][0]["reason"] == "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Per-category gates (Gap 3c)
+# ---------------------------------------------------------------------------
+
+
+from movate.cli.eval_scorecard_cmd import GateConfig  # noqa: E402
+
+
+@pytest.mark.unit
+class TestGateConfig:
+    def test_no_gates_set_means_has_any_gate_is_false(self) -> None:
+        assert GateConfig().has_any_gate() is False
+
+    def test_one_gate_set_means_has_any_gate_is_true(self) -> None:
+        assert GateConfig(overall=0.7).has_any_gate() is True
+        assert GateConfig(safety=1.0).has_any_gate() is True
+
+    def test_check_returns_empty_when_no_gates_set(self) -> None:
+        summary = ScorecardSummary(
+            agent="x",
+            mix="standard",
+            count=1,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.5),
+            overall_mean=0.5,
+        )
+        assert GateConfig().check(summary) == []
+
+    def test_check_returns_empty_when_all_gates_pass(self) -> None:
+        summary = ScorecardSummary(
+            agent="x",
+            mix="standard",
+            count=1,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.95),
+            overall_mean=0.95,
+        )
+        config = GateConfig(overall=0.7, accuracy=0.85, safety=0.9)
+        assert config.check(summary) == []
+
+    def test_check_returns_failures_for_categories_below_threshold(self) -> None:
+        means = dict.fromkeys(ALL_CATEGORIES, 0.95)
+        means["safety"] = 0.6  # well below the 0.9 floor
+        means["accuracy"] = 0.7  # below the 0.85 floor
+        summary = ScorecardSummary(
+            agent="x",
+            mix="standard",
+            count=1,
+            cases=[],
+            category_means=means,
+            overall_mean=0.9,
+        )
+        config = GateConfig(accuracy=0.85, safety=0.9, faithfulness=0.5)
+        failures = config.check(summary)
+        # Two failures (accuracy, safety); faithfulness=0.5 passes at 0.95.
+        cats = {f[0] for f in failures}
+        assert cats == {"accuracy", "safety"}
+
+    def test_check_includes_overall_when_set(self) -> None:
+        summary = ScorecardSummary(
+            agent="x",
+            mix="standard",
+            count=1,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.5),
+            overall_mean=0.5,
+        )
+        config = GateConfig(overall=0.7)
+        failures = config.check(summary)
+        assert len(failures) == 1
+        assert failures[0][0] == "overall"
+        assert failures[0][1] == 0.5
+        assert failures[0][2] == 0.7
+
+
+@pytest.mark.unit
+def test_gate_pass_keeps_exit_0(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A passing gate adds the green PASSED banner + exits 0. No
+    state change vs running without gates beyond the new banner."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.95),
+            overall_mean=0.95,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--gate-overall", "0.7", "--gate-safety", "0.9"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "Gates PASSED" in plain
+    assert "2 gate(s) set" in plain
+
+
+@pytest.mark.unit
+def test_gate_failure_exits_2_with_red_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing gate exits 2 + emits a red FAILED block listing each
+    failing category with its actual score vs the threshold."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        means = dict.fromkeys(ALL_CATEGORIES, 0.95)
+        means["safety"] = 0.5  # < 0.9 gate
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=means,
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--gate-safety", "0.9"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "Gates FAILED" in plain
+    assert "safety:" in plain
+    # The actual + threshold both appear in the failure line.
+    assert "0.50" in plain
+    assert "0.90" in plain
+
+
+@pytest.mark.unit
+def test_no_gates_set_skips_gate_block_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no gates are set, the gate PASS/FAIL block must NOT
+    render. Otherwise operators who don't care about gates would
+    see a noisy "0 gates set, all passed" line on every run."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.5),
+            overall_mean=0.5,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir)],  # no gate flags
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "Gates PASSED" not in plain
+    assert "Gates FAILED" not in plain
+
+
+@pytest.mark.unit
+def test_json_output_includes_gate_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The JSON output must include the gate config, failures list,
+    and gates_passed boolean — CI scrapers gate on these."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        means = dict.fromkeys(ALL_CATEGORIES, 0.95)
+        means["accuracy"] = 0.5  # < 0.8 gate
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=means,
+            overall_mean=0.85,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval-scorecard",
+            str(agent_dir),
+            "--gate-accuracy",
+            "0.8",
+            "--output",
+            "json",
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2  # gate failed
+    parsed = _json.loads(result.stdout)
+    assert parsed["gates"]["accuracy"] == 0.8
+    assert parsed["gates"]["safety"] is None  # unset
+    assert parsed["gates_passed"] is False
+    assert len(parsed["gate_failures"]) == 1
+    failure = parsed["gate_failures"][0]
+    assert failure["category"] == "accuracy"
+    assert failure["actual"] == 0.5
+    assert failure["threshold"] == 0.8
+
+
+@pytest.mark.unit
+def test_all_mode_per_agent_gates_aggregate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In --all mode, gates apply to each agent independently. If any
+    agent fails any gate, exit 2. The rollup Gates column shows the
+    pass/fail per agent."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        means = dict.fromkeys(ALL_CATEGORIES, 0.95)
+        if bundle.spec.name == "summarizer":
+            means["safety"] = 0.4  # gate fails
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=means,
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--gate-safety", "0.9"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2  # at least one agent fails a gate
+    plain = _ANSI_RE.sub("", result.stdout)
+    # Rollup includes a "Gates" column when gates are set.
+    assert "Gates" in plain
+    # summarizer failed; faq passed.
+    assert "✓ passed" in plain or "passed" in plain
+    assert "safety" in plain  # the failing category named in the row
+    # Project-level summary reflects the gate failure.
+    assert "gate_failures=1" in plain
+    assert "ok=false" in plain
+
+
+@pytest.mark.unit
+def test_all_mode_json_includes_per_agent_gate_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--all -o json`` includes per-agent ``gate_failures`` +
+    ``gates_passed`` inside each summary, plus a project-level
+    ``agents_failing_gate`` list."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        means = dict.fromkeys(ALL_CATEGORIES, 0.95)
+        if bundle.spec.name == "summarizer":
+            means["safety"] = 0.4
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=means,
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--gate-safety", "0.9", "-o", "json"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    parsed = _json.loads(result.stdout)
+    assert parsed["ok"] is False
+    assert parsed["agents_failing_gate"] == ["summarizer"]
+    by_agent = {s["agent"]: s for s in parsed["summaries"]}
+    assert by_agent["faq"]["gates_passed"] is True
+    assert by_agent["faq"]["gate_failures"] == []
+    assert by_agent["summarizer"]["gates_passed"] is False
+    assert len(by_agent["summarizer"]["gate_failures"]) == 1
+    assert by_agent["summarizer"]["gate_failures"][0]["category"] == "safety"
