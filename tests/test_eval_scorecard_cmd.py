@@ -92,17 +92,21 @@ def _disable_preflight(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureR
 
 @pytest.mark.unit
 class TestScorecardDefinition:
-    def test_10_categories_total(self) -> None:
-        """The user's spec was a '10-category scorecard'. Pin the count
-        so a future refactor can't silently shrink the rubric."""
-        assert len(ALL_CATEGORIES) == 10
+    def test_11_categories_total(self) -> None:
+        """The original spec was '10-category scorecard'. ``citation_accuracy``
+        added in 0.8.2.15 brings the count to 11 (9 LLM-judged + 2
+        programmatic). Pin the count so a future refactor can't
+        silently shrink the rubric."""
+        assert len(ALL_CATEGORIES) == 11
 
-    def test_8_llm_judged_plus_2_programmatic(self) -> None:
-        """The judge prompt scores 8 in one JSON call (cheap); the
+    def test_9_llm_judged_plus_2_programmatic(self) -> None:
+        """The judge prompt scores 9 in one JSON call (cheap); the
         other 2 are measured from the run record (latency, cost).
         Mixing those buckets would either over-count tokens or
-        under-score real bottlenecks."""
-        assert len(LLM_JUDGED_CATEGORIES) == 8
+        under-score real bottlenecks. ``citation_accuracy`` (added
+        0.8.2.15) lives in the LLM-judged bucket — it needs a model
+        to read the cited chunks + verify they support the claim."""
+        assert len(LLM_JUDGED_CATEGORIES) == 9
         assert len(PROGRAMMATIC_CATEGORIES) == 2
         assert set(LLM_JUDGED_CATEGORIES).isdisjoint(set(PROGRAMMATIC_CATEGORIES))
 
@@ -118,9 +122,9 @@ class TestScorecardDefinition:
             assert cat == cat.lower()
 
     def test_user_specified_categories_all_present(self) -> None:
-        """The user's sign-off message listed these 10 by name. Pin
-        the exact set so a typo in a future edit doesn't silently
-        drop one."""
+        """Pin the exact set so a typo in a future edit doesn't
+        silently drop one. ``citation_accuracy`` added 0.8.2.15 to
+        the original 10."""
         expected = {
             "accuracy",
             "faithfulness",
@@ -132,6 +136,7 @@ class TestScorecardDefinition:
             "cost",
             "completeness",
             "instruction_following",
+            "citation_accuracy",
         }
         assert set(ALL_CATEGORIES) == expected
 
@@ -556,7 +561,8 @@ async def test_score_one_case_strips_code_fences(monkeypatch: pytest.MonkeyPatch
         '"refusal": {"score": 1.0, "rationale": "x"},'
         '"hallucination": {"score": 1.0, "rationale": "x"},'
         '"completeness": {"score": 1.0, "rationale": "x"},'
-        '"instruction_following": {"score": 1.0, "rationale": "x"}}' + "\n```"
+        '"instruction_following": {"score": 1.0, "rationale": "x"},'
+        '"citation_accuracy": {"score": 1.0, "rationale": "x"}}' + "\n```"
     )
     fake_rt = mock.Mock()
     fake_rt.provider.complete = mock.AsyncMock(return_value=fake_response)
@@ -1850,8 +1856,10 @@ def test_cli_disable_category_filters_scorecard_output(
     # substring check ("8/10\n    categories" → "8/10 categories").
     flat = " ".join(plain.split())
 
-    # Title surfaces the reduced count.
-    assert "8/10 categories" in flat
+    # Title surfaces the reduced count. ``citation_accuracy`` added
+    # 0.8.2.15 bumped the total from 10 to 11; this test disables
+    # 2 (hallucination, refusal) so the rendered count is 9/11.
+    assert "9/11 categories" in flat
     # Disabled categories don't render as table rows.
     body = plain.split("Category")[1].split("overall")[0] if "Category" in plain else plain
     assert "refusal" not in body
@@ -5033,3 +5041,140 @@ class TestLiteLLMLoggingWorkerReset:
         finally:
             if saved is not None:
                 sys.modules["litellm.litellm_core_utils.logging_worker"] = saved
+
+
+# ---------------------------------------------------------------------------
+# citation_accuracy scorecard category (0.8.2.15)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCitationAccuracyCategory:
+    """The 11th scorecard category, added 0.8.2.15 to close the
+    measurement loop on RAG agents.
+
+    Distinct from ``faithfulness``: faithfulness scores whether the
+    answer stays grounded in ANY of the input context; citation_accuracy
+    scores whether the SPECIFIC chunks cited by the agent actually
+    support the cited claims. A RAG agent that answers correctly but
+    cites the wrong chunk should score high on faithfulness, low on
+    citation_accuracy — that's the signal this category exists to
+    surface.
+    """
+
+    def test_citation_accuracy_in_llm_judged_bucket(self) -> None:
+        """Lives in the LLM-judged bucket — needs a model to read
+        the cited chunks + verify they support the claim."""
+        assert "citation_accuracy" in LLM_JUDGED_CATEGORIES
+        assert "citation_accuracy" not in PROGRAMMATIC_CATEGORIES
+
+    def test_citation_accuracy_in_all_categories(self) -> None:
+        assert "citation_accuracy" in ALL_CATEGORIES
+
+    def test_citation_accuracy_in_default_judge_prompt(self) -> None:
+        """The default judge prompt MUST mention the new category
+        so judges score all 9 LLM-judged dimensions in one call."""
+        from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+            _JUDGE_SYSTEM_PROMPT,
+            _build_judge_prompt,
+        )
+
+        prompt = _build_judge_prompt(LLM_JUDGED_CATEGORIES)
+        assert "citation_accuracy" in prompt
+        # Description should explain the no-citations no-penalty rule
+        # so judges don't dock non-RAG agents.
+        assert "no citations are made" in prompt or "no penalty" in prompt
+        # And the pre-built default prompt matches the build call.
+        assert prompt == _JUDGE_SYSTEM_PROMPT
+
+    def test_disabled_judge_prompt_omits_citation_accuracy(self) -> None:
+        """Per-project rubric override can disable ``citation_accuracy``
+        for non-RAG projects. The judge prompt must respect the
+        narrower active set."""
+        from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+            _build_judge_prompt,
+        )
+
+        active = tuple(c for c in LLM_JUDGED_CATEGORIES if c != "citation_accuracy")
+        prompt = _build_judge_prompt(active)
+        assert "citation_accuracy" not in prompt
+        # The 8 surviving LLM categories still surface.
+        for cat in active:
+            assert cat in prompt
+
+    def test_gate_config_carries_citation_accuracy(self) -> None:
+        """GateConfig must accept ``citation_accuracy`` so the CLI
+        flag ``--gate-citation-accuracy`` can plumb through."""
+        from movate.cli.eval_scorecard_cmd import GateConfig  # noqa: PLC0415
+
+        gates = GateConfig(citation_accuracy=0.85)
+        assert gates.citation_accuracy == 0.85
+        assert gates.has_any_gate() is True
+
+    def test_gate_check_flags_low_citation_accuracy(self) -> None:
+        """A summary with citation_accuracy below the gate must
+        appear in the failures list."""
+        from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+            GateConfig,
+            ScorecardSummary,
+        )
+
+        gates = GateConfig(citation_accuracy=0.85)
+        summary = ScorecardSummary(
+            agent="rag-qa",
+            mix="standard",
+            count=10,
+            cases=[],
+            category_means={
+                "accuracy": 0.95,
+                "citation_accuracy": 0.50,  # below the 0.85 floor
+            },
+            overall_mean=0.80,
+        )
+        failures = gates.check(summary)
+        # The failure tuple is (category, actual, threshold).
+        cited = [f for f in failures if f[0] == "citation_accuracy"]
+        assert len(cited) == 1
+        assert cited[0][1] == 0.50
+        assert cited[0][2] == 0.85
+
+    def test_gate_check_passes_when_citation_accuracy_meets_floor(self) -> None:
+        """When citation_accuracy is at-or-above the gate, no failure
+        is recorded for that category."""
+        from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+            GateConfig,
+            ScorecardSummary,
+        )
+
+        gates = GateConfig(citation_accuracy=0.85)
+        summary = ScorecardSummary(
+            agent="rag-qa",
+            mix="standard",
+            count=10,
+            cases=[],
+            category_means={"citation_accuracy": 0.90},
+            overall_mean=0.90,
+        )
+        failures = gates.check(summary)
+        assert not any(f[0] == "citation_accuracy" for f in failures)
+
+    def test_gate_check_skips_citation_accuracy_when_disabled(self) -> None:
+        """When the project disabled ``citation_accuracy`` (so the
+        summary doesn't carry it), the gate is silently skipped —
+        operators don't get spurious failures for opted-out dims."""
+        from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+            GateConfig,
+            ScorecardSummary,
+        )
+
+        gates = GateConfig(citation_accuracy=0.85)
+        summary = ScorecardSummary(
+            agent="rag-qa",
+            mix="standard",
+            count=10,
+            cases=[],
+            category_means={"accuracy": 0.95},  # citation_accuracy absent
+            overall_mean=0.95,
+        )
+        failures = gates.check(summary)
+        assert not any(f[0] == "citation_accuracy" for f in failures)

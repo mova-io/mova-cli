@@ -19,7 +19,6 @@ ranking assertions are reproducible.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 from unittest import mock
 
 import pytest
@@ -27,11 +26,9 @@ import pytest
 from movate.core.models import KbChunk
 from movate.kb.chunk import (
     MAX_CHUNK_CHARS,
-    MIN_CHUNK_CHARS,
     split_paragraphs,
 )
 from movate.testing import InMemoryStorage
-
 
 # ---------------------------------------------------------------------------
 # Chunker

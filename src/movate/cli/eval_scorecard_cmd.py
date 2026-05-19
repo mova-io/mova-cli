@@ -69,8 +69,14 @@ err_console = Console(stderr=True)
 # ---------------------------------------------------------------------------
 
 
-# The 8 LLM-judged categories — one judge call per case scores all 8
+# The 9 LLM-judged categories — one judge call per case scores all 9
 # at once (JSON response). The judge prompt below pairs with these.
+#
+# ``citation_accuracy`` added 0.8.2.15 for RAG agents: verifies that
+# cited chunks/sources actually support the cited claims. Conditional
+# scoring — for non-RAG agents (no citations in output), the judge
+# returns 1.0 (no penalty), so the rubric stays portable across role
+# templates.
 LLM_JUDGED_CATEGORIES: tuple[str, ...] = (
     "accuracy",
     "faithfulness",
@@ -80,6 +86,7 @@ LLM_JUDGED_CATEGORIES: tuple[str, ...] = (
     "hallucination",
     "completeness",
     "instruction_following",
+    "citation_accuracy",
 )
 
 # The 2 programmatic categories — measured from the run record, not
@@ -120,6 +127,20 @@ _CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "completeness": "Does the response address all parts of the input?",
     "instruction_following": (
         "Does the response follow explicit instructions from the agent's system prompt?"
+    ),
+    "citation_accuracy": (
+        "For RAG-style agents whose output cites sources (e.g. a "
+        "``citations`` array indexing into ``input.context`` or a list "
+        "of source URIs): for each citation, verify the cited chunk's "
+        "text actually supports the fact being cited. Score = fraction "
+        "of citations that are well-grounded (correct chunk supports "
+        "claim). When the output makes NO citations (most non-RAG "
+        "agents), score 1.0 — no penalty for not citing. When the "
+        "output cites but the cited chunk doesn't support the claim, "
+        "score 0.0. This is distinct from ``faithfulness`` (which "
+        "scores whether the answer stays grounded in ANY of the "
+        "context); ``citation_accuracy`` scores whether the SPECIFIC "
+        "cited chunks back the cited claims."
     ),
 }
 
@@ -268,6 +289,7 @@ class GateConfig:
     hallucination: float | None = None
     completeness: float | None = None
     instruction_following: float | None = None
+    citation_accuracy: float | None = None
     latency: float | None = None
     cost: float | None = None
 
@@ -1825,6 +1847,17 @@ def eval_scorecard(
         max=1.0,
         help="Instruction-following floor.",
     ),
+    gate_citation_accuracy: float | None = typer.Option(
+        None,
+        "--gate-citation-accuracy",
+        min=0.0,
+        max=1.0,
+        help=(
+            "Citation-accuracy floor. Only meaningful for RAG-style agents "
+            "whose output cites sources. Non-citing agents score 1.0 by "
+            "convention; this gate is a no-op for them."
+        ),
+    ),
     gate_latency: float | None = typer.Option(
         None, "--gate-latency", min=0.0, max=1.0, help="Latency-score floor."
     ),
@@ -1946,6 +1979,7 @@ def eval_scorecard(
         hallucination=gate_hallucination,
         completeness=gate_completeness,
         instruction_following=gate_instruction_following,
+        citation_accuracy=gate_citation_accuracy,
         latency=gate_latency,
         cost=gate_cost,
     )
