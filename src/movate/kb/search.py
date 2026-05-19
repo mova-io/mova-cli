@@ -1,6 +1,6 @@
 """Search pipeline: question text → top-K retrieved chunks.
 
-Two modes:
+Three composable modes:
 
 * **Vector-only** (default) — embed the question via the same model
   used at ingest time, return cosine-ranked chunks. Best for
@@ -11,6 +11,12 @@ Two modes:
   recall on real corpora, especially for queries containing rare
   terms (product names, error codes, citation IDs) that vector
   retrieval blurs out.
+* **Query rewriting** (``rewrite_variants > 0``) — expand the
+  original question into N paraphrases via a small LLM, run retrieval
+  for each variant, dedup by chunk_id, then fuse. Catches the case
+  where the user's wording doesn't match the KB's terminology even
+  for the lexical path (e.g. "refunds?" → KB chunks talking about
+  "return policy"). Stacks with ``hybrid=True``.
 
 Powers ``mdk kb search`` (the CLI command) AND the
 ``kb-vector-lookup`` skill (invoked at agent run time).
@@ -37,18 +43,28 @@ async def search(
     api_key: str | None = None,
     hybrid: bool = False,
     fetch_multiplier: int = 4,
+    rewrite_variants: int = 0,
+    rewriter_model: str | None = None,
 ) -> list[KbChunkWithScore]:
     """Embed ``question`` + return the top-``limit`` chunks ranked.
 
-    When ``hybrid=False`` (default): pure vector / cosine similarity
-    via the storage layer.
+    Modes (composable — both flags can be active simultaneously):
 
-    When ``hybrid=True``: fetch ``limit * fetch_multiplier`` candidates
-    via BOTH vector and BM25 lexical paths, then fuse with reciprocal
-    rank fusion (RRF) and return the top ``limit``. The multiplier
-    ensures the fusion has enough candidates from each path to find
-    the cross-method overlap that RRF rewards. Default ``4`` fetches
-    20 per path for a 5-result query — proven sweet spot.
+    * ``hybrid=False``, ``rewrite_variants=0`` (default): pure vector
+      / cosine similarity via the storage layer.
+    * ``hybrid=True``: fetch ``limit * fetch_multiplier`` candidates
+      via BOTH vector and BM25 lexical paths, then fuse with
+      reciprocal rank fusion (RRF) and return the top ``limit``.
+      The multiplier ensures the fusion has enough candidates from
+      each path to find the cross-method overlap that RRF rewards.
+      Default ``4`` fetches 20 per path for a 5-result query —
+      proven sweet spot.
+    * ``rewrite_variants > 0``: expand the question into N paraphrases
+      via a small LLM, run the configured retrieval (vector or
+      hybrid) for the original AND each variant, then RRF-fuse the
+      N+1 ranked lists. The rewriter never blocks retrieval — on
+      any LLM failure we degrade to single-query behavior with a
+      warning log. Capped at :data:`movate.kb.rewrite.MAX_VARIANTS`.
 
     The ``embedding_model`` MUST match what was used at ingest time —
     different models produce incomparable vector spaces. The storage
@@ -58,6 +74,76 @@ async def search(
     """
     if not question.strip():
         return []
+
+    # Query rewriting expands ``question`` into N+1 variants. The
+    # original is always the first variant, even when the rewriter
+    # call fails — so this branch reduces to "[question]" in the
+    # default (rewrite_variants=0) case.
+    variants = [question]
+    if rewrite_variants > 0:
+        from movate.kb.rewrite import (  # noqa: PLC0415 — lazy import keeps litellm off the default hot path
+            DEFAULT_REWRITER_MODEL,
+            rewrite_query,
+        )
+
+        variants = await rewrite_query(
+            question,
+            n=rewrite_variants,
+            model=rewriter_model or DEFAULT_REWRITER_MODEL,
+            api_key=api_key,
+        )
+        if not variants:
+            variants = [question]
+
+    # Fan-out retrieval: run the configured pipeline once per
+    # variant. For the single-variant case (default), this is
+    # exactly equivalent to the previous behavior — no LLM call,
+    # one retrieval pass.
+    per_variant_results: list[list[KbChunkWithScore]] = []
+    for variant in variants:
+        results = await _retrieve_one(
+            storage=storage,
+            question=variant,
+            agent=agent,
+            tenant_id=tenant_id,
+            limit=limit,
+            embedding_model=embedding_model,
+            api_key=api_key,
+            hybrid=hybrid,
+            fetch_multiplier=fetch_multiplier,
+        )
+        per_variant_results.append(results)
+
+    # Single-variant case: skip the RRF round-trip; just clamp +
+    # return. Preserves byte-for-byte behavior for non-rewriter
+    # callers (so the existing snapshot tests don't shift).
+    if len(per_variant_results) == 1:
+        return per_variant_results[0][:limit]
+
+    # Multi-variant case: RRF-fuse across all variant result lists.
+    # Chunks that match multiple variants accumulate score, so the
+    # "agrees across paraphrases" signal floats to the top.
+    return rrf_fuse(*per_variant_results, limit=limit)
+
+
+async def _retrieve_one(
+    *,
+    storage: object,
+    question: str,
+    agent: str,
+    tenant_id: str,
+    limit: int,
+    embedding_model: str,
+    api_key: str | None,
+    hybrid: bool,
+    fetch_multiplier: int,
+) -> list[KbChunkWithScore]:
+    """Run one retrieval pass — either vector-only or hybrid.
+
+    Factored out of :func:`search` so the fan-out path can call it
+    once per query variant without duplicating the vector + BM25 +
+    RRF wiring.
+    """
     [query_embedding] = await embed_texts(
         [question],
         model=embedding_model,
