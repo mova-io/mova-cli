@@ -716,8 +716,11 @@ def _scaffold_project_with_agents(
     from movate.credentials.verify import VerifyResult  # noqa: PLC0415
 
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+    # Set BOTH keys so the stricter "BOTH required" pre-flight passes
+    # (2026-05-19). The scorecard's cross-family judge enforcement
+    # needs OpenAI + Anthropic both verified.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key-for-precheck-only")
-    # Stub the verifier so live-verify returns OK without HTTP.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-test-key-for-precheck-only")
     monkeypatch.setattr(
         "movate.credentials.verify_provider_key",
         lambda provider, key: VerifyResult(ok=True, detail="OK (test stub)"),

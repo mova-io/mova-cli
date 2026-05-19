@@ -1389,118 +1389,78 @@ def _prompt_continue_or_regenerate() -> str:
     return choices[idx][0]
 
 
-def _require_llm_provider_key_or_offer_setup() -> None:
-    """Pre-flight check: at least one LLM provider key must be set
-    AND verify against the provider's metadata endpoint.
+_REQUIRED_EVAL_PROVIDERS: tuple[str, ...] = ("openai", "anthropic")
+"""Providers required for ``mdk eval`` to proceed.
 
-    Eval (any path that isn't ``--mock``) needs an API key both for
-    case generation AND for judge scoring. Without a working one,
-    the operator hits AuthError partway through and has to
-    ``Ctrl+C`` + run ``mdk auth login`` + retry. Catching it here
-    saves them 4-5 wizard prompts only to discover at the end that
-    the key in their shell is a stale stub (``sk-test-*2345``).
+The 10-category scorecard's LLM judge runs in a separate provider
+family from the case generator + agent execution to defeat
+same-family scoring bias (a model judging its own family-mate is a
+known calibration failure mode). Cross-family enforcement needs at
+least TWO different provider families with working keys — OpenAI
+and Anthropic are the two we require because:
 
-    Behavior:
+1. They cover the two dominant model families operators want to
+   evaluate against in 2026.
+2. They have the cheapest metadata endpoints for live verify
+   (one HTTP roundtrip each, ~200ms).
+3. Their pricing tables are wired into the scorecard's cost
+   programmatic category.
 
-    * Live-verify each configured key via
-      :func:`movate.cli.auth._provider_status` (cheap HTTP metadata
-      call, 5s timeout). The result is cached per-process, so the
-      same call inside the scorecard later is free.
-    * If at least one of OpenAI / Anthropic returns ``"verified"``
-      → return cleanly. The auto-detect downstream routes around
-      whichever IS rejected.
-    * If at least one returns ``"unverifiable"`` (network error,
-      can't tell if the key works) AND another is verified → still
-      proceed. Network-error provider may come back up.
-    * If at least one returns ``"unverifiable"`` AND no other is
-      verified → warn + proceed (defensive: don't block when the
-      provider's own API is down).
-    * If everything configured is ``"rejected"`` (live verify hit
-      401) → show the rejected-keys panel + offer ``mdk auth login``
-      inline. Retry the verify; if STILL nothing verifies → exit 2.
-    * If NOTHING configured → existing "no keys" panel + auth login
-      flow.
-    * Non-TTY (CI, piped) and any failure path → exit 2 with hint.
+A future toggle (``--allow-same-family``) could let operators with
+only one key opt out of the cross-family rule, but the default
+stays strict to protect the eval's judgement quality.
+"""
+
+
+def _require_llm_provider_key_or_offer_setup() -> None:  # noqa: PLR0912 — orchestrator; verify/auth/retry branches add linear count
+    """Pre-flight check: BOTH OpenAI and Anthropic keys must be set
+    AND verify against their respective metadata endpoints.
+
+    Strictness lifted 2026-05-19 (was "at least one verified"): the
+    one-key path silently degraded to same-family judging, which the
+    LLM-as-judge cross-family enforcement was supposed to prevent.
+    The scorecard's 10-category rubric needs a generator + judge in
+    DIFFERENT provider families to avoid a model scoring its own
+    family-mate (a known calibration failure mode).
+
+    Behavior matrix (live-verify each via ``_provider_status``):
+
+    * Both verified → proceed.
+    * Any missing/rejected, all others verified → block with panel
+      naming which key(s) need attention; offer ``mdk auth login``
+      inline (TTY) or exit 2 with hint (non-TTY). Login loop runs
+      up to 3 times so an operator who sets only ONE key in the
+      first pass gets re-prompted for the missing one.
+    * Unverifiable (network error) → warn + proceed; provider may
+      be down + key might still work. Don't hard-block on outages.
     """
     import os  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
     from movate.cli.auth import (  # noqa: PLC0415
-        _provider_is_configured,
         _provider_status,
         _verify_cache,
     )
 
     def _statuses() -> dict[str, str]:
         # Live-verify both providers (cached after the first call).
-        return {
-            "openai": _provider_status("openai"),
-            "anthropic": _provider_status("anthropic"),
-        }
+        return {p: _provider_status(p) for p in _REQUIRED_EVAL_PROVIDERS}
+
+    def _all_verified(statuses: dict[str, str]) -> bool:
+        return all(s == "verified" for s in statuses.values())
 
     statuses = _statuses()
-    verified = [p for p, s in statuses.items() if s == "verified"]
-    rejected = [p for p, s in statuses.items() if s == "rejected"]
-    unverifiable = [p for p, s in statuses.items() if s == "unverifiable"]
-    if verified:
-        # At least one provider's key works — eval can proceed.
-        if rejected:
-            # Tell the operator that auto-detect will route around
-            # the rejected key, so they're not confused when the
-            # log later says "excluding openai" or similar.
-            rejected_list = ", ".join(rejected)
-            err_console.print(
-                f"[yellow]⚠[/yellow] key for [bold]{rejected_list}[/bold] is "
-                f"set but rejected — eval will auto-route through "
-                f"[bold]{verified[0]}[/bold]. Run "
-                f"[bold]mdk auth login {rejected[0]}[/bold] to rotate."
-            )
+    if _all_verified(statuses):
         return
 
-    # No verified providers. Three sub-cases:
-    # 1. Nothing configured: show "no keys" panel + offer login.
-    # 2. Everything configured is unverifiable (network errors): warn but
-    #    proceed (provider may be down, key might still work later).
-    # 3. Everything configured is rejected: show rejected panel + offer
-    #    login + re-verify.
+    missing = [p for p, s in statuses.items() if s == "unset"]
+    rejected = [p for p, s in statuses.items() if s == "rejected"]
+    unverifiable = [p for p, s in statuses.items() if s == "unverifiable"]
 
-    nothing_configured = not _provider_is_configured("openai") and not _provider_is_configured(
-        "anthropic"
-    )
-
-    if nothing_configured:
-        err_console.print()
-        err_console.print(
-            Panel(
-                "[bold yellow]⚠ No OpenAI or Anthropic key configured[/bold yellow]\n\n"
-                "[dim]Eval needs at least one LLM provider key — without one, "
-                "case generation + judging will both fail. Run [bold]mdk auth "
-                "login[/bold] to set one up, or pass [bold]--mock[/bold] for "
-                "offline / shape-only eval (no real LLM calls).[/dim]",
-                border_style="yellow",
-                title_align="left",
-            )
-        )
-    elif rejected and not unverifiable:
-        err_console.print()
-        rejected_list = ", ".join(rejected)
-        err_console.print(
-            Panel(
-                f"[bold red]✗ All configured LLM keys rejected[/bold red]\n\n"
-                f"[dim]The key(s) for [bold]{rejected_list}[/bold] are set in "
-                f"your shell or [bold]~/.movate/credentials[/bold] but the "
-                f"provider returned 401 Unauthorized on a live verify "
-                f"(2026-05-19 added — was only a 'set or not' check before). "
-                f"Run [bold]mdk auth login {rejected[0]}[/bold] to rotate, "
-                f"or [bold]--mock[/bold] for offline eval.[/dim]",
-                border_style="red",
-                title_align="left",
-            )
-        )
-    else:
-        # At least one unverifiable, none verified, none / some rejected.
-        # Treat as "we can't tell" — proceed with a warning so eval
-        # doesn't hard-block on a provider outage.
+    # Network-error path: don't block on a provider outage. Operator
+    # may hit the same issue later, but blocking pre-flight on a
+    # transient is wrong.
+    if unverifiable and not missing and not rejected:
         unv_list = ", ".join(unverifiable)
         err_console.print(
             f"[yellow]⚠[/yellow] could not verify key(s) for "
@@ -1509,20 +1469,63 @@ def _require_llm_provider_key_or_offer_setup() -> None:
         )
         return
 
+    # At least one of {missing, rejected} is non-empty — render a
+    # panel naming both required providers + each one's status.
+    err_console.print()
+    needs_lines: list[str] = []
+    for provider in _REQUIRED_EVAL_PROVIDERS:
+        state = statuses[provider]
+        if state == "verified":
+            needs_lines.append(f"  [green]✓[/green] [bold]{provider}[/bold] — verified")
+        elif state == "unset":
+            needs_lines.append(
+                f"  [red]✗[/red] [bold]{provider}[/bold] — not configured "
+                f"([dim]run [bold]mdk auth login {provider}[/bold][/dim])"
+            )
+        elif state == "rejected":
+            needs_lines.append(
+                f"  [red]✗[/red] [bold]{provider}[/bold] — key set but rejected "
+                f"([dim]rotate via [bold]mdk auth login {provider}[/bold][/dim])"
+            )
+        else:  # unverifiable
+            needs_lines.append(
+                f"  [yellow]?[/yellow] [bold]{provider}[/bold] — could not verify "
+                f"([dim]network error; will retry mid-eval[/dim])"
+            )
+    needs_block = "\n".join(needs_lines)
+    err_console.print(
+        Panel(
+            "[bold yellow]⚠ Eval needs BOTH OpenAI and Anthropic keys verified[/bold yellow]\n\n"
+            "[dim]The 10-category scorecard's LLM judge runs in a DIFFERENT "
+            "provider family from the case generator to defeat same-family "
+            "scoring bias. That cross-family rule needs both providers with "
+            "working keys. Status:[/dim]\n\n"
+            f"{needs_block}\n\n"
+            "[dim]Fix the failing one(s) below, or pass [bold]--mock[/bold] "
+            "for offline eval (no real LLM calls).[/dim]",
+            border_style="yellow",
+            title_align="left",
+        )
+    )
+
     if not sys.stdin.isatty():
         # Non-interactive context (CI / piped). No place to prompt.
         err_console.print()
+        # Name the FIRST missing/rejected provider in the exit hint
+        # — operators piping output need an actionable next step,
+        # not a generic "set one up".
+        target = (missing + rejected)[0] if (missing or rejected) else "anthropic"
         err_console.print(
-            "[red]✗[/red] not in a TTY; can't prompt for inline setup. "
-            "Run [bold]mdk auth login anthropic[/bold] (or openai) and "
-            "retry, or re-invoke with [bold]--mock[/bold]."
+            f"[red]✗[/red] not in a TTY; can't prompt for inline setup. "
+            f"Run [bold]mdk auth login {target}[/bold] and retry, or "
+            f"re-invoke with [bold]--mock[/bold]."
         )
         raise typer.Exit(code=2)
 
     err_console.print()
     try:
         answer = Prompt.ask(
-            "[bold]Set up a provider key now?[/bold]",
+            "[bold]Set up the missing provider(s) now?[/bold]",
             choices=["y", "n"],
             default="y",
             show_choices=False,
@@ -1531,49 +1534,63 @@ def _require_llm_provider_key_or_offer_setup() -> None:
         raise typer.Exit(code=2) from None
 
     if (answer or "").strip().lower() != "y":
-        err_console.print("[dim]→ skipped. Run [bold]mdk auth login[/bold] before retrying.[/dim]")
+        err_console.print(
+            "[dim]→ skipped. Run [bold]mdk auth login[/bold] for each missing "
+            "provider before retrying.[/dim]"
+        )
         raise typer.Exit(code=2)
 
-    # Launch the existing mdk auth login flow inline — same polished
-    # picker as the standalone command (with PR #207's live-verify
-    # markers showing ``✓ verified`` / ``✗ set but rejected``).
+    # Launch ``mdk auth login`` inline. The picker shows ✓/✗ markers
+    # per provider so the operator can see which ones still need work.
     from movate.cli.auth import login  # noqa: PLC0415
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
-    before = CredentialsStore().read()
-    try:
-        login()
-    except typer.Exit:
-        # Operator cancelled the picker or verify failed.
-        raise typer.Exit(code=2) from None
+    # Loop the login call up to N times — the operator might set only
+    # ONE provider on the first pass, and we still need the other.
+    # Cap iterations to prevent an infinite loop if something goes
+    # wrong with verify.
+    max_login_loops = 3
+    for _attempt in range(max_login_loops):
+        before = CredentialsStore().read()
+        try:
+            login()
+        except typer.Exit:
+            # Operator cancelled the picker or verify failed.
+            raise typer.Exit(code=2) from None
 
-    # Inject newly-saved keys into ``os.environ`` so the rest of this
-    # CLI invocation sees them (autoload already ran at startup;
-    # without this refresh the in-flight wizard would still see the
-    # pre-login state).
-    after = CredentialsStore().read()
-    for env_var, value in after.items():
-        before_value = before.get(env_var, "")
-        if value and value.strip() and value != before_value:
-            os.environ[env_var] = value.strip()
+        # Inject newly-saved keys into ``os.environ`` so the rest of
+        # this CLI invocation sees them (autoload already ran at
+        # startup; without this refresh the in-flight wizard would
+        # still see the pre-login state).
+        after = CredentialsStore().read()
+        for env_var, value in after.items():
+            before_value = before.get(env_var, "")
+            if value and value.strip() and value != before_value:
+                os.environ[env_var] = value.strip()
 
-    # Clear the verify cache so the re-check below probes the FRESH
-    # key (the cache still holds the pre-login "rejected" / "unset"
-    # state otherwise, and would silently make us exit 2 even after
-    # a successful auth login).
-    _verify_cache.clear()
+        # Clear the verify cache so the re-check below probes the
+        # FRESH key (cache still holds the pre-login "rejected" /
+        # "unset" state otherwise).
+        _verify_cache.clear()
 
-    # Re-verify after auth login. We require a working key now — a
-    # silent "key saved but doesn't actually work" path would have
-    # the operator hit the exact same AuthError mid-eval that we
-    # were trying to prevent.
-    statuses = _statuses()
-    if any(s == "verified" for s in statuses.values()):
-        return
+        statuses = _statuses()
+        if _all_verified(statuses):
+            return
+
+        # Still missing one — explain what's left and re-prompt.
+        still_missing = [p for p, s in statuses.items() if s != "verified"]
+        still_str = ", ".join(still_missing)
+        err_console.print()
+        err_console.print(
+            f"[yellow]⚠[/yellow] still need: [bold]{still_str}[/bold]. "
+            f"Launching auth picker again — pick the missing provider "
+            f"this time, or [bold]Ctrl+C[/bold] to abort."
+        )
 
     err_console.print(
-        "[red]✗[/red] still no verified OpenAI / Anthropic key after auth login. "
-        "Aborting eval — run [bold]mdk auth status[/bold] to debug."
+        "[red]✗[/red] could not get both OpenAI + Anthropic verified after "
+        f"{max_login_loops} login attempts. Aborting eval — run "
+        "[bold]mdk auth status[/bold] to debug."
     )
     raise typer.Exit(code=2)
 
