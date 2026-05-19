@@ -410,3 +410,115 @@ class TestAuthStatusTable:
         summary_line = [ln for ln in result.stdout.splitlines() if "mdk_auth_status_summary" in ln]
         assert summary_line
         assert "rejected=" not in summary_line[0]
+
+
+# ---------------------------------------------------------------------------
+# Python-callable login() (2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLoginCallableFromPython:
+    """``cli.auth.login`` is a ``@auth_app.command`` — designed for
+    Typer's CLI dispatcher. But two code paths import + invoke it
+    directly from Python: ``_offer_inline_auth_recovery`` in
+    ``eval_scorecard_cmd`` (when preflight finds every provider's
+    key rejected) and ``_require_llm_provider_key_or_offer_setup``
+    in ``eval`` (when no LLM key is configured at all).
+
+    When called from Python with no args, the ``typer.Argument(None)``
+    / ``typer.Option(...)`` defaults pass through as
+    ``ArgumentInfo`` / ``OptionInfo`` sentinel objects rather than
+    being resolved to their declared defaults. The next ``.lower()``
+    / ``.strip()`` call then dies with ``AttributeError: 'ArgumentInfo'
+    object has no attribute 'lower'`` — exactly what an operator hit
+    in production on 2026-05-19 when ``mdk eval`` tried to recover
+    from a placeholder ``OPENAI_API_KEY`` and dropped into the
+    inline auth-recovery flow.
+    """
+
+    def test_login_no_args_does_not_attribute_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The regression: bare ``login()`` from Python must NOT
+        crash with ``AttributeError``. The function may then prompt
+        interactively or raise ``typer.Exit`` — either is fine, as
+        long as the Typer sentinel doesn't bleed into ``.lower()``."""
+        from movate.cli.auth import login  # noqa: PLC0415
+
+        # The picker would call input() — short-circuit it by stubbing
+        # ``_prompt_for_provider`` to a known answer. The point of this
+        # test isn't to exercise the picker; it's to confirm the
+        # function reaches the picker call WITHOUT crashing on the
+        # sentinel-defaulted args before that.
+        monkeypatch.setattr("movate.cli.auth._prompt_for_provider", lambda: "openai")
+        # Stub the prompt + verifier so we don't try to make network calls.
+        monkeypatch.setattr("typer.prompt", lambda *a, **kw: "sk-test-noop")
+        monkeypatch.setattr(
+            "movate.credentials.verify_provider_key",
+            lambda provider, key: VerifyResult(ok=False, detail="401 Unauthorized"),
+        )
+
+        # The function will typer.Exit(2) on the rejected key — that's
+        # fine. We're guarding the AttributeError specifically.
+        import typer  # noqa: PLC0415
+
+        try:
+            login()
+        except typer.Exit:
+            # Acceptable terminal state — the verifier rejected our
+            # stub key, login bails with exit code 2.
+            pass
+        except AttributeError as exc:  # pragma: no cover - the regression
+            pytest.fail(
+                f"login() crashed with AttributeError when called from Python: {exc}. "
+                "Typer sentinel defaults (ArgumentInfo / OptionInfo) leaked through "
+                "instead of being normalized to their declared defaults."
+            )
+
+    def test_login_normalizes_argumentinfo_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Defense-in-depth: explicitly pass typer's sentinel objects
+        and verify the function tolerates them. This guards against
+        future Typer-call-from-Python sites that might forward
+        sentinel-defaulted args without thinking about it."""
+        import typer  # noqa: PLC0415
+
+        from movate.cli.auth import login  # noqa: PLC0415
+
+        # The picker would normally fire — stub it to a known value.
+        provider_picker_calls = []
+
+        def fake_picker() -> str:
+            provider_picker_calls.append(True)
+            return "openai"
+
+        monkeypatch.setattr("movate.cli.auth._prompt_for_provider", fake_picker)
+        monkeypatch.setattr("typer.prompt", lambda *a, **kw: "sk-noop")
+        monkeypatch.setattr(
+            "movate.credentials.verify_provider_key",
+            lambda provider, key: VerifyResult(ok=False, detail="401 Unauthorized"),
+        )
+
+        # These are EXACTLY the sentinels Python sees when ``login()``
+        # is invoked without args: the typer.Argument(None) /
+        # typer.Option(...) call return values.
+        sentinel_provider = typer.Argument(None)
+        sentinel_key = typer.Option(None, "--key")
+        sentinel_no_verify = typer.Option(False, "--no-verify")
+        sentinel_save_to = typer.Option("global", "--save-to")
+
+        try:
+            login(
+                provider=sentinel_provider,
+                key=sentinel_key,
+                no_verify=sentinel_no_verify,
+                save_to=sentinel_save_to,
+            )
+        except typer.Exit:
+            pass  # acceptable terminal state
+        except AttributeError as exc:  # pragma: no cover - the regression
+            pytest.fail(f"login() failed to normalize Typer sentinel defaults: {exc}")
+
+        # Picker fired — proves provider was normalized to None and
+        # the if-None branch was taken (not the ``.lower()`` branch).
+        assert provider_picker_calls, (
+            "provider sentinel should have been normalized to None, triggering the picker"
+        )
