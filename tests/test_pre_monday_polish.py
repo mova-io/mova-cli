@@ -245,28 +245,38 @@ def test_deploy_dry_run_header_uses_mdk_branding(
 
 
 @pytest.mark.unit
-def test_add_workspace_panel_uses_canonical_commands(
+def test_add_workspace_panel_uses_domain_scoped_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`mdk add <a> <b>` end-of-batch workspace Panel should use the
-    canonical commands established by PR #92/#93:
-      - `mdk validate --all` (not `mdk ci eval --mock`)
-      - `mdk eval --all --mock --gate 0.7` (not just `mdk ci eval`)
-      - `mdk deploy --target <active>` (not hard-coded `prod`)"""
+    """``mdk add <a> <b>`` end-of-batch picker should be DOMAIN-
+    SCOPED to ``add``'s own concerns (2026-05-19 operator feedback):
+    surface the IMMEDIATE-next actions on what we just scaffolded —
+    validate the bundle, doctor-check the agent. Eval + deploy
+    suggestions were removed because they're downstream concerns
+    owned by their own commands' menus.
+
+    Pre-2026-05-19 the menu showed all four (validate, eval, doctor,
+    deploy) — the cross-domain noise drowned out the actually-useful
+    "did my scaffold work" check.
+    """
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     monkeypatch.chdir(tmp_path / "proj")
     result = runner.invoke(app, ["add", "faq", "ticket-triager"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
-    # Canonical commands present.
+    # In-domain commands present.
     assert "mdk validate --all" in result.stdout
-    assert "mdk eval --all" in result.stdout
-    # Stale commands absent.
+    assert "mdk doctor agent" in result.stdout
+    # Cross-domain commands MUST NOT surface (per the scoping principle).
+    assert "mdk eval --all" not in result.stdout, (
+        "post-2026-05-19 mdk add menu must NOT suggest eval — that's a downstream domain"
+    )
+    assert "mdk deploy" not in result.stdout, (
+        "post-2026-05-19 mdk add menu must NOT suggest deploy — that's a downstream domain"
+    )
+    # Stale-command guards from the original test stay.
     assert "mdk ci eval" not in result.stdout
-    # `--target prod` (hard-coded) should NOT appear unless prod is
-    # actually the active target (which it isn't in a fresh test env).
-    # The line should either show `<your-target>` or the active one.
     assert "--target prod" not in result.stdout
 
 

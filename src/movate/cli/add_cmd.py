@@ -1065,8 +1065,17 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
     # Interactive picker — the single next-steps surface for the
     # batch-add path (no static block inside the Panel; the picker
     # renders the same list in both TTY and non-TTY modes).
+    #
+    # Domain-scoped (2026-05-19 operator feedback): ``mdk add``'s menu
+    # only surfaces the IMMEDIATE-next actions on what we just
+    # scaffolded — validate the bundle, doctor-check the agent.
+    # Removed eval + deploy: those are downstream concerns owned by
+    # their own commands' menus. ``active``  (the project target
+    # name) is unused now that deploy is gone — kept in the function
+    # signature for caller compat.
     from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
 
+    _ = active  # silence unused-variable in this scoped-down menu
     bin_name = mdk_bin_name()
     prompt_next_step(
         console=console,
@@ -1077,19 +1086,9 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
                 argv=[bin_name, "validate", "--all"],
             ),
             NextStep(
-                label="Eval all agents (mock)",
-                command=f"{bin_name} eval --all --mock --gate 0.7",
-                argv=[bin_name, "eval", "--all", "--mock", "--gate", "0.7"],
-            ),
-            NextStep(
                 label=f"Health-check {added_names[0]!r}",
                 command=f"{bin_name} doctor agent {added_names[0]}",
                 argv=[bin_name, "doctor", "agent", added_names[0]],
-            ),
-            NextStep(
-                label="Deploy agents to Azure",
-                command=f"{bin_name} deploy --target {active}",
-                argv=[bin_name, "deploy", "--target", active],
             ),
         ],
     )
