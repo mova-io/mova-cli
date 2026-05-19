@@ -1658,3 +1658,320 @@ def test_all_mode_baseline_per_agent_drift(tmp_path: Path, monkeypatch: pytest.M
     # Project summary reflects the regression count.
     assert "regressions=1" in plain
     assert "ok=false" in plain
+
+
+# ---------------------------------------------------------------------------
+# Per-project rubric overrides (Gap 3e)
+# ---------------------------------------------------------------------------
+
+
+from movate.cli.eval_scorecard_cmd import (  # noqa: E402
+    EffectiveCategories,
+    _build_judge_prompt,
+    _resolve_effective_categories,
+)
+
+
+@pytest.mark.unit
+class TestEffectiveCategories:
+    def test_default_is_full_set(self) -> None:
+        eff = _resolve_effective_categories()
+        assert eff.llm_judged == LLM_JUDGED_CATEGORIES
+        assert eff.programmatic == PROGRAMMATIC_CATEGORIES
+        assert eff.all == ALL_CATEGORIES
+        assert eff.is_default is True
+
+    def test_disabling_an_llm_category_shrinks_llm_set(self) -> None:
+        eff = _resolve_effective_categories(["refusal"])
+        assert "refusal" not in eff.llm_judged
+        assert "refusal" not in eff.all
+        # Programmatic ones unaffected.
+        assert eff.programmatic == PROGRAMMATIC_CATEGORIES
+        assert eff.is_default is False
+
+    def test_disabling_a_programmatic_category_shrinks_programmatic_set(self) -> None:
+        eff = _resolve_effective_categories(["cost"])
+        assert "cost" not in eff.programmatic
+        assert "cost" not in eff.all
+        assert eff.llm_judged == LLM_JUDGED_CATEGORIES
+        assert eff.is_default is False
+
+    def test_disabling_all_llm_categories_leaves_only_programmatic(self) -> None:
+        eff = _resolve_effective_categories(list(LLM_JUDGED_CATEGORIES))
+        assert eff.llm_judged == ()
+        assert eff.programmatic == PROGRAMMATIC_CATEGORIES
+        assert set(eff.all) == set(PROGRAMMATIC_CATEGORIES)
+
+    def test_unknown_disabled_silently_ignored(self) -> None:
+        """The CLI / project.yaml loader validates names — the helper
+        is forgiving so a typo doesn't crash the run."""
+        eff = _resolve_effective_categories(["not-a-real-category"])
+        assert eff.is_default is True
+
+
+@pytest.mark.unit
+class TestBuildJudgePrompt:
+    def test_full_set_matches_pre_built_default(self) -> None:
+        """The dynamically-built prompt for the full default set must
+        match the pre-built ``_JUDGE_SYSTEM_PROMPT`` constant."""
+        from movate.cli.eval_scorecard_cmd import _JUDGE_SYSTEM_PROMPT  # noqa: PLC0415
+
+        assert _build_judge_prompt(LLM_JUDGED_CATEGORIES) == _JUDGE_SYSTEM_PROMPT
+
+    def test_disabled_categories_dont_appear_in_prompt(self) -> None:
+        """When a category is disabled, the judge prompt must not
+        mention it — otherwise the LLM might still try to score it
+        (wasted tokens + confused parsing)."""
+        prompt = _build_judge_prompt(
+            tuple(c for c in LLM_JUDGED_CATEGORIES if c not in {"refusal", "hallucination"})
+        )
+        assert "refusal" not in prompt
+        assert "hallucination" not in prompt
+        # The remaining categories must still appear.
+        assert "accuracy" in prompt
+        assert "safety" in prompt
+
+    def test_prompt_count_reflects_active_set(self) -> None:
+        """Prompt says ``Score each of these N categories``; N should
+        update with the active set."""
+        prompt = _build_judge_prompt(("accuracy", "safety", "format"))
+        assert "3 categories" in prompt
+
+    def test_empty_active_returns_empty_prompt(self) -> None:
+        """Edge case: every LLM category disabled. The prompt is empty
+        and the caller is expected to skip the judge call."""
+        assert _build_judge_prompt(()) == ""
+
+
+@pytest.mark.unit
+def test_cli_disable_category_filters_scorecard_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--disable-category refusal --disable-category hallucination``
+    must produce a scorecard table that omits those categories +
+    drops them from the summary line / JSON."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    captured_effective: list[EffectiveCategories | None] = []
+
+    async def fake_run_scorecard(
+        bundle: Any, *, effective: EffectiveCategories | None = None, **kwargs: Any
+    ) -> ScorecardSummary:
+        captured_effective.append(effective)
+        active = effective.all if effective else ALL_CATEGORIES
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(active, 0.9),
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval-scorecard",
+            str(agent_dir),
+            "--disable-category",
+            "refusal",
+            "--disable-category",
+            "hallucination",
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    plain = _ANSI_RE.sub("", result.stdout)
+    # Flatten whitespace so Rich-wrapped title text doesn't trip the
+    # substring check ("8/10\n    categories" → "8/10 categories").
+    flat = " ".join(plain.split())
+
+    # Title surfaces the reduced count.
+    assert "8/10 categories" in flat
+    # Disabled categories don't render as table rows.
+    body = plain.split("Category")[1].split("overall")[0] if "Category" in plain else plain
+    assert "refusal" not in body
+    assert "hallucination" not in body
+    # The effective set passed to _run_scorecard reflects the disabled flags.
+    assert len(captured_effective) == 1
+    eff = captured_effective[0]
+    assert eff is not None
+    assert "refusal" not in eff.all
+    assert "hallucination" not in eff.all
+
+
+@pytest.mark.unit
+def test_cli_rejects_unknown_disable_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo in ``--disable-category`` must error before any LLM
+    call fires — operators learn the right name immediately."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--disable-category", "typo-not-real"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    combined = result.stdout + result.stderr
+    assert "unknown --disable-category" in combined or "typo-not-real" in combined
+
+
+@pytest.mark.unit
+def test_project_yaml_disabled_categories_take_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project that drops ``refusal`` in its project.yaml must have
+    the scorecard run without scoring that category — no CLI flag
+    needed."""
+    proj = _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    # Edit the scaffolded project.yaml to add scorecard overrides.
+    project_yaml = proj / "project.yaml"
+    existing = project_yaml.read_text()
+    project_yaml.write_text(existing + "\nscorecard:\n  disabled_categories: [refusal]\n")
+
+    agent_dir = proj / "agents" / "faq"
+    captured_effective: list[EffectiveCategories | None] = []
+
+    async def fake_run_scorecard(
+        bundle: Any, *, effective: EffectiveCategories | None = None, **kwargs: Any
+    ) -> ScorecardSummary:
+        captured_effective.append(effective)
+        active = effective.all if effective else ALL_CATEGORIES
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(active, 0.9),
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(captured_effective) == 1
+    eff = captured_effective[0]
+    assert eff is not None
+    assert "refusal" not in eff.all
+
+
+@pytest.mark.unit
+def test_cli_and_project_yaml_disabled_categories_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When both project.yaml and CLI disable categories, the union
+    applies — neither overrides the other. Operators use the CLI
+    flag for one-off skips on top of the project-level baseline."""
+    proj = _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    project_yaml = proj / "project.yaml"
+    project_yaml.write_text(
+        project_yaml.read_text() + "\nscorecard:\n  disabled_categories: [refusal]\n"
+    )
+
+    agent_dir = proj / "agents" / "faq"
+    captured_effective: list[EffectiveCategories | None] = []
+
+    async def fake_run_scorecard(
+        bundle: Any, *, effective: EffectiveCategories | None = None, **kwargs: Any
+    ) -> ScorecardSummary:
+        captured_effective.append(effective)
+        active = effective.all if effective else ALL_CATEGORIES
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(active, 0.9),
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval-scorecard",
+            str(agent_dir),
+            "--disable-category",
+            "hallucination",  # CLI adds to project.yaml's [refusal]
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    eff = captured_effective[0]
+    assert eff is not None
+    assert "refusal" not in eff.all  # from project.yaml
+    assert "hallucination" not in eff.all  # from CLI
+
+
+@pytest.mark.unit
+def test_gates_for_disabled_categories_silently_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If an operator sets a gate on a category that's been disabled
+    (e.g. ``--gate-refusal 0.9 --disable-category refusal``), the
+    gate must silently skip rather than failing with 0 < 0.9. This
+    is the practical case where a project.yaml disables a category
+    but a stale CI invocation still has the gate flag set."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    async def fake_run_scorecard(
+        bundle: Any, *, effective: EffectiveCategories | None = None, **kwargs: Any
+    ) -> ScorecardSummary:
+        active = effective.all if effective else ALL_CATEGORIES
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(active, 0.95),
+            overall_mean=0.95,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval-scorecard",
+            str(agent_dir),
+            "--disable-category",
+            "refusal",
+            "--gate-refusal",
+            "0.9",  # would fail if not skipped
+        ],
+        env={"COLUMNS": "200"},
+    )
+    # Should pass — the disabled category's gate is skipped.
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+
+@pytest.mark.unit
+class TestScorecardConfigValidation:
+    def test_project_yaml_unknown_category_rejected_at_load_time(self) -> None:
+        """A typo in ``scorecard.disabled_categories`` must error at
+        project.yaml load time — not silently disable nothing at
+        scorecard runtime. Catches misconfiguration early."""
+        from movate.core.config import ProjectConfig  # noqa: PLC0415
+
+        with pytest.raises(Exception, match="unknown scorecard categories"):
+            ProjectConfig(scorecard={"disabled_categories": ["typo-not-real"]})
+
+    def test_project_yaml_default_is_empty(self) -> None:
+        """Absent ``scorecard:`` block = empty disabled list = full
+        default rubric. Backwards-compatible with pre-Gap-3e projects."""
+        from movate.core.config import ProjectConfig  # noqa: PLC0415
+
+        assert ProjectConfig().scorecard.disabled_categories == []

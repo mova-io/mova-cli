@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from movate.core.models import AgentRuntime, SkillSideEffects
 
@@ -653,6 +653,65 @@ class ProjectConfig(BaseModel):
             "(output). See GuardrailsConfig for the full schema."
         ),
     )
+    scorecard: ScorecardConfig = Field(
+        # Lambda (not ``default_factory=ScorecardConfig``) because the
+        # class is defined AFTER ProjectConfig — the lambda defers the
+        # name resolution to call-time.
+        default_factory=lambda: ScorecardConfig(),  # noqa: PLW0108
+        description=(
+            "Per-project overrides for ``mdk eval-scorecard``. Lets each "
+            "project drop categories that don't apply to its agents "
+            "(e.g. an internal tool with no adversarial surface drops "
+            "``refusal``) without forking the scorecard rubric. Empty/"
+            "absent = use the default 10 categories. See ScorecardConfig."
+        ),
+    )
+
+
+class ScorecardConfig(BaseModel):
+    """Per-project overrides for the ``mdk eval-scorecard`` rubric.
+
+    The default rubric has 10 categories (8 LLM-judged + 2 programmatic);
+    this block lets each project tailor that set without forking the
+    scorecard code.
+
+    Today: support disabling categories. A future revision can add
+    weighting + custom categories.
+
+    YAML:
+
+      scorecard:
+        disabled_categories: [refusal, hallucination]
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    disabled_categories: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Categories to drop from the scorecard for this project. "
+            "Must be a subset of the 10 known names (accuracy, "
+            "faithfulness, format, safety, refusal, hallucination, "
+            "completeness, instruction_following, latency, cost). "
+            "Unknown names error at load time so a typo doesn't "
+            "silently disable nothing."
+        ),
+    )
+
+    @field_validator("disabled_categories")
+    @classmethod
+    def _validate_known(cls, v: list[str]) -> list[str]:
+        # Import locally to avoid the circular dep — eval_scorecard_cmd
+        # imports from movate.core.config (via load_project_config), so
+        # the inverse import has to be lazy.
+        from movate.cli.eval_scorecard_cmd import ALL_CATEGORIES  # noqa: PLC0415
+
+        unknown = [c for c in v if c not in ALL_CATEGORIES]
+        if unknown:
+            raise ValueError(
+                f"unknown scorecard categories: {unknown}. Valid: {sorted(ALL_CATEGORIES)}"
+            )
+        return v
 
 
 def load_project_config(path: Path | str | None = None) -> ProjectConfig:
