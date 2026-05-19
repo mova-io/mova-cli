@@ -423,8 +423,24 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
         wizard = _run_eval_wizard()
         if wizard is None:  # operator hit Ctrl-C / quit
             raise typer.Exit(code=0)
-        # Apply wizard's answers as if they were CLI flags, then fall
-        # through to the standard dispatch below — no duplicated logic.
+        # Scorecard branch: the operator picked "generate fresh" in
+        # the test-cases prompt. Skip the legacy --gate/--runs/--baseline
+        # dispatch entirely and route to the 10-cat scorecard. The
+        # scorecard does its own one-and-only generation.
+        if wizard.scorecard and wizard.path is not None:
+            from movate.cli.eval_scorecard_cmd import eval_scorecard  # noqa: PLC0415
+
+            agent_path = Path.cwd() / "agents" / wizard.path
+            eval_scorecard(
+                agent=str(agent_path),
+                count=wizard.scorecard_count,
+                mix=wizard.scorecard_mix,
+                mock=wizard.mock,
+                judge_model=None,
+            )
+            return
+        # Legacy branch: apply wizard's answers as if they were CLI
+        # flags, then fall through to the standard dispatch below.
         path = wizard.path
         all_in_project = wizard.all_in_project
         mock = wizard.mock
@@ -585,6 +601,22 @@ class _EvalWizardChoices:
     Maps 1:1 to the CLI flags the dispatch path already handles, so
     the wizard's only job is collecting choices — execution stays in
     the existing code paths.
+
+    Two dispatch modes:
+
+    * **Legacy** (``scorecard=False``): scores against
+      ``evals/dataset.jsonl`` with ``--gate``, ``--runs``,
+      ``--baseline-*``. The operator picked "keep existing dataset"
+      in the test-cases prompt, so they want the curated dataset
+      scored the curated way.
+
+    * **Scorecard** (``scorecard=True``): the operator picked
+      "generate fresh cases", which pairs naturally with the
+      10-category scorecard rubric. The wizard skips the gate /
+      runs / baseline questions (they don't map onto the 10-cat
+      rubric) and dispatches to ``eval_scorecard_cmd.eval_scorecard``
+      with ``scorecard_count`` + ``scorecard_mix``. Generation happens
+      once inside the scorecard (no double-generation).
     """
 
     path: str | None
@@ -594,6 +626,11 @@ class _EvalWizardChoices:
     runs: int
     baseline_file: Path | None
     output_baseline: Path | None
+    # Scorecard-mode dispatch (set when the operator picked
+    # "generate fresh cases" in the test-cases prompt).
+    scorecard: bool = False
+    scorecard_count: int = 10
+    scorecard_mix: str = "standard"
 
 
 def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orchestrator; 5 prompts each with try/except adds linear branch count
@@ -676,15 +713,55 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
     # without losing functionality.
     use_mock = False
 
-    # Q2 (NEW): Generate fresh test cases.
-    # Operators of the scorecard workflow expect the wizard to produce
-    # cases on the fly, not score against a pre-existing dataset.jsonl.
-    # If the agent has an existing dataset, ask whether to keep or
-    # regenerate (regeneration overwrites in place). In --all mode we
-    # skip the per-agent prompt and just leave existing datasets alone
-    # — too many decisions otherwise.
-    if chosen_agent != "all" and not _prompt_generate_cases(cwd, chosen_agent):
-        return None
+    # Q2 (NEW): Generate fresh test cases or keep existing?
+    # Branches into two scoring models:
+    #
+    # * "generate" → 10-category scorecard rubric (matches the
+    #   scorecard-style workflow this command was redesigned around).
+    #   Skips the gate/runs/baseline questions entirely; the scorecard
+    #   has its own scoring model.
+    # * "keep" → legacy dataset-based scoring. Falls through to the
+    #   gate/runs/baseline questions below.
+    #
+    # In --all mode we skip the per-agent prompt entirely and stay on
+    # the legacy flow — too many decisions otherwise (scorecard --all
+    # is on the roadmap as Gap 3).
+    if chosen_agent != "all":
+        raw_choice = _prompt_generate_cases(cwd, chosen_agent)
+        if raw_choice is _CANCELLED:
+            return None
+        # If the operator picked "generate fresh", short-circuit the
+        # rest of the wizard. The 10-cat rubric doesn't have a
+        # gate/runs/baseline shape, so asking those questions would
+        # produce dead inputs.
+        if raw_choice is not None:
+            # Narrow: raw_choice is neither _CANCELLED nor None →
+            # it's the (count, mix) tuple from _ask_scorecard_count_and_mix.
+            assert isinstance(raw_choice, tuple)
+            count, mix = raw_choice
+            console.print()
+            console.print(
+                Panel(
+                    f"[bold]Running:[/bold] mdk eval [bold]{chosen_agent}[/bold] "
+                    f"--scorecard --scorecard-count {count} "
+                    f"--scorecard-mix {mix}",
+                    title="[green]✓[/green] Configured",
+                    border_style="green",
+                    title_align="left",
+                )
+            )
+            return _EvalWizardChoices(
+                path=chosen_agent,
+                all_in_project=False,
+                mock=use_mock,
+                gate=0.0,  # ignored in scorecard mode
+                runs=1,  # ignored in scorecard mode
+                baseline_file=None,
+                output_baseline=None,
+                scorecard=True,
+                scorecard_count=count,
+                scorecard_mix=mix,
+            )
 
     # Q3: Gate threshold.
     gate_choices = {
@@ -817,25 +894,30 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
     )
 
 
-def _prompt_generate_cases(cwd: Path, agent_name: str) -> bool:
-    """Wizard step: offer to generate fresh test cases via LLM.
+# Sentinel for ``_prompt_generate_cases`` Ctrl-C return — using a
+# typed object lets the caller distinguish "user cancelled" from
+# "user picked keep" (which returns None).
+_CANCELLED: object = object()
 
-    Returns False on Ctrl-C / quit; True otherwise (including when
-    the operator chooses to keep an existing dataset). Side effect:
-    writes generated cases to ``agents/<agent>/evals/dataset.jsonl``
-    when the operator opts to regenerate.
 
-    Two flows:
+def _prompt_generate_cases(cwd: Path, agent_name: str) -> tuple[int, str] | None | object:
+    """Wizard step: ask whether to keep the existing dataset or
+    generate fresh cases via LLM.
 
-    * No existing dataset → default to "generate fresh". Ask count
-      + mix, then run generation showing progress.
-    * Existing dataset → ask whether to keep or regenerate. Keep is
-      the safe default (regeneration overwrites in place).
+    Returns:
 
-    Reuses :func:`movate.cli.eval_gen_cmd._generate_entries` so the
-    generation logic stays in one place. Falls back gracefully if the
-    agent can't be loaded — wizard continues with whatever dataset
-    is already there.
+    * ``_CANCELLED`` (sentinel) on Ctrl-C / quit.
+    * ``None`` if the operator chose to keep the existing dataset
+      (or skip generation when no dataset exists). Caller continues
+      with legacy gate / runs / baseline questions.
+    * ``(count, mix)`` if the operator chose to generate fresh.
+      Caller dispatches to the scorecard flow; the generation itself
+      happens inside the scorecard (no double-generation here).
+
+    Defaults:
+    * No existing dataset → default action is "generate".
+    * Existing dataset → default action is "keep" (regeneration would
+      overwrite a possibly-curated file, so opt-in only).
     """
     dataset_path = cwd / "agents" / agent_name / "evals" / "dataset.jsonl"
     existing_count = _count_dataset_rows(dataset_path) if dataset_path.is_file() else 0
@@ -848,8 +930,8 @@ def _prompt_generate_cases(cwd: Path, agent_name: str) -> bool:
             f"at {dataset_path.relative_to(cwd)})[/dim]"
         )
         choices = {
-            "1": ("keep", f"keep existing dataset ({existing_count} cases)"),
-            "2": ("generate", "generate fresh cases via LLM (overwrites dataset)"),
+            "1": ("keep", f"keep existing dataset ({existing_count} cases) — legacy scoring"),
+            "2": ("generate", "generate fresh cases via LLM — 10-category scorecard"),
         }
         default = "1"
     else:
@@ -857,8 +939,8 @@ def _prompt_generate_cases(cwd: Path, agent_name: str) -> bool:
             "[bold]Test cases?[/bold]  [dim](no dataset found — recommend generating)[/dim]"
         )
         choices = {
-            "1": ("generate", "generate fresh cases via LLM"),
-            "2": ("keep", "skip generation (eval against empty dataset)"),
+            "1": ("generate", "generate fresh cases via LLM — 10-category scorecard"),
+            "2": ("keep", "skip generation — legacy scoring against empty dataset"),
         }
         default = "1"
 
@@ -872,12 +954,12 @@ def _prompt_generate_cases(cwd: Path, agent_name: str) -> bool:
             show_choices=False,
         )
     except (KeyboardInterrupt, EOFError):
-        return False
+        return _CANCELLED
 
     if choices[action_idx][0] == "keep":
-        return True
+        return None
 
-    return _do_generate_cases(cwd, agent_name, dataset_path)
+    return _ask_scorecard_count_and_mix()
 
 
 def _count_dataset_rows(dataset_path: Path) -> int:
@@ -888,12 +970,14 @@ def _count_dataset_rows(dataset_path: Path) -> int:
         return 0
 
 
-def _do_generate_cases(cwd: Path, agent_name: str, dataset_path: Path) -> bool:
-    """Drive the count + mix sub-prompts, then run generation.
+def _ask_scorecard_count_and_mix() -> tuple[int, str] | object:
+    """Drive the count + mix sub-prompts for the scorecard branch.
 
-    Returns False on Ctrl-C / quit; True on success or on a generation
-    error (the wizard continues with whatever dataset exists so the
-    operator can still proceed to scoring)."""
+    Returns ``(count, mix)`` on success, ``_CANCELLED`` on Ctrl-C.
+    No generation happens here — the scorecard itself does that
+    exactly once when it runs (avoids the double-generation that
+    would result from the wizard generating + the scorecard
+    regenerating)."""
     # Sub-Q: count.
     count_choices = {
         "1": (5, "5 cases — fast iteration / quick demo"),
@@ -913,7 +997,7 @@ def _do_generate_cases(cwd: Path, agent_name: str, dataset_path: Path) -> bool:
             show_choices=False,
         )
     except (KeyboardInterrupt, EOFError):
-        return False
+        return _CANCELLED
     count = count_choices[count_idx][0]
 
     # Sub-Q: mix.
@@ -935,53 +1019,10 @@ def _do_generate_cases(cwd: Path, agent_name: str, dataset_path: Path) -> bool:
             show_choices=False,
         )
     except (KeyboardInterrupt, EOFError):
-        return False
+        return _CANCELLED
     mix = mix_choices[mix_idx][0]
 
-    # Run generation.
-    console.print()
-    console.print(f"[dim]Generating {count} {mix} cases for [bold]{agent_name}[/bold]…[/dim]")
-    try:
-        from movate.cli.eval_gen_cmd import _generate_entries  # noqa: PLC0415
-        from movate.core.loader import AgentLoadError, load_agent  # noqa: PLC0415
-
-        bundle = load_agent(cwd / "agents" / agent_name)
-        entries = asyncio.run(
-            _generate_entries(
-                bundle,
-                num=count,
-                sample_input=None,
-                mock=False,
-                with_dimensions=False,
-                mode=mix,
-            )
-        )
-        if not entries:
-            err_console.print(
-                "[yellow]⚠[/yellow] generation produced no cases — "
-                "continuing with existing dataset (if any)"
-            )
-            return True
-
-        # Write entries to dataset.jsonl. Existing file (if any) is
-        # overwritten — the operator opted into that path explicitly.
-        dataset_path.parent.mkdir(parents=True, exist_ok=True)
-        dataset_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
-        console.print(
-            f"[green]✓[/green] wrote {len(entries)} cases to "
-            f"[bold]{dataset_path.relative_to(cwd)}[/bold]"
-        )
-    except AgentLoadError as exc:
-        err_console.print(
-            f"[yellow]⚠[/yellow] could not load agent for generation: {exc}. "
-            "Continuing with existing dataset (if any)."
-        )
-    except Exception as exc:
-        err_console.print(
-            f"[yellow]⚠[/yellow] case generation failed ({type(exc).__name__}: "
-            f"{exc}). Continuing with existing dataset (if any)."
-        )
-    return True
+    return (count, mix)
 
 
 def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflects the per-agent state machine

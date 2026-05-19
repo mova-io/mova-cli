@@ -108,56 +108,117 @@ def test_guided_picks_single_agent_gate_07_runs_3(
 
 
 @pytest.mark.unit
-def test_guided_single_agent_generate_path_calls_generation_helper(
+def test_guided_single_agent_generate_dispatches_to_scorecard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Single-agent flow with "generate fresh" picked must run the
-    case-generation sub-flow (count + mix sub-prompts, then call
-    ``_generate_entries`` and write to dataset.jsonl). Mocked at the
-    generation boundary so the test stays hermetic.
+    """Gap 1: picking "generate fresh" in the wizard must dispatch to
+    the scorecard flow (10-category rubric), NOT the legacy gate /
+    runs / baseline dispatch. The 10-cat rubric pairs naturally with
+    LLM-generated cases; gate/runs/baseline questions don't map onto
+    it. So:
 
-    Pin the sub-flow order so a future refactor can't accidentally
-    skip the case-generation step in single-agent mode."""
+    * The wizard SKIPS the gate / runs / baseline prompts entirely
+      when "generate" is picked.
+    * ``eval_scorecard`` is called with the chosen count + mix.
+    * Generation happens exactly once (inside the scorecard) — the
+      wizard itself does not call _generate_entries (avoiding the
+      double-generation a naive design would produce).
+
+    Pin all three behaviors so a future refactor can't regress the
+    scorecard dispatch."""
     _bootstrap(tmp_path, monkeypatch)
 
-    # Mock the LLM generation so we don't need API keys + so we can
-    # assert that the wizard actually calls it.
-    gen_calls: list[dict[str, object]] = []
+    # Mock the scorecard entry point so we don't need API keys + so
+    # we can assert the wizard dispatches to it with the right kwargs.
+    scorecard_calls: list[dict[str, object]] = []
 
-    async def fake_generate_entries(bundle: object, **kwargs: object) -> list[dict[str, object]]:
-        gen_calls.append({"num": kwargs.get("num"), "mode": kwargs.get("mode")})
-        return [
-            {"input": {"question": "q1"}, "expected": {"answer": "a1"}},
-            {"input": {"question": "q2"}, "expected": {"answer": "a2"}},
-        ]
+    def fake_eval_scorecard(**kwargs: object) -> None:
+        scorecard_calls.append(kwargs)
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd.eval_scorecard", fake_eval_scorecard)
+
+    # Pin that the OLD generation path is NOT invoked from the wizard
+    # (that would mean double-generation).
+    gen_calls: list[object] = []
+
+    async def fake_generate_entries(*args: object, **kwargs: object) -> list[object]:
+        gen_calls.append(kwargs)
+        return []
 
     monkeypatch.setattr("movate.cli.eval_gen_cmd._generate_entries", fake_generate_entries)
 
-    # Six answers: 2=faq, 2=generate fresh, 2=10 cases, 1=standard,
-    # 1=gate 0.0 (so eval against the fresh dataset doesn't gate-fail
-    # without API keys), 1=runs 1, 1=no baseline.
-    # Wait — that's seven. Recount: agent, action, count, mix, gate,
-    # runs, baseline = 7 answers.
+    # Four answers: 2=faq, 2=generate fresh, 2=10 cases, 1=standard mix.
+    # (Note: no gate/runs/baseline answers needed — the wizard skips
+    # those questions when scorecard mode is selected.)
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="2\n2\n2\n1\n1\n1\n1\n",
+        input="2\n2\n2\n1\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
-    # Generation sub-prompts surfaced.
+    assert result.exit_code == 0, combined
+    # Scorecard sub-prompts surfaced.
     assert "Test cases?" in combined
     assert "How many cases?" in combined
     assert "Which mix?" in combined
-    # Generation actually fired.
-    assert len(gen_calls) == 1, f"expected one generation call, got {gen_calls}"
-    assert gen_calls[0]["num"] == 10
-    assert gen_calls[0]["mode"] == "standard"
-    # The dataset.jsonl was overwritten with the fake entries.
-    dataset_path = tmp_path / "proj" / "agents" / "faq" / "evals" / "dataset.jsonl"
-    assert dataset_path.is_file()
-    rows = [line for line in dataset_path.read_text().splitlines() if line.strip()]
-    assert len(rows) == 2
+    # Gate/runs/baseline questions did NOT surface in scorecard mode.
+    assert "Gate threshold?" not in combined, (
+        "scorecard branch must skip the gate/runs/baseline questions"
+    )
+    assert "Runs per case?" not in combined
+    assert "Baseline behavior?" not in combined
+    # Scorecard dispatch happened exactly once with the chosen params.
+    assert len(scorecard_calls) == 1, f"expected one dispatch, got {scorecard_calls}"
+    call = scorecard_calls[0]
+    assert call["count"] == 10
+    assert call["mix"] == "standard"
+    assert call["agent"].endswith("agents/faq")
+    # Wizard itself did NOT call _generate_entries — that would be
+    # double-generation (scorecard does it once internally).
+    assert len(gen_calls) == 0, (
+        "wizard should NOT call _generate_entries directly when "
+        "dispatching to scorecard — generation belongs inside the "
+        "scorecard flow exactly once"
+    )
+
+
+@pytest.mark.unit
+def test_guided_single_agent_keep_existing_uses_legacy_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other branch of the test-cases prompt: "keep existing"
+    must dispatch to the LEGACY flow (gate / runs / baseline) so
+    operators with curated datasets keep the deterministic scoring
+    they curated for. Pin that the gate/runs/baseline questions
+    still surface in this branch."""
+    _bootstrap(tmp_path, monkeypatch)
+
+    # Block scorecard dispatch — it must NOT fire in the legacy branch.
+    scorecard_calls: list[object] = []
+
+    def fake_eval_scorecard(**kwargs: object) -> None:
+        scorecard_calls.append(kwargs)
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd.eval_scorecard", fake_eval_scorecard)
+
+    # Five answers: 2=faq, 1=keep existing, 1=gate 0.0, 1=runs 1, 1=baseline none.
+    result = runner.invoke(
+        app,
+        ["eval", "--guided"],
+        input="2\n1\n1\n1\n1\n",
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    assert "Test cases?" in combined
+    # Legacy flow → gate/runs/baseline questions fire.
+    assert "Gate threshold?" in combined
+    assert "Runs per case?" in combined
+    assert "Baseline behavior?" in combined
+    # Scorecard did NOT fire.
+    assert len(scorecard_calls) == 0
+    # Legacy dispatch composed a `mdk eval faq` invocation.
+    assert "mdk eval faq" in combined
 
 
 @pytest.mark.unit
