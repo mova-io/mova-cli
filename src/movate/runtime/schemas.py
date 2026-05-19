@@ -779,6 +779,58 @@ class AgentDatasetUploadView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# KB upload wire types
+# ---------------------------------------------------------------------------
+
+
+class KbIngestFileResult(BaseModel):
+    """Per-file outcome from ``POST /api/v1/agents/{name}/kb``.
+
+    Mirrors :class:`movate.kb.ingest.IngestSummary` for the wire,
+    plus a status field so the caller can tell which files were
+    accepted vs. skipped (empty / unsupported extension).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    """The uploaded filename (basename). Empty string for inline text."""
+
+    status: str
+    """One of ``"ingested"`` (chunks saved), ``"empty"`` (file had no
+    extractable text), ``"skipped"`` (unsupported extension). The
+    endpoint returns 200 with a mix of statuses rather than 400'ing
+    a multi-file upload on a single bad file."""
+
+    chunks_total: int = 0
+    """Total chunks produced by the splitter. 0 for empty/skipped."""
+
+    chunks_saved: int = 0
+    """Chunks persisted to storage. Equal to ``chunks_total`` in v0.9
+    since the storage layer always upserts."""
+
+    embedding_model: str | None = None
+    """The full ``provider/model`` identifier used. ``None`` when the
+    file was empty/skipped (no embedding call made)."""
+
+
+class KbIngestView(BaseModel):
+    """``POST /api/v1/agents/{name}/kb`` response.
+
+    Aggregate plus per-file detail. Total counts make the success
+    summary trivial to render in the playground UI; per-file detail
+    lets the operator see exactly which uploads contributed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    files: list[KbIngestFileResult]
+    total_chunks_saved: int
+    """Sum of chunks_saved across all files — convenience for the UI."""
+
+
+# ---------------------------------------------------------------------------
 # Auth key management wire types
 # ---------------------------------------------------------------------------
 

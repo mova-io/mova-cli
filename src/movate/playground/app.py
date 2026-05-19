@@ -154,6 +154,94 @@ async def on_pick_agent(action: cl.Action) -> None:
         )
     ).send()
     await cl.Message(content=f"**Sample input:**\n```json\n{sample_json}\n```").send()
+    # KB upload action — gives the dev-team a fast loop for "did
+    # adding this document fix the failing case?" testing without
+    # leaving the chat or running CLI commands.
+    await cl.Message(
+        content=(
+            "**Knowledge base:** drag-drop .md / .txt files into the "
+            "chat (use the paperclip), or click below to upload a "
+            "file via dialog."
+        ),
+        actions=[
+            cl.Action(
+                name="upload_kb",
+                value=agent_name,
+                label="📎 Upload KB file",
+                description="Add a document to this agent's knowledge base",
+            ),
+        ],
+    ).send()
+
+
+@cl.action_callback("upload_kb")
+async def on_upload_kb(action: cl.Action) -> None:
+    """Operator clicked "Upload KB file" — prompt for a file picker,
+    then POST it to the runtime's KB ingest endpoint."""
+    client: PlaygroundClient = cl.user_session.get("client")
+    agent_name = action.value or cl.user_session.get("agent_name")
+    if not agent_name or not client:
+        await cl.Message(content="Pick an agent first from the buttons above.").send()
+        return
+
+    ask = cl.AskFileMessage(
+        content=(
+            f"Select one or more **.md / .markdown / .txt** files to add "
+            f"to **{agent_name}**'s knowledge base. They'll be chunked, "
+            "embedded, and indexed."
+        ),
+        accept=["text/markdown", "text/plain", ".md", ".markdown", ".txt"],
+        max_size_mb=20,
+        max_files=10,
+        timeout=180,
+    )
+    files = await ask.send()
+    if not files:
+        await cl.Message(content="No files received — upload cancelled.").send()
+        return
+
+    # ``cl.AskFileMessage`` returns a list of AskFileResponse objects,
+    # each carrying ``name`` + ``path`` (a temp file on disk Chainlit
+    # already wrote). We read the bytes and forward to the runtime.
+    payload: list[tuple[str, bytes]] = []
+    for f in files:
+        try:
+            with open(f.path, "rb") as fh:
+                payload.append((f.name, fh.read()))
+        except OSError as exc:
+            await cl.Message(
+                content=f"❌ Could not read uploaded file {f.name!r}: {exc}",
+            ).send()
+            return
+
+    progress = cl.Message(content=f"⏳ Ingesting {len(payload)} file(s) into **{agent_name}**...")
+    await progress.send()
+    try:
+        result = await client.upload_kb_files(agent=agent_name, files=payload)
+    except Exception as exc:
+        await cl.Message(
+            content=f"❌ KB upload failed: {type(exc).__name__}: {exc}",
+        ).send()
+        return
+
+    total_saved = result.get("total_chunks_saved", 0)
+    per_file = result.get("files") or []
+    lines = [f"✅ Ingested **{total_saved}** chunk(s) total."]
+    for entry in per_file:
+        status = entry.get("status", "?")
+        src = entry.get("source", "?")
+        saved = entry.get("chunks_saved", 0)
+        if status == "ingested":
+            lines.append(f"- `{src}` — {saved} chunk(s) saved ✓")
+        elif status == "empty":
+            lines.append(f"- `{src}` — empty / unchunkable, skipped")
+        else:
+            lines.append(f"- `{src}` — {status}, skipped")
+    lines.append(
+        "\nNow try a query that needs this content — the agent's "
+        "KB skill (if wired) will retrieve from the new chunks."
+    )
+    await cl.Message(content="\n".join(lines)).send()
 
 
 @cl.on_message

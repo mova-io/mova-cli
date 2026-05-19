@@ -119,7 +119,48 @@ async def _ingest_one_file(
 ) -> IngestSummary | None:
     text = file_path.read_text(encoding="utf-8")
     source = str(file_path.resolve())
-    chunks = split_paragraphs(text, source=source)
+    return await ingest_text(
+        storage=storage,
+        text=text,
+        source=source,
+        agent=agent,
+        tenant_id=tenant_id,
+        embedding_model=embedding_model,
+        api_key=api_key,
+    )
+
+
+async def ingest_text(
+    *,
+    storage: object,
+    text: str,
+    source: str,
+    agent: str,
+    tenant_id: str,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    api_key: str | None = None,
+) -> IngestSummary | None:
+    """Chunk + embed + persist ``text`` as KB content for ``agent``.
+
+    Same pipeline as :func:`ingest_path` but takes the document body
+    in memory rather than reading from disk. Used by:
+
+    * The runtime's KB upload endpoint
+      (``POST /api/v1/agents/{name}/kb``) — accepts multipart file
+      uploads and never writes them to a project ``kb/`` directory.
+    * Future programmatic ingest from notebooks / scripts.
+
+    ``source`` is a free-form label that ends up on each
+    :class:`KbChunk` for traceability (e.g. the uploaded filename or
+    ``"chainlit-upload/<filename>"``). It doesn't have to be an
+    actual filesystem path. Pass an empty string to get a generic
+    ``"<inline>"`` label.
+
+    Empty / whitespace-only input → ``None`` (idempotent no-op,
+    matches :func:`_ingest_one_file`).
+    """
+    label = source or "<inline>"
+    chunks = split_paragraphs(text, source=label)
     if not chunks:
         return None
 
@@ -139,7 +180,7 @@ async def _ingest_one_file(
             kb_chunk = KbChunk(
                 tenant_id=tenant_id,
                 agent=agent,
-                source=source,
+                source=label,
                 text=chunk.text,
                 embedding=embedding,
                 embedding_model=full_model_name,
@@ -151,7 +192,7 @@ async def _ingest_one_file(
             await storage.save_kb_chunk(kb_chunk)  # type: ignore[attr-defined]
             saved += 1
     return IngestSummary(
-        source=source,
+        source=label,
         chunks_total=len(chunks),
         chunks_saved=saved,
         embedding_model=full_model_name,
