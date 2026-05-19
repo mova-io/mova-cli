@@ -1990,6 +1990,17 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
         console.print(
             f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
         )
+    # Reset LiteLLM's GLOBAL_LOGGING_WORKER before opening a new
+    # event loop. The wizard's preview-gen path (PR #212) may have
+    # already done an ``asyncio.run`` upstream, leaving the worker's
+    # queue stranded on the closed loop. Without this reset the next
+    # ``acompletion`` inside the scorecard blows up with
+    # ``RuntimeError: <Queue> is bound to a different event loop``.
+    from movate.providers.litellm import (  # noqa: PLC0415
+        reset_logging_worker_for_new_event_loop,
+    )
+
+    reset_logging_worker_for_new_event_loop()
     summary = asyncio.run(
         _run_scorecard_single_async(
             bundle,
@@ -2372,6 +2383,16 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
     # bound to a different event loop" RuntimeError on every
     # subsequent acompletion. See _run_scorecard_sweep_async for the
     # full chronology.
+    #
+    # The wizard's preview-gen path (PR #212) ALSO opens an
+    # ``asyncio.run`` upstream of this one, leaving the worker
+    # bound to a closed loop. Reset the worker here before the
+    # sweep's run begins so it re-initializes against THIS loop.
+    from movate.providers.litellm import (  # noqa: PLC0415
+        reset_logging_worker_for_new_event_loop,
+    )
+
+    reset_logging_worker_for_new_event_loop()
     summaries, failed = asyncio.run(
         _run_scorecard_sweep_async(
             agent_dirs=agent_dirs,

@@ -50,6 +50,53 @@ log = logging.getLogger(__name__)
 litellm.suppress_debug_info = True
 
 
+def reset_logging_worker_for_new_event_loop() -> None:
+    """Reset LiteLLM's module-level ``GLOBAL_LOGGING_WORKER`` so the
+    next ``asyncio.run`` initializes its queue against the new loop.
+
+    LiteLLM lazily creates an ``asyncio.Queue`` inside
+    ``LoggingWorker._ensure_queue`` on the FIRST ``acompletion`` call.
+    The queue binds to whichever event loop touched it. When the
+    current ``asyncio.run`` closes the loop, the queue is stranded;
+    the next ``asyncio.run`` (e.g. wizard preview-gen → scorecard
+    scoring) creates a NEW loop and the stranded queue explodes::
+
+        RuntimeError: <Queue at 0x...> is bound to a different event loop
+
+    Historical fix (PR #197 era) consolidated preflight + sweep into
+    one ``asyncio.run`` to avoid the bug. But PR #212's wizard
+    preview-gen added a SECOND ``asyncio.run`` upstream of the
+    scorecard's run — re-introducing the original problem on the
+    single-agent generate-then-score path.
+
+    This helper is the smaller, lower-blast-radius alternative to
+    rearchitecting the whole wizard into one event loop: call it
+    before ``asyncio.run`` to ensure ``GLOBAL_LOGGING_WORKER`` will
+    re-initialize its queue against the FRESH loop on first
+    ``acompletion``. Idempotent — safe to call when the worker
+    hasn't been touched yet (no-op).
+
+    Best-effort: silently catches ImportError + AttributeError if
+    LiteLLM's internals change, so a future LiteLLM rev that
+    renames the global doesn't break movate.
+    """
+    try:
+        from litellm.litellm_core_utils.logging_worker import (  # noqa: PLC0415
+            GLOBAL_LOGGING_WORKER,
+        )
+    except ImportError:
+        return  # LiteLLM unavailable or restructured — no-op.
+    try:
+        # The worker task is tied to the dead loop too — cancel ref
+        # so the next start() rebuilds it. We don't need to await
+        # the cancel; the loop is already closed.
+        GLOBAL_LOGGING_WORKER._worker_task = None
+        GLOBAL_LOGGING_WORKER._queue = None
+    except AttributeError:
+        # LiteLLM renamed the internals — fail open rather than crash.
+        return
+
+
 class LiteLLMProvider(BaseLLMProvider):
     name = "litellm"
     version = "0.0.1"

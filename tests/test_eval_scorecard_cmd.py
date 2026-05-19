@@ -4831,3 +4831,182 @@ class TestRunsPerCaseAveraging:
             runs_per_case=999,
         )
         assert exec_calls == 10, f"runs_per_case=999 must clamp to 10, got {exec_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Wizard prompt markup escaping (2026-05-19) — Rich was swallowing the
+# ``[c]`` (custom) row label as an unrecognized style tag.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPromptMarkupEscaping:
+    """The wizard's count + runs prompts include a ``[c]`` row for
+    the "custom — type a number" option. Pre-2026-05-19 Rich's
+    markup parser treated ``[c]`` as a single-letter style tag and
+    silently swallowed it — operators saw the row indented but with
+    no key label, breaking the custom-input UX.
+
+    The fix escapes the opening bracket so Rich renders ``[c]`` as
+    literal text (numeric keys ``[1]``/``[2]``/``[3]``/``[4]`` also
+    get escaped now, for consistency).
+    """
+
+    def test_count_prompt_renders_c_label_as_literal_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive ``_ask_scorecard_count_and_mix`` enough to trigger
+        the row-render loop, capture the Rich Console output, and
+        assert the literal ``[c]`` appears."""
+        from rich.console import Console  # noqa: PLC0415
+
+        # Replace the module-level console with a recording one so we
+        # can inspect what got rendered. Both Prompt.ask calls also
+        # need stubbing so the function doesn't try to read stdin.
+        recording = Console(record=True, force_terminal=True, width=200)
+        monkeypatch.setattr("movate.cli.eval.console", recording)
+
+        # First Prompt = count choice, second = mix choice.
+        ask_calls = iter(["1", "1"])
+        monkeypatch.setattr("movate.cli.eval.Prompt.ask", lambda *a, **kw: next(ask_calls))
+
+        from movate.cli.eval import _ask_scorecard_count_and_mix  # noqa: PLC0415
+
+        result = _ask_scorecard_count_and_mix()
+        # Function returned a normal (count, mix) tuple, not _CANCELLED.
+        assert isinstance(result, tuple)
+
+        rendered = recording.export_text()
+        # The custom row's bracketed label MUST appear as literal text.
+        assert "[c]" in rendered, (
+            "the custom row's [c] label must render as literal text "
+            f"(Rich was swallowing it). Rendered output:\n{rendered}"
+        )
+        # The numeric labels stay too (they always worked, but pin
+        # the behavior so a future change doesn't break BOTH).
+        assert "[1]" in rendered
+        assert "[2]" in rendered
+
+    def test_runs_prompt_renders_c_label_as_literal_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same regression on the runs-per-case prompt."""
+        from rich.console import Console  # noqa: PLC0415
+
+        recording = Console(record=True, force_terminal=True, width=200)
+        monkeypatch.setattr("movate.cli.eval.console", recording)
+
+        monkeypatch.setattr("movate.cli.eval.Prompt.ask", lambda *a, **kw: "1")
+
+        from movate.cli.eval import _prompt_runs_per_case  # noqa: PLC0415
+
+        n = _prompt_runs_per_case()
+        assert n == 1
+
+        rendered = recording.export_text()
+        assert "[c]" in rendered, "the runs prompt's [c] custom label must render as literal text"
+        assert "[1]" in rendered
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM LoggingWorker reset (2026-05-19) — fixes the "Queue is bound
+# to a different event loop" RuntimeError in the wizard preview-gen +
+# scorecard double-asyncio.run flow.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLiteLLMLoggingWorkerReset:
+    """LiteLLM's ``GLOBAL_LOGGING_WORKER`` lazily creates an
+    ``asyncio.Queue`` on the first ``acompletion`` call. The queue
+    binds to whichever event loop touched it. When an
+    ``asyncio.run`` closes that loop, the queue is stranded — the
+    next ``asyncio.run`` then crashes on the first ``acompletion``
+    with ``RuntimeError: <Queue> is bound to a different event loop``.
+
+    The wizard's preview-gen path (PR #212) introduced a second
+    ``asyncio.run`` upstream of the scorecard's, re-creating the bug
+    the consolidated-loop fix (PR #197) was meant to prevent.
+
+    ``reset_logging_worker_for_new_event_loop`` clears the worker's
+    ``_queue`` + ``_worker_task`` so the next ``asyncio.run`` will
+    create fresh state bound to its own loop.
+    """
+
+    def test_reset_clears_queue_and_worker_task(self) -> None:
+        """Pin the helper's contract: after the call, the worker's
+        ``_queue`` and ``_worker_task`` are both ``None`` (forcing
+        ``LoggingWorker.start()`` to re-create them on the next
+        invocation)."""
+        from litellm.litellm_core_utils.logging_worker import (  # noqa: PLC0415
+            GLOBAL_LOGGING_WORKER,
+        )
+
+        from movate.providers.litellm import (  # noqa: PLC0415
+            reset_logging_worker_for_new_event_loop,
+        )
+
+        # Simulate the post-first-asyncio.run state: queue + task
+        # are non-None sentinels (in real life they're stranded on
+        # a closed event loop, but the reset doesn't care WHICH loop
+        # they're tied to — it just nulls them).
+        sentinel_queue = object()
+        sentinel_task = object()
+        GLOBAL_LOGGING_WORKER._queue = sentinel_queue  # type: ignore[assignment]
+        GLOBAL_LOGGING_WORKER._worker_task = sentinel_task  # type: ignore[assignment]
+
+        reset_logging_worker_for_new_event_loop()
+
+        assert GLOBAL_LOGGING_WORKER._queue is None
+        assert GLOBAL_LOGGING_WORKER._worker_task is None
+
+    def test_reset_is_idempotent_when_worker_never_initialized(self) -> None:
+        """Safe to call even when the worker hasn't been touched
+        yet (queue + task are still None from construction). Should
+        be a no-op, not an error."""
+        from litellm.litellm_core_utils.logging_worker import (  # noqa: PLC0415
+            GLOBAL_LOGGING_WORKER,
+        )
+
+        from movate.providers.litellm import (  # noqa: PLC0415
+            reset_logging_worker_for_new_event_loop,
+        )
+
+        GLOBAL_LOGGING_WORKER._queue = None
+        GLOBAL_LOGGING_WORKER._worker_task = None
+
+        # No exception expected.
+        reset_logging_worker_for_new_event_loop()
+        assert GLOBAL_LOGGING_WORKER._queue is None
+        assert GLOBAL_LOGGING_WORKER._worker_task is None
+
+    def test_reset_tolerates_missing_litellm_internals(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If a future LiteLLM rev renames ``GLOBAL_LOGGING_WORKER``
+        or drops the ``_queue`` / ``_worker_task`` attributes, the
+        helper falls open (no crash) — movate's CLI must not break
+        on an upstream refactor."""
+        # Patch the module so the import inside the helper raises
+        # ImportError. The helper must swallow it.
+        import sys  # noqa: PLC0415
+
+        from movate.providers.litellm import (  # noqa: PLC0415
+            reset_logging_worker_for_new_event_loop,
+        )
+
+        saved = sys.modules.pop("litellm.litellm_core_utils.logging_worker", None)
+        try:
+            monkeypatch.setitem(
+                sys.modules,
+                "litellm.litellm_core_utils.logging_worker",
+                None,  # forces ImportError on re-import
+            )
+            # No exception expected even though the worker module is "missing".
+            try:
+                reset_logging_worker_for_new_event_loop()
+            except Exception as exc:
+                pytest.fail(f"reset must be best-effort, but raised {type(exc).__name__}: {exc}")
+        finally:
+            if saved is not None:
+                sys.modules["litellm.litellm_core_utils.logging_worker"] = saved
