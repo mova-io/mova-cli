@@ -1115,7 +1115,14 @@ def _ask_scorecard_count_and_mix() -> tuple[int, str] | object:
     console.print("[bold]How many cases?[/bold]")
     for key, (n, label) in count_choices.items():
         n_display = "" if n is None else f"{n}  "
-        console.print(f"  [bold cyan][{key}][/bold cyan] {n_display}[dim]{label}[/dim]")
+        # Escape brackets so Rich renders ``[c]`` as literal text.
+        # Without escaping, Rich's markup parser treats single-letter
+        # tags like ``[c]`` as unrecognized style tags and silently
+        # swallows them (numeric ``[1]`` survives because numerics
+        # aren't style names); the operator then sees the row
+        # indented with no key label, which broke the wizard's
+        # custom-row UX on 2026-05-19.
+        console.print(f"  [bold cyan]\\[{key}][/bold cyan] {n_display}[dim]{label}[/dim]")
     try:
         count_idx = Prompt.ask(
             "\n[bold]Pick[/bold]",
@@ -1512,7 +1519,10 @@ def _prompt_runs_per_case() -> int | None:
     )
     for key, (value, label) in choices.items():
         value_display = "" if value is None else f"{value}  "
-        console.print(f"  [bold cyan][{key}][/bold cyan] {value_display}[dim]{label}[/dim]")
+        # Escape ``[`` so Rich renders ``[c]`` as literal text (same
+        # rationale as the count-prompt above — single-letter
+        # tags get parsed as style names and silently dropped).
+        console.print(f"  [bold cyan]\\[{key}][/bold cyan] {value_display}[dim]{label}[/dim]")
     try:
         idx = Prompt.ask(
             "\n[bold]Pick[/bold]",
