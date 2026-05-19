@@ -428,6 +428,7 @@ async def _run_scorecard(
     generator_model: str | None = None,
     project_root: Path | None = None,
     effective: EffectiveCategories | None = None,
+    remote_client: Any = None,
 ) -> ScorecardSummary:
     """End-to-end: generate cases, run agent, score, aggregate.
 
@@ -438,7 +439,15 @@ async def _run_scorecard(
     ``generator_model`` (optional) overrides the LLM model used for
     case generation — handy when the agent's own model isn't
     available in the operator's shell (e.g. agent is openai/... but
-    only ANTHROPIC_API_KEY is set)."""
+    only ANTHROPIC_API_KEY is set).
+
+    ``remote_client`` (optional :class:`movate.core.client.MovateClient`)
+    swaps the local in-process executor for a :class:`RemoteExecutor`
+    that submits each case as a job to a deployed runtime. The local
+    runtime is STILL built — we need its provider (for the LLM
+    judge), storage (trace + eval-record persistence), and tracer.
+    Only the agent-execution seam changes. ``None`` (default) =
+    in-process execution exactly as before."""
     if effective is None:
         effective = _resolve_effective_categories()
     # KB seeds: domain-mix wants generated cases grounded in the
@@ -494,13 +503,29 @@ async def _run_scorecard(
     # generator doesn't expose those). Could be optimized by changing
     # _generate_entries to return them, but staying focused.
     rt = await build_local_runtime(mock=mock)
+    # Swap the executor when scoring a deployed runtime. RemoteExecutor
+    # has the same execute(bundle, request) -> RunResponse signature
+    # as the local Executor, so the per-case loop below is identical.
+    # The local runtime's provider / storage / tracer are unchanged —
+    # judge calls + storage writes + traces stay in-process. ``Any``
+    # is the only annotation that covers both Executor + RemoteExecutor
+    # without forcing a Protocol declaration — the duck-typed call
+    # below (``executor.execute(bundle, request)``) is what actually
+    # binds the contract.
+    executor: Any
+    if remote_client is not None:
+        from movate.core.remote_executor import RemoteExecutor  # noqa: PLC0415
+
+        executor = RemoteExecutor(remote_client)
+    else:
+        executor = rt.executor
     cases: list[CaseScore] = []
     try:
         for entry in entries:
             input_data = entry["input"]
             t0 = time.perf_counter()
             request = RunRequest(agent=bundle.spec.name, input=input_data)
-            response = await rt.executor.execute(bundle, request)
+            response = await executor.execute(bundle, request)
             latency_ms = (time.perf_counter() - t0) * 1000.0
             cost_usd = float(getattr(response, "cost_usd", 0.0) or 0.0)
             output_data = response.data
@@ -750,6 +775,8 @@ async def _run_scorecard_sweep_async(
     preflight_models: set[str],
     is_json: bool,
     effective: EffectiveCategories | None,
+    remote_url: str | None = None,
+    remote_api_key: str | None = None,
 ) -> tuple[list[ScorecardSummary], list[tuple[str, str]]]:
     """Async core of the project-wide --all sweep — preflight + every
     per-agent scorecard run live in ONE event loop.
@@ -779,61 +806,88 @@ async def _run_scorecard_sweep_async(
     """
     await _preflight_check_generator_auth(models=preflight_models, mock=mock)
 
+    # When --target is set, build ONE MovateClient for the whole sweep
+    # so the httpx connection pool is amortized across every agent
+    # (one TCP+TLS handshake covers N x M HTTP calls). Closed in the
+    # finally below regardless of how the sweep exits.
+    remote_client = await _build_remote_client(remote_url, remote_api_key)
+
     summaries: list[ScorecardSummary] = []
     failed: list[tuple[str, str]] = []
 
-    for agent_dir in agent_dirs:
-        if not is_json:
-            console.print()
-            console.print(f"[bold]── {agent_dir.name}[/bold]")
-        try:
-            bundle = load_agent(agent_dir)
-        except AgentLoadError as exc:
-            err_console.print(f"  [red]✗[/red] load failed: {str(exc)[:120]}")
-            failed.append((agent_dir.name, "load_failed"))
-            continue
+    try:
+        for agent_dir in agent_dirs:
+            if not is_json:
+                console.print()
+                console.print(f"[bold]── {agent_dir.name}[/bold]")
+            try:
+                bundle = load_agent(agent_dir)
+            except AgentLoadError as exc:
+                err_console.print(f"  [red]✗[/red] load failed: {str(exc)[:120]}")
+                failed.append((agent_dir.name, "load_failed"))
+                continue
 
-        project_root = _find_project_root(agent_dir)
-        # Pick the resolved generator model for THIS agent (auto-
-        # detect ran in the orchestrator pre-pass). Falls back to
-        # the bundle's declared provider when the explicit flag is
-        # set (resolved_per_agent is empty in that case) or when
-        # auto-detect found no fallback.
-        effective_generator_model = (
-            generator_model
-            if generator_model is not None
-            else resolved_per_agent.get(agent_dir.name, bundle.spec.model.provider)
-        )
-        if not is_json:
-            console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
-        try:
-            summary = await _run_scorecard(
-                bundle,
-                count=count,
-                mix=mix,
-                mock=mock,
-                judge_model=judge_model,
-                generator_model=effective_generator_model,
-                project_root=project_root,
-                effective=effective,
+            project_root = _find_project_root(agent_dir)
+            # Pick the resolved generator model for THIS agent (auto-
+            # detect ran in the orchestrator pre-pass). Falls back to
+            # the bundle's declared provider when the explicit flag is
+            # set (resolved_per_agent is empty in that case) or when
+            # auto-detect found no fallback.
+            effective_generator_model = (
+                generator_model
+                if generator_model is not None
+                else resolved_per_agent.get(agent_dir.name, bundle.spec.model.provider)
             )
-        except Exception as exc:
-            err_console.print(
-                f"  [red]✗[/red] scorecard failed ({type(exc).__name__}): {str(exc)[:120]}"
-            )
-            failed.append((agent_dir.name, type(exc).__name__))
-            continue
+            if not is_json:
+                console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
+            try:
+                summary = await _run_scorecard(
+                    bundle,
+                    count=count,
+                    mix=mix,
+                    mock=mock,
+                    judge_model=judge_model,
+                    generator_model=effective_generator_model,
+                    project_root=project_root,
+                    effective=effective,
+                    remote_client=remote_client,
+                )
+            except Exception as exc:
+                err_console.print(
+                    f"  [red]✗[/red] scorecard failed ({type(exc).__name__}): {str(exc)[:120]}"
+                )
+                failed.append((agent_dir.name, type(exc).__name__))
+                continue
 
-        summaries.append(summary)
-        # Per-agent scorecard table renders inline so operators see
-        # progress agent-by-agent rather than waiting for the rollup.
-        # Suppressed in JSON mode — the final document carries it.
-        if not is_json:
-            console.print()
-            _render_scorecard(summary)
-            _emit_summary_line(summary)
+            summaries.append(summary)
+            # Per-agent scorecard table renders inline so operators see
+            # progress agent-by-agent rather than waiting for the rollup.
+            # Suppressed in JSON mode — the final document carries it.
+            if not is_json:
+                console.print()
+                _render_scorecard(summary)
+                _emit_summary_line(summary)
+    finally:
+        if remote_client is not None:
+            await remote_client.aclose()
 
     return summaries, failed
+
+
+async def _build_remote_client(remote_url: str | None, remote_api_key: str | None) -> Any:
+    """Build the MovateClient for remote-runtime execution, or return
+    ``None`` for in-process execution.
+
+    Kept as a tiny helper so the sweep + single-agent wrappers don't
+    each duplicate the conditional import + construction. Returns
+    ``Any`` rather than ``MovateClient | None`` so callers don't have
+    to import the type to type-hint themselves.
+    """
+    if remote_url is None:
+        return None
+    from movate.core.client import MovateClient  # noqa: PLC0415
+
+    return MovateClient(base_url=remote_url, api_key=remote_api_key or "")
 
 
 async def _run_scorecard_single_async(
@@ -847,6 +901,8 @@ async def _run_scorecard_single_async(
     project_root: Path | None,
     effective: EffectiveCategories | None,
     probe_model: str,
+    remote_url: str | None = None,
+    remote_api_key: str | None = None,
 ) -> ScorecardSummary:
     """Async core of the single-agent path — preflight + scorecard
     run in one event loop. See :func:`_run_scorecard_sweep_async`
@@ -855,16 +911,22 @@ async def _run_scorecard_single_async(
     own ``asyncio.run``.
     """
     await _preflight_check_generator_auth(models={probe_model}, mock=mock)
-    return await _run_scorecard(
-        bundle,
-        count=count,
-        mix=mix,
-        mock=mock,
-        judge_model=judge_model,
-        generator_model=generator_model,
-        project_root=project_root,
-        effective=effective,
-    )
+    remote_client = await _build_remote_client(remote_url, remote_api_key)
+    try:
+        return await _run_scorecard(
+            bundle,
+            count=count,
+            mix=mix,
+            mock=mock,
+            judge_model=judge_model,
+            generator_model=generator_model,
+            project_root=project_root,
+            effective=effective,
+            remote_client=remote_client,
+        )
+    finally:
+        if remote_client is not None:
+            await remote_client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1163,21 @@ def eval_scorecard(
             "anthropic/claude-haiku-4-5-20251001."
         ),
     ),
+    target: str | None = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Score the agent(s) against a DEPLOYED runtime instead of "
+            "running locally in-process. Resolves to a target from "
+            "[bold]~/.movate/config.yaml[/bold] (URL + key_env env var). "
+            "Cases are submitted as jobs to the deployment's [bold]"
+            "/api/v1/agents/<name>/runs[/bold] endpoint; the LLM judge "
+            "still runs locally (uses your provider keys, not the "
+            "deployment's). Useful for scoring what's ACTUALLY in "
+            "production rather than what your local bundle would do. "
+            "Same plumbing as [bold]mdk run --target[/bold]."
+        ),
+    ),
     output_format: Report = typer.Option(
         Report.TABLE,
         "--output",
@@ -1276,6 +1353,43 @@ def eval_scorecard(
         )
         raise typer.Exit(code=2)
 
+    # Resolve --target → (target_name, remote_url, remote_api_key).
+    # Same plumbing as ``mdk run --target`` so the operator's config
+    # works identically across commands. ``--target`` + ``--mock`` are
+    # mutex — mock means "no real LLM/runtime calls anywhere", which
+    # is incompatible with hitting a deployed runtime.
+    remote_url: str | None = None
+    remote_api_key: str | None = None
+    target_name: str | None = None
+    if target is not None:
+        if mock:
+            err_console.print(
+                "[red]✗[/red] [bold]--target[/bold] and [bold]--mock[/bold] "
+                "are mutually exclusive — --mock means 'no real LLM/runtime "
+                "calls', which conflicts with scoring a deployed agent."
+            )
+            raise typer.Exit(code=2)
+        from movate.core.user_config import (  # noqa: PLC0415
+            UserConfigError,
+            resolve_bearer_token,
+            resolve_target,
+        )
+
+        try:
+            target_name, target_cfg = resolve_target(target)
+            remote_api_key = resolve_bearer_token(target_cfg)
+        except UserConfigError as exc:
+            err_console.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=2) from None
+        remote_url = target_cfg.url
+        # Route this status line to STDERR so it doesn't pollute the
+        # JSON document on stdout when ``-o json`` is set. The line is
+        # useful operator context regardless of output format.
+        err_console.print(
+            f"[dim]→ scoring against deployed runtime [bold]{target_name}[/bold] "
+            f"({remote_url}). LLM judge still runs locally.[/dim]"
+        )
+
     if all_in_project:
         _run_scorecard_all_in_project(
             count=count,
@@ -1289,6 +1403,9 @@ def eval_scorecard(
             output_baseline=output_baseline,
             regression_tolerance=regression_tolerance,
             effective=effective,
+            remote_url=remote_url,
+            remote_api_key=remote_api_key,
+            target_name=target_name,
         )
         return
 
@@ -1312,6 +1429,9 @@ def eval_scorecard(
         baseline_file=baseline_file,
         output_baseline=output_baseline,
         regression_tolerance=regression_tolerance,
+        remote_url=remote_url,
+        remote_api_key=remote_api_key,
+        target_name=target_name,
     )
 
 
@@ -1329,6 +1449,9 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     baseline_file: Path | None = None,
     output_baseline: Path | None = None,
     regression_tolerance: float = 0.0,
+    remote_url: str | None = None,
+    remote_api_key: str | None = None,
+    target_name: str | None = None,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
@@ -1391,6 +1514,8 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             project_root=project_root,
             effective=effective,
             probe_model=resolved_model,
+            remote_url=remote_url,
+            remote_api_key=remote_api_key,
         )
     )
 
@@ -1412,6 +1537,12 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
 
     if output_format == Report.JSON:
         doc = _summary_to_json(summary)
+        # ``target`` lets CI scrapers correlate scores with WHICH
+        # runtime they came from — comparing a local-run scorecard
+        # against a deployed-run scorecard is meaningless without it.
+        # ``"local"`` for in-process execution; the target name (or
+        # the URL when there's no named target) for remote.
+        doc["target"] = target_name if target_name is not None else "local"
         doc["gates"] = _gates_to_json(gates)
         doc["gate_failures"] = [
             {"category": cat, "actual": actual, "threshold": threshold}
@@ -1668,6 +1799,9 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
     baseline_file: Path | None = None,
     output_baseline: Path | None = None,
     regression_tolerance: float = 0.0,
+    remote_url: str | None = None,
+    remote_api_key: str | None = None,
+    target_name: str | None = None,
 ) -> None:
     """Project-wide sweep: discover all agents under ./agents/, run the
     scorecard against each, then render a project-level rollup table.
@@ -1794,6 +1928,8 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
             preflight_models=preflight_models,
             is_json=is_json,
             effective=effective,
+            remote_url=remote_url,
+            remote_api_key=remote_api_key,
         )
     )
 
@@ -1828,6 +1964,10 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         "failed": len(failed),
         "project_mean": project_mean,
         "mix": mix,
+        # Same rationale as the single-agent JSON's ``target`` field —
+        # let CI scrapers correlate scores with the runtime they came
+        # from. ``"local"`` for in-process; target name for remote.
+        "target": target_name if target_name is not None else "local",
         "ok": not failed and not agents_failing_gate and not agents_with_regressions,
         "summaries": [
             {

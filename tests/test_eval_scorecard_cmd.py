@@ -2934,3 +2934,336 @@ class TestGeneratorAutoDetectIntegration:
         assert result.exit_code == 0, result.stdout + result.stderr
         stderr_plain = _ANSI_RE.sub("", result.stderr)
         assert "routing generation through" not in stderr_plain
+
+
+# ---------------------------------------------------------------------------
+# --target: score deployed runtime via RemoteExecutor
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestTargetDeployedAgent:
+    """``mdk eval-scorecard --target NAME`` swaps the local in-process
+    executor for a :class:`RemoteExecutor` so cases run against the
+    deployed runtime. The local runtime is still built — provider for
+    the LLM judge, storage for traces, tracer for spans. Only the
+    agent-execution seam changes.
+    """
+
+    def test_target_and_mock_are_mutex(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--mock means 'no real LLM/runtime calls'; that contradicts
+        scoring a deployed agent. CLI must reject the combo upfront."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--mock",
+                "--target",
+                "dev",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 2
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "--target" in stderr_plain
+        assert "--mock" in stderr_plain
+        assert "mutually exclusive" in stderr_plain
+
+    def test_target_not_in_config_errors_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unknown target name → ``UserConfigError`` from
+        ``resolve_target`` → friendly stderr line + exit 2."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        empty_config = tmp_path / "empty-movate-config.yaml"
+        empty_config.write_text("active: null\ntargets: {}\n")
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(empty_config))
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--target",
+                "nonexistent",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 2
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "nonexistent" in stderr_plain
+
+    def test_target_with_unset_env_var_errors_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Target is defined but its ``key_env`` env var is empty.
+        ``resolve_bearer_token`` raises ``UserConfigError`` → exit 2."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        config = tmp_path / "movate-config.yaml"
+        config.write_text(
+            "active: dev\n"
+            "targets:\n"
+            "  dev:\n"
+            "    url: https://dev.example.com\n"
+            "    key_env: MISSING_KEY_FOR_TEST\n"
+        )
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(config))
+        monkeypatch.delenv("MISSING_KEY_FOR_TEST", raising=False)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--target",
+                "dev",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 2
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "MISSING_KEY_FOR_TEST" in stderr_plain
+
+    def test_target_passes_remote_url_to_run_scorecard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end smoke: a configured target with a valid bearer
+        token propagates ``remote_client`` into ``_run_scorecard``,
+        which the scorecard uses to swap in a ``RemoteExecutor``."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        config = tmp_path / "movate-config.yaml"
+        config.write_text(
+            "active: dev\n"
+            "targets:\n"
+            "  dev:\n"
+            "    url: https://dev.example.com\n"
+            "    key_env: TEST_DEV_KEY\n"
+        )
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(config))
+        monkeypatch.setenv("TEST_DEV_KEY", "mvt_live_test_token_abc123")
+
+        captured: list[dict[str, Any]] = []
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            captured.append({k: v for k, v in kwargs.items()})
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--target",
+                "dev",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert len(captured) == 1
+        remote_client = captured[0].get("remote_client")
+        assert remote_client is not None
+        assert str(remote_client._client.base_url) == "https://dev.example.com"
+        assert remote_client._client.headers["Authorization"] == "Bearer mvt_live_test_token_abc123"
+
+        # Status line goes to STDERR (so JSON on stdout stays clean in
+        # ``-o json`` mode); assert it landed there.
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "scoring against deployed runtime" in stderr_plain
+        assert "dev" in stderr_plain
+        assert "https://dev.example.com" in stderr_plain
+
+    def test_no_target_passes_none_remote_client(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No --target → remote_client kwarg is ``None`` →
+        _run_scorecard uses the local in-process executor."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        captured: list[dict[str, Any]] = []
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            captured.append({k: v for k, v in kwargs.items()})
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", str(agent_dir), "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert captured[0].get("remote_client") is None
+
+    def test_target_json_output_carries_target_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``-o json`` payload gains a ``"target"`` field — ``"local"``
+        for in-process, target name for remote."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        config = tmp_path / "movate-config.yaml"
+        config.write_text(
+            "active: dev\n"
+            "targets:\n"
+            "  dev:\n"
+            "    url: https://dev.example.com\n"
+            "    key_env: TEST_DEV_KEY\n"
+        )
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(config))
+        monkeypatch.setenv("TEST_DEV_KEY", "mvt_live_test_token_xyz")
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--target",
+                "dev",
+                "-o",
+                "json",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        doc = _json.loads(result.stdout)
+        assert doc["target"] == "dev"
+
+    def test_local_json_output_carries_local_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without --target the JSON payload's ``target`` field is
+        ``"local"``. CI scrapers can rely on it always being there."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", str(agent_dir), "--count", "3", "-o", "json"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        doc = _json.loads(result.stdout)
+        assert doc["target"] == "local"
+
+    def test_all_target_json_output_carries_target_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--all -o json --target dev`` propagates the target into
+        the project-level JSON payload."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+        config = tmp_path / "movate-config.yaml"
+        config.write_text(
+            "active: dev\n"
+            "targets:\n"
+            "  dev:\n"
+            "    url: https://dev.example.com\n"
+            "    key_env: TEST_DEV_KEY\n"
+        )
+        monkeypatch.setenv("MOVATE_CONFIG_PATH", str(config))
+        monkeypatch.setenv("TEST_DEV_KEY", "mvt_live_test_token_qqq")
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                "--all",
+                "--count",
+                "3",
+                "--target",
+                "dev",
+                "-o",
+                "json",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        doc = _json.loads(result.stdout)
+        assert doc["target"] == "dev"
+
+    def test_target_help_text_mentions_deployed_runtime(self) -> None:
+        """Pin a couple anchor phrases in --help so a future refactor
+        doesn't accidentally lose the discoverability."""
+        result = runner.invoke(app, ["eval-scorecard", "--help"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0
+        plain = _ANSI_RE.sub("", result.stdout)
+        assert "--target" in plain
+        assert "DEPLOYED" in plain or "deployed" in plain
+        assert ".movate/config.yaml" in plain
