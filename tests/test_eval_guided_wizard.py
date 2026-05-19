@@ -81,27 +81,83 @@ def test_guided_picks_all_gate_0_runs_1_no_baseline(
 def test_guided_picks_single_agent_gate_07_runs_3(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pick agent #2 (faq, since #1 is 'all'), gate=0.7, runs=3, no
-    baseline. The mock-provider question was removed, so the wizard
-    composes the command without --mock. Real-LLM execution will fail
-    without API keys, but the wizard's correctness is what we're
-    testing (preview line)."""
+    """Pick agent #2 (faq, since #1 is 'all'), keep existing dataset,
+    gate=0.7, runs=3, no baseline. Single-agent flow now includes a
+    "Test cases?" prompt between agent selection and gate threshold —
+    the wizard's first job is to either generate fresh cases via LLM
+    or use the existing dataset.jsonl. Picking "keep existing" here
+    skips generation so the test stays hermetic (no API calls)."""
     _bootstrap(tmp_path, monkeypatch)
-    # Four answers (was five before the mock prompt was dropped):
-    # 2=faq, 3=gate 0.7, 2=runs 3, 1=no baseline.
+    # Five answers (was four before Phase 3a's test-cases prompt):
+    # 2=faq, 1=keep existing dataset, 3=gate 0.7, 2=runs 3,
+    # 1=no baseline.
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="2\n3\n2\n1\n",
+        input="2\n1\n3\n2\n1\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
+    assert "Test cases?" in combined, "wizard must prompt about test cases"
     assert "Running:" in combined
     # Single-agent mode (no --all), no --mock, gate 0.7, runs 3.
     assert "mdk eval faq" in combined
     assert "--all" not in combined.split("Running:")[1].splitlines()[0]
     assert "--gate 0.7" in combined
     assert "--runs 3" in combined
+
+
+@pytest.mark.unit
+def test_guided_single_agent_generate_path_calls_generation_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-agent flow with "generate fresh" picked must run the
+    case-generation sub-flow (count + mix sub-prompts, then call
+    ``_generate_entries`` and write to dataset.jsonl). Mocked at the
+    generation boundary so the test stays hermetic.
+
+    Pin the sub-flow order so a future refactor can't accidentally
+    skip the case-generation step in single-agent mode."""
+    _bootstrap(tmp_path, monkeypatch)
+
+    # Mock the LLM generation so we don't need API keys + so we can
+    # assert that the wizard actually calls it.
+    gen_calls: list[dict[str, object]] = []
+
+    async def fake_generate_entries(bundle: object, **kwargs: object) -> list[dict[str, object]]:
+        gen_calls.append({"num": kwargs.get("num"), "mode": kwargs.get("mode")})
+        return [
+            {"input": {"question": "q1"}, "expected": {"answer": "a1"}},
+            {"input": {"question": "q2"}, "expected": {"answer": "a2"}},
+        ]
+
+    monkeypatch.setattr("movate.cli.eval_gen_cmd._generate_entries", fake_generate_entries)
+
+    # Six answers: 2=faq, 2=generate fresh, 2=10 cases, 1=standard,
+    # 1=gate 0.0 (so eval against the fresh dataset doesn't gate-fail
+    # without API keys), 1=runs 1, 1=no baseline.
+    # Wait — that's seven. Recount: agent, action, count, mix, gate,
+    # runs, baseline = 7 answers.
+    result = runner.invoke(
+        app,
+        ["eval", "--guided"],
+        input="2\n2\n2\n1\n1\n1\n1\n",
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    # Generation sub-prompts surfaced.
+    assert "Test cases?" in combined
+    assert "How many cases?" in combined
+    assert "Which mix?" in combined
+    # Generation actually fired.
+    assert len(gen_calls) == 1, f"expected one generation call, got {gen_calls}"
+    assert gen_calls[0]["num"] == 10
+    assert gen_calls[0]["mode"] == "standard"
+    # The dataset.jsonl was overwritten with the fake entries.
+    dataset_path = tmp_path / "proj" / "agents" / "faq" / "evals" / "dataset.jsonl"
+    assert dataset_path.is_file()
+    rows = [line for line in dataset_path.read_text().splitlines() if line.strip()]
+    assert len(rows) == 2
 
 
 @pytest.mark.unit
