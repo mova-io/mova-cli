@@ -283,12 +283,27 @@ def search(
         "--full",
         help="Print full chunk text (default truncates to 200 chars).",
     ),
+    hybrid: bool = typer.Option(
+        False,
+        "--hybrid",
+        help=(
+            "Combine vector + BM25 lexical search via reciprocal rank "
+            "fusion. Typically 15-25% better recall on real corpora — "
+            "vector catches paraphrase, BM25 catches rare-term hits. "
+            "No extra API cost (BM25 runs locally)."
+        ),
+    ),
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
     Use this to validate that retrieval is finding the right chunks
     BEFORE running the agent end-to-end — saves the cost of agent
     iterations on a bad KB.
+
+    Default mode is vector-only (cosine similarity over OpenAI
+    embeddings). ``--hybrid`` adds a parallel BM25 lexical search
+    + reciprocal rank fusion; recommended for queries containing
+    product names, error codes, or other rare terms.
     """
     import os  # noqa: PLC0415
 
@@ -309,6 +324,7 @@ def search(
                 tenant_id=tenant_id,
                 limit=k,
                 api_key=api_key,
+                hybrid=hybrid,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
@@ -321,10 +337,11 @@ def search(
             )
             return
 
+        mode_label = "[bold magenta]hybrid[/bold magenta]" if hybrid else "vector"
         table = Table(
             title=(
                 f'[bold]Top {len(results)} chunks[/bold] for "[italic]{question}[/italic]"'
-                f" — agent [bold]{agent}[/bold]"
+                f" — agent [bold]{agent}[/bold] ({mode_label})"
             ),
             show_lines=True,
         )
