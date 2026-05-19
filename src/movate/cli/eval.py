@@ -19,7 +19,7 @@ from typing import Any
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 
 from movate.cli._completion import complete_agent_path
@@ -1099,17 +1099,23 @@ def _ask_scorecard_count_and_mix() -> tuple[int, str] | object:
     exactly once when it runs (avoids the double-generation that
     would result from the wizard generating + the scorecard
     regenerating)."""
-    # Sub-Q: count.
+    # Sub-Q: count. ``c`` picks an arbitrary integer (1-100) so
+    # operators iterating on a specific dataset size aren't pinned to
+    # 5/10/25/50 — added 2026-05-19 after operator feedback that
+    # "I want 8 cases" had no way to surface without the explicit
+    # ``--count`` CLI flag.
     count_choices = {
         "1": (5, "5 cases — fast iteration / quick demo"),
         "2": (10, "10 cases — recommended for first pass"),
         "3": (25, "25 cases — tighter coverage, more tokens"),
         "4": (50, "50 cases — exhaustive sweep"),
+        "c": (None, "custom — type a number (1-100)"),
     }
     console.print()
     console.print("[bold]How many cases?[/bold]")
     for key, (n, label) in count_choices.items():
-        console.print(f"  [bold cyan][{key}][/bold cyan] {n}  [dim]{label}[/dim]")
+        n_display = "" if n is None else f"{n}  "
+        console.print(f"  [bold cyan][{key}][/bold cyan] {n_display}[dim]{label}[/dim]")
     try:
         count_idx = Prompt.ask(
             "\n[bold]Pick[/bold]",
@@ -1119,7 +1125,24 @@ def _ask_scorecard_count_and_mix() -> tuple[int, str] | object:
         )
     except (KeyboardInterrupt, EOFError):
         return _CANCELLED
-    count = count_choices[count_idx][0]
+    if count_idx == "c":
+        try:
+            typed = IntPrompt.ask(
+                "[bold]Number of cases[/bold] [dim](1-100)[/dim]",
+                default=10,
+                show_default=True,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return _CANCELLED
+        # Clamp rather than re-prompt — operators who type 500 expecting
+        # "more thorough" get a useful default rather than a loop.
+        count = max(1, min(typed, 100))
+    else:
+        # Preset rows always carry an int; only the "c" row has None
+        # (the custom-input sentinel handled above).
+        preset = count_choices[count_idx][0]
+        assert preset is not None
+        count = preset
 
     # Sub-Q: mix.
     mix_choices = {
@@ -1480,6 +1503,7 @@ def _prompt_runs_per_case() -> int | None:
         "1": (1, "1 run — fast iteration (no variance signal)"),
         "2": (3, "3 runs — recommended (averages out judge noise)"),
         "3": (5, "5 runs — tight CI (most tokens spent)"),
+        "c": (None, "custom — type a number (1-10)"),
     }
     console.print()
     console.print(
@@ -1487,7 +1511,8 @@ def _prompt_runs_per_case() -> int | None:
         "0/1.00 binary scores usually mean N=1)[/dim]"
     )
     for key, (value, label) in choices.items():
-        console.print(f"  [bold cyan][{key}][/bold cyan] {value}  [dim]{label}[/dim]")
+        value_display = "" if value is None else f"{value}  "
+        console.print(f"  [bold cyan][{key}][/bold cyan] {value_display}[dim]{label}[/dim]")
     try:
         idx = Prompt.ask(
             "\n[bold]Pick[/bold]",
@@ -1497,6 +1522,18 @@ def _prompt_runs_per_case() -> int | None:
         )
     except (KeyboardInterrupt, EOFError):
         return None
+    if idx == "c":
+        try:
+            n = IntPrompt.ask(
+                "[bold]Runs per case[/bold] [dim](1-10)[/dim]",
+                default=3,
+                show_default=True,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return None
+        # Clamp matches ``_run_scorecard``'s defensive range —
+        # consistent behavior wizard ↔ CLI flag.
+        return max(1, min(n, 10))
     return choices[idx][0]
 
 
@@ -1605,7 +1642,7 @@ def _generate_preview_and_gate(
     return entries, runs, gate
 
 
-def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflects the per-agent state machine
+def _eval_all_in_project(
     *,
     gate: float,
     gate_mode: str,
@@ -1746,38 +1783,14 @@ def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflec
     if failed:
         raise typer.Exit(code=2)
 
-    # All-pass success — interactive picker (TTY prompts, non-TTY
-    # renders the list as documentation only). One surface for
-    # next-steps; no separate static block.
-    if passed > 0:
-        first_agent = rows[0][0]
-        from movate.cli._next_steps import (  # noqa: PLC0415
-            NextStep,
-            mdk_bin_name,
-            prompt_next_step,
-        )
-
-        bin_name = mdk_bin_name()
-        prompt_next_step(
-            console=console,
-            steps=[
-                NextStep(
-                    label=f"Quick-run {first_agent!r}",
-                    command=f"{bin_name} run {first_agent} --mock",
-                    argv=[bin_name, "run", first_agent, "--mock"],
-                ),
-                NextStep(
-                    label="Serve runtime locally (HTTP)",
-                    command=f"{bin_name} serve",
-                    argv=[bin_name, "serve"],
-                ),
-                NextStep(
-                    label="Deploy agents to Azure dev",
-                    command=f"{bin_name} deploy --target dev",
-                    argv=[bin_name, "deploy", "--target", "dev"],
-                ),
-            ],
-        )
+    # Previously rendered a Quick-run / Serve / Deploy / Skip picker
+    # here as a "next steps" cue. Removed 2026-05-19: operators reported
+    # the menu was noise after a green eval — they already know what
+    # comes next (run, serve, deploy) and the extra prompt cluttered
+    # the scrollback right when the agents-table was the most
+    # interesting thing on screen. The greppable
+    # ``mdk_eval_all_summary`` line above is the only post-eval
+    # output now; CI scripts that scrape it are unaffected.
 
 
 def _resolve_remote_url(path: str) -> str | None:
