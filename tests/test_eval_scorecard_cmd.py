@@ -697,8 +697,14 @@ def _scaffold_project_with_agents(
     Hand-rolled agent.yaml fixtures hit validation failures (input
     schema, objectives, prompt path, etc. all required). Going through
     ``mdk init`` + ``mdk add`` produces bundles the loader actually
-    accepts — same path the operator's project goes through."""
+    accepts — same path the operator's project goes through.
+
+    Also injects a fake ``OPENAI_API_KEY`` so the eval-scorecard
+    pre-flight check (added 2026-05-19) passes without CI needing
+    real keys. The value is non-empty; downstream LLM calls in
+    tests are always mocked."""
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key-for-precheck-only")
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr

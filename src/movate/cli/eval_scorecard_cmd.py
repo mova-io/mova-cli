@@ -1681,6 +1681,18 @@ def eval_scorecard(
         )
         raise typer.Exit(code=2)
 
+    # Pre-flight LLM key check. Without OpenAI or Anthropic the
+    # scorecard fails at both generation AND judging — surfacing it
+    # here saves the operator from a 10-second wait + a confusing
+    # "0 cases generated" error. Skipped under --mock (offline mode
+    # uses the deterministic mock provider, no real LLM calls).
+    if not mock:
+        from movate.cli.eval import (  # noqa: PLC0415
+            _require_llm_provider_key_or_offer_setup,
+        )
+
+        _require_llm_provider_key_or_offer_setup()
+
     gates = GateConfig(
         overall=gate_overall,
         accuracy=gate_accuracy,
