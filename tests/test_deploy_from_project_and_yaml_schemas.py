@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -863,18 +864,22 @@ def test_post_deploy_block_emits_no_rich_markup_tags(
 
 
 @pytest.mark.unit
-def test_post_deploy_block_shell_quotes_apostrophes_in_dataset_input(
+def test_post_deploy_block_apostrophes_in_dataset_input_survive_heredoc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: when dataset rows contain apostrophes (e.g.
-    ``"We're evaluating MDK"``), wrapping the JSON body in single
-    quotes naively cuts the body at every internal apostrophe —
-    zsh hangs on ``dquote>`` waiting for the matching quote.
+    ``"We're evaluating MDK"``), the old emitter wrapped the JSON
+    body in single quotes — every internal apostrophe terminated the
+    quoted string and zsh hung on ``dquote>``.
 
-    Fix: shlex.quote the body so apostrophes get the POSIX-portable
-    ``'\\''`` escape (close-quote, escaped-apostrophe, open-quote).
-    Round-trips through bash, zsh, sh — verified separately by
-    piping the rendered output through real shells."""
+    The 2026-05-19 fix switched to a ``<<'JSON'`` heredoc with
+    ``--data-binary @-``. Heredoc bodies don't interpret quotes, so
+    apostrophes appear verbatim in the JSON and the body passes
+    through to curl exactly as printed.
+
+    Pin: the apostrophe-bearing JSON value renders intact, the
+    output uses the heredoc form (not single-quoted ``-d``), and
+    there's no ``'"'"'`` shell-quote escape gymnastics needed."""
     agent = tmp_path / "agents" / "lead-qualifier"
     (agent / "evals").mkdir(parents=True)
     (agent / "evals" / "dataset.jsonl").write_text(
@@ -889,17 +894,86 @@ def test_post_deploy_block_shell_quotes_apostrophes_in_dataset_input(
         project_root=tmp_path,
     )
 
-    # The POSIX-portable apostrophe escape is `'"'"'` (close-quote,
-    # double-quoted-apostrophe, open-quote). Pin that the output
-    # uses this idiom rather than the broken naive form.
-    assert "'\"'\"'" in out, (
-        "shlex.quote should produce the POSIX '\\\"'\\\"' escape for "
-        "embedded apostrophes — got naive single-quote wrap that "
-        "would break shell parsing"
+    # The apostrophe-bearing value lands in the heredoc body intact.
+    assert "We're evaluating MDK. It's promising." in out
+    # New form: heredoc + --data-binary @-, NOT single-quoted -d.
+    assert "--data-binary @-" in out
+    assert "<<'JSON'" in out
+    # The old shell-escape gymnastics shouldn't appear — heredoc
+    # makes them unnecessary.
+    assert "'\"'\"'" not in out, (
+        "heredoc body should not contain shell-quote-escape gymnastics; "
+        "apostrophes pass through verbatim"
     )
-    # And the original apostrophe-containing text shouldn't appear
-    # in its raw single-quoted form (which would be broken).
-    assert "'We're evaluating" not in out
+
+
+@pytest.mark.unit
+def test_post_deploy_block_diff_input_parses_as_json_after_shell_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the 2026-05-19 operator bug: a code-reviewer
+    dataset with a ``diff`` field containing escaped newlines used to
+    emit a ``-d 'JSON-on-one-line'`` block. Rich terminal-wrapped that
+    block at terminal width; copy-paste embedded literal newline bytes
+    inside the JSON string value, and the server returned::
+
+        Invalid control character at position 121
+
+    The fix: ``--data-binary @-`` heredoc with pretty-printed JSON.
+    Pretty JSON has structural whitespace BETWEEN keys (which JSON
+    parsers ignore) so terminal wrap can't corrupt the body. String
+    values stay escaped (``\\n`` two-char sequences).
+
+    Pin: the rendered heredoc body parses as valid JSON when shell-
+    processed, the ``diff`` value round-trips with newlines intact,
+    and the body never contains a raw 0x0A inside a string value.
+    """
+    agent = tmp_path / "agents" / "code-reviewer"
+    (agent / "evals").mkdir(parents=True)
+    diff_value = (
+        "--- a/auth.py\n+++ b/auth.py\n@@ -10,7 +10,7 @@\n"
+        " def check_password(user, password):\n"
+        "-    if user.password_hash == hash_password(password):\n"
+        "+    if user.password_hash == password:\n"
+        "         return True\n     return False\n"
+    )
+    (agent / "evals" / "dataset.jsonl").write_text(
+        json.dumps({"input": {"diff": diff_value, "language": "python"}}) + "\n"
+    )
+
+    out = _capture_post_deploy_block(
+        monkeypatch,
+        target_name="dev",
+        uploaded=["code-reviewer"],
+        project_root=tmp_path,
+    )
+
+    # Extract the heredoc body — everything between "<<'JSON'\n" and "\nJSON".
+    match = re.search(r"<<'JSON'\n(.*?)\nJSON", out, re.DOTALL)
+    assert match, f"expected a <<'JSON' heredoc block in:\n{out}"
+    body = match.group(1)
+
+    # The body must parse as JSON (the whole point of the heredoc form).
+    parsed = json.loads(body)
+    assert parsed["agent"] == "code-reviewer"
+    # And the diff value round-trips with newlines intact.
+    assert parsed["input"]["diff"] == diff_value
+    # The body must NOT contain raw 0x0A inside a JSON string value —
+    # the diff's newlines stay as the two-character ``\n`` escape
+    # sequence in the JSON serialization (pretty-printing adds
+    # structural newlines BETWEEN tokens, but never inside string
+    # literals).
+    # We can't check 0x0A absence in `body` directly because pretty-
+    # printing adds newlines between fields. Check that every line of
+    # the body that contains the ``diff`` field's value carries the
+    # ``\n`` escape literal (backslash + n), not raw newlines.
+    diff_field_lines = [ln for ln in body.splitlines() if '"diff":' in ln]
+    assert diff_field_lines
+    # The ``"diff": "..."`` value is on ONE line (pretty-print at
+    # indent=2 doesn't break long strings). Its content has the
+    # two-char ``\\n`` escape, not raw newlines.
+    diff_line = diff_field_lines[0]
+    assert "\\n" in diff_line, "diff value should escape newlines as \\\\n"
 
 
 @pytest.mark.unit

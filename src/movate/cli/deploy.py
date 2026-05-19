@@ -948,28 +948,43 @@ def _render_post_deploy_next_steps(
     hints, but operators consistently wanted curl — it's portable
     across shells, scriptable in any language, and doesn't require
     a working ``mdk`` install on the box doing the inference.
-    """
-    import shlex  # noqa: PLC0415
 
+    Body shape: ``--data-binary @- <<'JSON' ... JSON`` heredoc with
+    pretty-printed JSON. Was ``-d 'JSON-on-one-line'`` until 2026-05
+    — operator hit ``"Invalid control character at position 121"``
+    because Rich's terminal-wrap of the long single-line ``-d``
+    arg embedded a literal ``0x0A`` newline inside the JSON string
+    value of ``input.diff`` when they copied the output. Heredocs
+    don't suffer from quote-escape or terminal-wrap issues:
+    pretty-printed JSON has structural whitespace between keys
+    (which JSON parsers ignore) so even if the operator's terminal
+    inserts wrap newlines between fields, the body stays valid.
+    String VALUES still need ``\\n`` escapes for embedded newlines
+    (e.g. ``diff: "--- a/auth.py\\n+++..."``), and pretty-printing
+    keeps each value on its own less-likely-to-wrap line.
+    """
     err.print("[bold]Next:[/bold] run inference against the deployed runtime")
     err.print()
 
     for agent_name in sorted(uploaded):
         sample_input_json = _sample_input_for_agent(project_root, agent_name)
-        body = json.dumps({"agent": agent_name, "input": json.loads(sample_input_json)})
-        # shlex.quote returns a POSIX-safe shell-quoted string that
-        # round-trips through any POSIX shell. For typical JSON it
-        # produces 'json-here'; for JSON containing apostrophes it
-        # produces a four-segment dance (close, escape, open) that
-        # works correctly across bash/zsh/sh.
-        body_shell = shlex.quote(body)
+        body = json.dumps(
+            {"agent": agent_name, "input": json.loads(sample_input_json)},
+            indent=2,
+        )
+        # ``soft_wrap=True`` keeps Rich from inserting its own line
+        # breaks; combined with the heredoc, copy-paste survives any
+        # terminal width.
         err.print(f"  # {agent_name}", markup=False)
         err.print(
             f"  curl -sS -X POST {base_url}/run \\\n"
             f"    -H 'content-type: application/json' \\\n"
             f'    -H "x-api-key: ${key_env}" \\\n'
-            f"    -d {body_shell}",
+            f"    --data-binary @- <<'JSON'\n"
+            f"{body}\n"
+            f"JSON",
             markup=False,
+            soft_wrap=True,
         )
         err.print()
 
