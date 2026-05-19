@@ -551,6 +551,26 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         verify_provider_key,
     )
 
+    # Defense for Python callers: when ``login()`` is invoked directly
+    # by another module (rather than dispatched via Typer's CLI runner),
+    # the ``typer.Argument(None)`` / ``typer.Option(...)`` defaults pass
+    # through as ``ArgumentInfo`` / ``OptionInfo`` sentinel objects
+    # instead of being resolved to their declared defaults. The result
+    # is an AttributeError on the next ``provider.lower()`` /
+    # ``key.strip()`` call (the sentinel isn't a str). Normalize here
+    # before anything touches them. Hits the live inline-auth-recovery
+    # path in ``_offer_inline_auth_recovery`` (eval-scorecard) +
+    # ``_require_llm_provider_key_or_offer_setup`` (eval), both of
+    # which call ``login()`` with no args.
+    if not isinstance(provider, (str, type(None))):
+        provider = None
+    if not isinstance(key, (str, type(None))):
+        key = None
+    if not isinstance(no_verify, bool):
+        no_verify = False
+    if not isinstance(save_to, str):
+        save_to = "global"
+
     # When no provider is passed, render an interactive picker. Mirrors
     # the `mdk menu` UX shape: numbered options, type the digit, hit
     # enter. Operators who don't know which providers MDK supports get
