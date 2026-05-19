@@ -527,7 +527,17 @@ async def _run_scorecard(
             request = RunRequest(agent=bundle.spec.name, input=input_data)
             response = await executor.execute(bundle, request)
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            cost_usd = float(getattr(response, "cost_usd", 0.0) or 0.0)
+            # Cost lives at ``response.metrics.cost_usd`` — NOT at
+            # ``response.cost_usd`` (RunResponse has ``extra="forbid"``,
+            # so no top-level cost field exists). The previous
+            # ``getattr(response, "cost_usd", 0.0)`` silently returned
+            # 0.0 for every case in every scorecard run, local AND
+            # remote, since v0.7 — the cost category scored 1.00
+            # uniformly because every cost was 0 vs the budget. Other
+            # cost-aware modules (bench, replay, run_replay) use the
+            # ``response.metrics.cost_usd`` pattern; the scorecard now
+            # matches.
+            cost_usd = float(response.metrics.cost_usd or 0.0)
             output_data = response.data
 
             llm_scores, rationales = await _score_one_case(

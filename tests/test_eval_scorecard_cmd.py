@@ -3267,3 +3267,178 @@ class TestTargetDeployedAgent:
         assert "--target" in plain
         assert "DEPLOYED" in plain or "deployed" in plain
         assert ".movate/config.yaml" in plain
+
+
+# ---------------------------------------------------------------------------
+# Cost-from-response regression guard (2026-05-19 bug fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCostFromResponseMetrics:
+    """``_run_scorecard`` reads cost from ``response.metrics.cost_usd``,
+    NOT ``response.cost_usd`` (the latter doesn't exist on
+    ``RunResponse``, which has ``extra="forbid"``). The pre-fix
+    ``getattr(response, "cost_usd", 0.0)`` silently returned 0.0 for
+    every case in every scorecard run since v0.7 — the cost category
+    scored 1.00 uniformly because every cost was 0 vs the budget,
+    masking real overruns from gates + drift comparisons.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_reads_cost_from_response_metrics(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive ``_run_scorecard`` with a fake executor whose response
+        carries a known ``metrics.cost_usd``. Assert the resulting
+        ``CaseScore.cost_usd`` matches — proves cost flows from the
+        Metrics field, not a phantom top-level attribute."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        async def fake_generate_entries(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return [{"input": {"question": "what time is it?"}, "expected": {"answer": "noon"}}]
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._generate_entries", fake_generate_entries
+        )
+
+        # Patch the executor to return a response with a KNOWN cost.
+        # The exact value is distinct from any plausible default so
+        # we can attribute mismatches if the assertion fails.
+        target_cost = 0.0042
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                return RunResponse(
+                    status="success",
+                    data={"answer": "noon"},
+                    metrics=Metrics(cost_usd=target_cost, latency_ms=42),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        summary = await _run_scorecard(
+            bundle, count=1, mix="standard", mock=False, judge_model=None
+        )
+        assert len(summary.cases) == 1
+        assert summary.cases[0].cost_usd == pytest.approx(target_cost), (
+            f"Expected cost_usd={target_cost} from response.metrics.cost_usd, "
+            f"got {summary.cases[0].cost_usd}. If this is 0.0, the regression "
+            f"is back — fix is to access ``response.metrics.cost_usd`` not "
+            f"``response.cost_usd``."
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_handles_zero_cost_response(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A response with metrics.cost_usd=0.0 (mock provider, cached
+        response) should record cost=0.0 cleanly."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        async def fake_generate_entries(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return [{"input": {"x": 1}, "expected": {"y": 2}}]
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._generate_entries", fake_generate_entries
+        )
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                return RunResponse(
+                    status="success",
+                    data={"y": 2},
+                    metrics=Metrics(cost_usd=0.0, latency_ms=10),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        summary = await _run_scorecard(
+            bundle, count=1, mix="standard", mock=False, judge_model=None
+        )
+        assert summary.cases[0].cost_usd == 0.0
+
+    def test_runresponse_has_no_top_level_cost_usd_attribute(self) -> None:
+        """Pin the schema constraint the fix is built around:
+        ``RunResponse`` uses ``extra="forbid"`` and does NOT expose
+        ``cost_usd`` as a top-level field. If a future refactor adds
+        one, this test fails and forces a deliberate decision."""
+        from movate.core.models import RunResponse  # noqa: PLC0415
+
+        assert "cost_usd" not in RunResponse.model_fields
+        assert "metrics" in RunResponse.model_fields
+        resp = RunResponse(status="success")
+        assert resp.metrics.cost_usd == 0.0
