@@ -836,7 +836,7 @@ async def _preflight_with_retry(
 
     # Auto-detect path with retry.
     excluded: set[str] = set()
-    auto_route_notes: list[str] = []  # accumulated across retries
+    attempted_models: list[str] = []  # for the exhaust hint
 
     while True:
         resolved_per_agent: dict[str, str] = {}
@@ -850,33 +850,36 @@ async def _preflight_with_retry(
                 first_pass_notes.append((agent_name, note))
 
         probe_set = set(resolved_per_agent.values())
+        attempted_models.extend(sorted(probe_set))
         try:
             await _preflight_check_generator_auth(models=probe_set, mock=False)
         except _PreflightAuthError as exc:
             failed_prefix = exc.model.split("/", 1)[0] if "/" in exc.model else exc.model
             if failed_prefix in excluded:
-                # We already excluded this — shouldn't repeat. Means
-                # auto-detect ran out of fallbacks. Surface the hint
-                # and exit.
-                _emit_preflight_failure_hint(exc, recoverable=True)
+                # We already excluded this — auto-detect ran out of
+                # fallbacks. Surface the chronology + hint and exit.
+                _emit_preflight_failure_hint(exc, recoverable=True, attempted=attempted_models)
                 raise typer.Exit(code=2) from exc
             excluded.add(failed_prefix)
-            # Short, single-line note on stderr for the operator;
-            # accumulated for emission alongside the main fallback
-            # notes once preflight finally succeeds.
-            auto_route_notes.append(
-                f"preflight: [bold]{exc.model}[/bold] key is set but rejected "
-                f"({_short_err(exc.message)}); excluding {failed_prefix} + "
-                f"retrying with next available provider."
-            )
+            # Emit the retry note IMMEDIATELY so operators see the
+            # chronology in real-time. Previously the notes were
+            # accumulated and only emitted on success — which meant
+            # an exhaust-and-exit path silently dropped the
+            # explanation of WHAT got tried (the operator only saw
+            # "Tried all configured providers" with no chronology).
+            if not is_json:
+                err_console.print(
+                    f"[yellow]→[/yellow] preflight: [bold]{exc.model}[/bold] "
+                    f"key is set but rejected ({_short_err(exc.message)}); "
+                    f"excluding {failed_prefix} + retrying with next "
+                    f"available provider."
+                )
             continue
 
-        # Preflight succeeded. Emit any auto-route notes (retry history)
-        # and the standard grouped fallback notes (first-pass
-        # routing decisions).
+        # Preflight succeeded. Emit the standard grouped fallback
+        # notes (first-pass routing decisions). The retry notes
+        # already streamed in real-time above.
         if not is_json:
-            for note_line in auto_route_notes:
-                err_console.print(f"[yellow]→[/yellow] {note_line}")
             _emit_grouped_fallback_notes(first_pass_notes)
         return resolved_per_agent
 
@@ -908,23 +911,49 @@ def _short_err(message: str) -> str:
     return first_line[:140]
 
 
-def _emit_preflight_failure_hint(exc: _PreflightAuthError, *, recoverable: bool) -> None:
+def _emit_preflight_failure_hint(
+    exc: _PreflightAuthError,
+    *,
+    recoverable: bool,
+    attempted: list[str] | None = None,
+) -> None:
     """Render the operator-facing exit hint after the preflight gives
     up. ``recoverable=True`` means auto-retry tried fallbacks and ran
     out; ``recoverable=False`` means the operator's explicit
     ``--generator-model FLAG`` was rejected (no fallback was attempted).
     The hint adapts to the situation so the operator's next move is
-    clear."""
+    clear.
+
+    ``attempted`` is the ordered list of models the auto-retry probed
+    (each got AuthError). Surfaced in the recoverable-failure hint
+    so the operator sees exactly WHICH providers were rejected —
+    turns "Tried all configured providers" from a vague claim into
+    an auditable list. This was a real UX paper-cut: the operator
+    saw only ONE provider error in stderr because the per-attempt
+    retry notes weren't streamed in real-time; even after fixing
+    that streaming, the exit hint should still name the providers
+    so a chat log / paste / CI output is self-contained."""
     err_console.print(
         f"[red]✗[/red] preflight auth check failed for provider "
         f"[bold]{exc.model}[/bold]:\n"
         f"  [dim]{exc.message[:300]}[/dim]\n"
     )
     if recoverable:
+        # De-dupe while preserving order. The same model may appear
+        # twice across retry iterations (once as declared, once as
+        # a fallback when another provider was excluded). dict.fromkeys
+        # preserves insertion order (3.7+) and drops duplicates.
+        unique_attempts = list(dict.fromkeys(attempted or []))
+        attempted_str = (
+            ", ".join(f"[bold]{m}[/bold]" for m in unique_attempts)
+            if unique_attempts
+            else "(unknown)"
+        )
         err_console.print(
-            "[bold]Tried all configured providers and got auth errors "
-            "from each. Fix one of these:[/bold]\n"
-            "  • Verify your keys: [bold]mdk doctor[/bold]\n"
+            f"[bold]Auto-retry attempted: {attempted_str}.[/bold] "
+            "All got auth errors. Fix one of these:\n"
+            "  • Verify your keys: [bold]mdk doctor[/bold] / "
+            "[bold]mdk auth status[/bold]\n"
             "  • Replace placeholders (e.g. [bold]OPENAI_API_KEY=sk-test-*[/bold]) "
             "with real values\n"
             "  • [bold]mdk auth login <provider>[/bold] to persist a valid key\n"
