@@ -33,6 +33,8 @@ from movate.core.models import (
     FeedbackRecord,
     JobRecord,
     JobStatus,
+    KbChunk,
+    KbChunkWithScore,
     RunRecord,
     TenantBudget,
     WorkflowRunRecord,
@@ -314,5 +316,64 @@ class StorageProvider(Protocol):
         together. Used by the analytics dashboard + by the playground
         when the operator re-opens a run they previously rated.
         """
+
+    # ------------------------------------------------------------------
+    # KB chunks (added 0.8.2.13) — vector retrieval MVP. The retrieval
+    # primitive is cosine similarity computed in Python over JSONB-
+    # stored float arrays; pgvector will swap in later behind the same
+    # protocol surface.
+    # ------------------------------------------------------------------
+
+    async def save_kb_chunk(self, chunk: KbChunk) -> None:
+        """Persist a :class:`KbChunk`. Upsert on ``(agent, tenant_id,
+        content_hash)``: re-ingesting an unchanged document is idempotent
+        (existing chunks updated in place, not duplicated). Chunks whose
+        ``content_hash`` already exists for the agent get their
+        ``embedding`` + ``embedding_model`` + ``metadata`` refreshed.
+        """
+
+    async def search_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        """Top-K most-similar chunks for the agent's KB.
+
+        Implementation: load all chunks matching ``(agent, tenant_id)``
+        from storage, compute cosine similarity against
+        ``query_embedding`` in Python, sort descending, return the top
+        ``limit``. Acceptable for KBs up to ~10k chunks; beyond that
+        the linear scan becomes a bottleneck and you'd want a real
+        vector index (pgvector / sqlite-vss).
+
+        Empty KB returns ``[]`` cleanly — no special-case needed.
+        """
+
+    async def list_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+        limit: int = 1000,
+    ) -> list[KbChunk]:
+        """List chunks for inspection / debugging. Filters AND
+        together. Returns embeddings + text + metadata; callers that
+        only need text should slice their fields after this returns
+        rather than this method maintaining a thin variant."""
+
+    async def delete_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        """Delete chunks scoped to an agent. When ``source`` is set,
+        only chunks from that source URI are removed (re-ingest with
+        --replace workflow). Returns the count deleted."""
 
     async def close(self) -> None: ...

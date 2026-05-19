@@ -1,0 +1,42 @@
+api_version: movate/v1
+kind: Skill
+
+name: __SKILL_NAME__
+version: 0.1.0
+description: >-
+  Semantic search over the agent's knowledge base via OpenAI
+  embeddings + cosine similarity. Returns the top-K most relevant
+  chunks for a query. Pair with a RAG agent so it can retrieve its
+  own context at run time instead of requiring the caller to
+  pre-fetch chunks.
+
+  Ingest knowledge with ``mdk kb ingest <agent> <path>`` before
+  running the agent. The skill reads from the same storage layer
+  (sqlite locally, Postgres in production via ``MOVATE_DB_URL``).
+
+schema:
+  input:
+    question: string
+    k?: integer
+  output:
+    chunks:
+      - text: string
+        source: string
+        score: number
+    chunks_found: integer
+    warning?: string
+
+implementation:
+  kind: python
+  entry: __SKILL_NAME__.impl:run
+
+cost:
+  # One OpenAI embedding call per query (~$0.00002 at
+  # text-embedding-3-small pricing). The cosine ranking is local —
+  # no per-call infrastructure cost for the search itself.
+  per_call_usd: 0.0001
+
+# Network — calls OpenAI's embeddings endpoint to embed the query.
+# Also reads from local / remote storage but the dominant external
+# call is the embedding API.
+side_effects: network
