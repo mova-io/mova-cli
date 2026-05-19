@@ -418,7 +418,7 @@ async def _score_one_case(
 # ---------------------------------------------------------------------------
 
 
-async def _run_scorecard(
+async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; splitting hides shared setup
     bundle: AgentBundle,
     *,
     count: int,
@@ -430,6 +430,7 @@ async def _run_scorecard(
     effective: EffectiveCategories | None = None,
     remote_client: Any = None,
     pre_generated_entries: list[dict[str, Any]] | None = None,
+    runs_per_case: int = 1,
 ) -> ScorecardSummary:
     """End-to-end: generate cases, run agent, score, aggregate.
 
@@ -457,7 +458,18 @@ async def _run_scorecard(
     then dispatches to the scorecard with the same entries (avoids
     double-generation that would otherwise produce different cases
     than what the operator saw). Each entry must have ``input`` +
-    ``expected`` keys, matching ``_generate_entries`` shape."""
+    ``expected`` keys, matching ``_generate_entries`` shape.
+
+    ``runs_per_case`` (default 1) controls how many times each case
+    is executed + scored before aggregation. With N>1, the agent +
+    judge are invoked N times per case and per-category scores are
+    averaged across runs. Latency mean + cost mean are also taken
+    across runs (the per-case CaseScore reflects "average behavior
+    of this case", not a single roll). Defeats the "everything 1.00"
+    binary-score effect that an LLM judge produces at N=1 — at N=3+,
+    a case that scored 1.0 / 1.0 / 0.0 surfaces as 0.667 instead of
+    looking deterministic. Cost scales linearly: N=5 means 5x agent
+    + 5x judge calls per case."""
     if effective is None:
         effective = _resolve_effective_categories()
     # KB seeds: domain-mix wants generated cases grounded in the
@@ -537,61 +549,98 @@ async def _run_scorecard(
         executor = RemoteExecutor(remote_client)
     else:
         executor = rt.executor
+    # Clamp runs_per_case to a sane range. A negative or zero value
+    # would silently drop every case (the inner loop would produce
+    # zero rolls per entry); cap at 10 to bound surprise blast-radius
+    # on operator wallets when a wizard prompt + CLI flag combination
+    # produces something unexpected.
+    n_runs = max(1, min(int(runs_per_case), 10))
+
     cases: list[CaseScore] = []
     try:
         for entry in entries:
             input_data = entry["input"]
-            t0 = time.perf_counter()
-            request = RunRequest(agent=bundle.spec.name, input=input_data)
-            response = await executor.execute(bundle, request)
-            latency_ms = (time.perf_counter() - t0) * 1000.0
-            # Cost lives at ``response.metrics.cost_usd`` — NOT at
-            # ``response.cost_usd`` (RunResponse has ``extra="forbid"``,
-            # so no top-level cost field exists). The previous
-            # ``getattr(response, "cost_usd", 0.0)`` silently returned
-            # 0.0 for every case in every scorecard run, local AND
-            # remote, since v0.7 — the cost category scored 1.00
-            # uniformly because every cost was 0 vs the budget. Other
-            # cost-aware modules (bench, replay, run_replay) use the
-            # ``response.metrics.cost_usd`` pattern; the scorecard now
-            # matches.
-            cost_usd = float(response.metrics.cost_usd or 0.0)
-            output_data = response.data
+            # Per-case accumulators across the N runs. Each run
+            # produces a (latency, cost, scores, rationales, output)
+            # tuple; we average latency + cost + per-category scores
+            # and keep the LAST run's output/rationales as a
+            # representative for display (the eval JSON output shows
+            # one case = one row, not N rows).
+            run_latencies: list[float] = []
+            run_costs: list[float] = []
+            # Map category -> list of scores across runs.
+            run_scores_by_cat: dict[str, list[float]] = {}
+            last_output: Any = None
+            last_rationales: dict[str, str] = {}
+            for _run_idx in range(n_runs):
+                t0 = time.perf_counter()
+                request = RunRequest(agent=bundle.spec.name, input=input_data)
+                response = await executor.execute(bundle, request)
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                # Cost lives at ``response.metrics.cost_usd`` — NOT at
+                # ``response.cost_usd`` (RunResponse has ``extra="forbid"``,
+                # so no top-level cost field exists). The previous
+                # ``getattr(response, "cost_usd", 0.0)`` silently returned
+                # 0.0 for every case in every scorecard run, local AND
+                # remote, since v0.7 — the cost category scored 1.00
+                # uniformly because every cost was 0 vs the budget. Other
+                # cost-aware modules (bench, replay, run_replay) use the
+                # ``response.metrics.cost_usd`` pattern; the scorecard now
+                # matches.
+                cost_usd = float(response.metrics.cost_usd or 0.0)
+                output_data = response.data
 
-            # The judge inherits the resolved generator model when no
-            # explicit ``--judge-model`` flag was passed. Without this,
-            # an operator with a stale ``OPENAI_API_KEY`` but a working
-            # ``ANTHROPIC_API_KEY`` would have the generator auto-route
-            # to anthropic (via _preflight_with_retry) while the judge
-            # still pointed at the declared openai provider — every
-            # case's judge call would AuthError silently, dumping all
-            # LLM-judged categories to 0.0. By falling back to
-            # ``generator_model`` (which IS the resolved + preflight-
-            # verified model when the operator didn't pass an explicit
-            # judge override), the judge picks up the same auto-detect
-            # benefit as generation. Caller's explicit ``--judge-model
-            # FLAG`` always wins (preserves operator intent).
-            effective_judge_model = judge_model or generator_model
-            llm_scores, rationales = await _score_one_case(
-                rt,
-                bundle,
-                input_data,
-                output_data,
-                judge_model=effective_judge_model,
-                effective=effective,
-            )
-            prog_scores_full = _measure_programmatic(latency_ms, cost_usd)
-            # Keep only the programmatic categories that are still active.
-            prog_scores = {k: v for k, v in prog_scores_full.items() if k in effective.programmatic}
-            scores = {**llm_scores, **prog_scores}
+                # The judge inherits the resolved generator model when no
+                # explicit ``--judge-model`` flag was passed. Without this,
+                # an operator with a stale ``OPENAI_API_KEY`` but a working
+                # ``ANTHROPIC_API_KEY`` would have the generator auto-route
+                # to anthropic (via _preflight_with_retry) while the judge
+                # still pointed at the declared openai provider — every
+                # case's judge call would AuthError silently, dumping all
+                # LLM-judged categories to 0.0. By falling back to
+                # ``generator_model`` (which IS the resolved + preflight-
+                # verified model when the operator didn't pass an explicit
+                # judge override), the judge picks up the same auto-detect
+                # benefit as generation. Caller's explicit ``--judge-model
+                # FLAG`` always wins (preserves operator intent).
+                effective_judge_model = judge_model or generator_model
+                llm_scores, rationales = await _score_one_case(
+                    rt,
+                    bundle,
+                    input_data,
+                    output_data,
+                    judge_model=effective_judge_model,
+                    effective=effective,
+                )
+                prog_scores_full = _measure_programmatic(latency_ms, cost_usd)
+                # Keep only the programmatic categories that are still active.
+                prog_scores = {
+                    k: v for k, v in prog_scores_full.items() if k in effective.programmatic
+                }
+                scores = {**llm_scores, **prog_scores}
+
+                run_latencies.append(latency_ms)
+                run_costs.append(cost_usd)
+                for cat, val in scores.items():
+                    run_scores_by_cat.setdefault(cat, []).append(float(val))
+                last_output = output_data
+                last_rationales = rationales
+
+            # Aggregate across runs into ONE CaseScore per entry.
+            mean_latency = sum(run_latencies) / len(run_latencies)
+            mean_cost = sum(run_costs) / len(run_costs)
+            mean_scores = {
+                cat: (sum(vals) / len(vals) if vals else 0.0)
+                for cat, vals in run_scores_by_cat.items()
+            }
             cases.append(
                 CaseScore(
                     input=input_data,
-                    output=output_data,
-                    latency_ms=latency_ms,
-                    cost_usd=cost_usd,
-                    scores=scores,
-                    rationales=rationales,
+                    output=last_output,
+                    latency_ms=mean_latency,
+                    cost_usd=mean_cost,
+                    scores=mean_scores,
+                    rationales=last_rationales,
                 )
             )
     finally:
@@ -1122,6 +1171,7 @@ async def _run_scorecard_sweep_async(
     effective: EffectiveCategories | None,
     remote_url: str | None = None,
     remote_api_key: str | None = None,
+    runs_per_case: int = 1,
 ) -> tuple[list[ScorecardSummary], list[tuple[str, str]]]:
     """Async core of the project-wide --all sweep — preflight + every
     per-agent scorecard run live in ONE event loop.
@@ -1206,6 +1256,7 @@ async def _run_scorecard_sweep_async(
                     project_root=project_root,
                     effective=effective,
                     remote_client=remote_client,
+                    runs_per_case=runs_per_case,
                 )
             except Exception as exc:
                 err_console.print(
@@ -1258,6 +1309,7 @@ async def _run_scorecard_single_async(
     remote_url: str | None = None,
     remote_api_key: str | None = None,
     pre_generated_entries: list[dict[str, Any]] | None = None,
+    runs_per_case: int = 1,
 ) -> ScorecardSummary:
     """Async core of the single-agent path — preflight + scorecard
     run in one event loop. See :func:`_run_scorecard_sweep_async`
@@ -1292,6 +1344,7 @@ async def _run_scorecard_single_async(
             effective=effective,
             remote_client=remote_client,
             pre_generated_entries=pre_generated_entries,
+            runs_per_case=runs_per_case,
         )
     finally:
         if remote_client is not None:
@@ -1650,6 +1703,21 @@ def eval_scorecard(
             "regression; 0.05 allows for sampling noise."
         ),
     ),
+    runs_per_case: int = typer.Option(
+        1,
+        "--runs",
+        min=1,
+        max=10,
+        help=(
+            "Run + judge each case N times and AVERAGE per-category "
+            "scores (1-10). Default 1. Use 3+ to widen the score "
+            "distribution — at N=1 the LLM judge gives binary-ish "
+            "rolls, so a 10-case sample often produces every category "
+            "scoring exactly 1.00 (no signal). At N=3 a case rolling "
+            "1.0/1.0/0.0 surfaces as 0.667 instead. Cost scales linearly "
+            "(N=5 = 5x agent + 5x judge calls per case)."
+        ),
+    ),
 ) -> None:
     """Generate test cases on the fly and score against a 10-category scorecard.
 
@@ -1787,6 +1855,7 @@ def eval_scorecard(
             remote_url=remote_url,
             remote_api_key=remote_api_key,
             target_name=target_name,
+            runs_per_case=runs_per_case,
         )
         return
 
@@ -1813,6 +1882,7 @@ def eval_scorecard(
         remote_url=remote_url,
         remote_api_key=remote_api_key,
         target_name=target_name,
+        runs_per_case=runs_per_case,
     )
 
 
@@ -1834,6 +1904,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     remote_api_key: str | None = None,
     target_name: str | None = None,
     pre_generated_entries: list[dict[str, Any]] | None = None,
+    runs_per_case: int = 1,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
@@ -1887,6 +1958,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             remote_url=remote_url,
             remote_api_key=remote_api_key,
             pre_generated_entries=pre_generated_entries,
+            runs_per_case=runs_per_case,
         )
     )
 
@@ -2173,6 +2245,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
     remote_url: str | None = None,
     remote_api_key: str | None = None,
     target_name: str | None = None,
+    runs_per_case: int = 1,
 ) -> None:
     """Project-wide sweep: discover all agents under ./agents/, run the
     scorecard against each, then render a project-level rollup table.
@@ -2267,6 +2340,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
             effective=effective,
             remote_url=remote_url,
             remote_api_key=remote_api_key,
+            runs_per_case=runs_per_case,
         )
     )
 

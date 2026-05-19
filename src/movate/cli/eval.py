@@ -456,6 +456,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
                 mock=wizard.mock,
                 judge_model=None,
                 gates=GateConfig(overall=wizard.scorecard_gate),
+                runs_per_case=wizard.scorecard_runs,
             )
             return
         if wizard.scorecard and wizard.path is not None:
@@ -473,6 +474,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
                 judge_model=None,
                 gates=GateConfig(overall=wizard.scorecard_gate),
                 pre_generated_entries=wizard.scorecard_entries,
+                runs_per_case=wizard.scorecard_runs,
             )
             return
         # Legacy branch: apply wizard's answers as if they were CLI
@@ -676,6 +678,13 @@ class _EvalWizardChoices:
     # gate question (added 2026-05-19; previously the scorecard
     # branch skipped the gate prompt entirely).
     scorecard_gate: float = 0.0
+    # Runs per case for the scorecard (added 2026-05-19). N=3+
+    # averages out judge sampling variance — without it operators
+    # routinely see "everything 1.00" because each case is judged
+    # exactly once and the judge gives binary-ish scores. The
+    # scorecard runs the agent + scoring loop ``scorecard_runs``
+    # times and averages per-category scores.
+    scorecard_runs: int = 1
 
 
 def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orchestrator; 5 prompts each with try/except adds linear branch count
@@ -787,8 +796,12 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
         is_all = chosen_agent == "all"
         if is_all:
             # --all mode: skip the preview table (would render N
-            # tables x 30s each) but still ask the gate threshold so
-            # CI scripts can gate on the rollup overall mean.
+            # tables x 30s each) but still ask runs-per-case + the
+            # gate threshold so CI scripts can gate on the rollup
+            # overall mean.
+            runs_per_case = _prompt_runs_per_case()
+            if runs_per_case is None:
+                return None
             gate = _prompt_scorecard_gate()
             if gate is None:
                 return None
@@ -797,8 +810,8 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
             console.print(
                 Panel(
                     f"[bold]Running:[/bold] scorecard --all "
-                    f"[dim]({count} {mix} cases per agent, "
-                    f"gate-overall={gate})[/dim]",
+                    f"[dim]({count} {mix} cases per agent x "
+                    f"{runs_per_case} run(s), gate-overall={gate})[/dim]",
                     title="[green]✓[/green] Configured",
                     border_style="green",
                     title_align="left",
@@ -811,14 +824,14 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
             )
             if preview is None:
                 return None
-            entries, gate = preview
+            entries, runs_per_case, gate = preview
             console.print()
             console.print(
                 Panel(
                     f"[bold]Running:[/bold] scorecard against "
                     f"[bold]{chosen_agent}[/bold] "
-                    f"[dim]({len(entries)} pre-generated {mix} cases, "
-                    f"gate-overall={gate})[/dim]",
+                    f"[dim]({len(entries)} pre-generated {mix} cases x "
+                    f"{runs_per_case} run(s), gate-overall={gate})[/dim]",
                     title="[green]✓[/green] Configured",
                     border_style="green",
                     title_align="left",
@@ -837,6 +850,7 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
             scorecard_mix=mix,
             scorecard_entries=entries,
             scorecard_gate=gate,
+            scorecard_runs=runs_per_case,
         )
 
     # Q3: Gate threshold.
@@ -1175,11 +1189,12 @@ def _render_cases_preview_table(entries: list[dict[str, Any]], mix: str) -> None
     """Render the generated test cases in a Rich table so the operator
     can sanity-check before paying for a full eval run.
 
-    Columns: ``#`` (index), ``Input`` (JSON-truncated to a readable
-    width), ``Expected`` (truncated agent output if the generator
-    produced one). Long JSON inputs are truncated with ``…`` — the
-    full JSON is in the eval's JSON output (``-o json``) if the
-    operator wants it.
+    Columns: ``#``, ``Input``, ``Expected``. Values are rendered as
+    scannable ``key: value`` lines with Rich color-coding (cyan keys,
+    yellow scalars, dim placeholders for nested dicts) — way easier
+    to read than the pre-2026-05-19 raw-JSON dump that was wrapped
+    + truncated mid-token. Lists of dicts get a compact 1-line
+    summary; long strings get truncated with ``…``.
     """
     from rich.table import Table  # noqa: PLC0415
 
@@ -1187,18 +1202,117 @@ def _render_cases_preview_table(entries: list[dict[str, Any]], mix: str) -> None
         title=f"[bold]Generated test cases[/bold] [dim]({len(entries)} x {mix})[/dim]",
         show_header=True,
         header_style="bold magenta",
+        # Row dividers — multi-line cells (one line per top-level key)
+        # are much easier to scan with explicit separators.
+        show_lines=True,
     )
     table.add_column("#", justify="right", style="dim", no_wrap=True)
-    table.add_column("Input", overflow="fold", max_width=70)
-    table.add_column("Expected", overflow="fold", max_width=50, style="dim")
+    table.add_column("Input", overflow="fold", max_width=60)
+    table.add_column("Expected", overflow="fold", max_width=55)
 
     for i, entry in enumerate(entries, start=1):
-        input_str = _truncate_json(entry.get("input"), max_chars=200)
-        expected_str = _truncate_json(entry.get("expected"), max_chars=120)
+        input_str = _format_for_preview_cell(entry.get("input"))
+        expected_str = _format_for_preview_cell(entry.get("expected"))
         table.add_row(str(i), input_str, expected_str)
 
     console.print()
     console.print(table)
+
+
+def _format_for_preview_cell(value: Any, *, max_lines: int = 6, max_value_chars: int = 60) -> str:
+    """Render a generated case's input/expected value for the preview
+    table.
+
+    Instead of raw JSON, format as scannable ``key: value`` lines with
+    Rich markup so the operator can read the structure at a glance.
+    Top-level dict fields get one line each. Lists of dicts collapse
+    into a 1-line summary (``list(N) first-vals…``). Strings get
+    truncated to ``max_value_chars``.
+
+    The output goes into a Rich Table cell, so Rich measures the
+    rendered length correctly (markup tags don't count toward width).
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, dict):
+        return _format_value(value, max_chars=max_value_chars)
+
+    lines: list[str] = []
+    items = list(value.items())
+    for key, val in items[:max_lines]:
+        lines.append(f"[cyan]{key}[/cyan]: {_format_value(val, max_chars=max_value_chars)}")
+    if len(items) > max_lines:
+        remaining = len(items) - max_lines
+        lines.append(f"[dim]… {remaining} more field(s)[/dim]")
+    return "\n".join(lines)
+
+
+# How many list items show as summary tokens before collapsing
+# the remainder into "+N more"; tuned so a typical row fits one
+# preview-table line without wrapping.
+_LIST_SUMMARY_HEAD = 3
+# Max token width inside a list summary — keeps long string items
+# from overflowing the preview cell when 3 of them are joined.
+_LIST_SUMMARY_TOKEN_MAX = 20
+
+
+def _format_value(value: Any, *, max_chars: int) -> str:  # noqa: PLR0912 — type-dispatch on 6 kinds; flattening hurts readability
+    """Render a single value (right-hand side of ``key: value``) with
+    type-appropriate Rich styling. Used by ``_format_for_preview_cell``
+    to keep the preview table scannable.
+
+    Type rendering:
+    - ``None`` → dim "null"
+    - bool / int / float → yellow (scalars stand out)
+    - str → truncated to ``max_chars`` with ``…``
+    - list → compact ``list(N) val1, val2, +K`` summary
+    - dict → dim ``{N field(s)}`` placeholder (deeper nesting hidden;
+      operator can use ``-o json`` for the raw structure)
+    """
+    if value is None:
+        return "[dim]null[/dim]"
+    if isinstance(value, bool):
+        return f"[yellow]{value}[/yellow]"
+    if isinstance(value, (int, float)):
+        return f"[yellow]{value}[/yellow]"
+    if isinstance(value, str):
+        if len(value) > max_chars:
+            return value[: max_chars - 1] + "…"
+        return value
+    if isinstance(value, list):
+        n = len(value)
+        summaries: list[str] = []
+        for item in value[:_LIST_SUMMARY_HEAD]:
+            if isinstance(item, dict) and item:
+                # Use the first field's value as a token for the
+                # summary line — typically more informative than
+                # "{2 fields}" for cases like
+                # ``indicators: [{code: damaged_item}, ...]``.
+                _, first_val = next(iter(item.items()))
+                if isinstance(first_val, (dict, list)):
+                    summaries.append("…")
+                else:
+                    token = str(first_val)
+                    if len(token) > _LIST_SUMMARY_TOKEN_MAX:
+                        token = token[: _LIST_SUMMARY_TOKEN_MAX - 1] + "…"
+                    summaries.append(token)
+            elif isinstance(item, (dict, list)):
+                summaries.append("…")
+            else:
+                token = str(item)
+                if len(token) > _LIST_SUMMARY_TOKEN_MAX:
+                    token = token[: _LIST_SUMMARY_TOKEN_MAX - 1] + "…"
+                summaries.append(token)
+        more = f" +{n - _LIST_SUMMARY_HEAD}" if n > _LIST_SUMMARY_HEAD else ""
+        joined = ", ".join(summaries) if summaries else ""
+        return f"[dim]list({n})[/dim] {joined}{more}".rstrip()
+    if isinstance(value, dict):
+        n = len(value)
+        return f"[dim]{{{n} field(s)}}[/dim]"
+    s = str(value)
+    if len(s) > max_chars:
+        return s[: max_chars - 1] + "…"
+    return s
 
 
 def _truncate_json(value: Any, *, max_chars: int) -> str:
@@ -1351,6 +1465,41 @@ def _require_llm_provider_key_or_offer_setup() -> None:
             os.environ[env_var] = value.strip()
 
 
+def _prompt_runs_per_case() -> int | None:
+    """Wizard prompt: how many times to run each case (scores averaged).
+
+    Multi-run averaging widens the score distribution. Without it (N=1)
+    the judge's per-category score is a single roll — operators
+    routinely see "everything 1.00 across all 10 cases" because each
+    case is judged exactly once + the judge often gives binary-ish
+    scores. With N=3+ each case's per-category mean reveals real
+    variance (e.g. 0.67 means 2-of-3 runs scored 1.0 + one scored 0).
+
+    Returns the chosen runs count, or ``None`` on Ctrl-C."""
+    choices = {
+        "1": (1, "1 run — fast iteration (no variance signal)"),
+        "2": (3, "3 runs — recommended (averages out judge noise)"),
+        "3": (5, "5 runs — tight CI (most tokens spent)"),
+    }
+    console.print()
+    console.print(
+        "[bold]Runs per case?[/bold] [dim](higher = wider score range; "
+        "0/1.00 binary scores usually mean N=1)[/dim]"
+    )
+    for key, (value, label) in choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {value}  [dim]{label}[/dim]")
+    try:
+        idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(choices.keys()),
+            default="2",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return choices[idx][0]
+
+
 def _prompt_scorecard_gate() -> float | None:
     """Wizard's scorecard-branch gate-threshold prompt.
 
@@ -1389,11 +1538,13 @@ def _generate_preview_and_gate(
     mix: str,
     mock: bool,
     cwd: Path,
-) -> tuple[list[dict[str, Any]], float] | None:
+) -> tuple[list[dict[str, Any]], int, float] | None:
     """Wizard sub-flow: load bundle, loop on generate-and-preview
-    until the operator says "continue", then ask the gate threshold.
+    until the operator says "continue", then ask runs-per-case +
+    gate threshold.
 
-    Returns ``(entries, gate)`` on success, ``None`` on cancel.
+    Returns ``(entries, runs_per_case, gate)`` on success, ``None``
+    on cancel.
 
     The generation runs INSIDE the wizard (rather than waiting for
     the scorecard to do it later) so the operator sees what's about
@@ -1445,10 +1596,13 @@ def _generate_preview_and_gate(
             return None
         # "regenerate" → loop, generate again.
 
+    runs = _prompt_runs_per_case()
+    if runs is None:
+        return None
     gate = _prompt_scorecard_gate()
     if gate is None:
         return None
-    return entries, gate
+    return entries, runs, gate
 
 
 def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflects the per-agent state machine
