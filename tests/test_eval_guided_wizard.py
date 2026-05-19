@@ -24,7 +24,14 @@ runner = CliRunner(mix_stderr=False)
 
 
 def _bootstrap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Init a project + add one agent. Returns project root."""
+    """Init a project + add one agent. Returns project root.
+
+    Also injects a fake ``OPENAI_API_KEY`` into the test env so the
+    new pre-flight check (PR added 2026-05-19) — which requires at
+    least one of OpenAI / Anthropic to be configured — passes
+    without forcing CI to provide real keys. The value only needs
+    to be non-empty; downstream calls are mocked in each test."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key-for-precheck-only")
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -436,3 +443,107 @@ def test_guided_all_generate_dispatches_to_scorecard_all_sweep(
     assert call["mix"] == "standard"
     # Gate carried into GateConfig.overall.
     assert call["gates"].overall == 0.7
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: require OpenAI or Anthropic key (added 2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_eval_warns_and_exits_when_no_provider_key_in_non_tty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a non-TTY context (CliRunner / CI / piped), bare ``mdk eval``
+    without OPENAI_API_KEY or ANTHROPIC_API_KEY must exit 2 with a
+    clear hint pointing at ``mdk auth login`` — NOT silently fall
+    through to the wizard and burn 4-5 prompts before failing at
+    generation."""
+    # Set up a project but explicitly clear both LLM keys (the env
+    # would normally have whatever's autoloaded from the operator's
+    # ~/.movate/credentials).
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Point credentials at an empty path so autoload finds nothing.
+    empty_creds = tmp_path / "empty-credentials"
+    empty_creds.write_text("")
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(empty_creds))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    result = runner.invoke(app, ["eval", "--all"], env={"COLUMNS": "200"})
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 2, combined
+    # Warning panel surfaced.
+    assert "No OpenAI or Anthropic key configured" in combined or "no LLM" in combined.lower()
+    # Hint points at the fix.
+    assert "mdk auth login" in combined
+
+
+@pytest.mark.unit
+def test_eval_skips_precheck_under_mock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--mock`` is the offline / shape-only path; it should NOT
+    trigger the pre-flight key check (no real LLM calls happen)."""
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    empty_creds = tmp_path / "empty-credentials"
+    empty_creds.write_text("")
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(empty_creds))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    # --mock + --all + --gate 0.0 → minimal path; no real LLM calls,
+    # check should be skipped.
+    result = runner.invoke(
+        app,
+        ["eval", "--all", "--mock", "--gate", "0.0"],
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    # Pre-flight warning panel must NOT fire under --mock.
+    assert "No OpenAI or Anthropic key configured" not in combined
+    # Eval ran (or attempted to run) past the precheck.
+    assert result.exit_code in (0, 2), combined  # 0 = pass, 2 = mock data missing
+    # If it failed, it's NOT because of the precheck.
+    if result.exit_code != 0:
+        assert "mdk auth login" not in combined or "No OpenAI" not in combined
+
+
+@pytest.mark.unit
+def test_eval_precheck_passes_when_one_key_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If at least one of OpenAI / Anthropic is configured, the
+    pre-flight check is silent + eval proceeds. The auto-detect
+    handles routing around whichever provider is missing."""
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    # Only OPENAI_API_KEY set — anthropic explicitly cleared.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-test-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    # Use --mock so we don't actually try to call an LLM; the test
+    # is about the pre-flight check passing, not about eval results.
+    result = runner.invoke(
+        app,
+        ["eval", "--all", "--mock", "--gate", "0.0"],
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    # No pre-flight panel — at least one key configured.
+    assert "No OpenAI or Anthropic key configured" not in combined

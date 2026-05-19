@@ -411,6 +411,14 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
     # cwd for --all). Resolved to actual path after path resolution below.
     _compare_pending = compare
 
+    # Pre-flight: eval (any path that isn't --mock) needs at least
+    # one LLM provider key — both for case generation AND for judge
+    # scoring. Surface a missing-keys warning BEFORE the wizard takes
+    # the operator through 4-5 prompts only to discover at the end
+    # that they can't run. Skipped under --mock (offline mode).
+    if not mock:
+        _require_llm_provider_key_or_offer_setup()
+
     # Guided wizard — explicit `--guided`, OR auto-trigger when an
     # operator typed bare `mdk eval` with no path and no `--all` from
     # an interactive shell inside a project. CI / pipe / no-args-outside-
@@ -1234,6 +1242,113 @@ def _prompt_continue_or_regenerate() -> str:
     except (KeyboardInterrupt, EOFError):
         return "cancel"
     return choices[idx][0]
+
+
+def _require_llm_provider_key_or_offer_setup() -> None:
+    """Pre-flight check: at least one LLM provider key must be set.
+
+    Eval (any path that isn't ``--mock``) needs an API key both for
+    case generation AND for judge scoring. Without one, the operator
+    will hit AuthError partway through and have to ``Ctrl+C`` + run
+    ``mdk auth login`` + retry. Catching it here saves them 4-5
+    wizard prompts only to discover at the end that no keys are
+    configured.
+
+    Behavior:
+
+    * If OPENAI_API_KEY *or* ANTHROPIC_API_KEY is set → return
+      cleanly (the auto-detect handles routing around whichever
+      provider IS missing).
+    * If NEITHER is set + we're in a TTY → show the warning panel,
+      offer to launch ``mdk auth login`` inline (same flow as
+      ``_offer_inline_auth_recovery`` in eval-scorecard's preflight
+      retry — reused here so the operator gets the consistent
+      polished picker).
+    * If NEITHER is set + non-TTY (CI, piped) → print the hint and
+      exit 2. Don't block on a prompt that would hang the script.
+
+    Telegram + Lyzr + Azure are intentionally NOT checked — the
+    rubric is "can the eval generate cases + judge them", and
+    OpenAI / Anthropic are the two providers the wizard's auto-
+    detect routes between (Gemini is in the fallback list too but
+    rarely the operator's only key in practice).
+    """
+    import os  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    from movate.cli.auth import _provider_is_configured  # noqa: PLC0415
+
+    if _provider_is_configured("openai") or _provider_is_configured("anthropic"):
+        return  # at least one key configured; auto-detect handles the rest
+
+    err_console.print()
+    err_console.print(
+        Panel(
+            "[bold yellow]⚠ No OpenAI or Anthropic key configured[/bold yellow]\n\n"
+            "[dim]Eval needs at least one LLM provider key — without one, "
+            "case generation + judging will both fail. Run [bold]mdk auth "
+            "login[/bold] to set one up, or pass [bold]--mock[/bold] for "
+            "offline / shape-only eval (no real LLM calls).[/dim]",
+            border_style="yellow",
+            title_align="left",
+        )
+    )
+
+    if not sys.stdin.isatty():
+        # Non-interactive context (CI / piped). No place to prompt.
+        err_console.print()
+        err_console.print(
+            "[red]✗[/red] not in a TTY; can't prompt for inline setup. "
+            "Run [bold]mdk auth login anthropic[/bold] (or openai) and "
+            "retry, or re-invoke with [bold]--mock[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    err_console.print()
+    try:
+        answer = Prompt.ask(
+            "[bold]Set up a provider key now?[/bold]",
+            choices=["y", "n"],
+            default="y",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        raise typer.Exit(code=2) from None
+
+    if (answer or "").strip().lower() != "y":
+        err_console.print("[dim]→ skipped. Run [bold]mdk auth login[/bold] before retrying.[/dim]")
+        raise typer.Exit(code=2)
+
+    # Launch the existing mdk auth login flow inline — same polished
+    # picker as the standalone command (with PR #207's live-verify
+    # markers showing ``✓ verified`` / ``✗ set but rejected``).
+    from movate.cli.auth import login  # noqa: PLC0415
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    before = CredentialsStore().read()
+    try:
+        login()
+    except typer.Exit:
+        # Operator cancelled the picker or verify failed.
+        raise typer.Exit(code=2) from None
+
+    # Re-check: maybe they typed an empty key or hit a verify
+    # failure that ``login()`` exited cleanly from.
+    if not (_provider_is_configured("openai") or _provider_is_configured("anthropic")):
+        err_console.print(
+            "[red]✗[/red] still no OpenAI / Anthropic key after auth login. Aborting eval."
+        )
+        raise typer.Exit(code=2)
+
+    # Inject newly-saved keys into ``os.environ`` so the rest of this
+    # CLI invocation sees them (autoload already ran at startup;
+    # without this refresh the in-flight wizard would still see the
+    # pre-login state).
+    after = CredentialsStore().read()
+    for env_var, value in after.items():
+        before_value = before.get(env_var, "")
+        if value and value.strip() and value != before_value:
+            os.environ[env_var] = value.strip()
 
 
 def _prompt_scorecard_gate() -> float | None:
