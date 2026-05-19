@@ -366,8 +366,11 @@ async def test_remote_executor_success_without_run_id_is_graceful(mini_bundle) -
 @pytest.mark.unit
 def test_eval_url_without_agent_yaml_errors_clean() -> None:
     """When path is a URL, --agent-yaml is required. The CLI surfaces a
-    readable error before constructing any HTTP client."""
-    result = runner.invoke(cli_app, ["eval", "https://example.test/runtime"])
+    readable error before constructing any HTTP client.
+
+    Uses --mock to skip the live-verify pre-flight (PR #223) so the
+    URL-validation error reaches the surface."""
+    result = runner.invoke(cli_app, ["eval", "https://example.test/runtime", "--mock"])
     assert result.exit_code == 2
     combined = result.stdout + (result.stderr or "")
     assert "--agent-yaml is required" in combined
@@ -410,6 +413,7 @@ def test_eval_url_without_api_key_errors_clean(tmp_path: Path) -> None:
             "https://example.test/runtime",
             "--agent-yaml",
             str(agent_dir),
+            "--mock",  # skip the live-verify pre-flight (PR #223)
         ],
         env={"MOVATE_API_KEY": ""},
     )

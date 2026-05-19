@@ -527,9 +527,18 @@ async def _generate_entries(
             try:
                 validator.validate(generated_input)
             except ValidationError as exc:
-                err_console.print(
-                    f"[yellow]⚠[/yellow] skipped generated input #{i + 1}: "
-                    f"failed schema validation ({exc.message})"
+                # Route through the logger (not ``err_console.print``)
+                # so the wizard's spinner-wrapped capture handler can
+                # collect this with the same machinery that handles
+                # "non-JSON" / "generator-call-failed" warnings — and
+                # so a clean summary panel can render counts by
+                # category instead of N raw lines interleaving with
+                # the spinner. The "skipped" prefix is preserved in
+                # the message body so legacy log scrapers still match.
+                log.warning(
+                    "skipped generated input #%d: failed schema validation (%s)",
+                    i + 1,
+                    exc.message,
                 )
                 continue
             # Execute to capture the expected output. Same path
