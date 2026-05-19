@@ -631,6 +631,129 @@ async def _preflight_check_generator_auth(*, models: set[str], mock: bool) -> No
 
 
 # ---------------------------------------------------------------------------
+# Sweep wrappers — one event loop per top-level CLI invocation
+# ---------------------------------------------------------------------------
+
+
+async def _run_scorecard_sweep_async(
+    *,
+    agent_dirs: list[Path],
+    count: int,
+    mix: str,
+    mock: bool,
+    judge_model: str | None,
+    generator_model: str | None,
+    preflight_models: set[str],
+    is_json: bool,
+    effective: EffectiveCategories | None,
+) -> tuple[list[ScorecardSummary], list[tuple[str, str]]]:
+    """Async core of the project-wide --all sweep — preflight + every
+    per-agent scorecard run live in ONE event loop.
+
+    Why this exists: until 2026-05-18 the orchestrator called
+    ``asyncio.run`` once for the preflight (PR #197) and once per
+    agent (existing pattern). LiteLLM's module-level ``LoggingWorker``
+    holds an ``asyncio.Queue`` initialized lazily on the first
+    ``acompletion`` call — the queue binds to whichever event loop
+    first touched it. As soon as ``asyncio.run`` closes that loop,
+    the queue is bound to a dead loop, and the next ``acompletion``
+    blows up with::
+
+        RuntimeError: <Queue at 0x...> is bound to a different event loop
+
+    The bug was latent while auth-failure short-circuited LiteLLM
+    before the worker queue was ever touched. Once PR #197's
+    preflight let the first ``acompletion`` succeed, every
+    subsequent agent crashed with the stranded-queue error.
+
+    Fix: one ``asyncio.run`` for the whole sweep. The LoggingWorker
+    queue binds once and stays valid until the CLI returns.
+
+    Per-agent rendering is interleaved into this async loop (Rich
+    console calls don't block the event loop) so the agent-by-agent
+    progress output looks identical to the old synchronous shape.
+    """
+    await _preflight_check_generator_auth(models=preflight_models, mock=mock)
+
+    summaries: list[ScorecardSummary] = []
+    failed: list[tuple[str, str]] = []
+
+    for agent_dir in agent_dirs:
+        if not is_json:
+            console.print()
+            console.print(f"[bold]── {agent_dir.name}[/bold]")
+        try:
+            bundle = load_agent(agent_dir)
+        except AgentLoadError as exc:
+            err_console.print(f"  [red]✗[/red] load failed: {str(exc)[:120]}")
+            failed.append((agent_dir.name, "load_failed"))
+            continue
+
+        project_root = _find_project_root(agent_dir)
+        if not is_json:
+            console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
+        try:
+            summary = await _run_scorecard(
+                bundle,
+                count=count,
+                mix=mix,
+                mock=mock,
+                judge_model=judge_model,
+                generator_model=generator_model,
+                project_root=project_root,
+                effective=effective,
+            )
+        except Exception as exc:
+            err_console.print(
+                f"  [red]✗[/red] scorecard failed ({type(exc).__name__}): {str(exc)[:120]}"
+            )
+            failed.append((agent_dir.name, type(exc).__name__))
+            continue
+
+        summaries.append(summary)
+        # Per-agent scorecard table renders inline so operators see
+        # progress agent-by-agent rather than waiting for the rollup.
+        # Suppressed in JSON mode — the final document carries it.
+        if not is_json:
+            console.print()
+            _render_scorecard(summary)
+            _emit_summary_line(summary)
+
+    return summaries, failed
+
+
+async def _run_scorecard_single_async(
+    bundle: AgentBundle,
+    *,
+    count: int,
+    mix: str,
+    mock: bool,
+    judge_model: str | None,
+    generator_model: str | None,
+    project_root: Path | None,
+    effective: EffectiveCategories | None,
+    probe_model: str,
+) -> ScorecardSummary:
+    """Async core of the single-agent path — preflight + scorecard
+    run in one event loop. See :func:`_run_scorecard_sweep_async`
+    for the LiteLLM ``LoggingWorker`` rationale; the bug surfaces
+    identically here when the preflight + scorecard each get their
+    own ``asyncio.run``.
+    """
+    await _preflight_check_generator_auth(models={probe_model}, mock=mock)
+    return await _run_scorecard(
+        bundle,
+        count=count,
+        mix=mix,
+        mock=mock,
+        judge_model=judge_model,
+        generator_model=generator_model,
+        project_root=project_root,
+        effective=effective,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1119,20 +1242,18 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
 
     project_root = _find_project_root(agent_path)
 
-    # Preflight auth probe — catches the common "API key not set"
-    # case BEFORE running 10 cases x 2 retries against a doomed
-    # provider. The probe uses --generator-model if the operator
-    # passed one (since that uniformly overrides bundle.spec.model),
-    # else the agent's declared provider.
+    # Preflight auth probe + scorecard run share ONE asyncio.run so
+    # LiteLLM's LoggingWorker queue binds to a single event loop and
+    # survives across both. See _run_scorecard_sweep_async for the
+    # full chronology of why splitting these breaks LiteLLM.
     probe_model = generator_model or bundle.spec.model.provider
-    asyncio.run(_preflight_check_generator_auth(models={probe_model}, mock=mock))
 
     if output_format == Report.TABLE:
         console.print(
             f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
         )
     summary = asyncio.run(
-        _run_scorecard(
+        _run_scorecard_single_async(
             bundle,
             count=count,
             mix=mix,
@@ -1141,6 +1262,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             generator_model=generator_model,
             project_root=project_root,
             effective=effective,
+            probe_model=probe_model,
         )
     )
 
@@ -1475,76 +1597,52 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         console.print("[dim]mdk_eval_scorecard_all_summary: agents=0 ok=true[/dim]")
         return
 
-    # Preflight auth probe — one tiny ping per unique generator model
-    # BEFORE the sweep loop. Without this, 10 agents x 10 cases x 2
-    # retries against a missing API key produces 200 duplicate
-    # warnings + 30s of spam before the first useful diagnostic.
-    # Probing upfront fails fast with one clear hint.
-    if not mock:
-        if generator_model is not None:
-            # --generator-model uniformly overrides every agent;
-            # one model probes the whole sweep.
-            preflight_models: set[str] = {generator_model}
-        else:
-            # Otherwise each agent uses its own declared provider.
-            # We probe each UNIQUE provider once (a project with all
-            # 10 agents on openai/... yields a single probe call).
-            # Agents that fail to load here are silently skipped —
-            # the main loop's load step will surface that failure
-            # in the rollup.
-            preflight_models = set()
-            for agent_dir in agent_dirs:
-                try:
-                    preflight_models.add(load_agent(agent_dir).spec.model.provider)
-                except AgentLoadError:
-                    continue
-        asyncio.run(_preflight_check_generator_auth(models=preflight_models, mock=False))
+    # Preflight model set — see _run_scorecard_sweep_async for the
+    # actual probe. Computed synchronously here because load_agent
+    # is a YAML read, not an LLM call.
+    preflight_models: set[str]
+    if mock:
+        preflight_models = set()
+    elif generator_model is not None:
+        # --generator-model uniformly overrides every agent;
+        # one model probes the whole sweep.
+        preflight_models = {generator_model}
+    else:
+        # Otherwise each agent uses its own declared provider.
+        # We probe each UNIQUE provider once (a project with all
+        # 10 agents on openai/... yields a single probe call).
+        # Agents that fail to load here are silently skipped —
+        # the main loop's load step will surface that failure
+        # in the rollup.
+        preflight_models = set()
+        for agent_dir in agent_dirs:
+            try:
+                preflight_models.add(load_agent(agent_dir).spec.model.provider)
+            except AgentLoadError:
+                continue
 
-    summaries: list[ScorecardSummary] = []
-    failed: list[tuple[str, str]] = []
-
-    for agent_dir in agent_dirs:
-        if not is_json:
-            console.print()
-            console.print(f"[bold]── {agent_dir.name}[/bold]")
-        try:
-            bundle = load_agent(agent_dir)
-        except AgentLoadError as exc:
-            err_console.print(f"  [red]✗[/red] load failed: {str(exc)[:120]}")
-            failed.append((agent_dir.name, "load_failed"))
-            continue
-
-        project_root = _find_project_root(agent_dir)
-        if not is_json:
-            console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
-        try:
-            summary = asyncio.run(
-                _run_scorecard(
-                    bundle,
-                    count=count,
-                    mix=mix,
-                    mock=mock,
-                    judge_model=judge_model,
-                    generator_model=generator_model,
-                    project_root=project_root,
-                    effective=effective,
-                )
-            )
-        except Exception as exc:
-            err_console.print(
-                f"  [red]✗[/red] scorecard failed ({type(exc).__name__}): {str(exc)[:120]}"
-            )
-            failed.append((agent_dir.name, type(exc).__name__))
-            continue
-
-        summaries.append(summary)
-        # Per-agent scorecard table renders inline so operators see
-        # progress agent-by-agent rather than waiting for the rollup.
-        # Suppressed in JSON mode — the final document carries it.
-        if not is_json:
-            console.print()
-            _render_scorecard(summary)
-            _emit_summary_line(summary)
+    # ONE asyncio.run for the entire sweep — preflight + every
+    # per-agent scorecard run share a single event loop. LiteLLM's
+    # module-level LoggingWorker queue binds to whichever event loop
+    # first touches it; splitting the sweep across multiple
+    # ``asyncio.run`` calls (preflight + N agents) closed that loop
+    # under LiteLLM's feet and surfaced as a "Queue at 0x... is
+    # bound to a different event loop" RuntimeError on every
+    # subsequent acompletion. See _run_scorecard_sweep_async for the
+    # full chronology.
+    summaries, failed = asyncio.run(
+        _run_scorecard_sweep_async(
+            agent_dirs=agent_dirs,
+            count=count,
+            mix=mix,
+            mock=mock,
+            judge_model=judge_model,
+            generator_model=generator_model,
+            preflight_models=preflight_models,
+            is_json=is_json,
+            effective=effective,
+        )
+    )
 
     project_mean = sum(s.overall_mean for s in summaries) / len(summaries) if summaries else 0.0
 
