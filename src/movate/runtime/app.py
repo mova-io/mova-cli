@@ -78,6 +78,8 @@ from movate.runtime.schemas import (
     HealthView,
     JobListView,
     JobView,
+    KbIngestFileResult,
+    KbIngestView,
     ReadyView,
     RunAccepted,
     RunSubmission,
@@ -1552,6 +1554,138 @@ def build_app(
             row_count=len(rows),
             sha256_prefix=sha256_prefix,
             preview=preview,
+        )
+
+    @v1.post(
+        "/agents/{name}/kb",
+        response_model=KbIngestView,
+        status_code=200,
+        tags=["agents-v1", "kb"],
+    )
+    async def v1_upload_agent_kb(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        files: list[UploadFile] = File(default=[]),
+    ) -> KbIngestView:
+        """Ingest one or more KB documents into an agent's knowledge
+        base (Tier 10 RAG enhancement, PR-D).
+
+        Accepts a ``multipart/form-data`` upload with a repeating
+        ``files`` field. Each file is split into paragraph chunks,
+        embedded via the configured embedding model, and persisted
+        via the storage layer's :func:`save_kb_chunk` (deduped on the
+        ``(agent, tenant_id, content_hash)`` constraint — re-uploading
+        the same document is a no-op).
+
+        Supported extensions: ``.md``, ``.markdown``, ``.txt``.
+        Files with unsupported extensions get ``status="skipped"``
+        in the per-file result but the overall upload still returns
+        200 — the operator sees the mix instead of getting a 400 that
+        blocks the whole batch.
+
+        Wraps the same ingest path as ``mdk kb ingest`` (see
+        :func:`movate.kb.ingest.ingest_text`); this endpoint exists so
+        the Chainlit playground (and the future Angular Agent Console)
+        can offer a drag-drop upload without requiring an SSH
+        connection to a project directory.
+
+        Errors:
+
+        * **400** — empty multipart form (no ``files`` field)
+        * **401** — missing / bad bearer token
+        * **404** — agent not found
+        * **502** — embedding API unreachable
+        """
+        from movate.kb.ingest import ingest_text  # noqa: PLC0415
+
+        if not files:
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no files in the multipart form; supply one or more "
+                    "``files`` fields (.md / .markdown / .txt)."
+                ),
+            )
+
+        # 404 on unknown agent — same surface as other agent endpoints.
+        agents: list[AgentBundle] = request.app.state.agents
+        agent_names = {b.spec.name for b in agents}
+        if name not in agent_names:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        supported = {".md", ".markdown", ".txt"}
+
+        per_file: list[KbIngestFileResult] = []
+        total_saved = 0
+        for upload in files:
+            raw_name = (upload.filename or "").lstrip("/")
+            basename = Path(raw_name).name
+            ext = Path(basename).suffix.lower()
+            if not basename:
+                # Unnamed multipart part — skip silently with a
+                # placeholder source so the operator sees something.
+                per_file.append(
+                    KbIngestFileResult(
+                        source="<unnamed>",
+                        status="skipped",
+                    )
+                )
+                continue
+            if ext not in supported:
+                per_file.append(
+                    KbIngestFileResult(
+                        source=basename,
+                        status="skipped",
+                    )
+                )
+                continue
+            raw = await upload.read()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                # Non-UTF8 file — skip rather than 400, so a single
+                # bad encoding doesn't sink a 10-file upload.
+                per_file.append(
+                    KbIngestFileResult(
+                        source=basename,
+                        status="skipped",
+                    )
+                )
+                continue
+            summary = await ingest_text(
+                storage=store,
+                text=text,
+                source=basename,
+                agent=name,
+                tenant_id=ctx.tenant_id,
+            )
+            if summary is None:
+                per_file.append(
+                    KbIngestFileResult(
+                        source=basename,
+                        status="empty",
+                    )
+                )
+                continue
+            total_saved += summary.chunks_saved
+            per_file.append(
+                KbIngestFileResult(
+                    source=basename,
+                    status="ingested",
+                    chunks_total=summary.chunks_total,
+                    chunks_saved=summary.chunks_saved,
+                    embedding_model=summary.embedding_model,
+                )
+            )
+
+        return KbIngestView(
+            agent_name=name,
+            files=per_file,
+            total_chunks_saved=total_saved,
         )
 
     @v1.post(

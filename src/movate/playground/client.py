@@ -137,6 +137,39 @@ class PlaygroundClient:
             f"complete — check ``mdk jobs show {job_id}``."
         )
 
+    async def upload_kb_files(
+        self,
+        *,
+        agent: str,
+        files: list[tuple[str, bytes]],
+    ) -> dict[str, Any]:
+        """Upload one or more KB documents to ``agent``'s knowledge base.
+
+        ``files`` is a list of ``(filename, bytes)`` tuples. Each is
+        sent as one part of a ``multipart/form-data`` POST to
+        ``/api/v1/agents/{agent}/kb`` with the field name ``files``
+        (repeated). The runtime chunks + embeds + persists each file
+        via the storage layer.
+
+        Returns the ``KbIngestView`` payload — ``{agent_name,
+        total_chunks_saved, files: [...]}``. The caller can render
+        per-file status to confirm what landed.
+
+        Raises ``httpx.HTTPStatusError`` for 4xx/5xx — typical causes
+        are 404 (agent not found in the runtime catalog) and 502
+        (embedding API unreachable).
+        """
+        # Repeating multipart field "files" — httpx accepts a list of
+        # tuples for this; each tuple is (field_name, (filename, content)).
+        multipart_files = [("files", (name, content)) for name, content in files]
+        resp = await self._client.post(
+            f"/api/v1/agents/{agent}/kb",
+            files=multipart_files,
+        )
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
     async def post_feedback(
         self,
         *,
