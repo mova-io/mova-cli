@@ -3,80 +3,240 @@
     "id": "KB-001",
     "category": "billing",
     "title": "Customer charged twice for the same invoice",
-    "symptom": "duplicate charge on credit card statement",
-    "resolution": "Confirm with Stripe dashboard, refund the duplicate via Stripe direct, email customer with reference numbers, route to billing_ops queue if the duplicate predates the 30-day refund window.",
+    "symptom": "duplicate charge on credit card statement, same amount, same date",
+    "resolution": "Confirm with Stripe dashboard (search by last-4 + amount + date range). Refund the duplicate via Stripe direct (NOT through our billing UI — it 422s on charges older than 24h). Email customer with both reference numbers + the refund ETA (5-7 business days). Route to billing_ops queue if the duplicate predates the 30-day refund window — finance has to issue a manual ACH credit instead.",
     "tags": ["billing", "stripe", "duplicate-charge", "refund"]
   },
   {
     "id": "KB-002",
     "category": "billing",
     "title": "Failed payment after trial conversion",
-    "symptom": "subscription downgraded to free tier without warning",
-    "resolution": "Customer's trial converted but the saved payment method failed silently. Look up the failed Stripe charge ID, ask customer to update their card, then manually retry the charge from Stripe dashboard. Restore the subscription tier once the charge clears.",
+    "symptom": "subscription silently downgraded to free tier 24-48h after trial ended, no email warning, customer surprised",
+    "resolution": "Customer's trial converted but the saved payment method failed (expired card, address mismatch, or insufficient funds). Look up the failed Stripe charge ID from the customer's account → Billing → Recent attempts. Ask customer to update their card via the self-serve portal. Then manually retry the charge from Stripe dashboard. Restore the subscription tier once the charge clears. If the customer can't update within 7 days, escalate to billing_ops — they have a workflow for invoice-based payment as a fallback.",
     "tags": ["billing", "stripe", "trial-conversion", "payment-failure"]
   },
   {
     "id": "KB-003",
     "category": "account",
     "title": "SSO setup loops at the IdP login page",
-    "symptom": "user redirected to IdP, signs in, redirected back to login screen",
-    "resolution": "Almost always a SAML clock-skew issue (>5 min drift between our IdP-config NotBefore and the customer's IdP clock). Have ops sync the NTP servers or widen the assertion validity window in the SAML config.",
-    "tags": ["account", "sso", "saml", "clock-skew"]
+    "symptom": "user redirected to IdP (Okta/Azure AD/Google Workspace), signs in successfully, redirected back to our login screen — loop repeats forever",
+    "resolution": "Almost always a SAML clock-skew issue (>5 min drift between our IdP-config NotBefore/NotOnOrAfter timestamps and the customer's IdP clock). Have customer's ops team sync the NTP servers, OR widen the assertion validity window in the SAML config (we accept ±10min by default; can push to ±15min for chronic offenders). Secondary cause: incorrect SP entity ID. Verify the entity ID in our admin console exactly matches what the customer's IdP is sending (case-sensitive).",
+    "tags": ["account", "sso", "saml", "clock-skew", "okta", "azure-ad"]
   },
   {
     "id": "KB-004",
     "category": "account",
     "title": "Locked out after password reset email",
-    "symptom": "reset email link expired before user could click",
-    "resolution": "Reset links are valid for 24h. Generate a fresh one from the admin console. If repeating, check the customer's email security gateway (Mimecast/Proofpoint sometimes pre-click links to scan them, burning the token).",
-    "tags": ["account", "password-reset", "email-gateway"]
+    "symptom": "user clicks reset link from email, gets 'link expired' error",
+    "resolution": "Reset links are valid for 24h from issue, single-use. Generate a fresh one from the admin console (Users → search → Send reset link). If failure repeats, check the customer's email security gateway — Mimecast, Proofpoint, and Microsoft Defender for Office 365 all pre-click links to scan them, which burns the single-use token before the actual user can click. Workaround: have the customer add our reset-email sender domain to their gateway's allowlist, OR issue them a temporary password via admin console (force-rotate at next login).",
+    "tags": ["account", "password-reset", "email-gateway", "mimecast", "proofpoint"]
   },
   {
     "id": "KB-005",
     "category": "bug",
     "title": "Export job hangs at 95% for large datasets",
-    "symptom": "CSV export of >100k rows never completes",
-    "resolution": "Known issue with the streaming export's chunk-flush threshold. Workaround: have customer filter to <50k rows or use the paginated API. Fix is on the v2.4 roadmap; bump priority if customer is enterprise-tier.",
-    "tags": ["bug", "export", "performance", "known-issue"]
+    "symptom": "CSV/JSON export of >100k rows never completes, progress bar stuck at 95% indefinitely, job eventually shows 'failed' after 30min timeout",
+    "resolution": "Known issue with the streaming export's chunk-flush threshold — the last 5% chunk exceeds our 10MB write buffer for wide schemas (>40 columns). Workaround: have customer filter to <50k rows per export, OR switch to the paginated API (it streams in 10k-row chunks server-side). Fix is on the v2.4 roadmap (linked ticket: ENG-4521). Bump priority if customer is enterprise-tier — they have a contractual export SLA.",
+    "tags": ["bug", "export", "performance", "known-issue", "csv"]
   },
   {
     "id": "KB-006",
     "category": "bug",
     "title": "Webhook receiver returns 200 but events never arrive",
-    "symptom": "customer's webhook endpoint responds 200, events not received downstream",
-    "resolution": "Check the webhook signature. If customer's HMAC secret rotated and they didn't update both sides, our retry queue will silently drop after 5 sig-mismatch failures. Have them rotate, then trigger a webhook replay from the admin panel.",
-    "tags": ["bug", "webhook", "hmac", "retry"]
+    "symptom": "customer's webhook endpoint responds 200 OK in their access logs, but events never appear in their downstream system",
+    "resolution": "Check the webhook signature header (X-MDK-Signature). If customer's HMAC secret rotated and they didn't update both sides simultaneously, our retry queue will silently drop the event after 5 consecutive signature-mismatch failures (anti-replay defense). Have them rotate the secret, update both sides in the same change window, then trigger a webhook replay from the admin panel (Settings → Webhooks → Replay last 24h). If signature is fine, check their endpoint's processing — they may return 200 BEFORE actually persisting the event, then crash silently in their queue worker.",
+    "tags": ["bug", "webhook", "hmac", "retry", "signature"]
   },
   {
     "id": "KB-007",
     "category": "how_to",
     "title": "Bulk import users from CSV",
-    "symptom": "customer asking how to add 200+ users at once",
-    "resolution": "Point at the bulk import endpoint: /api/v1/users/import with multipart CSV. Include a link to the CSV column reference doc. Beyond 5k users we recommend the async import flow with a callback URL.",
-    "tags": ["how_to", "bulk-import", "docs"]
+    "symptom": "customer wants to onboard 100+ users at once, doesn't want to invite one-at-a-time",
+    "resolution": "Use the Bulk Import wizard (Admin → Users → Bulk import). Required CSV columns: email, first_name, last_name, role. Optional: team, manager_email, invite_immediately (bool, default true). Max 5000 rows per upload. Common gotcha: the 'role' column must match EXACTLY one of our defined role slugs (case-sensitive: 'admin', 'member', 'viewer' — not 'Admin'). Validate the CSV with the dry-run toggle before committing — it'll surface row-level errors without creating any accounts.",
+    "tags": ["how_to", "bulk-import", "csv", "users", "onboarding"]
   },
   {
     "id": "KB-008",
     "category": "how_to",
     "title": "Configure email-based 2FA",
-    "symptom": "customer asking how to enforce 2FA org-wide",
-    "resolution": "Settings → Security → Two-factor authentication → toggle 'Required for all members'. Existing members get a 7-day grace period; new invites must enroll on first login.",
-    "tags": ["how_to", "2fa", "security"]
+    "symptom": "customer wants to require 2FA but doesn't want to mandate TOTP apps (their workforce includes warehouse staff without smartphones)",
+    "resolution": "Email-based 2FA is supported but disabled by default (slightly weaker than TOTP). Enable via Admin → Security → 2FA → 'Email codes' toggle. Once enabled, each user can choose Email OR TOTP at next login. Codes are 6 digits, valid 5 minutes, rate-limited to 1 send per 30 seconds. Note: if customer's IdP already enforces 2FA (e.g. Okta MFA), our 2FA is redundant — recommend they leave it off to avoid double-prompt friction.",
+    "tags": ["how_to", "2fa", "security", "email", "mfa"]
   },
   {
     "id": "KB-009",
     "category": "feature_request",
-    "title": "Custom domain support",
-    "symptom": "customer asking for branded URLs (cname → our app)",
-    "resolution": "On the roadmap for Q3. No timeline commitment to the customer. Track interest in the feature-request board so we can prioritize correctly when the work lands. Workaround: white-label proxy via their own CDN — works today.",
-    "tags": ["feature_request", "custom-domain", "roadmap"]
+    "title": "Custom domain support (CNAME)",
+    "symptom": "enterprise customer wants to host our portal under their domain (e.g. portal.customer.com -> app.movate.io)",
+    "resolution": "Custom domain support is roadmapped for v2.5 (ETA Q3). Today's workarounds: (1) use our subdomain feature (customer.movate.io) which is free for all tiers and supports custom SSL via Let's Encrypt; (2) for enterprise tier only, we can configure a CNAME with manual SSL certificate upload — this requires a signed amendment to the contract and a 5-business-day setup window. Log this as +1 on the FR-CUSTOM-DOMAIN ticket; product reviews customer requests at each release planning.",
+    "tags": ["feature_request", "custom-domain", "cname", "enterprise"]
   },
   {
     "id": "KB-010",
     "category": "billing",
     "title": "Annual contract renewal price increase",
-    "symptom": "customer surprised by renewal quote 20% above last year",
-    "resolution": "Per-seat list price increased Jan 1. Annual customers get the old price as long as their renewal is signed before their term ends. Forward to account_management with the customer ID; AM can grandfather if the renewal closes within the renewal window.",
-    "tags": ["billing", "renewal", "pricing", "account-management"]
+    "symptom": "customer received renewal quote with 8-12% price increase, asking why",
+    "resolution": "Standard contractual CPI adjustment — every annual contract includes a clause permitting up to 12% YoY increase. The actual % is set by Finance each Jan based on prior-year inflation. Talking points: (1) we absorbed cost increases in 2023, this is the first adjustment in 2 years; (2) the increase covers expanded support hours + the new dashboard module they're already using; (3) we can offer a 24-month renewal at the current rate to lock in pricing. Escalate to AE if customer threatens churn — they have a 5% retention discount available without exec approval.",
+    "tags": ["billing", "renewal", "price-increase", "retention"]
+  },
+  {
+    "id": "KB-011",
+    "category": "security",
+    "title": "SOC 2 Type II report request",
+    "symptom": "prospect's procurement team asking for SOC 2 Type II report before signing",
+    "resolution": "We have a current SOC 2 Type II (audited Q4 last year, covers 12 months of operations). Distribution requires a signed mutual NDA — send the prospect our standard NDA template (link in confluence: legal/templates/mnda.docx). Once signed by both sides, route to security@movate.io with the NDA attached; security ops will send the SOC 2 within 1 business day. Common follow-ups: penetration test summary (annual; same NDA covers it), data processing addendum (DPA) for GDPR/CCPA — pre-signed PDF lives at legal/dpa-v3.pdf.",
+    "tags": ["security", "soc2", "compliance", "nda", "procurement"]
+  },
+  {
+    "id": "KB-012",
+    "category": "security",
+    "title": "Customer wants to enable IP allowlisting",
+    "symptom": "enterprise customer wants to restrict our portal access to their corporate VPN IPs only",
+    "resolution": "IP allowlisting is available on enterprise tier (Settings -> Security -> IP allowlist). Accepts CIDR ranges (e.g. 10.0.0.0/16) and single IPs. Up to 100 entries per tenant. Important caveats: (1) the customer's own admin must add their current IP first or they'll lock themselves out — we always require 2 entries minimum on first enable; (2) our webhook delivery IPs are documented at docs.movate.io/webhooks/source-ips — customers using outbound webhooks need to allowlist those on their side; (3) IPv6 ranges supported but limited to /64 prefixes for performance reasons.",
+    "tags": ["security", "ip-allowlist", "cidr", "enterprise", "network"]
+  },
+  {
+    "id": "KB-013",
+    "category": "integration",
+    "title": "Slack notifications not arriving in customer's channel",
+    "symptom": "customer integrated Slack via OAuth, integration shows 'connected' but no messages appear in the target channel",
+    "resolution": "Two common causes: (1) the OAuth scope didn't include channels:write — customer needs to disconnect + reconnect, granting the wider scope at the consent screen; (2) the bot wasn't invited to the target channel — Slack requires explicit invite for bots in private channels (not public). Walk customer through: type /invite @movate-bot in the target channel from Slack itself. If still failing, check the integration's last-error field in our admin (Integrations -> Slack -> Logs) — Slack returns a structured error code we can map.",
+    "tags": ["integration", "slack", "oauth", "notifications"]
+  },
+  {
+    "id": "KB-014",
+    "category": "integration",
+    "title": "Webhook deliveries failing with TLS handshake error",
+    "symptom": "webhook delivery attempts fail with 'TLS handshake timeout' or 'certificate verify failed' in admin logs",
+    "resolution": "Almost always the customer's endpoint has a misconfigured SSL certificate. Common causes: (1) self-signed cert — we require a valid CA-signed cert (Let's Encrypt is free and works); (2) incomplete certificate chain (missing intermediate CA) — verify with `openssl s_client -connect their.endpoint:443 -showcerts`; (3) expired cert — common after Let's Encrypt 90-day renewals fail silently. We do NOT support certificate pinning on our outbound webhook sender. If customer is enterprise tier and needs mTLS, escalate to platform_eng — it's available but requires manual setup.",
+    "tags": ["integration", "webhook", "tls", "ssl", "certificates"]
+  },
+  {
+    "id": "KB-015",
+    "category": "performance",
+    "title": "API rate limit exceeded — 429 responses",
+    "symptom": "customer's integration is getting HTTP 429 'Too Many Requests' responses",
+    "resolution": "Our default rate limit is 100 req/min per API key (rolling window). Check the Retry-After response header — it tells the customer exactly how many seconds to wait. Customers can: (1) implement exponential backoff (recommended pattern: 1s, 2s, 4s, 8s, 16s, max 5 retries); (2) request a rate limit increase if they have a sustained legitimate need — enterprise tier gets 1000 req/min by default, mid-tier needs approval from AE; (3) batch API endpoints exist for several operations (bulk-create, bulk-update) — they consume 1 rate-limit unit per CALL, not per RECORD, which is often the right answer for high-volume integrations.",
+    "tags": ["performance", "rate-limit", "429", "api", "backoff"]
+  },
+  {
+    "id": "KB-016",
+    "category": "performance",
+    "title": "Dashboard slow to load for accounts with >50k records",
+    "symptom": "customer reports the main dashboard takes 15-30 seconds to load; small accounts load in <2s",
+    "resolution": "Known performance issue — the dashboard runs an unfiltered aggregation across the customer's full dataset. Workarounds (in order of effectiveness): (1) advise customer to use the date-range filter (defaulting to 'last 30 days' instead of 'all time') — typically drops load time 80%+; (2) enable the dashboard cache in their account settings (Settings -> Performance -> Dashboard cache) — refreshes every 15min instead of on-demand; (3) for accounts >500k records, we offer a pre-aggregation feature on enterprise tier (rollup tables computed nightly). Long-term fix is the columnar storage migration on the v3 roadmap.",
+    "tags": ["performance", "dashboard", "scaling", "aggregation"]
+  },
+  {
+    "id": "KB-017",
+    "category": "onboarding",
+    "title": "New customer can't find the API key generation page",
+    "symptom": "new admin user wants to wire up their first integration, can't locate API key UI",
+    "resolution": "API keys live under Settings -> Developers -> API Keys (NOT under Settings -> Security, which is where SSO/2FA live — common confusion). Only users with the 'admin' role can generate keys; 'member' role sees the menu item disabled. Walk new admins through: (1) Settings -> Developers -> API Keys -> 'Generate new key'; (2) name it after the use case (e.g. 'zapier-prod', 'internal-etl'); (3) copy the key IMMEDIATELY — we show it once, then hash it. If they lose it, they have to revoke + regenerate.",
+    "tags": ["onboarding", "api-keys", "developer-experience"]
+  },
+  {
+    "id": "KB-018",
+    "category": "onboarding",
+    "title": "Initial data import — what's the recommended path?",
+    "symptom": "newly-signed customer asking how to get their existing data in",
+    "resolution": "Three paths, depending on data size: (1) <10k records: use the Bulk Import wizard (CSV upload, see KB-007); (2) 10k-1M records: use the migration API (bulk-create endpoint, supports up to 100k records per request, async with progress polling); (3) >1M records: schedule a managed migration with our solutions engineering team — they have tooling for direct DB-to-DB copies from common sources (Salesforce, Hubspot, Postgres). All paths support a dry-run mode that surfaces validation errors before committing. Always recommend customers start with a sandbox tenant for their first 1-2 imports to learn the data shape.",
+    "tags": ["onboarding", "data-import", "migration", "csv", "api"]
+  },
+  {
+    "id": "KB-019",
+    "category": "feature_request",
+    "title": "Customer wants webhook signing with their own HMAC secret",
+    "symptom": "customer wants to set the HMAC secret used to sign outbound webhooks (today we generate it)",
+    "resolution": "Customer-supplied HMAC secrets are not supported today — we generate and rotate them on our side, customer reads via API. This is roadmapped (FR-WEBHOOK-CUSTOM-HMAC) but blocked on a security review (customer-supplied secrets need a HSM-backed storage path to meet our SOC 2 controls). ETA: v2.6, contingent on the security review landing. Workaround for customers needing custom auth: they can fetch our generated secret via /api/v1/webhooks/secrets and use it on their verification side — same outcome, just we control rotation.",
+    "tags": ["feature_request", "webhook", "hmac", "security"]
+  },
+  {
+    "id": "KB-020",
+    "category": "escalation",
+    "title": "Customer reports data loss — multiple records missing",
+    "symptom": "customer reports records that existed yesterday are gone today, no record of who deleted them",
+    "resolution": "P0 — page on-call immediately (PagerDuty: 'data-loss' service). DO NOT promise the data is recoverable until eng confirms — we have 7-day backups but restoration is record-level only, not bulk. While on-call investigates: (1) pull the audit log for the customer's tenant (Admin -> Audit -> filter by 'delete') — most 'data loss' is a user with admin permissions accidentally bulk-deleting; (2) check for active integrations that have delete scope — third-party tools occasionally fire delete operations during 'sync' cycles; (3) verify the customer is looking at the correct workspace (multi-workspace customers sometimes log into the wrong one). If genuine data loss confirmed, eng restores from backup; communications go through the AE + CSM, not support directly.",
+    "tags": ["escalation", "p0", "data-loss", "backup", "audit"]
+  },
+  {
+    "id": "KB-021",
+    "category": "escalation",
+    "title": "Possible security incident — customer reports unauthorized access",
+    "symptom": "customer admin sees logins from IPs/locations they don't recognize, suspects credential compromise",
+    "resolution": "P0 security incident — page security on-call (PagerDuty: 'security-incident' service). Immediate actions while security responds: (1) force a session revocation on the affected user (Admin -> Users -> search -> 'Revoke all sessions'); (2) reset their password and require re-auth at next login; (3) if 2FA was not enabled on the account, enable it organization-wide for the affected workspace as a precaution. Pull the auth-log for the suspicious IPs — geolocate via our internal IP intel tool. Do NOT delete any audit logs — security team needs the forensic trail. Communications: AE + customer's security contact only; never publicly acknowledge an incident.",
+    "tags": ["escalation", "p0", "security-incident", "credential-compromise"]
+  },
+  {
+    "id": "KB-022",
+    "category": "bug",
+    "title": "Email notifications arrive 30+ minutes delayed",
+    "symptom": "customer reports notification emails taking 30+ minutes to arrive (or never arriving)",
+    "resolution": "Check our notification queue status first (status.movate.io -> 'Notifications'). If queue is healthy, the issue is downstream: (1) check the customer's domain reputation — emails from new tenants sometimes get greylisted by aggressive spam filters (G Suite, Office 365); we can request whitelisting from our ESP (SendGrid) — takes 2-3 business days; (2) verify the customer's SPF/DKIM records if they're using a vanity sender domain — misconfigured records cause silent drops; (3) check their email gateway's quarantine — Mimecast/Proofpoint sometimes hold our emails for 'manual review'. Last resort: the customer can use webhook notifications instead of email for time-sensitive alerts.",
+    "tags": ["bug", "email", "notifications", "delivery", "spf-dkim"]
+  },
+  {
+    "id": "KB-023",
+    "category": "how_to",
+    "title": "Exporting all data for GDPR right-to-access request",
+    "symptom": "customer received a GDPR/CCPA data-access request from one of their end users, needs to export everything we have on that subject",
+    "resolution": "Use the Subject Data Export endpoint (API only — no UI yet). Required input: the subject's email or unique identifier. Returns a ZIP within 24h via signed S3 URL containing: (1) all records mentioning the subject; (2) audit-log entries; (3) any uploaded files referencing them. Customer is responsible for delivering this to the end user. For DELETE-right requests, use the Right to Erasure endpoint — it's irreversible and we ALSO purge our backups of that subject's records after the 30-day retention window. SLA: 30 days max for the underlying GDPR/CCPA timeline, but we typically deliver in <24h.",
+    "tags": ["how_to", "gdpr", "ccpa", "compliance", "data-export"]
+  },
+  {
+    "id": "KB-024",
+    "category": "billing",
+    "title": "Customer needs invoice in their local currency",
+    "symptom": "customer in EU/UK wants invoices in EUR/GBP instead of USD",
+    "resolution": "We can issue invoices in EUR, GBP, AUD, or CAD in addition to USD (Stripe limits us to these five). To switch: customer's billing admin opens a request via Settings -> Billing -> Currency change. Finance reviews + approves within 2 business days. The exchange rate locks at the time of approval and applies to all subsequent invoices until a future change. Note: switching currencies prorates the current billing period. We do NOT support currency-per-invoice — it's a tenant-wide setting. Tax handling differs by currency: USD invoices show tax on US states where we have nexus; EUR shows reverse-charge VAT for B2B EU customers.",
+    "tags": ["billing", "currency", "invoice", "vat", "international"]
+  },
+  {
+    "id": "KB-025",
+    "category": "bug",
+    "title": "Saved filter views disappearing on refresh",
+    "symptom": "customer creates a saved filter (e.g. 'High-priority tickets'), reloads the page, the filter is gone",
+    "resolution": "Known bug for users with browser ad-blockers / privacy extensions (uBlock Origin, Privacy Badger, Ghostery). Our filter state persists via a third-party analytics SDK that some blockers categorize as 'tracking' — when blocked, the localStorage write silently fails. Workaround: (1) advise customer to allowlist app.movate.io in their blocker; (2) we have a fix in progress (ENG-7891) to move filter state to our own /api/v1/views endpoint instead of the SDK — ETA Q3. For now, customers can use the URL-based filter (the query string preserves filter state across refreshes even when the SDK is blocked).",
+    "tags": ["bug", "filters", "browser", "ad-blocker", "localstorage"]
+  },
+  {
+    "id": "KB-026",
+    "category": "how_to",
+    "title": "Setting up alerts for budget thresholds",
+    "symptom": "customer wants to get notified when their monthly usage approaches their plan limit",
+    "resolution": "Budget alerts live under Settings -> Billing -> Usage Alerts. Customers can set thresholds at 50%, 75%, 90%, 100% of plan limits (multi-select). Alerts fire to: (1) the billing admin's email (default); (2) optionally Slack/Teams via integration; (3) optionally a webhook. Alert calculation refreshes every 15 minutes (NOT real-time) — heavy bursts can briefly exceed plan limits before the alert fires. Once an alert fires, we DON'T auto-throttle — customers must choose to upgrade their plan, or accept overage charges (configured per-customer in their contract). For hard caps (no overage), customers need to contact billing@movate.io to set up a usage ceiling.",
+    "tags": ["how_to", "alerts", "budget", "usage", "billing"]
+  },
+  {
+    "id": "KB-027",
+    "category": "integration",
+    "title": "Zapier integration loses authentication after a few days",
+    "symptom": "customer's Zapier zaps stop firing every few days, requiring them to reconnect",
+    "resolution": "Two possible causes: (1) the API key the customer used in Zapier has an expiration set (default 90 days for new keys) — check via Settings -> Developers -> API Keys -> look at expiry column; if expiring frequently, regenerate without an expiry (enterprise tier only) or extend to the max (1 year for non-enterprise); (2) Zapier's OAuth integration occasionally drops auth after Zapier deploys — they auto-recover within 24h; if longer, customer reconnects the Zapier app from the integrations page. Long-term: recommend customers use Zapier's API-key auth path (more stable than OAuth) for production zaps.",
+    "tags": ["integration", "zapier", "api-key", "oauth"]
+  },
+  {
+    "id": "KB-028",
+    "category": "feature_request",
+    "title": "Customer wants nested workspaces / org hierarchy",
+    "symptom": "enterprise customer (parent company + subsidiaries) wants to manage subsidiaries as nested workspaces under one parent",
+    "resolution": "Nested workspaces are NOT supported today — each workspace is a flat tenant with its own billing, users, data. Workarounds for hierarchy-needing customers: (1) use the multi-workspace feature (enterprise tier only) — one user identity can be a member of multiple workspaces with SSO; usage aggregates roll up in the admin portal; (2) use API-level prefixes/tags to model their hierarchy within a single workspace — works for read-only reporting, not for permission boundaries. True nested workspaces are roadmapped (FR-NESTED-ORGS) but blocked on a billing-engine refactor — no ETA. Always log enterprise interest on the FR — it's a top-5 enterprise ask.",
+    "tags": ["feature_request", "workspaces", "hierarchy", "enterprise", "multi-tenant"]
+  },
+  {
+    "id": "KB-029",
+    "category": "how_to",
+    "title": "Configuring per-user MFA enforcement",
+    "symptom": "customer wants to require 2FA for admin users but not regular members",
+    "resolution": "Granular MFA enforcement is supported on Pro and Enterprise tiers (Settings -> Security -> MFA -> 'Per-role enforcement'). Available levels: (1) 'optional for all' — default; (2) 'required for admins'; (3) 'required for all users'. The setting takes effect at the user's next login — currently-active sessions stay valid. Combine with the 'session timeout' setting (24h default) to force re-auth + MFA enrollment. If using SSO, MFA enforcement applies on top of the IdP's own policies — users prompted for both. For customers preferring single-MFA, configure the IdP MFA only and set our enforcement to 'optional'.",
+    "tags": ["how_to", "mfa", "2fa", "rbac", "security"]
+  },
+  {
+    "id": "KB-030",
+    "category": "escalation",
+    "title": "Customer threatening churn over feature gap",
+    "symptom": "AE flags account at risk; customer cites missing feature(s) as primary churn reason",
+    "resolution": "Not a support issue per se — route to the AE + CS team immediately, NOT into the standard FR queue. Talking points support can offer while waiting for AE: (1) acknowledge the gap explicitly, don't oversell roadmap; (2) ask whether a workaround would meet their need short-term (often yes for read-only reporting gaps); (3) offer to set up a roadmap review call with PM. Internal next steps: (a) check the FR ticket — is this on the v2.5/v2.6 roadmap? If yes, share ETA; (b) if not on any roadmap, escalate to product leadership — they have a 'churn-saver' weekly triage for feature gaps blocking >$50k ARR. Document the conversation in the customer's CRM record with tags [churn-risk, feature-gap].",
+    "tags": ["escalation", "churn", "retention", "ae", "feature-gap"]
   }
 ]
