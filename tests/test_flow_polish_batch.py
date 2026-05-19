@@ -147,27 +147,44 @@ def test_add_next_step_falls_back_when_no_dataset(
 
 
 @pytest.mark.unit
-def test_validate_all_suggests_eval_next(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """After an all-pass `mdk validate --all`, the operator should
-    see a "Next:" hint pointing at `mdk eval --all`."""
+def test_validate_all_suggests_doctor_only_in_menu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After an all-pass ``mdk validate --all``, the next-step picker
+    is DOMAIN-SCOPED (2026-05-19): only diagnostic / autofix-adjacent
+    commands surface (``mdk doctor`` / ``mdk doctor agent <name>``).
+
+    Pre-2026-05-19 the menu suggested eval, run, AND deploy — operator
+    feedback was that those cross-domain hints turned the validate
+    success view into a downstream-pipeline pitch. The actually-useful
+    follow-up to a green validate is "should I doctor-check too?" —
+    so that's all the menu surfaces now.
+    """
     _bootstrap_with_agent(tmp_path, monkeypatch)
     result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "Next:" in result.stdout
-    assert "mdk eval --all" in result.stdout
+    # In-domain commands surface.
+    assert "mdk doctor" in result.stdout
+    # Cross-domain commands MUST NOT surface.
+    assert "mdk eval --all" not in result.stdout, (
+        "post-2026-05-19 mdk validate menu must NOT suggest eval — out of domain"
+    )
+    assert "mdk run" not in result.stdout, "mdk validate menu must NOT suggest run"
+    assert "mdk deploy" not in result.stdout, "mdk validate menu must NOT suggest deploy"
 
 
 @pytest.mark.unit
 def test_validate_all_silent_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """On validation failure, the "Next: eval" hint should NOT fire
-    — the operator should fix the failure first, not chain eval."""
+    """On validation failure, the next-step menu should NOT fire
+    — the operator should fix the failure first."""
     proj = _bootstrap_with_agent(tmp_path, monkeypatch)
     # Sabotage the agent — make agent.yaml unloadable.
     (proj / "agents" / "faq" / "agent.yaml").write_text("garbage: not_valid:")
     result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
     assert result.exit_code != 0
-    # The "Next: mdk eval" hint should be absent on the failure path.
-    assert "Next:" not in result.stdout or "mdk eval --all" not in result.stdout
+    # The picker should be absent on the failure path.
+    assert "Next:" not in result.stdout or "mdk doctor" not in result.stdout
 
 
 # ---------------------------------------------------------------------------

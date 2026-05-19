@@ -71,12 +71,17 @@ def test_mdk_bin_name_defaults_to_mdk() -> None:
 
 
 @pytest.mark.unit
-def test_validate_all_renders_static_next_under_non_tty(
+def test_validate_all_renders_doctor_in_next_under_non_tty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Under CliRunner (non-TTY), `mdk validate --all` should still
-    print the `Next:` recommendation so CI log-scrapers / operators
-    reading the captured output know what to do next."""
+    """Under CliRunner (non-TTY), ``mdk validate --all`` still prints
+    the ``Next:`` recommendation so CI log-scrapers / operators
+    reading captured output see follow-ups.
+
+    Post-2026-05-19 the menu is DOMAIN-SCOPED: only ``mdk doctor`` /
+    ``mdk doctor agent <name>`` surface (diagnostic / autofix). The
+    pre-scoping eval-suggestion is gone (operator feedback: out of
+    domain). Companion regression in test_flow_polish_batch."""
     monkeypatch.chdir(tmp_path)
     runner.invoke(app, ["init", "p", "--skip-snapshot"], env={"COLUMNS": "200"})
     monkeypatch.chdir(tmp_path / "p")
@@ -84,7 +89,9 @@ def test_validate_all_renders_static_next_under_non_tty(
     result = runner.invoke(app, ["validate", "--all"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
     assert "Next:" in result.stdout
-    assert "mdk eval --all" in result.stdout
+    assert "mdk doctor" in result.stdout
+    # eval is out of validate's domain — must not surface.
+    assert "mdk eval --all" not in result.stdout
 
 
 @pytest.mark.unit

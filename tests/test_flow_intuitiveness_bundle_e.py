@@ -249,10 +249,16 @@ class TestBatchSummary:
         assert "rag-qa" in result.stdout
         assert "ticket-triager" in result.stdout
         # Hints for the workspace-level next commands.
-        # Post-PR-#94 the canonical command is `mdk eval --all`
-        # (was: `mdk ci eval --mock`, which was a stale placeholder).
-        assert "mdk eval --all" in result.stdout
-        assert "mdk deploy" in result.stdout
+        # Post-2026-05-19 the menu is DOMAIN-SCOPED — only validate
+        # + doctor surface (the immediate next checks after scaffolding).
+        # Eval + deploy were removed because they're downstream
+        # concerns owned by their own commands' menus; suggesting
+        # them after ``mdk add`` was operator-reported noise.
+        assert "mdk validate --all" in result.stdout
+        assert "mdk doctor agent" in result.stdout
+        # Cross-domain commands MUST NOT appear (regression guard).
+        assert "mdk eval --all" not in result.stdout
+        assert "mdk deploy" not in result.stdout
 
     def test_single_add_no_workspace_summary(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

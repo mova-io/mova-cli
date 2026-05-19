@@ -306,9 +306,15 @@ def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) 
     if failed:
         raise typer.Exit(code=2)
 
-    # All-pass success — interactive picker (TTY prompts, non-TTY
-    # just renders the list as documentation). The picker is the
-    # canonical next-steps surface; no separate static block needed.
+    # All-pass success — interactive picker scoped to the VALIDATE
+    # domain (per operator feedback 2026-05-19). Previously offered
+    # eval/run/deploy as next steps — those are downstream concerns
+    # and added scrollback noise when validate was the entry point
+    # for "did I configure this right?" Now the picker only surfaces
+    # diagnostic / autofix-adjacent commands (``mdk doctor``) — the
+    # one tool a validate-passing-but-something-feels-off operator
+    # actually wants next. Re-running validate isn't offered because
+    # the just-completed run is right above on screen.
     if passed > 0:
         from movate.cli._next_steps import (  # noqa: PLC0415
             NextStep,
@@ -318,26 +324,22 @@ def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) 
 
         bin_name = mdk_bin_name()
         first_agent_name = agent_dirs[0].name if agent_dirs else None
-        steps = [
-            NextStep(
-                label="Run eval across all agents",
-                command=f"{bin_name} eval --all --mock --gate 0.7",
-                argv=[bin_name, "eval", "--all", "--mock", "--gate", "0.7"],
-            ),
-        ]
+        steps: list[NextStep] = []
         if first_agent_name:
+            # Per-agent health check — the most specific diagnostic
+            # operators want after a green bundle validation.
             steps.append(
                 NextStep(
-                    label=f"Quick-run {first_agent_name!r} on a sample input",
-                    command=f"{bin_name} run {first_agent_name} --mock",
-                    argv=[bin_name, "run", first_agent_name, "--mock"],
+                    label=f"Health-check {first_agent_name!r} (env keys, contexts, skills)",
+                    command=f"{bin_name} doctor agent {first_agent_name}",
+                    argv=[bin_name, "doctor", "agent", first_agent_name],
                 )
             )
         steps.append(
             NextStep(
-                label="Deploy agents to Azure dev",
-                command=f"{bin_name} deploy --target dev",
-                argv=[bin_name, "deploy", "--target", "dev"],
+                label="Run project-level doctor (env, paths, provider keys)",
+                command=f"{bin_name} doctor",
+                argv=[bin_name, "doctor"],
             )
         )
         prompt_next_step(console=console, steps=steps)
