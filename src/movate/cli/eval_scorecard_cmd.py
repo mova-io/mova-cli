@@ -625,7 +625,10 @@ def _provider_has_key(provider_prefix: str) -> bool:
 
 
 def _resolve_generator_model(
-    declared_provider: str, generator_model_flag: str | None
+    declared_provider: str,
+    generator_model_flag: str | None,
+    *,
+    exclude_providers: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None]:
     """Pick the generator model for one agent. Returns ``(model, note)``.
 
@@ -634,20 +637,19 @@ def _resolve_generator_model(
     1. ``--generator-model FLAG`` — explicit operator choice. We never
        second-guess it; even if FLAG's key is missing, the preflight
        will catch and report.
-    2. The agent's own declared provider IF its key is configured.
-       This is the "everything is as expected" path — operator's
-       agent.yaml says openai/... and they have OPENAI_API_KEY set.
-    3. The first fallback provider with a key set. Lets a project
-       authored with openai/... still run when the operator only has
-       ANTHROPIC_API_KEY in their shell, without forcing them to
-       pass ``--generator-model``. Cases come from a different model
-       than agent.yaml declares; the returned note explains the swap.
-    4. The declared provider as-is. No keys are available anywhere;
-       the preflight will fail with the hint-rich error message.
+    2. The agent's own declared provider IF its key is configured AND
+       its provider prefix isn't in ``exclude_providers``. (Exclusion
+       happens when the preflight's auto-retry has discovered the
+       declared provider's key is set but INVALID — e.g. a placeholder
+       ``sk-test-*2345`` left over in the shell.)
+    3. The first fallback provider with a key set AND not excluded.
+    4. The declared provider as-is. No keys / all excluded; the
+       preflight will fail with the hint-rich error message.
 
-    The ``note`` is a Rich-marked-up one-liner ready to print to
-    ``err_console`` when a fallback was taken. ``None`` when no
-    swap happened (precedence 1, 2, or 4).
+    ``exclude_providers`` is the auto-retry's mechanism for "we tried
+    this provider's key and it was rejected; pretend it doesn't have
+    a key and walk the fallbacks." Empty by default — first-pass
+    resolution skips no providers.
     """
     # Precedence 1: explicit flag always wins.
     if generator_model_flag is not None:
@@ -660,17 +662,21 @@ def _resolve_generator_model(
         declared_provider.split("/", 1)[0] if "/" in declared_provider else declared_provider
     )
 
-    # Precedence 2: declared provider's key is set → use it.
-    if _provider_has_key(declared_prefix):
+    # Precedence 2: declared provider's key is set AND not excluded.
+    if declared_prefix not in exclude_providers and _provider_has_key(declared_prefix):
         return declared_provider, None
 
-    # Precedence 3: first fallback with a key.
+    # Precedence 3: first fallback with a key + not excluded.
     from movate.cli.auth import _PROVIDER_TO_ENV_VAR  # noqa: PLC0415
 
     for fallback_prefix, fallback_model in _GENERATOR_FALLBACK_MODELS:
         if fallback_prefix == declared_prefix:
-            # We already failed the declared provider's key check;
-            # don't re-probe it as a fallback.
+            # Already failed the declared provider's check; don't
+            # re-probe it as a fallback.
+            continue
+        if fallback_prefix in exclude_providers:
+            # Auto-retry already determined this one's key is invalid;
+            # skip.
             continue
         if _provider_has_key(fallback_prefix):
             declared_env_var = _PROVIDER_TO_ENV_VAR.get(declared_prefix, "<unknown>")
@@ -692,6 +698,30 @@ def _resolve_generator_model(
 # ---------------------------------------------------------------------------
 
 
+class _PreflightAuthError(Exception):
+    """Raised by the preflight when a model's API key is set but
+    rejected by the provider (e.g. a placeholder ``sk-test-*2345``
+    left over in the operator's shell).
+
+    Carries the failing model + a short message so callers can
+    decide whether to:
+    - **Retry** with a different generator (the auto-retry wrapper
+      excludes the failed provider and re-resolves), OR
+    - **Exit** if the caller is the explicit ``--generator-model``
+      path that doesn't want auto-fallback.
+
+    The bare ``_preflight_check_generator_auth`` raises this rather
+    than calling ``typer.Exit`` directly so the orchestrator can run
+    the retry loop. ``_preflight_with_retry`` is the canonical
+    caller for the auto-detect path.
+    """
+
+    def __init__(self, model: str, message: str) -> None:
+        super().__init__(f"{model}: {message}")
+        self.model = model
+        self.message = message
+
+
 async def _preflight_check_generator_auth(*, models: set[str], mock: bool) -> None:
     """One tiny generator call per unique model BEFORE the sweep starts.
 
@@ -703,11 +733,13 @@ async def _preflight_check_generator_auth(*, models: set[str], mock: bool) -> No
     spam before the first useful diagnostic.
 
     The probe is a 1-token ``ping`` completion against each unique
-    generator model. On :class:`AuthError`, exits 2 immediately with
-    the same hint-rich workarounds the per-case error surfaces. Other
-    exceptions (transient network, rate limit) just warn + return —
-    those tend to recover, and we don't want a flaky probe to block
-    a real run that would have succeeded.
+    generator model. On :class:`AuthError`, raises
+    :class:`_PreflightAuthError` so the caller can either retry with
+    a different model (the auto-retry wrapper does this when an
+    auto-detected provider's key turns out to be invalid) or surface
+    it as a fatal exit. Other exceptions (transient network, rate
+    limit) just warn + return — those tend to recover, and we don't
+    want a flaky probe to block a real run that would have succeeded.
 
     Skipped under ``mock=True`` (no real provider calls) and when the
     model set is empty (no agents to probe).
@@ -733,22 +765,11 @@ async def _preflight_check_generator_auth(*, models: set[str], mock: bool) -> No
             try:
                 await rt.provider.complete(request)
             except AuthError as exc:
-                err_console.print(
-                    f"[red]✗[/red] preflight auth check failed for provider "
-                    f"[bold]{model}[/bold]:\n"
-                    f"  [dim]{str(exc)[:300]}[/dim]\n\n"
-                    "[bold]Fix one of these and re-run:[/bold]\n"
-                    "  • Export the provider's API key in your shell "
-                    "(e.g. [bold]export ANTHROPIC_API_KEY=...[/bold]) "
-                    "and reopen the terminal\n"
-                    "  • [bold]--generator-model anthropic/claude-haiku-4-5-20251001[/bold] "
-                    "(route generation through a different provider)\n"
-                    "  • [bold]--mock[/bold] (offline; deterministic "
-                    "shape-only generation, no LLM calls)\n"
-                    "  • Run [bold]mdk doctor[/bold] to see which "
-                    "provider keys are loaded."
-                )
-                raise typer.Exit(code=2) from exc
+                # Raise typed exception so the caller chooses the
+                # response — auto-retry path excludes the provider
+                # and re-resolves; explicit ``--generator-model``
+                # path surfaces typer.Exit verbatim.
+                raise _PreflightAuthError(model=model, message=str(exc)) from exc
             except Exception as exc:
                 # Non-auth failures aren't fatal here. The real run
                 # may still succeed (a transient timeout on the
@@ -768,6 +789,163 @@ async def _preflight_check_generator_auth(*, models: set[str], mock: bool) -> No
         await shutdown_runtime(rt.storage, rt.tracer)
 
 
+async def _preflight_with_retry(
+    *,
+    declared_per_agent: dict[str, str],
+    generator_model_flag: str | None,
+    mock: bool,
+    is_json: bool,
+) -> dict[str, str]:
+    """Resolve generator-model per agent + preflight + auto-retry on AuthError.
+
+    Returns ``{agent_name: resolved_model}``. Empty dict in mock mode.
+
+    The retry loop handles the common case where an operator has a
+    placeholder/stale ``OPENAI_API_KEY`` (e.g. ``sk-test-*2345``) in
+    their shell — auto-detect would pick openai (key IS set), preflight
+    would fail with AuthError, and pre-2026-05-19 the operator would
+    have to manually pass ``--generator-model``. Now we just exclude
+    openai and re-resolve with the next fallback.
+
+    Precedence:
+
+    * ``--generator-model FLAG`` set: probe that one model. AuthError
+      from the explicit choice is fatal — no auto-fallback (the
+      operator explicitly chose FLAG, we don't second-guess it).
+    * Auto-detect: resolve per-agent, probe the unique resolved set.
+      On AuthError, exclude the failed provider and retry. Loop until
+      preflight succeeds OR all fallbacks are exhausted.
+
+    Emits grouped fallback notes to stderr (suppressed in JSON mode).
+    Surfaces an auto-route note when a retry happened so operators
+    understand why generation went to a different provider than
+    auto-detect's first pick.
+    """
+    if mock:
+        return {}
+    if generator_model_flag is not None:
+        # Explicit flag — single-model preflight, no fallback. The
+        # operator explicitly chose FLAG; surface the auth error
+        # verbatim with the hint message.
+        try:
+            await _preflight_check_generator_auth(models={generator_model_flag}, mock=False)
+        except _PreflightAuthError as exc:
+            _emit_preflight_failure_hint(exc, recoverable=False)
+            raise typer.Exit(code=2) from exc
+        return dict.fromkeys(declared_per_agent, generator_model_flag)
+
+    # Auto-detect path with retry.
+    excluded: set[str] = set()
+    auto_route_notes: list[str] = []  # accumulated across retries
+
+    while True:
+        resolved_per_agent: dict[str, str] = {}
+        first_pass_notes: list[tuple[str, str]] = []
+        for agent_name, declared in declared_per_agent.items():
+            model, note = _resolve_generator_model(
+                declared, None, exclude_providers=frozenset(excluded)
+            )
+            resolved_per_agent[agent_name] = model
+            if note:
+                first_pass_notes.append((agent_name, note))
+
+        probe_set = set(resolved_per_agent.values())
+        try:
+            await _preflight_check_generator_auth(models=probe_set, mock=False)
+        except _PreflightAuthError as exc:
+            failed_prefix = exc.model.split("/", 1)[0] if "/" in exc.model else exc.model
+            if failed_prefix in excluded:
+                # We already excluded this — shouldn't repeat. Means
+                # auto-detect ran out of fallbacks. Surface the hint
+                # and exit.
+                _emit_preflight_failure_hint(exc, recoverable=True)
+                raise typer.Exit(code=2) from exc
+            excluded.add(failed_prefix)
+            # Short, single-line note on stderr for the operator;
+            # accumulated for emission alongside the main fallback
+            # notes once preflight finally succeeds.
+            auto_route_notes.append(
+                f"preflight: [bold]{exc.model}[/bold] key is set but rejected "
+                f"({_short_err(exc.message)}); excluding {failed_prefix} + "
+                f"retrying with next available provider."
+            )
+            continue
+
+        # Preflight succeeded. Emit any auto-route notes (retry history)
+        # and the standard grouped fallback notes (first-pass
+        # routing decisions).
+        if not is_json:
+            for note_line in auto_route_notes:
+                err_console.print(f"[yellow]→[/yellow] {note_line}")
+            _emit_grouped_fallback_notes(first_pass_notes)
+        return resolved_per_agent
+
+
+def _emit_grouped_fallback_notes(notes: list[tuple[str, str]]) -> None:
+    """Render the per-agent fallback notes with identical messages
+    grouped into one ``(applies to: a, b, c, ...)`` line.
+
+    Pulled into its own helper so the auto-retry path can call it
+    after preflight finally succeeds (the notes accumulated during
+    the optimistic first pass) without duplicating the grouping
+    logic from the orchestrator."""
+    if not notes:
+        return
+    grouped: dict[str, list[str]] = {}
+    for agent_name, note in notes:
+        grouped.setdefault(note, []).append(agent_name)
+    for note, agents in grouped.items():
+        err_console.print(
+            f"[yellow]→[/yellow] {note} [dim](applies to: {', '.join(sorted(agents))})[/dim]"
+        )
+
+
+def _short_err(message: str) -> str:
+    """Trim a provider auth error to one line suitable for a stderr
+    note. The full error already lives in the preflight retry log;
+    this is just a one-line hint about WHY we excluded a provider."""
+    first_line = message.strip().split("\n", 1)[0]
+    return first_line[:140]
+
+
+def _emit_preflight_failure_hint(exc: _PreflightAuthError, *, recoverable: bool) -> None:
+    """Render the operator-facing exit hint after the preflight gives
+    up. ``recoverable=True`` means auto-retry tried fallbacks and ran
+    out; ``recoverable=False`` means the operator's explicit
+    ``--generator-model FLAG`` was rejected (no fallback was attempted).
+    The hint adapts to the situation so the operator's next move is
+    clear."""
+    err_console.print(
+        f"[red]✗[/red] preflight auth check failed for provider "
+        f"[bold]{exc.model}[/bold]:\n"
+        f"  [dim]{exc.message[:300]}[/dim]\n"
+    )
+    if recoverable:
+        err_console.print(
+            "[bold]Tried all configured providers and got auth errors "
+            "from each. Fix one of these:[/bold]\n"
+            "  • Verify your keys: [bold]mdk doctor[/bold]\n"
+            "  • Replace placeholders (e.g. [bold]OPENAI_API_KEY=sk-test-*[/bold]) "
+            "with real values\n"
+            "  • [bold]mdk auth login <provider>[/bold] to persist a valid key\n"
+            "  • [bold]--mock[/bold] (offline; deterministic shape-only "
+            "generation, no LLM calls)"
+        )
+    else:
+        err_console.print(
+            "[bold]Fix one of these and re-run:[/bold]\n"
+            "  • Export the provider's API key in your shell "
+            "(e.g. [bold]export ANTHROPIC_API_KEY=...[/bold]) "
+            "and reopen the terminal\n"
+            "  • Pick a different model with [bold]--generator-model[/bold] "
+            "(e.g. anthropic/claude-haiku-4-5-20251001)\n"
+            "  • [bold]--mock[/bold] (offline; deterministic "
+            "shape-only generation, no LLM calls)\n"
+            "  • Run [bold]mdk doctor[/bold] to see which "
+            "provider keys are loaded."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Sweep wrappers — one event loop per top-level CLI invocation
 # ---------------------------------------------------------------------------
@@ -781,8 +959,7 @@ async def _run_scorecard_sweep_async(
     mock: bool,
     judge_model: str | None,
     generator_model: str | None,
-    resolved_per_agent: dict[str, str],
-    preflight_models: set[str],
+    declared_per_agent: dict[str, str],
     is_json: bool,
     effective: EffectiveCategories | None,
     remote_url: str | None = None,
@@ -814,7 +991,17 @@ async def _run_scorecard_sweep_async(
     console calls don't block the event loop) so the agent-by-agent
     progress output looks identical to the old synchronous shape.
     """
-    await _preflight_check_generator_auth(models=preflight_models, mock=mock)
+    # Resolve generator-model + preflight with auto-retry on AuthError.
+    # When a provider's key is set but rejected (e.g. a placeholder
+    # ``sk-test-*2345`` left in the shell), we exclude that provider
+    # and re-resolve so the sweep can still proceed via a fallback —
+    # rather than failing the operator's whole eval.
+    resolved_per_agent = await _preflight_with_retry(
+        declared_per_agent=declared_per_agent,
+        generator_model_flag=generator_model,
+        mock=mock,
+        is_json=is_json,
+    )
 
     # When --target is set, build ONE MovateClient for the whole sweep
     # so the httpx connection pool is amortized across every agent
@@ -839,10 +1026,10 @@ async def _run_scorecard_sweep_async(
 
             project_root = _find_project_root(agent_dir)
             # Pick the resolved generator model for THIS agent (auto-
-            # detect ran in the orchestrator pre-pass). Falls back to
-            # the bundle's declared provider when the explicit flag is
-            # set (resolved_per_agent is empty in that case) or when
-            # auto-detect found no fallback.
+            # detect + retry ran in ``_preflight_with_retry`` above).
+            # Falls back to the bundle's declared provider when the
+            # explicit flag is set (resolved_per_agent is empty in
+            # that case) or when auto-detect found no fallback.
             effective_generator_model = (
                 generator_model
                 if generator_model is not None
@@ -910,7 +1097,6 @@ async def _run_scorecard_single_async(
     generator_model: str | None,
     project_root: Path | None,
     effective: EffectiveCategories | None,
-    probe_model: str,
     remote_url: str | None = None,
     remote_api_key: str | None = None,
 ) -> ScorecardSummary:
@@ -920,7 +1106,20 @@ async def _run_scorecard_single_async(
     identically here when the preflight + scorecard each get their
     own ``asyncio.run``.
     """
-    await _preflight_check_generator_auth(models={probe_model}, mock=mock)
+    # Resolve + preflight with auto-retry. The single-agent path uses
+    # the same helper as ``--all``; we just feed it a one-entry map.
+    resolved = await _preflight_with_retry(
+        declared_per_agent={bundle.spec.name: bundle.spec.model.provider},
+        generator_model_flag=generator_model,
+        mock=mock,
+        is_json=False,
+    )
+    effective_generator_model = (
+        generator_model
+        if generator_model is not None
+        else resolved.get(bundle.spec.name, bundle.spec.model.provider)
+    )
+
     remote_client = await _build_remote_client(remote_url, remote_api_key)
     try:
         return await _run_scorecard(
@@ -929,7 +1128,7 @@ async def _run_scorecard_single_async(
             mix=mix,
             mock=mock,
             judge_model=judge_model,
-            generator_model=generator_model,
+            generator_model=effective_generator_model,
             project_root=project_root,
             effective=effective,
             remote_client=remote_client,
@@ -1489,25 +1688,11 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
 
     project_root = _find_project_root(agent_path)
 
-    # Auto-detect: if the agent's declared provider has no key but
-    # the operator HAS a key for some other provider, route generation
-    # through the available provider instead of failing the preflight.
-    # ``--generator-model`` always wins; auto-detect is the implicit
-    # behavior when the operator hasn't specified one. ``--mock``
-    # short-circuits the whole resolution.
-    if mock:
-        resolved_model, fallback_note = bundle.spec.model.provider, None
-    else:
-        resolved_model, fallback_note = _resolve_generator_model(
-            bundle.spec.model.provider, generator_model
-        )
-    if fallback_note and output_format == Report.TABLE:
-        err_console.print(f"[yellow]→[/yellow] {fallback_note}")
-
-    # Preflight auth probe + scorecard run share ONE asyncio.run so
-    # LiteLLM's LoggingWorker queue binds to a single event loop and
-    # survives across both. See _run_scorecard_sweep_async for the
-    # full chronology of why splitting these breaks LiteLLM.
+    # Resolution + preflight + auto-retry on AuthError happen INSIDE
+    # ``_run_scorecard_single_async`` so the whole flow shares one
+    # event loop (LiteLLM LoggingWorker bug) AND so the retry path
+    # can re-resolve when a provider's key turns out to be set-but-
+    # invalid (e.g. a placeholder ``sk-test-*2345``).
 
     if output_format == Report.TABLE:
         console.print(
@@ -1520,10 +1705,9 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             mix=mix,
             mock=mock,
             judge_model=judge_model,
-            generator_model=resolved_model,
+            generator_model=generator_model,
             project_root=project_root,
             effective=effective,
-            probe_model=resolved_model,
             remote_url=remote_url,
             remote_api_key=remote_api_key,
         )
@@ -1869,53 +2053,20 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         console.print("[dim]mdk_eval_scorecard_all_summary: agents=0 ok=true[/dim]")
         return
 
-    # Pre-pass: load each loadable agent and resolve its generator
-    # model (auto-detect against the operator's configured keys).
-    # Build the preflight set + collect fallback notes here so we
-    # can emit them upfront, BEFORE the sweep header lands. Agents
-    # that fail to load are silently skipped — the main loop's
-    # load_agent step will surface that failure in the rollup
-    # exactly as before.
-    resolved_per_agent: dict[str, str] = {}
-    fallback_notes: list[tuple[str, str]] = []  # [(agent_name, note)]
-    if not mock:
-        for agent_dir in agent_dirs:
-            try:
-                b = load_agent(agent_dir)
-            except AgentLoadError:
-                continue
-            model, note = _resolve_generator_model(b.spec.model.provider, generator_model)
-            resolved_per_agent[agent_dir.name] = model
-            if note:
-                fallback_notes.append((agent_dir.name, note))
-
-    # Emit fallback notes upfront so operators see WHICH agents got
-    # routed to a different provider before the sweep starts. Two
-    # or more agents with the same note get a single grouped line
-    # (typical case: all 10 agents declare openai/... but only
-    # ANTHROPIC_API_KEY is set — one note covers them).
-    if fallback_notes and not is_json:
-        grouped: dict[str, list[str]] = {}
-        for agent_name, note in fallback_notes:
-            grouped.setdefault(note, []).append(agent_name)
-        for note, agents in grouped.items():
-            err_console.print(
-                f"[yellow]→[/yellow] {note} [dim](applies to: {', '.join(sorted(agents))})[/dim]"
-            )
-
-    # Preflight model set — see _run_scorecard_sweep_async for the
-    # actual probe. Built from the resolved generator models (NOT
-    # the declared providers) so the probe matches what will actually
-    # run.
-    preflight_models: set[str]
-    if mock:
-        preflight_models = set()
-    elif generator_model is not None:
-        # --generator-model uniformly overrides every agent;
-        # one model probes the whole sweep.
-        preflight_models = {generator_model}
-    else:
-        preflight_models = set(resolved_per_agent.values())
+    # Pre-pass: load each loadable agent and capture its DECLARED
+    # generator provider. Resolution + preflight + auto-retry happen
+    # inside the async wrapper so they share the sweep's event loop
+    # AND so the retry path can re-resolve when a provider's key
+    # turns out to be set-but-invalid. Agents that fail to load are
+    # silently skipped — the main sweep loop's load_agent step will
+    # surface that failure in the rollup.
+    declared_per_agent: dict[str, str] = {}
+    for agent_dir in agent_dirs:
+        try:
+            b = load_agent(agent_dir)
+        except AgentLoadError:
+            continue
+        declared_per_agent[agent_dir.name] = b.spec.model.provider
 
     # ONE asyncio.run for the entire sweep — preflight + every
     # per-agent scorecard run share a single event loop. LiteLLM's
@@ -1934,8 +2085,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
             mock=mock,
             judge_model=judge_model,
             generator_model=generator_model,
-            resolved_per_agent=resolved_per_agent,
-            preflight_models=preflight_models,
+            declared_per_agent=declared_per_agent,
             is_json=is_json,
             effective=effective,
             remote_url=remote_url,

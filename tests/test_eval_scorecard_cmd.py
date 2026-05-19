@@ -2063,12 +2063,17 @@ class TestPreflight:
     async def test_preflight_fails_fast_on_auth_error(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: Any,
     ) -> None:
-        """``AuthError`` from the provider during probe → ``typer.Exit(2)``
-        with the hint-rich message in stderr. The probe stops at the
-        first auth failure rather than continuing through other models."""
+        """``AuthError`` from the provider during probe → raises
+        ``_PreflightAuthError`` (carrying model + message) so the
+        caller can choose between retry and exit. The probe stops
+        at the first auth failure rather than continuing through
+        other models.
 
+        Pre-2026-05-19, the preflight called ``typer.Exit(2)`` directly
+        from inside; now the caller decides (the auto-retry path
+        wraps this in ``_preflight_with_retry`` to handle stale
+        keys like ``sk-test-*2345``)."""
         probed: list[str] = []
 
         class _StubProvider:
@@ -2097,23 +2102,16 @@ class TestPreflight:
         monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
         monkeypatch.setattr(eval_scorecard_cmd, "shutdown_runtime", fake_shutdown)
 
-        with pytest.raises(typer.Exit) as excinfo:
+        with pytest.raises(eval_scorecard_cmd._PreflightAuthError) as excinfo:
             await eval_scorecard_cmd._preflight_check_generator_auth(
                 models={"anthropic/claude-haiku-4-5-20251001"}, mock=False
             )
-        assert excinfo.value.exit_code == 2
+        # Exception carries the model + message so the retry wrapper
+        # can decide whether to exclude and re-resolve.
+        assert excinfo.value.model == "anthropic/claude-haiku-4-5-20251001"
+        assert "Missing Anthropic API Key" in excinfo.value.message
         # Probe ran exactly once before bailing.
         assert probed == ["anthropic/claude-haiku-4-5-20251001"]
-
-        # Hint-rich error message hit stderr.
-        captured = capsys.readouterr()
-        stderr_plain = _ANSI_RE.sub("", captured.err)
-        assert "preflight auth check failed" in stderr_plain
-        assert "anthropic/claude-haiku-4-5-20251001" in stderr_plain
-        assert "ANTHROPIC_API_KEY" in stderr_plain
-        assert "--generator-model" in stderr_plain
-        assert "--mock" in stderr_plain
-        assert "mdk doctor" in stderr_plain
 
     @pytest.mark.asyncio
     async def test_preflight_tolerates_non_auth_error(
@@ -2356,9 +2354,11 @@ class TestPreflightIntegration:
     def test_single_agent_skips_preflight_under_mock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``--mock`` propagates through to the preflight call — the
-        preflight itself short-circuits, but we still verify the
-        wiring carries ``mock=True``."""
+        """``--mock`` short-circuits the entire resolution + preflight
+        path before any LLM call would fire. Pin this: the inner
+        ``_preflight_check_generator_auth`` is NEVER reached under
+        mock (the auto-retry wrapper bails first), AND the run
+        completes successfully."""
         _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
 
         preflight_calls: list[dict[str, Any]] = []
@@ -2389,8 +2389,9 @@ class TestPreflightIntegration:
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        assert len(preflight_calls) == 1
-        assert preflight_calls[0]["mock"] is True
+        # Under --mock, ``_preflight_with_retry`` returns {} without
+        # ever calling the inner preflight. No probe fires.
+        assert preflight_calls == []
 
     def test_all_runs_preflight_with_generator_model_override(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3442,3 +3443,277 @@ class TestCostFromResponseMetrics:
         assert "metrics" in RunResponse.model_fields
         resp = RunResponse(status="success")
         assert resp.metrics.cost_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Preflight auto-retry on AuthError (2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPreflightAutoRetry:
+    """When an auto-detected provider's key is set but invalid
+    (placeholder/stale, like ``OPENAI_API_KEY=sk-test-*2345``), the
+    preflight wrapper excludes that provider and re-resolves with
+    the next fallback rather than exiting. Operators who don't
+    perfectly curate their env vars still get a working sweep.
+
+    Explicit ``--generator-model FLAG`` bypasses retry — the operator
+    explicitly chose FLAG, so an auth error on FLAG is fatal.
+    """
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_retry_excludes_failed_provider_and_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """First probe fails with AuthError (openai key is set but
+        rejected); retry resolves to anthropic, succeeds. Final
+        resolved map points the agent at the fallback."""
+
+        # Pretend both openai and anthropic are configured.
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in {"openai", "anthropic"},
+        )
+
+        # First call → openai. Second call → anthropic.
+        probe_calls: list[set[str]] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            probe_calls.append(models)
+            if any("openai" in m for m in models):
+                raise eval_scorecard_cmd._PreflightAuthError(
+                    model="openai/gpt-4o-mini-2024-07-18",
+                    message="Incorrect API key provided: sk-test-*2345",
+                )
+            # Anthropic probe succeeds (no raise).
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        resolved = await eval_scorecard_cmd._preflight_with_retry(
+            declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+            generator_model_flag=None,
+            mock=False,
+            is_json=True,  # suppress note printing in tests
+        )
+
+        # Resolved to anthropic (the fallback), not openai.
+        assert resolved == {"faq": "anthropic/claude-haiku-4-5-20251001"}
+        # Exactly TWO preflight calls: openai (failed) → anthropic (passed).
+        assert len(probe_calls) == 2
+        assert any("openai" in m for m in probe_calls[0])
+        assert any("anthropic" in m for m in probe_calls[1])
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_retry_exhausts_fallbacks_then_exits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If every configured provider fails preflight, the retry
+        loop runs out of options and raises ``typer.Exit(2)`` with
+        the recoverable-failure hint (which mentions ``mdk doctor``
+        + placeholder cleanup, not the generic env-export hint)."""
+
+        # Both openai + anthropic LOOK configured but both reject.
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in {"openai", "anthropic"},
+        )
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            # Reject whichever model is being probed.
+            failing_model = next(iter(models))
+            raise eval_scorecard_cmd._PreflightAuthError(model=failing_model, message="invalid key")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=True,
+            )
+        assert excinfo.value.exit_code == 2
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_explicit_flag_does_not_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``--generator-model FLAG`` bypasses retry — operator
+        explicitly chose FLAG, so an AuthError on FLAG is fatal.
+        Pin: only ONE probe fires, and exit code is 2 with the
+        non-recoverable hint."""
+
+        probe_count = 0
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            nonlocal probe_count
+            probe_count += 1
+            raise eval_scorecard_cmd._PreflightAuthError(
+                model="openai/gpt-4o-mini-2024-07-18",
+                message="invalid key",
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "anthropic/claude-3-opus"},
+                generator_model_flag="openai/gpt-4o-mini-2024-07-18",
+                mock=False,
+                is_json=True,
+            )
+        assert excinfo.value.exit_code == 2
+        # No retry attempted — the operator's explicit choice wasn't
+        # second-guessed.
+        assert probe_count == 1
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_mock_skips_resolution_and_preflight_entirely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``mock=True`` → returns ``{}`` without invoking either the
+        resolver or the preflight. Mock mode means no LLM activity
+        of any kind."""
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            pytest.fail("preflight must not be called in mock mode")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        resolved = await eval_scorecard_cmd._preflight_with_retry(
+            declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+            generator_model_flag=None,
+            mock=True,
+            is_json=True,
+        )
+        assert resolved == {}
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_retry_emits_auto_route_note_to_stderr(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        """When retry kicks in (a configured provider's key was
+        rejected), the wrapper emits a one-line stderr note so the
+        operator understands WHY generation routed elsewhere — they
+        didn't ask for the swap, the auto-retry made the call."""
+
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in {"openai", "anthropic"},
+        )
+
+        first_call = True
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                raise eval_scorecard_cmd._PreflightAuthError(
+                    model="openai/gpt-4o-mini-2024-07-18",
+                    message="Incorrect API key provided: sk-test-*2345",
+                )
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        # is_json=False so notes actually emit.
+        await eval_scorecard_cmd._preflight_with_retry(
+            declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+            generator_model_flag=None,
+            mock=False,
+            is_json=False,
+        )
+
+        captured = capsys.readouterr()
+        stderr_plain = _ANSI_RE.sub("", captured.err)
+        # The auto-route note explains the swap.
+        assert "preflight:" in stderr_plain
+        assert "openai/gpt-4o-mini-2024-07-18" in stderr_plain
+        # Mentions the underlying reason (truncated) so it's
+        # debuggable, not just "auto-routed".
+        assert "rejected" in stderr_plain or "Incorrect API key" in stderr_plain
+
+
+@pytest.mark.unit
+class TestResolveGeneratorModelExclusion:
+    """``_resolve_generator_model`` accepts ``exclude_providers`` for
+    the auto-retry path: a provider whose key is set but rejected
+    by preflight should be treated as if no key is configured."""
+
+    def test_excluded_declared_provider_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Operator has openai + anthropic keys. Declared is openai.
+        Without exclusion, returns openai. With openai excluded
+        (preflight rejected its key), falls back to anthropic."""
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in {"openai", "anthropic"},
+        )
+
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18", None
+        )
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+        assert note is None
+
+        # With openai excluded:
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18",
+            None,
+            exclude_providers=frozenset({"openai"}),
+        )
+        assert model == "anthropic/claude-haiku-4-5-20251001"
+        assert note is not None  # Note explains the swap.
+
+    def test_excluded_fallback_provider_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Anthropic is the priority-1 fallback. If it's excluded,
+        resolution should skip it and pick the next fallback (OpenAI),
+        not raise or loop."""
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in {"anthropic", "openai"},
+        )
+
+        # Declared = azure (not in fallback list), anthropic excluded
+        # by retry. Next available fallback is openai.
+        model, _ = eval_scorecard_cmd._resolve_generator_model(
+            "azure/gpt-4",
+            None,
+            exclude_providers=frozenset({"anthropic"}),
+        )
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+
+    def test_all_providers_excluded_returns_declared(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If every configured provider has been excluded by retry,
+        resolution returns the declared provider as-is — the
+        preflight will then fail again and the retry loop will exit
+        with the recoverable-failure hint."""
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: True)
+
+        model, _ = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18",
+            None,
+            exclude_providers=frozenset({"openai", "anthropic", "gemini"}),
+        )
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+
+    def test_explicit_flag_bypasses_exclusion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Even if every provider is excluded, an explicit
+        ``--generator-model FLAG`` is returned as-is. The flag is
+        outside the auto-retry's authority."""
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: False)
+
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18",
+            "anthropic/claude-haiku-4-5-20251001",
+            exclude_providers=frozenset({"anthropic", "openai"}),
+        )
+        assert model == "anthropic/claude-haiku-4-5-20251001"
+        assert note is None
