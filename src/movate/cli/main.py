@@ -92,6 +92,41 @@ from movate.cli._env_aliases import sync_env_aliases  # noqa: E402
 
 sync_env_aliases()
 
+
+def _eager_load_project_config() -> None:
+    """Trigger any project-config deprecation warnings at CLI startup,
+    BEFORE any Rich panel / prompt / wizard renders.
+
+    Pre-2026-05-19 the project config was loaded lazily — first by the
+    bundle loader or runtime, well into a command's execution. For
+    ``mdk eval`` specifically that meant the legacy-yaml warning
+    (``⚠ movate.yaml is deprecated``) fired mid-wizard, between the
+    operator's ``Pick (1):`` answer and the spinner — visually jarring
+    and easy to miss.
+
+    Eager-loading here pushes the warning to the very first stderr
+    line. Subsequent loads find the warning's one-shot flag already
+    set and stay silent. Skipped when cwd isn't a project root so
+    one-shot commands (``mdk --version``, ``mdk init``) don't pay
+    a YAML-read cost.
+    """
+    import contextlib  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.core.config import is_project_root, load_project_config  # noqa: PLC0415
+
+    if not is_project_root(Path.cwd()):
+        return
+    # Defensive: a malformed project.yaml would otherwise abort the
+    # CLI before any command-specific error handling fires. Swallow
+    # exceptions; the bundle/runtime path will surface the load
+    # error later with a friendlier context-aware message.
+    with contextlib.suppress(Exception):
+        load_project_config()
+
+
+_eager_load_project_config()
+
 from movate import __version__  # noqa: E402
 from movate.cli import (  # noqa: E402
     _console,
