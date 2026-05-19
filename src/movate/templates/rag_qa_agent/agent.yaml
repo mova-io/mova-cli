@@ -51,8 +51,14 @@ tags:
 contexts:
   - grounded-qa-rubric
 
-# External skill the agent can call when the provided context doesn't
-# answer the question. `mdk add rag-qa` auto-scaffolds the skill at
-# `<project>/skills/web-search/` with a working DuckDuckGo HTML impl.
+# External skills the agent can call:
+# - kb-vector-lookup: semantic search over this agent's KB. Pair
+#   with ``mdk kb ingest rag-qa agents/rag-qa/kb`` to populate, then
+#   the agent retrieves relevant chunks at run time when the caller
+#   doesn't pass ``context`` explicitly.
+# - web-search: fallback when neither the passed context nor the KB
+#   answers the question. DuckDuckGo HTML scrape under the hood.
+# Both auto-scaffold under ``<project>/skills/`` on ``mdk add rag-qa``.
 skills:
+  - kb-vector-lookup
   - web-search

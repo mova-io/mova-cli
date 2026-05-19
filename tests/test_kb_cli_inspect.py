@@ -1,0 +1,245 @@
+"""``mdk kb`` inspection commands + ``--dry-run`` for ingest (PR-A).
+
+Covers:
+
+* ``mdk kb list <agent>`` — prints chunks; warns on empty KB.
+* ``mdk kb stats <agent>`` — per-source breakdown + totals.
+* ``mdk kb clear <agent> [--source]`` — deletes chunks + confirms count.
+* ``mdk kb ingest --dry-run`` — no OpenAI call, no storage writes,
+  prints estimated cost.
+
+CLI tests drive the Typer app via ``CliRunner`` against the real
+sqlite backend at a tmp path so the storage roundtrip is end-to-end.
+Embedding calls are stubbed via ``mdk kb ingest --dry-run`` (which
+bypasses the OpenAI client entirely) so no API traffic is required.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from movate.cli.main import app
+
+runner = CliRunner(mix_stderr=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test gets its own sqlite DB so kb state doesn't leak."""
+    db_path = tmp_path / "kb-tests.db"
+    monkeypatch.setenv("MOVATE_DB", str(db_path))
+    # Make sure no Postgres URL is set (some CI envs export one for
+    # other tests; this would dispatch to PG which our test doesn't want).
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+
+
+@pytest.fixture
+def kb_dir(tmp_path: Path) -> Path:
+    """Drop two .md files in a fresh dir so ingest --dry-run finds them."""
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    (kb / "alpha.md").write_text(
+        "First paragraph of alpha doc.\n\nSecond paragraph of alpha doc.\n",
+        encoding="utf-8",
+    )
+    (kb / "beta.md").write_text(
+        "Beta doc has one paragraph here.\n",
+        encoding="utf-8",
+    )
+    return kb
+
+
+# ---------------------------------------------------------------------------
+# mdk kb ingest --dry-run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_dry_run_walks_files_without_calling_openai(
+    kb_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run should NOT require an OpenAI key — it never calls
+    the API. Pin this by explicitly clearing OPENAI_API_KEY first."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = runner.invoke(
+        app,
+        ["kb", "ingest", "rag-qa", str(kb_dir), "--dry-run"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Dry-run" in result.stdout
+    # Both files surface in the per-source table.
+    assert "alpha.md" in result.stdout
+    assert "beta.md" in result.stdout
+    # Estimated cost line renders.
+    assert "Estimated" in result.stdout
+    assert "embeddings cost" in result.stdout
+
+
+@pytest.mark.unit
+def test_real_ingest_without_key_errors_with_hint(
+    kb_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real ingest path (no --dry-run) requires an OpenAI key. The
+    error should point at the --dry-run escape hatch."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = runner.invoke(
+        app,
+        ["kb", "ingest", "rag-qa", str(kb_dir)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    combined = result.stdout + result.stderr
+    assert "no OpenAI API key" in combined
+    assert "--dry-run" in combined
+
+
+# ---------------------------------------------------------------------------
+# mdk kb list / stats / clear — empty-KB error paths first
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_list_empty_kb_warns_and_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No chunks ingested yet → warning + hint to run ingest."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = runner.invoke(
+        app,
+        ["kb", "list", "rag-qa"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0  # warning, not error
+    combined = result.stdout + result.stderr
+    assert "no chunks" in combined.lower()
+    assert "mdk kb ingest" in combined
+
+
+@pytest.mark.unit
+def test_stats_empty_kb_warns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``mdk kb stats`` on empty KB → warning, no traceback."""
+    result = runner.invoke(
+        app,
+        ["kb", "stats", "rag-qa"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "no chunks" in combined.lower()
+
+
+@pytest.mark.unit
+def test_clear_with_yes_flag_on_empty_kb(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``mdk kb clear -y`` on an empty KB succeeds with a 'nothing
+    deleted' note rather than failing."""
+    result = runner.invoke(
+        app,
+        ["kb", "clear", "rag-qa", "--yes"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "nothing deleted" in combined.lower() or "0 chunk" in combined.lower()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: seed via direct storage call, then list / stats / clear
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_list_stats_clear_after_direct_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seed two chunks via the storage layer, then exercise list /
+    stats / clear. Verifies the CLI commands see what storage saved.
+
+    Sync (not async) so the CLI commands' internal ``asyncio.run()``
+    can spin up its own event loop. Seeds via a fresh loop so the
+    storage write is committed before the CLI commands query.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from movate.core.models import KbChunk  # noqa: PLC0415
+    from movate.storage import build_storage  # noqa: PLC0415
+
+    async def _seed() -> None:
+        storage = build_storage()
+        await storage.init()
+        try:
+            for i in range(2):
+                await storage.save_kb_chunk(
+                    KbChunk(
+                        tenant_id="local",
+                        agent="rag-qa",
+                        source=f"/tmp/doc-{i}.md",
+                        text=f"Sample chunk text number {i}",
+                        embedding=[1.0, 0.0],
+                        embedding_model="openai/text-embedding-3-small",
+                        content_hash=f"hash-{i}",
+                    )
+                )
+        finally:
+            await storage.close()
+
+    asyncio.new_event_loop().run_until_complete(_seed())
+
+    # list — should show both chunks.
+    r = runner.invoke(app, ["kb", "list", "rag-qa"], env={"COLUMNS": "200"})
+    assert r.exit_code == 0, r.stdout + r.stderr
+    assert "doc-0.md" in r.stdout
+    assert "doc-1.md" in r.stdout
+
+    # stats — should show 2 chunks, 2 sources, the embedding model.
+    r = runner.invoke(app, ["kb", "stats", "rag-qa"], env={"COLUMNS": "200"})
+    assert r.exit_code == 0
+    assert "total chunks:" in r.stdout
+    assert "openai/text-embedding-3-small" in r.stdout
+
+    # clear with --yes — should delete both.
+    r = runner.invoke(app, ["kb", "clear", "rag-qa", "--yes"], env={"COLUMNS": "200"})
+    assert r.exit_code == 0
+    assert "deleted 2" in r.stdout
+
+    # List again — empty.
+    r = runner.invoke(app, ["kb", "list", "rag-qa"], env={"COLUMNS": "200"})
+    combined = r.stdout + r.stderr
+    assert "no chunks" in combined.lower()
+
+
+# ---------------------------------------------------------------------------
+# Skill template registration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_kb_vector_lookup_in_skill_templates_map() -> None:
+    """Wiring check: the ``kb-vector-lookup`` skill name maps to the
+    ``skill_kb_vector_lookup`` template directory so ``mdk add rag-qa``
+    auto-scaffolds the real impl, not the default echo stub."""
+    from movate.templates import SKILL_TEMPLATES, TEMPLATES_DIR  # noqa: PLC0415
+
+    assert SKILL_TEMPLATES.get("kb-vector-lookup") == "skill_kb_vector_lookup"
+    template_dir = TEMPLATES_DIR / SKILL_TEMPLATES["kb-vector-lookup"]
+    assert template_dir.is_dir()
+    assert (template_dir / "skill.yaml").is_file()
+    assert (template_dir / "impl.py").is_file()
+
+
+@pytest.mark.unit
+def test_rag_qa_agent_yaml_declares_kb_vector_lookup_skill() -> None:
+    """Wiring check: the ``rag_qa_agent`` template's agent.yaml lists
+    ``kb-vector-lookup`` in its ``skills:`` so a fresh ``mdk add rag-qa``
+    immediately has the skill scaffolded + declared."""
+    import yaml  # noqa: PLC0415
+
+    from movate.templates import TEMPLATES_DIR  # noqa: PLC0415
+
+    agent_yaml_path = TEMPLATES_DIR / "rag_qa_agent" / "agent.yaml"
+    spec = yaml.safe_load(agent_yaml_path.read_text())
+    assert "kb-vector-lookup" in spec.get("skills", []), (
+        f"rag-qa skills should include 'kb-vector-lookup', got: {spec.get('skills')}"
+    )
