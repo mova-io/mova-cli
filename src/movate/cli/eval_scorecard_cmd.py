@@ -871,7 +871,20 @@ async def _preflight_with_retry(
             failed_prefix = exc.model.split("/", 1)[0] if "/" in exc.model else exc.model
             if failed_prefix in excluded:
                 # We already excluded this — auto-detect ran out of
-                # fallbacks. Surface the chronology + hint and exit.
+                # fallbacks. Before bailing, offer an interactive
+                # ``mdk auth login`` flow inline so operators in a
+                # TTY can fix it without exiting + re-running. The
+                # JSON / non-TTY paths skip straight to the exit
+                # hint as before (no place to prompt).
+                if not is_json and _offer_inline_auth_recovery():
+                    # Operator just saved a working key into
+                    # credentials + os.environ. Reset state and
+                    # re-resolve from scratch — the new key changes
+                    # what ``_provider_has_key`` returns, so a
+                    # previously-no-fallback agent now has options.
+                    excluded.clear()
+                    attempted_models.clear()
+                    continue
                 _emit_preflight_failure_hint(exc, recoverable=True, attempted=attempted_models)
                 raise typer.Exit(code=2) from exc
             excluded.add(failed_prefix)
@@ -987,6 +1000,121 @@ def _emit_preflight_failure_hint(
             "  • Run [bold]mdk doctor[/bold] to see which "
             "provider keys are loaded."
         )
+
+
+def _offer_inline_auth_recovery() -> bool:
+    """Interactive escape hatch when preflight retry has exhausted
+    every configured provider and we're running in a TTY.
+
+    Triggered by the common operator footgun: stale / placeholder /
+    never-set provider keys make the auto-detect's retry loop
+    exhaust. Rather than dump the exit hint and force the operator
+    to ``Ctrl+C → mdk auth login → re-run``, ask inline: which
+    provider do you want to set up now? Verify + save + inject into
+    the current process's env, then signal the caller to restart
+    the retry loop with the freshly-saved key.
+
+    Returns ``True`` if a key was saved (caller should retry).
+    Returns ``False`` if the operator declined OR if we're in a
+    non-TTY context (CI, piped output) where prompting would block.
+    JSON-output mode is the caller's responsibility — this function
+    is only invoked from non-JSON paths.
+    """
+    import sys  # noqa: PLC0415
+
+    if not sys.stdin.isatty():
+        # Non-interactive context (CI, scripted run, piped stdin).
+        # Skip the prompt; caller emits the standard exit hint.
+        return False
+
+    err_console.print()
+    err_console.print(
+        "[bold yellow]→[/bold yellow] No working LLM provider key found "
+        "(every configured key was rejected by its provider). Would you "
+        "like to set up a key now? This is the same flow as "
+        "[bold]mdk auth login[/bold] — just inline so you don't have to "
+        "exit and re-run."
+    )
+    choice = typer.prompt(
+        "Provider to configure ([bold]a[/bold]nthropic / [bold]o[/bold]penai / [bold]s[/bold]kip)",
+        default="a",
+        show_default=False,
+    )
+    normalized = (choice or "").strip().lower()
+    if normalized in {"s", "skip", "n", "no", ""}:
+        return False
+    provider_map = {
+        "a": "anthropic",
+        "anthropic": "anthropic",
+        "o": "openai",
+        "openai": "openai",
+    }
+    provider = provider_map.get(normalized)
+    if provider is None:
+        err_console.print(f"[yellow]→[/yellow] unrecognized choice {choice!r}; skipping.")
+        return False
+
+    return _save_provider_key_interactive(provider)
+
+
+def _save_provider_key_interactive(provider: str) -> bool:
+    """Prompt for + verify + save one provider's API key, then inject
+    it into the current process's ``os.environ`` so the in-flight
+    retry picks it up.
+
+    Returns ``True`` on success. Returns ``False`` on empty input,
+    verification failure (when the network reached the provider),
+    or operator decline of a network-error-then-save-anyway fallback.
+    """
+    import os  # noqa: PLC0415
+
+    from movate.cli.auth import _PROVIDER_TO_ENV_VAR  # noqa: PLC0415
+    from movate.credentials import verify_provider_key  # noqa: PLC0415
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    env_var = _PROVIDER_TO_ENV_VAR.get(provider)
+    if env_var is None:
+        # Shouldn't reach here from the picker, but defensive.
+        err_console.print(f"[red]✗[/red] unknown provider {provider!r}.")
+        return False
+
+    key = typer.prompt(f"{provider.title()} API key", hide_input=True)
+    key = (key or "").strip()
+    if not key:
+        err_console.print("[yellow]→[/yellow] no key entered; skipping.")
+        return False
+
+    err_console.print("[dim]→ verifying with the provider…[/dim]")
+    result = verify_provider_key(provider, key)
+    if not result.ok:
+        err_console.print(f"[red]✗[/red] {result.detail}")
+        if not result.network_error:
+            # Authentic verification failure (401 etc.) — the key is
+            # wrong. Don't save it.
+            return False
+        # Network glitch — the key MIGHT be valid. Let the operator
+        # decide. Default to NOT saving so a typo doesn't sneak
+        # through.
+        save_anyway = typer.prompt(
+            "Couldn't reach the provider to verify — save the key anyway? [y/N]",
+            default="n",
+            show_default=False,
+        )
+        if not (save_anyway or "").strip().lower().startswith("y"):
+            return False
+    else:
+        err_console.print(f"[green]✓[/green] {result.detail}")
+
+    CredentialsStore().set(env_var, key)
+    # The autoload already ran (at CLI startup, BEFORE this prompt
+    # could possibly fire). Set os.environ directly so the in-flight
+    # retry loop sees the new key without a CLI restart.
+    os.environ[env_var] = key
+    err_console.print(
+        f"[green]✓[/green] saved [bold]{env_var}[/bold] to "
+        f"~/.movate/credentials (mode 0600). Retrying preflight…"
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

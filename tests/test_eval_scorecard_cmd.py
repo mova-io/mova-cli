@@ -45,6 +45,7 @@ from movate.cli.eval_scorecard_cmd import (
 )
 from movate.cli.main import app
 from movate.core.failures import AuthError
+from movate.credentials.verify import VerifyResult
 
 runner = CliRunner(mix_stderr=False)
 
@@ -3958,3 +3959,229 @@ class TestJudgeInheritsResolvedGenerator:
         )
         # Explicit flag wins — generator's anthropic does NOT override.
         assert captured_judge_model == ["gemini/gemini-2.5-flash"]
+
+
+# ---------------------------------------------------------------------------
+# Interactive auth-recovery on preflight exhaust (2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestInlineAuthRecovery:
+    """When preflight retry exhausts AND we're in a TTY, the eval
+    offers to set up a working provider key inline rather than
+    forcing the operator to Ctrl+C → ``mdk auth login`` → re-run.
+    Non-TTY contexts (CI, piped output, JSON mode) skip the prompt
+    and exit as before.
+    """
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_non_tty_skips_inline_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """In CI / piped contexts the prompt would block forever.
+        The recovery helper short-circuits to ``False`` so the
+        caller falls through to the standard exit hint."""
+        import sys  # noqa: PLC0415
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            raise eval_scorecard_cmd._PreflightAuthError(
+                model=next(iter(models)), message="rejected"
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        prompt_count = 0
+        real_prompt = typer.prompt
+
+        def counting_prompt(*args: Any, **kwargs: Any) -> Any:
+            nonlocal prompt_count
+            prompt_count += 1
+            return real_prompt(*args, **kwargs)
+
+        monkeypatch.setattr(typer, "prompt", counting_prompt)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=False,
+            )
+        assert excinfo.value.exit_code == 2
+        # No prompt fired — stdin isn't a TTY.
+        assert prompt_count == 0
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_json_mode_skips_inline_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``-o json`` mode must NOT prompt — would pollute the JSON
+        document on stdout and CI scrapers can't handle interactive
+        recovery anyway."""
+        import sys  # noqa: PLC0415
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            raise eval_scorecard_cmd._PreflightAuthError(
+                model=next(iter(models)), message="rejected"
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        prompt_count = 0
+
+        def counting_prompt(*args: Any, **kwargs: Any) -> Any:
+            nonlocal prompt_count
+            prompt_count += 1
+            return ""
+
+        monkeypatch.setattr(typer, "prompt", counting_prompt)
+
+        with pytest.raises(typer.Exit):
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=True,
+            )
+        assert prompt_count == 0
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_tty_offers_recovery_user_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Interactive shell + operator chooses ``s`` (skip) → caller
+        emits standard exit hint."""
+        import sys  # noqa: PLC0415
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            raise eval_scorecard_cmd._PreflightAuthError(
+                model=next(iter(models)), message="rejected"
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        monkeypatch.setattr(typer, "prompt", lambda *a, **kw: "s")
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=False,
+            )
+        assert excinfo.value.exit_code == 2
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_tty_recovery_saves_key_and_continues(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Interactive shell + operator picks ``a`` (anthropic) +
+        enters a key → verify succeeds → key saved + injected into
+        env → retry loop continues → preflight ultimately succeeds."""
+        import os  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        # Save the original ANTHROPIC_API_KEY (if any) so we can
+        # restore after — the test temporarily injects a value.
+        original_anthropic = os.environ.get("ANTHROPIC_API_KEY")
+
+        configured: set[str] = {"openai"}
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in configured,
+        )
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            for m in models:
+                if "openai" in m:
+                    raise eval_scorecard_cmd._PreflightAuthError(model=m, message="rejected")
+            # Anthropic probe silently passes.
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        prompt_responses = iter(["a", "sk-ant-fake-but-passes-verify"])
+        monkeypatch.setattr(typer, "prompt", lambda *a, **kw: next(prompt_responses))
+
+        def fake_verify(provider: str, key: str) -> VerifyResult:
+            configured.add("anthropic")
+            return VerifyResult(ok=True, detail="OK — messages endpoint reachable")
+
+        monkeypatch.setattr("movate.credentials.verify_provider_key", fake_verify)
+
+        saved: dict[str, str] = {}
+
+        def fake_set(self: Any, key: str, value: str) -> None:
+            saved[key] = value
+
+        monkeypatch.setattr("movate.credentials.store.CredentialsStore.set", fake_set)
+
+        try:
+            resolved = await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=False,
+            )
+            assert saved.get("ANTHROPIC_API_KEY") == "sk-ant-fake-but-passes-verify"
+            assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-fake-but-passes-verify"
+            assert resolved == {"faq": "anthropic/claude-haiku-4-5-20251001"}
+        finally:
+            # Don't leak the test's fake ANTHROPIC_API_KEY into the
+            # rest of the suite (other tests may inspect env state).
+            if original_anthropic is None:
+                os.environ.pop("ANTHROPIC_API_KEY", None)
+            else:
+                os.environ["ANTHROPIC_API_KEY"] = original_anthropic
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_tty_recovery_rejects_invalid_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If verify fails with a real 401 (not network), the bad
+        key is NOT saved — caller falls through to the exit hint."""
+        import sys  # noqa: PLC0415
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            raise eval_scorecard_cmd._PreflightAuthError(
+                model=next(iter(models)), message="rejected"
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        prompt_responses = iter(["a", "sk-ant-wrong"])
+        monkeypatch.setattr(typer, "prompt", lambda *a, **kw: next(prompt_responses))
+
+        def fake_verify_fails(provider: str, key: str) -> VerifyResult:
+            return VerifyResult(ok=False, detail="401 Unauthorized — key rejected")
+
+        monkeypatch.setattr("movate.credentials.verify_provider_key", fake_verify_fails)
+
+        save_count = 0
+
+        def fake_set(self: Any, key: str, value: str) -> None:
+            nonlocal save_count
+            save_count += 1
+
+        monkeypatch.setattr("movate.credentials.store.CredentialsStore.set", fake_set)
+
+        with pytest.raises(typer.Exit):
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=False,
+            )
+        # Bad key was NOT saved.
+        assert save_count == 0
