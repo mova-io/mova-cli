@@ -451,9 +451,22 @@ def _find_project_root(agent_path: Path) -> Path:
 
 
 def eval_scorecard(
-    agent: str = typer.Argument(
-        ...,
-        help="Path to the agent directory (e.g. agents/faq).",
+    agent: str | None = typer.Argument(
+        None,
+        help=(
+            "Path to the agent directory (e.g. agents/faq). Omit with "
+            "[bold]--all[/bold] to sweep every agent in the project."
+        ),
+    ),
+    all_in_project: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Run the scorecard against every agent under "
+            "[bold]./agents/[/bold] in the current project. Renders a "
+            "per-agent scorecard for each, then a project-level rollup "
+            "table at the end. Mutex with the [bold]agent[/bold] argument."
+        ),
     ),
     count: int = typer.Option(
         10,
@@ -496,6 +509,9 @@ def eval_scorecard(
       [dim]$ mdk eval-scorecard agents/faq --mix adversarial \\[/dim]
       [dim]      --judge-model anthropic/claude-haiku-4-5-20251001[/dim]
 
+      [dim]# Project-wide sweep — one scorecard per agent + rollup:[/dim]
+      [dim]$ mdk eval-scorecard --all --mix standard[/dim]
+
     [bold]The 10 categories:[/bold]
 
     LLM-judged: accuracy, faithfulness, format, safety, refusal,
@@ -507,17 +523,55 @@ def eval_scorecard(
         err_console.print(f"[red]✗[/red] invalid --mix {mix!r}. Valid: {', '.join(_VALID_MIXES)}.")
         raise typer.Exit(code=2)
 
-    agent_path = Path(agent)
+    # `--all` and a positional agent are mutually exclusive — pick one.
+    if all_in_project and agent is not None:
+        err_console.print(
+            "[red]✗[/red] [bold]--all[/bold] and an explicit agent path are mutually exclusive."
+        )
+        raise typer.Exit(code=2)
+
+    if all_in_project:
+        _run_scorecard_all_in_project(
+            count=count,
+            mix=mix,
+            mock=mock,
+            judge_model=judge_model,
+        )
+        return
+
+    if agent is None:
+        err_console.print(
+            "[red]✗[/red] agent path required (or pass [bold]--all[/bold] "
+            "to sweep every agent in the project)."
+        )
+        raise typer.Exit(code=2)
+
+    _run_scorecard_single_agent(
+        agent_path_str=agent,
+        count=count,
+        mix=mix,
+        mock=mock,
+        judge_model=judge_model,
+    )
+
+
+def _run_scorecard_single_agent(
+    *,
+    agent_path_str: str,
+    count: int,
+    mix: str,
+    mock: bool,
+    judge_model: str | None,
+) -> None:
+    """Single-agent scorecard: load, run, render. Shared by the
+    positional-arg path and (one iteration of) the --all loop."""
+    agent_path = Path(agent_path_str)
     try:
         bundle = load_agent(agent_path)
     except AgentLoadError as exc:
-        err_console.print(f"[red]✗[/red] could not load agent at {agent}: {exc}")
+        err_console.print(f"[red]✗[/red] could not load agent at {agent_path_str}: {exc}")
         raise typer.Exit(code=2) from None
 
-    # Resolve the project root by walking up from the agent dir until
-    # we find a project.yaml / movate.yaml. Domain-mix uses it to find
-    # the kb/ corpus; other mixes ignore it. Falls back to the agent
-    # dir's parent if no marker found — domain still works degradedly.
     project_root = _find_project_root(agent_path)
 
     console.print(
@@ -537,3 +591,119 @@ def eval_scorecard(
     console.print()
     _render_scorecard(summary)
     _emit_summary_line(summary)
+
+
+def _run_scorecard_all_in_project(
+    *,
+    count: int,
+    mix: str,
+    mock: bool,
+    judge_model: str | None,
+) -> None:
+    """Project-wide sweep: discover all agents under ./agents/, run the
+    scorecard against each, then render a project-level rollup table.
+
+    Per-agent failures (load errors, generation errors) are captured
+    and surfaced in the rollup rather than aborting the sweep — a
+    failing single agent shouldn't block the rest of the project's
+    visibility into its scorecard."""
+    cwd = Path.cwd()
+    agents_dir = cwd / "agents"
+    if not agents_dir.is_dir():
+        err_console.print(
+            "[red]✗[/red] no [bold]./agents/[/bold] directory found. "
+            "Run [bold]mdk eval-scorecard --all[/bold] from inside a "
+            "movate project."
+        )
+        raise typer.Exit(code=2)
+
+    agent_dirs = sorted(p.parent for p in agents_dir.glob("*/agent.yaml") if p.is_file())
+    if not agent_dirs:
+        err_console.print(
+            "[yellow]⚠[/yellow] no agents under [bold]./agents/[/bold]. "
+            "Run [bold]mdk add <template>[/bold] first."
+        )
+        # Vacuous-pass: no agents → no failures.
+        console.print("[dim]mdk_eval_scorecard_all_summary: agents=0 ok=true[/dim]")
+        return
+
+    summaries: list[ScorecardSummary] = []
+    failed: list[tuple[str, str]] = []
+
+    for agent_dir in agent_dirs:
+        console.print()
+        console.print(f"[bold]── {agent_dir.name}[/bold]")
+        try:
+            bundle = load_agent(agent_dir)
+        except AgentLoadError as exc:
+            err_console.print(f"  [red]✗[/red] load failed: {str(exc)[:120]}")
+            failed.append((agent_dir.name, "load_failed"))
+            continue
+
+        project_root = _find_project_root(agent_dir)
+        console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
+        try:
+            summary = asyncio.run(
+                _run_scorecard(
+                    bundle,
+                    count=count,
+                    mix=mix,
+                    mock=mock,
+                    judge_model=judge_model,
+                    project_root=project_root,
+                )
+            )
+        except Exception as exc:
+            err_console.print(
+                f"  [red]✗[/red] scorecard failed ({type(exc).__name__}): {str(exc)[:120]}"
+            )
+            failed.append((agent_dir.name, type(exc).__name__))
+            continue
+
+        summaries.append(summary)
+        # Per-agent scorecard table renders inline so operators see
+        # progress agent-by-agent rather than waiting for the rollup.
+        console.print()
+        _render_scorecard(summary)
+        _emit_summary_line(summary)
+
+    # Project-level rollup.
+    console.print()
+    rollup = Table(
+        title=(
+            f"[bold]Project scorecard[/bold] — {cwd.name} "
+            f"[dim]({len(agent_dirs)} agent(s), mix={mix})[/dim]"
+        ),
+        show_header=True,
+        header_style="bold magenta",
+    )
+    rollup.add_column("Agent", style="bold", no_wrap=True)
+    rollup.add_column("Cases", justify="right", no_wrap=True)
+    rollup.add_column("Overall", justify="right", no_wrap=True)
+    rollup.add_column("Verdict", no_wrap=True)
+    for s in summaries:
+        color = _score_color(s.overall_mean)
+        rollup.add_row(
+            s.agent,
+            str(s.count),
+            f"[{color}]{s.overall_mean:.2f}[/{color}]",
+            "[green]ok[/green]"
+            if s.overall_mean >= _GREEN_THRESHOLD
+            else "[yellow]warn[/yellow]"
+            if s.overall_mean >= _YELLOW_THRESHOLD
+            else "[red]fail[/red]",
+        )
+    for name, reason in failed:
+        rollup.add_row(name, "—", "—", f"[red]✗ {reason}[/red]")
+    console.print(rollup)
+
+    # Greppable project-level summary line for CI scraping.
+    project_mean = sum(s.overall_mean for s in summaries) / len(summaries) if summaries else 0.0
+    console.print(
+        f"[dim]mdk_eval_scorecard_all_summary: "
+        f"agents={len(agent_dirs)} succeeded={len(summaries)} "
+        f"failed={len(failed)} project_mean={project_mean:.3f} "
+        f"mix={mix} ok={'true' if not failed else 'false'}[/dim]"
+    )
+    if failed:
+        raise typer.Exit(code=2)

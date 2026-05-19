@@ -222,7 +222,7 @@ class TestFindProjectRoot:
         """``agents/<name>/`` → walk up to find ``project.yaml`` at
         the project root. Domain-mix needs this to locate the kb/
         corpus."""
-        (tmp_path / "project.yaml").write_text("name: demo\n")
+        (tmp_path / "project.yaml").write_text("# minimal project marker\n")
         agent_dir = tmp_path / "agents" / "rag-qa"
         agent_dir.mkdir(parents=True)
         assert _find_project_root(agent_dir) == tmp_path.resolve()
@@ -580,3 +580,187 @@ async def test_score_one_case_judge_failure_returns_zeros(
     scores, rationales = await _score_one_case(fake_rt, fake_bundle, {}, {})
     assert all(s == 0.0 for s in scores.values())
     assert "judge error" in rationales["accuracy"]
+
+
+# ---------------------------------------------------------------------------
+# --all mode: project-wide scorecard sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_all_flag_and_positional_agent_are_mutex(tmp_path: Path) -> None:
+    """``mdk eval-scorecard agents/x --all`` is ambiguous — pick one
+    or the other. The error must surface before any LLM call fires."""
+    # No agent dir needed — we error before loading anything.
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "agents/anything", "--all"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    combined = result.stdout + result.stderr
+    assert "mutually exclusive" in combined
+
+
+@pytest.mark.unit
+def test_no_agent_and_no_all_errors_with_hint(tmp_path: Path) -> None:
+    """Bare ``mdk eval-scorecard`` (no positional, no --all) must
+    error with a hint, not crash. Operators new to the command
+    should land on the help, not a stack trace."""
+    result = runner.invoke(
+        app,
+        ["eval-scorecard"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    combined = result.stdout + result.stderr
+    assert "agent path required" in combined or "--all" in combined
+
+
+@pytest.mark.unit
+def test_all_outside_project_errors_with_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--all`` from a directory with no ./agents/ subdir must
+    error with a hint pointing at the project-init flow, not crash
+    on a missing-dir traceback."""
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    combined = result.stdout + result.stderr
+    assert "./agents/" in combined or "agents/" in combined
+
+
+@pytest.mark.unit
+def test_all_empty_agents_dir_vacuous_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A project with ./agents/ but zero agents under it is a
+    vacuous-pass (ok=true, agents=0), not an error. Mirrors how
+    ``mdk eval --all`` handles the same edge case."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agents").mkdir()
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "agents=0" in combined
+    assert "ok=true" in combined
+
+
+def _scaffold_project_with_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *agent_templates: str
+) -> Path:
+    """Init a real project + add real agents via the CLI scaffolding.
+
+    Hand-rolled agent.yaml fixtures hit validation failures (input
+    schema, objectives, prompt path, etc. all required). Going through
+    ``mdk init`` + ``mdk add`` produces bundles the loader actually
+    accepts — same path the operator's project goes through."""
+    monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    proj = tmp_path / "proj"
+    monkeypatch.chdir(proj)
+    for template in agent_templates:
+        result = runner.invoke(app, ["add", template], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.stdout + result.stderr
+    return proj
+
+
+@pytest.mark.unit
+def test_all_runs_per_agent_and_renders_rollup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--all`` discovers every agent under ./agents/, runs the
+    scorecard against each, and renders a per-agent table + a
+    project-level rollup. Mock the scorecard internals so the test
+    stays hermetic; verify the orchestration (per-agent invocation
+    + rollup table + greppable summary)."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+    # Mock _run_scorecard to return a deterministic summary per agent.
+    invocations: list[str] = []
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        invocations.append(bundle.spec.name)
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix=kwargs.get("mix", "standard"),
+            count=kwargs.get("count", 10),
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+            overall_mean=0.85,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--mix", "standard", "--count", "5"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+    # Both agents were processed.
+    assert sorted(invocations) == ["faq", "summarizer"]
+
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "── faq" in plain
+    assert "── summarizer" in plain
+    assert "Project scorecard" in plain
+    assert "mdk_eval_scorecard_all_summary:" in plain
+    assert "agents=2" in plain
+    assert "succeeded=2" in plain
+    assert "failed=0" in plain
+    assert "ok=true" in plain
+
+
+@pytest.mark.unit
+def test_all_one_agent_failure_doesnt_abort_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If one agent's scorecard run blows up (network error, judge
+    failure, etc.) the sweep must keep going for the OTHER agents.
+    The rollup table surfaces the failure; the process exits 2 at
+    the end."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer", "rag-qa")
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        if bundle.spec.name == "summarizer":
+            raise RuntimeError("simulated judge timeout")
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=5,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+            overall_mean=0.85,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--mix", "standard"],
+        env={"COLUMNS": "200"},
+    )
+    # One failure → exit 2, but the other two agents still ran +
+    # their results surface in the rollup.
+    assert result.exit_code == 2
+    plain = _ANSI_RE.sub("", result.stdout + result.stderr)
+    assert "── faq" in plain
+    assert "── summarizer" in plain
+    assert "── rag-qa" in plain
+    # Per-agent failure annotation surfaces in the rollup.
+    assert "RuntimeError" in plain or "scorecard failed" in plain
+    # Summary line shows partial success.
+    assert "succeeded=2" in plain
+    assert "failed=1" in plain
+    assert "ok=false" in plain
