@@ -550,6 +550,87 @@ async def _run_scorecard(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight auth probe
+# ---------------------------------------------------------------------------
+
+
+async def _preflight_check_generator_auth(*, models: set[str], mock: bool) -> None:
+    """One tiny generator call per unique model BEFORE the sweep starts.
+
+    Without this, a project with N agents x M cases x 2 retries floods
+    the terminal with the SAME auth-error warning ``2 * N * M`` times
+    before the first agent's ``0/M cases`` hint lands - observed in
+    production when an operator runs ``--all`` against 10 agents with
+    an unset ``ANTHROPIC_API_KEY``: ~200 duplicate warnings, ~30s of
+    spam before the first useful diagnostic.
+
+    The probe is a 1-token ``ping`` completion against each unique
+    generator model. On :class:`AuthError`, exits 2 immediately with
+    the same hint-rich workarounds the per-case error surfaces. Other
+    exceptions (transient network, rate limit) just warn + return —
+    those tend to recover, and we don't want a flaky probe to block
+    a real run that would have succeeded.
+
+    Skipped under ``mock=True`` (no real provider calls) and when the
+    model set is empty (no agents to probe).
+    """
+    if mock or not models:
+        return
+    # Lazy-imported to keep this helper's import cost zero when callers
+    # bail early on ``mock=True``.
+    from movate.core.failures import AuthError  # noqa: PLC0415
+    from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
+
+    rt = await build_local_runtime(mock=False)
+    try:
+        # ``sorted`` so the probe order is deterministic — matters
+        # for tests asserting on probe sequencing and for operators
+        # reading the warning log in --all mode with multiple models.
+        for model in sorted(models):
+            request = CompletionRequest(
+                provider=model,
+                messages=[Message(role="user", content="ping")],
+                params={"max_tokens": 1, "temperature": 0.0},
+            )
+            try:
+                await rt.provider.complete(request)
+            except AuthError as exc:
+                err_console.print(
+                    f"[red]✗[/red] preflight auth check failed for provider "
+                    f"[bold]{model}[/bold]:\n"
+                    f"  [dim]{str(exc)[:300]}[/dim]\n\n"
+                    "[bold]Fix one of these and re-run:[/bold]\n"
+                    "  • Export the provider's API key in your shell "
+                    "(e.g. [bold]export ANTHROPIC_API_KEY=...[/bold]) "
+                    "and reopen the terminal\n"
+                    "  • [bold]--generator-model anthropic/claude-haiku-4-5-20251001[/bold] "
+                    "(route generation through a different provider)\n"
+                    "  • [bold]--mock[/bold] (offline; deterministic "
+                    "shape-only generation, no LLM calls)\n"
+                    "  • Run [bold]mdk doctor[/bold] to see which "
+                    "provider keys are loaded."
+                )
+                raise typer.Exit(code=2) from exc
+            except Exception as exc:
+                # Non-auth failures aren't fatal here. The real run
+                # may still succeed (a transient timeout on the
+                # 1-token probe could be a coincidence). If it
+                # doesn't, the per-case warnings + the final "0 cases"
+                # hint already cover the operator. Just log the
+                # surprise so the trail is in stderr.
+                log.warning(
+                    "preflight probe for %s returned a non-auth error "
+                    "(%s: %s) — proceeding with the sweep; the real "
+                    "run may still succeed.",
+                    model,
+                    type(exc).__name__,
+                    exc,
+                )
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1038,6 +1119,14 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
 
     project_root = _find_project_root(agent_path)
 
+    # Preflight auth probe — catches the common "API key not set"
+    # case BEFORE running 10 cases x 2 retries against a doomed
+    # provider. The probe uses --generator-model if the operator
+    # passed one (since that uniformly overrides bundle.spec.model),
+    # else the agent's declared provider.
+    probe_model = generator_model or bundle.spec.model.provider
+    asyncio.run(_preflight_check_generator_auth(models={probe_model}, mock=mock))
+
     if output_format == Report.TABLE:
         console.print(
             f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
@@ -1385,6 +1474,31 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         # Vacuous-pass: no agents → no failures.
         console.print("[dim]mdk_eval_scorecard_all_summary: agents=0 ok=true[/dim]")
         return
+
+    # Preflight auth probe — one tiny ping per unique generator model
+    # BEFORE the sweep loop. Without this, 10 agents x 10 cases x 2
+    # retries against a missing API key produces 200 duplicate
+    # warnings + 30s of spam before the first useful diagnostic.
+    # Probing upfront fails fast with one clear hint.
+    if not mock:
+        if generator_model is not None:
+            # --generator-model uniformly overrides every agent;
+            # one model probes the whole sweep.
+            preflight_models: set[str] = {generator_model}
+        else:
+            # Otherwise each agent uses its own declared provider.
+            # We probe each UNIQUE provider once (a project with all
+            # 10 agents on openai/... yields a single probe call).
+            # Agents that fail to load here are silently skipped —
+            # the main loop's load step will surface that failure
+            # in the rollup.
+            preflight_models = set()
+            for agent_dir in agent_dirs:
+                try:
+                    preflight_models.add(load_agent(agent_dir).spec.model.provider)
+                except AgentLoadError:
+                    continue
+        asyncio.run(_preflight_check_generator_auth(models=preflight_models, mock=False))
 
     summaries: list[ScorecardSummary] = []
     failed: list[tuple[str, str]] = []

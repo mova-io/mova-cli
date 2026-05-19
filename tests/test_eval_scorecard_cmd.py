@@ -17,14 +17,17 @@ Covers:
 from __future__ import annotations
 
 import json as _json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
+from movate.cli import eval_scorecard_cmd
 from movate.cli.eval_scorecard_cmd import (
     _VALID_MIXES,
     ALL_CATEGORIES,
@@ -40,6 +43,7 @@ from movate.cli.eval_scorecard_cmd import (
     _score_one_case,
 )
 from movate.cli.main import app
+from movate.core.failures import AuthError
 
 runner = CliRunner(mix_stderr=False)
 
@@ -48,6 +52,35 @@ runner = CliRunner(mix_stderr=False)
 # substring assertions strip these first so they're whitespace +
 # content focused.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+@pytest.fixture(autouse=True)
+def _disable_preflight(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """No-op the generator-auth preflight by default.
+
+    The preflight makes a real 1-token LLM call when ``mock=False`` to
+    fail fast on missing API keys. Most tests in this file scaffold a
+    real project and invoke ``eval-scorecard`` WITHOUT ``--mock``, then
+    monkeypatch the downstream ``_run_scorecard`` to a fake. Without
+    this fixture each of those tests would hit the live LiteLLM
+    provider during preflight and exit 2 with AuthError in CI (no API
+    keys).
+
+    Tests marked ``@pytest.mark.no_preflight_stub`` opt out — typically
+    the ``TestPreflight`` class which exercises the real preflight with
+    its own stub provider, and ``TestPreflightIntegration`` which
+    re-patches the preflight with a recording stub.
+    """
+    if request.node.get_closest_marker("no_preflight_stub") is not None:
+        return
+
+    async def _noop(*, models: set[str], mock: bool) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+        _noop,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +950,6 @@ def test_all_json_output_captures_per_agent_failures(
 # Per-category gates (Gap 3c)
 # ---------------------------------------------------------------------------
 
-
 from movate.cli.eval_scorecard_cmd import GateConfig  # noqa: E402
 
 
@@ -1218,7 +1250,6 @@ def test_all_mode_json_includes_per_agent_gate_failures(
 # ---------------------------------------------------------------------------
 # Baseline + drift (Gap 3d)
 # ---------------------------------------------------------------------------
-
 
 from movate.cli.eval_scorecard_cmd import (  # noqa: E402
     _compute_drift,
@@ -1664,7 +1695,6 @@ def test_all_mode_baseline_per_agent_drift(tmp_path: Path, monkeypatch: pytest.M
 # Per-project rubric overrides (Gap 3e)
 # ---------------------------------------------------------------------------
 
-
 from movate.cli.eval_scorecard_cmd import (  # noqa: E402
     EffectiveCategories,
     _build_judge_prompt,
@@ -1975,3 +2005,476 @@ class TestScorecardConfigValidation:
         from movate.core.config import ProjectConfig  # noqa: PLC0415
 
         assert ProjectConfig().scorecard.disabled_categories == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight generator-auth probe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.no_preflight_stub
+class TestPreflight:
+    """``_preflight_check_generator_auth`` makes one tiny LLM ping per
+    unique model BEFORE the sweep — so an unset API key fails fast
+    with a single hint, instead of flooding 200 duplicate warnings
+    for ``10 agents x 10 cases x 2 retries``."""
+
+    @pytest.mark.asyncio
+    async def test_preflight_skipped_under_mock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``mock=True`` short-circuits — no runtime is built, no
+        provider call. The mock provider doesn't need keys."""
+
+        built: list[bool] = []
+
+        async def fake_build(*, mock: bool) -> Any:
+            built.append(mock)
+            raise RuntimeError("should never be called under mock=True")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
+
+        # Should return cleanly without touching the runtime builder.
+        await eval_scorecard_cmd._preflight_check_generator_auth(
+            models={"openai/gpt-4o-mini-2024-07-18"}, mock=True
+        )
+        assert built == []
+
+    @pytest.mark.asyncio
+    async def test_preflight_skipped_with_empty_models(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No models = nothing to probe. Common when ``--all`` runs on
+        an agents/ dir where every bundle failed to load — we don't
+        want to invent a probe model."""
+
+        built: list[bool] = []
+
+        async def fake_build(*, mock: bool) -> Any:
+            built.append(mock)
+            raise RuntimeError("should never be called for empty models")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
+
+        await eval_scorecard_cmd._preflight_check_generator_auth(models=set(), mock=False)
+        assert built == []
+
+    @pytest.mark.asyncio
+    async def test_preflight_fails_fast_on_auth_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: Any,
+    ) -> None:
+        """``AuthError`` from the provider during probe → ``typer.Exit(2)``
+        with the hint-rich message in stderr. The probe stops at the
+        first auth failure rather than continuing through other models."""
+
+        probed: list[str] = []
+
+        class _StubProvider:
+            async def complete(self, request: Any) -> Any:
+                probed.append(request.provider)
+                raise AuthError("litellm.AuthenticationError: Missing Anthropic API Key")
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubTracer:
+            pass
+
+        class _StubRuntime:
+            provider = _StubProvider()
+            storage = _StubStorage()
+            tracer = _StubTracer()
+
+        async def fake_build(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
+        monkeypatch.setattr(eval_scorecard_cmd, "shutdown_runtime", fake_shutdown)
+
+        with pytest.raises(typer.Exit) as excinfo:
+            await eval_scorecard_cmd._preflight_check_generator_auth(
+                models={"anthropic/claude-haiku-4-5-20251001"}, mock=False
+            )
+        assert excinfo.value.exit_code == 2
+        # Probe ran exactly once before bailing.
+        assert probed == ["anthropic/claude-haiku-4-5-20251001"]
+
+        # Hint-rich error message hit stderr.
+        captured = capsys.readouterr()
+        stderr_plain = _ANSI_RE.sub("", captured.err)
+        assert "preflight auth check failed" in stderr_plain
+        assert "anthropic/claude-haiku-4-5-20251001" in stderr_plain
+        assert "ANTHROPIC_API_KEY" in stderr_plain
+        assert "--generator-model" in stderr_plain
+        assert "--mock" in stderr_plain
+        assert "mdk doctor" in stderr_plain
+
+    @pytest.mark.asyncio
+    async def test_preflight_tolerates_non_auth_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: Any,
+    ) -> None:
+        """Transient network error / rate limit during probe → warn
+        and return, NOT exit. The real run may still succeed; we
+        don't want a flaky probe blocking work that would have
+        completed."""
+
+        class _StubProvider:
+            async def complete(self, request: Any) -> Any:
+                raise TimeoutError("connection reset")
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            provider = _StubProvider()
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
+        monkeypatch.setattr(eval_scorecard_cmd, "shutdown_runtime", fake_shutdown)
+
+        with caplog.at_level(logging.WARNING, logger="movate.cli.eval_scorecard_cmd"):
+            # Must NOT raise — non-auth failures are non-fatal.
+            await eval_scorecard_cmd._preflight_check_generator_auth(
+                models={"openai/gpt-4o-mini-2024-07-18"}, mock=False
+            )
+        joined = " ".join(r.message for r in caplog.records)
+        assert "preflight probe for openai/gpt-4o-mini-2024-07-18" in joined
+        assert "TimeoutError" in joined
+
+    @pytest.mark.asyncio
+    async def test_preflight_probes_each_unique_model_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--all`` collects unique providers across agents. If a
+        project has 5 agents on openai/... and 5 on anthropic/...,
+        the probe should hit each provider EXACTLY ONCE — not 10
+        times."""
+
+        probed: list[str] = []
+
+        class _StubProvider:
+            async def complete(self, request: Any) -> Any:
+                probed.append(request.provider)
+
+                class _Resp:
+                    text = ""
+                    tokens = None
+
+                return _Resp()
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            provider = _StubProvider()
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
+        monkeypatch.setattr(eval_scorecard_cmd, "shutdown_runtime", fake_shutdown)
+
+        await eval_scorecard_cmd._preflight_check_generator_auth(
+            models={
+                "openai/gpt-4o-mini-2024-07-18",
+                "anthropic/claude-haiku-4-5-20251001",
+            },
+            mock=False,
+        )
+        # Exactly one call per unique model; order is deterministic
+        # (sorted) so the assertion is stable.
+        assert probed == [
+            "anthropic/claude-haiku-4-5-20251001",
+            "openai/gpt-4o-mini-2024-07-18",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_preflight_probe_uses_max_tokens_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The probe must be MINIMAL — one token, low temperature —
+        so it costs ~nothing and finishes in <1s. A heavier probe
+        would defeat the "fail fast" goal."""
+
+        seen_params: list[dict[str, Any]] = []
+        seen_messages: list[list[Any]] = []
+
+        class _StubProvider:
+            async def complete(self, request: Any) -> Any:
+                seen_params.append(request.params)
+                seen_messages.append(request.messages)
+
+                class _Resp:
+                    text = ""
+                    tokens = None
+
+                return _Resp()
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            provider = _StubProvider()
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(eval_scorecard_cmd, "build_local_runtime", fake_build)
+        monkeypatch.setattr(eval_scorecard_cmd, "shutdown_runtime", fake_shutdown)
+
+        await eval_scorecard_cmd._preflight_check_generator_auth(
+            models={"openai/gpt-4o-mini-2024-07-18"}, mock=False
+        )
+        assert seen_params[0]["max_tokens"] == 1
+        assert seen_params[0]["temperature"] == 0.0
+        # Single short user message — no system prompt overhead.
+        assert len(seen_messages[0]) == 1
+
+
+@pytest.mark.unit
+class TestPreflightIntegration:
+    """Integration tests: preflight is wired into both orchestrators
+    (single-agent + ``--all``) and fires BEFORE any scoring work."""
+
+    def test_single_agent_runs_preflight_with_bundle_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No ``--generator-model``: the preflight uses the agent's
+        own declared provider."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        preflight_calls: list[dict[str, Any]] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            preflight_calls.append({"models": models, "mock": mock})
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+            fake_preflight,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", str(agent_dir), "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert len(preflight_calls) == 1
+        # The faq bundle has SOME declared provider — we don't care
+        # which one (templates evolve), just that exactly one model
+        # was probed and it's not ``None``.
+        models = preflight_calls[0]["models"]
+        assert len(models) == 1
+        assert next(iter(models))  # non-empty string
+        assert preflight_calls[0]["mock"] is False
+
+    def test_single_agent_runs_preflight_with_generator_model_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--generator-model X`` makes the preflight probe X, NOT
+        the agent's declared provider — since X is what generation
+        will actually use."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        preflight_calls: list[dict[str, Any]] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            preflight_calls.append({"models": models, "mock": mock})
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+            fake_preflight,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--generator-model",
+                "anthropic/claude-haiku-4-5-20251001",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert preflight_calls == [
+            {"models": {"anthropic/claude-haiku-4-5-20251001"}, "mock": False}
+        ]
+
+    def test_single_agent_skips_preflight_under_mock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--mock`` propagates through to the preflight call — the
+        preflight itself short-circuits, but we still verify the
+        wiring carries ``mock=True``."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        preflight_calls: list[dict[str, Any]] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            preflight_calls.append({"models": models, "mock": mock})
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+            fake_preflight,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", str(agent_dir), "--count", "3", "--mock"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert len(preflight_calls) == 1
+        assert preflight_calls[0]["mock"] is True
+
+    def test_all_runs_preflight_with_generator_model_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In ``--all`` mode with ``--generator-model X``, the
+        preflight probes ONLY X (uniform override) — not each agent's
+        declared provider."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+        preflight_calls: list[dict[str, Any]] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            preflight_calls.append({"models": models, "mock": mock})
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+            fake_preflight,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                "--all",
+                "--count",
+                "3",
+                "--generator-model",
+                "anthropic/claude-haiku-4-5-20251001",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert preflight_calls == [
+            {"models": {"anthropic/claude-haiku-4-5-20251001"}, "mock": False}
+        ]
+
+    def test_all_preflight_failure_aborts_before_any_agent_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the preflight raises ``typer.Exit(2)`` (auth fail), the
+        sweep MUST NOT proceed to any agent. Otherwise we'd still
+        burn 10 x 10 calls before exiting - defeating the whole
+        purpose of the preflight."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+        run_scorecard_calls: list[str] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+
+            raise typer.Exit(code=2)
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            run_scorecard_calls.append(bundle.spec.name)
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=0,
+                cases=[],
+                category_means={},
+                overall_mean=0.0,
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+            fake_preflight,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", "--all", "--count", "10"],
+            env={"COLUMNS": "200"},
+        )
+        # Exited via the preflight, not via the rollup's fail path.
+        assert result.exit_code == 2
+        # No agent's scorecard ran — preflight aborted upfront.
+        assert run_scorecard_calls == []
