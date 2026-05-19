@@ -43,6 +43,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._output import Report
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.cli.eval_gen_cmd import _generate_entries, _load_kb_seeds
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
@@ -499,6 +500,18 @@ def eval_scorecard(
             "model. Example: --judge-model anthropic/claude-haiku-4-5-20251001."
         ),
     ),
+    output_format: Report = typer.Option(
+        Report.TABLE,
+        "--output",
+        "-o",
+        case_sensitive=False,
+        help=(
+            "Output format. ``table`` (default) renders the Rich scorecard "
+            "for human consumption. ``json`` emits a machine-readable "
+            "document for CI scraping — suppresses the table + greppable "
+            "summary line."
+        ),
+    ),
 ) -> None:
     """Generate test cases on the fly and score against a 10-category scorecard.
 
@@ -536,6 +549,7 @@ def eval_scorecard(
             mix=mix,
             mock=mock,
             judge_model=judge_model,
+            output_format=output_format,
         )
         return
 
@@ -552,6 +566,7 @@ def eval_scorecard(
         mix=mix,
         mock=mock,
         judge_model=judge_model,
+        output_format=output_format,
     )
 
 
@@ -562,9 +577,15 @@ def _run_scorecard_single_agent(
     mix: str,
     mock: bool,
     judge_model: str | None,
+    output_format: Report = Report.TABLE,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
-    positional-arg path and (one iteration of) the --all loop."""
+    positional-arg path and (one iteration of) the --all loop.
+
+    ``output_format=Report.JSON`` swaps the Rich table + greppable
+    summary line for a single-document JSON emission on stdout. The
+    "Generating…" status line is also suppressed so the JSON is the
+    only thing on stdout — pipe-safe for CI scrapers."""
     agent_path = Path(agent_path_str)
     try:
         bundle = load_agent(agent_path)
@@ -574,9 +595,10 @@ def _run_scorecard_single_agent(
 
     project_root = _find_project_root(agent_path)
 
-    console.print(
-        f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
-    )
+    if output_format == Report.TABLE:
+        console.print(
+            f"[dim]Generating {count} {mix} test cases for [bold]{bundle.spec.name}[/bold]…[/dim]"
+        )
     summary = asyncio.run(
         _run_scorecard(
             bundle,
@@ -588,17 +610,56 @@ def _run_scorecard_single_agent(
         )
     )
 
+    if output_format == Report.JSON:
+        print(json.dumps(_summary_to_json(summary), indent=2))
+        return
+
     console.print()
     _render_scorecard(summary)
     _emit_summary_line(summary)
 
 
-def _run_scorecard_all_in_project(
+def _summary_to_json(summary: ScorecardSummary) -> dict[str, Any]:
+    """Serialize a ScorecardSummary to a CI-scrapeable dict.
+
+    Shape:
+      {"agent": str, "mix": str, "count": int, "overall_mean": float,
+       "category_means": {<cat>: float, …},
+       "cases": [
+         {"input": {...}, "output": {...}, "latency_ms": float,
+          "cost_usd": float, "scores": {<cat>: float}, "rationales": {<cat>: str}},
+         …
+       ]}
+
+    Stable shape — adding new keys is OK (additive), renaming would
+    break CI scrapers that learned the old key names."""
+    return {
+        "agent": summary.agent,
+        "mix": summary.mix,
+        "count": summary.count,
+        "overall_mean": summary.overall_mean,
+        "category_means": dict(summary.category_means),
+        "cases": [
+            {
+                "input": c.input,
+                "output": c.output,
+                "latency_ms": c.latency_ms,
+                "cost_usd": c.cost_usd,
+                "scores": dict(c.scores),
+                "rationales": dict(c.rationales),
+            }
+            for c in summary.cases
+        ],
+    }
+
+
+def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine + format dispatch
     *,
     count: int,
     mix: str,
     mock: bool,
     judge_model: str | None,
+    output_format: Report = Report.TABLE,
 ) -> None:
     """Project-wide sweep: discover all agents under ./agents/, run the
     scorecard against each, then render a project-level rollup table.
@@ -606,7 +667,13 @@ def _run_scorecard_all_in_project(
     Per-agent failures (load errors, generation errors) are captured
     and surfaced in the rollup rather than aborting the sweep — a
     failing single agent shouldn't block the rest of the project's
-    visibility into its scorecard."""
+    visibility into its scorecard.
+
+    ``output_format=Report.JSON`` emits a single document at the end
+    containing per-agent summaries + project-level aggregates. Status
+    output during the sweep is suppressed (routed to stderr or
+    omitted) so the JSON on stdout stays pipe-clean."""
+    is_json = output_format == Report.JSON
     cwd = Path.cwd()
     agents_dir = cwd / "agents"
     if not agents_dir.is_dir():
@@ -619,6 +686,23 @@ def _run_scorecard_all_in_project(
 
     agent_dirs = sorted(p.parent for p in agents_dir.glob("*/agent.yaml") if p.is_file())
     if not agent_dirs:
+        if is_json:
+            print(
+                json.dumps(
+                    {
+                        "agents_total": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "project_mean": 0.0,
+                        "mix": mix,
+                        "ok": True,
+                        "summaries": [],
+                        "failures": [],
+                    },
+                    indent=2,
+                )
+            )
+            return
         err_console.print(
             "[yellow]⚠[/yellow] no agents under [bold]./agents/[/bold]. "
             "Run [bold]mdk add <template>[/bold] first."
@@ -631,8 +715,9 @@ def _run_scorecard_all_in_project(
     failed: list[tuple[str, str]] = []
 
     for agent_dir in agent_dirs:
-        console.print()
-        console.print(f"[bold]── {agent_dir.name}[/bold]")
+        if not is_json:
+            console.print()
+            console.print(f"[bold]── {agent_dir.name}[/bold]")
         try:
             bundle = load_agent(agent_dir)
         except AgentLoadError as exc:
@@ -641,7 +726,8 @@ def _run_scorecard_all_in_project(
             continue
 
         project_root = _find_project_root(agent_dir)
-        console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
+        if not is_json:
+            console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
         try:
             summary = asyncio.run(
                 _run_scorecard(
@@ -663,11 +749,37 @@ def _run_scorecard_all_in_project(
         summaries.append(summary)
         # Per-agent scorecard table renders inline so operators see
         # progress agent-by-agent rather than waiting for the rollup.
-        console.print()
-        _render_scorecard(summary)
-        _emit_summary_line(summary)
+        # Suppressed in JSON mode — the final document carries it.
+        if not is_json:
+            console.print()
+            _render_scorecard(summary)
+            _emit_summary_line(summary)
 
-    # Project-level rollup.
+    project_mean = sum(s.overall_mean for s in summaries) / len(summaries) if summaries else 0.0
+
+    if is_json:
+        # Single-document emission on stdout. Stable shape — adding
+        # new keys is OK (additive), renaming would break CI scrapers.
+        print(
+            json.dumps(
+                {
+                    "agents_total": len(agent_dirs),
+                    "succeeded": len(summaries),
+                    "failed": len(failed),
+                    "project_mean": project_mean,
+                    "mix": mix,
+                    "ok": not failed,
+                    "summaries": [_summary_to_json(s) for s in summaries],
+                    "failures": [{"agent": name, "reason": reason} for name, reason in failed],
+                },
+                indent=2,
+            )
+        )
+        if failed:
+            raise typer.Exit(code=2)
+        return
+
+    # Project-level rollup table for table mode.
     console.print()
     rollup = Table(
         title=(
@@ -698,7 +810,6 @@ def _run_scorecard_all_in_project(
     console.print(rollup)
 
     # Greppable project-level summary line for CI scraping.
-    project_mean = sum(s.overall_mean for s in summaries) / len(summaries) if summaries else 0.0
     console.print(
         f"[dim]mdk_eval_scorecard_all_summary: "
         f"agents={len(agent_dirs)} succeeded={len(summaries)} "

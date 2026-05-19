@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import json as _json
 import re
 from pathlib import Path
 from typing import Any
@@ -764,3 +765,149 @@ def test_all_one_agent_failure_doesnt_abort_sweep(
     assert "succeeded=2" in plain
     assert "failed=1" in plain
     assert "ok=false" in plain
+
+
+# ---------------------------------------------------------------------------
+# --output json (Gap 3b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_single_agent_json_output_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``mdk eval-scorecard <agent> --output json`` emits a single
+    JSON document on stdout — no Rich table, no greppable summary
+    line. Shape is stable + machine-readable for CI scrapers."""
+
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[
+                CaseScore(
+                    input={"q": "test"},
+                    output={"a": "ok"},
+                    latency_ms=120.0,
+                    cost_usd=0.0001,
+                    scores=dict.fromkeys(ALL_CATEGORIES, 0.9),
+                    rationales=dict.fromkeys(LLM_JUDGED_CATEGORIES, "looks fine"),
+                )
+            ],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.9),
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--output", "json"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+    # stdout should be parseable JSON, nothing else.
+    parsed = _json.loads(result.stdout)
+    assert parsed["agent"] == "faq"
+    assert parsed["mix"] == "standard"
+    assert parsed["count"] == 3
+    assert parsed["overall_mean"] == 0.9
+    assert set(parsed["category_means"].keys()) == set(ALL_CATEGORIES)
+    assert len(parsed["cases"]) == 1
+    case = parsed["cases"][0]
+    assert case["input"] == {"q": "test"}
+    assert case["output"] == {"a": "ok"}
+    assert case["latency_ms"] == 120.0
+    assert case["cost_usd"] == 0.0001
+    assert set(case["scores"].keys()) == set(ALL_CATEGORIES)
+
+    # JSON mode must NOT emit the Rich table or greppable line on
+    # stdout (those are table-mode surfaces).
+    assert "mdk_eval_scorecard_summary:" not in result.stdout
+    assert "Generating" not in result.stdout  # status was suppressed
+
+
+@pytest.mark.unit
+def test_all_json_output_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``mdk eval-scorecard --all --output json`` emits a single
+    project-level JSON document with per-agent summaries +
+    project-level aggregates. The shape is stable for CI scrapers."""
+
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=5,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.8),
+            overall_mean=0.8,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--output", "json"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+    parsed = _json.loads(result.stdout)
+    assert parsed["agents_total"] == 2
+    assert parsed["succeeded"] == 2
+    assert parsed["failed"] == 0
+    assert parsed["mix"] == "standard"
+    assert parsed["ok"] is True
+    assert parsed["project_mean"] == 0.8
+    assert len(parsed["summaries"]) == 2
+    assert {s["agent"] for s in parsed["summaries"]} == {"faq", "summarizer"}
+    assert parsed["failures"] == []
+
+    # Table-mode surfaces must NOT appear on stdout in JSON mode.
+    assert "Project scorecard" not in result.stdout
+    assert "mdk_eval_scorecard_all_summary:" not in result.stdout
+
+
+@pytest.mark.unit
+def test_all_json_output_captures_per_agent_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When some agents fail in --all mode, the JSON document
+    surfaces them under ``failures: [...]`` with the agent name +
+    error type. ``ok: false`` and exit code 2 for CI gating."""
+
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        if bundle.spec.name == "summarizer":
+            raise RuntimeError("simulated judge timeout")
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=5,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.8),
+            overall_mean=0.8,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--output", "json"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+
+    parsed = _json.loads(result.stdout)
+    assert parsed["succeeded"] == 1
+    assert parsed["failed"] == 1
+    assert parsed["ok"] is False
+    assert len(parsed["failures"]) == 1
+    assert parsed["failures"][0]["agent"] == "summarizer"
+    assert parsed["failures"][0]["reason"] == "RuntimeError"
