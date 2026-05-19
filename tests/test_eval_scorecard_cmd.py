@@ -1213,3 +1213,448 @@ def test_all_mode_json_includes_per_agent_gate_failures(
     assert by_agent["summarizer"]["gates_passed"] is False
     assert len(by_agent["summarizer"]["gate_failures"]) == 1
     assert by_agent["summarizer"]["gate_failures"][0]["category"] == "safety"
+
+
+# ---------------------------------------------------------------------------
+# Baseline + drift (Gap 3d)
+# ---------------------------------------------------------------------------
+
+
+from movate.cli.eval_scorecard_cmd import (  # noqa: E402
+    _compute_drift,
+    _load_baseline_means,
+)
+
+
+@pytest.mark.unit
+class TestLoadBaselineMeans:
+    def test_single_agent_shape(self, tmp_path: Path) -> None:
+        """Reading a single-agent scorecard JSON returns the agent
+        + its per-category means including ``overall``."""
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(
+            _json.dumps(
+                {
+                    "agent": "faq",
+                    "overall_mean": 0.9,
+                    "category_means": {"accuracy": 0.95, "safety": 1.0},
+                }
+            )
+        )
+        result = _load_baseline_means(baseline)
+        assert "faq" in result
+        assert result["faq"]["accuracy"] == 0.95
+        assert result["faq"]["safety"] == 1.0
+        assert result["faq"]["overall"] == 0.9
+
+    def test_all_mode_shape(self, tmp_path: Path) -> None:
+        """``--all`` baselines have a ``summaries: [...]`` array of
+        per-agent entries. Each agent's means are flattened into the
+        return dict."""
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text(
+            _json.dumps(
+                {
+                    "summaries": [
+                        {"agent": "alpha", "overall_mean": 0.85, "category_means": {"safety": 1.0}},
+                        {"agent": "beta", "overall_mean": 0.7, "category_means": {"safety": 0.5}},
+                    ],
+                }
+            )
+        )
+        result = _load_baseline_means(baseline)
+        assert set(result.keys()) == {"alpha", "beta"}
+        assert result["alpha"]["overall"] == 0.85
+        assert result["beta"]["safety"] == 0.5
+
+    def test_unreadable_returns_empty(self, tmp_path: Path) -> None:
+        """Missing / unreadable baseline returns ``{}`` so the caller
+        can warn + skip rather than crashing."""
+        assert _load_baseline_means(tmp_path / "nonexistent.json") == {}
+
+    def test_malformed_json_returns_empty(self, tmp_path: Path) -> None:
+        """Corrupt JSON returns ``{}`` rather than raising."""
+        baseline = tmp_path / "baseline.json"
+        baseline.write_text("not valid json at all {")
+        assert _load_baseline_means(baseline) == {}
+
+
+@pytest.mark.unit
+class TestComputeDrift:
+    def _summary(self, **means: float) -> ScorecardSummary:
+        full = {**dict.fromkeys(ALL_CATEGORIES, 0.8), **means}
+        return ScorecardSummary(
+            agent="x",
+            mix="standard",
+            count=1,
+            cases=[],
+            category_means=full,
+            overall_mean=full.get("overall", 0.8),
+        )
+
+    def test_improvement_not_a_regression(self) -> None:
+        """A score improvement is rendered green but never flags as a
+        regression, even with tolerance=0."""
+        current = self._summary(accuracy=0.95)
+        baseline = {"accuracy": 0.7, "overall": 0.8}
+        drifts = _compute_drift(current, baseline, tolerance=0.0)
+        accuracy = next(d for d in drifts if d.category == "accuracy")
+        assert accuracy.delta == pytest.approx(0.25)
+        assert accuracy.is_regression is False
+
+    def test_drop_within_tolerance_not_a_regression(self) -> None:
+        """A drop SMALLER than the tolerance forgives the noise."""
+        current = self._summary(accuracy=0.86)
+        baseline = {"accuracy": 0.9, "overall": 0.8}
+        drifts = _compute_drift(current, baseline, tolerance=0.05)
+        accuracy = next(d for d in drifts if d.category == "accuracy")
+        assert accuracy.delta == pytest.approx(-0.04)
+        assert accuracy.is_regression is False  # |delta| < tolerance
+
+    def test_drop_exceeding_tolerance_is_a_regression(self) -> None:
+        """A drop LARGER than the tolerance is a regression."""
+        current = self._summary(accuracy=0.7)
+        baseline = {"accuracy": 0.9, "overall": 0.8}
+        drifts = _compute_drift(current, baseline, tolerance=0.05)
+        accuracy = next(d for d in drifts if d.category == "accuracy")
+        assert accuracy.is_regression is True
+
+    def test_categories_only_in_baseline_skipped(self) -> None:
+        """The baseline might have categories the current run doesn't
+        (e.g. if the rubric expanded). Those entries are skipped
+        rather than producing phantom drift rows."""
+        current = self._summary()
+        baseline = {"made_up_category": 0.5, "overall": 0.8}
+        drifts = _compute_drift(current, baseline, tolerance=0.0)
+        # 'made_up_category' should NOT appear in the drift output.
+        cats = {d.category for d in drifts}
+        assert "made_up_category" not in cats
+        # 'overall' should still be present (it's in the baseline).
+        assert "overall" in cats
+
+
+@pytest.mark.unit
+def test_output_baseline_writes_json_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--output-baseline path`` writes the current scorecard JSON
+    to that path so a future ``--baseline-file`` run can diff against it.
+    Creates parent dirs as needed."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+    baseline_out = tmp_path / "proj" / ".movate" / "scorecards" / "faq.json"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.9),
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--output-baseline", str(baseline_out)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert baseline_out.is_file()
+    parsed = _json.loads(baseline_out.read_text())
+    assert parsed["agent"] == "faq"
+    assert parsed["overall_mean"] == 0.9
+    assert set(parsed["category_means"].keys()) == set(ALL_CATEGORIES)
+
+
+@pytest.mark.unit
+def test_baseline_file_drift_no_regression_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When current scores match (or improve on) baseline, the drift
+    table renders but exit code stays 0."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    # Save a baseline with mean 0.7 across all categories.
+    baseline_file = tmp_path / "baseline.json"
+    baseline_file.write_text(
+        _json.dumps(
+            {
+                "agent": "faq",
+                "overall_mean": 0.7,
+                "category_means": dict.fromkeys(ALL_CATEGORIES, 0.7),
+            }
+        )
+    )
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        # Current run scores HIGHER → improvement, not regression.
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.9),
+            overall_mean=0.9,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--baseline-file", str(baseline_file)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "Drift vs baseline" in plain
+    assert "No regressions" in plain
+
+
+@pytest.mark.unit
+def test_baseline_file_drift_with_regression_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regression beyond tolerance exits 2 + renders the failure
+    block. Default tolerance 0.0 means any drop counts."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    baseline_file = tmp_path / "baseline.json"
+    baseline_file.write_text(
+        _json.dumps(
+            {
+                "agent": "faq",
+                "overall_mean": 0.9,
+                "category_means": dict.fromkeys(ALL_CATEGORIES, 0.9),
+            }
+        )
+    )
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        # Current is LOWER than baseline → regression.
+        means = dict.fromkeys(ALL_CATEGORIES, 0.9)
+        means["accuracy"] = 0.5  # 0.4 drop = regression
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=means,
+            overall_mean=0.85,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--baseline-file", str(baseline_file)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "Drift vs baseline" in plain
+    assert "regression" in plain.lower()
+
+
+@pytest.mark.unit
+def test_baseline_file_tolerance_forgives_small_drops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--regression-tolerance 0.05`` forgives drops smaller than 5%
+    so noisy LLM-judge sampling doesn't constantly trigger regressions."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    baseline_file = tmp_path / "baseline.json"
+    baseline_file.write_text(
+        _json.dumps(
+            {
+                "agent": "faq",
+                "overall_mean": 0.9,
+                "category_means": dict.fromkeys(ALL_CATEGORIES, 0.9),
+            }
+        )
+    )
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        # Tiny 0.03 drop — within the 0.05 tolerance.
+        means = dict.fromkeys(ALL_CATEGORIES, 0.87)
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=means,
+            overall_mean=0.87,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval-scorecard",
+            str(agent_dir),
+            "--baseline-file",
+            str(baseline_file),
+            "--regression-tolerance",
+            "0.05",
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    plain = _ANSI_RE.sub("", result.stdout)
+    assert "No regressions" in plain
+
+
+@pytest.mark.unit
+def test_baseline_missing_agent_warns_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the baseline file has no entry for the current agent
+    (e.g. agent was added after baseline was committed), emit a
+    yellow warning and proceed without drift comparison rather than
+    erroring."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+
+    baseline_file = tmp_path / "baseline.json"
+    baseline_file.write_text(
+        _json.dumps(
+            {
+                "agent": "different-agent",  # baseline is for a different agent
+                "overall_mean": 0.9,
+                "category_means": dict.fromkeys(ALL_CATEGORIES, 0.9),
+            }
+        )
+    )
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.5),
+            overall_mean=0.5,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--baseline-file", str(baseline_file)],
+        env={"COLUMNS": "200"},
+    )
+    # Exit 0 — no drift check happened, no regressions to flag.
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "no entry for agent" in combined or "Skipping drift" in combined
+
+
+@pytest.mark.unit
+def test_baseline_round_trip_output_then_compare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: run with --output-baseline, then re-run with
+    --baseline-file pointed at the same file. Same scores → no
+    drift → exit 0."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+    agent_dir = tmp_path / "proj" / "agents" / "faq"
+    baseline_path = tmp_path / "baseline.json"
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.8),
+            overall_mean=0.8,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    # Step 1: save baseline.
+    result1 = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--output-baseline", str(baseline_path)],
+        env={"COLUMNS": "200"},
+    )
+    assert result1.exit_code == 0
+    assert baseline_path.is_file()
+
+    # Step 2: re-run with --baseline-file. Same scores → no regressions.
+    result2 = runner.invoke(
+        app,
+        ["eval-scorecard", str(agent_dir), "--baseline-file", str(baseline_path)],
+        env={"COLUMNS": "200"},
+    )
+    assert result2.exit_code == 0
+    plain = _ANSI_RE.sub("", result2.stdout)
+    assert "No regressions" in plain
+
+
+@pytest.mark.unit
+def test_all_mode_baseline_per_agent_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--all --baseline-file path`` does per-agent drift detection.
+    Project exits 2 if any agent regresses."""
+    _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+    baseline_file = tmp_path / "baseline.json"
+    baseline_file.write_text(
+        _json.dumps(
+            {
+                "summaries": [
+                    {
+                        "agent": "faq",
+                        "overall_mean": 0.9,
+                        "category_means": dict.fromkeys(ALL_CATEGORIES, 0.9),
+                    },
+                    {
+                        "agent": "summarizer",
+                        "overall_mean": 0.85,
+                        "category_means": dict.fromkeys(ALL_CATEGORIES, 0.85),
+                    },
+                ],
+            }
+        )
+    )
+
+    async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+        if bundle.spec.name == "summarizer":
+            # Regression for summarizer.
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.4),
+                overall_mean=0.4,
+            )
+        # No regression for faq.
+        return ScorecardSummary(
+            agent=bundle.spec.name,
+            mix="standard",
+            count=3,
+            cases=[],
+            category_means=dict.fromkeys(ALL_CATEGORIES, 0.95),
+            overall_mean=0.95,
+        )
+
+    monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+    result = runner.invoke(
+        app,
+        ["eval-scorecard", "--all", "--baseline-file", str(baseline_file)],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 2  # summarizer regressed
+    plain = _ANSI_RE.sub("", result.stdout)
+    # Per-agent drift table for summarizer surfaces in the output.
+    assert "drift for" in plain.lower() or "Drift vs baseline" in plain
+    # Project summary reflects the regression count.
+    assert "regressions=1" in plain
+    assert "ok=false" in plain
