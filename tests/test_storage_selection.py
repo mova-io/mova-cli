@@ -18,9 +18,30 @@ import pytest
 from fastapi.testclient import TestClient
 
 from movate.runtime.app import build_app
-from movate.storage import SqliteProvider, build_storage, selected_backend
+from movate.storage import (
+    SqliteProvider,
+    _reset_state_for_tests,
+    build_storage,
+    mark_cli_mode,
+    selected_backend,
+)
 from movate.storage.postgres import PostgresProvider
 from movate.testing import InMemoryStorage
+
+
+@pytest.fixture(autouse=True)
+def _reset_storage_globals() -> None:
+    """Wipe the once-per-process flags before every test.
+
+    ``build_storage`` emits the durability warning at most ONCE per
+    process (added 2026-05-19 to keep ``mdk eval-scorecard``'s 10+
+    build_storage calls from spamming stderr). Without this reset
+    the first test in this file would consume the warning and any
+    later test asserting on it would silently see zero records.
+    Also resets the CLI-mode flag so tests don't leak across each
+    other.
+    """
+    _reset_state_for_tests()
 
 
 @pytest.mark.unit
@@ -195,3 +216,90 @@ def test_ready_endpoint_surfaces_backend_fields(
     payload: dict[str, Any] = r.json()
     assert payload["storage_backend"] == "sqlite"
     assert payload["storage_durable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Durability warning suppression (2026-05-19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_durability_warning_emits_only_once_per_process(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``build_storage`` is called repeatedly per ``mdk eval-scorecard``
+    sweep (preflight + N agents). Without dedup the durability
+    warning lands 10+ times on every sweep. Pin that the warning
+    fires once + every subsequent ``build_storage`` call is silent."""
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.setenv("MOVATE_DB", "/tmp/mdk-test.db")
+
+    with caplog.at_level(logging.WARNING, logger="movate.storage"):
+        build_storage()
+        build_storage()
+        build_storage()
+
+    warnings = [r for r in caplog.records if "NOT durable" in r.message]
+    assert len(warnings) == 1, (
+        f"expected the durability warning to fire ONCE per process, "
+        f"got {len(warnings)}: {[r.message for r in warnings]}"
+    )
+
+
+@pytest.mark.unit
+def test_mark_cli_mode_drops_warning_to_debug(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """After ``mark_cli_mode()``, the durability warning is logged at
+    DEBUG level instead of WARNING. CLI invocations always use SQLite
+    locally — the warning targets production containers, so dropping
+    it from CLI output stops cluttering ``mdk ...`` runs.
+
+    The message itself is preserved (operators with --verbose / DEBUG
+    logging still see it); only the LEVEL changes."""
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.setenv("MOVATE_DB", "/tmp/mdk-test.db")
+
+    mark_cli_mode()
+    # Capture at DEBUG so we can confirm the message still emits,
+    # just at a lower level.
+    with caplog.at_level(logging.DEBUG, logger="movate.storage"):
+        build_storage()
+
+    # No record at WARNING level.
+    warning_records = [
+        r for r in caplog.records if "NOT durable" in r.message and r.levelno >= logging.WARNING
+    ]
+    assert not warning_records, (
+        f"CLI mode must downgrade the warning below WARNING, got: {warning_records}"
+    )
+    # But the message DID emit at DEBUG so --verbose / debug logging
+    # still surfaces it.
+    debug_records = [
+        r for r in caplog.records if "NOT durable" in r.message and r.levelno == logging.DEBUG
+    ]
+    assert debug_records, "CLI mode should still emit the message at DEBUG level"
+
+
+@pytest.mark.unit
+def test_warning_still_fires_at_warning_level_without_cli_mode(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pin the regression guard: without ``mark_cli_mode()``, the
+    durability warning STILL fires at WARNING level. Production
+    server / container deployments don't call mark_cli_mode, so
+    their misconfiguration signal is preserved."""
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.setenv("MOVATE_DB", "/tmp/mdk-test.db")
+    # Do NOT call mark_cli_mode — simulate the server / container path.
+
+    with caplog.at_level(logging.WARNING, logger="movate.storage"):
+        build_storage()
+
+    warnings = [
+        r for r in caplog.records if "NOT durable" in r.message and r.levelno >= logging.WARNING
+    ]
+    assert warnings, (
+        "without CLI mode, the durability warning must still fire at "
+        "WARNING level (server / container deployments rely on it)"
+    )

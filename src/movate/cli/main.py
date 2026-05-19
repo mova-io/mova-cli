@@ -72,6 +72,15 @@ load_dotenv()
 # via `mdk auth login <provider>` and every project on the machine
 # picks them up.
 from movate.credentials import autoload_credentials  # noqa: E402
+from movate.storage import mark_cli_mode as _storage_mark_cli_mode  # noqa: E402
+
+# Tell ``movate.storage`` we're running in CLI mode so the
+# "SqliteProvider not durable across container restarts" warning
+# drops to DEBUG. The warning targets production containers; in
+# ``mdk ...`` invocations it's noise at the top of every output.
+# Server processes (``movate serve`` / FastAPI runtime) don't hit
+# this codepath, so they still emit the warning at WARNING level.
+_storage_mark_cli_mode()
 
 autoload_credentials()
 
