@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -424,19 +425,28 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
         if wizard is None:  # operator hit Ctrl-C / quit
             raise typer.Exit(code=0)
         # Scorecard branch: the operator picked "generate fresh" in
-        # the test-cases prompt. Skip the legacy --gate/--runs/--baseline
-        # dispatch entirely and route to the 10-cat scorecard. The
-        # scorecard does its own one-and-only generation.
+        # the test-cases prompt. The wizard ALREADY generated +
+        # previewed the cases (and got operator approval) AND asked
+        # the gate threshold. Dispatch directly to the orchestrator
+        # so we can pass the pre-generated entries through — going
+        # via ``eval_scorecard`` (the Typer command) would have no
+        # way to forward ``pre_generated_entries`` since it's not a
+        # CLI flag.
         if wizard.scorecard and wizard.path is not None:
-            from movate.cli.eval_scorecard_cmd import eval_scorecard  # noqa: PLC0415
+            from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+                GateConfig,
+                _run_scorecard_single_agent,
+            )
 
             agent_path = Path.cwd() / "agents" / wizard.path
-            eval_scorecard(
-                agent=str(agent_path),
+            _run_scorecard_single_agent(
+                agent_path_str=str(agent_path),
                 count=wizard.scorecard_count,
                 mix=wizard.scorecard_mix,
                 mock=wizard.mock,
                 judge_model=None,
+                gates=GateConfig(overall=wizard.scorecard_gate),
+                pre_generated_entries=wizard.scorecard_entries,
             )
             return
         # Legacy branch: apply wizard's answers as if they were CLI
@@ -631,6 +641,15 @@ class _EvalWizardChoices:
     scorecard: bool = False
     scorecard_count: int = 10
     scorecard_mix: str = "standard"
+    # Pre-generated entries the operator approved in the wizard's
+    # preview table. When set, the scorecard skips its internal
+    # ``_generate_entries`` call and scores these directly — no
+    # double-generation, no surprise about WHAT got scored.
+    scorecard_entries: list[dict[str, Any]] | None = None
+    # Overall gate threshold the operator picked in the wizard's
+    # gate question (added 2026-05-19; previously the scorecard
+    # branch skipped the gate prompt entirely).
+    scorecard_gate: float = 0.0
 
 
 def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orchestrator; 5 prompts each with try/except adds linear branch count
@@ -730,21 +749,28 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
         raw_choice = _prompt_generate_cases(cwd, chosen_agent)
         if raw_choice is _CANCELLED:
             return None
-        # If the operator picked "generate fresh", short-circuit the
-        # rest of the wizard. The 10-cat rubric doesn't have a
-        # gate/runs/baseline shape, so asking those questions would
-        # produce dead inputs.
+        # If the operator picked "generate fresh", continue down the
+        # scorecard branch: GENERATE the cases right now, show them
+        # in a preview table, ask gate threshold, then dispatch with
+        # those exact cases (no double-generation).
         if raw_choice is not None:
             # Narrow: raw_choice is neither _CANCELLED nor None →
             # it's the (count, mix) tuple from _ask_scorecard_count_and_mix.
             assert isinstance(raw_choice, tuple)
             count, mix = raw_choice
+            preview = _generate_preview_and_gate(
+                chosen_agent, count=count, mix=mix, mock=use_mock, cwd=cwd
+            )
+            if preview is None:
+                return None
+            entries, gate = preview
             console.print()
             console.print(
                 Panel(
-                    f"[bold]Running:[/bold] mdk eval [bold]{chosen_agent}[/bold] "
-                    f"--scorecard --scorecard-count {count} "
-                    f"--scorecard-mix {mix}",
+                    f"[bold]Running:[/bold] scorecard against "
+                    f"[bold]{chosen_agent}[/bold] "
+                    f"[dim]({len(entries)} pre-generated {mix} cases, "
+                    f"gate-overall={gate})[/dim]",
                     title="[green]✓[/green] Configured",
                     border_style="green",
                     title_align="left",
@@ -761,6 +787,8 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
                 scorecard=True,
                 scorecard_count=count,
                 scorecard_mix=mix,
+                scorecard_entries=entries,
+                scorecard_gate=gate,
             )
 
     # Q3: Gate threshold.
@@ -1023,6 +1051,218 @@ def _ask_scorecard_count_and_mix() -> tuple[int, str] | object:
     mix = mix_choices[mix_idx][0]
 
     return (count, mix)
+
+
+async def _generate_cases_for_preview(
+    bundle: Any, *, count: int, mix: str, mock: bool, project_root: Path
+) -> list[dict[str, Any]]:
+    """Thin async wrapper that calls the scorecard's generation
+    primitive with the auto-detect path applied.
+
+    The wizard's preview flow needs to run generation BEFORE the
+    scorecard so the operator can see + approve the cases. Reuses
+    ``_generate_entries`` from the scorecard's generator module so
+    the same prompts, KB seeds, target dimensions, and provider
+    auto-detect behavior apply — the wizard just sees the cases
+    earlier."""
+    from movate.cli.eval_gen_cmd import _generate_entries, _load_kb_seeds  # noqa: PLC0415
+    from movate.cli.eval_scorecard_cmd import _resolve_generator_model  # noqa: PLC0415
+
+    # KB seeds for domain mix (same logic as ``_run_scorecard``).
+    kb_seeds: list[str] | None = None
+    if mix == "domain":
+        kb_seeds = _load_kb_seeds(bundle, project_root) or None
+
+    # Auto-detect generator model so the wizard's preview uses the
+    # same model the scorecard would have used. None means "let
+    # _generate_entries fall back to the bundle's declared provider";
+    # we surface the resolved model so the operator sees what's being
+    # used in the spinner status line.
+    resolved_model, _note = _resolve_generator_model(bundle.spec.model.provider, None)
+
+    return await _generate_entries(
+        bundle,
+        num=count,
+        sample_input=None,
+        mock=mock,
+        with_dimensions=False,
+        mode=mix,
+        kb_seeds=kb_seeds,
+        generator_model=resolved_model,
+    )
+
+
+def _render_cases_preview_table(entries: list[dict[str, Any]], mix: str) -> None:
+    """Render the generated test cases in a Rich table so the operator
+    can sanity-check before paying for a full eval run.
+
+    Columns: ``#`` (index), ``Input`` (JSON-truncated to a readable
+    width), ``Expected`` (truncated agent output if the generator
+    produced one). Long JSON inputs are truncated with ``…`` — the
+    full JSON is in the eval's JSON output (``-o json``) if the
+    operator wants it.
+    """
+    from rich.table import Table  # noqa: PLC0415
+
+    table = Table(
+        title=f"[bold]Generated test cases[/bold] [dim]({len(entries)} x {mix})[/dim]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Input", overflow="fold", max_width=70)
+    table.add_column("Expected", overflow="fold", max_width=50, style="dim")
+
+    for i, entry in enumerate(entries, start=1):
+        input_str = _truncate_json(entry.get("input"), max_chars=200)
+        expected_str = _truncate_json(entry.get("expected"), max_chars=120)
+        table.add_row(str(i), input_str, expected_str)
+
+    console.print()
+    console.print(table)
+
+
+def _truncate_json(value: Any, *, max_chars: int) -> str:
+    """JSON-serialize a value, collapse whitespace, truncate to fit
+    a table cell. Returns ``""`` for ``None``."""
+    if value is None:
+        return ""
+    import json as _json  # noqa: PLC0415
+
+    try:
+        s = _json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        s = str(value)
+    s = " ".join(s.split())  # collapse newlines + multiple spaces
+    if len(s) > max_chars:
+        return s[: max_chars - 1] + "…"
+    return s
+
+
+def _prompt_continue_or_regenerate() -> str:
+    """After showing the preview table, ask the operator what to do.
+
+    Returns one of ``"continue"`` / ``"regenerate"`` / ``"cancel"``.
+    Operator hits Ctrl-C → ``"cancel"`` (caller exits cleanly)."""
+    choices = {
+        "1": ("continue", "score these cases against the rubric"),
+        "2": ("regenerate", "regenerate (different cases via LLM)"),
+        "3": ("cancel", "exit without scoring"),
+    }
+    console.print()
+    console.print("[bold]Looks good?[/bold]")
+    for key, (_, label) in choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {label}")
+    try:
+        idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(choices.keys()),
+            default="1",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return "cancel"
+    return choices[idx][0]
+
+
+def _prompt_scorecard_gate() -> float | None:
+    """Wizard's scorecard-branch gate-threshold prompt.
+
+    Same shape as the legacy branch's gate question, but expressed
+    as the scorecard's ``--gate-overall`` flag (which gates on the
+    overall composite, NOT per-category — operators using the
+    scorecard typically want one knob, not 10). Returns the float
+    threshold on success, ``None`` on Ctrl-C.
+    """
+    choices = {
+        "1": (0.0, "no gate (just score; never fails)"),
+        "2": (0.5, "loose (50%+ overall; permissive)"),
+        "3": (0.7, "recommended (70%+ overall; CI default)"),
+        "4": (0.9, "strict (90%+ overall; production-ready bar)"),
+    }
+    console.print()
+    console.print("[bold]Gate threshold?[/bold] [dim](applied to overall composite)[/dim]")
+    for key, (value, label) in choices.items():
+        console.print(f"  [bold cyan][{key}][/bold cyan] {value}  [dim]{label}[/dim]")
+    try:
+        idx = Prompt.ask(
+            "\n[bold]Pick[/bold]",
+            choices=list(choices.keys()),
+            default="3",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return choices[idx][0]
+
+
+def _generate_preview_and_gate(
+    chosen_agent: str,
+    *,
+    count: int,
+    mix: str,
+    mock: bool,
+    cwd: Path,
+) -> tuple[list[dict[str, Any]], float] | None:
+    """Wizard sub-flow: load bundle, loop on generate-and-preview
+    until the operator says "continue", then ask the gate threshold.
+
+    Returns ``(entries, gate)`` on success, ``None`` on cancel.
+
+    The generation runs INSIDE the wizard (rather than waiting for
+    the scorecard to do it later) so the operator sees what's about
+    to be scored and can regenerate before paying for the full
+    judge sweep. The returned ``entries`` are passed to the
+    scorecard via ``pre_generated_entries`` so the scorecard
+    doesn't re-generate.
+    """
+    from movate.core.loader import AgentLoadError, load_agent  # noqa: PLC0415
+
+    agent_path = cwd / "agents" / chosen_agent
+    try:
+        bundle = load_agent(agent_path)
+    except AgentLoadError as exc:
+        err_console.print(f"[red]✗[/red] could not load agent {chosen_agent}: {exc}")
+        return None
+
+    while True:
+        # Generate with a spinner so the operator sees something
+        # happening during the 10-30s LLM call.
+        with console.status(
+            f"[bold cyan]Generating {count} {mix} cases for "
+            f"[white]{chosen_agent}[/white]…[/bold cyan]",
+            spinner="dots",
+        ):
+            try:
+                entries = asyncio.run(
+                    _generate_cases_for_preview(
+                        bundle, count=count, mix=mix, mock=mock, project_root=cwd
+                    )
+                )
+            except Exception as exc:
+                err_console.print(f"[red]✗[/red] generation failed: {type(exc).__name__}: {exc}")
+                return None
+
+        if not entries:
+            err_console.print(
+                f"[red]✗[/red] generator returned 0 cases for {chosen_agent}. "
+                "Try [bold]mdk doctor[/bold] to verify provider keys, or "
+                "[bold]--mock[/bold] for offline generation."
+            )
+            return None
+
+        _render_cases_preview_table(entries, mix)
+        choice = _prompt_continue_or_regenerate()
+        if choice == "continue":
+            break
+        if choice == "cancel":
+            return None
+        # "regenerate" → loop, generate again.
+
+    gate = _prompt_scorecard_gate()
+    if gate is None:
+        return None
+    return entries, gate
 
 
 def _eval_all_in_project(  # noqa: PLR0912 — orchestrator; branch count reflects the per-agent state machine
