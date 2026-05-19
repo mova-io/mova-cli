@@ -2626,3 +2626,311 @@ class TestOneEventLoopPerInvocation:
             f"{loop_ids}. LiteLLM's LoggingWorker would crash on the "
             f"second call in production."
         )
+
+
+# ---------------------------------------------------------------------------
+# Generator-model auto-detect
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGeneratorModelAutoDetect:
+    """``_resolve_generator_model`` picks the right model based on which
+    keys the operator has set. Precedence (highest wins):
+
+    1. ``--generator-model FLAG`` (explicit choice)
+    2. Agent's declared provider IF its key is set
+    3. First fallback provider with a key set
+    4. Declared provider (preflight will fail with hint)
+    """
+
+    def test_explicit_flag_always_wins_even_with_missing_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the operator passed --generator-model, never override.
+        Even if FLAG's own key is missing, that's the operator's
+        choice — preflight will catch and report."""
+        # Force every key to "unset" so auto-detect would otherwise
+        # bail to precedence 4. Explicit flag must still survive.
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: False)
+
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18",
+            "anthropic/claude-haiku-4-5-20251001",
+        )
+        assert model == "anthropic/claude-haiku-4-5-20251001"
+        assert note is None  # No fallback happened.
+
+    def test_declared_provider_used_when_its_key_is_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Happy path: operator's agent.yaml declares openai/... and
+        they have OPENAI_API_KEY. Use the declared model verbatim."""
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p == "openai",
+        )
+
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18", None
+        )
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+        assert note is None
+
+    def test_falls_back_to_anthropic_when_declared_openai_missing_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Agent declares openai/... but operator only has
+        ANTHROPIC_API_KEY. Auto-detect routes through Anthropic and
+        returns a note explaining the swap."""
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p == "anthropic",
+        )
+
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18", None
+        )
+        assert model == "anthropic/claude-haiku-4-5-20251001"
+        assert note is not None
+        # Note explains what happened + how to suppress the auto-route.
+        plain = _ANSI_RE.sub("", note)
+        assert "openai/gpt-4o-mini-2024-07-18" in plain
+        assert "anthropic/claude-haiku-4-5-20251001" in plain
+        assert "OPENAI_API_KEY" in plain
+        assert "--generator-model" in plain
+
+    def test_fallback_priority_anthropic_before_openai_before_gemini(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pin the priority order — Anthropic first, then OpenAI,
+        then Gemini. Changing this is a UX change worth a deliberate
+        decision, not an accidental refactor."""
+        # Declared = azure (not in fallback list) so all 3 fallbacks
+        # are candidates. Toggle keys one at a time + assert which
+        # one wins.
+        available: set[str] = set()
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p in available)
+
+        # Only Gemini available → use Gemini.
+        available = {"gemini"}
+        model, _ = eval_scorecard_cmd._resolve_generator_model("azure/gpt-4", None)
+        assert model == "gemini/gemini-2.5-flash"
+
+        # OpenAI + Gemini → OpenAI wins (higher priority).
+        available = {"openai", "gemini"}
+        model, _ = eval_scorecard_cmd._resolve_generator_model("azure/gpt-4", None)
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+
+        # All 3 → Anthropic wins.
+        available = {"anthropic", "openai", "gemini"}
+        model, _ = eval_scorecard_cmd._resolve_generator_model("azure/gpt-4", None)
+        assert model == "anthropic/claude-haiku-4-5-20251001"
+
+    def test_no_keys_returns_declared_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nothing configured anywhere → return the declared model
+        so the preflight catches it with the hint message. We don't
+        invent a fake fallback that would later fail anyway."""
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: False)
+
+        model, note = eval_scorecard_cmd._resolve_generator_model(
+            "openai/gpt-4o-mini-2024-07-18", None
+        )
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+        assert note is None
+
+    def test_declared_provider_not_re_probed_as_its_own_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If declared is anthropic/... and the anthropic key is
+        missing, auto-detect should skip anthropic in the fallback
+        list and go straight to OpenAI / Gemini."""
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
+
+        model, note = eval_scorecard_cmd._resolve_generator_model("anthropic/claude-3-opus", None)
+        assert model == "openai/gpt-4o-mini-2024-07-18"
+        assert note is not None
+        plain = _ANSI_RE.sub("", note)
+        assert "anthropic/claude-3-opus" in plain  # declared, mentioned
+        assert "openai/gpt-4o-mini-2024-07-18" in plain  # fallback
+
+    def test_bare_provider_string_handled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Some agent.yaml files declare a bare runtime name without
+        a slash. Don't crash on the missing slash."""
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "openai")
+
+        model, note = eval_scorecard_cmd._resolve_generator_model("openai", None)
+        assert model == "openai"
+        assert note is None
+
+    def test_provider_has_key_returns_false_for_unknown_provider(self) -> None:
+        """Unknown provider prefixes must return False, NOT raise."""
+        # "made-up-provider" isn't in _PROVIDER_TO_ENV_VAR. Should
+        # not raise KeyError, should return False.
+        assert eval_scorecard_cmd._provider_has_key("not-a-real-provider") is False
+
+
+@pytest.mark.unit
+class TestGeneratorAutoDetectIntegration:
+    """End-to-end: the orchestrators emit the fallback note + route
+    through the resolved provider when the operator's key state
+    triggers auto-detect."""
+
+    def test_single_agent_emits_fallback_note_when_auto_routing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stub ``_provider_has_key`` so only anthropic returns True;
+        invoke single-agent scorecard with no --generator-model;
+        verify the fallback note hits stderr + the resolved model
+        propagates to ``_run_scorecard``."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "anthropic")
+
+        captured_models: list[str | None] = []
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            captured_models.append(kwargs.get("generator_model"))
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", str(agent_dir), "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+        # The resolved generator_model passed to _run_scorecard should
+        # be the anthropic fallback (the faq template declares
+        # openai/... and only anthropic has a key per our stub).
+        assert captured_models == ["anthropic/claude-haiku-4-5-20251001"]
+
+        # Fallback note hit stderr.
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "routing generation through" in stderr_plain
+        assert "anthropic/claude-haiku-4-5-20251001" in stderr_plain
+
+    def test_single_agent_no_fallback_note_when_explicit_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--generator-model X`` bypasses auto-detect entirely —
+        no fallback note printed, X used verbatim."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        # No keys set anywhere — would normally trigger auto-detect.
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: False)
+
+        captured_models: list[str | None] = []
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            captured_models.append(kwargs.get("generator_model"))
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            [
+                "eval-scorecard",
+                str(agent_dir),
+                "--count",
+                "3",
+                "--generator-model",
+                "openai/gpt-4o-mini-2024-07-18",
+            ],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert captured_models == ["openai/gpt-4o-mini-2024-07-18"]
+        # No "routing generation through" line — explicit flag wins.
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "routing generation through" not in stderr_plain
+
+    def test_all_groups_fallback_notes_by_message(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With multiple agents declaring the same provider, group
+        their fallback notes into ONE line with an ``applies to:``
+        suffix instead of repeating the identical message."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer", "rag-qa")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: p == "anthropic")
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", "--all", "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        # Single grouped fallback line.
+        assert stderr_plain.count("routing generation through") == 1
+        # All three agents listed in the "applies to" suffix.
+        assert "faq" in stderr_plain
+        assert "summarizer" in stderr_plain
+        assert "rag-qa" in stderr_plain
+
+    def test_all_no_fallback_notes_when_declared_keys_match(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If every agent's declared provider has its key set, the
+        sweep emits NO fallback notes — auto-detect is invisible
+        in the happy path."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+        # All keys set.
+        monkeypatch.setattr(eval_scorecard_cmd, "_provider_has_key", lambda p: True)
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", "--all", "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        stderr_plain = _ANSI_RE.sub("", result.stderr)
+        assert "routing generation through" not in stderr_plain

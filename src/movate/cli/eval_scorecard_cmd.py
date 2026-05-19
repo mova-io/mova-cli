@@ -550,6 +550,109 @@ async def _run_scorecard(
 
 
 # ---------------------------------------------------------------------------
+# Generator-model auto-detect
+# ---------------------------------------------------------------------------
+
+
+# Fallback generator models, in priority order. Used when the agent's
+# declared provider has no key set in the operator's shell. Each entry
+# is (provider_prefix, model_string). Anthropic first because operators
+# who have just one key configured most often have Anthropic right now
+# (May 2026); OpenAI second as the next most common; Gemini third.
+# Azure deliberately omitted — its keys need endpoint config beyond a
+# single env var, and routing generation through Azure transparently
+# would surprise an operator who configured Azure for a specific agent.
+_GENERATOR_FALLBACK_MODELS: tuple[tuple[str, str], ...] = (
+    ("anthropic", "anthropic/claude-haiku-4-5-20251001"),
+    ("openai", "openai/gpt-4o-mini-2024-07-18"),
+    ("gemini", "gemini/gemini-2.5-flash"),
+)
+
+
+def _provider_has_key(provider_prefix: str) -> bool:
+    """True if the operator has a key set (env or credentials file)
+    for ``provider_prefix`` (e.g. ``"anthropic"``, ``"openai"``).
+
+    Reuses the canonical provider→env-var map from ``cli.auth`` so
+    auto-detect agrees with what ``mdk auth status`` reports.
+    Returns False for unknown providers so callers can safely probe
+    arbitrary prefixes.
+    """
+    # Lazy import to avoid pulling auth's transitive deps at module
+    # load time — the scorecard command itself doesn't need them.
+    from movate.cli.auth import _PROVIDER_TO_ENV_VAR  # noqa: PLC0415
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    env_var = _PROVIDER_TO_ENV_VAR.get(provider_prefix)
+    if env_var is None:
+        return False
+    return key_source(env_var) != "unset"
+
+
+def _resolve_generator_model(
+    declared_provider: str, generator_model_flag: str | None
+) -> tuple[str, str | None]:
+    """Pick the generator model for one agent. Returns ``(model, note)``.
+
+    Precedence (highest wins):
+
+    1. ``--generator-model FLAG`` — explicit operator choice. We never
+       second-guess it; even if FLAG's key is missing, the preflight
+       will catch and report.
+    2. The agent's own declared provider IF its key is configured.
+       This is the "everything is as expected" path — operator's
+       agent.yaml says openai/... and they have OPENAI_API_KEY set.
+    3. The first fallback provider with a key set. Lets a project
+       authored with openai/... still run when the operator only has
+       ANTHROPIC_API_KEY in their shell, without forcing them to
+       pass ``--generator-model``. Cases come from a different model
+       than agent.yaml declares; the returned note explains the swap.
+    4. The declared provider as-is. No keys are available anywhere;
+       the preflight will fail with the hint-rich error message.
+
+    The ``note`` is a Rich-marked-up one-liner ready to print to
+    ``err_console`` when a fallback was taken. ``None`` when no
+    swap happened (precedence 1, 2, or 4).
+    """
+    # Precedence 1: explicit flag always wins.
+    if generator_model_flag is not None:
+        return generator_model_flag, None
+
+    # Parse "openai/gpt-4o-mini" → "openai". Bundles may declare a
+    # bare provider (no slash) for some runtimes — treat the whole
+    # string as the prefix in that case.
+    declared_prefix = (
+        declared_provider.split("/", 1)[0] if "/" in declared_provider else declared_provider
+    )
+
+    # Precedence 2: declared provider's key is set → use it.
+    if _provider_has_key(declared_prefix):
+        return declared_provider, None
+
+    # Precedence 3: first fallback with a key.
+    from movate.cli.auth import _PROVIDER_TO_ENV_VAR  # noqa: PLC0415
+
+    for fallback_prefix, fallback_model in _GENERATOR_FALLBACK_MODELS:
+        if fallback_prefix == declared_prefix:
+            # We already failed the declared provider's key check;
+            # don't re-probe it as a fallback.
+            continue
+        if _provider_has_key(fallback_prefix):
+            declared_env_var = _PROVIDER_TO_ENV_VAR.get(declared_prefix, "<unknown>")
+            note = (
+                f"declared provider [bold]{declared_provider}[/bold] has no key "
+                f"in this shell; routing generation through "
+                f"[bold]{fallback_model}[/bold]. To suppress this fallback: "
+                f"export [bold]{declared_env_var}[/bold] or pass "
+                f"[bold]--generator-model {declared_provider}[/bold] (explicit)."
+            )
+            return fallback_model, note
+
+    # Precedence 4: nothing works; preflight will catch.
+    return declared_provider, None
+
+
+# ---------------------------------------------------------------------------
 # Pre-flight auth probe
 # ---------------------------------------------------------------------------
 
@@ -643,6 +746,7 @@ async def _run_scorecard_sweep_async(
     mock: bool,
     judge_model: str | None,
     generator_model: str | None,
+    resolved_per_agent: dict[str, str],
     preflight_models: set[str],
     is_json: bool,
     effective: EffectiveCategories | None,
@@ -690,6 +794,16 @@ async def _run_scorecard_sweep_async(
             continue
 
         project_root = _find_project_root(agent_dir)
+        # Pick the resolved generator model for THIS agent (auto-
+        # detect ran in the orchestrator pre-pass). Falls back to
+        # the bundle's declared provider when the explicit flag is
+        # set (resolved_per_agent is empty in that case) or when
+        # auto-detect found no fallback.
+        effective_generator_model = (
+            generator_model
+            if generator_model is not None
+            else resolved_per_agent.get(agent_dir.name, bundle.spec.model.provider)
+        )
         if not is_json:
             console.print(f"  [dim]Generating {count} {mix} cases…[/dim]")
         try:
@@ -699,7 +813,7 @@ async def _run_scorecard_sweep_async(
                 mix=mix,
                 mock=mock,
                 judge_model=judge_model,
-                generator_model=generator_model,
+                generator_model=effective_generator_model,
                 project_root=project_root,
                 effective=effective,
             )
@@ -1242,11 +1356,25 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
 
     project_root = _find_project_root(agent_path)
 
+    # Auto-detect: if the agent's declared provider has no key but
+    # the operator HAS a key for some other provider, route generation
+    # through the available provider instead of failing the preflight.
+    # ``--generator-model`` always wins; auto-detect is the implicit
+    # behavior when the operator hasn't specified one. ``--mock``
+    # short-circuits the whole resolution.
+    if mock:
+        resolved_model, fallback_note = bundle.spec.model.provider, None
+    else:
+        resolved_model, fallback_note = _resolve_generator_model(
+            bundle.spec.model.provider, generator_model
+        )
+    if fallback_note and output_format == Report.TABLE:
+        err_console.print(f"[yellow]→[/yellow] {fallback_note}")
+
     # Preflight auth probe + scorecard run share ONE asyncio.run so
     # LiteLLM's LoggingWorker queue binds to a single event loop and
     # survives across both. See _run_scorecard_sweep_async for the
     # full chronology of why splitting these breaks LiteLLM.
-    probe_model = generator_model or bundle.spec.model.provider
 
     if output_format == Report.TABLE:
         console.print(
@@ -1259,10 +1387,10 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             mix=mix,
             mock=mock,
             judge_model=judge_model,
-            generator_model=generator_model,
+            generator_model=resolved_model,
             project_root=project_root,
             effective=effective,
-            probe_model=probe_model,
+            probe_model=resolved_model,
         )
     )
 
@@ -1597,9 +1725,44 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         console.print("[dim]mdk_eval_scorecard_all_summary: agents=0 ok=true[/dim]")
         return
 
+    # Pre-pass: load each loadable agent and resolve its generator
+    # model (auto-detect against the operator's configured keys).
+    # Build the preflight set + collect fallback notes here so we
+    # can emit them upfront, BEFORE the sweep header lands. Agents
+    # that fail to load are silently skipped — the main loop's
+    # load_agent step will surface that failure in the rollup
+    # exactly as before.
+    resolved_per_agent: dict[str, str] = {}
+    fallback_notes: list[tuple[str, str]] = []  # [(agent_name, note)]
+    if not mock:
+        for agent_dir in agent_dirs:
+            try:
+                b = load_agent(agent_dir)
+            except AgentLoadError:
+                continue
+            model, note = _resolve_generator_model(b.spec.model.provider, generator_model)
+            resolved_per_agent[agent_dir.name] = model
+            if note:
+                fallback_notes.append((agent_dir.name, note))
+
+    # Emit fallback notes upfront so operators see WHICH agents got
+    # routed to a different provider before the sweep starts. Two
+    # or more agents with the same note get a single grouped line
+    # (typical case: all 10 agents declare openai/... but only
+    # ANTHROPIC_API_KEY is set — one note covers them).
+    if fallback_notes and not is_json:
+        grouped: dict[str, list[str]] = {}
+        for agent_name, note in fallback_notes:
+            grouped.setdefault(note, []).append(agent_name)
+        for note, agents in grouped.items():
+            err_console.print(
+                f"[yellow]→[/yellow] {note} [dim](applies to: {', '.join(sorted(agents))})[/dim]"
+            )
+
     # Preflight model set — see _run_scorecard_sweep_async for the
-    # actual probe. Computed synchronously here because load_agent
-    # is a YAML read, not an LLM call.
+    # actual probe. Built from the resolved generator models (NOT
+    # the declared providers) so the probe matches what will actually
+    # run.
     preflight_models: set[str]
     if mock:
         preflight_models = set()
@@ -1608,18 +1771,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         # one model probes the whole sweep.
         preflight_models = {generator_model}
     else:
-        # Otherwise each agent uses its own declared provider.
-        # We probe each UNIQUE provider once (a project with all
-        # 10 agents on openai/... yields a single probe call).
-        # Agents that fail to load here are silently skipped —
-        # the main loop's load step will surface that failure
-        # in the rollup.
-        preflight_models = set()
-        for agent_dir in agent_dirs:
-            try:
-                preflight_models.add(load_agent(agent_dir).spec.model.provider)
-            except AgentLoadError:
-                continue
+        preflight_models = set(resolved_per_agent.values())
 
     # ONE asyncio.run for the entire sweep — preflight + every
     # per-agent scorecard run share a single event loop. LiteLLM's
@@ -1638,6 +1790,7 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
             mock=mock,
             judge_model=judge_model,
             generator_model=generator_model,
+            resolved_per_agent=resolved_per_agent,
             preflight_models=preflight_models,
             is_json=is_json,
             effective=effective,
