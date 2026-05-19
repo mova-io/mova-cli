@@ -117,10 +117,16 @@ def test_telegram_picker_marker_after_credentials_file_save(
     """Full round-trip: write telegram secrets to the credentials
     file (same as `mdk auth login telegram --no-verify`), then
     autoload, then render the picker — Telegram row should show
-    ``✓ configured``.
+    the configured marker.
 
     Pre-fix this failed because autoload skipped the Telegram secrets,
-    so `_provider_is_configured("telegram")` saw them as unset.
+    so ``_provider_is_configured("telegram")`` saw them as unset.
+
+    Note: as of 2026-05-19 the marker text changed from
+    ``✓ configured`` to ``✓ verified`` for LLM providers, but
+    Telegram still gets ``✓ verified`` (no live-verify probe — its
+    API isn't an LLM one, just confirmed-set-in-env). Assert against
+    the new text.
     """
     store = CredentialsStore()
     store.set("TELEGRAM_BOT_TOKEN", "fake-token")
@@ -138,7 +144,7 @@ def test_telegram_picker_marker_after_credentials_file_save(
     assert result.exit_code == 0, result.stdout + result.stderr
     telegram_lines = [line for line in result.stdout.splitlines() if "Telegram" in line]
     assert telegram_lines
-    # The marker fires: telegram row shows ✓ configured.
-    assert any("configured" in line.lower() for line in telegram_lines), (
-        f"Telegram row should be marked configured after autoload: {telegram_lines}"
+    # The marker fires: telegram row shows the new ``✓ verified`` text.
+    assert any("verified" in line.lower() for line in telegram_lines), (
+        f"Telegram row should be marked verified after autoload: {telegram_lines}"
     )
