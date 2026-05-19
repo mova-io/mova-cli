@@ -25,6 +25,8 @@ from movate.core.models import (
     JobRecord,
     JobStatus,
     JudgeMethod,
+    KbChunk,
+    KbChunkWithScore,
     Metrics,
     RunRecord,
     TenantBudget,
@@ -241,6 +243,27 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_run_feedback_tenant_created "
         "ON run_feedback(tenant_id, created_at DESC)"
     ),
+    # 0.8.2.13: KB chunks for vector retrieval. Embeddings stored as
+    # TEXT (JSON-encoded float arrays); no native vector index. Cosine
+    # similarity computed in Python at query time. Acceptable for KBs
+    # up to ~10k chunks per agent.
+    """
+    CREATE TABLE IF NOT EXISTS kb_chunks (
+        chunk_id        TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        agent           TEXT NOT NULL,
+        source          TEXT NOT NULL,
+        text            TEXT NOT NULL,
+        embedding       TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        content_hash    TEXT NOT NULL,
+        metadata        TEXT,
+        created_at      TEXT NOT NULL,
+        UNIQUE(agent, tenant_id, content_hash)
+    )
+    """,
+    ("CREATE INDEX IF NOT EXISTS idx_kb_chunks_agent_tenant ON kb_chunks(agent, tenant_id)"),
+    ("CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(agent, tenant_id, source)"),
 ]
 
 
@@ -920,6 +943,122 @@ class SqliteProvider:
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # KB chunks — vector retrieval (cosine in Python)
+    # ------------------------------------------------------------------
+
+    async def save_kb_chunk(self, chunk: KbChunk) -> None:
+        import json as _json  # noqa: PLC0415
+
+        embedding_json = _json.dumps(chunk.embedding)
+        metadata_json = _json.dumps(chunk.metadata) if chunk.metadata is not None else None
+        # INSERT OR REPLACE on the unique (agent, tenant_id, content_hash)
+        # would also work but sqlite's REPLACE = DELETE+INSERT changes
+        # the chunk_id. We want to PRESERVE chunk_id so anything that
+        # cached it still works. Use ON CONFLICT explicitly.
+        await self._db.execute(
+            """
+            INSERT INTO kb_chunks (
+                chunk_id, tenant_id, agent, source, text, embedding,
+                embedding_model, content_hash, metadata, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(agent, tenant_id, content_hash) DO UPDATE SET
+                embedding = excluded.embedding,
+                embedding_model = excluded.embedding_model,
+                metadata = excluded.metadata,
+                source = excluded.source
+            """,
+            (
+                chunk.chunk_id,
+                chunk.tenant_id,
+                chunk.agent,
+                chunk.source,
+                chunk.text,
+                embedding_json,
+                chunk.embedding_model,
+                chunk.content_hash,
+                metadata_json,
+                chunk.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def search_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        # Same Python-cosine ranking as Postgres path. The index on
+        # (agent, tenant_id) keeps the SELECT cheap; ranking dominates.
+        from movate.storage.postgres import _rank_chunks_by_cosine  # noqa: PLC0415
+
+        chunks = await self.list_kb_chunks(agent=agent, tenant_id=tenant_id, limit=100_000)
+        return _rank_chunks_by_cosine(chunks, query_embedding, limit)
+
+    async def list_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+        limit: int = 1000,
+    ) -> list[KbChunk]:
+        import json as _json  # noqa: PLC0415
+
+        clauses = ["agent = ?", "tenant_id = ?"]
+        params: list[Any] = [agent, tenant_id]
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        params.append(int(limit))
+        sql = (
+            "SELECT chunk_id, tenant_id, agent, source, text, embedding, "
+            "embedding_model, content_hash, metadata, created_at "
+            "FROM kb_chunks WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC LIMIT ?"
+        )
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            KbChunk(
+                chunk_id=r["chunk_id"],
+                tenant_id=r["tenant_id"],
+                agent=r["agent"],
+                source=r["source"],
+                text=r["text"],
+                embedding=_json.loads(r["embedding"]),
+                embedding_model=r["embedding_model"],
+                content_hash=r["content_hash"],
+                metadata=_json.loads(r["metadata"]) if r["metadata"] else None,
+                created_at=datetime.fromisoformat(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    async def delete_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        if source is not None:
+            async with self._db.execute(
+                "DELETE FROM kb_chunks WHERE agent = ? AND tenant_id = ? AND source = ?",
+                (agent, tenant_id, source),
+            ) as cur:
+                count = cur.rowcount
+        else:
+            async with self._db.execute(
+                "DELETE FROM kb_chunks WHERE agent = ? AND tenant_id = ?",
+                (agent, tenant_id),
+            ) as cur:
+                count = cur.rowcount
+        await self._db.commit()
+        return int(count or 0)
 
     async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
         # First-of-the-month UTC. We do this in Python so the SQL

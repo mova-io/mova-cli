@@ -18,6 +18,8 @@ from movate.core.models import (
     FeedbackRecord,
     JobRecord,
     JobStatus,
+    KbChunk,
+    KbChunkWithScore,
     RunRecord,
     TenantBudget,
     WorkflowRunRecord,
@@ -49,6 +51,7 @@ class InMemoryStorage:
         self.api_keys: list[ApiKeyRecord] = []
         self.tenant_budgets: dict[str, TenantBudget] = {}
         self.feedback: list[FeedbackRecord] = []
+        self.kb_chunks: list[KbChunk] = []
 
     async def init(self) -> None:
         return None
@@ -345,6 +348,64 @@ class InMemoryStorage:
         # OR REPLACE semantics).
         self.feedback = [f for f in self.feedback if f.feedback_id != feedback.feedback_id]
         self.feedback.append(feedback)
+
+    async def save_kb_chunk(self, chunk: KbChunk) -> None:
+        # Upsert on (agent, tenant_id, content_hash). Preserve
+        # ``chunk_id`` when updating so cached references stay valid
+        # — matches the Postgres + sqlite contract.
+        key = (chunk.agent, chunk.tenant_id, chunk.content_hash)
+        for i, existing in enumerate(self.kb_chunks):
+            if (existing.agent, existing.tenant_id, existing.content_hash) == key:
+                # Replace in place, keep the old chunk_id.
+                self.kb_chunks[i] = chunk.model_copy(update={"chunk_id": existing.chunk_id})
+                return
+        self.kb_chunks.append(chunk)
+
+    async def search_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        from movate.storage.postgres import _rank_chunks_by_cosine  # noqa: PLC0415
+
+        chunks = [c for c in self.kb_chunks if c.agent == agent and c.tenant_id == tenant_id]
+        return _rank_chunks_by_cosine(chunks, query_embedding, limit)
+
+    async def list_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+        limit: int = 1000,
+    ) -> list[KbChunk]:
+        rows = [c for c in self.kb_chunks if c.agent == agent and c.tenant_id == tenant_id]
+        if source is not None:
+            rows = [c for c in rows if c.source == source]
+        rows = sorted(rows, key=lambda c: c.created_at, reverse=True)
+        return rows[: int(limit)]
+
+    async def delete_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        before = len(self.kb_chunks)
+        self.kb_chunks = [
+            c
+            for c in self.kb_chunks
+            if not (
+                c.agent == agent
+                and c.tenant_id == tenant_id
+                and (source is None or c.source == source)
+            )
+        ]
+        return before - len(self.kb_chunks)
 
     async def list_feedback(
         self,

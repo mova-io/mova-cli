@@ -1669,5 +1669,94 @@ class FeedbackRecord(BaseModel):
         )
 
 
+class KbChunk(BaseModel):
+    """A single retrievable chunk of a knowledge-base document.
+
+    Written by ``mdk kb ingest <agent> <path>`` and queried by the
+    ``kb-vector-lookup`` skill at agent run time. Lets an agent
+    answer questions over a corpus without the caller having to
+    pre-fetch context (today's ``rag-qa`` template requires the
+    caller to pass ``context: list[str]`` in the input — this
+    flips the model so the agent retrieves its own context).
+
+    Storage strategy (0.8.2.13 MVP): embeddings persisted as plain
+    float arrays — JSONB on Postgres, JSON-encoded TEXT on sqlite.
+    NO native vector index yet (pgvector / sqlite-vss); cosine
+    similarity is computed in Python at query time. This keeps the
+    MVP infrastructure-free + works on Azure Postgres Flex without
+    a server-parameter change. The storage protocol is shaped so a
+    later pgvector swap is the only diff — callers don't change.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str = Field(default_factory=lambda: uuid4().hex)
+    """Stable id; doubles as the table primary key."""
+
+    tenant_id: str
+    """Tenant that owns the chunk. Same scoping convention as runs/
+    feedback — never list / search across tenants."""
+
+    agent: str
+    """Which agent this chunk's KB belongs to. One KB per agent is
+    the v0.9 mental model; future expansion (shared / cross-agent
+    KBs) is deferred until we have a real need."""
+
+    source: str
+    """Source identifier (e.g. file path, URL). The combination of
+    ``(agent, tenant_id, content_hash)`` is unique — see
+    ``content_hash`` for the dedup story."""
+
+    text: str
+    """The chunk's text content. Length-bounded by the chunker's
+    target size (default ~500 tokens; concrete byte cap is left to
+    the chunker, not the storage layer)."""
+
+    embedding: list[float]
+    """Vector representation, length matches the producer model's
+    output dim (OpenAI text-embedding-3-small → 1536). Stored as
+    JSONB on Postgres / JSON-encoded TEXT on sqlite. Cosine similarity
+    against this vector is the retrieval primitive."""
+
+    embedding_model: str
+    """Model identifier that produced ``embedding`` (e.g.
+    ``openai/text-embedding-3-small``). At query time we MUST embed
+    the question with the same model — different models produce
+    incomparable vector spaces. The skill rejects cross-model
+    queries explicitly rather than silently degrading retrieval."""
+
+    content_hash: str
+    """SHA-256 of ``text``. Combined with ``(agent, tenant_id)``
+    forms the dedup key — re-ingesting the same file is idempotent
+    (existing chunks are upserted, not duplicated)."""
+
+    metadata: dict[str, Any] | None = None
+    """Optional bag of source-document attributes — e.g. heading
+    path, page number, section index. Used by citation rendering;
+    not part of the dedup key."""
+
+    created_at: datetime = Field(default_factory=_now)
+
+
+class KbChunkWithScore(BaseModel):
+    """A retrieved :class:`KbChunk` plus its similarity score.
+
+    Search results carry both — the chunk's own data + the cosine
+    similarity (0.0 to 1.0) against the query embedding. Callers use
+    the score to threshold or rank results; CLIs display it for
+    operator inspection.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk: KbChunk
+    score: float = Field(
+        ...,
+        ge=-1.0,
+        le=1.0,
+        description="Cosine similarity. Higher = closer match. 1.0 = identical.",
+    )
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

@@ -38,6 +38,8 @@ from movate.core.models import (
     JobRecord,
     JobStatus,
     JudgeMethod,
+    KbChunk,
+    KbChunkWithScore,
     Metrics,
     RunRecord,
     TenantBudget,
@@ -214,6 +216,35 @@ CREATE INDEX IF NOT EXISTS idx_run_feedback_agent_created
 -- Per-tenant listing (analytics scoped to a workspace).
 CREATE INDEX IF NOT EXISTS idx_run_feedback_tenant_created
     ON run_feedback(tenant_id, created_at DESC);
+
+-- KB chunks for vector retrieval (added 0.8.2.13). Embeddings stored
+-- as JSONB float arrays — NOT pgvector yet. Cosine similarity is
+-- computed in Python at query time. Future: swap to ``embedding
+-- vector(1536)`` + ivfflat index when KB sizes warrant the perf
+-- jump; the storage protocol stays unchanged.
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    chunk_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    embedding       JSONB NOT NULL,
+    embedding_model TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ NOT NULL
+);
+-- Per-agent + per-tenant retrieval scope. Search scans this index
+-- range so the Python cosine loop touches only the relevant chunks.
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_agent_tenant
+    ON kb_chunks(agent, tenant_id);
+-- Dedup: re-ingesting the same content for the same agent is a no-op
+-- via this unique constraint + ON CONFLICT in the upsert path.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_dedup
+    ON kb_chunks(agent, tenant_id, content_hash);
+-- Per-source listing (mdk kb ls --source <path>).
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_source
+    ON kb_chunks(agent, tenant_id, source);
 """
 
 
@@ -894,6 +925,112 @@ class PostgresProvider:
         rows = await self._db.fetch(sql, *params)
         return [_row_to_feedback(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # KB chunks — vector retrieval. Cosine in Python (no pgvector yet).
+    # ------------------------------------------------------------------
+
+    async def save_kb_chunk(self, chunk: KbChunk) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO kb_chunks (
+                chunk_id, tenant_id, agent, source, text, embedding,
+                embedding_model, content_hash, metadata, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
+                SET embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
+                    metadata = EXCLUDED.metadata,
+                    source = EXCLUDED.source
+            """,
+            chunk.chunk_id,
+            chunk.tenant_id,
+            chunk.agent,
+            chunk.source,
+            chunk.text,
+            chunk.embedding,
+            chunk.embedding_model,
+            chunk.content_hash,
+            chunk.metadata,
+            chunk.created_at,
+        )
+
+    async def search_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        # No pgvector yet — load matching chunks and rank in Python.
+        # The (agent, tenant_id) index scopes the scan to one KB; for
+        # KBs under ~10k chunks the Python cosine loop completes in
+        # <50ms. Future pgvector swap will compute the similarity in
+        # SQL and only return the top-K.
+        rows = await self._db.fetch(
+            """
+            SELECT chunk_id, tenant_id, agent, source, text, embedding,
+                   embedding_model, content_hash, metadata, created_at
+            FROM kb_chunks
+            WHERE agent = $1 AND tenant_id = $2
+            """,
+            agent,
+            tenant_id,
+        )
+        chunks = [_row_to_kb_chunk(r) for r in rows]
+        return _rank_chunks_by_cosine(chunks, query_embedding, limit)
+
+    async def list_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+        limit: int = 1000,
+    ) -> list[KbChunk]:
+        clauses = ["agent = $1", "tenant_id = $2"]
+        params: list[Any] = [agent, tenant_id]
+        if source is not None:
+            params.append(source)
+            clauses.append(f"source = ${len(params)}")
+        params.append(int(limit))
+        sql = (
+            "SELECT chunk_id, tenant_id, agent, source, text, embedding, "
+            "embedding_model, content_hash, metadata, created_at "
+            "FROM kb_chunks WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC LIMIT $"
+            + str(len(params))
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_kb_chunk(r) for r in rows]
+
+    async def delete_kb_chunks(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        if source is not None:
+            result = await self._db.execute(
+                "DELETE FROM kb_chunks WHERE agent = $1 AND tenant_id = $2 AND source = $3",
+                agent,
+                tenant_id,
+                source,
+            )
+        else:
+            result = await self._db.execute(
+                "DELETE FROM kb_chunks WHERE agent = $1 AND tenant_id = $2",
+                agent,
+                tenant_id,
+            )
+        # asyncpg's execute returns "DELETE <count>" — parse the count.
+        try:
+            return int(str(result).split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
     async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
         # ``date_trunc('month', now() at time zone 'utc')`` returns the
         # 1st-of-month UTC. The ``metrics->>'cost_usd'`` extraction is
@@ -994,6 +1131,59 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         attempt_count=row["attempt_count"],
         next_retry_at=row["next_retry_at"],
     )
+
+
+def _row_to_kb_chunk(row: asyncpg.Record) -> KbChunk:
+    row_dict = dict(row)
+    return KbChunk(
+        chunk_id=row_dict["chunk_id"],
+        tenant_id=row_dict["tenant_id"],
+        agent=row_dict["agent"],
+        source=row_dict["source"],
+        text=row_dict["text"],
+        embedding=list(row_dict["embedding"]),
+        embedding_model=row_dict["embedding_model"],
+        content_hash=row_dict["content_hash"],
+        metadata=row_dict.get("metadata"),
+        created_at=row_dict["created_at"],
+    )
+
+
+def _rank_chunks_by_cosine(
+    chunks: list[KbChunk], query: list[float], limit: int
+) -> list[KbChunkWithScore]:
+    """Score every chunk against ``query`` by cosine similarity,
+    return the top ``limit`` descending. Shared between Postgres and
+    Sqlite paths so both return identical ranking semantics.
+
+    Cosine = dot(a, b) / (||a|| * ||b||). Both vectors are produced
+    by the same embedding model so the normalization is well-defined;
+    a length mismatch (e.g. caller embedded with a different model
+    than the chunks) raises ValueError — silent dim-mismatch would
+    return garbage scores."""
+    import math  # noqa: PLC0415
+
+    if not chunks:
+        return []
+    q_norm = math.sqrt(sum(x * x for x in query))
+    if q_norm == 0.0:
+        return []
+    scored: list[KbChunkWithScore] = []
+    for c in chunks:
+        if len(c.embedding) != len(query):
+            raise ValueError(
+                f"embedding dim mismatch: chunk {c.chunk_id} is "
+                f"{len(c.embedding)}-dim but query is {len(query)}-dim. "
+                f"Re-embed the query with {c.embedding_model!r} or "
+                f"re-ingest the KB with the query's model."
+            )
+        c_norm = math.sqrt(sum(x * x for x in c.embedding))
+        if c_norm == 0.0:
+            continue  # zero-vector chunks (shouldn't happen) — skip
+        dot = sum(a * b for a, b in zip(c.embedding, query, strict=True))
+        scored.append(KbChunkWithScore(chunk=c, score=dot / (q_norm * c_norm)))
+    scored.sort(key=lambda s: s.score, reverse=True)
+    return scored[: int(limit)]
 
 
 def _row_to_feedback(row: asyncpg.Record) -> FeedbackRecord:
