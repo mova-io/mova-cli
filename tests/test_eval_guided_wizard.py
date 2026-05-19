@@ -179,12 +179,13 @@ def test_guided_single_agent_generate_previews_and_dispatches_to_scorecard(
         ),
     )
 
-    # Six answers: 2=faq, 2=generate, 2=10 cases, 1=standard mix,
-    # 1=continue (after preview table), 3=gate 0.7 (CI default).
+    # Seven answers: 2=faq, 2=generate, 2=10 cases, 1=standard mix,
+    # 1=continue (after preview table), 2=runs 3 (default — averaging
+    # widens the score distribution), 3=gate 0.7 (CI default).
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="2\n2\n2\n1\n1\n3\n",
+        input="2\n2\n2\n1\n1\n2\n3\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
@@ -194,12 +195,14 @@ def test_guided_single_agent_generate_previews_and_dispatches_to_scorecard(
     assert "Test cases?" in combined
     assert "How many cases?" in combined
     assert "Which mix?" in combined
-    # NEW: preview "Looks good?" + gate threshold prompts.
+    # NEW: preview "Looks good?" + runs-per-case + gate threshold prompts.
     assert "Looks good?" in combined
+    assert "Runs per case?" in combined, (
+        "scorecard branch must ask runs-per-case (added 2026-05-19) so "
+        "operators get >0/1.00 binary scores"
+    )
     assert "Gate threshold?" in combined
-    # Runs / Baseline questions still skipped (scorecard doesn't
-    # have those concepts — only the gate carries over).
-    assert "Runs per case?" not in combined
+    # Baseline still skipped (scorecard doesn't have that concept).
     assert "Baseline behavior?" not in combined
 
     # Dispatch fired exactly once, against the right agent, with
@@ -215,6 +218,8 @@ def test_guided_single_agent_generate_previews_and_dispatches_to_scorecard(
     # Gate config carries the operator's 0.7 choice on the overall
     # composite (matches PR #212's ``GateConfig(overall=...)`` shape).
     assert call["gates"].overall == 0.7
+    # Runs-per-case forwarded (operator picked "2" → 3 runs).
+    assert call["runs_per_case"] == 3
 
 
 @pytest.mark.unit
@@ -410,30 +415,35 @@ def test_guided_all_generate_dispatches_to_scorecard_all_sweep(
     )
 
     # Six answers: 1=all, 1=generate fresh, 2=10 cases,
-    # 1=standard mix, 3=gate 0.7 (CI default).
+    # 1=standard mix, 2=runs 3 (default — averaging widens score
+    # range), 3=gate 0.7 (CI default).
     # Note: --all path SKIPS the preview "Looks good?" prompt
-    # (would render N tables); operator only sees the gate
-    # threshold prompt after picking count + mix.
+    # (would render N tables); operator only sees the runs +
+    # gate threshold prompts after picking count + mix.
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="1\n1\n2\n1\n3\n",
+        input="1\n1\n2\n1\n2\n3\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
     assert result.exit_code == 0, combined
 
-    # Wizard sub-prompts: test-cases + count + mix + gate.
+    # Wizard sub-prompts: test-cases + count + mix + runs + gate.
     assert "Test cases?" in combined
     assert "How many cases?" in combined
     assert "Which mix?" in combined
+    assert "Runs per case?" in combined, (
+        "scorecard --all branch must also ask runs-per-case (added "
+        "2026-05-19) so the sweep's per-agent scores average across "
+        "N runs"
+    )
     assert "Gate threshold?" in combined
     # Preview table NOT shown in --all mode.
     assert "Looks good?" not in combined, (
         "the --all path should skip the per-agent preview table (would render N tables x 30s each)"
     )
-    # Legacy questions skipped (the scorecard owns the scoring model).
-    assert "Runs per case?" not in combined
+    # Baseline still skipped (the scorecard owns the scoring model).
     assert "Baseline behavior?" not in combined
 
     # Project-wide sweep fired exactly once with the operator's choices.
@@ -443,6 +453,8 @@ def test_guided_all_generate_dispatches_to_scorecard_all_sweep(
     assert call["mix"] == "standard"
     # Gate carried into GateConfig.overall.
     assert call["gates"].overall == 0.7
+    # Runs-per-case forwarded into the sweep dispatcher.
+    assert call["runs_per_case"] == 3
 
 
 # ---------------------------------------------------------------------------

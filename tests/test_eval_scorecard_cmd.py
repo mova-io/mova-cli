@@ -4433,3 +4433,401 @@ class TestWizardPreviewHelpers:
         # Both inputs render (truncated or not).
         assert "refund window" in out
         assert "SSO posture" in out
+
+
+# ---------------------------------------------------------------------------
+# Preview-cell formatter (2026-05-19) — the upgrade from raw-JSON-dump
+# to scannable key:value lines with Rich color tags.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPreviewCellFormatter:
+    """The wizard's preview table used to dump raw JSON like
+    ``{"decision": "human_review", "risk_score": 0.65, "indicators": [...]}``
+    truncated mid-token; operators couldn't read the structure. The
+    new formatter renders one cyan-keyed line per top-level dict
+    field with type-aware value styling (yellow scalars, dim
+    placeholders, list summaries). The Rich color tags are still
+    PRESENT in the output — Rich strips them at render time, but the
+    raw string returned by the helper carries them so the Table cell
+    can measure width correctly.
+    """
+
+    def test_format_value_none_renders_dim_null(self) -> None:
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        assert _format_value(None, max_chars=20) == "[dim]null[/dim]"
+
+    def test_format_value_bool_and_numbers_are_yellow_scalars(self) -> None:
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        assert _format_value(True, max_chars=20) == "[yellow]True[/yellow]"
+        assert _format_value(0.65, max_chars=20) == "[yellow]0.65[/yellow]"
+        assert _format_value(42, max_chars=20) == "[yellow]42[/yellow]"
+
+    def test_format_value_short_string_passes_through(self) -> None:
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        assert _format_value("hello", max_chars=20) == "hello"
+
+    def test_format_value_long_string_truncates_with_ellipsis(self) -> None:
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        long = "a" * 100
+        out = _format_value(long, max_chars=20)
+        assert len(out) == 20
+        assert out.endswith("…")
+
+    def test_format_value_list_of_dicts_summarizes_with_first_field_value(self) -> None:
+        """Lists of dicts (e.g. ``indicators: [{"code": "damaged_item"},
+        ...]``) are the case that motivated this whole refactor.
+        Render a 1-line summary using the first dict's first-field
+        value as a token so the operator gets a hint at the contents
+        instead of just ``list(3)``."""
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        value = [
+            {"code": "damaged_item", "severity": 0.8},
+            {"code": "late_return", "severity": 0.3},
+        ]
+        out = _format_value(value, max_chars=60)
+        # Shows the list length + the first-field tokens.
+        assert "list(2)" in out
+        assert "damaged_item" in out
+        assert "late_return" in out
+
+    def test_format_value_long_list_shows_truncated_summary_with_remainder(self) -> None:
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        value = [{"code": f"thing_{i}"} for i in range(8)]
+        out = _format_value(value, max_chars=60)
+        assert "list(8)" in out
+        # First 3 are summarized; the rest are counted into ``+5``.
+        assert "+5" in out
+
+    def test_format_value_dict_renders_field_count_placeholder(self) -> None:
+        """Nested dicts collapse to a count placeholder — the operator
+        can drop into ``-o json`` for the full structure if they need
+        to see deeper. Avoids the recursive-rendering rabbit hole."""
+        from movate.cli.eval import _format_value  # noqa: PLC0415
+
+        out = _format_value({"a": 1, "b": 2, "c": 3}, max_chars=60)
+        assert "3 field(s)" in out
+
+    def test_format_for_preview_cell_dict_renders_one_line_per_field(self) -> None:
+        """The whole-cell formatter — dict input becomes ``key: value``
+        lines, one per line. This is the actual upgrade the operator
+        sees in the preview table."""
+        from movate.cli.eval import _format_for_preview_cell  # noqa: PLC0415
+
+        value = {
+            "decision": "human_review",
+            "risk_score": 0.65,
+            "indicators": [{"code": "damaged_item"}],
+        }
+        out = _format_for_preview_cell(value)
+        # Top-level keys are cyan-tagged.
+        assert "[cyan]decision[/cyan]: human_review" in out
+        assert "[cyan]risk_score[/cyan]: [yellow]0.65[/yellow]" in out
+        # Nested list collapses to summary.
+        assert "list(1)" in out
+        # One line per top-level key.
+        assert out.count("\n") == 2
+
+    def test_format_for_preview_cell_none_is_empty_string(self) -> None:
+        """``None`` values (e.g. the ``expected`` field on adversarial
+        cases where the agent is expected to refuse) render as an
+        empty cell — no placeholder noise."""
+        from movate.cli.eval import _format_for_preview_cell  # noqa: PLC0415
+
+        assert _format_for_preview_cell(None) == ""
+
+    def test_format_for_preview_cell_truncates_dict_with_too_many_fields(self) -> None:
+        """When a dict has more fields than ``max_lines``, show the
+        first N + a ``… X more field(s)`` footer so the operator
+        knows there's more underneath."""
+        from movate.cli.eval import _format_for_preview_cell  # noqa: PLC0415
+
+        value = {f"key_{i}": i for i in range(10)}
+        out = _format_for_preview_cell(value, max_lines=3)
+        # 3 visible lines + 1 footer = 4 lines (3 newlines).
+        assert out.count("\n") == 3
+        assert "7 more field(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# Multi-run averaging (2026-05-19) — ``--runs N`` widens the score
+# distribution so operators stop seeing every category at exactly 1.00.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRunsPerCaseAveraging:
+    """Each case is now scored N times and the per-category scores are
+    averaged into a single ``CaseScore`` for the entry. Without this,
+    the LLM judge's binary-ish per-roll behavior produces "everything
+    1.00" at N=1 — there's no variance signal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_averages_scores_across_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive ``_run_scorecard`` with ``runs_per_case=3`` against a
+        stub judge that returns 1.0 on the first call and 0.0 on the
+        second + third. The averaged score should land at 1/3 (~0.333)
+        — the case score reflects the mean of the 3 rolls, not the
+        last one."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        class _StubExecutor:
+            calls = 0
+
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                type(self).calls += 1
+                return RunResponse(
+                    status="success",
+                    data={"answer": f"run_{type(self).calls}"},
+                    metrics=Metrics(cost_usd=0.001, latency_ms=50),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        # Judge returns alternating scores: 1.0 on run 0, 0.0 on runs 1+2.
+        # Each LLM-judged category gets the same value per call.
+        judge_call_count = 0
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            nonlocal judge_call_count
+            score = 1.0 if judge_call_count == 0 else 0.0
+            judge_call_count += 1
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, score),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, f"run_{judge_call_count}"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        # Single entry, scored 3x → expected mean across LLM categories = 1/3.
+        pre_generated = [{"input": {"question": "q1"}, "expected": {"answer": "a1"}}]
+        summary = await _run_scorecard(
+            bundle,
+            count=1,
+            mix="standard",
+            mock=False,
+            judge_model=None,
+            pre_generated_entries=pre_generated,
+            runs_per_case=3,
+        )
+        # Exactly ONE CaseScore — entries collapse across runs.
+        assert summary.count == 1
+        assert len(summary.cases) == 1
+        # Judge called 3 times (once per run); executor called 3 times.
+        assert judge_call_count == 3
+        assert _StubExecutor.calls == 3
+        # Each LLM-judged category averages 1/3 across the 3 runs.
+        for cat in LLM_JUDGED_CATEGORIES:
+            assert summary.cases[0].scores[cat] == pytest.approx(1 / 3, abs=1e-9), (
+                f"category {cat} should average 1/3, got {summary.cases[0].scores[cat]}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_default_runs_is_one_run_per_case(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: the default (``runs_per_case=1``) must
+        execute + judge each case EXACTLY ONCE. Operators not opting
+        into multi-run averaging shouldn't see a sudden N-x cost
+        multiplier."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        exec_calls = 0
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                nonlocal exec_calls
+                exec_calls += 1
+                return RunResponse(
+                    status="success",
+                    data={"answer": "stubbed"},
+                    metrics=Metrics(cost_usd=0.0, latency_ms=10),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        judge_calls = 0
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            nonlocal judge_calls
+            judge_calls += 1
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        pre_generated = [
+            {"input": {"question": "q1"}, "expected": {"answer": "a1"}},
+            {"input": {"question": "q2"}, "expected": {"answer": "a2"}},
+        ]
+        await _run_scorecard(
+            bundle,
+            count=2,
+            mix="standard",
+            mock=False,
+            judge_model=None,
+            pre_generated_entries=pre_generated,
+            # runs_per_case defaults to 1 — no kwarg passed.
+        )
+        # 2 entries x 1 run = 2 executor calls + 2 judge calls.
+        assert exec_calls == 2
+        assert judge_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_run_scorecard_clamps_runs_to_safe_range(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``runs_per_case=0`` or negative would silently produce zero
+        scored cases (the inner loop never enters); ``runs_per_case=999``
+        would explode the operator's API bill. The helper clamps to
+        [1, 10] so neither footgun is reachable."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        exec_calls = 0
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                nonlocal exec_calls
+                exec_calls += 1
+                return RunResponse(
+                    status="success",
+                    data={"a": "y"},
+                    metrics=Metrics(cost_usd=0.0, latency_ms=1),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        async def fake_score_one_case(
+            *args: Any, **kwargs: Any
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 1.0),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        pre_generated = [{"input": {"question": "q1"}, "expected": {"answer": "a1"}}]
+
+        # runs_per_case=0 → clamped to 1.
+        exec_calls = 0
+        await _run_scorecard(
+            bundle,
+            count=1,
+            mix="standard",
+            mock=False,
+            judge_model=None,
+            pre_generated_entries=pre_generated,
+            runs_per_case=0,
+        )
+        assert exec_calls == 1, "runs_per_case=0 must clamp to 1, not 0"
+
+        # runs_per_case=999 → clamped to 10.
+        exec_calls = 0
+        await _run_scorecard(
+            bundle,
+            count=1,
+            mix="standard",
+            mock=False,
+            judge_model=None,
+            pre_generated_entries=pre_generated,
+            runs_per_case=999,
+        )
+        assert exec_calls == 10, f"runs_per_case=999 must clamp to 10, got {exec_calls}"
