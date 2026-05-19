@@ -3509,12 +3509,12 @@ class TestPreflightAutoRetry:
     @pytest.mark.no_preflight_stub
     @pytest.mark.asyncio
     async def test_retry_exhausts_fallbacks_then_exits(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
         """If every configured provider fails preflight, the retry
-        loop runs out of options and raises ``typer.Exit(2)`` with
-        the recoverable-failure hint (which mentions ``mdk doctor``
-        + placeholder cleanup, not the generic env-export hint)."""
+        loop runs out of options, exits 2, AND the exit hint lists
+        the providers that were attempted (so an operator pasting
+        the output has the full chronology)."""
 
         # Both openai + anthropic LOOK configured but both reject.
         monkeypatch.setattr(
@@ -3535,9 +3535,64 @@ class TestPreflightAutoRetry:
                 declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
                 generator_model_flag=None,
                 mock=False,
-                is_json=True,
+                is_json=False,  # allow stderr emission to assert on it
             )
         assert excinfo.value.exit_code == 2
+
+        # Exit hint lists what was attempted — NOT just one model.
+        captured = capsys.readouterr()
+        stderr_plain = _ANSI_RE.sub("", captured.err)
+        assert "Auto-retry attempted:" in stderr_plain
+        # Both providers attempted by retry must appear in the hint.
+        assert "openai/gpt-4o-mini-2024-07-18" in stderr_plain
+        assert "anthropic/claude-haiku-4-5-20251001" in stderr_plain
+
+    @pytest.mark.no_preflight_stub
+    @pytest.mark.asyncio
+    async def test_retry_emits_chronology_in_real_time(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        """Retry notes stream to stderr as each provider gets
+        excluded — NOT batched at the end of the loop. Without this,
+        the exhaust path silently drops the chronology and operators
+        see only the final exit hint with no explanation of what got
+        tried first.
+
+        Regression guard: prior to 2026-05-19, the retry notes lived
+        in an ``auto_route_notes`` list that was only emitted on
+        success. An exhaust path would lose them entirely — exactly
+        the symptom that surfaced when the user's first retry probe
+        ran while ``ANTHROPIC_API_KEY`` was missing from the
+        credentials file."""
+        monkeypatch.setattr(
+            eval_scorecard_cmd,
+            "_provider_has_key",
+            lambda p: p in {"openai", "anthropic"},
+        )
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            failing_model = next(iter(models))
+            raise eval_scorecard_cmd._PreflightAuthError(model=failing_model, message="invalid key")
+
+        monkeypatch.setattr(eval_scorecard_cmd, "_preflight_check_generator_auth", fake_preflight)
+
+        with pytest.raises(typer.Exit):
+            await eval_scorecard_cmd._preflight_with_retry(
+                declared_per_agent={"faq": "openai/gpt-4o-mini-2024-07-18"},
+                generator_model_flag=None,
+                mock=False,
+                is_json=False,
+            )
+
+        captured = capsys.readouterr()
+        stderr_plain = _ANSI_RE.sub("", captured.err)
+        # The FIRST exclusion note must be in stderr even though the
+        # loop ultimately exhausted. Pre-fix this was silently
+        # dropped because notes only emitted on success.
+        assert "preflight:" in stderr_plain
+        assert "excluding openai" in stderr_plain or "openai" in stderr_plain
+        # And the exhaust hint follows.
+        assert "Auto-retry attempted:" in stderr_plain
 
     @pytest.mark.no_preflight_stub
     @pytest.mark.asyncio
