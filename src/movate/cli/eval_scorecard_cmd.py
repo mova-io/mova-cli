@@ -608,6 +608,41 @@ def eval_scorecard(
     gate_cost: float | None = typer.Option(
         None, "--gate-cost", min=0.0, max=1.0, help="Cost-score floor."
     ),
+    # ---- Baseline + drift (Gap 3d) -----------------------------------
+    # Pair: ``--output-baseline path`` writes the current scorecard as
+    # JSON to ``path``; a later run ``--baseline-file path`` reads it
+    # back + diffs per-category. Operators wire ``--baseline-file`` into
+    # PR-time CI to catch regressions vs the main-branch baseline.
+    baseline_file: Path | None = typer.Option(
+        None,
+        "--baseline-file",
+        help=(
+            "Path to a prior scorecard JSON to diff against. Emits a "
+            "per-category drift table + exits 2 if any category dropped "
+            "by more than [bold]--regression-tolerance[/bold]. The file "
+            "shape auto-detects (single-agent vs --all)."
+        ),
+    ),
+    output_baseline: Path | None = typer.Option(
+        None,
+        "--output-baseline",
+        help=(
+            "Write this run's scorecard JSON to the given path. Use after "
+            "a main-branch merge to refresh the committed baseline; CI "
+            "then diffs PRs against it via [bold]--baseline-file[/bold]."
+        ),
+    ),
+    regression_tolerance: float = typer.Option(
+        0.0,
+        "--regression-tolerance",
+        min=0.0,
+        max=1.0,
+        help=(
+            "Allowable score drop vs baseline before flagging a "
+            "regression (0.0-1.0). Default 0.0 = any drop is a "
+            "regression; 0.05 allows for sampling noise."
+        ),
+    ),
 ) -> None:
     """Generate test cases on the fly and score against a 10-category scorecard.
 
@@ -661,6 +696,9 @@ def eval_scorecard(
             judge_model=judge_model,
             output_format=output_format,
             gates=gates,
+            baseline_file=baseline_file,
+            output_baseline=output_baseline,
+            regression_tolerance=regression_tolerance,
         )
         return
 
@@ -679,10 +717,13 @@ def eval_scorecard(
         judge_model=judge_model,
         output_format=output_format,
         gates=gates,
+        baseline_file=baseline_file,
+        output_baseline=output_baseline,
+        regression_tolerance=regression_tolerance,
     )
 
 
-def _run_scorecard_single_agent(
+def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispatch + gate + baseline branches
     *,
     agent_path_str: str,
     count: int,
@@ -691,17 +732,25 @@ def _run_scorecard_single_agent(
     judge_model: str | None,
     output_format: Report = Report.TABLE,
     gates: GateConfig | None = None,
+    baseline_file: Path | None = None,
+    output_baseline: Path | None = None,
+    regression_tolerance: float = 0.0,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
 
     ``output_format=Report.JSON`` swaps the Rich table + greppable
-    summary line for a single-document JSON emission on stdout. The
-    "Generating…" status line is also suppressed so the JSON is the
-    only thing on stdout — pipe-safe for CI scrapers.
+    summary line for a single-document JSON emission on stdout.
 
-    ``gates`` (optional) lets the operator enforce per-category +
-    overall floors. Any gate failure emits a red line + exits 2."""
+    ``gates`` (optional) enforces per-category + overall floors.
+
+    ``baseline_file`` (optional) reads a prior scorecard JSON and
+    renders a drift table; ``--regression-tolerance`` controls how
+    big a per-category drop can be before flagging as a regression.
+    Any regression flips exit code to 2.
+
+    ``output_baseline`` (optional) writes this run's JSON to disk
+    for a future ``--baseline-file`` comparison."""
     if gates is None:
         gates = GateConfig()
     agent_path = Path(agent_path_str)
@@ -730,6 +779,20 @@ def _run_scorecard_single_agent(
 
     gate_failures = gates.check(summary)
 
+    # Baseline / drift comparison. Empty drifts when no baseline_file.
+    drifts: list[CategoryDrift] = []
+    if baseline_file is not None:
+        baseline_data = _load_baseline_means(baseline_file)
+        agent_means = baseline_data.get(summary.agent)
+        if agent_means is None:
+            err_console.print(
+                f"[yellow]⚠[/yellow] baseline file {baseline_file} has no entry "
+                f"for agent {summary.agent!r}. Skipping drift check."
+            )
+        else:
+            drifts = _compute_drift(summary, agent_means, regression_tolerance)
+    has_regressions = any(d.is_regression for d in drifts)
+
     if output_format == Report.JSON:
         doc = _summary_to_json(summary)
         doc["gates"] = _gates_to_json(gates)
@@ -738,8 +801,15 @@ def _run_scorecard_single_agent(
             for cat, actual, threshold in gate_failures
         ]
         doc["gates_passed"] = not gate_failures
+        if baseline_file is not None:
+            doc["baseline_file"] = str(baseline_file)
+            doc["drift"] = _drift_to_json(drifts)
+            doc["has_regressions"] = has_regressions
+            doc["regression_tolerance"] = regression_tolerance
         print(json.dumps(doc, indent=2))
-        if gate_failures:
+        if output_baseline is not None:
+            _write_output_baseline(output_baseline, _summary_to_json(summary))
+        if gate_failures or has_regressions:
             raise typer.Exit(code=2)
         return
 
@@ -748,7 +818,11 @@ def _run_scorecard_single_agent(
     _emit_summary_line(summary)
     if gates.has_any_gate():
         _render_gate_results(gate_failures, gates)
-    if gate_failures:
+    if baseline_file is not None and drifts:
+        _render_drift(drifts, regression_tolerance)
+    if output_baseline is not None:
+        _write_output_baseline(output_baseline, _summary_to_json(summary))
+    if gate_failures or has_regressions:
         raise typer.Exit(code=2)
 
 
@@ -760,6 +834,157 @@ def _gates_to_json(gates: GateConfig) -> dict[str, float | None]:
         "overall": gates.overall,
         **{cat: getattr(gates, cat) for cat in ALL_CATEGORIES},
     }
+
+
+# ---------------------------------------------------------------------------
+# Baseline + drift (Gap 3d)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CategoryDrift:
+    """Per-category drift for one agent between a baseline scorecard
+    and the current run. Used by both the table renderer and the JSON
+    payload."""
+
+    category: str
+    baseline: float
+    current: float
+    delta: float  # current - baseline; negative = score dropped
+    is_regression: bool  # delta < -regression_tolerance
+
+
+def _load_baseline_means(baseline_file: Path) -> dict[str, dict[str, float]]:
+    """Read a prior scorecard JSON and extract per-agent category means.
+
+    Returns ``{agent_name: {category: mean, ..., "overall": mean}}``.
+
+    Auto-detects two shapes:
+
+    * Single-agent (``{"agent": "...", "category_means": {...}, "overall_mean": ...}``)
+    * --all (``{"summaries": [<single-agent shapes>], ...}``)
+
+    Returns ``{}`` on any read / parse error — caller emits a yellow
+    warning and proceeds without drift comparison.
+    """
+    try:
+        data = json.loads(baseline_file.read_text())
+    except (OSError, ValueError):
+        return {}
+
+    def _one(d: dict[str, Any]) -> tuple[str, dict[str, float]]:
+        agent_name = str(d.get("agent", ""))
+        means = dict(d.get("category_means", {}))
+        means["overall"] = float(d.get("overall_mean", 0.0))
+        return agent_name, means
+
+    if isinstance(data, dict) and "summaries" in data:
+        out: dict[str, dict[str, float]] = {}
+        for entry in data.get("summaries", []):
+            if isinstance(entry, dict):
+                name, means = _one(entry)
+                if name:
+                    out[name] = means
+        return out
+    if isinstance(data, dict) and "agent" in data:
+        name, means = _one(data)
+        return {name: means} if name else {}
+    return {}
+
+
+def _compute_drift(
+    current: ScorecardSummary,
+    baseline_means: dict[str, float],
+    tolerance: float,
+) -> list[CategoryDrift]:
+    """Diff current per-category means against baseline. ``tolerance``
+    is the size of a "noise" drop we forgive (default 0.0 = any drop
+    is a regression). Returns one CategoryDrift per category present
+    in both the baseline + current (plus "overall")."""
+    drifts: list[CategoryDrift] = []
+    for cat in ("overall", *ALL_CATEGORIES):
+        if cat not in baseline_means:
+            continue
+        baseline = baseline_means[cat]
+        current_val = (
+            current.overall_mean if cat == "overall" else current.category_means.get(cat, 0.0)
+        )
+        delta = current_val - baseline
+        drifts.append(
+            CategoryDrift(
+                category=cat,
+                baseline=baseline,
+                current=current_val,
+                delta=delta,
+                is_regression=delta < -tolerance,
+            )
+        )
+    return drifts
+
+
+def _render_drift(drifts: list[CategoryDrift], tolerance: float) -> None:
+    """Print a compact drift table comparing baseline vs current. Red
+    rows = regressions; green = improvements; dim = unchanged."""
+    if not drifts:
+        return
+    console.print()
+    table = Table(
+        title="[bold]Drift vs baseline[/bold]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    table.add_column("Category", no_wrap=True)
+    table.add_column("Baseline", justify="right", no_wrap=True)
+    table.add_column("Current", justify="right", no_wrap=True)
+    table.add_column("Δ", justify="right", no_wrap=True)
+    for d in drifts:
+        if d.is_regression:
+            delta_str = f"[bold red]{d.delta:+.3f}[/bold red]"
+        elif d.delta > 0:
+            delta_str = f"[green]{d.delta:+.3f}[/green]"
+        else:
+            delta_str = f"[dim]{d.delta:+.3f}[/dim]"
+        table.add_row(
+            d.category,
+            f"{d.baseline:.2f}",
+            f"{d.current:.2f}",
+            delta_str,
+        )
+    console.print(table)
+    regressions = [d for d in drifts if d.is_regression]
+    if regressions:
+        console.print(
+            f"[bold red]✗ {len(regressions)} regression(s)[/bold red] "
+            f"[dim](drop > tolerance {tolerance:.2f})[/dim]"
+        )
+    else:
+        console.print("[bold green]✓ No regressions[/bold green]")
+
+
+def _drift_to_json(drifts: list[CategoryDrift]) -> list[dict[str, Any]]:
+    """Serialize drift list for the JSON output."""
+    return [
+        {
+            "category": d.category,
+            "baseline": d.baseline,
+            "current": d.current,
+            "delta": d.delta,
+            "is_regression": d.is_regression,
+        }
+        for d in drifts
+    ]
+
+
+def _write_output_baseline(path: Path, payload: dict[str, Any]) -> None:
+    """Write a single-agent or --all scorecard JSON to *path*.
+    Creates parent directories as needed. On write error, emits a
+    yellow warning but doesn't abort the eval."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+        console.print(f"[green]✓[/green] wrote baseline to [bold]{path}[/bold]")
+    except OSError as exc:
+        err_console.print(f"[yellow]⚠[/yellow] could not write baseline to {path}: {exc}")
 
 
 def _render_gate_results(failures: list[tuple[str, float, float]], gates: GateConfig) -> None:
@@ -813,7 +1038,7 @@ def _summary_to_json(summary: ScorecardSummary) -> dict[str, Any]:
     }
 
 
-def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine + format dispatch
+def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state machine + format + gate + baseline
     *,
     count: int,
     mix: str,
@@ -821,6 +1046,9 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
     judge_model: str | None,
     output_format: Report = Report.TABLE,
     gates: GateConfig | None = None,
+    baseline_file: Path | None = None,
+    output_baseline: Path | None = None,
+    regression_tolerance: float = 0.0,
 ) -> None:
     """Project-wide sweep: discover all agents under ./agents/, run the
     scorecard against each, then render a project-level rollup table.
@@ -932,37 +1160,61 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
     }
     agents_failing_gate = {a for a, fs in per_agent_gate.items() if fs}
 
+    # Per-agent drift vs baseline. Empty when no baseline_file.
+    per_agent_drift: dict[str, list[CategoryDrift]] = {}
+    if baseline_file is not None:
+        baseline_data = _load_baseline_means(baseline_file)
+        for s in summaries:
+            agent_means = baseline_data.get(s.agent)
+            if agent_means is None:
+                continue
+            per_agent_drift[s.agent] = _compute_drift(s, agent_means, regression_tolerance)
+    agents_with_regressions = {
+        a for a, drifts in per_agent_drift.items() if any(d.is_regression for d in drifts)
+    }
+
+    # Pre-build the full --all JSON payload so we can both emit it on
+    # stdout (when -o json) AND write it via --output-baseline.
+    all_payload: dict[str, Any] = {
+        "agents_total": len(agent_dirs),
+        "succeeded": len(summaries),
+        "failed": len(failed),
+        "project_mean": project_mean,
+        "mix": mix,
+        "ok": not failed and not agents_failing_gate and not agents_with_regressions,
+        "summaries": [
+            {
+                **_summary_to_json(s),
+                "gate_failures": [
+                    {"category": c, "actual": a, "threshold": t}
+                    for c, a, t in per_agent_gate.get(s.agent, [])
+                ],
+                "gates_passed": not per_agent_gate.get(s.agent, []),
+                **(
+                    {
+                        "drift": _drift_to_json(per_agent_drift[s.agent]),
+                        "has_regressions": any(d.is_regression for d in per_agent_drift[s.agent]),
+                    }
+                    if s.agent in per_agent_drift
+                    else {}
+                ),
+            }
+            for s in summaries
+        ],
+        "failures": [{"agent": name, "reason": reason} for name, reason in failed],
+        "gates": _gates_to_json(gates),
+        "agents_failing_gate": sorted(agents_failing_gate),
+    }
+    if baseline_file is not None:
+        all_payload["baseline_file"] = str(baseline_file)
+        all_payload["regression_tolerance"] = regression_tolerance
+        all_payload["agents_with_regressions"] = sorted(agents_with_regressions)
+
     if is_json:
-        # Single-document emission on stdout. Stable shape — adding
-        # new keys is OK (additive), renaming would break CI scrapers.
-        print(
-            json.dumps(
-                {
-                    "agents_total": len(agent_dirs),
-                    "succeeded": len(summaries),
-                    "failed": len(failed),
-                    "project_mean": project_mean,
-                    "mix": mix,
-                    "ok": not failed and not agents_failing_gate,
-                    "summaries": [
-                        {
-                            **_summary_to_json(s),
-                            "gate_failures": [
-                                {"category": c, "actual": a, "threshold": t}
-                                for c, a, t in per_agent_gate.get(s.agent, [])
-                            ],
-                            "gates_passed": not per_agent_gate.get(s.agent, []),
-                        }
-                        for s in summaries
-                    ],
-                    "failures": [{"agent": name, "reason": reason} for name, reason in failed],
-                    "gates": _gates_to_json(gates),
-                    "agents_failing_gate": sorted(agents_failing_gate),
-                },
-                indent=2,
-            )
-        )
-        if failed or agents_failing_gate:
+        print(json.dumps(all_payload, indent=2))
+        if output_baseline is not None:
+            _write_output_baseline(output_baseline, all_payload)
+        if failed or agents_failing_gate or agents_with_regressions:
             raise typer.Exit(code=2)
         return
 
@@ -1011,14 +1263,27 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — per-agent state machine 
         rollup.add_row(name, "—", "—", f"[red]✗ {reason}[/red]", *empty_gates)
     console.print(rollup)
 
+    # Per-agent drift tables (if a baseline file was provided).
+    for s in summaries:
+        drifts = per_agent_drift.get(s.agent)
+        if not drifts:
+            continue
+        console.print()
+        console.print(f"[dim]── drift for [bold]{s.agent}[/bold]:[/dim]")
+        _render_drift(drifts, regression_tolerance)
+
     # Greppable project-level summary line for CI scraping.
-    overall_ok = not failed and not agents_failing_gate
+    overall_ok = not failed and not agents_failing_gate and not agents_with_regressions
     gate_part = f" gate_failures={len(agents_failing_gate)}" if has_gates else ""
+    drift_part = f" regressions={len(agents_with_regressions)}" if baseline_file is not None else ""
     console.print(
         f"[dim]mdk_eval_scorecard_all_summary: "
         f"agents={len(agent_dirs)} succeeded={len(summaries)} "
-        f"failed={len(failed)}{gate_part} project_mean={project_mean:.3f} "
+        f"failed={len(failed)}{gate_part}{drift_part} "
+        f"project_mean={project_mean:.3f} "
         f"mix={mix} ok={'true' if overall_ok else 'false'}[/dim]"
     )
-    if failed or agents_failing_gate:
+    if output_baseline is not None:
+        _write_output_baseline(output_baseline, all_payload)
+    if failed or agents_failing_gate or agents_with_regressions:
         raise typer.Exit(code=2)
