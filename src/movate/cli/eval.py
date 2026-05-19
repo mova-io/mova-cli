@@ -432,6 +432,24 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
         # via ``eval_scorecard`` (the Typer command) would have no
         # way to forward ``pre_generated_entries`` since it's not a
         # CLI flag.
+        if wizard.scorecard and wizard.all_in_project:
+            # --all + generate: dispatch to the scorecard's project-
+            # wide sweep. The sweep generates per-agent internally;
+            # the wizard skipped its own preview step (would have
+            # rendered N tables x 30s each).
+            from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
+                GateConfig,
+                _run_scorecard_all_in_project,
+            )
+
+            _run_scorecard_all_in_project(
+                count=wizard.scorecard_count,
+                mix=wizard.scorecard_mix,
+                mock=wizard.mock,
+                judge_model=None,
+                gates=GateConfig(overall=wizard.scorecard_gate),
+            )
+            return
         if wizard.scorecard and wizard.path is not None:
             from movate.cli.eval_scorecard_cmd import (  # noqa: PLC0415
                 GateConfig,
@@ -742,22 +760,44 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
     # * "keep" → legacy dataset-based scoring. Falls through to the
     #   gate/runs/baseline questions below.
     #
-    # In --all mode we skip the per-agent prompt entirely and stay on
-    # the legacy flow — too many decisions otherwise (scorecard --all
-    # is on the roadmap as Gap 3).
-    if chosen_agent != "all":
-        raw_choice = _prompt_generate_cases(cwd, chosen_agent)
-        if raw_choice is _CANCELLED:
-            return None
-        # If the operator picked "generate fresh", continue down the
-        # scorecard branch: GENERATE the cases right now, show them
-        # in a preview table, ask gate threshold, then dispatch with
-        # those exact cases (no double-generation).
-        if raw_choice is not None:
-            # Narrow: raw_choice is neither _CANCELLED nor None →
-            # it's the (count, mix) tuple from _ask_scorecard_count_and_mix.
-            assert isinstance(raw_choice, tuple)
-            count, mix = raw_choice
+    # Ask "generate / keep" for BOTH single-agent and --all modes.
+    # Pre-2026-05-19 the wizard skipped this prompt in --all mode and
+    # went straight to legacy gate/runs/baseline — operator running
+    # ``mdk eval --all`` had no way to opt into the 10-cat scorecard
+    # from the wizard. Now both modes get the same question; the
+    # downstream behavior differs only in whether the preview table
+    # fires (single-agent: yes; --all: no, since generating + showing
+    # 10 tables would take 5+ minutes and overwhelm the operator).
+    raw_choice = _prompt_generate_cases(cwd, chosen_agent)
+    if raw_choice is _CANCELLED:
+        return None
+    if raw_choice is not None:
+        # Narrow: raw_choice is neither _CANCELLED nor None →
+        # it's the (count, mix) tuple from _ask_scorecard_count_and_mix.
+        assert isinstance(raw_choice, tuple)
+        count, mix = raw_choice
+        is_all = chosen_agent == "all"
+        if is_all:
+            # --all mode: skip the preview table (would render N
+            # tables x 30s each) but still ask the gate threshold so
+            # CI scripts can gate on the rollup overall mean.
+            gate = _prompt_scorecard_gate()
+            if gate is None:
+                return None
+            entries: list[dict[str, Any]] | None = None
+            console.print()
+            console.print(
+                Panel(
+                    f"[bold]Running:[/bold] scorecard --all "
+                    f"[dim]({count} {mix} cases per agent, "
+                    f"gate-overall={gate})[/dim]",
+                    title="[green]✓[/green] Configured",
+                    border_style="green",
+                    title_align="left",
+                )
+            )
+        else:
+            # Single-agent mode: full preview-and-approve flow.
             preview = _generate_preview_and_gate(
                 chosen_agent, count=count, mix=mix, mock=use_mock, cwd=cwd
             )
@@ -776,20 +816,20 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
                     title_align="left",
                 )
             )
-            return _EvalWizardChoices(
-                path=chosen_agent,
-                all_in_project=False,
-                mock=use_mock,
-                gate=0.0,  # ignored in scorecard mode
-                runs=1,  # ignored in scorecard mode
-                baseline_file=None,
-                output_baseline=None,
-                scorecard=True,
-                scorecard_count=count,
-                scorecard_mix=mix,
-                scorecard_entries=entries,
-                scorecard_gate=gate,
-            )
+        return _EvalWizardChoices(
+            path=None if is_all else chosen_agent,
+            all_in_project=is_all,
+            mock=use_mock,
+            gate=0.0,  # ignored in scorecard mode
+            runs=1,  # ignored in scorecard mode
+            baseline_file=None,
+            output_baseline=None,
+            scorecard=True,
+            scorecard_count=count,
+            scorecard_mix=mix,
+            scorecard_entries=entries,
+            scorecard_gate=gate,
+        )
 
     # Q3: Gate threshold.
     gate_choices = {
@@ -939,38 +979,69 @@ def _prompt_generate_cases(cwd: Path, agent_name: str) -> tuple[int, str] | None
       (or skip generation when no dataset exists). Caller continues
       with legacy gate / runs / baseline questions.
     * ``(count, mix)`` if the operator chose to generate fresh.
-      Caller dispatches to the scorecard flow; the generation itself
-      happens inside the scorecard (no double-generation here).
+      Caller dispatches to the scorecard flow.
+
+    ``agent_name`` may be the literal ``"all"`` — in that case we
+    don't look up a single agent's dataset.jsonl (every agent has
+    its own); just offer the generate/keep choice generically.
 
     Defaults:
-    * No existing dataset → default action is "generate".
+    * No existing dataset / all mode → default action is "generate".
     * Existing dataset → default action is "keep" (regeneration would
       overwrite a possibly-curated file, so opt-in only).
     """
-    dataset_path = cwd / "agents" / agent_name / "evals" / "dataset.jsonl"
-    existing_count = _count_dataset_rows(dataset_path) if dataset_path.is_file() else 0
-
-    console.print()
-    if existing_count > 0:
+    is_all = agent_name == "all"
+    if is_all:
+        # In ``--all`` mode there's no single dataset to count; just
+        # offer the two paths. Existing-dataset agents would be
+        # scored against their files (legacy path); generate path
+        # dispatches to ``scorecard --all`` with fresh cases per
+        # agent. Default to generate — operators picking ``--all``
+        # interactively are typically iterating on the project's
+        # quality, not gating CI against a curated dataset.
+        existing_count = 0
+        console.print()
         console.print(
-            f"[bold]Test cases?[/bold]  "
-            f"[dim](existing dataset has {existing_count} case(s) "
-            f"at {dataset_path.relative_to(cwd)})[/dim]"
+            "[bold]Test cases?[/bold]  "
+            "[dim](generate fresh cases for every agent, or score "
+            "each agent's existing dataset.jsonl)[/dim]"
         )
         choices = {
-            "1": ("keep", f"keep existing dataset ({existing_count} cases) — legacy scoring"),
-            "2": ("generate", "generate fresh cases via LLM — 10-category scorecard"),
+            "1": (
+                "generate",
+                "generate fresh cases via LLM for each agent — 10-category scorecard",
+            ),
+            "2": (
+                "keep",
+                "score each agent's existing dataset.jsonl — legacy scoring",
+            ),
         }
         default = "1"
     else:
-        console.print(
-            "[bold]Test cases?[/bold]  [dim](no dataset found — recommend generating)[/dim]"
-        )
-        choices = {
-            "1": ("generate", "generate fresh cases via LLM — 10-category scorecard"),
-            "2": ("keep", "skip generation — legacy scoring against empty dataset"),
-        }
-        default = "1"
+        dataset_path = cwd / "agents" / agent_name / "evals" / "dataset.jsonl"
+        existing_count = _count_dataset_rows(dataset_path) if dataset_path.is_file() else 0
+
+        console.print()
+        if existing_count > 0:
+            console.print(
+                f"[bold]Test cases?[/bold]  "
+                f"[dim](existing dataset has {existing_count} case(s) "
+                f"at {dataset_path.relative_to(cwd)})[/dim]"
+            )
+            choices = {
+                "1": ("keep", f"keep existing dataset ({existing_count} cases) — legacy scoring"),
+                "2": ("generate", "generate fresh cases via LLM — 10-category scorecard"),
+            }
+            default = "1"
+        else:
+            console.print(
+                "[bold]Test cases?[/bold]  [dim](no dataset found — recommend generating)[/dim]"
+            )
+            choices = {
+                "1": ("generate", "generate fresh cases via LLM — 10-category scorecard"),
+                "2": ("keep", "skip generation — legacy scoring against empty dataset"),
+            }
+            default = "1"
 
     for key, (_, label) in choices.items():
         console.print(f"  [bold cyan][{key}][/bold cyan] {label}")
