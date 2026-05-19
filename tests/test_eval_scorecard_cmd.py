@@ -3772,3 +3772,189 @@ class TestResolveGeneratorModelExclusion:
         )
         assert model == "anthropic/claude-haiku-4-5-20251001"
         assert note is None
+
+
+# ---------------------------------------------------------------------------
+# Judge inherits the resolved generator model (2026-05-19 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestJudgeInheritsResolvedGenerator:
+    """When ``--judge-model`` isn't set explicitly, the judge call
+    should use whatever model the generator was auto-routed to.
+    Otherwise an operator with a stale OpenAI key + working Anthropic
+    key would have a successful generator (auto-detect routes around
+    the stale key) but a silently-failing judge (still points at the
+    declared openai provider), and every LLM-judged category would
+    score 0.0 without any actionable error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_judge_falls_back_to_generator_when_no_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive ``_run_scorecard`` with ``generator_model`` set to the
+        anthropic fallback (mimicking what ``_preflight_with_retry``
+        produces when the operator's openai key is stale) and
+        ``judge_model=None``. The captured judge call must use the
+        anthropic model, NOT the bundle's declared openai provider."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        async def fake_generate_entries(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return [{"input": {"q": "x"}, "expected": {"a": "y"}}]
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._generate_entries", fake_generate_entries
+        )
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                return RunResponse(
+                    status="success",
+                    data={"a": "y"},
+                    metrics=Metrics(cost_usd=0.001, latency_ms=100),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        captured_judge_model: list[str | None] = []
+
+        async def fake_score_one_case(
+            rt: Any,
+            bundle: Any,
+            input_data: Any,
+            output_data: Any,
+            *,
+            judge_model: str | None = None,
+            effective: Any = None,
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            captured_judge_model.append(judge_model)
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        await _run_scorecard(
+            bundle,
+            count=1,
+            mix="standard",
+            mock=False,
+            judge_model=None,  # no explicit override
+            generator_model="anthropic/claude-haiku-4-5-20251001",  # auto-detect resolved here
+        )
+        # Judge was called with the resolved generator model, NOT
+        # the bundle's declared openai provider.
+        assert captured_judge_model == ["anthropic/claude-haiku-4-5-20251001"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_judge_model_overrides_generator(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--judge-model FLAG`` always wins. If the operator
+        explicitly chose a judge model, the auto-detect's resolved
+        generator model must NOT override it."""
+        from movate.core.loader import load_agent  # noqa: PLC0415
+        from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        bundle = load_agent(agent_dir)
+
+        async def fake_generate_entries(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return [{"input": {"q": "x"}, "expected": {"a": "y"}}]
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._generate_entries", fake_generate_entries
+        )
+
+        class _StubExecutor:
+            async def execute(self, bundle: Any, request: Any, **_kw: Any) -> RunResponse:
+                return RunResponse(
+                    status="success",
+                    data={"a": "y"},
+                    metrics=Metrics(cost_usd=0.0, latency_ms=10),
+                )
+
+        class _StubStorage:
+            async def close(self) -> None:
+                pass
+
+        class _StubRuntime:
+            executor = _StubExecutor()
+            provider = None
+            storage = _StubStorage()
+            tracer = None
+
+        async def fake_build_local_runtime(*, mock: bool) -> Any:
+            return _StubRuntime()
+
+        async def fake_shutdown(storage: Any, tracer: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd.build_local_runtime",
+            fake_build_local_runtime,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd.shutdown_runtime", fake_shutdown)
+
+        captured_judge_model: list[str | None] = []
+
+        async def fake_score_one_case(
+            rt: Any,
+            bundle: Any,
+            input_data: Any,
+            output_data: Any,
+            *,
+            judge_model: str | None = None,
+            effective: Any = None,
+        ) -> tuple[dict[str, float], dict[str, str]]:
+            captured_judge_model.append(judge_model)
+            return (
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, 0.9),
+                dict.fromkeys(LLM_JUDGED_CATEGORIES, "ok"),
+            )
+
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._score_one_case", fake_score_one_case)
+
+        from movate.cli.eval_scorecard_cmd import _run_scorecard  # noqa: PLC0415
+
+        await _run_scorecard(
+            bundle,
+            count=1,
+            mix="standard",
+            mock=False,
+            judge_model="gemini/gemini-2.5-flash",  # explicit operator choice
+            generator_model="anthropic/claude-haiku-4-5-20251001",
+        )
+        # Explicit flag wins — generator's anthropic does NOT override.
+        assert captured_judge_model == ["gemini/gemini-2.5-flash"]
