@@ -51,13 +51,17 @@ def test_guided_picks_all_gate_0_runs_1_no_baseline(
     providers; the test asserts on the wizard's resolved command + the
     summary line, NOT on eval success (no API keys in test env).
 
-    Answers in order: agent(1=all), gate(1=0.0), runs(1=1), baseline(1=none).
-    Four answers now instead of five — the mock prompt is gone."""
+    Answers in order: agent(1=all), test_cases(2=keep existing — pick
+    legacy path), gate(1=0.0), runs(1=1), baseline(1=none).
+
+    Five answers as of 2026-05-19: the wizard now asks "Test cases?"
+    in --all mode too (was previously skipped). Picking "keep" routes
+    to legacy gate/runs/baseline — exactly the path this test pins."""
     _bootstrap(tmp_path, monkeypatch)
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="1\n1\n1\n1\n",
+        input="1\n2\n1\n1\n1\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
@@ -252,12 +256,13 @@ def test_guided_baseline_write_creates_dir_and_passes_output_baseline(
     --output-baseline pointing at .movate/baseline.json and the
     .movate/ dir should be created if it doesn't exist."""
     proj = _bootstrap(tmp_path, monkeypatch)
-    # Four answers (mock prompt dropped):
-    # 1=all, 1=gate 0.0, 1=runs 1, 3=write baseline
+    # Five answers (test-cases prompt now fires in --all too as of
+    # 2026-05-19): 1=all, 2=keep existing dataset, 1=gate 0.0,
+    # 1=runs 1, 3=write baseline.
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="1\n1\n1\n3\n",
+        input="1\n2\n1\n1\n3\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
@@ -275,12 +280,12 @@ def test_guided_baseline_compare_warns_when_file_missing(
     exist should warn and skip the drift check — not error."""
     _bootstrap(tmp_path, monkeypatch)
     # Make sure baseline doesn't exist (fresh project doesn't have it).
-    # Four answers (mock prompt dropped):
-    # 1=all, 1=gate 0.0, 1=runs 1, 2=compare
+    # Five answers (test-cases prompt now fires in --all too): 1=all,
+    # 2=keep existing dataset, 1=gate 0.0, 1=runs 1, 2=compare.
     result = runner.invoke(
         app,
         ["eval", "--guided"],
-        input="1\n1\n1\n2\n",
+        input="1\n2\n1\n1\n2\n",
         env={"COLUMNS": "200"},
     )
     combined = result.stdout + result.stderr
@@ -364,3 +369,70 @@ def test_guided_errors_on_empty_project(tmp_path: Path, monkeypatch: pytest.Monk
     combined = result.stdout + result.stderr
     assert "no agents" in combined.lower()
     assert "mdk add" in combined.lower()
+
+
+@pytest.mark.unit
+def test_guided_all_generate_dispatches_to_scorecard_all_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mdk eval`` wizard with ``all + generate`` dispatches to the
+    scorecard's project-wide sweep — NOT the legacy gate/runs/baseline
+    path, and NOT the single-agent preview flow.
+
+    The ``--all`` mode deliberately skips the preview table (which
+    would render N tables x 30s each) but DOES ask the count + mix
+    + gate threshold so the operator gets a CI-gateable sweep.
+
+    Operator footgun fixed in 2026-05-19: previously the wizard
+    asked the "Test cases?" question only for single-agent mode and
+    silently skipped it for ``--all``, meaning operators picking
+    ``all`` couldn't get to the scorecard from the wizard at all.
+    """
+    _bootstrap(tmp_path, monkeypatch)
+
+    # Mock the project-wide sweep so we can assert dispatch shape
+    # without needing real LLM keys.
+    dispatch_calls: list[dict[str, object]] = []
+
+    def fake_run_all(**kwargs: object) -> None:
+        dispatch_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "movate.cli.eval_scorecard_cmd._run_scorecard_all_in_project",
+        fake_run_all,
+    )
+
+    # Six answers: 1=all, 1=generate fresh, 2=10 cases,
+    # 1=standard mix, 3=gate 0.7 (CI default).
+    # Note: --all path SKIPS the preview "Looks good?" prompt
+    # (would render N tables); operator only sees the gate
+    # threshold prompt after picking count + mix.
+    result = runner.invoke(
+        app,
+        ["eval", "--guided"],
+        input="1\n1\n2\n1\n3\n",
+        env={"COLUMNS": "200"},
+    )
+    combined = result.stdout + result.stderr
+    assert result.exit_code == 0, combined
+
+    # Wizard sub-prompts: test-cases + count + mix + gate.
+    assert "Test cases?" in combined
+    assert "How many cases?" in combined
+    assert "Which mix?" in combined
+    assert "Gate threshold?" in combined
+    # Preview table NOT shown in --all mode.
+    assert "Looks good?" not in combined, (
+        "the --all path should skip the per-agent preview table (would render N tables x 30s each)"
+    )
+    # Legacy questions skipped (the scorecard owns the scoring model).
+    assert "Runs per case?" not in combined
+    assert "Baseline behavior?" not in combined
+
+    # Project-wide sweep fired exactly once with the operator's choices.
+    assert len(dispatch_calls) == 1, f"expected 1 dispatch, got {dispatch_calls}"
+    call = dispatch_calls[0]
+    assert call["count"] == 10
+    assert call["mix"] == "standard"
+    # Gate carried into GateConfig.overall.
+    assert call["gates"].overall == 0.7
