@@ -17,6 +17,9 @@ storage methods through middleware.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+from typing import Literal
 
 import typer
 from rich.console import Console
@@ -655,12 +658,16 @@ def status() -> None:
     table.add_column("Source", style="dim")
     table.add_column("Hint", style="dim")
 
-    counts = {"ok": 0, "unset": 0}
+    counts = {"ok": 0, "unset": 0, "rejected": 0}
+    # Live-verify every set LLM provider in parallel so the table
+    # below distinguishes ``✓ verified`` from ``✗ set but rejected``
+    # (key persisted but provider returns 401). Bounded ~5s.
+    _verify_all_configured_providers_in_parallel()
     for env_var in PROVIDER_KEY_ENV_VARS:
         src = key_source(env_var)
+        provider = env_var.lower().removesuffix("_api_key").split("_")[0]
         if src == "unset":
             counts["unset"] += 1
-            provider = env_var.lower().removesuffix("_api_key").split("_")[0]
             table.add_row(
                 env_var,
                 "[yellow]⊘ not set[/yellow]",
@@ -668,13 +675,37 @@ def status() -> None:
                 f"run [bold]mdk auth login {provider}[/bold]",
             )
         else:
-            counts["ok"] += 1
-            table.add_row(
-                env_var,
-                "[green]✓ set[/green]",
-                src.replace("_", " "),
-                "",
-            )
+            # Translate the verify state into a per-row marker + hint.
+            # ``rejected`` is counted separately from ``ok`` so the
+            # summary line at the bottom tells the operator they have
+            # an actionable problem (set-but-broken) distinct from a
+            # missing-key problem.
+            state = _provider_status(provider)
+            if state == "verified":
+                counts["ok"] += 1
+                table.add_row(
+                    env_var,
+                    "[green]✓ verified[/green]",
+                    src.replace("_", " "),
+                    "",
+                )
+            elif state == "rejected":
+                counts["rejected"] += 1
+                table.add_row(
+                    env_var,
+                    "[red]✗ set but rejected[/red]",
+                    src.replace("_", " "),
+                    f"key set but provider 401'd — "
+                    f"run [bold]mdk auth login {provider}[/bold] to rotate",
+                )
+            else:  # unverifiable
+                counts["ok"] += 1
+                table.add_row(
+                    env_var,
+                    "[yellow]⚠ set, couldn't verify[/yellow]",
+                    src.replace("_", " "),
+                    "network error reaching provider — try again later",
+                )
 
     # Separator + notifications group. `mdk deploy --notify` reads
     # these env vars; surface them in the status table so operators
@@ -723,7 +754,15 @@ def status() -> None:
 
     stdout.print()
     stdout.print(f"[dim]credentials file: [cyan]{CredentialsStore().path}[/cyan][/dim]")
-    stdout.print(f"[dim]mdk_auth_status_summary: set={counts['ok']} unset={counts['unset']}[/dim]")
+    # Summary line tail keeps the ``set=`` and ``unset=`` keys for
+    # backwards-compat with downstream scrapers; adds ``rejected=``
+    # when any keys came back 401 so CI scripts can gate on it
+    # (``mdk_auth_status_summary: ... rejected=1`` → flagged).
+    rejected_part = f" rejected={counts['rejected']}" if counts["rejected"] else ""
+    stdout.print(
+        f"[dim]mdk_auth_status_summary: set={counts['ok']} "
+        f"unset={counts['unset']}{rejected_part}[/dim]"
+    )
 
 
 def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PLR0912 — per-target state-machine reads clearer flat than refactored
@@ -1306,6 +1345,12 @@ def _provider_is_configured(provider: str) -> bool:
     :data:`_PROVIDER_TO_ENV_VAR`). Telegram is special: needs BOTH
     ``TELEGRAM_BOT_TOKEN`` AND ``TELEGRAM_CHAT_ID`` — show "configured"
     only if both are set.
+
+    This is a CHEAP boolean — just "is something there?" — without
+    contacting the provider. For the UI markers in ``mdk auth login``
+    and ``mdk auth status``, see :func:`_provider_status` which adds
+    a live-verify probe so the marker can distinguish "set + works"
+    from "set + rejected by provider".
     """
     from movate.credentials import key_source  # noqa: PLC0415
 
@@ -1318,6 +1363,143 @@ def _provider_is_configured(provider: str) -> bool:
     if env_var is None:
         return False
     return key_source(env_var) != "unset"
+
+
+# State returned by :func:`_provider_status` — drives the marker
+# rendered in the auth-login picker and the auth-status table.
+#
+# ``unset`` — no key configured for this provider.
+# ``verified`` — key is set AND the provider's metadata endpoint
+#   accepted it. Safe to use for real work.
+# ``rejected`` — key is set but the provider returned 401 / "invalid
+#   key". Operator needs to rotate. THIS is the state that used to be
+#   silently shown as ``✓ configured`` even though the key was bogus
+#   (the bug the 2026-05-19 reproduction surfaced: stub keys lingering
+#   in shells / credentials file).
+# ``unverifiable`` — key is set, but we couldn't reach the provider
+#   to verify (network error, DNS failure, hard timeout). Don't lie
+#   to the operator either way — show "set, not verified".
+ProviderState = Literal["unset", "verified", "rejected", "unverifiable"]
+
+
+# Tiny per-process cache. ``mdk auth login``'s picker calls
+# ``_provider_status`` once per provider; ``mdk auth status`` also
+# iterates over them. Without a cache we'd double-probe every
+# provider. Scoped per-process so multi-shot CLI commands re-verify
+# (a key rotated mid-session would otherwise still appear stale).
+_verify_cache: dict[str, ProviderState] = {}
+
+
+def _provider_status(provider: str) -> ProviderState:
+    """Return the verified state of a provider's API key.
+
+    Goes beyond :func:`_provider_is_configured` by actually calling
+    the provider's metadata endpoint when a key is set, so the
+    operator-facing marker can show "set but rejected" (key is wrong)
+    distinctly from "set + verified" (key works). The probe is the
+    same one ``mdk auth login`` uses post-save; cost is ~$0 per call.
+
+    Telegram is not live-verifiable through this path (its API is
+    different + isn't an LLM provider); returns ``verified`` when
+    both env vars are set, ``unset`` otherwise.
+
+    Cached per-process — repeated calls in one CLI invocation share
+    the result so the picker + status table don't double-probe.
+    """
+    # Telegram check stays cheap — no HTTP call.
+    if provider == "telegram":
+        return "verified" if _provider_is_configured("telegram") else "unset"
+
+    if not _provider_is_configured(provider):
+        return "unset"
+
+    if provider in _verify_cache:
+        return _verify_cache[provider]
+
+    env_var = _PROVIDER_TO_ENV_VAR.get(provider)
+    if env_var is None:
+        return "unset"
+    key_value = os.environ.get(env_var, "").strip()
+    if not key_value:
+        # Defensive: ``_provider_is_configured`` said True but the
+        # env value is empty. Treat as unset.
+        return "unset"
+
+    # Live probe. Network errors → ``unverifiable`` (don't claim
+    # rejection when we can't actually reach the provider).
+    try:
+        from movate.credentials import verify_provider_key  # noqa: PLC0415
+
+        result = verify_provider_key(provider, key_value)
+    except Exception:
+        # ``verify_provider_key`` already catches httpx errors and
+        # returns a ``VerifyResult(network_error=True)`` — this except
+        # is only for truly unexpected exceptions (e.g. a verify
+        # implementation for a new provider that's not wired yet).
+        state: ProviderState = "unverifiable"
+    else:
+        if result.ok:
+            state = "verified"
+        elif result.network_error:
+            state = "unverifiable"
+        else:
+            state = "rejected"
+
+    _verify_cache[provider] = state
+    return state
+
+
+def _verify_all_configured_providers_in_parallel() -> None:
+    """Pre-warm :data:`_verify_cache` for every configured LLM provider
+    in parallel — so the auth-status table / login picker render in
+    ~1 round-trip latency instead of N sequential probes.
+
+    ``mdk auth status`` was visibly slow when 3+ providers needed a
+    5-second-per-probe HTTP roundtrip. Threading them out keeps the
+    total wait bounded by the slowest single provider.
+
+    Safe to call multiple times — each call is a no-op for providers
+    already in the cache.
+    """
+    import concurrent.futures  # noqa: PLC0415
+
+    # Only probe providers that have keys AND aren't already cached.
+    todo = [
+        provider
+        for provider in _PROVIDER_TO_ENV_VAR
+        if provider not in _verify_cache and _provider_is_configured(provider)
+    ]
+    if not todo:
+        return
+
+    # Each verify call has its own 5-second timeout; threading 4 of
+    # them caps the picker wait at ~5s in the worst case (vs ~20s
+    # serially).
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(todo)) as executor:
+        futures = {executor.submit(_provider_status, p): p for p in todo}
+        for future in concurrent.futures.as_completed(futures):
+            # The function caches its own result; we just need to wait.
+            with contextlib.suppress(Exception):
+                future.result()
+
+
+def _provider_status_marker(provider: str) -> str:
+    """Render the Rich-marked-up marker text for a provider's state.
+
+    Returns the empty string for the ``unset`` case (no marker —
+    matches the legacy "blank means unconfigured" pattern). The other
+    three states each get a distinct color + glyph so an operator
+    glancing at the picker can tell at a glance which row needs
+    attention.
+    """
+    state = _provider_status(provider)
+    if state == "verified":
+        return " [green]✓ verified[/green]"
+    if state == "rejected":
+        return " [red]✗ set but rejected[/red]"
+    if state == "unverifiable":
+        return " [yellow]⚠ set, couldn't verify[/yellow]"
+    return ""
 
 
 def _prompt_for_provider() -> str:
@@ -1346,12 +1528,19 @@ def _prompt_for_provider() -> str:
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
+    # Live-verify every configured provider in parallel BEFORE rendering
+    # the picker so the markers reflect reality, not "is the env var
+    # populated with anything" (which silently green-checked stub keys
+    # like ``sk-test-*****2345`` before this change). Threading caps
+    # total latency at ~5s worst case (one probe roundtrip) regardless
+    # of how many providers are configured.
+    _verify_all_configured_providers_in_parallel()
     for i, (key, name) in enumerate(options, start=1):
-        # Green check when already configured. Re-running login on a
-        # configured provider is still allowed — it overwrites the
-        # stored key (useful for rotation), but the marker tells
-        # operators they're picking an "already-done" row.
-        marker = " [green]✓ configured[/green]" if _provider_is_configured(key) else ""
+        # Marker now distinguishes ``✓ verified`` (key set + provider
+        # accepted) from ``✗ set but rejected`` (key set + provider
+        # 401'd) so an operator picking option N knows whether they're
+        # rotating a working key or replacing a broken one.
+        marker = _provider_status_marker(key)
         stdout.print(f"  [cyan]{i}[/cyan]) {name} [dim]({key})[/dim]{marker}")
     raw_input = typer.prompt(f"Choice [1-{len(options)} or provider name]")
     raw = str(raw_input).strip()
