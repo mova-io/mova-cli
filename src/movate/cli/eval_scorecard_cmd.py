@@ -540,12 +540,26 @@ async def _run_scorecard(
             cost_usd = float(response.metrics.cost_usd or 0.0)
             output_data = response.data
 
+            # The judge inherits the resolved generator model when no
+            # explicit ``--judge-model`` flag was passed. Without this,
+            # an operator with a stale ``OPENAI_API_KEY`` but a working
+            # ``ANTHROPIC_API_KEY`` would have the generator auto-route
+            # to anthropic (via _preflight_with_retry) while the judge
+            # still pointed at the declared openai provider — every
+            # case's judge call would AuthError silently, dumping all
+            # LLM-judged categories to 0.0. By falling back to
+            # ``generator_model`` (which IS the resolved + preflight-
+            # verified model when the operator didn't pass an explicit
+            # judge override), the judge picks up the same auto-detect
+            # benefit as generation. Caller's explicit ``--judge-model
+            # FLAG`` always wins (preserves operator intent).
+            effective_judge_model = judge_model or generator_model
             llm_scores, rationales = await _score_one_case(
                 rt,
                 bundle,
                 input_data,
                 output_data,
-                judge_model=judge_model,
+                judge_model=effective_judge_model,
                 effective=effective,
             )
             prog_scores_full = _measure_programmatic(latency_ms, cost_usd)
