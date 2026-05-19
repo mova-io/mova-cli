@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 import re
@@ -2478,3 +2479,150 @@ class TestPreflightIntegration:
         assert result.exit_code == 2
         # No agent's scorecard ran — preflight aborted upfront.
         assert run_scorecard_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Single-asyncio.run-per-invocation regression guard (2026-05-18 bug)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOneEventLoopPerInvocation:
+    """LiteLLM's module-level ``LoggingWorker`` holds an ``asyncio.Queue``
+    that binds to whichever event loop first touches it. Splitting the
+    scorecard flow across multiple ``asyncio.run`` calls (preflight +
+    one-per-agent in the old shape) closed that loop under LiteLLM's
+    feet and surfaced as ``RuntimeError: Queue is bound to a different
+    event loop`` on every subsequent ``acompletion``.
+
+    These tests pin the invariant: ONE ``asyncio.run`` per top-level
+    CLI invocation. If someone reintroduces a per-agent or
+    preflight-then-loop pattern, these tests fail before LiteLLM
+    crashes in production.
+    """
+
+    def test_all_sweep_uses_exactly_one_asyncio_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--all`` against N agents must call ``asyncio.run`` exactly
+        once total (NOT once per agent + once for preflight)."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer", "rag-qa")
+
+        run_calls: list[Any] = []
+        real_run = asyncio.run
+
+        def counting_run(coro: Any, **kwargs: Any) -> Any:
+            run_calls.append(coro)
+            return real_run(coro, **kwargs)
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd.asyncio, "run", counting_run)
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", "--all", "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # 3 agents — would have been 4 calls in the pre-fix shape
+        # (1 preflight + 3 per-agent). Now exactly 1.
+        assert len(run_calls) == 1, (
+            f"Expected exactly 1 asyncio.run call for --all sweep, "
+            f"got {len(run_calls)}. Each extra call risks stranding "
+            f"LiteLLM's LoggingWorker queue in a closed event loop."
+        )
+
+    def test_single_agent_uses_exactly_one_asyncio_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-agent path must call ``asyncio.run`` exactly once
+        (NOT once for preflight + once for the scorecard run)."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq")
+
+        run_calls: list[Any] = []
+        real_run = asyncio.run
+
+        def counting_run(coro: Any, **kwargs: Any) -> Any:
+            run_calls.append(coro)
+            return real_run(coro, **kwargs)
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(eval_scorecard_cmd.asyncio, "run", counting_run)
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        agent_dir = tmp_path / "proj" / "agents" / "faq"
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", str(agent_dir), "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # Was 2 in the pre-fix shape (preflight + scorecard). Now 1.
+        assert len(run_calls) == 1, (
+            f"Expected exactly 1 asyncio.run call for single-agent path, "
+            f"got {len(run_calls)}. Each extra call risks stranding "
+            f"LiteLLM's LoggingWorker queue in a closed event loop."
+        )
+
+    def test_sweep_preflight_and_scorecard_share_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The preflight probe and every per-agent scorecard run must
+        execute in the SAME event loop. Captures the loop id at each
+        await point and asserts they all match."""
+        _scaffold_project_with_agents(tmp_path, monkeypatch, "faq", "summarizer")
+
+        loop_ids: list[int] = []
+
+        async def fake_preflight(*, models: set[str], mock: bool) -> None:
+            loop_ids.append(id(asyncio.get_running_loop()))
+
+        async def fake_run_scorecard(bundle: Any, **kwargs: Any) -> ScorecardSummary:
+            loop_ids.append(id(asyncio.get_running_loop()))
+            return ScorecardSummary(
+                agent=bundle.spec.name,
+                mix="standard",
+                count=3,
+                cases=[],
+                category_means=dict.fromkeys(ALL_CATEGORIES, 0.85),
+                overall_mean=0.85,
+            )
+
+        monkeypatch.setattr(
+            "movate.cli.eval_scorecard_cmd._preflight_check_generator_auth",
+            fake_preflight,
+        )
+        monkeypatch.setattr("movate.cli.eval_scorecard_cmd._run_scorecard", fake_run_scorecard)
+
+        result = runner.invoke(
+            app,
+            ["eval-scorecard", "--all", "--count", "3"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # 1 preflight + 2 agents = 3 calls, ALL on the same loop.
+        assert len(loop_ids) == 3
+        assert len(set(loop_ids)) == 1, (
+            f"Preflight + per-agent runs landed in different event loops: "
+            f"{loop_ids}. LiteLLM's LoggingWorker would crash on the "
+            f"second call in production."
+        )
