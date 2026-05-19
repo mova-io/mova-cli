@@ -912,6 +912,102 @@ track each slice; status here mirrors the v0.7 milestone.
 
 ---
 
+## 10. RAG enhancements (May 2026)
+
+Operator ask 2026-05-19: improve MDK's RAG story so agents can retrieve their
+own context (not require the caller to pre-fetch chunks). Each item below
+is a micro-sprint sized to ≤5 hours so it fits in one focused work block.
+
+**Critical context.** Today's `rag-qa` template requires the caller to pass
+`context: list[str]` as input — there's no internal retrieval, no KB
+ingestion pipeline, no vector store. The `skill_kb_lookup` template does
+static JSON-file lookup but doesn't embed or do semantic search.
+
+**Phasing principle.** Each tier compounds the previous one's value; pick
+tiers serially. Within a tier, items can run in parallel.
+
+---
+
+### Tier 10.1 — Vector retrieval (~3 weeks ÷ 8 micro-sprints)
+
+Foundation: pgvector + embeddings + chunking + ingest CLI + a working
+skill. Without this tier, every other RAG enhancement is blocked.
+
+- [ ] **pgvector extension + `kb_chunks` Postgres migration** `[HIGH] [v0.9] [≤2h]` — `CREATE EXTENSION IF NOT EXISTS vector;` + new table with `embedding vector(1536)` column + ivfflat index + tenant_id + agent + chunk_text + source_uri + ord + content_hash. Idempotent migration in `storage/postgres.py`. No new code paths yet — schema only.
+- [ ] **Sqlite fallback: in-memory cosine similarity** `[HIGH] [v0.9] [2-3h]` — sqlite has no native vector type. Store embeddings as JSON-encoded float arrays; do cosine similarity in Python at query time. Acceptable for dev / CI / small KBs (<10k chunks). Same storage protocol surface as Postgres so callers don't care which backend they're on.
+- [ ] **Embedding-provider abstraction (`EmbeddingProvider` Protocol)** `[HIGH] [v0.9] [≤2h]` — `embed(texts: list[str]) -> list[list[float]]` + `name` + `dimension` properties. Pure interface in `core/embeddings.py`. No impl yet.
+- [ ] **OpenAI `text-embedding-3-small` impl** `[HIGH] [v0.9] [2-3h]` — concrete `EmbeddingProvider` using OpenAI's embeddings endpoint via httpx (NOT litellm — we want a dedicated path with cost accounting). 1536-dim. Tests via stub.
+- [ ] **Anthropic Voyage embeddings impl** `[MED] [v0.9] [2-3h]` — second concrete `EmbeddingProvider` (`voyage-2`, 1024-dim) so cross-family enforcement works in eval. Same interface; auto-select based on agent's primary provider.
+- [ ] **Recursive markdown chunker** `[HIGH] [v0.9] [3-4h]` — `chunk_text(text, max_tokens=500, overlap=50)` honoring markdown heading boundaries. Returns `list[Chunk]` with `text`, `metadata` (heading path, section index). Tokenization via tiktoken. Tests on a representative agents/rag-qa/contexts/*.md fixture.
+- [ ] **`mdk kb ingest <dir>` CLI command** `[HIGH] [v0.9] [3-4h]` — walks `<dir>`, reads .md / .txt files, chunks, embeds, writes to `kb_chunks` table for the configured agent. Idempotent (content_hash dedup). Surfaces a progress bar + final summary. Tests with --mock embedding.
+- [ ] **`kb-vector-lookup` skill template** `[HIGH] [v0.9] [3-4h]` — new skill template under `src/movate/templates/skill_kb_vector_lookup/`; agent calls it at run time with the user's question; skill embeds the question, retrieves top-K chunks, returns them as context for the prompt. End-to-end test with the rag-qa agent.
+
+### Tier 10.2 — Quality (~1.5 weeks ÷ 5 micro-sprints)
+
+Once vector retrieval lands, the next 25% of recall + precision lives here.
+Hybrid search alone is typically a 15-25% recall jump on real corpora.
+
+- [ ] **Postgres full-text index for `kb_chunks.chunk_text`** `[HIGH] [v0.9] [≤2h]` — `CREATE INDEX ... USING gin(to_tsvector('english', chunk_text))`. Updates the schema migration. No new query paths yet.
+- [ ] **BM25-style FTS query method on storage** `[HIGH] [v0.9] [2-3h]` — `kb_search_lexical(query, agent, limit) -> list[Chunk]` using Postgres `tsquery` + `ts_rank`. Sqlite path uses FTS5 (already available). Tests with a known corpus.
+- [ ] **Reciprocal rank fusion (RRF) combiner** `[HIGH] [v0.9] [≤2h]` — pure function `fuse(vector_results, lexical_results, k=60) -> list[Chunk]`. RRF score = sum(1 / (k + rank)) per chunk across both lists. Tests with synthetic input.
+- [ ] **Wire RRF into `kb-vector-lookup` skill behind `--hybrid` flag** `[HIGH] [v0.9] [2-3h]` — when enabled, run both vector + lexical paths in parallel (asyncio.gather), fuse, return top-K. Default off in v0.9 → on in v0.10 after benchmarking.
+- [ ] **Cross-encoder rerank (BAAI/bge-reranker-base)** `[MED] [v0.9] [3-4h]` — fetch 20 via hybrid, rerank to 5 with a small cross-encoder model. `--rerank` flag. Adds ~200ms latency but dramatically better precision at top-K. Lazy-loaded model (sentence-transformers extra).
+
+### Tier 10.3 — Smarter retrieval (~1 week ÷ 4 micro-sprints)
+
+Query rewriting + multi-hop. The query rewriter alone is the cheapest
+quality win after Tier 10.1; multi-hop is the big capability unlock for
+complex questions.
+
+- [ ] **Query rewriter LLM call** `[MED] [v0.9] [≤2h]` — `rewrite_query(question, n=3) -> list[str]` via a small LLM call (gpt-4o-mini or claude-haiku). Prompt: "Rewrite this question as N alternative phrasings for retrieval." Returns N variants + original.
+- [ ] **Fan-out + dedup in `kb-vector-lookup`** `[MED] [v0.9] [2-3h]` — when query rewriting enabled, fetch top-K for each variant, dedup by `chunk.id`, then rerank. `--rewrite-queries N` flag.
+- [ ] **Multi-hop retrieval loop scaffolding** `[MED] [v0.9] [3-4h]` — `multi_hop(question, max_hops=3, max_total_chunks=15) -> list[Chunk]` that alternates retrieve → reason ("do we have enough to answer?") → retrieve. Budget-bounded so a bad question can't loop forever. New skill template `kb-multi-hop`.
+- [ ] **Per-hop termination prompt + tests** `[MED] [v0.9] [3-4h]` — the LLM call that decides "stop fetching, we have enough" or "fetch with this refined question". Tests with mocked LLM scoring on a 3-hop synthetic benchmark.
+
+### Tier 10.4 — Quality measurement (~3 days ÷ 2 micro-sprints)
+
+The scorecard's existing `faithfulness` measures "answer matches context"
+but not "citations point to chunks that actually support the answer."
+
+- [ ] **`citation_accuracy` scorecard category — judge prompt** `[MED] [v0.9] [≤2h]` — new prompt in `eval_scorecard_cmd.py`'s judge rubric: "For each citation in the answer, verify the cited chunk actually contains the fact being cited. Score 0-1." Updates the 10-category constant to 11.
+- [ ] **Wire `citation_accuracy` into scorecard aggregation + tests** `[MED] [v0.9] [3-4h]` — adds the new category to `ALL_CATEGORIES`, plumbs through `_score_one_case`, updates the JSON output shape, adds 3-4 tests covering "all citations correct → 1.0", "wrong-chunk citation → 0.5", "no citations → 0.0".
+
+### Tier 10.5 — Conversation memory (~5 days ÷ 3 micro-sprints)
+
+Multi-turn RAG (chat-style) — operator asks a follow-up that references
+the previous turn ("and what about the prorated case?"). Today every run
+is independent.
+
+- [ ] **`conversation_threads` Postgres table** `[MED] [v1.0] [≤2h]` — `(thread_id PK, tenant_id, agent, created_at)`. Runs join via `RunRecord.thread_id` (new optional column).
+- [ ] **`POST /threads/{id}/messages` endpoint** `[MED] [v1.0] [3-4h]` — submit a message in the context of a thread; the runtime fetches last N runs from the thread, formats as conversation history, prepends to the agent's prompt.
+- [ ] **Chainlit playground: thread-aware mode** `[MED] [v1.0] [3-4h]` — playground stores `thread_id` per Chainlit session; subsequent messages go via `/threads/{id}/messages` instead of `/run`. UI shows the conversation history.
+
+### Tier 10.6 — Document parsers (~2 weeks ÷ 5 micro-sprints)
+
+Most real KB content isn't markdown — it's PDF policies, DOCX runbooks,
+HTML scraped from internal wikis. Without these parsers, `mdk kb ingest`
+is limited to whatever's already in plain text.
+
+- [ ] **`DocumentParser` Protocol** `[LOW] [v1.0] [≤2h]` — interface in `core/parsers.py`: `parse(path) -> ParsedDocument(title, text, sections)`. Per-format impls register via entry point.
+- [ ] **PDF parser (pypdf)** `[LOW] [v1.0] [3-4h]` — handles text-based PDFs (NOT scanned image PDFs — that needs OCR, separate item). Extracts page-by-page, heuristic section detection from font-size jumps.
+- [ ] **DOCX parser (python-docx)** `[LOW] [v1.0] [3-4h]` — straightforward; docx is XML under the hood. Honors heading levels for section structure.
+- [ ] **HTML parser (readability-lxml)** `[LOW] [v1.0] [3-4h]` — readability extracts the "main article content" from messy HTML (think: Confluence pages, blog posts). Strips nav / ads / sidebars before chunking.
+- [ ] **Wire parsers into `mdk kb ingest`** `[LOW] [v1.0] [≤2h]` — dispatch on file extension. Surfaces parse errors per-file without aborting the batch.
+
+---
+
+**Sizing note:** Tier 10.1's 8 sprints land in ~3 weeks of focused 1-sprint-per-day cadence. Faster if multiple devs parallelize (each sprint is mostly independent — only the kb-vector-lookup skill template depends on the rest).
+
+**Out of scope (deferred to follow-ups):**
+
+- **OCR for scanned PDFs** — needs tesseract or a hosted OCR service. Real but niche.
+- **Live re-indexing on KB changes** — today's `mdk kb ingest` is batch-only. A file-watcher mode could refresh chunks as files change.
+- **Multi-vector representations (dense + sparse + late-interaction)** — research-quality improvements over RRF; deferred until we have benchmark numbers showing RRF is the bottleneck.
+- **Customer-supplied embedding endpoints (BYOE)** — operators with their own fine-tuned embedding models. Niche; deferred.
+- **GraphRAG** (knowledge-graph-backed retrieval) — substantial scope, separate ADR before committing.
+
+---
+
 ## How to use this file
 
 1. Pick the highest item from §0 ("Top 10") that isn't blocked.
