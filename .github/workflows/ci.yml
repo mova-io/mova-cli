@@ -137,104 +137,15 @@ jobs:
         # secure-secrets-in-params, etc.) and fails on errors.
         run: bicep lint infra/azure/main.bicep
 
-  # Auto-bump the patch component of the version on every push to main.
-  # Lets operators tell at a glance whether `mdk --version` reflects
-  # the latest merged code — a stale install shows an older patch
-  # number than the README/GitHub release tag.
-  #
-  # Why the PR dance instead of a direct push: main is a protected
-  # branch with "Require PR before merging" enabled, so even the
-  # github-actions[bot] (with contents:write) can't push directly.
-  # The bot opens a tiny bump-only PR and enables auto-merge; the
-  # `[skip ci]` in the PR title becomes the squash-merge commit
-  # message, which our own `if:` condition uses to break the
-  # otherwise-infinite loop (push to main → fires this workflow →
-  # opens bump PR → merges → push to main → ...).
-  auto-version-bump:
-    needs: [lint-and-test]
-    runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'push'
-      && github.ref == 'refs/heads/main'
-      && !contains(github.event.head_commit.message, '[skip ci]')
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          version: "0.5.x"
-
-      - name: Bump patch version
-        id: bump
-        run: |
-          new_version=$(python scripts/bump_version.py)
-          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
-
-      - name: Refresh uv.lock with new package version
-        # The bump touches pyproject.toml's [project].version; without
-        # also regenerating uv.lock the next CI run fails the lockfile
-        # freshness gate (`uv lock --check`) and silently skips the
-        # next auto-bump (and any other lint-and-test-dependent job).
-        # `uv lock` recomputes the lockfile in place — for a version-
-        # only bump this is fast because no dependency graph changes.
-        run: uv lock
-
-      - name: Open + auto-merge bump PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          new_version='${{ steps.bump.outputs.new_version }}'
-          # Suffix the branch with the GHA run ID so each attempt gets
-          # its own branch. Without this, a previous failed run (one
-          # that pushed the branch but failed before opening the PR)
-          # leaves bot/bump-vN.N.N on remote, and every subsequent
-          # push fails with "non-fast-forward". Run IDs are guaranteed
-          # unique per workflow execution.
-          branch="bot/bump-v${new_version}-${{ github.run_id }}"
-          parent_sha=$(git rev-parse --short HEAD)
-          parent_subject=$(git log -1 --pretty=%s HEAD)
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          git add pyproject.toml src/movate/__init__.py uv.lock
-          git commit -m "chore: bump version to ${new_version} [skip ci]"
-          git push origin "$branch"
-
-          # IMPORTANT: don't write the literal "[ skip ci ]" string
-          # (without the spaces) in the body — GitHub Actions scans the
-          # ENTIRE commit message (title + body) of the squash-merge
-          # commit for that marker. Repeating it in explanatory text
-          # would cause the merge commit to silently skip CI, which
-          # would also skip this workflow on the next push to main and
-          # break the auto-bump chain. The title carries the marker;
-          # the body must not.
-          pr_url=$(gh pr create \
-            --base main --head "$branch" \
-            --title "chore: bump version to ${new_version} [skip ci]" \
-            --body "Automated patch bump after \`${parent_sha} ${parent_subject}\`.
-
-          The CI-skip marker is intentionally only in the title — see
-          the workflow comments in \`.github/workflows/ci.yml\` for why
-          the body must not repeat it.")
-          echo "Opened: $pr_url"
-
-          # Try auto-merge first (queues until any required checks pass).
-          # If branch protection prevents auto-merge from being enabled,
-          # fall back to an immediate squash-merge (which works because
-          # the bot's own PR has no required reviews).
-          gh pr merge --squash --auto "$pr_url" \
-            || gh pr merge --squash "$pr_url"
+  # NOTE: the previous ``auto-version-bump`` job (every push-to-main
+  # opened a chore: bump PR via the github-actions[bot] and
+  # auto-merged it) was removed because the mova-io org policy
+  # disables "Allow GitHub Actions to create and approve pull
+  # requests" — the bot could push the branch but ``gh pr create``
+  # always 409'd, leaving dangling ``bot/bump-v*`` branches on every
+  # merge with no PR ever opened. Rather than fight the policy, we
+  # moved to a release-tag bump model: the version is bumped manually
+  # when cutting a release (see ``RELEASING.md`` step 6 + the
+  # ``scripts/bump_version.py`` script). Operators install from a
+  # specific tag / GitHub Release asset, so ``mdk --version`` matches
+  # the tag they pulled. Removed: 2026-05.

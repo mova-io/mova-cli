@@ -1,10 +1,12 @@
-"""Tests for ``scripts/bump_version.py`` — the per-merge patch-bumper.
+"""Tests for ``scripts/bump_version.py`` — the manual release-time bumper.
 
-The script is invoked by ``.github/workflows/ci.yml`` on every push
-to main so operators can tell from ``mdk --version`` whether their
-installed binary reflects the latest merged code. Regressions in
-the parsing or write-back logic would silently break that signal,
-so pin the behavior here.
+The script is invoked by a maintainer cutting a release (see
+``RELEASING.md`` step 6). It edits ``pyproject.toml`` + ``src/movate
+/__init__.py`` in lockstep — drift between the two would silently
+ship a wheel where ``pip show`` and ``mdk --version`` disagree, so
+pin the behavior here. (Until 2026-05 this script ran on every
+push-to-main via CI; that path was removed because the mova-io org
+policy blocks GitHub Actions from opening PRs.)
 """
 
 from __future__ import annotations

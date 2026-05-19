@@ -7,17 +7,20 @@ Two files hold the canonical version string in lockstep:
 * ``src/movate/__init__.py`` — ``__version__`` exposed to runtime
   callers (e.g. ``mdk --version``).
 
-Invoked by ``.github/workflows/ci.yml`` on every push to ``main`` so
-operators can tell at a glance whether their installed ``mdk`` is up
-to date with the latest merged code. Prints the new version on stdout.
+Invoked manually by a maintainer cutting a release — see step 6 of
+``RELEASING.md``. Prints the new version on stdout. (Until 2026-05
+this was wired into a per-merge CI auto-bump job; that path was
+removed because the mova-io org policy blocks GitHub Actions from
+opening PRs, leaving the bot pushing dangling bump branches with no
+PR ever created. The release-tag model is more honest anyway.)
 
 Usage::
 
     python scripts/bump_version.py            # bump patch
     python scripts/bump_version.py --check    # exit nonzero if files drift
 
-The ``--check`` mode is a safety net for CI: if a PR somehow lands
-with pyproject.toml's version != src/movate/__init__.py's __version__,
+The ``--check`` mode is a safety net: if a PR somehow lands with
+pyproject.toml's version != src/movate/__init__.py's __version__,
 the bump script would just silently fix one — better to fail loudly
 and force a manual reconcile.
 """
@@ -85,9 +88,7 @@ def main() -> None:
     new = _bump_patch(old)
 
     pyproject_text = PYPROJECT.read_text()
-    PYPROJECT.write_text(
-        _PYPROJECT_RE.sub(f'version = "{new}"', pyproject_text, count=1)
-    )
+    PYPROJECT.write_text(_PYPROJECT_RE.sub(f'version = "{new}"', pyproject_text, count=1))
 
     init_text = INIT_PY.read_text()
     INIT_PY.write_text(_INIT_RE.sub(f'__version__ = "{new}"', init_text, count=1))
