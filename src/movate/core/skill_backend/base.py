@@ -118,6 +118,15 @@ class SkillExecutionContext:
     agent_name: str = ""
     storage: Any = None
     retrieval: Any = None
+    tracer: Any = None
+    """The active :class:`movate.tracing.base.Tracer` for this run
+    (PR-V). Skills that produce nested observability (e.g.
+    ``kb-vector-lookup``'s retrieval stages) emit child spans against
+    this. ``None`` for backends that don't need it."""
+    parent_span: Any = None
+    """The :class:`movate.tracing.base.SpanCtx` to parent child spans
+    under (PR-V). Typically the skill's own dispatch span if the
+    backend creates one, or the agent run span otherwise."""
 
 
 class SkillBackend(Protocol):

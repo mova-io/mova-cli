@@ -88,6 +88,22 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
             "multi_hop": int(getattr(cfg, "multi_hop", 0)),
         }
 
+    # PR-V: when a tracer is available on the context, record the
+    # retrieval pipeline's per-stage telemetry into a SearchTrace and
+    # emit it as nested child spans under the agent's run span.
+    # Operators inspecting the run in Langfuse / OTel see retrieve /
+    # rerank / multi-hop stages as siblings of the LLM call.
+    #
+    # When ``ctx`` is None (CLI testing path) or the tracer is
+    # missing, we skip the SearchTrace entirely — zero overhead.
+    tracer = getattr(ctx, "tracer", None) if ctx is not None else None
+    parent_span = getattr(ctx, "parent_span", None) if ctx is not None else None
+    search_trace = None
+    if tracer is not None:
+        from movate.kb.trace import SearchTrace  # noqa: PLC0415
+
+        search_trace = SearchTrace()
+
     results = await kb_search(
         storage=storage,
         question=question,
@@ -95,8 +111,16 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
         tenant_id=tenant_id,
         limit=k,
         api_key=api_key,
+        trace=search_trace,
         **retrieval_kwargs,
     )
+
+    # Best-effort tracer export. emit_to_tracer swallows tracer
+    # exceptions so an unhealthy Langfuse can't block retrieval.
+    if tracer is not None and search_trace is not None:
+        from movate.kb.trace import emit_to_tracer  # noqa: PLC0415
+
+        emit_to_tracer(search_trace, tracer, parent_span=parent_span)
 
     return {
         "chunks": [
