@@ -11,15 +11,19 @@ After the executor gets a final output from the LLM, if the agent has
    If ``grounded=false`` and citations are non-empty, that's internally
    inconsistent (claiming "not grounded" while pointing to sources).
 
-2. **Citation index validity** — if the output has a ``citations``
-   field (a list of 1-based integers referencing KB chunks), every
-   index must be within the range returned by the KB lookup skill.
-   Out-of-range indices indicate hallucinated source references.
+2. **Citation index validity (format)** — citation indices must be
+   positive integers (1-based). Non-integer or non-positive values
+   indicate a model formatting error.
 
-3. **KB-skill presence check** — if the agent has at least one
-   ``kb-vector-lookup`` skill call in the skill_calls log but the
-   output's ``grounded`` field is ``false`` with a non-empty
-   ``citations`` list (or vice versa), that's flagged as inconsistent.
+3. **KB-skill presence check** — if ``grounded=true`` but no
+   ``kb-vector-lookup`` skill call was made, the agent may be
+   hallucinating KB-grounded answers without querying the KB.
+
+4. **Citation index range (M4)** — when the total number of chunks
+   returned by the KB skill is known, every citation index must be
+   ≤ that total. Indices beyond the returned set are hallucinated
+   source references — the model cited a chunk that was never
+   retrieved.
 
 Design choices
 --------------
@@ -80,6 +84,7 @@ def check_grounding(
     output: dict[str, Any],
     *,
     kb_call_count: int = 0,
+    max_valid_citation_index: int = 0,
     enforcement: str = "off",
 ) -> GroundingReport:
     """Run structural grounding checks on *output*.
@@ -93,6 +98,11 @@ def check_grounding(
     kb_call_count:
         Number of successful ``kb-vector-lookup`` skill calls in this run.
         Used to detect "output claims KB-grounding but no KB was queried".
+    max_valid_citation_index:
+        Total chunks returned by all successful KB calls (sum of
+        ``chunks_found`` across calls).  When > 0, citation indices are
+        validated to be ≤ this value.  Pass 0 to skip the range check
+        (e.g. when the KB skill output format does not expose a count).
     enforcement:
         ``"off"`` → always returns a passing report (no-op).
         ``"warn"`` → runs checks, returns the report; caller logs and continues.
@@ -108,7 +118,11 @@ def check_grounding(
     if enforcement == "off":
         return GroundingReport(ok=True)
 
-    violations = _run_checks(output, kb_call_count=kb_call_count)
+    violations = _run_checks(
+        output,
+        kb_call_count=kb_call_count,
+        max_valid_citation_index=max_valid_citation_index,
+    )
     report = GroundingReport(ok=not violations, violations=violations)
 
     if violations and enforcement == "strict":
@@ -127,6 +141,7 @@ def _run_checks(
     output: dict[str, Any],
     *,
     kb_call_count: int,
+    max_valid_citation_index: int = 0,
 ) -> list[GroundingViolation]:
     """Run all check passes; return a flat list of violations."""
     violations: list[GroundingViolation] = []
@@ -186,6 +201,27 @@ def _run_checks(
             )
         )
 
+    # Check 5 — citation indices must not exceed the number of chunks
+    # actually returned by the KB skill (M4: range enforcement).
+    # Only runs when max_valid_citation_index > 0 (i.e. the executor
+    # harvested a chunk count from the skill call output).
+    if citations and max_valid_citation_index > 0:
+        # Only check well-formed indices (bad indices caught by Check 3).
+        valid_ints = [c for c in citations if isinstance(c, int) and c >= 1]
+        out_of_range = [c for c in valid_ints if c > max_valid_citation_index]
+        if out_of_range:
+            violations.append(
+                GroundingViolation(
+                    code="out_of_range_citation_indices",
+                    message=(
+                        f"citations {out_of_range[:5]} exceed the {max_valid_citation_index} "
+                        f"chunk(s) returned by the kb-vector-lookup skill — "
+                        "these indices reference chunks that were never retrieved; "
+                        "the model may be hallucinating source references"
+                    ),
+                )
+            )
+
     return violations
 
 
@@ -208,3 +244,29 @@ def kb_call_count_from_records(
         if getattr(sc, "skill", None) == _KB_LOOKUP_SKILL
         and not getattr(sc, "error", None)
     )
+
+
+def max_valid_citation_index_from_records(
+    skill_calls: list[Any],  # list[SkillCallRecord] — avoid circular import
+) -> int:
+    """Return total chunks returned across all successful KB calls.
+
+    The ``kb-vector-lookup`` skill output contains a ``chunks_found``
+    integer field.  Summing across all successful calls gives the upper
+    bound on valid 1-based citation indices — any citation > this value
+    references a chunk that was never retrieved.
+
+    Returns 0 when no successful KB calls exist or when ``chunks_found``
+    is absent from the skill output (skips the range check gracefully).
+    """
+    total = 0
+    for sc in skill_calls:
+        if getattr(sc, "skill", None) != _KB_LOOKUP_SKILL:
+            continue
+        if getattr(sc, "error", None):
+            continue
+        output = getattr(sc, "output", None) or {}
+        found = output.get("chunks_found", 0)
+        if isinstance(found, int):
+            total += found
+    return total
