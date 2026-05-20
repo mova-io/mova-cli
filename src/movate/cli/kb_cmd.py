@@ -640,10 +640,35 @@ def stats(
         "--tenant-id",
         help="Tenant scope (matches ingest value).",
     ),
+    by_source: bool = typer.Option(
+        False,
+        "--by-source",
+        help=(
+            "Distribution-view: sort per-source rows by chunk count "
+            "DESCENDING + add a percentage column. Useful for triaging "
+            "KB quality — 'which doc dominates retrieval?' and 'is any "
+            "one source contributing most of the chunks?'. Default "
+            "sort (without this flag) is alphabetical by source path."
+        ),
+    ),
+    top: int = typer.Option(
+        0,
+        "--top",
+        min=0,
+        help=(
+            "Cap the per-source table at the top N rows (most chunks "
+            "first when combined with --by-source). 0 = show all. "
+            "Useful when an agent's KB has hundreds of source files."
+        ),
+    ),
 ) -> None:
     """Summary stats for ``agent``'s KB: chunk count, source
     breakdown, embedding model(s) in use, total + per-source character
     counts. Useful for sanity-checking after a big ingest.
+
+    Use ``--by-source`` to flip the per-source table into a
+    distribution view (sorted by chunk count DESC with a %-of-total
+    column) — quick triage for 'is one document dominating?'.
     """
 
     async def _run() -> None:
@@ -681,21 +706,59 @@ def stats(
         console.print(f"  sources:      [bold]{len(per_source)}[/bold]")
         console.print(f"  models:       [bold]{', '.join(sorted(models))}[/bold]")
 
-        # Per-source table.
-        table = Table(title="[bold]Per-source breakdown[/bold]", show_lines=False)
+        # Per-source table — sort + columns vary by --by-source.
+        title = (
+            "[bold]Per-source distribution[/bold] (top sources first)"
+            if by_source
+            else "[bold]Per-source breakdown[/bold]"
+        )
+        table = Table(title=title, show_lines=False)
         table.add_column("source", overflow="fold")
         table.add_column("chunks", justify="right", no_wrap=True)
+        if by_source:
+            table.add_column("% of total", justify="right", no_wrap=True)
         table.add_column("chars", justify="right", no_wrap=True)
         table.add_column("avg chunk len", justify="right", no_wrap=True)
-        for source, sizes in sorted(per_source.items()):
-            short = Path(source).name if source else "?"
-            avg = sum(sizes) / len(sizes) if sizes else 0
-            table.add_row(
-                short,
-                str(len(sizes)),
-                f"{sum(sizes):,}",
-                f"{avg:.0f}",
+
+        # Sort key: chunk count DESC for distribution view, alphabetical
+        # for the default breakdown.
+        if by_source:
+            rows_iter = sorted(
+                per_source.items(),
+                key=lambda kv: (-len(kv[1]), kv[0]),
             )
+        else:
+            rows_iter = sorted(per_source.items())
+
+        # Optional top-N cap. Applies regardless of sort mode.
+        rows = list(rows_iter)
+        if top > 0:
+            rows = rows[:top]
+
+        total_chunks = len(chunks)
+        for source, sizes in rows:
+            short = Path(source).name if source else "?"
+            count = len(sizes)
+            avg = sum(sizes) / count if sizes else 0
+            row = [
+                short,
+                str(count),
+            ]
+            if by_source:
+                pct = (count / total_chunks * 100.0) if total_chunks else 0.0
+                row.append(f"{pct:.1f}%")
+            row.extend([f"{sum(sizes):,}", f"{avg:.0f}"])
+            table.add_row(*row)
+
+        if top > 0 and len(per_source) > top:
+            # Tail-row summary so the operator knows about the cap.
+            remainder = len(per_source) - top
+            row = [f"[dim]…and {remainder} more sources[/dim]", ""]
+            if by_source:
+                row.append("")
+            row.extend(["", ""])
+            table.add_row(*row)
+
         console.print(table)
 
     asyncio.run(_run())

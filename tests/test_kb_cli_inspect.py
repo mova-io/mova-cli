@@ -211,6 +211,122 @@ def test_list_stats_clear_after_direct_seed(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# Distribution view: mdk kb stats --by-source (PR-Y)
+# ---------------------------------------------------------------------------
+
+
+def _seed_uneven(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seed a KB where one source contributes most chunks — exercises
+    the 'dominance' use case for --by-source."""
+    import asyncio  # noqa: PLC0415
+
+    from movate.core.models import KbChunk  # noqa: PLC0415
+    from movate.storage import build_storage  # noqa: PLC0415
+
+    async def _do() -> None:
+        storage = build_storage()
+        await storage.init()
+        try:
+            # heavy.md: 7 chunks. light.md: 1 chunk. ten distinct chunks total.
+            for i in range(7):
+                await storage.save_kb_chunk(
+                    KbChunk(
+                        tenant_id="local",
+                        agent="rag-qa",
+                        source="/tmp/heavy.md",
+                        text=f"Heavy chunk {i}" * 5,
+                        embedding=[1.0, 0.0],
+                        embedding_model="openai/text-embedding-3-small",
+                        content_hash=f"heavy-{i}",
+                    )
+                )
+            for i in range(1):
+                await storage.save_kb_chunk(
+                    KbChunk(
+                        tenant_id="local",
+                        agent="rag-qa",
+                        source="/tmp/light.md",
+                        text=f"Light chunk {i}",
+                        embedding=[1.0, 0.0],
+                        embedding_model="openai/text-embedding-3-small",
+                        content_hash=f"light-{i}",
+                    )
+                )
+        finally:
+            await storage.close()
+
+    asyncio.new_event_loop().run_until_complete(_do())
+
+
+@pytest.mark.unit
+def test_stats_by_source_shows_percentage_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--by-source`` adds a '% of total' column."""
+    _seed_uneven(monkeypatch)
+    r = runner.invoke(
+        app,
+        ["kb", "stats", "rag-qa", "--by-source"],
+        env={"COLUMNS": "200"},
+    )
+    assert r.exit_code == 0, r.stdout + r.stderr
+    assert "% of total" in r.stdout
+    # heavy.md = 7/8 = 87.5%. The text rendered shows "87.5%".
+    assert "87.5%" in r.stdout
+
+
+@pytest.mark.unit
+def test_stats_default_sort_omits_percentage_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``--by-source``, the table is the legacy alphabetical
+    breakdown WITHOUT the percentage column. Back-compat."""
+    _seed_uneven(monkeypatch)
+    r = runner.invoke(app, ["kb", "stats", "rag-qa"], env={"COLUMNS": "200"})
+    assert r.exit_code == 0
+    assert "% of total" not in r.stdout
+    # Both sources still shown.
+    assert "heavy.md" in r.stdout
+    assert "light.md" in r.stdout
+
+
+@pytest.mark.unit
+def test_stats_by_source_sorts_heaviest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distribution view sorts by chunk count DESC — heavy.md (7
+    chunks) must appear ABOVE light.md (1 chunk) in the table."""
+    _seed_uneven(monkeypatch)
+    r = runner.invoke(
+        app,
+        ["kb", "stats", "rag-qa", "--by-source"],
+        env={"COLUMNS": "200"},
+    )
+    assert r.exit_code == 0
+    # heavy.md's row appears before light.md's in stdout.
+    heavy_idx = r.stdout.index("heavy.md")
+    light_idx = r.stdout.index("light.md")
+    assert heavy_idx < light_idx
+
+
+@pytest.mark.unit
+def test_stats_top_caps_displayed_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--top N`` caps the per-source table at the top N rows."""
+    _seed_uneven(monkeypatch)
+    r = runner.invoke(
+        app,
+        ["kb", "stats", "rag-qa", "--by-source", "--top", "1"],
+        env={"COLUMNS": "200"},
+    )
+    assert r.exit_code == 0
+    # heavy.md kept (most chunks), light.md dropped.
+    assert "heavy.md" in r.stdout
+    assert "light.md" not in r.stdout
+    # Tail-row indicator surfaces the count.
+    assert "and 1 more sources" in r.stdout
+
+
+# ---------------------------------------------------------------------------
 # Skill template registration
 # ---------------------------------------------------------------------------
 
