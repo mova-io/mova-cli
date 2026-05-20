@@ -29,6 +29,7 @@ from movate.core.models import (
     JobStatus,
     Metrics,
     RunRecord,
+    TokenUsage,
 )
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
@@ -246,7 +247,7 @@ def test_get_thread_returns_metadata_and_runs(
             status=JobStatus.SUCCESS,
             input={"q": f"turn {i}"},
             output={"a": f"answer {i}"},
-            metrics=Metrics(latency_ms=100, cost_usd=0.001, tokens_in=10, tokens_out=10),
+            metrics=Metrics(latency_ms=100, cost_usd=0.001, tokens=TokenUsage(input=10, output=10)),
             created_at=ts,
             thread_id=thread_id,
         )

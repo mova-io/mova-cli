@@ -31,7 +31,14 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from movate.core.auth import ApiKeyEnv, mint_api_key
-from movate.core.models import AgentSpec, JobStatus, Metrics, RetrievalConfig, RunRecord
+from movate.core.models import (
+    AgentSpec,
+    JobStatus,
+    Metrics,
+    RetrievalConfig,
+    RunRecord,
+    TokenUsage,
+)
 from movate.runtime import build_app
 from movate.runtime.registry import scan_agents
 from movate.testing import InMemoryStorage
@@ -265,7 +272,9 @@ def _seed_runs(storage: InMemoryStorage, *, thread_id: str, tenant_id: str, n: i
                 status=JobStatus.SUCCESS,
                 input={"q": f"q{i}"},
                 output={"a": f"a{i}"},
-                metrics=Metrics(latency_ms=50, cost_usd=0.001, tokens_in=5, tokens_out=5),
+                metrics=Metrics(
+                    latency_ms=50, cost_usd=0.001, tokens=TokenUsage(input=5, output=5)
+                ),
                 created_at=now + timedelta(seconds=i),
                 thread_id=thread_id,
             )
@@ -328,7 +337,9 @@ def test_messages_endpoint_applies_char_budget_override(
                 status=JobStatus.SUCCESS,
                 input={"q": "x" * 2500},
                 output={"a": "y"},
-                metrics=Metrics(latency_ms=50, cost_usd=0.001, tokens_in=5, tokens_out=5),
+                metrics=Metrics(
+                    latency_ms=50, cost_usd=0.001, tokens=TokenUsage(input=5, output=5)
+                ),
                 created_at=now + timedelta(seconds=i),
                 thread_id=thread_id,
             )
