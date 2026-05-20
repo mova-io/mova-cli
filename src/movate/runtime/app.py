@@ -86,6 +86,9 @@ from movate.runtime.schemas import (
     RunTraceView,
     RunView,
     SkillCreatedView,
+    ThreadCreateSubmission,
+    ThreadListView,
+    ThreadView,
     WizardAgentSubmission,
 )
 from movate.runtime.skill_creation import (
@@ -2475,6 +2478,124 @@ def build_app(
             label=record.label if record is not None else None,
             expires_at=record.expires_at if record is not None else None,
         )
+
+    # ------------------------------------------------------------------
+    # Conversation thread management (Tier 10.5, PR-O). The MESSAGES
+    # endpoint that creates a threaded run lives in PR-Q (needs worker
+    # thread_id propagation); these endpoints handle the create/get/list
+    # management half. Used by the Chainlit playground thread-aware
+    # mode (PR-P) + the Mova iO Angular console's thread browser.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/threads",
+        response_model=ThreadView,
+        status_code=201,
+        tags=["threads-v1"],
+    )
+    async def v1_create_thread(
+        body: ThreadCreateSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ThreadView:
+        """Open a new multi-turn conversation with one agent.
+
+        Returns the freshly-minted thread with a new ``thread_id``
+        (URL-safe hex uuid). Clients store this id + send subsequent
+        messages via ``POST /api/v1/threads/{id}/messages``
+        (endpoint lands in PR-Q).
+
+        Threads are bound to ONE agent — the operator picks at
+        creation time and can't swap mid-thread. To target a different
+        agent, open a new thread.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **422** — invalid body (missing ``agent``, oversize ``title``)
+        """
+        from movate.core.models import ConversationThread  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        thread = ConversationThread(
+            thread_id=uuid4().hex,
+            tenant_id=ctx.tenant_id,
+            agent=body.agent,
+            title=body.title,
+        )
+        await store.save_conversation_thread(thread)
+        return ThreadView.from_record(thread)
+
+    @v1.get(
+        "/threads",
+        response_model=ThreadListView,
+        tags=["threads-v1"],
+    )
+    async def v1_list_threads(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> ThreadListView:
+        """List threads for the authenticated tenant, ordered
+        ``updated_at DESC`` (most recently active first).
+
+        Query params:
+
+        * ``?agent=<name>`` — scope to one agent's threads (typical
+          Chainlit case: the picker is per-agent).
+        * ``?limit=N`` — cap on returned rows (default 100, no hard
+          maximum at this tier — the storage layer's internal cap
+          protects against runaway).
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_conversation_threads(
+            tenant_id=ctx.tenant_id,
+            agent=agent,
+            limit=int(limit),
+        )
+        views = [ThreadView.from_record(r) for r in rows]
+        return ThreadListView(threads=views, count=len(views))
+
+    @v1.get(
+        "/threads/{thread_id}",
+        response_model=ThreadView,
+        tags=["threads-v1"],
+    )
+    async def v1_get_thread(
+        thread_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        include_runs: bool = True,
+        runs_limit: int = 100,
+    ) -> ThreadView:
+        """Get a thread by id with optional chronological run history.
+
+        When ``include_runs=true`` (the default), the response includes
+        a ``runs`` array sorted ASC by ``created_at`` — earliest turn
+        first so clients can render the conversation top-to-bottom.
+        Set ``include_runs=false`` for clients that just want the
+        thread metadata (saves the history scan).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — thread doesn't exist OR belongs to a different
+          tenant (the 404 NEVER leaks cross-tenant existence — same
+          contract as ``GET /runs/{id}`` and ``GET /jobs/{id}``)
+        """
+        store: StorageProvider = request.app.state.storage
+        thread = await store.get_conversation_thread(thread_id, tenant_id=ctx.tenant_id)
+        if thread is None:
+            raise not_found("thread", thread_id)
+
+        runs_view: list[RunView] | None = None
+        if include_runs:
+            run_records = await store.list_runs_for_thread(
+                thread_id, tenant_id=ctx.tenant_id, limit=int(runs_limit)
+            )
+            runs_view = [RunView.from_record(r) for r in run_records]
+        return ThreadView.from_record(thread, runs=runs_view)
 
     app.include_router(v1)
 

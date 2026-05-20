@@ -18,6 +18,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from movate.core.models import (
+    ConversationThread,
     ErrorInfo,
     FeedbackRecord,
     JobKind,
@@ -1251,4 +1252,86 @@ class FeedbackListView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     feedback: list[FeedbackView]
+    count: int
+
+
+# ---------------------------------------------------------------------------
+# Conversation thread wire types (PR-O, Tier 10.5)
+# ---------------------------------------------------------------------------
+
+
+class ThreadCreateSubmission(BaseModel):
+    """``POST /api/v1/threads`` body — operator opens a new
+    multi-turn conversation with one agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str = Field(
+        ...,
+        description=(
+            "Agent the thread targets. Threads are bound to one agent — "
+            "swap to a different agent by opening a new thread."
+        ),
+    )
+    title: str = Field(
+        default="",
+        max_length=256,
+        description=(
+            "Optional human-readable label for client display. Empty "
+            "string is fine; clients fall back to the first message's "
+            "truncated text when rendering."
+        ),
+    )
+
+
+class ThreadView(BaseModel):
+    """``POST /api/v1/threads`` + ``GET /api/v1/threads/{id}`` response
+    envelope. 1:1 with :class:`movate.core.models.ConversationThread`
+    plus an optional ``runs`` array (filled by the get-with-history
+    endpoint, omitted on bare create/list)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str
+    tenant_id: str
+    agent: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    runs: list[RunView] | None = Field(
+        default=None,
+        description=(
+            "Chronological run history (earliest turn first). Populated "
+            "by GET /api/v1/threads/{id}; omitted on create + list "
+            "responses so the operator can fetch just the thread "
+            "metadata without paying for the history scan."
+        ),
+    )
+
+    @classmethod
+    def from_record(
+        cls,
+        record: ConversationThread,
+        *,
+        runs: list[RunView] | None = None,
+    ) -> ThreadView:
+        return cls(
+            thread_id=record.thread_id,
+            tenant_id=record.tenant_id,
+            agent=record.agent,
+            title=record.title,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            runs=runs,
+        )
+
+
+class ThreadListView(BaseModel):
+    """``GET /api/v1/threads`` response — paginated thread list for
+    a tenant. Threads are returned ``updated_at DESC`` so the active
+    conversations float to the top of the operator's view."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    threads: list[ThreadView]
     count: int
