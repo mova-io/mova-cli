@@ -233,7 +233,13 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
     embedding_model TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
     metadata        JSONB,
-    created_at      TIMESTAMPTZ NOT NULL
+    created_at      TIMESTAMPTZ NOT NULL,
+    -- PR-EE: OCR provenance flag. True when the chunk's text was
+    -- extracted via Tesseract OCR rather than native text extraction
+    -- (pypdf text layer, docx paragraphs, readability HTML strip).
+    -- Default false so existing rows (native extraction) are
+    -- unaffected on schema upgrade.
+    ocr             BOOLEAN NOT NULL DEFAULT false
 );
 -- Per-agent + per-tenant retrieval scope. Search scans this index
 -- range so the Python cosine loop touches only the relevant chunks.
@@ -976,13 +982,14 @@ class PostgresProvider:
             """
             INSERT INTO kb_chunks (
                 chunk_id, tenant_id, agent, source, text, embedding,
-                embedding_model, content_hash, metadata, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                embedding_model, content_hash, metadata, created_at, ocr
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
                 SET embedding = EXCLUDED.embedding,
                     embedding_model = EXCLUDED.embedding_model,
                     metadata = EXCLUDED.metadata,
-                    source = EXCLUDED.source
+                    source = EXCLUDED.source,
+                    ocr = EXCLUDED.ocr
             """,
             chunk.chunk_id,
             chunk.tenant_id,
@@ -994,6 +1001,7 @@ class PostgresProvider:
             chunk.content_hash,
             chunk.metadata,
             chunk.created_at,
+            chunk.ocr,
         )
 
     async def search_kb_chunks(
@@ -1012,7 +1020,7 @@ class PostgresProvider:
         rows = await self._db.fetch(
             """
             SELECT chunk_id, tenant_id, agent, source, text, embedding,
-                   embedding_model, content_hash, metadata, created_at
+                   embedding_model, content_hash, metadata, created_at, ocr
             FROM kb_chunks
             WHERE agent = $1 AND tenant_id = $2
             """,
@@ -1038,7 +1046,7 @@ class PostgresProvider:
         params.append(int(limit))
         sql = (
             "SELECT chunk_id, tenant_id, agent, source, text, embedding, "
-            "embedding_model, content_hash, metadata, created_at "
+            "embedding_model, content_hash, metadata, created_at, ocr "
             "FROM kb_chunks WHERE "
             + " AND ".join(clauses)
             + " ORDER BY created_at DESC LIMIT $"
@@ -1094,7 +1102,7 @@ class PostgresProvider:
             rows = await self._db.fetch(
                 """
                 SELECT chunk_id, tenant_id, agent, source, text, embedding,
-                       embedding_model, content_hash, metadata, created_at,
+                       embedding_model, content_hash, metadata, created_at, ocr,
                        ts_rank(
                            to_tsvector('english', text),
                            plainto_tsquery('english', $3)
@@ -1359,6 +1367,7 @@ def _row_to_kb_chunk(row: asyncpg.Record) -> KbChunk:
         embedding_model=row_dict["embedding_model"],
         content_hash=row_dict["content_hash"],
         metadata=row_dict.get("metadata"),
+        ocr=bool(row_dict.get("ocr", False)),
         created_at=row_dict["created_at"],
     )
 

@@ -1724,8 +1724,8 @@ def build_app(
                 )
                 continue
             raw = await upload.read()
-            text = parse_document(basename, raw)
-            if text is None:
+            parse_result = parse_document(basename, raw)
+            if parse_result is None:
                 # Parser returned None — corrupt PDF, non-UTF8 .txt,
                 # encrypted PDF, scanned-image PDF, etc. Skip the
                 # file rather than 400'ing the whole batch.
@@ -1738,10 +1738,11 @@ def build_app(
                 continue
             summary = await ingest_text(
                 storage=store,
-                text=text,
+                text=parse_result.text,
                 source=basename,
                 agent=name,
                 tenant_id=ctx.tenant_id,
+                ocr=parse_result.ocr_used,
             )
             if summary is None:
                 per_file.append(

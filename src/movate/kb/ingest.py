@@ -133,17 +133,18 @@ async def _ingest_one_file(
 
     content = file_path.read_bytes()
     source = str(file_path.resolve())
-    text = parse_document(file_path.name, content)
-    if text is None:
+    result = parse_document(file_path.name, content)
+    if result is None:
         return None
     return await ingest_text(
         storage=storage,
-        text=text,
+        text=result.text,
         source=source,
         agent=agent,
         tenant_id=tenant_id,
         embedding_model=embedding_model,
         api_key=api_key,
+        ocr=result.ocr_used,
     )
 
 
@@ -156,6 +157,7 @@ async def ingest_text(
     tenant_id: str,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
+    ocr: bool = False,
 ) -> IngestSummary | None:
     """Chunk + embed + persist ``text`` as KB content for ``agent``.
 
@@ -203,6 +205,7 @@ async def ingest_text(
                 embedding_model=full_model_name,
                 content_hash=chunk.content_hash,
                 metadata=chunk.metadata,
+                ocr=ocr,
             )
             # Duck-typed: any storage backend implementing
             # ``save_kb_chunk`` works (Postgres / sqlite / in-memory).
