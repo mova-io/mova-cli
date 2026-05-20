@@ -10,7 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
-from movate.core.models import ErrorInfo, JobStatus, Metrics, RunRecord, TokenUsage
+from movate.core.models import ErrorInfo, JobStatus, Metrics, RunRecord, SkillCallRecord, TokenUsage
 
 runner = CliRunner(mix_stderr=False)
 
@@ -249,3 +249,181 @@ def test_explain_error_json_includes_error_field(monkeypatch: pytest.MonkeyPatch
     assert parsed["error"]["type"] == "timeout"
     assert parsed["error"]["message"] == "call timed out"
     assert parsed["output"] is None
+
+
+# ---------------------------------------------------------------------------
+# M6 milestone: --steps flag and SkillCallRecord tests
+# ---------------------------------------------------------------------------
+
+
+def _make_skill_calls() -> list[SkillCallRecord]:
+    """Return a small list of sample SkillCallRecord objects for tests."""
+    return [
+        SkillCallRecord(
+            step=1,
+            skill="kb-vector-lookup",
+            input={"query": "return policy"},
+            output={"results": ["30 days", "no questions asked"]},
+            latency_ms=123.4,
+        ),
+        SkillCallRecord(
+            step=2,
+            skill="calculator",
+            input={"expression": "2 + 2"},
+            output={"result": 4},
+            latency_ms=5.0,
+        ),
+    ]
+
+
+@pytest.mark.unit
+def test_explain_steps_flag_shows_skill_calls_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mdk explain <id> --steps renders 'Skill calls' heading and each skill name."""
+    skill_calls = _make_skill_calls()
+    rec = _make_run(output={"answer": "30 days"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Skill calls" in result.stdout
+    assert "kb-vector-lookup" in result.stdout
+    assert "calculator" in result.stdout
+
+
+@pytest.mark.unit
+def test_explain_without_steps_shows_hint_not_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without --steps, a run with skill_calls shows a hint but not the full table."""
+    skill_calls = _make_skill_calls()
+    rec = _make_run(output={"answer": "30 days"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Hint line should mention the count
+    assert "skill call(s)" in result.stdout
+    # The detailed table columns should NOT appear without --steps
+    assert "Skill calls" not in result.stdout
+    assert "kb-vector-lookup" not in result.stdout
+
+
+@pytest.mark.unit
+def test_explain_json_with_steps_includes_skill_calls_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mdk explain <id> --json --steps includes a 'skill_calls' list in JSON output."""
+    skill_calls = _make_skill_calls()
+    rec = _make_run(output={"answer": "yes"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--json", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    parsed = json.loads(result.stdout)
+    assert "skill_calls" in parsed
+    assert isinstance(parsed["skill_calls"], list)
+    assert len(parsed["skill_calls"]) == 2
+    first = parsed["skill_calls"][0]
+    assert first["step"] == 1
+    assert first["skill"] == "kb-vector-lookup"
+    assert first["input"] == {"query": "return policy"}
+    assert first["output"] == {"results": ["30 days", "no questions asked"]}
+    assert first["latency_ms"] == pytest.approx(123.4)
+    # skill_calls_hint must NOT appear when --steps is given
+    assert "skill_calls_hint" not in parsed
+
+
+@pytest.mark.unit
+def test_explain_json_without_steps_includes_skill_calls_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mdk explain <id> --json without --steps includes 'skill_calls_hint', not the list."""
+    skill_calls = _make_skill_calls()
+    rec = _make_run(output={"answer": "yes"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    parsed = json.loads(result.stdout)
+    assert "skill_calls_hint" in parsed
+    assert "2" in parsed["skill_calls_hint"]
+    # Full skill_calls list must NOT appear without --steps
+    assert "skill_calls" not in parsed or "skill_calls_hint" in parsed
+
+
+@pytest.mark.unit
+def test_explain_no_skill_calls_shows_no_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run with skill_calls=[] shows no hint and no 'Skill calls' section."""
+    rec = _make_run(output={"answer": "fine"})
+    # _make_run leaves skill_calls as default empty list — no changes needed
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "skill call" not in result.stdout.lower()
+    assert "Skill calls" not in result.stdout
+
+
+@pytest.mark.unit
+def test_explain_no_skill_calls_json_hint_is_no_skill_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With skill_calls=[], --json output hint says 'no skill calls'."""
+    rec = _make_run(output={"answer": "fine"})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    parsed = json.loads(result.stdout)
+    assert "skill_calls_hint" in parsed
+    assert "no skill calls" in parsed["skill_calls_hint"].lower()
+
+
+@pytest.mark.unit
+def test_explain_steps_shows_step_numbers_and_latency(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--steps table includes step numbers and latency values for each call."""
+    skill_calls = _make_skill_calls()
+    rec = _make_run(output={"answer": "done"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # step numbers
+    assert "1" in result.stdout
+    assert "2" in result.stdout
+    # latency values (rendered as "<N> ms")
+    assert "123" in result.stdout  # 123.4 ms truncated to 123 ms
+    assert "5" in result.stdout  # 5.0 ms
+
+
+@pytest.mark.unit
+def test_explain_steps_shows_error_skill_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--steps renders a failed skill call with its error text."""
+    skill_calls = [
+        SkillCallRecord(
+            step=1,
+            skill="external-lookup",
+            input={"id": "42"},
+            error="connection refused",
+            latency_ms=15.0,
+        )
+    ]
+    rec = _make_run(output={"answer": "partial"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "external-lookup" in result.stdout
+    assert "connection refused" in result.stdout
