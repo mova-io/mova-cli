@@ -302,6 +302,11 @@ _MIGRATIONS = [
     CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts
     USING fts5(chunk_id UNINDEXED, text)
     """,
+    # PR-EE: OCR provenance flag. INTEGER (0/1) in sqlite; NOT NULL so
+    # existing rows default to 0 (native extraction). The migration is
+    # idempotent on first-run (brand-new DB also has the column from
+    # the CREATE TABLE below once the migration runs).
+    "ALTER TABLE kb_chunks ADD COLUMN ocr INTEGER NOT NULL DEFAULT 0",
 ]
 
 
@@ -1037,13 +1042,14 @@ class SqliteProvider:
             """
             INSERT INTO kb_chunks (
                 chunk_id, tenant_id, agent, source, text, embedding,
-                embedding_model, content_hash, metadata, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                embedding_model, content_hash, metadata, created_at, ocr
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(agent, tenant_id, content_hash) DO UPDATE SET
                 embedding = excluded.embedding,
                 embedding_model = excluded.embedding_model,
                 metadata = excluded.metadata,
-                source = excluded.source
+                source = excluded.source,
+                ocr = excluded.ocr
             """,
             (
                 chunk.chunk_id,
@@ -1056,6 +1062,7 @@ class SqliteProvider:
                 chunk.content_hash,
                 metadata_json,
                 chunk.created_at.isoformat(),
+                int(chunk.ocr),
             ),
         )
         await self._db.commit()
@@ -1114,7 +1121,7 @@ class SqliteProvider:
         params.append(int(limit))
         sql = (
             "SELECT chunk_id, tenant_id, agent, source, text, embedding, "
-            "embedding_model, content_hash, metadata, created_at "
+            "embedding_model, content_hash, metadata, created_at, ocr "
             "FROM kb_chunks WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC LIMIT ?"
         )
         async with self._db.execute(sql, params) as cur:
@@ -1130,6 +1137,7 @@ class SqliteProvider:
                 embedding_model=r["embedding_model"],
                 content_hash=r["content_hash"],
                 metadata=_json.loads(r["metadata"]) if r["metadata"] else None,
+                ocr=bool(r["ocr"]),
                 created_at=datetime.fromisoformat(r["created_at"]),
             )
             for r in rows

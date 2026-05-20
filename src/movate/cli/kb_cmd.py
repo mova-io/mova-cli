@@ -631,6 +631,7 @@ def list_chunks(
         table.add_column("#", justify="right", style="dim", no_wrap=True)
         table.add_column("source", overflow="fold", max_width=40)
         table.add_column("len", justify="right", style="dim", no_wrap=True)
+        table.add_column("ocr", justify="center", style="dim", no_wrap=True)
         table.add_column("preview", overflow="fold")
         for i, c in enumerate(chunks, start=1):
             short = Path(c.source).name if c.source else "?"
@@ -639,7 +640,8 @@ def list_chunks(
                 if len(c.text) <= _CHUNK_PREVIEW_CHARS
                 else c.text[:_CHUNK_PREVIEW_CHARS].rstrip() + "…"
             )
-            table.add_row(str(i), short, str(len(c.text)), preview)
+            ocr_flag = "✓" if c.ocr else ""
+            table.add_row(str(i), short, str(len(c.text)), ocr_flag, preview)
         console.print(table)
 
     asyncio.run(_run())
@@ -704,10 +706,13 @@ def stats(
         per_source: dict[str, list[int]] = {}
         models: set[str] = set()
         total_chars = 0
+        ocr_count = 0
         for c in chunks:
             per_source.setdefault(c.source, []).append(len(c.text))
             models.add(c.embedding_model)
             total_chars += len(c.text)
+            if c.ocr:
+                ocr_count += 1
 
         # Top-level summary.
         console.print(
@@ -718,6 +723,11 @@ def stats(
         console.print(f"  total chars:  [bold]{total_chars:,}[/bold]")
         console.print(f"  sources:      [bold]{len(per_source)}[/bold]")
         console.print(f"  models:       [bold]{', '.join(sorted(models))}[/bold]")
+        ocr_pct = f"{ocr_count / len(chunks) * 100:.0f}%" if ocr_count else "0%"
+        console.print(
+            f"  ocr chunks:   [bold]{ocr_count}[/bold] [dim]({ocr_pct} — "
+            "Tesseract-extracted from scanned-image PDFs)[/dim]"
+        )
 
         # Per-source table — sort + columns vary by --by-source.
         title = (

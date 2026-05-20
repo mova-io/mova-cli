@@ -114,7 +114,9 @@ def test_is_supported_extension_case_insensitive() -> None:
 @pytest.mark.unit
 def test_parse_document_routes_md_to_text() -> None:
     out = parse_document("hello.md", b"# Heading\n\nbody")
-    assert out == "# Heading\n\nbody"
+    assert out is not None
+    assert out.text == "# Heading\n\nbody"
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -135,7 +137,10 @@ def test_parse_document_returns_none_for_unsupported() -> None:
 
 @pytest.mark.unit
 def test_parse_text_decodes_utf8() -> None:
-    assert parse_text("héllo wörld".encode()) == "héllo wörld"
+    result = parse_text("héllo wörld".encode())
+    assert result is not None
+    assert result.text == "héllo wörld"
+    assert result.ocr_used is False
 
 
 @pytest.mark.unit
@@ -158,7 +163,8 @@ def test_parse_pdf_extracts_single_page_text() -> None:
     pdf_bytes = _make_pdf_bytes("Hello PDF world")
     out = parse_pdf(pdf_bytes)
     assert out is not None
-    assert "Hello PDF world" in out
+    assert "Hello PDF world" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -168,10 +174,11 @@ def test_parse_pdf_joins_multiple_pages_with_paragraph_breaks() -> None:
     pdf_bytes = _make_pdf_bytes("Page one text", "Page two text")
     out = parse_pdf(pdf_bytes)
     assert out is not None
-    assert "Page one text" in out
-    assert "Page two text" in out
+    assert "Page one text" in out.text
+    assert "Page two text" in out.text
     # Confirm the paragraph-boundary separator is present.
-    assert "\n\n" in out
+    assert "\n\n" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -222,7 +229,8 @@ def test_parse_document_routes_pdf_to_pdf_parser() -> None:
     pdf_bytes = _make_pdf_bytes("Routed correctly")
     out = parse_document("policy.pdf", pdf_bytes)
     assert out is not None
-    assert "Routed correctly" in out
+    assert "Routed correctly" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit

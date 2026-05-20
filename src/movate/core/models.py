@@ -1980,6 +1980,13 @@ class KbChunk(BaseModel):
     path, page number, section index. Used by citation rendering;
     not part of the dedup key."""
 
+    ocr: bool = False
+    """True iff the chunk's text was produced by Tesseract OCR rather
+    than native text extraction (pypdf text layer, docx paragraphs,
+    readability HTML strip). Set by the ingest pipeline when
+    :func:`~movate.kb.parsers.parse_pdf` falls back to OCR for a
+    scanned-image PDF. Always False for non-PDF formats."""
+
     created_at: datetime = Field(default_factory=_now)
 
 

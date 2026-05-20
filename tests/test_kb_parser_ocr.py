@@ -75,7 +75,9 @@ def test_parse_pdf_text_pdf_no_ocr() -> None:
 
         result = parse_pdf(b"%PDF-fake-bytes")
 
-    assert result == "Page one content.\n\nPage two content."
+    assert result is not None
+    assert result.text == "Page one content.\n\nPage two content."
+    assert result.ocr_used is False
     mock_ocr.assert_not_called()
 
 
@@ -92,7 +94,9 @@ def test_parse_pdf_partial_empty_pages() -> None:
 
         result = parse_pdf(b"%PDF-fake-bytes")
 
-    assert result == "Good content here."
+    assert result is not None
+    assert result.text == "Good content here."
+    assert result.ocr_used is False
     mock_ocr.assert_not_called()
 
 
@@ -153,7 +157,9 @@ def test_parse_pdf_scanned_calls_ocr() -> None:
 
         result = parse_pdf(b"%PDF-scanned")
 
-    assert result == "OCR'd text"
+    assert result is not None
+    assert result.text == "OCR'd text"
+    assert result.ocr_used is True
     mock_ocr.assert_called_once_with(b"%PDF-scanned")
 
 

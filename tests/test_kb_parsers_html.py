@@ -39,7 +39,8 @@ def test_parse_document_routes_html_to_html_parser() -> None:
     body = b"<html><body><article><p>Hello HTML</p></article></body></html>"
     out = parse_document("page.html", body)
     assert out is not None
-    assert "Hello HTML" in out
+    assert "Hello HTML" in out.text
+    assert out.ocr_used is False
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +61,9 @@ def test_parse_html_extracts_article_content() -> None:
     )
     out = parse_html(body)
     assert out is not None
-    assert "Refund Policy" in out
-    assert "Annual subscriptions" in out
+    assert "Refund Policy" in out.text
+    assert "Annual subscriptions" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -79,9 +81,10 @@ def test_parse_html_strips_script_and_style() -> None:
     )
     out = parse_html(body)
     assert out is not None
-    assert "real article body" in out
-    assert "color: red" not in out
-    assert "alert" not in out
+    assert "real article body" in out.text
+    assert "color: red" not in out.text
+    assert "alert" not in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -98,10 +101,11 @@ def test_parse_html_block_tags_become_paragraph_breaks() -> None:
     out = parse_html(body)
     assert out is not None
     # \n\n boundaries between block-level pieces.
-    assert "\n\n" in out
+    assert "\n\n" in out.text
     # Each chunk distinguishable.
-    assert "First paragraph" in out
-    assert "Second paragraph" in out
+    assert "First paragraph" in out.text
+    assert "Second paragraph" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -118,7 +122,8 @@ def test_parse_html_normalizes_internal_whitespace() -> None:
     out = parse_html(body)
     assert out is not None
     # Multiple spaces in a row collapsed to single.
-    assert "Word with excess whitespace" in out
+    assert "Word with excess whitespace" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -132,7 +137,8 @@ def test_parse_html_decodes_latin1_fallback() -> None:
     out = parse_html(body)
     assert out is not None
     # latin-1 decoded "\xe9" → "é"; preserved in the extracted text.
-    assert "café menu" in out or "menu" in out  # decode-flexible
+    assert "café menu" in out.text or "menu" in out.text  # decode-flexible
+    assert out.ocr_used is False
 
 
 # ---------------------------------------------------------------------------

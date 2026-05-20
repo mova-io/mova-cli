@@ -45,9 +45,28 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 logger = logging.getLogger(__name__)
+
+
+class ParseResult(NamedTuple):
+    """Return value of :func:`parse_document` and each per-format parser.
+
+    Carrying ``ocr_used`` alongside the text lets the ingest pipeline
+    tag :class:`~movate.core.models.KbChunk` records with whether they
+    were extracted from image content via Tesseract OCR rather than
+    native text extraction. Operators can then filter / audit OCR-sourced
+    chunks separately (e.g. to flag lower-confidence content for review).
+    """
+
+    text: str
+    """Extracted text, stripped of leading/trailing whitespace."""
+
+    ocr_used: bool
+    """True iff the text was produced by Tesseract OCR rather than a
+    native text-extraction path (pypdf text layer, docx paragraphs,
+    readability HTML strip). Always False for non-PDF formats."""
 
 
 # File extensions the dispatch layer accepts. Sorted by frequency
@@ -69,20 +88,21 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
 
 class DocumentParser(Protocol):
     """Per-format parser interface. Each registered parser converts
-    raw bytes to extracted text or returns ``None`` on failure.
+    raw bytes to a :class:`ParseResult` or returns ``None`` on failure.
 
     Implementations MUST NOT raise; they log and return ``None`` so
     the dispatch layer can route a single bad file's
     ``status="skipped"`` without sinking a multi-file upload.
     """
 
-    def __call__(self, content: bytes) -> str | None: ...
+    def __call__(self, content: bytes) -> ParseResult | None: ...
 
 
-def parse_document(filename: str, content: bytes) -> str | None:
+def parse_document(filename: str, content: bytes) -> ParseResult | None:
     """Extract text from ``content`` based on ``filename``'s extension.
 
-    Returns the extracted text on success, or ``None`` if:
+    Returns a :class:`ParseResult` on success, or ``None`` if:
+
     * the extension isn't in :data:`SUPPORTED_EXTENSIONS`, OR
     * the parser failed (corrupt bytes, encrypted PDF, etc).
 
@@ -96,7 +116,7 @@ def parse_document(filename: str, content: bytes) -> str | None:
         content: The raw bytes from the upload.
 
     Returns:
-        Extracted text (UTF-8 string) or ``None``.
+        :class:`ParseResult` on success, ``None`` on failure.
     """
     if not filename:
         return None
@@ -130,7 +150,7 @@ def _extension(filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_text(content: bytes) -> str | None:
+def parse_text(content: bytes) -> ParseResult | None:
     """Decode UTF-8 text. Returns ``None`` on decode failure.
 
     Used for .md / .markdown / .txt. Same semantics as the KB
@@ -138,12 +158,12 @@ def parse_text(content: bytes) -> str | None:
     centralizes the failure-mode reporting.
     """
     try:
-        return content.decode("utf-8")
+        return ParseResult(text=content.decode("utf-8"), ocr_used=False)
     except UnicodeDecodeError:
         return None
 
 
-def parse_pdf(content: bytes) -> str | None:
+def parse_pdf(content: bytes) -> ParseResult | None:
     """Extract text from a PDF via pypdf, with OCR fallback for scanned images.
 
     Returns the concatenated page text (one page per ``\\n\\n``
@@ -214,11 +234,14 @@ def parse_pdf(content: bytes) -> str | None:
         # from rasterised content). Attempt OCR via the [ocr] extra
         # (pdf2image + pytesseract). Falls back to None gracefully when
         # the extra isn't installed — same behaviour as before PR-CC.
-        return _ocr_pdf(content)
+        ocr_text = _ocr_pdf(content)
+        if ocr_text is None:
+            return None
+        return ParseResult(text=ocr_text, ocr_used=True)
 
     # Join pages with the paragraph boundary the chunker uses so
     # natural page breaks become chunk breaks.
-    return "\n\n".join(pages)
+    return ParseResult(text="\n\n".join(pages), ocr_used=False)
 
 
 def _ocr_pdf(content: bytes) -> str | None:
@@ -282,7 +305,7 @@ def _ocr_pdf(content: bytes) -> str | None:
     return "\n\n".join(pages)
 
 
-def parse_docx(content: bytes) -> str | None:
+def parse_docx(content: bytes) -> ParseResult | None:
     """Extract text from a .docx via python-docx.
 
     Returns paragraphs joined by ``\\n\\n`` so the downstream chunker
@@ -313,6 +336,9 @@ def parse_docx(content: bytes) -> str | None:
     content lives in paragraphs, and table cells would need their
     own row/col reconstruction logic. Operator can convert tables
     to inline text in Word before upload if they're critical.
+
+    ``ocr_used`` is always ``False`` — DOCX text extraction is
+    native (no OCR path exists for this format in v0.9).
     """
     try:
         import docx  # noqa: PLC0415 — lazy: only paid for when an operator uploads a .docx
@@ -350,10 +376,10 @@ def parse_docx(content: bytes) -> str | None:
         return None
 
     # Same join semantics as parse_pdf — chunker splits on \n\n.
-    return "\n\n".join(paragraphs)
+    return ParseResult(text="\n\n".join(paragraphs), ocr_used=False)
 
 
-def parse_html(content: bytes) -> str | None:
+def parse_html(content: bytes) -> ParseResult | None:
     """Extract main-article text from HTML via Readability + BeautifulSoup.
 
     Two-stage pipeline:
@@ -386,6 +412,9 @@ def parse_html(content: bytes) -> str | None:
     * **html2text**: produces clean Markdown but ~100KB + slower
       to extract main content. We don't need Markdown round-trip —
       plain text feeds the chunker fine.
+
+    ``ocr_used`` is always ``False`` — HTML text extraction is
+    native (no OCR path for HTML in v0.9).
     """
     try:
         from bs4 import BeautifulSoup  # noqa: PLC0415 — lazy: only paid for HTML uploads
@@ -452,7 +481,7 @@ def parse_html(content: bytes) -> str | None:
 
     if not paragraphs:
         return None
-    return "\n\n".join(paragraphs)
+    return ParseResult(text="\n\n".join(paragraphs), ocr_used=False)
 
 
 # Dispatch table — extension → parser. Keeping this at the module

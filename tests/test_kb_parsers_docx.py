@@ -72,7 +72,8 @@ def test_parse_document_routes_docx_to_docx_parser() -> None:
     body = _make_docx_bytes("Hello DOCX world")
     out = parse_document("policy.docx", body)
     assert out is not None
-    assert "Hello DOCX world" in out
+    assert "Hello DOCX world" in out.text
+    assert out.ocr_used is False
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +86,8 @@ def test_parse_docx_extracts_single_paragraph() -> None:
     body = _make_docx_bytes("This is a refund policy paragraph.")
     out = parse_docx(body)
     assert out is not None
-    assert "refund policy" in out
+    assert "refund policy" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -98,9 +100,10 @@ def test_parse_docx_joins_paragraphs_with_paragraph_breaks() -> None:
     )
     out = parse_docx(body)
     assert out is not None
-    assert "First paragraph" in out
-    assert "Second paragraph" in out
-    assert "\n\n" in out  # paragraph boundary preserved
+    assert "First paragraph" in out.text
+    assert "Second paragraph" in out.text
+    assert "\n\n" in out.text  # paragraph boundary preserved
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -114,8 +117,9 @@ def test_parse_docx_includes_heading_text() -> None:
     )
     out = parse_docx(body)
     assert out is not None
-    assert "Refund Policy" in out
-    assert "Annual subscriptions" in out
+    assert "Refund Policy" in out.text
+    assert "Annual subscriptions" in out.text
+    assert out.ocr_used is False
 
 
 @pytest.mark.unit
@@ -132,7 +136,8 @@ def test_parse_docx_skips_empty_paragraphs() -> None:
     assert out is not None
     # Two paragraphs joined by a single \n\n — not three with stray
     # blank chunks in between.
-    assert out.count("\n\n") == 1
+    assert out.text.count("\n\n") == 1
+    assert out.ocr_used is False
 
 
 # ---------------------------------------------------------------------------
