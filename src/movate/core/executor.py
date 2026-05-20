@@ -745,11 +745,19 @@ class Executor:
                 # Effective per-call budget is skill override OR agent
                 # inheritance (ADR 002 D3).
                 call_ms = skill.spec.timeout_call_ms or agent_call_ms
+                # ``agent_name`` + ``storage`` + ``retrieval`` plumbed
+                # through for skills that introspect the calling agent
+                # (the ``kb-vector-lookup`` skill needs all three to
+                # query the agent's KB chunks with the operator's
+                # configured retrieval pipeline — PR-I).
                 ctx = SkillExecutionContext(
                     trace_id=span.trace_id,
                     tenant_id=tenant_id,
                     run_id=run_id,
                     call_ms_budget=call_ms,
+                    agent_name=bundle.spec.name,
+                    storage=self._storage,
+                    retrieval=bundle.spec.retrieval,
                 )
                 try:
                     output = await dispatch_skill(skill, tool_input, ctx)

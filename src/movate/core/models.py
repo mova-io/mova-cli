@@ -739,6 +739,96 @@ class AgentMetadata(BaseModel):
         return v
 
 
+class RetrievalConfig(BaseModel):
+    """KB retrieval pipeline configuration for an agent's
+    ``kb-vector-lookup`` skill.
+
+    Mirrors the flags ``mdk kb search`` exposes on the command line
+    (``--hybrid`` / ``--rewrite N`` / ``--rerank`` / ``--multi-hop N``)
+    so an operator who tuned retrieval interactively can lock in the
+    same settings for their deployed agent. All fields default to
+    "off" → the v0.9 default of vector-only is preserved for agents
+    that don't opt in.
+
+    Example ``agent.yaml``::
+
+        api_version: movate/v1
+        kind: Agent
+        name: refund-helper
+        ...
+        retrieval:
+          hybrid: true
+          rewrite: 3
+          rerank: true
+          multi_hop: 0
+
+    Cost / latency stacking (per agent call):
+
+    * vector only: ~50ms embedding round-trip
+    * +hybrid: ~+5ms (BM25 is in-memory)
+    * +rewrite=N: ~+200ms (one rewriter LLM call) + N+1 retrieval
+      fan-outs
+    * +rerank: ~+200ms (one reranker LLM call)
+    * +multi-hop=N: up to N planner LLM calls + N retrieval passes
+
+    The operator decides the right cost trade-off for their use case.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hybrid: bool = Field(
+        default=False,
+        description=(
+            "Combine vector + BM25 lexical search via RRF. Typically "
+            "15-25% better recall on real corpora — catches rare-term "
+            "hits (product names, error codes) that vector alone "
+            "blurs out. No extra API cost; BM25 runs locally."
+        ),
+    )
+    rewrite: int = Field(
+        default=0,
+        ge=0,
+        le=8,
+        description=(
+            "Expand the question into N alternative paraphrases via a "
+            "small LLM, fan out retrieval across all N+1 variants, "
+            "RRF-fuse the rankings. Catches vague queries that miss "
+            "specific KB terminology. Adds ~200ms + ~$0.0001/query. "
+            "0 = disabled (default)."
+        ),
+    )
+    rerank: bool = Field(
+        default=False,
+        description=(
+            "Add an LLM rerank stage that re-scores upstream candidates "
+            "by relevance, correcting 'noisy top-K' where vector / BM25 "
+            "scores rank irrelevant chunks high. Adds ~200ms + "
+            "~$0.0002/query."
+        ),
+    )
+    multi_hop: int = Field(
+        default=0,
+        ge=0,
+        le=5,
+        description=(
+            "Iterative retrieve → reason → retrieve loop. Best on "
+            "multi-fact questions ('how does X interact with Y?'). "
+            "Each hop runs the full pipeline; a planner LLM decides "
+            "'done' or generates a refined sub-query. Adds N planner "
+            "calls + N retrieval passes. 0 = disabled (default)."
+        ),
+    )
+
+    def is_default(self) -> bool:
+        """True when every field is at its default value.
+
+        Used by the skill template to skip kwargs entirely when the
+        operator hasn't opted in — keeps ``kb_search()`` calls byte-
+        for-byte unchanged from the pre-PR-I default path.
+        """
+        return not self.hybrid and self.rewrite == 0 and not self.rerank and self.multi_hop == 0
+
+
 class AgentSpec(BaseModel):
     """Parsed ``agent.yaml`` contents (api_version: movate/v1, kind: Agent)."""
 
@@ -925,6 +1015,29 @@ class AgentSpec(BaseModel):
             "embedding backends (pgvector / Azure AI Search) using the "
             "same interface — agents won't need to migrate. "
             "Omit (the default) for agents that don't need RAG."
+        ),
+    )
+
+    # ---- v0.9 KB retrieval configuration (Tier 10 RAG enhancements) ----
+    # Optional `retrieval:` block that the `kb-vector-lookup` skill reads
+    # at agent run time. Without this block, the skill uses pure vector
+    # retrieval (the v0.9 default). With it, agents opt into hybrid +
+    # BM25 + rewriter + rerank + multi-hop on a per-agent basis — the
+    # same flags the CLI exposes via `mdk kb search --hybrid ...`.
+    #
+    # Design choice: per-AGENT config (not per-call), because the
+    # operator wants their PRODUCTION agent to use the full stack
+    # consistently, not toggle it per request. Per-call override stays
+    # available via direct `kb_search(...)` kwargs for advanced uses.
+
+    retrieval: RetrievalConfig = Field(
+        default_factory=RetrievalConfig,
+        description=(
+            "KB retrieval pipeline configuration for the agent's "
+            "`kb-vector-lookup` skill. Defaults to vector-only "
+            "(`hybrid=false, rewrite=0, rerank=false, multi_hop=0`) "
+            "which preserves pre-v0.9 behavior — existing agents "
+            "load unchanged. See :class:`RetrievalConfig` for fields."
         ),
     )
 
