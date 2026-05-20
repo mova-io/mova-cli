@@ -18,7 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli._doctor_explanations import EXPLANATIONS
-from movate.cli.doctor import _PROVIDER_KEYS, _RUNTIME_PROBES, _TRACING_KEYS
+from movate.cli.doctor import _KB_DEPS, _OCR_DEPS, _PROVIDER_KEYS, _RUNTIME_PROBES, _TRACING_KEYS
 from movate.cli.main import app
 
 runner = CliRunner()
@@ -47,6 +47,32 @@ def test_every_optional_dep_has_explanation() -> None:
 
     for dep in _OPTIONAL_DEPS:
         assert f"opt: {dep}" in EXPLANATIONS, f"Optional dep {dep!r} has no entry in EXPLANATIONS."
+
+
+def test_every_kb_dep_has_explanation() -> None:
+    """Drift guard: new KB dep added to doctor.py without an explanation
+    entry is caught here rather than silently skipped in --explain."""
+    for _probe_mod, display_name in _KB_DEPS:
+        assert f"kb: {display_name}" in EXPLANATIONS, (
+            f"KB dep {display_name!r} has no entry in EXPLANATIONS — "
+            f"add one in cli/_doctor_explanations.py."
+        )
+
+
+def test_every_ocr_dep_has_explanation() -> None:
+    """Drift guard: new OCR dep (Pillow, EasyOCR, etc.) added to doctor.py
+    without a corresponding explanation is caught here."""
+    # _OCR_DEPS entries are 3-tuples: (probe_module, display_name, install_hint)
+    for _probe_mod, display_name, _hint in _OCR_DEPS:
+        assert f"ocr: {display_name}" in EXPLANATIONS, (
+            f"OCR dep {display_name!r} has no entry in EXPLANATIONS — "
+            f"add one in cli/_doctor_explanations.py."
+        )
+    # The Tesseract binary check is separate from _OCR_DEPS (it's a shutil.which
+    # check, not an importlib probe) but still warrants an explanation entry.
+    assert "ocr: tesseract" in EXPLANATIONS, (
+        "Tesseract binary check has no EXPLANATIONS entry — add 'ocr: tesseract'."
+    )
 
 
 def test_every_runtime_has_explanation() -> None:
@@ -110,11 +136,33 @@ def test_doctor_with_explain_prints_details() -> None:
     assert "Check details" in result.stdout
     # Section headers all appear.
     assert "Required dependencies" in result.stdout
+    assert "KB parsing & OCR" in result.stdout
     assert "Runtime adapters" in result.stdout
     assert "Provider API keys" in result.stdout
     # At least one specific WHAT line surfaces — proves entries render,
     # not just the section structure.
     assert "Typer CLI framework" in result.stdout
+
+
+def test_doctor_explain_shows_kb_and_ocr_sections() -> None:
+    """The KB parsing & OCR section must render with entries for all four
+    Python deps (pillow, pdf2image, pytesseract, easyocr) and the
+    Tesseract system-binary entry."""
+    result = runner.invoke(app, ["doctor", "--explain"])
+    assert result.exit_code == 0
+    # Section header
+    assert "KB parsing & OCR" in result.stdout
+    # KB parsing entries (document formats)
+    assert "pypdf" in result.stdout
+    assert "python-docx" in result.stdout
+    assert "beautifulsoup4" in result.stdout
+    # OCR entries
+    assert "pillow" in result.stdout.lower()
+    assert "pdf2image" in result.stdout
+    assert "pytesseract" in result.stdout
+    assert "easyocr" in result.stdout.lower()
+    # EasyOCR-specific key detail — no system binary needed
+    assert "no system binary" in result.stdout.lower()
 
 
 def test_doctor_explain_shows_fix_for_missing_provider_key() -> None:

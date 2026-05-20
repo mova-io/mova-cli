@@ -42,12 +42,36 @@ _KB_DEPS: tuple[tuple[str, str], ...] = (
     ("bs4", "beautifulsoup4"),
 )
 
-# OCR deps — optional [ocr] extra (pdf2image + pytesseract).
-# Both require system binaries: Poppler (for pdf2image) and Tesseract
-# (for pytesseract). The Tesseract binary check is done via shutil.which.
-_OCR_DEPS: tuple[tuple[str, str], ...] = (
-    ("pdf2image", "pdf2image"),
-    ("pytesseract", "pytesseract"),
+# OCR deps — optional [ocr] and [easyocr] extras, plus Pillow for
+# standalone image files (PNG/JPG/TIFF).
+#
+# Each entry is (probe_module, display_name, install_hint) so the
+# doctor table can point operators at the right `uv add` command per dep:
+#
+#   [ocr]      — Pillow (image decoder) + pdf2image (Poppler rasterizer)
+#                + pytesseract (Tesseract Python wrapper)
+#   [easyocr]  — EasyOCR (pure-Python OCR; no system binary required)
+#
+# All four feed the same _ocr_tesseract / _ocr_easyocr dispatcher in
+# movate.kb.parsers. The Tesseract system-binary check is done separately
+# via shutil.which (it's not a Python package).
+_OCR_DEPS: tuple[tuple[str, str, str], ...] = (
+    # Pillow — decodes PNG/JPG/TIFF/BMP → PIL.Image before OCR.
+    # Required for standalone image KB files; also used inside the PDF OCR
+    # path once pdf2image rasterizes a page.
+    ("PIL", "pillow", "uv add 'movate-cli[ocr]'"),
+    # pdf2image — wraps Poppler's `pdftoppm` to rasterize PDF pages.
+    # Required only for scanned / mixed PDFs (text PDFs are parsed
+    # directly by pypdf without OCR).
+    ("pdf2image", "pdf2image", "uv add 'movate-cli[ocr]'"),
+    # pytesseract — thin Python wrapper around the Tesseract binary.
+    # `MOVATE_OCR_BACKEND=tesseract` (the default) uses this path.
+    ("pytesseract", "pytesseract", "uv add 'movate-cli[ocr]'"),
+    # EasyOCR — pure-Python OCR (torch-based); no system binary needed.
+    # `MOVATE_OCR_BACKEND=easyocr` uses this path. Better than Tesseract
+    # on noisy scans, handwriting, and non-Latin scripts. GPU-optional
+    # (MOVATE_EASYOCR_GPU=1). Apache-2.0 licensed.
+    ("easyocr", "easyocr", "uv add 'movate-cli[easyocr]'"),
 )
 
 # SPDX license per dep. Curated by hand because Python package metadata
@@ -77,10 +101,13 @@ _DEP_LICENSES: dict[str, str] = {
     "pypdf": "BSD-3-Clause",
     "python-docx": "MIT",
     "beautifulsoup4": "MIT",
-    # OCR deps ([ocr] extra)
+    # OCR deps ([ocr] extra — Pillow + pdf2image + pytesseract)
+    "pillow": "HPND",          # Historical Permission Notice and Disclaimer (permissive)
     "pdf2image": "MIT",
     "pytesseract": "Apache-2.0",
     "tesseract": "Apache-2.0",  # system binary
+    # EasyOCR dep ([easyocr] extra — alternative pure-Python OCR backend)
+    "easyocr": "Apache-2.0",
 }
 
 # One-line role description per dep — surfaced in ``mdk doctor`` so
@@ -107,10 +134,13 @@ _DEP_PURPOSE: dict[str, str] = {
     "pypdf": "PDF text extraction (mdk kb ingest)",
     "python-docx": "DOCX text extraction (mdk kb ingest)",
     "beautifulsoup4": "HTML text extraction (mdk kb ingest)",
-    # OCR deps ([ocr] extra)
+    # OCR deps — [ocr] extra (Pillow + pdf2image + pytesseract)
+    "pillow": "Decode PNG/JPG/TIFF/BMP KB files → OCR-ready PIL.Image",
     "pdf2image": "PDF→image rasterizer for scanned PDFs (Poppler)",
     "pytesseract": "Python wrapper for Tesseract OCR engine",
     "tesseract": "Tesseract OCR engine binary (system install)",
+    # EasyOCR dep — [easyocr] extra
+    "easyocr": "Pure-Python OCR backend; no system binary, GPU-optional",
 }
 
 # Map each AgentRuntime to (probe-module, extras-install-hint). Used by
@@ -273,13 +303,21 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
 
     _add("", "", "", "")
 
-    # OCR deps — [ocr] extra (pdf2image + pytesseract) plus the
-    # Tesseract system binary. All three must be present for scanned-PDF
-    # OCR to work. pdf2image also needs Poppler (`brew install poppler`
-    # / `apt-get install poppler-utils`).
-    for probe_mod, display_name in _OCR_DEPS:
+    # OCR deps — Pillow (image decoder) + [ocr] extra (pdf2image +
+    # pytesseract) + [easyocr] extra (EasyOCR) — plus the Tesseract
+    # system binary.
+    #
+    # The three Python extras gate three different document-type paths:
+    #   Pillow       → standalone image files (PNG/JPG/TIFF/BMP)
+    #   pdf2image    → scanned / mixed PDFs (rasterize → OCR)
+    #   pytesseract  → MOVATE_OCR_BACKEND=tesseract (default)
+    #   easyocr      → MOVATE_OCR_BACKEND=easyocr (no system binary)
+    #
+    # All paths converge at movate.kb.parsers; install whichever combo
+    # matches your document mix. Full pipeline: all four + tesseract binary.
+    for probe_mod, display_name, install_hint in _OCR_DEPS:
         spec = importlib.util.find_spec(probe_mod)
-        status = _ok("") if spec else _missing("uv add 'movate-cli[ocr]'")
+        status = _ok("") if spec else _missing(install_hint)
         purpose = _DEP_PURPOSE.get(display_name, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(display_name, "[yellow]?[/yellow]")
         _add(f"ocr: {display_name}", status, purpose, license_str)
@@ -697,6 +735,13 @@ def _render_explanations() -> None:
     sections = [
         ("Required dependencies", [k for k in EXPLANATIONS if k.startswith("dep: ")]),
         ("Optional dependencies", [k for k in EXPLANATIONS if k.startswith("opt: ")]),
+        # KB parsing + OCR — separate section so operators building document
+        # ingestion pipelines get focused guidance without wading through the
+        # core-dep explanations.
+        (
+            "KB parsing & OCR",
+            [k for k in EXPLANATIONS if k.startswith(("kb: ", "ocr: "))],
+        ),
         ("Runtime adapters", [k for k in EXPLANATIONS if k.startswith("runtime: ")]),
         ("Provider API keys", [k for k in EXPLANATIONS if k.endswith("_API_KEY")]),
         (
@@ -757,6 +802,11 @@ _LICENSE_ALLOWLIST: frozenset[str] = frozenset(
         "PostgreSQL",
         "PSF-2.0",
         "MIT OR Apache-2.0",
+        # HPND — Historical Permission Notice and Disclaimer. OSI-approved
+        # permissive license used by Pillow. Functionally equivalent to MIT;
+        # no copyleft / source-availability obligations. Safe for embedding
+        # in commercial deliverables. See: spdx.org/licenses/HPND.html
+        "HPND",
     }
 )
 
