@@ -95,7 +95,7 @@ def test_real_ingest_without_key_errors_with_hint(
     )
     assert result.exit_code == 2
     combined = result.stdout + result.stderr
-    assert "no OpenAI API key" in combined
+    assert "no API key found" in combined
     assert "--dry-run" in combined
 
 
