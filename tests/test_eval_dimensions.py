@@ -428,6 +428,11 @@ class _FaithfulnessStubProvider(BaseLLMProvider):
             return CompletionResponse(
                 text='{"score": 1.0, "rationale": "stub-specialist"}',
             )
+        if "CONTEXT COMPLIANCE" in body:
+            # context_compliance scorer — triggered when bundle.contexts is set.
+            return CompletionResponse(
+                text='{"score": 1.0, "rationale": "stub-ctx-compliance"}',
+            )
         return CompletionResponse(text=self._agent_response)
 
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
@@ -713,3 +718,119 @@ def test_gate_context_compliance_skipped_when_not_scored() -> None:
         gate_context_compliance=0.8,
     )
     assert not failed  # skipped, not failed
+
+
+# ---------------------------------------------------------------------------
+# PR-DD: contexts/ files as default faithfulness grounding
+# ---------------------------------------------------------------------------
+
+
+def _scaffold_with_contexts(dst: Path, ctx_name: str, ctx_body: str) -> Path:
+    """Scaffold a minimal agent that declares one context file."""
+    agent_dir = _scaffold(dst)
+    project_root = dst.parent
+
+    # Declare the context in agent.yaml (appended; loader merges with spec).
+    yaml_path = agent_dir / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + f"\ncontexts:\n  - {ctx_name}\n")
+
+    # Write the context body at project_root/contexts/<name>.md
+    ctx_dir = project_root / "contexts"
+    ctx_dir.mkdir(exist_ok=True)
+    (ctx_dir / f"{ctx_name}.md").write_text(ctx_body)
+
+    return agent_dir
+
+
+@pytest.mark.unit
+async def test_faithfulness_uses_contexts_when_no_grounding_in_case(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """When dataset case has no grounding, bundle.contexts feeds faithfulness."""
+    ctx_body = "Refunds are processed within 5 business days."
+    agent_dir = _scaffold_with_contexts(
+        tmp_path / "demo", ctx_name="refund-policy", ctx_body=ctx_body
+    )
+
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        # No "grounding" field — faithfulness should still be scored via contexts.
+        '{"input": {"text": "how long for refund?"}, "expected": {"message": "5 days"}}\n'
+    )
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: llm_judge\n"
+        "model:\n  provider: anthropic/claude-haiku-4-5-20251001\n"
+        "rubric: 'be strict'\n"
+        "threshold: 0.7\n"
+    )
+    bundle = load_agent(agent_dir)
+
+    provider = _FaithfulnessStubProvider(
+        agent_response='{"message": "5 days"}', faithfulness_score=0.95
+    )
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    dims = summary.cases[0].runs[0].dimensions
+
+    # Faithfulness must be scored — contexts/ injected as grounding.
+    assert dims.faithfulness.value == pytest.approx(0.95)
+    assert provider.faithfulness_prompts, "Faithfulness judge never called"
+    # The contexts body should appear in the prompt sent to the judge.
+    assert ctx_body in provider.faithfulness_prompts[0]
+
+
+@pytest.mark.unit
+async def test_explicit_grounding_takes_priority_over_contexts(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """case.grounding wins over bundle.contexts when both are present."""
+    ctx_body = "Context file content — should NOT appear in the judge prompt."
+    explicit_grounding = "Explicit grounding string from the dataset."
+    agent_dir = _scaffold_with_contexts(tmp_path / "demo", ctx_name="policy", ctx_body=ctx_body)
+
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        f'{{"input": {{"text": "q"}}, "expected": {{"message": "a"}}, '
+        f'"grounding": "{explicit_grounding}"}}\n'
+    )
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: llm_judge\n"
+        "model:\n  provider: anthropic/claude-haiku-4-5-20251001\n"
+        "rubric: 'be strict'\n"
+        "threshold: 0.7\n"
+    )
+    bundle = load_agent(agent_dir)
+
+    provider = _FaithfulnessStubProvider(agent_response='{"message": "a"}', faithfulness_score=0.8)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    await engine.run(bundle)
+
+    assert provider.faithfulness_prompts, "Faithfulness judge never called"
+    prompt = provider.faithfulness_prompts[0]
+    assert explicit_grounding in prompt
+    assert ctx_body not in prompt  # contexts/ not injected when grounding is explicit
+
+
+@pytest.mark.unit
+async def test_faithfulness_not_scored_without_grounding_or_contexts(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """Neither case.grounding nor bundle.contexts → faithfulness stays None (back-compat)."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}}\n'
+        # No grounding; agent has no contexts/ files.
+    )
+    bundle = load_agent(agent_dir)
+
+    provider = _FaithfulnessStubProvider(agent_response='{"message": "ok"}', faithfulness_score=0.9)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    dims = summary.cases[0].runs[0].dimensions
+
+    assert dims.faithfulness.value is None
+    assert not provider.faithfulness_prompts, "Faithfulness judge should NOT have been called"
