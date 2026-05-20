@@ -29,6 +29,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.kb.embed import DEFAULT_EMBEDDING_MODEL
+
 console = Console()
 err_console = Console(stderr=True)
 
@@ -103,11 +105,24 @@ def ingest(
             "in production where the tenant comes from the auth context."
         ),
     ),
+    model: str = typer.Option(
+        DEFAULT_EMBEDDING_MODEL,
+        "--model",
+        help=(
+            "Embedding model. Bare names (``text-embedding-3-small``) and "
+            "``openai/`` prefixed strings go directly to OpenAI. Any other "
+            "``provider/model`` string (``cohere/embed-english-v3.0``, "
+            "``voyage/voyage-3``, etc.) is routed through LiteLLM — set "
+            "the matching provider env var (COHERE_API_KEY, VOYAGE_API_KEY, …)."
+        ),
+    ),
     api_key_env: str = typer.Option(
         "OPENAI_API_KEY",
         "--api-key-env",
         help=(
-            "Env var holding the OpenAI key for embedding calls. Defaults to ``OPENAI_API_KEY``."
+            "Env var holding the API key for embedding calls. "
+            "Defaults to ``OPENAI_API_KEY``. Override when using a "
+            "non-OpenAI provider (e.g. ``COHERE_API_KEY``)."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -115,7 +130,7 @@ def ingest(
         "--dry-run",
         help=(
             "Chunk + report what WOULD be ingested without calling "
-            "OpenAI or writing to storage. Use to validate chunk "
+            "the embedding API or writing to storage. Use to validate chunk "
             "sizes + counts before paying for embeddings."
         ),
     ),
@@ -125,15 +140,20 @@ def ingest(
     Use ``--dry-run`` to preview chunk count + size distribution
     without consuming any embedding budget. Useful when tuning a
     new corpus before committing to the real ingest.
+
+    Use ``--model`` to select a non-default embedding provider, e.g.
+    ``--model cohere/embed-english-v3.0``. The model used at ingest
+    MUST match the model used at search time.
     """
     import os  # noqa: PLC0415
 
-    # --dry-run skips the OpenAI key check (no embedding calls).
+    # --dry-run skips the API key check (no embedding calls).
     api_key = os.environ.get(api_key_env, "").strip()
     if not api_key and not dry_run:
         err_console.print(
-            f"[red]✗[/red] no OpenAI API key in [bold]${api_key_env}[/bold]. "
-            "Run [bold]mdk auth login openai[/bold] first, or pass "
+            f"[red]✗[/red] no API key found in [bold]${api_key_env}[/bold]. "
+            "Set the env var or pass [bold]--api-key-env[/bold] to point at "
+            "the correct env var for your embedding provider. Pass "
             "[bold]--dry-run[/bold] to preview without embedding."
         )
         raise typer.Exit(code=2)
@@ -156,6 +176,7 @@ def ingest(
                 path=path,
                 agent=agent,
                 tenant_id=tenant_id,
+                embedding_model=model,
                 api_key=api_key,
             )
         finally:
@@ -386,10 +407,24 @@ def search(
         "--tenant-id",
         help="Tenant scope (matches the value used at ingest).",
     ),
+    model: str = typer.Option(
+        DEFAULT_EMBEDDING_MODEL,
+        "--model",
+        help=(
+            "Embedding model used to embed the query. MUST match the model "
+            "used at ingest time — different models produce incomparable "
+            "vector spaces. Bare names (``text-embedding-3-small``) and "
+            "``openai/`` prefixed strings go directly to OpenAI; any other "
+            "``provider/model`` string is routed through LiteLLM."
+        ),
+    ),
     api_key_env: str = typer.Option(
         "OPENAI_API_KEY",
         "--api-key-env",
-        help="Env var holding the OpenAI key for query embedding.",
+        help=(
+            "Env var holding the API key for query embedding. "
+            "Defaults to ``OPENAI_API_KEY``; override for non-OpenAI providers."
+        ),
     ),
     show_full: bool = typer.Option(
         False,
@@ -487,7 +522,11 @@ def search(
 
     api_key = os.environ.get(api_key_env, "").strip()
     if not api_key:
-        err_console.print(f"[red]✗[/red] no OpenAI API key in [bold]${api_key_env}[/bold].")
+        err_console.print(
+            f"[red]✗[/red] no API key found in [bold]${api_key_env}[/bold]. "
+            "Set the env var or pass [bold]--api-key-env[/bold] to point at "
+            "the correct env var for your embedding provider."
+        )
         raise typer.Exit(code=2)
 
     async def _run() -> None:
@@ -505,6 +544,7 @@ def search(
                 tenant_id=tenant_id,
                 limit=k,
                 api_key=api_key,
+                embedding_model=model,
                 hybrid=hybrid,
                 rewrite_variants=rewrite,
                 rerank=rerank,

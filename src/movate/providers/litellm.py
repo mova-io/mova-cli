@@ -197,8 +197,21 @@ class LiteLLMProvider(BaseLLMProvider):
         async for chunk in resp:
             yield _stream_chunk_from_litellm(chunk)
 
-    async def embed(self, text: str, *, model: str) -> list[float]:  # pragma: no cover - v0.5
-        raise NotImplementedError("embed lands in v0.5 with retrieval")
+    async def embed(self, text: str, *, model: str) -> list[float]:
+        """Embed a single text via LiteLLM's ``aembedding()`` call.
+
+        Wraps the batch helper in :mod:`movate.kb.embed` for a
+        single-text convenience interface.  Callers embedding many texts
+        should use :func:`movate.kb.embed.embed_texts` directly to take
+        advantage of batched API calls.
+
+        Raises :class:`movate.kb.embed.EmbeddingError` on API errors
+        (auth failure, malformed response, provider unavailable).
+        """
+        from movate.kb.embed import embed_texts  # noqa: PLC0415
+
+        results = await embed_texts([text], model=model)
+        return results[0]
 
 
 def _extract_retry_after(exc: Exception) -> float | None:
