@@ -59,7 +59,10 @@ def test_chunker_drops_tiny_fragments() -> None:
 def test_chunker_subsplits_long_paragraphs() -> None:
     """A single 5000-char paragraph gets split into multiple chunks
     no larger than MAX_CHUNK_CHARS."""
-    sentence = "This is a deliberately long sentence with enough words to consume meaningful char count. "
+    sentence = (
+        "This is a deliberately long sentence with enough words "
+        "to consume meaningful char count. "
+    )
     # ~90 chars * 60 = ~5400 chars, well over MAX_CHUNK_CHARS (2000).
     long_paragraph = sentence * 60
     chunks = split_paragraphs(long_paragraph)
