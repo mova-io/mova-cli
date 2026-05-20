@@ -103,20 +103,103 @@ class TestInMemoryStore:
 
 
 # ---------------------------------------------------------------------------
-# SqliteStore scaffold
+# SqliteStore — full implementation tests
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.unit
-class TestSqliteStoreScaffold:
-    def test_list_returns_empty(self, tmp_path: Path) -> None:
-        store = SqliteStore(db_path=tmp_path / "x.db")
-        assert asyncio.run(store.list("a")) == []
+@pytest.fixture
+def sqlite_store(tmp_path: Path) -> SqliteStore:
+    return SqliteStore(db_path=tmp_path / "memory.db")
 
-    def test_set_raises_not_implemented(self, tmp_path: Path) -> None:
-        store = SqliteStore(db_path=tmp_path / "x.db")
-        with pytest.raises(NotImplementedError):
-            asyncio.run(store.set("a", "k", {"v": 1}))
+
+@pytest.mark.unit
+class TestSqliteStore:
+    def test_set_then_get(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("triage", "k1", {"x": 42}))
+        entry = asyncio.run(sqlite_store.get("triage", "k1"))
+        assert entry is not None
+        assert entry.value == {"x": 42}
+        assert entry.agent == "triage"
+        assert entry.key == "k1"
+
+    def test_get_missing_returns_none(self, sqlite_store: SqliteStore) -> None:
+        result = asyncio.run(sqlite_store.get("nobody", "missing"))
+        assert result is None
+
+    def test_list_empty_agent(self, sqlite_store: SqliteStore) -> None:
+        assert asyncio.run(sqlite_store.list("nobody")) == []
+
+    def test_list_returns_entries_sorted_by_created_at(
+        self, sqlite_store: SqliteStore
+    ) -> None:
+        asyncio.run(sqlite_store.set("a", "k1", {"n": 1}))
+        asyncio.run(sqlite_store.set("a", "k2", {"n": 2}))
+        asyncio.run(sqlite_store.set("a", "k3", {"n": 3}))
+        entries = asyncio.run(sqlite_store.list("a"))
+        assert [e.key for e in entries] == ["k1", "k2", "k3"]
+
+    def test_set_upserts_existing_key(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("a", "k", {"v": 1}))
+        asyncio.run(sqlite_store.set("a", "k", {"v": 2}))
+        entry = asyncio.run(sqlite_store.get("a", "k"))
+        assert entry is not None
+        assert entry.value == {"v": 2}
+        # Only one entry — not two.
+        all_entries = asyncio.run(sqlite_store.list("a"))
+        assert len(all_entries) == 1
+
+    def test_delete_existing_returns_true(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("a", "k", {"v": 1}))
+        assert asyncio.run(sqlite_store.delete("a", "k")) is True
+        assert asyncio.run(sqlite_store.get("a", "k")) is None
+
+    def test_delete_missing_returns_false(self, sqlite_store: SqliteStore) -> None:
+        assert asyncio.run(sqlite_store.delete("nobody", "missing")) is False
+
+    def test_evict_older_than_removes_stale(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("a", "old", {"v": "old"}))
+        # Timestamp guaranteed later than the entry above.
+        import time  # noqa: PLC0415
+
+        time.sleep(0.01)
+        from movate.memory.store import _now_iso  # noqa: PLC0415
+
+        cutoff = _now_iso()
+        asyncio.run(sqlite_store.set("a", "new", {"v": "new"}))
+        removed = asyncio.run(sqlite_store.evict_older_than("a", cutoff))
+        assert removed == 1
+        assert asyncio.run(sqlite_store.get("a", "old")) is None
+        assert asyncio.run(sqlite_store.get("a", "new")) is not None
+
+    def test_evict_nothing_to_remove(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("a", "k", {"v": 1}))
+        # Cutoff in the past — nothing should be removed.
+        removed = asyncio.run(sqlite_store.evict_older_than("a", "2020-01-01T00:00:00.000Z"))
+        assert removed == 0
+
+    def test_persists_across_instances(self, tmp_path: Path) -> None:
+        db = tmp_path / "shared.db"
+        first = SqliteStore(db_path=db)
+        asyncio.run(first.set("agent", "k", {"hello": "world"}))
+        second = SqliteStore(db_path=db)
+        entry = asyncio.run(second.get("agent", "k"))
+        assert entry is not None
+        assert entry.value == {"hello": "world"}
+
+    def test_ttl_seconds_stored_and_retrieved(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("a", "k", {"v": 1}, ttl_seconds=3600))
+        entry = asyncio.run(sqlite_store.get("a", "k"))
+        assert entry is not None
+        assert entry.ttl_seconds == 3600
+
+    def test_agent_isolation(self, sqlite_store: SqliteStore) -> None:
+        asyncio.run(sqlite_store.set("agent-a", "k", {"who": "a"}))
+        asyncio.run(sqlite_store.set("agent-b", "k", {"who": "b"}))
+        a_entry = asyncio.run(sqlite_store.get("agent-a", "k"))
+        b_entry = asyncio.run(sqlite_store.get("agent-b", "k"))
+        assert a_entry is not None and a_entry.value["who"] == "a"
+        assert b_entry is not None and b_entry.value["who"] == "b"
+        assert asyncio.run(sqlite_store.list("agent-a")) == [a_entry]
 
 
 # ---------------------------------------------------------------------------

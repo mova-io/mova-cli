@@ -201,29 +201,90 @@ class InMemoryStore:
 
 
 # ---------------------------------------------------------------------------
-# SqliteStore — MVP scaffold (raises on writes; shape is here)
+# SqliteStore — aiosqlite-backed persistent memory
 # ---------------------------------------------------------------------------
+
+_CREATE_TABLE_SQL = """\
+CREATE TABLE IF NOT EXISTS memory_entries (
+    agent       TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value_json  TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    ttl_seconds INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent, key)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_agent ON memory_entries (agent);
+"""
 
 
 class SqliteStore:
-    """Persistent memory backed by SQLite.
+    """Persistent memory backed by SQLite via ``aiosqlite``.
 
-    [bold]MVP scaffold[/bold] — the Protocol surface is implemented
-    but writes raise ``NotImplementedError``. Lets the Executor
-    wiring + CLI dispatch land against the right interface; the
-    actual DDL + adapter lands in a follow-up.
+    Enabled by setting ``MOVATE_MEMORY_BACKEND=sqlite`` (or by
+    constructing directly). Uses ``~/.movate/memory.db`` by default;
+    override with the ``db_path`` constructor arg.
+
+    Design choices:
+    * Schema is a single ``memory_entries`` table with ``(agent, key)``
+      as the composite primary key — upsert via ``INSERT OR REPLACE``.
+    * ``value`` is stored as JSON text; round-trips cleanly for any
+      JSON-serializable dict.
+    * WAL mode is enabled on first connection for better concurrent
+      read throughput (multiple readers, one writer).
+    * Each async method opens + closes its own connection so the store
+      is safe to share across async tasks without connection-pool
+      overhead (writes are infrequent; connections are lightweight).
+    * ``aiosqlite`` is already a core dependency (used by the storage
+      layer); no new requirements.
     """
 
     def __init__(self, db_path: str | Path = "~/.movate/memory.db") -> None:
         self._path = Path(str(db_path)).expanduser()
 
+    async def _conn(self) -> Any:
+        """Open a connection, enable WAL, ensure schema, return connection.
+
+        Caller is responsible for closing (used as async context manager
+        by each method).
+        """
+        import aiosqlite  # noqa: PLC0415 — optional at module level; always installed
+
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(self._path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.executescript(_CREATE_TABLE_SQL)
+        await conn.commit()
+        return conn
+
     async def list(self, agent: str) -> list[MemoryEntry]:
-        _ = agent
-        return []  # Scaffold: empty store until SQLite adapter lands.
+        """All entries for ``agent``, sorted by created_at ascending."""
+        conn = await self._conn()
+        try:
+            async with conn.execute(
+                "SELECT agent, key, value_json, created_at, ttl_seconds "
+                "FROM memory_entries WHERE agent = ? ORDER BY created_at ASC",
+                (agent,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+        return [_row_to_entry(row) for row in rows]
 
     async def get(self, agent: str, key: str) -> MemoryEntry | None:
-        _ = (agent, key)
-        return None
+        """One entry; ``None`` when absent."""
+        conn = await self._conn()
+        try:
+            async with conn.execute(
+                "SELECT agent, key, value_json, created_at, ttl_seconds "
+                "FROM memory_entries WHERE agent = ? AND key = ?",
+                (agent, key),
+            ) as cursor:
+                row = await cursor.fetchone()
+        finally:
+            await conn.close()
+        return _row_to_entry(row) if row else None
 
     async def set(
         self,
@@ -233,20 +294,68 @@ class SqliteStore:
         *,
         ttl_seconds: int = 0,
     ) -> MemoryEntry:
-        _ = (agent, key, value, ttl_seconds)
-        raise NotImplementedError(
-            "SqliteStore.set is a scaffold — use InMemoryStore for MVP "
-            "(set MOVATE_MEMORY_BACKEND=memory) or wait for the SQLite "
-            "adapter (Sprint T follow-up)"
+        """Insert or replace. Returns the stored entry."""
+        entry = MemoryEntry(
+            agent=agent,
+            key=key,
+            value=value,
+            created_at=_now_iso(),
+            ttl_seconds=ttl_seconds,
         )
+        conn = await self._conn()
+        try:
+            await conn.execute(
+                "INSERT OR REPLACE INTO memory_entries "
+                "(agent, key, value_json, created_at, ttl_seconds) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (agent, key, json.dumps(value, ensure_ascii=False), entry.created_at, ttl_seconds),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+        return entry
 
     async def delete(self, agent: str, key: str) -> bool:
-        _ = (agent, key)
-        return False
+        """Delete one entry. Returns ``True`` if a row was removed."""
+        conn = await self._conn()
+        try:
+            cursor = await conn.execute(
+                "DELETE FROM memory_entries WHERE agent = ? AND key = ?",
+                (agent, key),
+            )
+            await conn.commit()
+            deleted = int(cursor.rowcount) > 0
+        finally:
+            await conn.close()
+        return deleted
 
     async def evict_older_than(self, agent: str, before_iso: str) -> int:
-        _ = (agent, before_iso)
-        return 0
+        """Delete entries whose created_at < ``before_iso``. Returns count."""
+        conn = await self._conn()
+        try:
+            cursor = await conn.execute(
+                "DELETE FROM memory_entries WHERE agent = ? AND created_at < ?",
+                (agent, before_iso),
+            )
+            await conn.commit()
+            return int(cursor.rowcount)
+        finally:
+            await conn.close()
+
+
+def _row_to_entry(row: Any) -> MemoryEntry:
+    """Convert an ``aiosqlite.Row`` to a :class:`MemoryEntry`."""
+    try:
+        value = json.loads(row["value_json"])
+    except (TypeError, ValueError):
+        value = {}
+    return MemoryEntry(
+        agent=row["agent"],
+        key=row["key"],
+        value=value if isinstance(value, dict) else {},
+        created_at=row["created_at"],
+        ttl_seconds=int(row["ttl_seconds"]),
+    )
 
 
 # ---------------------------------------------------------------------------

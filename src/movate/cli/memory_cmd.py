@@ -166,12 +166,7 @@ def set_(
     if not isinstance(value, dict):
         err_console.print("[red]✗[/red] value must be a JSON object")
         raise typer.Exit(code=2)
-    try:
-        entry = asyncio.run(_store().set(agent, key, value, ttl_seconds=ttl_seconds))
-    except NotImplementedError as exc:
-        # SqliteStore scaffold — surface cleanly.
-        err_console.print(f"[yellow]⚠[/yellow] backend not implemented: {exc}")
-        raise typer.Exit(code=2) from None
+    entry = asyncio.run(_store().set(agent, key, value, ttl_seconds=ttl_seconds))
     console.print(
         f"[green]✓[/green] stored [bold]{key}[/bold] for "
         f"[cyan]{agent}[/cyan] [dim]({entry.created_at})[/dim]"
