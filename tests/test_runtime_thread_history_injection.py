@@ -24,7 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from movate.core.auth import ApiKeyEnv, mint_api_key
-from movate.core.models import JobStatus, Metrics, RunRecord
+from movate.core.models import JobStatus, Metrics, RunRecord, TokenUsage
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
@@ -78,7 +78,7 @@ def _seed_prior_run(
         status=JobStatus.SUCCESS,
         input=input_data,
         output=output_data,
-        metrics=Metrics(latency_ms=50, cost_usd=0.001, tokens_in=5, tokens_out=5),
+        metrics=Metrics(latency_ms=50, cost_usd=0.001, tokens=TokenUsage(input=5, output=5)),
         created_at=created_at,
         thread_id=thread_id,
     )
@@ -269,7 +269,7 @@ async def test_other_tenants_runs_dont_leak_into_history(
         status=JobStatus.SUCCESS,
         input={"q": "should NOT leak"},
         output={"a": "should NOT leak"},
-        metrics=Metrics(latency_ms=50, cost_usd=0.001, tokens_in=5, tokens_out=5),
+        metrics=Metrics(latency_ms=50, cost_usd=0.001, tokens=TokenUsage(input=5, output=5)),
         created_at=datetime.now(UTC),
         thread_id=thread_id,
     )

@@ -27,6 +27,7 @@ from movate.core.models import (
     JobStatus,
     Metrics,
     RunRecord,
+    TokenUsage,
 )
 from movate.storage.sqlite import SqliteProvider
 from movate.testing import InMemoryStorage
@@ -105,7 +106,7 @@ def _make_run(
         status=JobStatus.SUCCESS,
         input={"question": f"{run_id} input"},
         output={"answer": f"{run_id} output"},
-        metrics=Metrics(latency_ms=100, cost_usd=0.001, tokens_in=10, tokens_out=10),
+        metrics=Metrics(latency_ms=100, cost_usd=0.001, tokens=TokenUsage(input=10, output=10)),
         created_at=created_at or datetime.now(UTC),
         thread_id=thread_id,
     )
