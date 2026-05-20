@@ -857,6 +857,19 @@ class RetrievalConfig(BaseModel):
             "but eat into the model's available output budget."
         ),
     )
+    history_summarize: bool = Field(
+        default=False,
+        description=(
+            "Smarter alternative to PR-U's raw budget truncation. When "
+            "True AND the raw history exceeds the char budget, the "
+            "OLDEST turns get compressed via a small LLM into a single "
+            "synthetic 'earlier in this conversation: ...' entry so "
+            "the agent sees the GIST of earlier context instead of "
+            "losing it entirely. Adds ~200ms + ~$0.0002 per message "
+            "(only when over budget). Default False keeps the v0.9 "
+            "raw-truncation behavior for back-compat."
+        ),
+    )
 
     def is_default(self) -> bool:
         """True when every field is at its default value.
@@ -873,6 +886,7 @@ class RetrievalConfig(BaseModel):
             and self.multi_hop_max_total_chunks is None
             and self.history_turns is None
             and self.history_char_budget is None
+            and not self.history_summarize
         )
 
 
