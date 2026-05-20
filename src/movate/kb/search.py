@@ -59,6 +59,7 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
     rewriter_model: str | None = None,
     rerank: bool = False,
     rerank_model: str | None = None,
+    rerank_mode: str = "llm",
     rerank_candidate_multiplier: int = 3,
     multi_hop: int = 0,
     multi_hop_model: str | None = None,
@@ -158,6 +159,7 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
                 rewriter_model=rewriter_model,
                 rerank=rerank,
                 rerank_model=rerank_model,
+                rerank_mode=rerank_mode,
                 rerank_candidate_multiplier=rerank_candidate_multiplier,
                 multi_hop=0,  # break recursion
                 trace=inner_trace,
@@ -284,50 +286,57 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
         # to the top.
         upstream_results = rrf_fuse(*per_variant_results, limit=upstream_limit)
 
-    # Final stage: LLM rerank. The reranker scores each candidate's
-    # relevance to the ORIGINAL question (not rewritten variants —
-    # the user's original phrasing is the source of truth for what
-    # they want answered).
+    # Final stage: rerank. Scores each candidate's relevance to the
+    # ORIGINAL question (not rewritten variants — the user's original
+    # phrasing is the ground truth for what they want answered).
+    # Two modes: "llm" (default) or "cross_encoder" (PR-BB).
     if rerank and upstream_results:
-        from movate.kb.rerank import (  # noqa: PLC0415 — lazy import keeps litellm off the default hot path
+        from movate.kb.rerank import (  # noqa: PLC0415 — lazy, keeps litellm + sentence-transformers off the default hot path
+            DEFAULT_CROSS_ENCODER_MODEL,
             DEFAULT_RERANKER_MODEL,
+            cross_encoder_rerank,
             llm_rerank,
         )
 
-        if trace is not None:
-            # Capture the pre-rerank top-K so the trace can show
-            # how much the rerank shuffled things — the operator's
-            # eye-test is "did the rerank actually help?"
-            pre_rerank_top_ids = [r.chunk.chunk_id for r in upstream_results[:limit]]
-            with trace.time("rerank") as rec:
-                rec.input_count = len(upstream_results)
-                reranked = await llm_rerank(
+        use_cross_encoder = rerank_mode == "cross_encoder"
+        effective_model = rerank_model or (
+            DEFAULT_CROSS_ENCODER_MODEL if use_cross_encoder else DEFAULT_RERANKER_MODEL
+        )
+        trace_label = f"rerank[{rerank_mode}]"
+
+        async def _do_rerank(candidates: list[KbChunkWithScore]) -> list[KbChunkWithScore]:
+            if use_cross_encoder:
+                return await cross_encoder_rerank(
                     question=question,
-                    candidates=upstream_results,
+                    candidates=candidates,
                     limit=limit,
-                    model=rerank_model or DEFAULT_RERANKER_MODEL,
-                    api_key=api_key,
+                    model=effective_model,
                 )
+            return await llm_rerank(
+                question=question,
+                candidates=candidates,
+                limit=limit,
+                model=effective_model,
+                api_key=api_key,
+            )
+
+        if trace is not None:
+            pre_rerank_top_ids = [r.chunk.chunk_id for r in upstream_results[:limit]]
+            with trace.time(trace_label) as rec:
+                rec.input_count = len(upstream_results)
+                rec.details["mode"] = rerank_mode
+                rec.details["model"] = effective_model
+                reranked = await _do_rerank(upstream_results)
                 rec.output_count = len(reranked)
                 post_rerank_top_ids = [r.chunk.chunk_id for r in reranked]
                 rec.chunk_ids = post_rerank_top_ids
-                # Overlap between pre-rerank and post-rerank top-K.
-                # 100% = rerank changed nothing; 0% = rerank totally
-                # replaced the top-K.
                 pre_set = set(pre_rerank_top_ids)
                 post_set = set(post_rerank_top_ids)
                 if pre_set:
-                    overlap = len(pre_set & post_set) / len(pre_set)
-                    rec.details["top_k_overlap"] = round(overlap, 2)
+                    rec.details["top_k_overlap"] = round(len(pre_set & post_set) / len(pre_set), 2)
             return reranked
 
-        return await llm_rerank(
-            question=question,
-            candidates=upstream_results,
-            limit=limit,
-            model=rerank_model or DEFAULT_RERANKER_MODEL,
-            api_key=api_key,
-        )
+        return await _do_rerank(upstream_results)
 
     # No rerank: clamp the upstream results to the final limit
     # and return.

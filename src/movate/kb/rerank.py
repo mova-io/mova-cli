@@ -61,6 +61,19 @@ logger = logging.getLogger(__name__)
 # typical K=10-20 candidates.
 DEFAULT_RERANKER_MODEL = "anthropic/claude-haiku-4-5-20251001"
 
+# Default cross-encoder model. MiniLM-L6 is fast (~50ms CPU), English
+# only, and tuned on MS MARCO (passage relevance) — the same task as
+# RAG reranking. ~67MB on disk, no GPU required. Operators needing
+# better quality can swap to BAAI/bge-reranker-base (~278MB) or
+# cross-encoder/ms-marco-MiniLM-L-12-v2 (~130MB) via rerank_model.
+DEFAULT_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Module-level model cache. Populated lazily on first cross-encoder
+# call. CPython's GIL makes single-assignment dict writes atomic,
+# so this is safe without a lock for the typical "one model per
+# process" case.
+_CE_CACHE: dict[str, object] = {}
+
 # Max chars of each candidate's text we feed to the reranker.
 # Caps the prompt's total length so 20 candidates with 2000-char
 # chunks don't blow past the model's context. 800 chars ≈ 200 tokens
@@ -317,3 +330,123 @@ def _try_json(text: str) -> dict[str, object] | None:
     except (json.JSONDecodeError, ValueError):
         return None
     return result if isinstance(result, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranker (PR-BB)
+# ---------------------------------------------------------------------------
+
+
+async def cross_encoder_rerank(
+    *,
+    question: str,
+    candidates: list[KbChunkWithScore],
+    limit: int = 5,
+    model: str = DEFAULT_CROSS_ENCODER_MODEL,
+    timeout_s: float = 30.0,
+) -> list[KbChunkWithScore]:
+    """Re-score ``candidates`` with a local cross-encoder model.
+
+    A cross-encoder scores (query, chunk) pairs jointly — the
+    attention layers see the full question-chunk context rather than
+    comparing pre-computed embeddings. This gives better relevance
+    signal than cosine similarity at the cost of O(N) model passes
+    (one per candidate, batched).
+
+    Performance vs :func:`llm_rerank`:
+
+    * **Latency**: ~50ms CPU for 20 candidates vs ~200ms (LLM round
+      trip). Cross-encoder wins on latency when the model is cached.
+    * **Cost**: zero API cost after install vs ~$0.0002/query for
+      the LLM path.
+    * **Quality**: similar on English RAG. The LLM has an edge on
+      complex, multi-hop questions; the cross-encoder is more
+      consistent on simple factual retrieval.
+    * **Dependency**: requires ``pip install movate-cli[cross-encoder]``
+      (~300MB sentence-transformers + torch-cpu). If the import fails
+      the method falls back to returning the input order (same
+      graceful-degradation contract as :func:`llm_rerank`).
+
+    The model is loaded once per process and cached. The first call
+    downloads the model from HuggingFace Hub (~67MB for the default
+    MiniLM-L6 model, ~278MB for BAAI/bge-reranker-base).
+
+    Args:
+        question: The user's question.
+        candidates: Ranked candidates from the upstream retrieval
+            stages. Ordering is preserved on all fallback paths.
+        limit: Top-K to return.
+        model: HuggingFace cross-encoder model name. Defaults to
+            :data:`DEFAULT_CROSS_ENCODER_MODEL`.
+        timeout_s: Timeout for the (potentially first-run) model
+            load + inference. Generous default because the first
+            call downloads model weights.
+
+    Returns:
+        Top-``limit`` chunks ranked by cross-encoder score.
+        On any failure (ImportError, timeout, shape mismatch),
+        returns ``candidates[:limit]`` unchanged. Never raises.
+    """
+    if not candidates:
+        return []
+    if not question.strip():
+        return candidates[:limit]
+    if limit <= 0:
+        return []
+
+    truncated = candidates[:MAX_RERANK_CANDIDATES]
+
+    try:
+        import asyncio  # noqa: PLC0415
+
+        q = question.strip()
+
+        def _score_sync() -> list[float]:
+            """Load model (cached) + run batch inference in a thread."""
+            # Lazy import: sentence-transformers is an optional dep.
+            # ImportError propagates to the outer try/except.
+            import sentence_transformers as _st  # type: ignore[import-not-found]  # noqa: PLC0415
+
+            _ce_cls = _st.CrossEncoder
+            if model not in _CE_CACHE:
+                _CE_CACHE[model] = _ce_cls(model)
+            ce = _CE_CACHE[model]
+            pairs = [(q, c.chunk.text[:_MAX_CHUNK_CHARS_FOR_RERANK]) for c in truncated]
+            raw = ce.predict(pairs)  # type: ignore[attr-defined]
+            # ``predict`` returns a numpy array or list of floats.
+            # Convert to plain Python list for simplicity.
+            return [float(s) for s in raw]
+
+        scores: list[float] = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _score_sync),
+            timeout=timeout_s,
+        )
+    except Exception as exc:
+        logger.warning("cross-encoder reranker failed: %s; returning upstream order", exc)
+        return candidates[:limit]
+
+    if len(scores) != len(truncated):
+        logger.warning(
+            "cross-encoder returned %d scores for %d candidates; returning upstream order",
+            len(scores),
+            len(truncated),
+        )
+        return candidates[:limit]
+
+    # MS-MARCO cross-encoders return logits (unbounded floats). Normalize
+    # to [-1, 1] via tanh so KbChunkWithScore's validator accepts the
+    # score AND so the scores are comparable across the two reranker
+    # modes when operators A/B test them. tanh(x/5) maps the typical
+    # logit range [-10, +10] to [-0.96, +0.96] — preserving rank order.
+    rescored: list[KbChunkWithScore] = []
+    for chunk_with_score, raw_score in zip(truncated, scores, strict=False):
+        if math.isnan(raw_score) or math.isinf(raw_score):
+            continue
+        normalized = math.tanh(raw_score / 5.0)
+        rescored.append(KbChunkWithScore(chunk=chunk_with_score.chunk, score=normalized))
+
+    if not rescored:
+        return candidates[:limit]
+
+    rescored.sort(key=lambda x: x.score, reverse=True)
+    return rescored[:limit]

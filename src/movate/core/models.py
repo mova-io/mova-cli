@@ -800,10 +800,23 @@ class RetrievalConfig(BaseModel):
     rerank: bool = Field(
         default=False,
         description=(
-            "Add an LLM rerank stage that re-scores upstream candidates "
+            "Add a rerank stage that re-scores upstream candidates "
             "by relevance, correcting 'noisy top-K' where vector / BM25 "
-            "scores rank irrelevant chunks high. Adds ~200ms + "
-            "~$0.0002/query."
+            "scores rank irrelevant chunks high. See ``rerank_mode`` for "
+            "which backend to use."
+        ),
+    )
+    rerank_mode: str = Field(
+        default="llm",
+        description=(
+            "Which rerank backend to use when ``rerank=true``. "
+            "``llm`` (default) — one batched LLM call via LiteLLM "
+            "(~200ms, ~$0.0002/query, zero extra deps). "
+            "``cross_encoder`` — local sentence-transformers "
+            "cross-encoder (~50ms CPU, zero API cost, requires "
+            "``pip install movate-cli[cross-encoder]`` ~300MB). "
+            "``rerank_model`` controls the specific model for "
+            "whichever mode is active."
         ),
     )
     multi_hop: int = Field(
@@ -882,6 +895,7 @@ class RetrievalConfig(BaseModel):
             not self.hybrid
             and self.rewrite == 0
             and not self.rerank
+            and self.rerank_mode == "llm"
             and self.multi_hop == 0
             and self.multi_hop_max_total_chunks is None
             and self.history_turns is None

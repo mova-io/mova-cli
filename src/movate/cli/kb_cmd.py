@@ -424,12 +424,24 @@ def search(
         False,
         "--rerank",
         help=(
-            "Add an LLM rerank stage that re-scores upstream candidates "
+            "Add a rerank stage that re-scores upstream candidates "
             "by relevance to the question, correcting 'noisy top-K' "
             "where vector/BM25 scores rank irrelevant chunks high. "
             "Fetches 3x candidates upstream then trims to top-K. "
-            "Adds ~200ms latency + ~$0.0002/query. Stacks with "
-            "--hybrid and --rewrite."
+            "Use --rerank-mode to choose between LLM (default) and "
+            "local cross-encoder backends. Stacks with --hybrid and --rewrite."
+        ),
+    ),
+    rerank_mode: str = typer.Option(
+        "llm",
+        "--rerank-mode",
+        help=(
+            "Which rerank backend to use when --rerank is set. "
+            "'llm' (default) — one batched LLM call via LiteLLM "
+            "(~200ms, ~$0.0002/query, zero extra deps). "
+            "'cross_encoder' — local sentence-transformers cross-encoder "
+            "(~50ms CPU, zero API cost, requires "
+            "'pip install movate-cli[cross-encoder]' ~300MB)."
         ),
     ),
     multi_hop: int = typer.Option(
@@ -496,6 +508,7 @@ def search(
                 hybrid=hybrid,
                 rewrite_variants=rewrite,
                 rerank=rerank,
+                rerank_mode=rerank_mode,
                 multi_hop=multi_hop,
                 trace=trace,
             )
