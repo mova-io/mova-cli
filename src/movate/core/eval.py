@@ -319,6 +319,26 @@ class EvalCase:
     score is 1.0 when all expected tools appear to have been called
     (via skill_responses fixture presence or output evidence).
     """
+    # ---- PR-GG: live KB retrieval for grounding ----
+    kb_query: bool = False
+    """When True, the eval engine queries the agent's configured in-memory
+    retriever (``bundle.retriever``) with a text extracted from ``case.input``
+    and uses the top-5 hits as the grounding context for faithfulness +
+    retrieval_accuracy scoring.
+
+    Priority: ``case.grounding`` (explicit string) > ``kb_query`` retrieval >
+    ``bundle.contexts`` fallback.  When ``kb_query=True`` but the bundle has
+    no retriever, grounding falls back to ``bundle.contexts`` as usual.
+
+    Use this to turn every eval case into an end-to-end RAG quality check:
+    the faithfulness score measures whether the agent stayed true to *what
+    the retriever actually returned*, and the retrieval_accuracy score
+    measures whether the retrieved docs were relevant to the question.
+
+    **Dataset example** (``evals/dataset.jsonl`` row)::
+
+        {"input": {"text": "refund policy"}, "expected": {...}, "kb_query": true}
+    """
 
 
 @dataclass
@@ -554,6 +574,20 @@ class EvalSummary:
 # ---------------------------------------------------------------------------
 
 
+def _parse_bool_field(d: dict[str, Any], key: str, path: Path, line_no: int) -> bool:
+    """Extract and validate a boolean field from a JSONL row dict.
+
+    Returns the bool value (defaulting to ``False`` when the key is absent).
+    Raises :class:`EvalConfigError` when the field is present but not a bool.
+    Extracted as a helper to keep ``_parse_dataset_path`` under the
+    PLR0912 branch limit.
+    """
+    val = d.get(key, False)
+    if not isinstance(val, bool):
+        raise EvalConfigError(f"{path}:{line_no} {key} must be a boolean; got {type(val).__name__}")
+    return val
+
+
 def _parse_dataset_path(path: Path) -> tuple[list[EvalCase], str]:
     """Parse a dataset JSONL file into (cases, sha256-hex).
 
@@ -627,6 +661,7 @@ def _parse_dataset_path(path: Path) -> tuple[list[EvalCase], str]:
                 f"{path}:{line_no} expected_tool_calls must be a list of strings; "
                 f"got {type(expected_tool_calls).__name__}"
             )
+        kb_query = _parse_bool_field(d, "kb_query", path, line_no)
         cases.append(
             EvalCase(
                 input=d.get("input", {}),
@@ -640,6 +675,7 @@ def _parse_dataset_path(path: Path) -> tuple[list[EvalCase], str]:
                 refusal_expected=refusal_expected,
                 required_fields=required_fields,
                 expected_tool_calls=expected_tool_calls,
+                kb_query=kb_query,
             )
         )
     return cases, digest
@@ -945,6 +981,83 @@ Score the UX and tone:
 Return ONLY a JSON object on a single line, no prose, no code fences:
 {{"score": <float between 0.0 and 1.0>, "rationale": "<brief explanation>"}}
 """
+
+
+# ---------------------------------------------------------------------------
+# PR-GG: KB retrieval helpers for kb_query grounding
+# ---------------------------------------------------------------------------
+
+
+def _extract_query_for_kb(case: EvalCase) -> str | None:
+    """Extract a plain-text query string from ``case.input``.
+
+    Mirrors the heuristic in ``movate.cli.knowledge_cmd._extract_query_from_input``:
+    tries ``query``, ``question``, ``text``, ``message`` in that order, then
+    falls back to the first string-valued key (alphabetically). Returns None
+    when the input has no string fields — KB retrieval is skipped.
+    """
+    inp = case.input
+    for key in ("query", "question", "text", "message"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    for key in sorted(inp):
+        val = inp[key]
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _hits_to_grounding(hits: list[Any]) -> str | None:
+    """Convert a list of :class:`~movate.knowledge.retriever.RetrievalHit` objects
+    to a grounding string for faithfulness + retrieval_accuracy scoring.
+
+    Each hit's ``entry`` dict is JSON-serialised (schema-agnostic — works for
+    kb-lookup, FAQ, and custom corpora). Hits are separated by ``\\n\\n---\\n\\n``
+    to match the ``bundle.contexts`` grounding format used elsewhere.
+
+    Returns None when ``hits`` is empty so callers can skip scoring.
+    """
+    if not hits:
+        return None
+    parts = []
+    for hit in hits:
+        entry = getattr(hit, "entry", None)
+        doc_id = getattr(hit, "doc_id", "?")
+        if entry is not None:
+            parts.append(f"[{doc_id}]\n{json.dumps(entry, ensure_ascii=False, indent=2)}")
+        else:
+            parts.append(f"[{doc_id}]\n{hit!r}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _resolve_effective_grounding(case: EvalCase, bundle: AgentBundle) -> str | None:
+    """Resolve the grounding text for faithfulness + retrieval_accuracy scoring.
+
+    Priority (PR-GG):
+
+    1. ``case.grounding`` — explicit string wins; no retrieval needed.
+    2. ``case.kb_query=True`` + ``bundle.retriever`` — live retrieval against
+       the agent's configured in-memory retriever; top-5 hits formatted as
+       JSON entries. Lets operators test end-to-end RAG quality.
+    3. ``bundle.contexts`` — static context files (existing fallback).
+    4. ``None`` — no grounding available; faithfulness + retrieval_accuracy
+       dims are skipped for this case.
+
+    Extracted as a module-level helper to keep ``_score_dimensions`` under
+    the PLR0912 branch limit.
+    """
+    if case.grounding:
+        return case.grounding
+    if case.kb_query and bundle.retriever is not None:
+        query = _extract_query_for_kb(case)
+        if query:
+            hits = bundle.retriever.query(query, 5)
+            return _hits_to_grounding(hits)
+        return None
+    if bundle.contexts:
+        return "\n\n---\n\n".join(f"[{name}]\n{body}" for name, body in bundle.contexts)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1468,16 +1581,10 @@ class EvalEngine:
 
         faithfulness = DimensionScore()
         retrieval_accuracy = DimensionScore()
-        # Effective grounding: explicit case.grounding takes priority; when
-        # absent, fall back to the agent's contexts/ files (already loaded
-        # as (name, body) pairs on the bundle).  This lets operators skip the
-        # `grounding` field in their dataset and still get faithfulness scoring
-        # as long as the agent declares at least one context file.
-        _effective_grounding: str | None = case.grounding or (
-            "\n\n---\n\n".join(f"[{name}]\n{body}" for name, body in bundle.contexts)
-            if bundle.contexts
-            else None
-        )
+        # Effective grounding priority (PR-GG): explicit case.grounding >
+        # kb_query live retrieval > bundle.contexts fallback. See
+        # _resolve_effective_grounding for the full priority chain.
+        _effective_grounding = _resolve_effective_grounding(case, bundle)
         if _effective_grounding:
             faithfulness, retrieval_accuracy = await asyncio.gather(
                 self._score_faithfulness(case, actual, judge, grounding=_effective_grounding),

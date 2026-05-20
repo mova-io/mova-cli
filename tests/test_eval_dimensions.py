@@ -28,9 +28,13 @@ from movate.core.eval import (
     DimensionalMeans,
     DimensionScore,
     DimensionScores,
+    EvalCase,
     EvalConfigError,
     EvalEngine,
     _compute_dimensional_means,
+    _extract_query_for_kb,
+    _hits_to_grounding,
+    _resolve_effective_grounding,
     _score_coverage,
     _score_latency,
     load_dataset,
@@ -930,3 +934,224 @@ async def test_retrieval_accuracy_skipped_when_no_judge_model(
     dims = summary.cases[0].runs[0].dimensions
 
     assert dims.retrieval_accuracy.value is None
+
+
+# ---------------------------------------------------------------------------
+# PR-GG: kb_query field — unit helpers + engine integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_extract_query_for_kb_text_key() -> None:
+    """Extracts query from the ``text`` key (most common input shape)."""
+    case = EvalCase(input={"text": "refund policy?", "session_id": "abc"}, expected={})
+    assert _extract_query_for_kb(case) == "refund policy?"
+
+
+@pytest.mark.unit
+def test_extract_query_for_kb_query_key_wins() -> None:
+    """``query`` key takes priority over ``text`` key."""
+    case = EvalCase(input={"query": "refund?", "text": "fallback"}, expected={})
+    assert _extract_query_for_kb(case) == "refund?"
+
+
+@pytest.mark.unit
+def test_extract_query_for_kb_alphabetical_fallback() -> None:
+    """Falls back to first alphabetical string key when no known key matches."""
+    case = EvalCase(input={"amount": 100, "note": "custom"}, expected={})
+    assert _extract_query_for_kb(case) == "custom"
+
+
+@pytest.mark.unit
+def test_extract_query_for_kb_returns_none_when_no_strings() -> None:
+    """Returns None when input has no string-valued fields."""
+    case = EvalCase(input={"count": 5, "flag": True}, expected={})
+    assert _extract_query_for_kb(case) is None
+
+
+@pytest.mark.unit
+def test_hits_to_grounding_formats_entries_as_json() -> None:
+    """Each hit's entry is JSON-serialised; hits joined by the standard separator."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    hits = [
+        SimpleNamespace(
+            doc_id="KB-001",
+            score=1.5,
+            entry={"title": "Refund", "resolution": "5 days"},
+        ),
+        SimpleNamespace(
+            doc_id="KB-002",
+            score=0.8,
+            entry={"title": "Cancel", "resolution": "Email support"},
+        ),
+    ]
+    result = _hits_to_grounding(hits)
+    assert result is not None
+    assert "[KB-001]" in result
+    assert "[KB-002]" in result
+    assert "Refund" in result
+    assert "\n\n---\n\n" in result
+
+
+@pytest.mark.unit
+def test_hits_to_grounding_returns_none_for_empty_list() -> None:
+    """Empty hit list → None (no grounding available)."""
+    assert _hits_to_grounding([]) is None
+
+
+@pytest.mark.unit
+def test_resolve_effective_grounding_explicit_grounding_wins(tmp_path: Path) -> None:
+    """Explicit ``case.grounding`` takes priority over kb_query + bundle.contexts."""
+    from types import SimpleNamespace  # noqa: PLC0415
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    agent_dir = _scaffold(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+
+    mock_retriever = MagicMock()
+    mock_retriever.query.return_value = [
+        SimpleNamespace(doc_id="KB-X", score=1.0, entry={"title": "Wrong"}),
+    ]
+    bundle.retriever = mock_retriever
+
+    case = EvalCase(
+        input={"text": "refund?"},
+        expected={},
+        grounding="Explicit grounding text.",
+        kb_query=True,
+    )
+    result = _resolve_effective_grounding(case, bundle)
+
+    assert result == "Explicit grounding text."
+    mock_retriever.query.assert_not_called()
+
+
+@pytest.mark.unit
+def test_resolve_effective_grounding_kb_query_calls_retriever(tmp_path: Path) -> None:
+    """When ``kb_query=True`` and no explicit grounding, the retriever is called."""
+    from types import SimpleNamespace  # noqa: PLC0415
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    agent_dir = _scaffold(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+
+    hit = SimpleNamespace(
+        doc_id="KB-001",
+        score=1.5,
+        entry={"title": "Refund", "resolution": "5 days"},
+    )
+    mock_retriever = MagicMock()
+    mock_retriever.query.return_value = [hit]
+    bundle.retriever = mock_retriever
+
+    case = EvalCase(input={"text": "refund policy"}, expected={}, kb_query=True)
+    result = _resolve_effective_grounding(case, bundle)
+
+    mock_retriever.query.assert_called_once_with("refund policy", 5)
+    assert result is not None
+    assert "KB-001" in result
+    assert "Refund" in result
+
+
+@pytest.mark.unit
+def test_resolve_effective_grounding_kb_query_no_retriever_falls_back_to_contexts(
+    tmp_path: Path,
+) -> None:
+    """When ``kb_query=True`` but no retriever, fall back to bundle.contexts."""
+    ctx_body = "Static context text."
+    agent_dir = _scaffold_with_contexts(tmp_path / "demo", ctx_name="policy", ctx_body=ctx_body)
+    bundle = load_agent(agent_dir)
+    assert bundle.retriever is None
+
+    case = EvalCase(input={"text": "policy?"}, expected={}, kb_query=True)
+    result = _resolve_effective_grounding(case, bundle)
+
+    assert result is not None
+    assert "Static context text." in result
+
+
+@pytest.mark.unit
+async def test_kb_query_true_triggers_retrieval_and_scores_retrieval_accuracy(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """End-to-end: ``kb_query: true`` in dataset.jsonl triggers live retrieval
+    and populates retrieval_accuracy via the LLM judge."""
+    from types import SimpleNamespace  # noqa: PLC0415
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    agent_dir = _scaffold(tmp_path / "demo")
+    row = (
+        '{"input": {"text": "refund policy?"}, "expected": {"message": "5 days"},'
+        ' "kb_query": true}\n'
+    )
+    (agent_dir / "evals" / "dataset.jsonl").write_text(row)
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: llm_judge\n"
+        "model:\n  provider: anthropic/claude-haiku-4-5-20251001\n"
+        "rubric: 'check it'\n"
+        "threshold: 0.7\n"
+    )
+
+    bundle = load_agent(agent_dir)
+    hit = SimpleNamespace(
+        doc_id="KB-001",
+        score=1.5,
+        entry={"title": "Refund Policy", "resolution": "Refunds within 5 days."},
+    )
+    mock_retriever = MagicMock()
+    mock_retriever.query.return_value = [hit]
+    bundle.retriever = mock_retriever
+
+    provider = _FaithfulnessStubProvider(
+        agent_response='{"message": "5 days"}', faithfulness_score=0.9
+    )
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    dims = summary.cases[0].runs[0].dimensions
+
+    mock_retriever.query.assert_called_once_with("refund policy?", 5)
+    assert dims.retrieval_accuracy.value is not None
+    assert dims.retrieval_accuracy.value == pytest.approx(0.9)
+    assert dims.faithfulness.value is not None
+
+
+@pytest.mark.unit
+async def test_kb_query_false_does_not_call_retriever(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """``kb_query: false`` (default) — retriever is never called."""
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}}\n'
+    )
+    bundle = load_agent(agent_dir)
+
+    mock_retriever = MagicMock()
+    mock_retriever.query.return_value = []
+    bundle.retriever = mock_retriever
+
+    provider = _FaithfulnessStubProvider(agent_response='{"message": "ok"}', faithfulness_score=0.9)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+
+    mock_retriever.query.assert_not_called()
+    dims = summary.cases[0].runs[0].dimensions
+    assert dims.retrieval_accuracy.value is None
+
+
+@pytest.mark.unit
+def test_parse_dataset_rejects_non_bool_kb_query(tmp_path: Path) -> None:
+    """``kb_query`` must be a boolean in the JSONL row."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    ds = agent_dir / "evals" / "dataset.jsonl"
+    ds.write_text('{"input": {"text": "hi"}, "expected": {}, "kb_query": "yes"}\n')
+
+    with pytest.raises(EvalConfigError, match="kb_query must be a boolean"):
+        load_dataset(load_agent(agent_dir))
