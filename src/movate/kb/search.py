@@ -31,6 +31,8 @@ Powers ``mdk kb search`` (the CLI command) AND the
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from movate.core.models import KbChunkWithScore
 from movate.kb.embed import (
     DEFAULT_EMBEDDING_MODEL,
@@ -38,8 +40,11 @@ from movate.kb.embed import (
 )
 from movate.kb.lexical import bm25_search, rrf_fuse
 
+if TYPE_CHECKING:
+    from movate.kb.trace import SearchTrace
 
-async def search(
+
+async def search(  # noqa: PLR0912 — orchestrator naturally branches across stages
     *,
     storage: object,
     question: str,
@@ -58,6 +63,7 @@ async def search(
     multi_hop: int = 0,
     multi_hop_model: str | None = None,
     multi_hop_max_total_chunks: int = 15,
+    trace: SearchTrace | None = None,
 ) -> list[KbChunkWithScore]:
     """Embed ``question`` + return the top-``limit`` chunks ranked.
 
@@ -114,12 +120,31 @@ async def search(
             multi_hop_search,
         )
 
+        # Per-hop counter for nested trace stage names. The outer
+        # multi-hop loop calls _one_hop once per sub-query; each
+        # invocation's stages get a ``hop_N:`` prefix so the trace
+        # reads in source order. The planner's own latency is folded
+        # into the gap between hops (best we can do without
+        # instrumenting the multi_hop_search internals).
+        hop_idx = [0]
+
         async def _one_hop(sub_query: str) -> list[KbChunkWithScore]:
             # Recurse into search() but with multi_hop=0 to avoid
             # infinite recursion. Each hop gets the full retrieval
             # stack (vector / hybrid / rewriter / rerank) tuned by
-            # the same flags the caller passed.
-            return await search(
+            # the same flags the caller passed. When a trace is
+            # active we wrap the call with a per-hop timer so the
+            # operator sees per-hop cost; the nested stages inside
+            # search() get an "outer" record on the trace's stages
+            # list because the same trace object is reused (we
+            # rename them after-the-fact for readability).
+            if trace is None:
+                inner_trace = None
+            else:
+                from movate.kb.trace import SearchTrace as _SearchTrace  # noqa: PLC0415
+
+                inner_trace = _SearchTrace()
+            result = await search(
                 storage=storage,
                 question=sub_query,
                 agent=agent,
@@ -135,7 +160,23 @@ async def search(
                 rerank_model=rerank_model,
                 rerank_candidate_multiplier=rerank_candidate_multiplier,
                 multi_hop=0,  # break recursion
+                trace=inner_trace,
             )
+            # Fold the inner trace's stages into the outer trace
+            # under a hop-prefixed name so the operator can see
+            # the per-hop breakdown.
+            if trace is not None and inner_trace is not None:
+                this_hop = hop_idx[0]
+                for stage in inner_trace.stages:
+                    trace.record(
+                        f"hop_{this_hop}:{stage.name}",
+                        stage.duration_ms,
+                        input_count=stage.input_count,
+                        output_count=stage.output_count,
+                        details={**stage.details, "sub_query": sub_query},
+                    )
+                hop_idx[0] = this_hop + 1
+            return result
 
         return await multi_hop_search(
             question=question,
@@ -157,12 +198,24 @@ async def search(
             rewrite_query,
         )
 
-        variants = await rewrite_query(
-            question,
-            n=rewrite_variants,
-            model=rewriter_model or DEFAULT_REWRITER_MODEL,
-            api_key=api_key,
-        )
+        if trace is not None:
+            with trace.time("rewrite") as rec:
+                variants = await rewrite_query(
+                    question,
+                    n=rewrite_variants,
+                    model=rewriter_model or DEFAULT_REWRITER_MODEL,
+                    api_key=api_key,
+                )
+                rec.output_count = len(variants)
+                rec.details["variants"] = list(variants)
+                rec.details["requested"] = rewrite_variants
+        else:
+            variants = await rewrite_query(
+                question,
+                n=rewrite_variants,
+                model=rewriter_model or DEFAULT_REWRITER_MODEL,
+                api_key=api_key,
+            )
         if not variants:
             variants = [question]
 
@@ -177,18 +230,34 @@ async def search(
     # exactly equivalent to the previous behavior — no LLM call,
     # one retrieval pass.
     per_variant_results: list[list[KbChunkWithScore]] = []
-    for variant in variants:
-        results = await _retrieve_one(
-            storage=storage,
-            question=variant,
-            agent=agent,
-            tenant_id=tenant_id,
-            limit=upstream_limit,
-            embedding_model=embedding_model,
-            api_key=api_key,
-            hybrid=hybrid,
-            fetch_multiplier=fetch_multiplier,
-        )
+    for i, variant in enumerate(variants):
+        if trace is not None:
+            with trace.time(f"retrieve[{i}]", variant=variant) as rec:
+                results = await _retrieve_one(
+                    storage=storage,
+                    question=variant,
+                    agent=agent,
+                    tenant_id=tenant_id,
+                    limit=upstream_limit,
+                    embedding_model=embedding_model,
+                    api_key=api_key,
+                    hybrid=hybrid,
+                    fetch_multiplier=fetch_multiplier,
+                )
+                rec.output_count = len(results)
+                rec.details["mode"] = "hybrid" if hybrid else "vector"
+        else:
+            results = await _retrieve_one(
+                storage=storage,
+                question=variant,
+                agent=agent,
+                tenant_id=tenant_id,
+                limit=upstream_limit,
+                embedding_model=embedding_model,
+                api_key=api_key,
+                hybrid=hybrid,
+                fetch_multiplier=fetch_multiplier,
+            )
         per_variant_results.append(results)
 
     # Fuse across variants (single-variant case skips the round-trip).
@@ -197,6 +266,12 @@ async def search(
     # not the final ``limit``.
     if len(per_variant_results) == 1:
         upstream_results = per_variant_results[0][:upstream_limit]
+    elif trace is not None:
+        with trace.time("rrf_fuse") as rec:
+            rec.input_count = sum(len(v) for v in per_variant_results)
+            upstream_results = rrf_fuse(*per_variant_results, limit=upstream_limit)
+            rec.output_count = len(upstream_results)
+            rec.details["variants"] = len(per_variant_results)
     else:
         # Multi-variant case: RRF-fuse across all variant result
         # lists. Chunks that match multiple variants accumulate
@@ -213,6 +288,32 @@ async def search(
             DEFAULT_RERANKER_MODEL,
             llm_rerank,
         )
+
+        if trace is not None:
+            # Capture the pre-rerank top-K so the trace can show
+            # how much the rerank shuffled things — the operator's
+            # eye-test is "did the rerank actually help?"
+            pre_rerank_top_ids = [r.chunk.chunk_id for r in upstream_results[:limit]]
+            with trace.time("rerank") as rec:
+                rec.input_count = len(upstream_results)
+                reranked = await llm_rerank(
+                    question=question,
+                    candidates=upstream_results,
+                    limit=limit,
+                    model=rerank_model or DEFAULT_RERANKER_MODEL,
+                    api_key=api_key,
+                )
+                rec.output_count = len(reranked)
+                post_rerank_top_ids = [r.chunk.chunk_id for r in reranked]
+                # Overlap between pre-rerank and post-rerank top-K.
+                # 100% = rerank changed nothing; 0% = rerank totally
+                # replaced the top-K.
+                pre_set = set(pre_rerank_top_ids)
+                post_set = set(post_rerank_top_ids)
+                if pre_set:
+                    overlap = len(pre_set & post_set) / len(pre_set)
+                    rec.details["top_k_overlap"] = round(overlap, 2)
+            return reranked
 
         return await llm_rerank(
             question=question,
