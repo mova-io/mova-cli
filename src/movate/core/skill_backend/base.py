@@ -96,6 +96,16 @@ class SkillExecutionContext:
     (HTTP, MCP, remote agents) should short-circuit to a deterministic
     stub response when this is ``True``.
 
+    ``agent_name`` + ``storage`` were added in PR-I so the
+    ``kb-vector-lookup`` skill can query the agent's KB chunks
+    without building its own storage. ``retrieval`` carries the
+    agent's :class:`RetrievalConfig` (hybrid / rewrite / rerank /
+    multi_hop flags from ``agent.yaml``) so the skill applies the
+    operator's configured pipeline. All three are typed as ``Any``
+    to keep the import surface flat (no circular imports against
+    storage / models), and the kb-lookup skill is the only consumer
+    today.
+
     Kept narrow on purpose — the backend is a function, not a god
     object. If a backend needs more, we add a field deliberately.
     """
@@ -105,6 +115,9 @@ class SkillExecutionContext:
     run_id: str = ""
     call_ms_budget: int = 30_000
     mock: bool = False
+    agent_name: str = ""
+    storage: Any = None
+    retrieval: Any = None
 
 
 class SkillBackend(Protocol):

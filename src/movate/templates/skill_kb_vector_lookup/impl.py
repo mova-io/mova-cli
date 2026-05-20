@@ -69,6 +69,25 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
     from movate.kb.search import search as kb_search  # noqa: PLC0415
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip() or None
+
+    # Per-agent retrieval config (PR-I). When the agent's `agent.yaml`
+    # declares a `retrieval:` block, those flags drive the pipeline —
+    # the operator's tuning ("hybrid + rerank works best for us") gets
+    # locked in for every production call. Without the block, the
+    # default `RetrievalConfig()` is all-off, so the skill runs pure
+    # vector retrieval (the v0.9 default — byte-for-byte unchanged).
+    retrieval_kwargs: dict[str, Any] = {}
+    cfg = getattr(ctx, "retrieval", None) if ctx is not None else None
+    if cfg is not None:
+        # Duck-typed read so the impl doesn't import RetrievalConfig
+        # (keeps the skill template's deps light).
+        retrieval_kwargs = {
+            "hybrid": bool(getattr(cfg, "hybrid", False)),
+            "rewrite_variants": int(getattr(cfg, "rewrite", 0)),
+            "rerank": bool(getattr(cfg, "rerank", False)),
+            "multi_hop": int(getattr(cfg, "multi_hop", 0)),
+        }
+
     results = await kb_search(
         storage=storage,
         question=question,
@@ -76,6 +95,7 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
         tenant_id=tenant_id,
         limit=k,
         api_key=api_key,
+        **retrieval_kwargs,
     )
 
     return {
