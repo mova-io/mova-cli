@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,27 @@ console = Console()
 
 _REQUIRED_DEPS = ("typer", "rich", "pydantic", "yaml", "jinja2", "litellm", "aiosqlite")
 _OPTIONAL_DEPS = ("langfuse", "opentelemetry", "asyncpg", "fastapi")
+
+# KB parsing deps — required for document ingestion pipelines.
+# Listed separately from _REQUIRED_DEPS because they're KB-specific and
+# installed as part of the movate-cli[kb] extra (or the full install).
+# pypdf, docx (python-docx), and bs4 (beautifulsoup4) cover PDF, DOCX,
+# and HTML ingest respectively. Operators without these see "missing" but
+# the core agent runtime still works — they just can't run mdk kb ingest.
+_KB_DEPS: tuple[tuple[str, str], ...] = (
+    # (probe_module, display_name) — display_name used as the "dep: X" label.
+    ("pypdf", "pypdf"),
+    ("docx", "python-docx"),
+    ("bs4", "beautifulsoup4"),
+)
+
+# OCR deps — optional [ocr] extra (pdf2image + pytesseract).
+# Both require system binaries: Poppler (for pdf2image) and Tesseract
+# (for pytesseract). The Tesseract binary check is done via shutil.which.
+_OCR_DEPS: tuple[tuple[str, str], ...] = (
+    ("pdf2image", "pdf2image"),
+    ("pytesseract", "pytesseract"),
+)
 
 # SPDX license per dep. Curated by hand because Python package metadata
 # is famously inconsistent — many packages set the license as free-text
@@ -51,6 +73,14 @@ _DEP_LICENSES: dict[str, str] = {
     "asyncpg": "Apache-2.0",
     "fastapi": "MIT",
     "httpx": "BSD-3-Clause",
+    # KB parsing deps
+    "pypdf": "BSD-3-Clause",
+    "python-docx": "MIT",
+    "beautifulsoup4": "MIT",
+    # OCR deps ([ocr] extra)
+    "pdf2image": "MIT",
+    "pytesseract": "Apache-2.0",
+    "tesseract": "Apache-2.0",  # system binary
 }
 
 # One-line role description per dep — surfaced in ``mdk doctor`` so
@@ -73,6 +103,14 @@ _DEP_PURPOSE: dict[str, str] = {
     "asyncpg": "Async Postgres driver (deployed runtime)",
     "fastapi": "HTTP runtime + Teams bot webhook",
     "httpx": "Async HTTP client (LiteLLM, Lyzr, etc.)",
+    # KB parsing deps
+    "pypdf": "PDF text extraction (mdk kb ingest)",
+    "python-docx": "DOCX text extraction (mdk kb ingest)",
+    "beautifulsoup4": "HTML text extraction (mdk kb ingest)",
+    # OCR deps ([ocr] extra)
+    "pdf2image": "PDF→image rasterizer for scanned PDFs (Poppler)",
+    "pytesseract": "Python wrapper for Tesseract OCR engine",
+    "tesseract": "Tesseract OCR engine binary (system install)",
 }
 
 # Map each AgentRuntime to (probe-module, extras-install-hint). Used by
@@ -220,6 +258,58 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
         purpose = _DEP_PURPOSE.get(mod, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(mod, "[yellow]?[/yellow]")
         _add(f"opt: {mod}", status, purpose, license_str)
+
+    _add("", "", "", "")
+
+    # KB parsing deps — PDF, DOCX, HTML ingest for `mdk kb ingest`.
+    # Probe by the importable module name; display uses the canonical
+    # PyPI package name so operators know exactly what to `uv add`.
+    for probe_mod, display_name in _KB_DEPS:
+        spec = importlib.util.find_spec(probe_mod)
+        status = _ok("") if spec else _missing(f"uv add '{display_name}'")
+        purpose = _DEP_PURPOSE.get(display_name, "[yellow]?[/yellow]")
+        license_str = _DEP_LICENSES.get(display_name, "[yellow]?[/yellow]")
+        _add(f"kb: {display_name}", status, purpose, license_str)
+
+    _add("", "", "", "")
+
+    # OCR deps — [ocr] extra (pdf2image + pytesseract) plus the
+    # Tesseract system binary. All three must be present for scanned-PDF
+    # OCR to work. pdf2image also needs Poppler (`brew install poppler`
+    # / `apt-get install poppler-utils`).
+    for probe_mod, display_name in _OCR_DEPS:
+        spec = importlib.util.find_spec(probe_mod)
+        status = _ok("") if spec else _missing("uv add 'movate-cli[ocr]'")
+        purpose = _DEP_PURPOSE.get(display_name, "[yellow]?[/yellow]")
+        license_str = _DEP_LICENSES.get(display_name, "[yellow]?[/yellow]")
+        _add(f"ocr: {display_name}", status, purpose, license_str)
+
+    # System binary: Tesseract engine.  Neither pdf2image nor pytesseract
+    # bundles the Tesseract binary — it must be installed separately.
+    # shutil.which() finds it if it's on PATH.
+    tess_bin = shutil.which("tesseract")
+    if tess_bin:
+        try:
+            import subprocess  # noqa: PLC0415
+
+            ver_out = subprocess.check_output(
+                ["tesseract", "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+            )
+            tess_ver = ver_out.splitlines()[0] if ver_out else "found"
+        except Exception:
+            tess_ver = "found"
+        tess_status = _ok(tess_ver)
+    else:
+        tess_status = _missing("brew install tesseract  /  apt-get install tesseract-ocr")
+    _add(
+        "ocr: tesseract",
+        tess_status,
+        _DEP_PURPOSE.get("tesseract", ""),
+        _DEP_LICENSES.get("tesseract", "Apache-2.0"),
+    )
 
     _add("", "")
 
