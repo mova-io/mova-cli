@@ -174,6 +174,7 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
                         input_count=stage.input_count,
                         output_count=stage.output_count,
                         details={**stage.details, "sub_query": sub_query},
+                        chunk_ids=stage.chunk_ids,
                     )
                 hop_idx[0] = this_hop + 1
             return result
@@ -246,6 +247,9 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
                 )
                 rec.output_count = len(results)
                 rec.details["mode"] = "hybrid" if hybrid else "vector"
+                # PR-S: stamp the per-stage chunk path so operators
+                # can answer "where did chunk X drop out?".
+                rec.chunk_ids = [r.chunk.chunk_id for r in results]
         else:
             results = await _retrieve_one(
                 storage=storage,
@@ -272,6 +276,7 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
             upstream_results = rrf_fuse(*per_variant_results, limit=upstream_limit)
             rec.output_count = len(upstream_results)
             rec.details["variants"] = len(per_variant_results)
+            rec.chunk_ids = [r.chunk.chunk_id for r in upstream_results]
     else:
         # Multi-variant case: RRF-fuse across all variant result
         # lists. Chunks that match multiple variants accumulate
@@ -305,6 +310,7 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
                 )
                 rec.output_count = len(reranked)
                 post_rerank_top_ids = [r.chunk.chunk_id for r in reranked]
+                rec.chunk_ids = post_rerank_top_ids
                 # Overlap between pre-rerank and post-rerank top-K.
                 # 100% = rerank changed nothing; 0% = rerank totally
                 # replaced the top-K.
