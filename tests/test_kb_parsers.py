@@ -58,9 +58,7 @@ def _make_pdf_bytes(*pages_text: str) -> bytes:
         # mutate the page's /Contents stream with a minimal BT/ET
         # block that draws the text at position (100, 700).
         escaped = text.replace("\\", "\\\\").replace("(", r"\(").replace(")", r"\)")
-        content_stream = (
-            f"BT /F1 12 Tf 100 700 Td ({escaped}) Tj ET".encode()
-        )
+        content_stream = f"BT /F1 12 Tf 100 700 Td ({escaped}) Tj ET".encode()
         from pypdf.generic import (  # noqa: PLC0415
             DecodedStreamObject,
             DictionaryObject,

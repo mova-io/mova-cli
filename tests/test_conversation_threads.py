@@ -229,13 +229,9 @@ async def test_list_threads_filters_by_agent(
     async def body(storage) -> None:
         await storage.save_conversation_thread(_make_thread(thread_id="t_rag", agent="rag-qa"))
         await storage.save_conversation_thread(_make_thread(thread_id="t_faq", agent="faq"))
-        rag_threads = await storage.list_conversation_threads(
-            tenant_id="tenant_1", agent="rag-qa"
-        )
+        rag_threads = await storage.list_conversation_threads(tenant_id="tenant_1", agent="rag-qa")
         assert [t.thread_id for t in rag_threads] == ["t_rag"]
-        faq_threads = await storage.list_conversation_threads(
-            tenant_id="tenant_1", agent="faq"
-        )
+        faq_threads = await storage.list_conversation_threads(tenant_id="tenant_1", agent="faq")
         assert [t.thread_id for t in faq_threads] == ["t_faq"]
 
     await _run_against_both(body, in_memory, sqlite_provider)
@@ -248,12 +244,8 @@ async def test_list_threads_tenant_scoped(
     """Cross-tenant rows excluded from list results."""
 
     async def body(storage) -> None:
-        await storage.save_conversation_thread(
-            _make_thread(thread_id="t_a", tenant_id="tenant_a")
-        )
-        await storage.save_conversation_thread(
-            _make_thread(thread_id="t_b", tenant_id="tenant_b")
-        )
+        await storage.save_conversation_thread(_make_thread(thread_id="t_a", tenant_id="tenant_a"))
+        await storage.save_conversation_thread(_make_thread(thread_id="t_b", tenant_id="tenant_b"))
         rows = await storage.list_conversation_threads(tenant_id="tenant_a")
         assert [t.thread_id for t in rows] == ["t_a"]
 
@@ -353,9 +345,7 @@ async def test_list_runs_for_thread_tenant_scoped(
     even when a caller guesses the thread_id."""
 
     async def body(storage) -> None:
-        await storage.save_run(
-            _make_run(run_id="r1", thread_id="t_abc", tenant_id="tenant_a")
-        )
+        await storage.save_run(_make_run(run_id="r1", thread_id="t_abc", tenant_id="tenant_a"))
         rows = await storage.list_runs_for_thread("t_abc", tenant_id="tenant_b")
         assert rows == []
 

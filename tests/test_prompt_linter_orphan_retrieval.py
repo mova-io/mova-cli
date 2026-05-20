@@ -117,9 +117,7 @@ def test_retrieval_with_canonical_skill_no_warning(tmp_path: Path) -> None:
         "  output:\n"
         "    text: string\n"
     )
-    (skills_dir / "impl.py").write_text(
-        "async def run(inputs, ctx=None): return {'chunks': []}\n"
-    )
+    (skills_dir / "impl.py").write_text("async def run(inputs, ctx=None): return {'chunks': []}\n")
     bundle = load_agent(agent_dir)
     issues = lint_prompt(bundle)
     assert "ORPHAN_RETRIEVAL_CONFIG" not in _codes(issues)
@@ -148,9 +146,7 @@ def test_retrieval_with_renamed_skill_no_warning(tmp_path: Path) -> None:
         "  input:\n    question: string\n"
         "  output:\n    text: string\n"
     )
-    (skills_dir / "impl.py").write_text(
-        "async def run(inputs, ctx=None): return {'chunks': []}\n"
-    )
+    (skills_dir / "impl.py").write_text("async def run(inputs, ctx=None): return {'chunks': []}\n")
     bundle = load_agent(agent_dir)
     issues = lint_prompt(bundle)
     assert "ORPHAN_RETRIEVAL_CONFIG" not in _codes(issues)
@@ -213,9 +209,7 @@ def test_orphan_retrieval_with_unrelated_skill_still_fires(
         "  input:\n    expr: string\n"
         "  output:\n    result: number\n"
     )
-    (skills_dir / "impl.py").write_text(
-        "async def run(inputs, ctx=None): return {'result': 0}\n"
-    )
+    (skills_dir / "impl.py").write_text("async def run(inputs, ctx=None): return {'result': 0}\n")
     bundle = load_agent(agent_dir)
     issues = lint_prompt(bundle)
     assert "ORPHAN_RETRIEVAL_CONFIG" in _codes(issues)

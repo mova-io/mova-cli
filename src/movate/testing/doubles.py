@@ -456,9 +456,7 @@ class InMemoryStorage:
     ) -> list[RunRecord]:
         # Tenant-scoped: cross-tenant thread id returns [] rather than
         # raising or leaking.
-        rows = [
-            r for r in self.runs if r.thread_id == thread_id and r.tenant_id == tenant_id
-        ]
+        rows = [r for r in self.runs if r.thread_id == thread_id and r.tenant_id == tenant_id]
         # ASC by created_at — chronological order, earliest turn first,
         # so the runtime can render conversation history without
         # reversing.

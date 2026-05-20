@@ -51,9 +51,7 @@ def client(storage: InMemoryStorage) -> TestClient:
 
 @pytest.fixture
 async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
-    minted = mint_api_key(
-        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="thread-message-tests"
-    )
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="thread-message-tests")
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}
 
@@ -113,9 +111,7 @@ def test_post_message_persists_thread_id_on_job(
     # Look up the job in storage and check it has thread_id set.
     loop = asyncio.new_event_loop()
     try:
-        job = loop.run_until_complete(
-            storage.get_job(job_id, tenant_id=storage.jobs[0].tenant_id)
-        )
+        job = loop.run_until_complete(storage.get_job(job_id, tenant_id=storage.jobs[0].tenant_id))
     finally:
         loop.close()
     assert job is not None
@@ -266,9 +262,7 @@ def test_post_message_401_without_auth(client: TestClient) -> None:
 
 
 @pytest.mark.integration
-def test_post_message_422_missing_input(
-    client: TestClient, auth_header: dict[str, str]
-) -> None:
+def test_post_message_422_missing_input(client: TestClient, auth_header: dict[str, str]) -> None:
     thread_id = _create_thread(client, auth_header)
     r = client.post(
         f"/api/v1/threads/{thread_id}/messages",

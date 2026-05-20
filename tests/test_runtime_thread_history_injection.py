@@ -43,17 +43,13 @@ def client(storage: InMemoryStorage) -> TestClient:
 
 @pytest.fixture
 async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
-    minted = mint_api_key(
-        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="history-tests"
-    )
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="history-tests")
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}
 
 
 def _create_thread(client: TestClient, auth_header: dict[str, str]) -> str:
-    r = client.post(
-        "/api/v1/threads", json={"agent": "rag-qa"}, headers=auth_header
-    )
+    r = client.post("/api/v1/threads", json={"agent": "rag-qa"}, headers=auth_header)
     return r.json()["thread_id"]
 
 

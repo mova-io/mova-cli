@@ -165,8 +165,7 @@ async def test_search_rerank_stage_stamps_chunk_ids(
     order. Lets operators answer 'did rerank shuffle things?' by
     diffing chunk_ids vs the retrieve stage's."""
     mock_litellm.return_value = _make_resp(
-        '{"rankings": [{"id": 1, "score": 0.9}, '
-        '{"id": 2, "score": 0.7}, {"id": 3, "score": 0.5}]}'
+        '{"rankings": [{"id": 1, "score": 0.9}, {"id": 2, "score": 0.7}, {"id": 3, "score": 0.5}]}'
     )
     trace = SearchTrace()
     with um.patch("movate.kb.search.embed_texts", side_effect=_fake_embed):

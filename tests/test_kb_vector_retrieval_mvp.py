@@ -60,8 +60,7 @@ def test_chunker_subsplits_long_paragraphs() -> None:
     """A single 5000-char paragraph gets split into multiple chunks
     no larger than MAX_CHUNK_CHARS."""
     sentence = (
-        "This is a deliberately long sentence with enough words "
-        "to consume meaningful char count. "
+        "This is a deliberately long sentence with enough words to consume meaningful char count. "
     )
     # ~90 chars * 60 = ~5400 chars, well over MAX_CHUNK_CHARS (2000).
     long_paragraph = sentence * 60
@@ -180,12 +179,8 @@ async def test_storage_search_rejects_dim_mismatch() -> None:
 async def test_storage_delete_kb_chunks() -> None:
     """delete_kb_chunks returns the count + removes the rows."""
     storage = InMemoryStorage()
-    await storage.save_kb_chunk(
-        _kb_chunk(embedding=[1.0, 0.0], content_hash="a", text="text-a")
-    )
-    await storage.save_kb_chunk(
-        _kb_chunk(embedding=[0.0, 1.0], content_hash="b", text="text-b")
-    )
+    await storage.save_kb_chunk(_kb_chunk(embedding=[1.0, 0.0], content_hash="a", text="text-a"))
+    await storage.save_kb_chunk(_kb_chunk(embedding=[0.0, 1.0], content_hash="b", text="text-b"))
 
     n = await storage.delete_kb_chunks(agent="rag-qa", tenant_id="test")
     assert n == 2
@@ -212,9 +207,7 @@ async def test_ingest_pipeline_end_to_end(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (tmp_path / "features.md").write_text(
-        "# Features\n\n"
-        "We offer SSO on the enterprise tier.\n\n"
-        "Custom domains roadmapped for Q3.\n",
+        "# Features\n\nWe offer SSO on the enterprise tier.\n\nCustom domains roadmapped for Q3.\n",
         encoding="utf-8",
     )
     # Hidden dir should be skipped.
@@ -273,16 +266,12 @@ async def test_ingest_pipeline_is_idempotent(tmp_path: Path) -> None:
         await ingest_path(
             storage=storage, path=tmp_path, agent="rag-qa", tenant_id="test", api_key="sk-x"
         )
-        before = len(
-            await storage.list_kb_chunks(agent="rag-qa", tenant_id="test")
-        )
+        before = len(await storage.list_kb_chunks(agent="rag-qa", tenant_id="test"))
         # Re-ingest the same files.
         await ingest_path(
             storage=storage, path=tmp_path, agent="rag-qa", tenant_id="test", api_key="sk-x"
         )
-        after = len(
-            await storage.list_kb_chunks(agent="rag-qa", tenant_id="test")
-        )
+        after = len(await storage.list_kb_chunks(agent="rag-qa", tenant_id="test"))
 
     assert before == after  # no duplicates
 

@@ -256,6 +256,4 @@ async def test_thread_methods_raise_on_4xx() -> None:
     with pytest.raises(httpx.HTTPStatusError):
         await client.get_thread("missing")
     with pytest.raises(httpx.HTTPStatusError):
-        await client.submit_thread_message(
-            thread_id="missing", input_data={"q": "x"}
-        )
+        await client.submit_thread_message(thread_id="missing", input_data={"q": "x"})
