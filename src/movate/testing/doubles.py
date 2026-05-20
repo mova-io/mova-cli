@@ -463,6 +463,23 @@ class InMemoryStorage:
         rows = sorted(rows, key=lambda r: r.created_at)
         return rows[: int(limit)]
 
+    async def delete_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        # Tenant-scoped delete: a thread row for a different tenant
+        # is invisible to this call (returns False), mirroring the
+        # 404-not-403 contract on cross-tenant reads.
+        before = len(self.conversation_threads)
+        self.conversation_threads = [
+            t
+            for t in self.conversation_threads
+            if not (t.thread_id == thread_id and t.tenant_id == tenant_id)
+        ]
+        return len(self.conversation_threads) < before
+
     async def list_feedback(
         self,
         *,

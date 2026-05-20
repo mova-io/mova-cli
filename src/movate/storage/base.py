@@ -426,4 +426,24 @@ class StorageProvider(Protocol):
         list without an extra reverse. Tenant-scoped: a cross-tenant
         thread id returns ``[]`` rather than raising or leaking."""
 
+    async def delete_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        """Hard-delete a thread row scoped to ``tenant_id``.
+
+        Returns True when a row was deleted, False when no matching
+        thread existed (or it belonged to a different tenant — same
+        404-not-403 semantics as ``get_conversation_thread``).
+
+        Runs that referenced the thread_id stay in storage; their
+        ``thread_id`` column becomes a dangling reference (the runs
+        still exist but ``list_runs_for_thread`` returns them only
+        when the operator queries by the now-deleted thread id, which
+        is fine — operators delete a thread when they don't want to
+        see it anymore, not when they want to nuke the historical
+        runs themselves)."""
+
     async def close(self) -> None: ...

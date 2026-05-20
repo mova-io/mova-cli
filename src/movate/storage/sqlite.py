@@ -1197,6 +1197,22 @@ class SqliteProvider:
             rows = await cur.fetchall()
         return [_row_to_run(r) for r in rows]
 
+    async def delete_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        # Tenant-scoped DELETE — a thread row for a different tenant
+        # is invisible (returns False / rowcount=0), matching the
+        # 404-not-403 cross-tenant contract.
+        cur = await self._db.execute(
+            "DELETE FROM conversation_threads WHERE thread_id = ? AND tenant_id = ?",
+            (thread_id, tenant_id),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()

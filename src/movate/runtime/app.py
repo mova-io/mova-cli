@@ -2607,6 +2607,45 @@ def build_app(
             runs_view = [RunView.from_record(r) for r in run_records]
         return ThreadView.from_record(thread, runs=runs_view)
 
+    @v1.delete(
+        "/threads/{thread_id}",
+        status_code=204,
+        tags=["threads-v1"],
+    )
+    async def v1_delete_thread(
+        thread_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Hard-delete a thread by id.
+
+        Returns 204 No Content on success. Tenant-scoped: a thread
+        belonging to a different tenant returns 404 (NEVER 403 —
+        matches the contract on every other thread endpoint, never
+        confirms cross-tenant existence).
+
+        Runs that previously referenced the thread stay in storage
+        (the operator deleting a thread expresses "I don't want to
+        see this conversation anymore", not "nuke the run records").
+        Their ``thread_id`` column becomes a dangling reference —
+        harmless because ``GET /api/v1/threads/{id}`` returns 404
+        for the deleted thread and ``list_runs_for_thread`` only
+        runs when the operator explicitly queries by an id.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — thread doesn't exist OR belongs to a different tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        deleted = await store.delete_conversation_thread(thread_id, tenant_id=ctx.tenant_id)
+        if not deleted:
+            raise not_found("thread", thread_id)
+        # FastAPI emits an empty body when status_code=204 + the
+        # handler returns a Response; explicit return keeps the
+        # type contract clean.
+        return Response(status_code=204)
+
     @v1.post(
         "/threads/{thread_id}/messages",
         response_model=RunAccepted,
