@@ -2757,8 +2757,28 @@ def build_app(
         # supplies their own ``conversation_history``, we don't
         # overwrite it. Lets advanced operators pre-format the
         # history (e.g. summarize older turns) before submission.
+        #
+        # PR-W: per-agent overrides on the thread-history caps. The
+        # agent's ``retrieval.history_turns`` + ``history_char_budget``
+        # let operators dial budgets per agent (verbose-turn threads
+        # get more; FAQ agents save tokens). Falls back to the
+        # process-wide defaults when the agent doesn't set them OR
+        # when the runtime can't find the bundle (e.g. an agent
+        # that landed on storage but not the registry yet).
+        history_turns = _THREAD_HISTORY_TURNS
+        history_char_budget = _THREAD_HISTORY_CHAR_BUDGET
+        agents: list[AgentBundle] = request.app.state.agents
+        for bundle in agents:
+            if bundle.spec.name == thread.agent:
+                cfg = bundle.spec.retrieval
+                if cfg.history_turns is not None:
+                    history_turns = cfg.history_turns
+                if cfg.history_char_budget is not None:
+                    history_char_budget = cfg.history_char_budget
+                break
+
         prior_runs = await store.list_runs_for_thread(
-            thread_id, tenant_id=ctx.tenant_id, limit=_THREAD_HISTORY_TURNS
+            thread_id, tenant_id=ctx.tenant_id, limit=history_turns
         )
         augmented_input = dict(body.input)
         if "conversation_history" not in augmented_input:
@@ -2773,7 +2793,9 @@ def build_app(
             # first when the raw history exceeds the char budget.
             # Most recent context survives; pathological 50KB-turn
             # threads no longer break everyone else.
-            augmented_input["conversation_history"] = _apply_history_char_budget(raw_turns)
+            augmented_input["conversation_history"] = _apply_history_char_budget(
+                raw_turns, budget=history_char_budget
+            )
 
         # Queue the job with the thread linkage. Worker dispatch
         # (``runtime/dispatch.py``) reads ``job.thread_id`` and passes

@@ -87,6 +87,11 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
             "rerank": bool(getattr(cfg, "rerank", False)),
             "multi_hop": int(getattr(cfg, "multi_hop", 0)),
         }
+        # PR-W: per-agent override for multi-hop's aggregated-chunks
+        # cap. ``None`` keeps the kb_search default (15).
+        mh_chunks = getattr(cfg, "multi_hop_max_total_chunks", None)
+        if mh_chunks is not None:
+            retrieval_kwargs["multi_hop_max_total_chunks"] = int(mh_chunks)
 
     # PR-V: when a tracer is available on the context, record the
     # retrieval pipeline's per-stage telemetry into a SearchTrace and

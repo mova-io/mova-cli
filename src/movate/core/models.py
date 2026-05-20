@@ -819,6 +819,45 @@ class RetrievalConfig(BaseModel):
         ),
     )
 
+    # ---- per-agent budget overrides (PR-W) ----
+    # Optional overrides for the process-wide defaults. ``None``
+    # means "use the runtime's default"; integers override. Lets
+    # operators with verbose-turn threads dial budgets up + operators
+    # with simple FAQ agents dial down to save tokens.
+
+    multi_hop_max_total_chunks: int | None = Field(
+        default=None,
+        ge=1,
+        le=30,
+        description=(
+            "Per-agent override for the multi-hop aggregated-chunks "
+            "cap. ``None`` = use the process default (15). Capped at "
+            ":data:`movate.kb.multi_hop.MAX_TOTAL_CHUNKS_CAP` (30)."
+        ),
+    )
+    history_turns: int | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description=(
+            "Per-agent override for the number of prior turns the "
+            "messages endpoint injects under "
+            "``input.conversation_history``. ``None`` = use the "
+            "process default (20)."
+        ),
+    )
+    history_char_budget: int | None = Field(
+        default=None,
+        ge=1000,
+        le=200_000,
+        description=(
+            "Per-agent override for the char-budget cap on injected "
+            "conversation history. ``None`` = use the process default "
+            "(40000 ≈ 10k tokens). Larger budgets pack more context "
+            "but eat into the model's available output budget."
+        ),
+    )
+
     def is_default(self) -> bool:
         """True when every field is at its default value.
 
@@ -826,7 +865,15 @@ class RetrievalConfig(BaseModel):
         operator hasn't opted in — keeps ``kb_search()`` calls byte-
         for-byte unchanged from the pre-PR-I default path.
         """
-        return not self.hybrid and self.rewrite == 0 and not self.rerank and self.multi_hop == 0
+        return (
+            not self.hybrid
+            and self.rewrite == 0
+            and not self.rerank
+            and self.multi_hop == 0
+            and self.multi_hop_max_total_chunks is None
+            and self.history_turns is None
+            and self.history_char_budget is None
+        )
 
 
 class AgentSpec(BaseModel):
