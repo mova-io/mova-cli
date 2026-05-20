@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.53"
+version = "0.8.2.54"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -77,16 +77,23 @@ cross-encoder = [
     "sentence-transformers>=2.7,<4",
 ]
 ocr = [
-    # OCR fallback for scanned-image PDFs (PR-CC / PR-HH). pdf2image
-    # wraps Poppler's pdftoppm renderer to rasterise pages at 300 DPI;
-    # pytesseract calls the system Tesseract binary to extract text.
-    # Both require external system dependencies:
-    #   - Poppler (e.g. `brew install poppler` / `apt-get install poppler-utils`)
-    #   - Tesseract (e.g. `brew install tesseract` / `apt-get install tesseract-ocr`)
+    # OCR fallback for scanned-image PDFs and standalone image files
+    # (PR-CC / PR-HH / PR-JJ). pdf2image wraps Poppler's pdftoppm
+    # renderer to rasterise PDF pages at 300 DPI; pytesseract calls
+    # the system Tesseract binary to extract text; Pillow decodes
+    # standalone image files (PNG/JPG/TIFF) directly.
+    # System dependencies required:
+    #   - Poppler (for PDF pages: `brew install poppler` / `apt-get install poppler-utils`)
+    #   - Tesseract (`brew install tesseract` / `apt-get install tesseract-ocr`)
     # Without the system binaries the Python packages install fine but
     # fail at runtime; movate gracefully returns None and logs a warning.
     "pdf2image>=1.17,<2",
     "pytesseract>=0.3,<1",
+    # Pillow is used to decode standalone image files (PNG/JPG/TIFF)
+    # into PIL Image objects before passing to Tesseract or EasyOCR.
+    # EasyOCR already pulls Pillow in transitively via torchvision, but
+    # listing it here keeps the [ocr] extra self-contained.
+    "pillow>=10.0",
 ]
 easyocr = [
     # EasyOCR backend for scanned-image PDFs — alternative to the [ocr]
@@ -264,6 +271,10 @@ module = [
     "chainlit.*",
     "readability.*",
     "bs4.*",
+    # Pillow ships type stubs in a separate `types-Pillow` package; the
+    # stubs don't always match the installed version and PIL is an
+    # optional extra dep, so we suppress missing-import errors here.
+    "PIL.*",
 ]
 ignore_missing_imports = true
 

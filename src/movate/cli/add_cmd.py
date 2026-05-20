@@ -84,6 +84,10 @@ _ROLE_DESCRIPTIONS: dict[str, tuple[str, str]] = {
         "Topic + sources → executive summary with per-source citations.",
         "multi-source synthesis with citations",
     ),
+    "hr-policy": (
+        "Employee HR question → grounded policy answer + citations + escalation flag.",
+        "multi-format KB demo (MD + HTML + PDF + DOCX + images)",
+    ),
     # Core templates also addable via `mdk add`. Shown under a separate
     # heading in --list so the role templates are the first thing
     # operators see.
@@ -118,6 +122,7 @@ _ROLE_TEMPLATES: frozenset[str] = frozenset(
         "resume-screener",
         "compliance-checker",
         "research-agent",
+        "hr-policy",
     }
 )
 
@@ -131,7 +136,7 @@ _ROLE_GROUPS: list[tuple[str, list[str]]] = [
     ("Sales / GTM", ["lead-qualifier"]),
     ("Engineering", ["code-reviewer", "sql-writer"]),
     ("Knowledge work", ["rag-qa", "research-agent"]),
-    ("HR / Recruiting", ["resume-screener"]),
+    ("HR / Recruiting", ["resume-screener", "hr-policy"]),
     ("Compliance / Ops", ["compliance-checker", "meeting-summarizer"]),
 ]
 

@@ -37,6 +37,7 @@ _VERBOSE_DEMO_TEMPLATES = (
     "rag-qa",
     "ticket-triager",
     "code-reviewer",
+    "hr-policy",
 )
 
 # The structural markers that mark a prompt as a curated role agent

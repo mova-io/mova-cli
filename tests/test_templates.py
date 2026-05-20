@@ -155,6 +155,19 @@ CANONICAL: dict[str, tuple[dict, str]] = {
         '"key_points": [{"claim": "60% quality at 6% cost.", "citations": [1]}], '
         '"disagreements": [], "open_questions": []}',
     ),
+    "hr-policy": (
+        {
+            "question": "How many PTO days do I get per year?",
+            "context": [
+                "Full-time employees accrue 15 days of paid time off per calendar year "
+                "during their first two years of employment.",
+            ],
+        },
+        '{"answer": "Full-time employees accrue 15 days of PTO per calendar year '
+        'during their first two years of employment [1].", '
+        '"citations": [1], "grounded": true, "confidence": 0.97, '
+        '"needs_escalation": false}',
+    ),
     # Skill-demo templates — MockProvider returns the output directly;
     # skill execution (calculator Python impl / HTTP lookup) is bypassed.
     "calc-agent": (
@@ -194,6 +207,7 @@ def test_template_registry_exposes_all_known() -> None:
         "resume-screener",
         "compliance-checker",
         "research-agent",
+        "hr-policy",
         # Skill-demo templates (post-v1.1)
         "calc-agent",
         "lookup-agent",

@@ -109,6 +109,13 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
         ".docx",
         ".html",
         ".htm",
+        # Image formats — text extracted via OCR (Tesseract or EasyOCR).
+        # Requires the [ocr] or [easyocr] extra AND Pillow for decoding.
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tiff",
+        ".tif",
     }
 )
 
@@ -651,6 +658,82 @@ def parse_html(content: bytes) -> ParseResult | None:
     return ParseResult(text="\n\n".join(paragraphs), ocr_used=False)
 
 
+def parse_image(content: bytes) -> ParseResult | None:
+    """Extract text from an image file (PNG / JPG / TIFF) via OCR.
+
+    Unlike the PDF path, no pdf2image rasterisation step is needed —
+    the bytes are decoded directly via Pillow (``PIL.Image``) and
+    the resulting image object is passed straight to the configured OCR
+    backend. The same ``MOVATE_OCR_BACKEND`` / ``MOVATE_OCR_LANG`` env
+    vars control backend selection and language as for the PDF path.
+
+    Pipeline:
+
+    1. **Pillow** opens the raw bytes as a PIL Image and converts to
+       RGB (normalises palette / RGBA / greyscale modes that some OCR
+       backends handle inconsistently).
+    2. **OCR backend** (Tesseract via pytesseract, or EasyOCR) extracts
+       text from the RGB image.
+    3. **Whitespace normalisation**: same as the PDF path — space/tab
+       runs collapsed, three-or-more consecutive newlines reduced to two.
+
+    Requires:
+
+    * ``pillow>=10.0`` — for ``PIL.Image.open``. Included in the
+      ``[ocr]`` and ``[easyocr]`` extras. Without it, returns ``None``
+      (logged at DEBUG, not WARNING, so silent absent-extra behaviour
+      matches the PDF OCR path).
+    * ``pytesseract`` + system Tesseract binary (``[ocr]`` extra) OR
+      ``easyocr`` (``[easyocr]`` extra).
+
+    Returns a :class:`ParseResult` with ``ocr_used=True`` on success
+    (image text is always OCR-based), or ``None`` if:
+
+    * Pillow is not installed.
+    * The bytes aren't a valid image (corrupt, wrong format).
+    * The OCR backend is not installed / fails.
+    * OCR succeeds but produces only whitespace.
+
+    Why RGB conversion:
+
+    Tesseract's internal decoder works best on RGB images. Palette-mode
+    PNGs (``mode="P"``), RGBA screenshots, and single-channel greyscale
+    scans can produce degraded output or explicit errors without
+    conversion. Converting to RGB is the smallest-surface-area fix that
+    covers all common scan modes without losing text information.
+    """
+    try:
+        from PIL import Image as _PILImage  # noqa: PLC0415
+    except ImportError:
+        logger.debug(
+            "Pillow not installed — image OCR unavailable. "
+            "Install movate-cli[ocr] or movate-cli[easyocr] to enable image parsing."
+        )
+        return None
+
+    try:
+        image = _PILImage.open(io.BytesIO(content))
+        # Convert to RGB: normalises palette, RGBA, and greyscale modes
+        # so both Tesseract and EasyOCR receive a consistent input format.
+        image = image.convert("RGB")
+    except Exception as exc:
+        logger.warning("Pillow failed to open image: %s", exc)
+        return None
+
+    lang = os.environ.get("MOVATE_OCR_LANG", "eng")
+    backend = os.environ.get("MOVATE_OCR_BACKEND", "tesseract").lower()
+
+    text = _ocr_easyocr(image, lang) if backend == "easyocr" else _ocr_tesseract(image, lang)
+
+    if text is None:
+        return None
+
+    # Same normalisation as the PDF OCR path.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return ParseResult(text=text.strip(), ocr_used=True) if text.strip() else None
+
+
 # Dispatch table — extension → parser. Keeping this at the module
 # bottom lets each parser's docstring sit next to the function for
 # readability. Extending: add the extension to SUPPORTED_EXTENSIONS,
@@ -663,4 +746,11 @@ _PARSERS: dict[str, DocumentParser] = {
     ".docx": parse_docx,
     ".html": parse_html,
     ".htm": parse_html,
+    # Image formats — OCR via Tesseract or EasyOCR (requires [ocr] or
+    # [easyocr] extra + Pillow; returns None gracefully if not installed).
+    ".png": parse_image,
+    ".jpg": parse_image,
+    ".jpeg": parse_image,
+    ".tiff": parse_image,
+    ".tif": parse_image,
 }
