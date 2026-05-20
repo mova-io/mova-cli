@@ -28,6 +28,7 @@ from typing import Protocol
 
 from movate.core.models import (
     ApiKeyRecord,
+    ConversationThread,
     EvalRecord,
     FailureRecord,
     FeedbackRecord,
@@ -375,5 +376,54 @@ class StorageProvider(Protocol):
         """Delete chunks scoped to an agent. When ``source`` is set,
         only chunks from that source URI are removed (re-ingest with
         --replace workflow). Returns the count deleted."""
+
+    # ------------------------------------------------------------------
+    # Conversation threads (Tier 10.5, added 0.8.2.27 / PR-N) — group
+    # runs together so multi-turn agents can fetch prior context when
+    # rendering the next message's prompt. Runtime endpoint + Chainlit
+    # thread-aware mode land in follow-up PRs.
+    # ------------------------------------------------------------------
+
+    async def save_conversation_thread(self, thread: ConversationThread) -> None:
+        """Persist a :class:`ConversationThread`. Idempotent on
+        ``thread_id``: re-saving the same id refreshes ``title`` /
+        ``updated_at`` (clients call this each time they append a
+        message so the thread sorts most-recently-active first)."""
+
+    async def get_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> ConversationThread | None:
+        """Fetch a thread by id, scoped to ``tenant_id``. Returns
+        ``None`` if the thread doesn't exist OR belongs to a different
+        tenant — never leaks existence across tenants (mirrors the
+        single-record-by-id contract on every storage method)."""
+
+    async def list_conversation_threads(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationThread]:
+        """List threads for a tenant, ordered ``updated_at DESC`` so
+        the active conversations float to the top. Optional ``agent``
+        filter when the client wants threads for one specific agent
+        (Chainlit's typical case — one tab per agent picker)."""
+
+    async def list_runs_for_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[RunRecord]:
+        """Fetch runs that belong to ``thread_id``, ordered
+        ``created_at ASC`` (chronological — earliest turn first) so the
+        runtime can render the conversation history straight from the
+        list without an extra reverse. Tenant-scoped: a cross-tenant
+        thread id returns ``[]`` rather than raising or leaking."""
 
     async def close(self) -> None: ...

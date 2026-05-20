@@ -1347,6 +1347,57 @@ class RunRecord(BaseModel):
     workflow_run_id: str | None = None
     node_id: str | None = None
     """For workflow runs, the id of the workflow node that produced this run."""
+    thread_id: str | None = None
+    """For multi-turn conversational runs (Tier 10.5 / PR-N), the id of the
+    :class:`ConversationThread` this run belongs to. Standalone runs leave
+    this ``None``. The runtime joins on this column to fetch prior turns
+    when rendering the next message's prompt."""
+
+
+class ConversationThread(BaseModel):
+    """A multi-turn conversation with a single agent (Tier 10.5, PR-N).
+
+    Threads group runs together so the runtime can fetch the last N turns
+    when rendering the next message's prompt. Without threads, every
+    ``mdk submit`` is a fresh single-shot call — operators can't ask
+    follow-up questions ("and what about the prorated case?") that
+    reference earlier context.
+
+    Storage contract:
+
+    * One thread per agent per tenant. Cross-agent threads aren't a
+      thing in v0.9 — an operator who wants to swap agents mid-thread
+      should start a new one.
+    * ``thread_id`` is the public identifier (URL-safe hex uuid).
+    * ``RunRecord.thread_id`` references this when the run was
+      submitted as part of the thread.
+    * Threads accumulate forever in v0.9 — no built-in TTL or message
+      count cap. Operators with thread-cleanup needs can call
+      ``storage.list_conversation_threads`` and prune by ``created_at``.
+
+    Design choices:
+
+    * **No message-body storage on the thread itself**. The thread is
+      a join key; the actual conversation lives in the per-run
+      ``RunRecord.input`` + ``RunRecord.output`` fields. This keeps
+      the schema small + lets us evolve message shape without
+      migrating thread rows.
+    * **Optional ``title``** rendered by clients (Chainlit playground,
+      Mova iO Angular). Empty string = no title; clients should fall
+      back to the first message's truncated text.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str
+    tenant_id: str
+    agent: str
+    title: str = ""
+    """Optional human-readable label for client display."""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    """Refreshed on every appended message so clients can sort
+    threads most-recently-active first."""
 
 
 class FailureRecord(BaseModel):

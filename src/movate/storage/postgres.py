@@ -30,6 +30,7 @@ import asyncpg
 from movate.core.models import (
     ApiKeyEnv,
     ApiKeyRecord,
+    ConversationThread,
     ErrorInfo,
     EvalRecord,
     FailureRecord,
@@ -245,6 +246,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_dedup
 -- Per-source listing (mdk kb ls --source <path>).
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_source
     ON kb_chunks(agent, tenant_id, source);
+
+-- Conversation threads (PR-N) — group runs for multi-turn agents.
+-- Runs link via the new ``runs.thread_id`` column (added below as an
+-- ADD COLUMN IF NOT EXISTS — idempotent so re-running init() on an
+-- upgraded database is safe).
+CREATE TABLE IF NOT EXISTS conversation_threads (
+    thread_id   TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    agent       TEXT NOT NULL,
+    title       TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_threads_tenant_updated
+    ON conversation_threads(tenant_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_threads_agent_tenant
+    ON conversation_threads(agent, tenant_id);
+
+-- Per-run thread linkage. NULL = standalone (non-threaded) run.
+-- Postgres supports ADD COLUMN IF NOT EXISTS so re-running init() on
+-- a database that already has the column is a no-op.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS thread_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_runs_thread
+    ON runs(thread_id, created_at)
+    WHERE thread_id IS NOT NULL;
 """
 
 
@@ -348,10 +374,10 @@ class PostgresProvider:
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id
+                workflow_run_id, node_id, thread_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17
+                $11, $12, $13, $14, $15, $16, $17, $18
             )
             """,
             run.run_id,
@@ -371,6 +397,7 @@ class PostgresProvider:
             run.created_at,
             run.workflow_run_id,
             run.node_id,
+            run.thread_id,
         )
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
@@ -1049,6 +1076,100 @@ class PostgresProvider:
         )
         return float(result or 0.0)
 
+    # ------------------------------------------------------------------
+    # Conversation threads (PR-N) — multi-turn agent foundation.
+    # ------------------------------------------------------------------
+
+    async def save_conversation_thread(self, thread: ConversationThread) -> None:
+        # ON CONFLICT DO UPDATE so clients can call this on every
+        # appended message to refresh ``updated_at`` (and optionally
+        # ``title``) without re-inserting.
+        await self._db.execute(
+            """
+            INSERT INTO conversation_threads
+            (thread_id, tenant_id, agent, title, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (thread_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                updated_at = EXCLUDED.updated_at
+            """,
+            thread.thread_id,
+            thread.tenant_id,
+            thread.agent,
+            thread.title,
+            thread.created_at,
+            thread.updated_at,
+        )
+
+    async def get_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> ConversationThread | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM conversation_threads WHERE thread_id = $1 AND tenant_id = $2",
+            thread_id,
+            tenant_id,
+        )
+        if row is None:
+            return None
+        return _row_to_thread(row)
+
+    async def list_conversation_threads(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationThread]:
+        if agent is not None:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM conversation_threads
+                WHERE tenant_id = $1 AND agent = $2
+                ORDER BY updated_at DESC
+                LIMIT $3
+                """,
+                tenant_id,
+                agent,
+                int(limit),
+            )
+        else:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM conversation_threads
+                WHERE tenant_id = $1
+                ORDER BY updated_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                int(limit),
+            )
+        return [_row_to_thread(r) for r in rows]
+
+    async def list_runs_for_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[RunRecord]:
+        # Tenant-scoped via the WHERE clause — cross-tenant returns [].
+        # ASC by created_at for chronological conversation history.
+        rows = await self._db.fetch(
+            """
+            SELECT * FROM runs
+            WHERE thread_id = $1 AND tenant_id = $2
+            ORDER BY created_at ASC
+            LIMIT $3
+            """,
+            thread_id,
+            tenant_id,
+            int(limit),
+        )
+        return [_row_to_run(r) for r in rows]
+
 
 # ---------------------------------------------------------------------------
 # Row → model converters
@@ -1075,6 +1196,18 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         created_at=row["created_at"],
         workflow_run_id=row["workflow_run_id"],
         node_id=row["node_id"],
+        thread_id=row["thread_id"],
+    )
+
+
+def _row_to_thread(row: asyncpg.Record) -> ConversationThread:
+    return ConversationThread(
+        thread_id=row["thread_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        title=row["title"] or "",
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
