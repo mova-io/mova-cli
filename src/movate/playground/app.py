@@ -49,6 +49,15 @@ except ImportError as exc:  # pragma: no cover - covered by CLI hint
 
 from movate.playground.client import PlaygroundClient, PlaygroundClientConfig
 
+# Thread-resume UI tuning (PR-P). Rendering the full thread history
+# can flood the chat — show the most recent N turns inline, truncate
+# each input/output preview to keep rows scannable.
+_RECENT_TURNS_TO_RENDER = 5
+_TURN_PREVIEW_CHARS = 120
+# Thread-picker label cap. Chainlit Action labels render in a tight
+# row; > 30 chars wrap awkwardly.
+_THREAD_LABEL_MAX = 30
+
 
 def _client_from_env() -> PlaygroundClient:
     """Build the runtime client from env vars set by the CLI wrapper.
@@ -121,10 +130,21 @@ async def start() -> None:
 
 @cl.action_callback("pick_agent")
 async def on_pick_agent(action: cl.Action) -> None:
-    """An agent was picked. Fetch its input schema + ask for input."""
+    """An agent was picked. Fetch its input schema + ask for input.
+
+    Also lists any existing threads for this agent so the operator
+    can resume a prior multi-turn conversation (Tier 10.5 / PR-P).
+    Single-shot mode (no thread) stays the default — pre-PR-P
+    behavior is byte-for-byte unchanged for operators who don't pick
+    a thread.
+    """
     client: PlaygroundClient = cl.user_session.get("client")
     agent_name = action.value
     cl.user_session.set("agent_name", agent_name)
+    # Clear any thread from a prior agent's session — a fresh pick
+    # starts in single-shot mode until the operator explicitly picks
+    # or creates a thread.
+    cl.user_session.set("thread_id", None)
 
     try:
         detail = await client.get_agent_detail(agent_name)
@@ -172,6 +192,121 @@ async def on_pick_agent(action: cl.Action) -> None:
             ),
         ],
     ).send()
+
+    # Thread picker (Tier 10.5 / PR-P). List recent threads for this
+    # agent so the operator can resume a multi-turn conversation;
+    # offer a "new thread" action that opens a fresh one. Falls back
+    # silently when the runtime endpoint isn't available (pre-PR-O
+    # runtimes 404 on /api/v1/threads) — operator keeps single-shot
+    # mode without seeing an error.
+    try:
+        threads = await client.list_threads(agent=agent_name, limit=5)
+    except Exception:
+        threads = []
+    actions: list = [
+        cl.Action(
+            name="new_thread",
+            value=agent_name,
+            label="+ New thread",
+            description="Start a fresh multi-turn conversation",
+        ),
+    ]
+    if threads:
+        for t in threads:
+            label = t.get("title") or "(untitled)"
+            if len(label) > _THREAD_LABEL_MAX:
+                label = label[: _THREAD_LABEL_MAX - 3] + "..."
+            actions.append(
+                cl.Action(
+                    name="resume_thread",
+                    value=t["thread_id"],
+                    label=f"📜 {label}",
+                    description=f"Resume thread {t['thread_id'][:8]}…",
+                )
+            )
+    await cl.Message(
+        content=(
+            "**Conversation mode:** by default each message is a "
+            "single-shot run. Pick a thread to keep multi-turn context "
+            "(the agent's prior turns will appear in the thread history "
+            "even if its prompt template doesn't auto-render them yet)."
+        ),
+        actions=actions,
+    ).send()
+
+
+@cl.action_callback("new_thread")
+async def on_new_thread(action: cl.Action) -> None:
+    """Operator clicked "New thread" — open one + tell them subsequent
+    messages will go via /api/v1/threads/{id}/messages."""
+    client: PlaygroundClient = cl.user_session.get("client")
+    agent_name = action.value or cl.user_session.get("agent_name")
+    if not agent_name or not client:
+        await cl.Message(content="Pick an agent first from the buttons above.").send()
+        return
+    try:
+        thread = await client.create_thread(agent=agent_name)
+    except Exception as exc:
+        await cl.Message(
+            content=f"❌ Could not open thread: {type(exc).__name__}: {exc}"
+        ).send()
+        return
+    thread_id = thread["thread_id"]
+    cl.user_session.set("thread_id", thread_id)
+    await cl.Message(
+        content=(
+            f"✅ Opened new thread `{thread_id[:8]}…` for **{agent_name}**.\n\n"
+            "Subsequent messages stay in this thread until you pick a different "
+            "one or refresh."
+        )
+    ).send()
+
+
+@cl.action_callback("resume_thread")
+async def on_resume_thread(action: cl.Action) -> None:
+    """Operator picked an existing thread — bind it + show prior turns
+    so they have visual continuity before sending the next message."""
+    client: PlaygroundClient = cl.user_session.get("client")
+    thread_id = action.value
+    if not thread_id or not client:
+        await cl.Message(content="Couldn't bind thread — pick an agent first.").send()
+        return
+    try:
+        thread = await client.get_thread(thread_id, include_runs=True)
+    except Exception as exc:
+        await cl.Message(
+            content=f"❌ Could not fetch thread: {type(exc).__name__}: {exc}"
+        ).send()
+        return
+    cl.user_session.set("thread_id", thread_id)
+    cl.user_session.set("agent_name", thread["agent"])
+
+    runs = thread.get("runs") or []
+    lines = [
+        f"📜 Resumed thread `{thread_id[:8]}…` (**{thread['agent']}**)",
+        f"_{len(runs)} prior turn(s)_",
+    ]
+    if runs:
+        lines.append("")
+        # Show the last RECENT_TURNS_TO_RENDER turns inline — older
+        # turns are still in the thread but rendering the full history
+        # can flood the chat. Per-turn text is truncated to keep each
+        # row scannable.
+        recent = runs[-_RECENT_TURNS_TO_RENDER:]
+        for i, run in enumerate(recent, start=max(1, len(runs) - len(recent) + 1)):
+            inp = run.get("input") or {}
+            out = run.get("output") or {}
+            inp_str = json.dumps(inp, indent=None)
+            out_str = json.dumps(out, indent=None)
+            if len(inp_str) > _TURN_PREVIEW_CHARS:
+                inp_str = inp_str[: _TURN_PREVIEW_CHARS - 3] + "..."
+            if len(out_str) > _TURN_PREVIEW_CHARS:
+                out_str = out_str[: _TURN_PREVIEW_CHARS - 3] + "..."
+            lines.append(f"**Turn {i}** — in: `{inp_str}` → out: `{out_str}`")
+    lines.append(
+        "\nSend your next message in JSON and it'll continue this thread."
+    )
+    await cl.Message(content="\n".join(lines)).send()
 
 
 @cl.action_callback("upload_kb")
@@ -280,10 +415,24 @@ async def on_message(message: cl.Message) -> None:
 
     # Submit + poll. Stream a progress message so the operator sees
     # something happen during the typical 2-10s eval window.
-    progress = cl.Message(content=f"⏳ Running **{agent_name}**...")
+    #
+    # Routing: when a thread is bound to the session (PR-P), the
+    # message goes via POST /api/v1/threads/{id}/messages so the
+    # worker stamps thread_id on the spawned run. Otherwise the
+    # default single-shot /run path runs (pre-PR-P behavior, byte-
+    # for-byte unchanged for operators who haven't picked a thread).
+    thread_id = cl.user_session.get("thread_id")
+    mode_label = f"in thread `{thread_id[:8]}…`" if thread_id else "single-shot"
+    progress = cl.Message(content=f"⏳ Running **{agent_name}** ({mode_label})...")
     await progress.send()
     try:
-        submission = await client.submit_run(agent=agent_name, input_data=input_data)
+        if thread_id:
+            submission = await client.submit_thread_message(
+                thread_id=thread_id,
+                input_data=input_data,
+            )
+        else:
+            submission = await client.submit_run(agent=agent_name, input_data=input_data)
         job_id = submission.get("job_id")
         if not job_id:
             await cl.Message(content=f"❌ Runtime didn't return a job_id: {submission}").send()

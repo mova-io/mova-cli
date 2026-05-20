@@ -170,6 +170,86 @@ class PlaygroundClient:
         result: dict[str, Any] = resp.json()
         return result
 
+    # ------------------------------------------------------------------
+    # Conversation threads (Tier 10.5 / PR-P)
+    # ------------------------------------------------------------------
+
+    async def create_thread(
+        self,
+        *,
+        agent: str,
+        title: str = "",
+    ) -> dict[str, Any]:
+        """Open a new multi-turn conversation thread with ``agent``.
+
+        POSTs to ``/api/v1/threads``. Returns the
+        ``{thread_id, agent, title, created_at, ...}`` envelope —
+        clients store ``thread_id`` and send subsequent messages via
+        :meth:`submit_thread_message`.
+        """
+        payload: dict[str, Any] = {"agent": agent}
+        if title:
+            payload["title"] = title
+        resp = await self._client.post("/api/v1/threads", json=payload)
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def list_threads(
+        self,
+        *,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List threads for the authenticated tenant, ordered
+        ``updated_at DESC``. Optional ``agent`` filter narrows the
+        result to one agent's threads (typical Chainlit case)."""
+        params: dict[str, Any] = {"limit": limit}
+        if agent is not None:
+            params["agent"] = agent
+        resp = await self._client.get("/api/v1/threads", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return list(data.get("threads") or [])
+
+    async def get_thread(
+        self,
+        thread_id: str,
+        *,
+        include_runs: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch a thread by id with optional chronological run history.
+
+        Returns ``{thread_id, agent, title, runs?, ...}``. Set
+        ``include_runs=False`` to skip the history scan when the
+        client only needs metadata."""
+        params = {"include_runs": "true" if include_runs else "false"}
+        resp = await self._client.get(f"/api/v1/threads/{thread_id}", params=params)
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def submit_thread_message(
+        self,
+        *,
+        thread_id: str,
+        input_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Submit a message in the context of an existing thread.
+
+        POSTs to ``/api/v1/threads/{thread_id}/messages``. Returns
+        the same ``{job_id, status}`` envelope as
+        :meth:`submit_run` — clients poll ``/jobs/{id}`` until
+        terminal, then fetch the run via :meth:`get_run`.
+        """
+        resp = await self._client.post(
+            f"/api/v1/threads/{thread_id}/messages",
+            json={"input": input_data},
+        )
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
     async def post_feedback(
         self,
         *,
