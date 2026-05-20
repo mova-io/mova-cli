@@ -2767,6 +2767,7 @@ def build_app(
         # that landed on storage but not the registry yet).
         history_turns = _THREAD_HISTORY_TURNS
         history_char_budget = _THREAD_HISTORY_CHAR_BUDGET
+        history_summarize = False
         agents: list[AgentBundle] = request.app.state.agents
         for bundle in agents:
             if bundle.spec.name == thread.agent:
@@ -2775,6 +2776,7 @@ def build_app(
                     history_turns = cfg.history_turns
                 if cfg.history_char_budget is not None:
                     history_char_budget = cfg.history_char_budget
+                history_summarize = cfg.history_summarize
                 break
 
         # Bug fix (CI-caught from PR-W): list_runs_for_thread returns
@@ -2796,12 +2798,44 @@ def build_app(
                 }
                 for r in prior_runs
             ]
+            # PR-Z: when the agent opted into history_summarize AND
+            # the raw history exceeds the char budget, replace the
+            # OLDEST turns with a synthetic summary entry so the
+            # agent sees the GIST of earlier context instead of
+            # losing it. Falls back to raw truncation on any LLM
+            # failure (the summarizer's own degraded path).
+            #
+            # Default path (history_summarize=False) → PR-U's raw
+            # budget-aware truncation. Byte-for-byte unchanged from
+            # before PR-Z for back-compat.
+            applied_turns = raw_turns
+            if history_summarize and raw_turns:
+                import json  # noqa: PLC0415 — lazy: only paid for opt-in agents
+
+                from movate.kb.history_summary import (  # noqa: PLC0415
+                    summarize_older_turns,
+                )
+
+                total_chars = sum(len(json.dumps(t, default=str)) for t in raw_turns)
+                if total_chars > history_char_budget:
+                    # Keep the most recent turns whose total fits the
+                    # budget; everything older gets summarized.
+                    kept_chars = 0
+                    keep_recent = 0
+                    for t in reversed(raw_turns):
+                        size = len(json.dumps(t, default=str))
+                        if kept_chars + size > history_char_budget:
+                            break
+                        kept_chars += size
+                        keep_recent += 1
+                    keep_recent = max(keep_recent, 1)
+                    applied_turns = await summarize_older_turns(raw_turns, keep_recent=keep_recent)
             # PR-U: budget-aware truncation — drops OLDEST turns
             # first when the raw history exceeds the char budget.
             # Most recent context survives; pathological 50KB-turn
             # threads no longer break everyone else.
             augmented_input["conversation_history"] = _apply_history_char_budget(
-                raw_turns, budget=history_char_budget
+                applied_turns, budget=history_char_budget
             )
 
         # Queue the job with the thread linkage. Worker dispatch
