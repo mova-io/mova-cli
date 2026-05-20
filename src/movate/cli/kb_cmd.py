@@ -182,6 +182,90 @@ def ingest(
     asyncio.run(_run())
 
 
+def _print_trace_table(trace: object) -> None:
+    """Render a :class:`SearchTrace` as a Rich table.
+
+    Three columns: stage name (left-aligned), duration in ms
+    (right-aligned), and a free-form details column (truncated to
+    keep narrow terminals readable). A footer row shows the total.
+
+    Designed to print BEFORE the results table so the operator
+    can read top-to-bottom: timing context, then the chunks. Both
+    tables print to stdout; ``--trace`` is opt-in so default output
+    stays clean for piping / scripting.
+    """
+    # Imported locally so callers that never set ``--trace`` don't
+    # pay the import cost — Rich tables aren't free at import time.
+    from rich.console import Console  # noqa: PLC0415
+
+    stdout = Console()
+    table = Table(
+        title="[bold]Search trace[/bold]",
+        show_lines=False,
+        title_justify="left",
+    )
+    table.add_column("stage", style="cyan", no_wrap=True)
+    table.add_column("latency", justify="right", style="bold")
+    table.add_column("in → out", justify="right", style="dim")
+    table.add_column("details", overflow="fold")
+
+    stages = getattr(trace, "stages", []) or []
+    for stage in stages:
+        # Show "→ N" when input_count is 0 — it's the stage's first
+        # source of candidates, not a transformation of an upstream
+        # count.
+        if stage.input_count:
+            io = f"{stage.input_count} → {stage.output_count}"
+        else:
+            io = f"→ {stage.output_count}"
+        # Compact the details dict into one line. Skip noisy
+        # internals (full variant lists, full sub-query strings).
+        details_str = _format_stage_details(stage.details)
+        table.add_row(
+            stage.name,
+            f"{stage.duration_ms:.1f}ms",
+            io,
+            details_str,
+        )
+
+    total_ms = getattr(trace, "total_ms", lambda: 0.0)()
+    table.add_section()
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        f"[bold]{total_ms:.1f}ms[/bold]",
+        "",
+        "",
+    )
+    stdout.print(table)
+
+
+_MAX_DETAILS_LEN = 80
+
+
+def _format_stage_details(details: dict[str, object]) -> str:
+    """Compact a stage's details dict for table display.
+
+    Drops keys whose value is too long for a one-liner; keeps
+    scalars + small collections. Best-effort — the full details
+    are still on the trace object for programmatic inspection.
+    """
+    if not details:
+        return ""
+    parts: list[str] = []
+    for k, v in details.items():
+        # Skip long variant / sub-query lists; the operator gets
+        # the count from input_count/output_count, the actual
+        # strings are noise here.
+        if isinstance(v, list) and len(v) > 0:
+            parts.append(f"{k}={len(v)}")
+            continue
+        s = str(v)
+        if len(s) > _MAX_DETAILS_LEN:
+            s = s[:_MAX_DETAILS_LEN] + "…"
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)
+
+
 def _run_dry(*, path: Path, agent: str) -> None:
     """Dry-run path for ``mdk kb ingest --dry-run``.
 
@@ -333,6 +417,17 @@ def search(
             "planner calls + N retrieval passes. 0 = disabled (default)."
         ),
     ),
+    show_trace: bool = typer.Option(
+        False,
+        "--trace",
+        help=(
+            "Render a per-stage trace table after the results: which "
+            "stages fired, how long each took, candidate counts in/out. "
+            "Useful for debugging 'why didn't this chunk surface?' or "
+            "'where's my latency going?'. Adds ~0.1ms of overhead per "
+            "stage (negligible)."
+        ),
+    ),
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
@@ -356,6 +451,9 @@ def search(
 
     async def _run() -> None:
         from movate.kb.search import search as kb_search  # noqa: PLC0415
+        from movate.kb.trace import SearchTrace  # noqa: PLC0415
+
+        trace = SearchTrace() if show_trace else None
 
         storage = await _build_storage()
         try:
@@ -370,9 +468,17 @@ def search(
                 rewrite_variants=rewrite,
                 rerank=rerank,
                 multi_hop=multi_hop,
+                trace=trace,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
+
+        # Render the trace before the results table so the operator
+        # sees timing context above the chunks (which can be long).
+        # Hide noisy details from the table; full payload is on the
+        # ``trace`` object for programmatic callers.
+        if trace is not None and trace.stages:
+            _print_trace_table(trace)
 
         if not results:
             err_console.print(
