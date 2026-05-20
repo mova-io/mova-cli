@@ -246,6 +246,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_chunks_dedup
 -- Per-source listing (mdk kb ls --source <path>).
 CREATE INDEX IF NOT EXISTS idx_kb_chunks_source
     ON kb_chunks(agent, tenant_id, source);
+-- PR-AA: GIN index on tsvector for native full-text BM25 search.
+-- Indexed with the 'english' text search configuration (stemming +
+-- stopwords). Queries use plainto_tsquery('english', ...) which
+-- converts free text to AND-connected lexemes — same semantics as
+-- the Python BM25 scorer in movate.kb.lexical.
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_text_gin
+    ON kb_chunks USING gin(to_tsvector('english', text));
 
 -- Conversation threads (PR-N) — group runs for multi-turn agents.
 -- Runs link via the new ``runs.thread_id`` column (added below as an
@@ -1065,6 +1072,54 @@ class PostgresProvider:
             return int(str(result).split()[-1])
         except (ValueError, IndexError):
             return 0
+
+    async def search_kb_chunks_lexical(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        """Postgres tsvector + GIN index BM25-style lexical search.
+
+        Uses ``plainto_tsquery`` (converts plain text to AND-connected
+        lexemes) + ``ts_rank`` for scoring. Returns up to ``limit``
+        chunks ranked most-relevant first. Empty query or no matches
+        → empty list. NEVER raises.
+        """
+        if not query.strip():
+            return []
+        try:
+            rows = await self._db.fetch(
+                """
+                SELECT chunk_id, tenant_id, agent, source, text, embedding,
+                       embedding_model, content_hash, metadata, created_at,
+                       ts_rank(
+                           to_tsvector('english', text),
+                           plainto_tsquery('english', $3)
+                       ) AS rank
+                FROM kb_chunks
+                WHERE agent = $1
+                  AND tenant_id = $2
+                  AND to_tsvector('english', text) @@ plainto_tsquery('english', $3)
+                ORDER BY rank DESC
+                LIMIT $4
+                """,
+                agent,
+                tenant_id,
+                query,
+                int(limit),
+            )
+        except Exception:
+            return []
+        results = []
+        for r in rows:
+            rank = float(r["rank"] or 0.0)
+            # ts_rank returns [0, 1] normally. Clamp defensively.
+            score = min(max(rank, 0.0), 1.0)
+            results.append(KbChunkWithScore(chunk=_row_to_kb_chunk(r), score=score))
+        return results
 
     async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
         # ``date_trunc('month', now() at time zone 'utc')`` returns the
