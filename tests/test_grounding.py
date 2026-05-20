@@ -19,6 +19,7 @@ from movate.core.grounding import (
     GroundingViolation,
     check_grounding,
     kb_call_count_from_records,
+    max_valid_citation_index_from_records,
 )
 from movate.core.models import SkillCallRecord
 
@@ -518,3 +519,196 @@ class TestDefaultEnforcement:
         report = check_grounding(output, kb_call_count=0)
         assert report.ok is True
         assert report.violations == []
+
+
+# ---------------------------------------------------------------------------
+# Check 5: out-of-range citation indices (M4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestViolationOutOfRangeCitationIndices:
+    """Check 5: citation indices must not exceed chunks_found from KB calls."""
+
+    def _kb_rec(self, chunks_found: int, *, step: int = 1) -> SkillCallRecord:
+        return SkillCallRecord(
+            step=step,
+            skill="kb-vector-lookup",
+            input={"query": "q"},
+            output={"chunks": [], "chunks_found": chunks_found},
+        )
+
+    def test_within_range_passes(self) -> None:
+        output = {"grounded": True, "citations": [1, 2, 3]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=3,
+            enforcement="warn",
+        )
+        assert report.ok is True
+        assert report.violations == []
+
+    def test_exact_max_index_passes(self) -> None:
+        output = {"grounded": True, "citations": [5]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=5,
+            enforcement="warn",
+        )
+        assert report.ok is True
+
+    def test_one_over_range_flagged(self) -> None:
+        output = {"grounded": True, "citations": [1, 2, 4]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=3,
+            enforcement="warn",
+        )
+        assert report.ok is False
+        codes = [v.code for v in report.violations]
+        assert "out_of_range_citation_indices" in codes
+        violation = next(v for v in report.violations if v.code == "out_of_range_citation_indices")
+        assert "4" in violation.message
+        assert "3" in violation.message
+
+    def test_all_out_of_range(self) -> None:
+        output = {"grounded": True, "citations": [6, 7, 8]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=5,
+            enforcement="warn",
+        )
+        assert report.ok is False
+        assert any(v.code == "out_of_range_citation_indices" for v in report.violations)
+
+    def test_zero_max_index_skips_range_check(self) -> None:
+        """max_valid_citation_index=0 means no KB count available — skip range check."""
+        output = {"grounded": True, "citations": [1, 99, 100]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=0,
+            enforcement="warn",
+        )
+        # Only grounded_without_kb_call fires (kb_call_count=1 so that's fine too);
+        # range check is skipped.
+        codes = [v.code for v in report.violations]
+        assert "out_of_range_citation_indices" not in codes
+
+    def test_strict_mode_raises_on_out_of_range(self) -> None:
+        output = {"grounded": True, "citations": [1, 2, 10]}
+        with pytest.raises(GroundingViolationError) as exc_info:
+            check_grounding(
+                output,
+                kb_call_count=1,
+                max_valid_citation_index=5,
+                enforcement="strict",
+            )
+        assert "exceed" in str(exc_info.value)
+
+    def test_format_invalid_indices_not_double_counted(self) -> None:
+        """Indices that fail Check 3 (non-positive) are not re-checked in Check 5."""
+        output = {"grounded": True, "citations": [0, -1]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=5,
+            enforcement="warn",
+        )
+        # invalid_citation_indices fires; out_of_range should NOT fire for 0/-1.
+        codes = [v.code for v in report.violations]
+        assert "invalid_citation_indices" in codes
+        assert "out_of_range_citation_indices" not in codes
+
+    def test_multi_hop_sums_chunks(self) -> None:
+        """Two KB calls each returning 3 chunks → max valid index is 6."""
+        output = {"grounded": True, "citations": [5, 6]}
+        report = check_grounding(
+            output,
+            kb_call_count=2,
+            max_valid_citation_index=6,
+            enforcement="warn",
+        )
+        assert report.ok is True
+
+    def test_multi_hop_citation_beyond_total_flagged(self) -> None:
+        output = {"grounded": True, "citations": [5, 7]}
+        report = check_grounding(
+            output,
+            kb_call_count=2,
+            max_valid_citation_index=6,
+            enforcement="warn",
+        )
+        assert report.ok is False
+        assert any(v.code == "out_of_range_citation_indices" for v in report.violations)
+
+
+# ---------------------------------------------------------------------------
+# max_valid_citation_index_from_records helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMaxValidCitationIndexFromRecords:
+    """Unit tests for max_valid_citation_index_from_records()."""
+
+    def _kb(self, chunks_found: int, *, step: int = 1, error: str | None = None) -> SkillCallRecord:
+        return SkillCallRecord(
+            step=step,
+            skill="kb-vector-lookup",
+            input={"query": "q"},
+            output=None if error else {"chunks": [], "chunks_found": chunks_found},
+            error=error,
+        )
+
+    def _other(self, chunks_found: int = 3) -> SkillCallRecord:
+        return SkillCallRecord(
+            step=1,
+            skill="calculator",
+            input={},
+            output={"chunks_found": chunks_found},  # same field name, different skill
+        )
+
+    def test_empty_list_returns_zero(self) -> None:
+        assert max_valid_citation_index_from_records([]) == 0
+
+    def test_single_kb_call(self) -> None:
+        assert max_valid_citation_index_from_records([self._kb(5)]) == 5
+
+    def test_two_kb_calls_summed(self) -> None:
+        assert max_valid_citation_index_from_records([self._kb(3), self._kb(4, step=2)]) == 7
+
+    def test_failed_kb_call_excluded(self) -> None:
+        assert max_valid_citation_index_from_records([self._kb(5, error="timeout")]) == 0
+
+    def test_non_kb_skill_ignored(self) -> None:
+        assert max_valid_citation_index_from_records([self._other(10)]) == 0
+
+    def test_mixed_skills_only_sums_kb(self) -> None:
+        records = [self._kb(3), self._other(10), self._kb(2, step=2)]
+        assert max_valid_citation_index_from_records(records) == 5
+
+    def test_kb_output_missing_chunks_found(self) -> None:
+        rec = SkillCallRecord(
+            step=1, skill="kb-vector-lookup", input={}, output={"chunks": []}
+        )
+        assert max_valid_citation_index_from_records([rec]) == 0
+
+    def test_kb_output_is_none(self) -> None:
+        rec = SkillCallRecord(step=1, skill="kb-vector-lookup", input={}, output=None)
+        assert max_valid_citation_index_from_records([rec]) == 0
+
+    def test_chunks_found_non_int_ignored(self) -> None:
+        rec = SkillCallRecord(
+            step=1, skill="kb-vector-lookup", input={},
+            output={"chunks_found": "five"},
+        )
+        assert max_valid_citation_index_from_records([rec]) == 0
+
+    def test_failed_and_successful_mixed(self) -> None:
+        records = [self._kb(5, error="err"), self._kb(3, step=2)]
+        assert max_valid_citation_index_from_records(records) == 3
