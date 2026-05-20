@@ -1,5 +1,12 @@
 """Search trace — per-stage telemetry for the retrieval pipeline.
 
+Also exposes :func:`emit_to_tracer` (PR-V) for piping the recorded
+stages into the agent's active Tracer (Langfuse / OTel / stdout) so
+operators inspecting a run end-to-end see retrieval stages as nested
+spans alongside the LLM call + skill invocations.
+
+
+
 The full retrieval stack now has up to four LLM-stage layers
 (rewriter / rerank / multi-hop planner) plus per-variant vector +
 BM25 lookups. When an operator says "this chunk didn't surface,
@@ -193,3 +200,77 @@ class _StageTimer:
             details=self.details,
             chunk_ids=self.chunk_ids,
         )
+
+
+def emit_to_tracer(
+    trace: SearchTrace,
+    tracer: Any,
+    *,
+    parent_span: Any = None,
+    root_name: str = "kb_search",
+) -> Any:
+    """Pipe a :class:`SearchTrace` into a :class:`movate.tracing.base.Tracer`
+    as nested spans (PR-V).
+
+    Creates a root span named ``root_name`` under ``parent_span``,
+    then one child span per stage. Each child carries:
+
+    * ``duration_ms`` (the stage's measured wall-time)
+    * ``input_count`` / ``output_count``
+    * the stage's ``details`` dict
+    * a truncated ``chunk_ids_preview`` (first 10 ids) when the stage
+      produced chunks — operator can drill into the Langfuse UI to
+      see what dropped at each stage
+
+    Note on timing fidelity: SearchTrace records latency POST-hoc as
+    a single scalar per stage. Tracers want start + end. We emit
+    spans serially at the same wall-clock instant — Langfuse will
+    show them all roughly co-occurring, but each span's
+    ``duration_ms`` attribute carries the actual latency. Good enough
+    for "where's the time going" inspection.
+
+    Best-effort: any tracer failure (e.g. Langfuse is down) is
+    swallowed so a flaky observability sink can never block retrieval.
+
+    Args:
+        trace: The :class:`SearchTrace` to emit.
+        tracer: A :class:`Tracer` (Langfuse / OTel / stdout / null).
+        parent_span: Optional parent ``SpanCtx``. When ``None``, the
+            root span becomes a new top-level trace.
+        root_name: Name for the parent span that holds the stage
+            spans. Default ``"kb_search"``.
+
+    Returns:
+        The root :class:`SpanCtx` (already ended). Callers that need
+        to inspect the emitted spans for testing read this; the
+        normal case is fire-and-forget.
+    """
+    try:
+        root = tracer.start_span(
+            root_name,
+            attrs={
+                "stage_count": len(trace.stages),
+                "total_ms": trace.total_ms(),
+            },
+            parent=parent_span,
+        )
+        for stage in trace.stages:
+            attrs: dict[str, Any] = {
+                "duration_ms": stage.duration_ms,
+                "input_count": stage.input_count,
+                "output_count": stage.output_count,
+                **stage.details,
+            }
+            if stage.chunk_ids is not None:
+                attrs["chunk_count"] = len(stage.chunk_ids)
+                attrs["chunk_ids_preview"] = stage.chunk_ids[:10]
+            child = tracer.start_span(stage.name, attrs=attrs, parent=root)
+            tracer.end_span(child, status="ok")
+        tracer.end_span(root, status="ok")
+        return root
+    except Exception:
+        # Tracer is unhealthy (Langfuse 5xx, network down, etc.).
+        # The retrieval itself already completed successfully; the
+        # missing trace export is operator-debuggable via the agent
+        # run's own logs.
+        return None

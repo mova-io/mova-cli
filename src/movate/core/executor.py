@@ -760,6 +760,11 @@ class Executor:
                     agent_name=bundle.spec.name,
                     storage=self._storage,
                     retrieval=bundle.spec.retrieval,
+                    # PR-V: skill emits retrieval stages as child
+                    # spans under the agent's run span. ``span`` is
+                    # the executor's per-run tracing context.
+                    tracer=self._tracer,
+                    parent_span=span,
                 )
                 try:
                     output = await dispatch_skill(skill, tool_input, ctx)
