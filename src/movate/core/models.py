@@ -1116,6 +1116,25 @@ class AgentSpec(BaseModel):
         ),
     )
 
+    grounding_enforcement: Literal["off", "warn", "strict"] = Field(
+        default="off",
+        description=(
+            "Post-execution grounding check mode for RAG agents. "
+            "Checks that the output's `grounded` flag is consistent with "
+            "the retrieved KB context, and that all `citations` indices are "
+            "valid.\n\n"
+            "* ``off`` (default) — no check; existing agents unaffected.\n"
+            "* ``warn`` — violations logged as tracer events; run succeeds.\n"
+            "* ``strict`` — a grounding violation raises a "
+            "``GroundingViolationError`` and the run status becomes "
+            "``safety_blocked``. Use for production RAG agents where "
+            "hallucinated answers are worse than a refusal.\n\n"
+            "Only meaningful for agents that use a `kb-vector-lookup` "
+            "skill or otherwise produce a `grounded` / `citations` output "
+            "field. Non-RAG agents should leave this ``off``."
+        ),
+    )
+
     @field_validator("name")
     @classmethod
     def _validate_name(cls, v: str) -> str:
@@ -1394,6 +1413,30 @@ class TenantBudget(BaseModel):
     updated_at: datetime = Field(default_factory=_now)
 
 
+class SkillCallRecord(BaseModel):
+    """One tool/skill invocation captured inside a run's tool-use loop.
+
+    Stored as a JSON array in ``RunRecord.skill_calls`` so ``mdk explain
+    --steps`` can render per-step breakdown without requiring a Langfuse
+    backend.  Optional — agents with no skills leave the list empty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: int
+    """1-based position in the tool-use loop (step 1 = first tool call)."""
+    skill: str
+    """Skill name as it appears in the agent's ``skills:`` list."""
+    input: dict[str, Any]
+    """The arguments the LLM passed to the tool call."""
+    output: dict[str, Any] | None = None
+    """The skill's return value on success."""
+    error: str | None = None
+    """Short error description when the skill raised a ``SkillError``."""
+    latency_ms: float = 0.0
+    """Wall-clock time from dispatch to result, in milliseconds."""
+
+
 class RunRecord(BaseModel):
     """Persisted record of an agent execution.
 
@@ -1427,6 +1470,15 @@ class RunRecord(BaseModel):
     :class:`ConversationThread` this run belongs to. Standalone runs leave
     this ``None``. The runtime joins on this column to fetch prior turns
     when rendering the next message's prompt."""
+    skill_calls: list[SkillCallRecord] = Field(
+        default_factory=list,
+        description=(
+            "Per-step skill/tool invocations captured during the tool-use loop. "
+            "Empty for single-shot agents (no skills). Populated by the executor "
+            "and persisted as a JSON blob so `mdk explain --steps` can render the "
+            "decision chain without a Langfuse backend."
+        ),
+    )
 
 
 class ConversationThread(BaseModel):
