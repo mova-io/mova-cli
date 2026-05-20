@@ -1,14 +1,15 @@
-"""``movate.memory`` — agent memory layer (Sprint T MVP).
+"""``movate.memory`` — agent memory layer.
 
-A :class:`MemoryStore` Protocol with three backends planned:
+A :class:`MemoryStore` Protocol with two shipped backends:
 
-* ``InMemoryStore`` (MVP, shipped)  — per-process dict; sufficient
-  for local dev + tests. Loses state on process exit.
-* ``SqliteStore`` (MVP scaffold)    — persistence across process
-  restarts. Returns ``NotImplementedError`` from the writes; the
-  shape is here so the Executor wiring can land first.
-* ``VectorStore``  (deferred)       — semantic recall via pgvector
-  / Azure AI Search. Sprint T+ once the SQLite backend is stable.
+* ``InMemoryStore`` (default) — JSON-file-backed, persists to
+  ``~/.movate/memory.json`` across process restarts. Thread-safe
+  via RLock + atomic temp-rename. Suitable for single-node use.
+* ``SqliteStore``              — aiosqlite-backed with WAL mode.
+  Enabled via ``MOVATE_MEMORY_BACKEND=sqlite``. Better concurrency
+  for multi-reader workloads; same Protocol surface as InMemoryStore.
+* ``VectorStore``  (deferred) — semantic recall via pgvector
+  / Azure AI Search. Follow-up once traffic patterns are clear.
 
 Public API:
 
