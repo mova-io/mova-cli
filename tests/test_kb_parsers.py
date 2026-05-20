@@ -105,7 +105,10 @@ def test_is_supported_extension_case_insensitive() -> None:
     assert is_supported_extension("doc.PDF")
     assert is_supported_extension("DOC.MD")
     assert is_supported_extension("doc.Markdown")
-    assert not is_supported_extension("doc.docx")
+    # Legacy binary .doc is NOT supported (python-docx rejects it);
+    # operators convert to .docx first. PR-L added .docx support
+    # — see test_kb_parsers_docx.py.
+    assert not is_supported_extension("legacy.doc")
     assert not is_supported_extension("noext")
     assert not is_supported_extension("")
 
@@ -118,7 +121,10 @@ def test_parse_document_routes_md_to_text() -> None:
 
 @pytest.mark.unit
 def test_parse_document_returns_none_for_unsupported() -> None:
-    assert parse_document("doc.docx", b"anything") is None
+    # .html / unknown extensions / extensionless / empty filenames.
+    # PR-L moved .docx into supported; test_kb_parsers_docx.py covers it.
+    assert parse_document("doc.html", b"anything") is None
+    assert parse_document("legacy.doc", b"anything") is None
     assert parse_document("noext", b"anything") is None
     assert parse_document("", b"anything") is None
 
@@ -245,7 +251,9 @@ def test_find_files_includes_pdf(tmp_path: object) -> None:
     (root / "a.md").write_text("md content")
     (root / "b.txt").write_text("txt content")
     (root / "c.pdf").write_bytes(_make_pdf_bytes("pdf content"))
-    (root / "skip.docx").write_bytes(b"docx bytes")
+    # Legacy .doc is not in the supported set (PR-L kept it out;
+    # python-docx rejects the binary format). .html is also TBD.
+    (root / "skip.html").write_text("html not supported")
 
     found = {p.name for p in find_files(root)}
     assert found == {"a.md", "b.txt", "c.pdf"}

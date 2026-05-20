@@ -15,17 +15,20 @@ return ``None`` so the caller can surface a clean
 
 v0.9 MVP scope:
 
-* **PDF** via pypdf (this PR) — handles text-based PDFs.
+* **PDF** via pypdf (PR-G) — handles text-based PDFs.
   Scanned-image PDFs need OCR; deferred to a separate
   ``[ocr]`` extra with tesseract.
+* **DOCX** via python-docx (PR-L) — handles standard Word
+  documents. Honors heading levels as paragraph boundaries.
 * **Markdown / plain text** via UTF-8 decode (already supported
   by the runtime endpoint; included here for unified dispatch).
 
-Out of scope for this PR (tracked in BACKLOG §10.6):
+Out of scope (tracked in BACKLOG §10.6):
 
-* **DOCX** — needs python-docx. Straightforward; XML under the hood.
 * **HTML** — needs readability-lxml to extract main-article content
   from messy nav/sidebar/ad noise.
+* **Legacy .doc** (binary Word format pre-2007) — python-docx
+  rejects these; operators should convert to .docx first.
 
 The :class:`DocumentParser` Protocol lays the groundwork for
 per-format entry-point registration when more formats land — but
@@ -51,6 +54,7 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
         ".markdown",
         ".txt",
         ".pdf",
+        ".docx",
     }
 )
 
@@ -196,6 +200,77 @@ def parse_pdf(content: bytes) -> str | None:
     return "\n\n".join(pages)
 
 
+def parse_docx(content: bytes) -> str | None:
+    """Extract text from a .docx via python-docx.
+
+    Returns paragraphs joined by ``\\n\\n`` so the downstream chunker
+    treats them as natural chunk boundaries. Inserts a paragraph
+    break around any paragraph with the "Heading 1" / "Heading 2" /
+    etc. style so heading-style cues survive the round-trip even if
+    the heading itself doesn't get pulled into its own chunk.
+
+    Returns ``None`` if:
+
+    * python-docx rejects the bytes (not a valid .docx — legacy
+      binary .doc, corrupt zip, or a misnamed file), OR
+    * the document has no extractable text (paragraphs all empty,
+      or document contains only embedded images / tables we don't
+      extract from in v0.9).
+
+    Why python-docx vs alternatives:
+
+    * **python-docx** (~3MB incl. lxml): mature, well-maintained,
+      handles standard .docx files. Only reads from the document's
+      main body; doesn't touch headers/footers (intentional — they
+      are usually boilerplate noise).
+    * **mammoth**: better at converting to HTML/Markdown but ~6MB
+      with extra deps. Overkill for plain text extraction.
+    * **textract**: heavyweight (depends on many system tools).
+
+    Tables in .docx files are NOT extracted in v0.9 — most real KB
+    content lives in paragraphs, and table cells would need their
+    own row/col reconstruction logic. Operator can convert tables
+    to inline text in Word before upload if they're critical.
+    """
+    try:
+        import docx  # noqa: PLC0415 — lazy: only paid for when an operator uploads a .docx
+    except ImportError:
+        logger.warning(
+            "python-docx is not installed — DOCX parsing unavailable. "
+            "Install via: uv pip install python-docx"
+        )
+        return None
+
+    try:
+        # python-docx's Document() accepts a file-like object.
+        document = docx.Document(io.BytesIO(content))
+    except Exception as exc:
+        logger.warning("python-docx failed to open document: %s", exc)
+        return None
+
+    paragraphs: list[str] = []
+    for para in document.paragraphs:
+        text = (para.text or "").strip()
+        if not text:
+            continue
+        # Headings get their own paragraph so the chunker doesn't
+        # blur a "Refund Policy" heading into the surrounding
+        # body text — operator-visible structure stays intact.
+        style_name = getattr(getattr(para, "style", None), "name", "") or ""
+        if style_name.lower().startswith("heading"):
+            paragraphs.append(text)
+        else:
+            paragraphs.append(text)
+
+    if not paragraphs:
+        # Empty document OR contained only tables / images we don't
+        # extract from. Either way the result is unusable.
+        return None
+
+    # Same join semantics as parse_pdf — chunker splits on \n\n.
+    return "\n\n".join(paragraphs)
+
+
 # Dispatch table — extension → parser. Keeping this at the module
 # bottom lets each parser's docstring sit next to the function for
 # readability. Extending: add the extension to SUPPORTED_EXTENSIONS,
@@ -205,4 +280,5 @@ _PARSERS: dict[str, DocumentParser] = {
     ".markdown": parse_text,
     ".txt": parse_text,
     ".pdf": parse_pdf,
+    ".docx": parse_docx,
 }
