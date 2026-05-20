@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.45"
+version = "0.8.2.46"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -75,6 +75,18 @@ cross-encoder = [
     # the default cross-encoder/ms-marco-MiniLM-L-6-v2). Opt-in only
     # so the vast majority of operators don't pay the disk/memory cost.
     "sentence-transformers>=2.7,<4",
+]
+ocr = [
+    # OCR fallback for scanned-image PDFs (PR-CC). pdf2image wraps
+    # Poppler's pdftoppm renderer to rasterise pages at 200 DPI;
+    # pytesseract calls the system Tesseract binary to extract text.
+    # Both require external system dependencies:
+    #   - Poppler (e.g. `brew install poppler` / `apt-get install poppler-utils`)
+    #   - Tesseract (e.g. `brew install tesseract` / `apt-get install tesseract-ocr`)
+    # Without the system binaries the Python packages install fine but
+    # fail at runtime; movate gracefully returns None and logs a warning.
+    "pdf2image>=1.17,<2",
+    "pytesseract>=0.3,<1",
 ]
 otel = [
     "opentelemetry-api>=1.25",

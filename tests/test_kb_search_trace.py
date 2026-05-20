@@ -236,8 +236,8 @@ async def test_search_trace_includes_rerank_stage_with_overlap(
             trace=trace,
         )
     names = [s.name for s in trace.stages]
-    assert "rerank" in names
-    rerank_stage = next(s for s in trace.stages if s.name == "rerank")
+    assert "rerank[llm]" in names
+    rerank_stage = next(s for s in trace.stages if s.name == "rerank[llm]")
     assert rerank_stage.input_count > 0  # widened pool from rerank_candidate_multiplier
     assert rerank_stage.output_count == 3
     # Overlap metric is present and in [0, 1].

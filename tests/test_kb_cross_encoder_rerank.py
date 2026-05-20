@@ -266,7 +266,7 @@ async def test_search_dispatches_cross_encoder_rerank() -> None:
 
     with (
         patch.object(search_mod, "embed_texts", _fake_embed),
-        patch("movate.kb.search.cross_encoder_rerank", _fake_ce_rerank),
+        patch("movate.kb.rerank.cross_encoder_rerank", _fake_ce_rerank),
     ):
         await search_mod.search(
             storage=storage,
