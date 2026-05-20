@@ -45,9 +45,29 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import re
 from typing import NamedTuple, Protocol
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# OCR tunables — can be overridden at process level for non-default setups.
+# ---------------------------------------------------------------------------
+
+# DPI for PDF→image rasterisation. 300 is the ISO-recommended minimum for
+# OCR; 200 DPI (the prior default) is too coarse for small fonts and
+# compressed scans. Higher DPI (400-600) improves accuracy on very small
+# text at the cost of memory + latency — 300 is the sweet spot for most
+# KB ingest workloads.
+_OCR_DPI: int = 300
+
+# Tesseract engine + page-segmentation mode:
+#   --oem 1  → LSTM neural engine (default for Tesseract 4+; more accurate
+#              than legacy OCR engine)
+#   --psm 6  → Assume a single uniform block of text (appropriate for scanned
+#              pages that are mostly prose; use --psm 11 for sparse layouts)
+_OCR_CONFIG: str = "--oem 1 --psm 6"
 
 
 class ParseResult(NamedTuple):
@@ -178,12 +198,13 @@ def parse_pdf(content: bytes) -> ParseResult | None:
     * OCR is available but also produces no text.
 
     When the optional ``[ocr]`` extra IS installed (pdf2image +
-    pytesseract + system Tesseract binary), scanned-image PDFs are
-    handled transparently: pypdf's empty-page result triggers a
-    Poppler-based rasterisation step (200 DPI) followed by
-    Tesseract OCR per page. Callers see no difference — they just
-    get text back regardless of whether the PDF was text-based or
-    image-based.
+    pytesseract + system Tesseract binary), scanned-image pages are
+    handled transparently: for each page where pypdf returns no text,
+    a per-page Poppler rasterisation step (``_OCR_DPI`` DPI, default
+    300) is followed by Tesseract OCR. This enables **mixed PDFs**
+    where some pages are text-based and others are scanned images —
+    both contribute to the extracted corpus. Callers see no difference
+    — they just get text back regardless of PDF content type.
 
     Why pypdf vs alternatives:
 
@@ -220,6 +241,7 @@ def parse_pdf(content: bytes) -> ParseResult | None:
         return None
 
     pages: list[str] = []
+    ocr_used = False
     for page_num, page in enumerate(reader.pages):
         try:
             text = page.extract_text()
@@ -228,49 +250,59 @@ def parse_pdf(content: bytes) -> ParseResult | None:
             continue
         if text and text.strip():
             pages.append(text.strip())
+        else:
+            # Empty page — scanned image. Attempt per-page OCR so mixed
+            # PDFs (text pages interleaved with scanned pages) are handled
+            # correctly instead of silently dropping the scanned pages.
+            ocr_text = _ocr_pdf(content, page_num=page_num)
+            if ocr_text:
+                pages.append(ocr_text)
+                ocr_used = True
 
     if not pages:
-        # All-pages-empty = scanned-image PDF (pypdf can't extract text
-        # from rasterised content). Attempt OCR via the [ocr] extra
-        # (pdf2image + pytesseract). Falls back to None gracefully when
-        # the extra isn't installed — same behaviour as before PR-CC.
-        ocr_text = _ocr_pdf(content)
-        if ocr_text is None:
-            return None
-        return ParseResult(text=ocr_text, ocr_used=True)
+        return None
 
     # Join pages with the paragraph boundary the chunker uses so
     # natural page breaks become chunk breaks.
-    return ParseResult(text="\n\n".join(pages), ocr_used=False)
+    return ParseResult(text="\n\n".join(pages), ocr_used=ocr_used)
 
 
-def _ocr_pdf(content: bytes) -> str | None:
-    """OCR fallback for scanned-image PDFs (requires the ``[ocr]`` extra).
+def _ocr_pdf(content: bytes, *, page_num: int) -> str | None:
+    """OCR a single PDF page (0-based index) using pdf2image + pytesseract.
+
+    Called by :func:`parse_pdf` for every page that yields no text from
+    pypdf — this per-page design enables **mixed PDFs** (text and scanned
+    pages interleaved) rather than only handling fully-scanned documents.
 
     Pipeline:
 
-    1. **pdf2image** converts each PDF page to a PIL Image at 200 DPI
-       using Poppler's pdftoppm renderer (much more faithful than
-       pypdf's page-render path for scanned content).
-    2. **pytesseract** runs Tesseract OCR on each PIL Image and returns
-       the recognised unicode text.
+    1. **pdf2image** rasterises the requested page at ``_OCR_DPI`` DPI
+       (300 by default) using Poppler's pdftoppm renderer. Passing
+       ``first_page``/``last_page`` means only the target page is decoded,
+       which avoids re-rasterising the entire PDF for every empty page.
+    2. **pytesseract** runs Tesseract with ``_OCR_CONFIG``
+       (``--oem 1 --psm 6`` by default): LSTM engine + single-block
+       page-segmentation mode, which works well for dense prose pages.
+    3. Whitespace is normalised: runs of spaces/tabs are collapsed to a
+       single space, and three or more consecutive newlines are reduced
+       to two, preserving paragraph structure without noisy blank lines.
 
-    Returns the OCR'd text (pages joined by ``\\n\\n``) or ``None`` if:
+    Language is read from the ``MOVATE_OCR_LANG`` environment variable
+    (default ``"eng"``). Set it to a Tesseract language code (e.g.
+    ``"fra"`` for French, ``"deu"`` for German, ``"eng+fra"`` for
+    multilingual) before starting the ingest process.
+
+    Returns the normalised page text, or ``None`` if:
 
     * ``pdf2image`` or ``pytesseract`` are not installed (``[ocr]``
-      extra missing) — logs a DEBUG-level hint, returns ``None``
-      silently so the caller still gets a clean ``status="skipped"``.
-    * Poppler is not installed on the system (pdf2image depends on it)
-      — pdf2image raises an exception, logged at WARNING.
-    * Tesseract is not installed on the system — pytesseract raises
-      ``TesseractNotFoundError``, logged at WARNING.
-    * OCR succeeds but produces no extractable text (blank pages,
-      low-quality scans below Tesseract's confidence threshold).
+      extra missing) — logged at DEBUG so the import absence stays quiet.
+    * Poppler is not installed (pdf2image raises) — logged at WARNING.
+    * Tesseract is not installed or fails — logged at WARNING.
+    * OCR succeeds but produces only whitespace.
 
-    This function is intentionally synchronous — the caller
-    (``parse_pdf``) is also sync; operators who run large-batch
-    ingest via ``mdk kb ingest`` already off-load the whole ingest
-    call to a background thread or async executor at a higher level.
+    Intentionally synchronous — ``parse_pdf`` is also sync; large-batch
+    ingest callers off-load the whole parse call to a thread/executor
+    at a higher level.
     """
     try:
         import pdf2image  # type: ignore[import-not-found]  # noqa: PLC0415
@@ -283,26 +315,30 @@ def _ocr_pdf(content: bytes) -> str | None:
         return None
 
     try:
-        images = pdf2image.convert_from_bytes(content, dpi=200)
+        images = pdf2image.convert_from_bytes(
+            content,
+            dpi=_OCR_DPI,
+            first_page=page_num + 1,
+            last_page=page_num + 1,
+        )
     except Exception as exc:
-        logger.warning("pdf2image failed to rasterise PDF for OCR: %s", exc)
+        logger.warning("pdf2image failed to rasterise page %d for OCR: %s", page_num, exc)
         return None
 
-    pages: list[str] = []
-    for page_num, image in enumerate(images):
-        try:
-            ocr_text: str = pytesseract.image_to_string(image)
-        except Exception as exc:
-            logger.warning("tesseract OCR failed on page %d: %s; skipping page", page_num, exc)
-            continue
-        if ocr_text and ocr_text.strip():
-            pages.append(ocr_text.strip())
-
-    if not pages:
-        logger.warning("OCR produced no text from scanned PDF")
+    if not images:
         return None
 
-    return "\n\n".join(pages)
+    lang = os.environ.get("MOVATE_OCR_LANG", "eng")
+    try:
+        text: str = pytesseract.image_to_string(images[0], lang=lang, config=_OCR_CONFIG)
+    except Exception as exc:
+        logger.warning("tesseract OCR failed on page %d: %s", page_num, exc)
+        return None
+
+    # Normalise whitespace: collapse tab/space runs; trim excess blank lines.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() or None
 
 
 def parse_docx(content: bytes) -> ParseResult | None:
