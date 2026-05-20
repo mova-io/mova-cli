@@ -1178,6 +1178,23 @@ class PostgresProvider:
         )
         return [_row_to_run(r) for r in rows]
 
+    async def delete_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        # asyncpg returns a status string like ``DELETE 1`` /
+        # ``DELETE 0``; parse the trailing count for the bool.
+        # Tenant-scoped via the WHERE clause — cross-tenant deletes
+        # don't touch the row + return False.
+        status = await self._db.execute(
+            "DELETE FROM conversation_threads WHERE thread_id = $1 AND tenant_id = $2",
+            thread_id,
+            tenant_id,
+        )
+        return status.endswith(" 1") if isinstance(status, str) else False
+
 
 # ---------------------------------------------------------------------------
 # Row → model converters
