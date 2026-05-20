@@ -142,6 +142,7 @@ class Executor:
         history: list[Message] | None = None,
         tenant_id_override: str | None = None,
         skill_fixture: dict[str, Any] | None = None,
+        thread_id: str | None = None,
     ) -> RunResponse:
         """Execute one agent against one input.
 
@@ -563,6 +564,7 @@ class Executor:
                 chosen_provider=chosen_provider,
                 workflow_run_id=workflow_run_id,
                 node_id=node_id,
+                thread_id=thread_id,
             )
             self._tracer.end_span(span, status="ok")
             return response
@@ -1112,6 +1114,7 @@ class Executor:
         chosen_provider: str,
         workflow_run_id: str | None = None,
         node_id: str | None = None,
+        thread_id: str | None = None,
     ) -> None:
         record = RunRecord(
             run_id=run_id,
@@ -1132,6 +1135,7 @@ class Executor:
             metrics=response.metrics,
             workflow_run_id=workflow_run_id,
             node_id=node_id,
+            thread_id=thread_id,
         )
         await self._storage.save_run(record)
 

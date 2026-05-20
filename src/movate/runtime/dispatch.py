@@ -132,6 +132,11 @@ class WorkerDispatch:
                 request,
                 job_id=job.job_id,
                 tenant_id_override=job.tenant_id,
+                # Propagate the thread linkage onto the spawned run
+                # so multi-turn agents can later list this turn via
+                # list_runs_for_thread. ``None`` (the common case for
+                # standalone runs) is a no-op.
+                thread_id=job.thread_id,
             )
         except Exception as exc:
             # Executor is expected to swallow MovateError into a

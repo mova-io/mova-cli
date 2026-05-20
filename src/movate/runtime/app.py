@@ -88,6 +88,7 @@ from movate.runtime.schemas import (
     SkillCreatedView,
     ThreadCreateSubmission,
     ThreadListView,
+    ThreadMessageSubmission,
     ThreadView,
     WizardAgentSubmission,
 )
@@ -2596,6 +2597,75 @@ def build_app(
             )
             runs_view = [RunView.from_record(r) for r in run_records]
         return ThreadView.from_record(thread, runs=runs_view)
+
+    @v1.post(
+        "/threads/{thread_id}/messages",
+        response_model=RunAccepted,
+        status_code=202,
+        tags=["threads-v1"],
+    )
+    async def v1_thread_submit_message(
+        thread_id: str,
+        body: ThreadMessageSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> RunAccepted:
+        """Submit a new message in the context of an existing thread.
+
+        Equivalent to ``POST /run`` but with the resulting JobRecord
+        carrying the thread linkage. The worker propagates
+        ``job.thread_id`` onto the spawned RunRecord
+        (``dispatch.py``) so the run shows up in
+        ``GET /api/v1/threads/{id}``'s history.
+
+        Also refreshes the thread's ``updated_at`` so it floats to the
+        top of the operator's "recent conversations" list.
+
+        Returns ``202 Accepted`` with ``job_id`` — same polling
+        protocol as ``POST /run``. Clients poll ``/jobs/{id}`` until
+        terminal, then fetch the run via ``GET /runs/{id}`` OR
+        ``GET /api/v1/threads/{id}`` (the run now appears in the
+        thread's history once it lands).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — thread doesn't exist OR belongs to a different
+          tenant (the 404 NEVER leaks cross-tenant existence;
+          same contract as ``GET /api/v1/threads/{id}``)
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        # Tenant-scoped lookup — cross-tenant returns None → 404.
+        thread = await store.get_conversation_thread(thread_id, tenant_id=ctx.tenant_id)
+        if thread is None:
+            raise not_found("thread", thread_id)
+
+        # Queue the job with the thread linkage. Worker dispatch
+        # (``runtime/dispatch.py``) reads ``job.thread_id`` and passes
+        # it as ``thread_id`` to ``Executor.execute``, which stamps it
+        # onto the spawned RunRecord.
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.AGENT,
+            target=thread.agent,
+            status=JobStatus.QUEUED,
+            input=body.input,
+            api_key_id=ctx.api_key_id,
+            notify_email=body.notify_email,
+            thread_id=thread_id,
+        )
+        await store.save_job(job)
+
+        # Refresh the thread's updated_at so it floats to the top of
+        # the list view (sorted updated_at DESC). Preserves
+        # created_at + title; just stamps the activity timestamp.
+        refreshed = thread.model_copy(update={"updated_at": datetime.now(UTC)})
+        await store.save_conversation_thread(refreshed)
+
+        return RunAccepted(job_id=job.job_id, status=job.status)
 
     app.include_router(v1)
 
