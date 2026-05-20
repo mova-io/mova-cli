@@ -13,6 +13,7 @@ from typing import Any
 
 from movate.core.models import (
     ApiKeyRecord,
+    ConversationThread,
     EvalRecord,
     FailureRecord,
     FeedbackRecord,
@@ -52,6 +53,7 @@ class InMemoryStorage:
         self.tenant_budgets: dict[str, TenantBudget] = {}
         self.feedback: list[FeedbackRecord] = []
         self.kb_chunks: list[KbChunk] = []
+        self.conversation_threads: list[ConversationThread] = []
 
     async def init(self) -> None:
         return None
@@ -406,6 +408,62 @@ class InMemoryStorage:
             )
         ]
         return before - len(self.kb_chunks)
+
+    # ------------------------------------------------------------------
+    # Conversation threads (PR-N) — multi-turn agent foundation.
+    # ------------------------------------------------------------------
+
+    async def save_conversation_thread(self, thread: ConversationThread) -> None:
+        # In-memory upsert on thread_id — matches Postgres ON CONFLICT
+        # + sqlite INSERT OR REPLACE semantics.
+        self.conversation_threads = [
+            t for t in self.conversation_threads if t.thread_id != thread.thread_id
+        ]
+        self.conversation_threads.append(thread)
+
+    async def get_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> ConversationThread | None:
+        # Tenant-scoped — cross-tenant lookup returns None (mirrors
+        # the contract on every single-record getter).
+        for t in self.conversation_threads:
+            if t.thread_id == thread_id and t.tenant_id == tenant_id:
+                return t
+        return None
+
+    async def list_conversation_threads(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationThread]:
+        rows = [t for t in self.conversation_threads if t.tenant_id == tenant_id]
+        if agent is not None:
+            rows = [t for t in rows if t.agent == agent]
+        rows = sorted(rows, key=lambda t: t.updated_at, reverse=True)
+        return rows[: int(limit)]
+
+    async def list_runs_for_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[RunRecord]:
+        # Tenant-scoped: cross-tenant thread id returns [] rather than
+        # raising or leaking.
+        rows = [
+            r for r in self.runs if r.thread_id == thread_id and r.tenant_id == tenant_id
+        ]
+        # ASC by created_at — chronological order, earliest turn first,
+        # so the runtime can render conversation history without
+        # reversing.
+        rows = sorted(rows, key=lambda r: r.created_at)
+        return rows[: int(limit)]
 
     async def list_feedback(
         self,

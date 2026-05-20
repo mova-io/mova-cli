@@ -17,6 +17,7 @@ import aiosqlite
 from movate.core.models import (
     ApiKeyEnv,
     ApiKeyRecord,
+    ConversationThread,
     ErrorInfo,
     EvalRecord,
     FailureRecord,
@@ -264,6 +265,31 @@ _MIGRATIONS = [
     """,
     ("CREATE INDEX IF NOT EXISTS idx_kb_chunks_agent_tenant ON kb_chunks(agent, tenant_id)"),
     ("CREATE INDEX IF NOT EXISTS idx_kb_chunks_source ON kb_chunks(agent, tenant_id, source)"),
+    # 0.8.2.27 / PR-N: Conversation threads — group runs for multi-turn
+    # agents. Runs link via the new ``runs.thread_id`` column (added
+    # below). updated_at is refreshed on each appended message so
+    # clients can sort threads most-recently-active first.
+    """
+    CREATE TABLE IF NOT EXISTS conversation_threads (
+        thread_id   TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        agent       TEXT NOT NULL,
+        title       TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_threads_tenant_updated "
+        "ON conversation_threads(tenant_id, updated_at DESC)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_threads_agent_tenant "
+        "ON conversation_threads(agent, tenant_id)"
+    ),
+    # Per-run thread linkage. NULL = standalone (non-threaded) run.
+    "ALTER TABLE runs ADD COLUMN thread_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_runs_thread ON runs(thread_id, created_at)",
 ]
 
 
@@ -313,8 +339,8 @@ class SqliteProvider:
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                workflow_run_id, node_id, thread_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
@@ -334,6 +360,7 @@ class SqliteProvider:
                 run.created_at.isoformat(),
                 run.workflow_run_id,
                 run.node_id,
+                run.thread_id,
             ),
         )
         await self._db.commit()
@@ -1080,10 +1107,107 @@ class SqliteProvider:
             return 0.0
         return float(row["total"] or 0.0)
 
+    # ------------------------------------------------------------------
+    # Conversation threads (PR-N) — multi-turn agent foundation.
+    # ------------------------------------------------------------------
+
+    async def save_conversation_thread(self, thread: ConversationThread) -> None:
+        # Upsert on thread_id — INSERT OR REPLACE matches the
+        # Postgres ON CONFLICT semantics. Clients call this once at
+        # thread creation and again on every appended message to
+        # refresh updated_at.
+        await self._db.execute(
+            """
+            INSERT OR REPLACE INTO conversation_threads
+            (thread_id, tenant_id, agent, title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                thread.thread_id,
+                thread.tenant_id,
+                thread.agent,
+                thread.title,
+                thread.created_at.isoformat(),
+                thread.updated_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_conversation_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+    ) -> ConversationThread | None:
+        async with self._db.execute(
+            "SELECT * FROM conversation_threads WHERE thread_id = ? AND tenant_id = ?",
+            (thread_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return _row_to_thread(row)
+
+    async def list_conversation_threads(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[ConversationThread]:
+        clauses = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if agent is not None:
+            clauses.append("agent = ?")
+            params.append(agent)
+        sql = (
+            "SELECT * FROM conversation_threads WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY updated_at DESC LIMIT ?"
+        )
+        params.append(int(limit))
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_thread(r) for r in rows]
+
+    async def list_runs_for_thread(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[RunRecord]:
+        # Chronological order — earliest turn first — so the runtime
+        # renders conversation history straight from the list.
+        # Tenant-scoped via the WHERE clause (cross-tenant lookups
+        # return []).
+        async with self._db.execute(
+            """
+            SELECT * FROM runs
+            WHERE thread_id = ? AND tenant_id = ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (thread_id, tenant_id, int(limit)),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_run(r) for r in rows]
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+
+def _row_to_thread(row: aiosqlite.Row) -> ConversationThread:
+    return ConversationThread(
+        thread_id=row["thread_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        title=row["title"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
 
 
 def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
@@ -1126,6 +1250,7 @@ def _row_to_run(row: aiosqlite.Row) -> RunRecord:
         created_at=datetime.fromisoformat(row["created_at"]),
         workflow_run_id=row["workflow_run_id"] if "workflow_run_id" in keys else None,
         node_id=row["node_id"] if "node_id" in keys else None,
+        thread_id=row["thread_id"] if "thread_id" in keys else None,
     )
 
 
