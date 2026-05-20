@@ -24,6 +24,29 @@ from movate import __version__
 from movate.providers.pricing import load_pricing
 from movate.tracing import build_tracer
 
+
+def _ocr_install_hint(extra: str) -> str:
+    """Return the right install command for an OCR extra.
+
+    Two contexts:
+
+    * **Source-repo developer** (``pyproject.toml`` in cwd is movate-cli
+      itself) — ``uv add 'movate-cli[ocr]'`` fails with the self-dependency
+      error. Use ``uv sync --extra <extra>`` instead.
+    * **Operator project** (movate-cli installed as an external dep or tool)
+      — ``uv add 'movate-cli[<extra>]'`` is the right command.
+
+    Detection: look for a ``pyproject.toml`` in cwd that declares
+    ``name = "movate-cli"`` (the source repo's own manifest).
+    """
+    try:
+        toml_path = Path("pyproject.toml")
+        if toml_path.is_file() and 'name = "movate-cli"' in toml_path.read_text():
+            return f"uv sync --extra {extra}"
+    except OSError:
+        pass
+    return f"uv add 'movate-cli[{extra}]'"
+
 console = Console()
 
 _REQUIRED_DEPS = ("typer", "rich", "pydantic", "yaml", "jinja2", "litellm", "aiosqlite")
@@ -36,7 +59,9 @@ _OPTIONAL_DEPS = ("langfuse", "opentelemetry", "asyncpg", "fastapi")
 # and HTML ingest respectively. Operators without these see "missing" but
 # the core agent runtime still works — they just can't run mdk kb ingest.
 _KB_DEPS: tuple[tuple[str, str], ...] = (
-    # (probe_module, display_name) — display_name used as the "dep: X" label.
+    # (probe_module, display_name) — display_name used as the "kb: X" label.
+    # These are CORE deps (always installed with movate-cli). If they show as
+    # missing the install is broken — the fix is a full reinstall, not an extra.
     ("pypdf", "pypdf"),
     ("docx", "python-docx"),
     ("bs4", "beautifulsoup4"),
@@ -59,19 +84,20 @@ _OCR_DEPS: tuple[tuple[str, str, str], ...] = (
     # Pillow — decodes PNG/JPG/TIFF/BMP → PIL.Image before OCR.
     # Required for standalone image KB files; also used inside the PDF OCR
     # path once pdf2image rasterizes a page.
-    ("PIL", "pillow", "uv add 'movate-cli[ocr]'"),
+    # Install hint is resolved at runtime by _ocr_install_hint() so it shows
+    # the right command whether you're inside the source repo or an operator
+    # project (uv sync --extra vs uv add 'movate-cli[...]').
+    ("PIL", "pillow", "ocr"),
     # pdf2image — wraps Poppler's `pdftoppm` to rasterize PDF pages.
-    # Required only for scanned / mixed PDFs (text PDFs are parsed
-    # directly by pypdf without OCR).
-    ("pdf2image", "pdf2image", "uv add 'movate-cli[ocr]'"),
+    # Required only for scanned / mixed PDFs (text PDFs parsed by pypdf).
+    ("pdf2image", "pdf2image", "ocr"),
     # pytesseract — thin Python wrapper around the Tesseract binary.
     # `MOVATE_OCR_BACKEND=tesseract` (the default) uses this path.
-    ("pytesseract", "pytesseract", "uv add 'movate-cli[ocr]'"),
+    ("pytesseract", "pytesseract", "ocr"),
     # EasyOCR — pure-Python OCR (torch-based); no system binary needed.
-    # `MOVATE_OCR_BACKEND=easyocr` uses this path. Better than Tesseract
-    # on noisy scans, handwriting, and non-Latin scripts. GPU-optional
-    # (MOVATE_EASYOCR_GPU=1). Apache-2.0 licensed.
-    ("easyocr", "easyocr", "uv add 'movate-cli[easyocr]'"),
+    # `MOVATE_OCR_BACKEND=easyocr` uses this path. Better on noisy scans,
+    # handwriting, and non-Latin scripts. GPU-optional (MOVATE_EASYOCR_GPU=1).
+    ("easyocr", "easyocr", "easyocr"),
 )
 
 # SPDX license per dep. Curated by hand because Python package metadata
@@ -292,11 +318,14 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     _add("", "", "", "")
 
     # KB parsing deps — PDF, DOCX, HTML ingest for `mdk kb ingest`.
+    # These are CORE deps (always installed); missing = broken install.
     # Probe by the importable module name; display uses the canonical
-    # PyPI package name so operators know exactly what to `uv add`.
+    # PyPI package name for recognition.
     for probe_mod, display_name in _KB_DEPS:
         spec = importlib.util.find_spec(probe_mod)
-        status = _ok("") if spec else _missing(f"uv add '{display_name}'")
+        # Core deps: missing means the whole install is broken, not just
+        # one extra. Point at a full reinstall rather than a specific package.
+        status = _ok("") if spec else _missing("reinstall: uv tool install movate-cli --force")
         purpose = _DEP_PURPOSE.get(display_name, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(display_name, "[yellow]?[/yellow]")
         _add(f"kb: {display_name}", status, purpose, license_str)
@@ -315,9 +344,12 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     #
     # All paths converge at movate.kb.parsers; install whichever combo
     # matches your document mix. Full pipeline: all four + tesseract binary.
-    for probe_mod, display_name, install_hint in _OCR_DEPS:
+    for probe_mod, display_name, extra_name in _OCR_DEPS:
         spec = importlib.util.find_spec(probe_mod)
-        status = _ok("") if spec else _missing(install_hint)
+        # _ocr_install_hint detects whether we're in the source repo (→ uv sync
+        # --extra) or an operator project (→ uv add 'movate-cli[extra]') so the
+        # fix command always works regardless of where `mdk doctor` is run from.
+        status = _ok("") if spec else _missing(_ocr_install_hint(extra_name))
         purpose = _DEP_PURPOSE.get(display_name, "[yellow]?[/yellow]")
         license_str = _DEP_LICENSES.get(display_name, "[yellow]?[/yellow]")
         _add(f"ocr: {display_name}", status, purpose, license_str)

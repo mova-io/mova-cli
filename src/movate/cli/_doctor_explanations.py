@@ -298,38 +298,43 @@ _STORAGE_AND_PROJECT_EXPLANATIONS: dict[str, CheckExplanation] = {
 
 _KB_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
     "pypdf": CheckExplanation(
-        what="KB dep — pypdf Python PDF parser.",
+        what="KB dep — pypdf Python PDF parser (core dep, always installed).",
         why=(
             "`mdk kb ingest` extracts text from machine-readable PDFs directly "
             "(no OCR needed). pypdf reads the PDF text layer and feeds it into "
             "the chunker + embedder pipeline. Fast, zero system deps."
         ),
         failure_impact=(
-            "Machine-readable PDFs are skipped at ingest time. Scanned PDFs "
-            "still work via the OCR path (pdf2image + pytesseract/easyocr), "
-            "but text-layer PDFs lose their content."
+            "Machine-readable PDFs are skipped at ingest time. If this shows "
+            "missing the movate-cli install is broken — run a full reinstall."
         ),
-        fix="uv add 'movate-cli[kb]'",
+        fix="uv tool install movate-cli --force   # or: uv sync (dev repo)",
     ),
     "python-docx": CheckExplanation(
-        what="KB dep — python-docx DOCX parser.",
+        what="KB dep — python-docx DOCX parser (core dep, always installed).",
         why=(
             "`mdk kb ingest` extracts text from Word documents (.docx). "
             "Reads paragraphs, headers, and table cells. Common format for "
             "HR policies, SOPs, and compliance docs."
         ),
-        failure_impact="`.docx` files are skipped at ingest time. PDF/MD/HTML paths unaffected.",
-        fix="uv add 'movate-cli[kb]'",
+        failure_impact=(
+            "`.docx` files are skipped at ingest time. If missing, "
+            "the install is broken — run a full reinstall."
+        ),
+        fix="uv tool install movate-cli --force   # or: uv sync (dev repo)",
     ),
     "beautifulsoup4": CheckExplanation(
-        what="KB dep — BeautifulSoup4 HTML parser.",
+        what="KB dep — BeautifulSoup4 HTML parser (core dep, always installed).",
         why=(
             "`mdk kb ingest` extracts text from `.html` files (knowledge bases "
             "exported from Confluence, Notion, Zendesk, etc.). BS4 strips nav, "
             "scripts, and boilerplate; `readability-lxml` cleans article body."
         ),
-        failure_impact="`.html` files are skipped at ingest time. PDF/MD/DOCX paths unaffected.",
-        fix="uv add 'movate-cli[kb]'",
+        failure_impact=(
+            "`.html` files are skipped at ingest time. If missing, "
+            "the install is broken — run a full reinstall."
+        ),
+        fix="uv tool install movate-cli --force   # or: uv sync (dev repo)",
     ),
 }
 
@@ -361,7 +366,7 @@ _OCR_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
             "'unsupported extension' warning. PDF OCR path also breaks "
             "(pdf2image returns PIL images; they can't be decoded further)."
         ),
-        fix="uv add 'movate-cli[ocr]'",
+        fix="uv sync --extra ocr   # dev repo\nuv add 'movate-cli[ocr]'  # operator project",
     ),
     "pdf2image": CheckExplanation(
         what="OCR dep — pdf2image (Poppler wrapper).",
@@ -375,7 +380,7 @@ _OCR_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
             "Scanned / image-only PDFs silently fall back to empty text at "
             "ingest time. Machine-readable PDFs (text layer) unaffected."
         ),
-        fix="uv add 'movate-cli[ocr]'  # then: brew install poppler  /  apt-get install poppler-utils",
+        fix="uv sync --extra ocr   # dev repo\nuv add 'movate-cli[ocr]'  # operator project\nthen: brew install poppler  /  apt-get install poppler-utils",
     ),
     "pytesseract": CheckExplanation(
         what="OCR dep — pytesseract (Tesseract Python wrapper).",
@@ -390,7 +395,7 @@ _OCR_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
             "scanned PDFs and image files. Switch to EasyOCR "
             "(`MOVATE_OCR_BACKEND=easyocr`) as a drop-in alternative."
         ),
-        fix="uv add 'movate-cli[ocr]'  # also needs: brew install tesseract  /  apt-get install tesseract-ocr",
+        fix="uv sync --extra ocr   # dev repo\nuv add 'movate-cli[ocr]'  # operator project\nthen: brew install tesseract  /  apt-get install tesseract-ocr",
     ),
     "tesseract": CheckExplanation(
         what="OCR dep — Tesseract system binary (NOT a Python package).",
@@ -422,7 +427,7 @@ _OCR_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
             "Falls back gracefully to `None` (skips the file) rather than "
             "crashing the ingest run. Tesseract backend unaffected."
         ),
-        fix="uv add 'movate-cli[easyocr]'",
+        fix="uv sync --extra easyocr   # dev repo\nuv add 'movate-cli[easyocr]'  # operator project",
     ),
 }
 
