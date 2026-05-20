@@ -44,6 +44,7 @@ from movate.core.models import (
     RunRecord,
     RunRequest,
     RunResponse,
+    SkillCallRecord,
     TokenUsage,
 )
 from movate.core.reflection import build_revision_prompt, call_judge
@@ -350,6 +351,8 @@ class Executor:
             # so existing budget enforcement covers skills without
             # extra plumbing. ADR 002 — cost participates in budget.
             skill_cost_usd = 0.0
+            # Per-step skill call records threaded back from the loop.
+            skill_calls: list[SkillCallRecord] = []
             # Pre-compute tool specs from the agent's resolved skills.
             # Empty list = no tool-use loop, single-shot path runs
             # identically to v0.5. The provider's to_tool_spec
@@ -373,6 +376,7 @@ class Executor:
                     (
                         completion,
                         skill_cost_usd,
+                        skill_calls,
                     ) = await self._run_with_tool_use(
                         provider_for_run=provider_for_run,
                         bundle=bundle,
@@ -500,6 +504,40 @@ class Executor:
             except JsonSchemaError as exc:
                 raise SchemaError(f"model output failed schema: {exc.message}") from exc
 
+            # Grounding check (M2 gap closure). Runs after schema
+            # validation so we know the output shape is correct. Only
+            # meaningful for RAG agents with grounding_enforcement != "off".
+            # ``warn`` logs events without blocking; ``strict`` raises
+            # GroundingViolationError which the outer try/except converts
+            # to safety_blocked. Imported locally to avoid circular imports
+            # (grounding.py only imports from stdlib + core.models).
+            _grounding_mode = spec.grounding_enforcement
+            if _grounding_mode != "off":
+                from movate.core.grounding import (  # noqa: PLC0415
+                    check_grounding,
+                    kb_call_count_from_records,
+                )
+
+                _kb_calls = kb_call_count_from_records(skill_calls)
+                _g_report = check_grounding(
+                    output,
+                    kb_call_count=_kb_calls,
+                    enforcement=_grounding_mode,
+                )
+                if not _g_report.ok:
+                    # warn mode: log each violation as a tracer event,
+                    # then continue. strict mode already raised above.
+                    for _v in _g_report.violations:
+                        log.warning("grounding violation [%s]: %s", _v.code, _v.message)
+                        self._tracer.log_event(
+                            span,
+                            {
+                                "grounding_violation": _v.code,
+                                "message": _v.message,
+                                "enforcement": _grounding_mode,
+                            },
+                        )
+
             # Reflection loop (Phase J-1). When the agent's
             # ``reflection.enabled`` is true, run the output through a
             # judge. On a ``revise`` verdict, re-prompt the same
@@ -565,6 +603,7 @@ class Executor:
                 workflow_run_id=workflow_run_id,
                 node_id=node_id,
                 thread_id=thread_id,
+                skill_calls=skill_calls,
             )
             self._tracer.end_span(span, status="ok")
             return response
@@ -604,10 +643,10 @@ class Executor:
         run_id: str,
         tenant_id: str,
         skill_fixture: dict[str, Any] | None = None,
-    ) -> tuple[CompletionResponse, float]:
+    ) -> tuple[CompletionResponse, float, list[SkillCallRecord]]:
         """Drive the tool-use loop for one provider in the fallback chain.
 
-        Returns ``(final_completion, accumulated_skill_cost_usd)``. The
+        Returns ``(final_completion, accumulated_skill_cost_usd, skill_calls)``. The
         final completion has ``kind == "final"`` and its ``text`` is
         the model's answer; its ``tokens`` field is the SUM across
         every turn the loop took, so downstream cost accounting reads
@@ -660,6 +699,7 @@ class Executor:
         accumulated_skill_cost = 0.0
         turns_taken = 0
         agent_call_ms = bundle.spec.timeouts.call_ms
+        skill_call_records: list[SkillCallRecord] = []
 
         while True:
             req = CompletionRequest(
@@ -694,6 +734,7 @@ class Executor:
                         update={"tokens": accumulated_tokens, "raw": accumulated_raw},
                     ),
                     accumulated_skill_cost,
+                    skill_call_records,
                 )
 
             # Tool-use turn. Resolve, dispatch, append to history.
@@ -718,7 +759,7 @@ class Executor:
                         "raw": accumulated_raw,
                     },
                 )
-                return final, accumulated_skill_cost
+                return final, accumulated_skill_cost, skill_call_records
 
             tool_name = completion.tool_name
             tool_id = completion.tool_id
@@ -766,8 +807,10 @@ class Executor:
                     tracer=self._tracer,
                     parent_span=span,
                 )
+                _skill_t0 = time.monotonic()
                 try:
                     output = await dispatch_skill(skill, tool_input, ctx)
+                    _skill_latency_ms = (time.monotonic() - _skill_t0) * 1000
                     tool_result_content = json.dumps(output)
                     # Add this skill's cost to the run total.
                     accumulated_skill_cost += skill.spec.cost.per_call_usd
@@ -779,7 +822,17 @@ class Executor:
                             "turn": turns_taken,
                         },
                     )
+                    skill_call_records.append(
+                        SkillCallRecord(
+                            step=turns_taken,
+                            skill=tool_name,
+                            input=tool_input,
+                            output=output,
+                            latency_ms=round(_skill_latency_ms, 1),
+                        )
+                    )
                 except SkillError as exc:
+                    _skill_latency_ms = (time.monotonic() - _skill_t0) * 1000
                     tool_result_content = json.dumps(
                         {"error": exc.type.value, "message": exc.message}
                     )
@@ -790,6 +843,15 @@ class Executor:
                             "skill_error_type": exc.type.value,
                             "turn": turns_taken,
                         },
+                    )
+                    skill_call_records.append(
+                        SkillCallRecord(
+                            step=turns_taken,
+                            skill=tool_name,
+                            input=tool_input,
+                            error=f"{exc.type.value}: {exc.message}",
+                            latency_ms=round(_skill_latency_ms, 1),
+                        )
                     )
 
             # Append assistant's tool_use turn + the matching tool
@@ -1120,6 +1182,7 @@ class Executor:
         workflow_run_id: str | None = None,
         node_id: str | None = None,
         thread_id: str | None = None,
+        skill_calls: list[SkillCallRecord] | None = None,
     ) -> None:
         record = RunRecord(
             run_id=run_id,
@@ -1141,6 +1204,7 @@ class Executor:
             workflow_run_id=workflow_run_id,
             node_id=node_id,
             thread_id=thread_id,
+            skill_calls=skill_calls or [],
         )
         await self._storage.save_run(record)
 
@@ -1156,7 +1220,8 @@ class Executor:
         err: MovateError,
     ) -> RunResponse:
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        status = "safety_blocked" if err.failure_type.value == "content_filter" else "error"
+        _safety_types = {"content_filter", "grounding_violation"}
+        status = "safety_blocked" if err.failure_type.value in _safety_types else "error"
         info = ErrorInfo(type=err.failure_type.value, message=str(err), retryable=err.retryable)
         self._tracer.log_event(span, {"error": info.model_dump()})
         self._tracer.end_span(span, status="error")

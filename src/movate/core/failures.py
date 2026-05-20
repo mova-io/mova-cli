@@ -23,6 +23,7 @@ class FailureType(StrEnum):
     POLICY_VIOLATION = "policy_violation"
     TENANT_BUDGET_EXCEEDED = "tenant_budget_exceeded"
     GUARDRAIL_VIOLATION = "guardrail_violation"
+    GROUNDING_VIOLATION = "grounding_violation"
 
 
 @dataclass(frozen=True)
@@ -175,4 +176,26 @@ class GuardrailViolationError(MovateError):
     """
 
     failure_type = FailureType.GUARDRAIL_VIOLATION
+    retryable = False
+
+
+class GroundingViolationError(MovateError):
+    """The agent's output failed the runtime grounding check.
+
+    Raised when ``grounding_enforcement: strict`` is set in agent.yaml and
+    the post-execution grounding check detects an inconsistency (e.g.
+    ``grounded=true`` with no citations, out-of-range citation indices, or
+    claiming KB-grounded answers without ever calling the KB skill).
+
+    The executor converts this to a ``safety_blocked`` run status — the
+    same semantic as a content-filter block. Retrying the same input with
+    the same KB context would produce the same violation, so ``retryable``
+    is false.
+
+    Use ``grounding_enforcement: warn`` during development to see the
+    violations without blocking runs; switch to ``strict`` in production
+    once the agent reliably self-reports grounding correctly.
+    """
+
+    failure_type = FailureType.GROUNDING_VIOLATION
     retryable = False

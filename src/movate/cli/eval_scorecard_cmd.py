@@ -473,6 +473,8 @@ def _color_for_overall(overall: float) -> str:
 # imported into local scope.
 _GREEN_THRESHOLD = 0.8
 _YELLOW_THRESHOLD = 0.6
+# Delta threshold below which two variant scores are considered a tie.
+_VARIANT_TIE_THRESHOLD = 0.01
 
 
 def _format_live_stats(
@@ -548,6 +550,7 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
     remote_client: Any = None,
     pre_generated_entries: list[dict[str, Any]] | None = None,
     runs_per_case: int = 1,
+    model_override: Any = None,
 ) -> ScorecardSummary:
     """End-to-end: generate cases, run agent, score, aggregate.
 
@@ -738,7 +741,7 @@ async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; 
             for run_idx in range(1, n_runs + 1):
                 t0 = time.perf_counter()
                 request = RunRequest(agent=bundle.spec.name, input=input_data)
-                response = await executor.execute(bundle, request)
+                response = await executor.execute(bundle, request, model_override=model_override)
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 # Cost lives at ``response.metrics.cost_usd`` — NOT at
                 # ``response.cost_usd`` (RunResponse has ``extra="forbid"``,
@@ -1508,12 +1511,18 @@ async def _run_scorecard_single_async(
     remote_api_key: str | None = None,
     pre_generated_entries: list[dict[str, Any]] | None = None,
     runs_per_case: int = 1,
+    model_override: Any = None,
 ) -> ScorecardSummary:
     """Async core of the single-agent path — preflight + scorecard
     run in one event loop. See :func:`_run_scorecard_sweep_async`
     for the LiteLLM ``LoggingWorker`` rationale; the bug surfaces
     identically here when the preflight + scorecard each get their
     own ``asyncio.run``.
+
+    ``model_override`` (optional) swaps the agent's declared model for
+    every executor.execute() call in the scoring loop. Used by the
+    A/B variant path to run the same generated cases against a challenger
+    model without changing the bundle spec.
     """
     # Resolve + preflight with auto-retry. The single-agent path uses
     # the same helper as ``--all``; we just feed it a one-entry map.
@@ -1543,6 +1552,7 @@ async def _run_scorecard_single_async(
             remote_client=remote_client,
             pre_generated_entries=pre_generated_entries,
             runs_per_case=runs_per_case,
+            model_override=model_override,
         )
     finally:
         if remote_client is not None:
@@ -1926,6 +1936,20 @@ def eval_scorecard(
             "(N=5 = 5x agent + 5x judge calls per case)."
         ),
     ),
+    variant: str | None = typer.Option(
+        None,
+        "--variant",
+        help=(
+            "A/B comparison mode: run the SAME generated cases against a second "
+            "model and show a side-by-side comparison table. Pass the model "
+            "string for the challenger (e.g. [bold]anthropic/claude-3-5-haiku-20241022[/bold]). "
+            "The baseline is the agent's declared model; the variant is the "
+            "challenger. Cases are generated ONCE and reused for both runs so "
+            "the comparison is apples-to-apples. Gates still apply to the "
+            "baseline run only. Incompatible with [bold]--all[/bold] "
+            "(run per-agent instead and compare the resulting tables)."
+        ),
+    ),
 ) -> None:
     """Generate test cases on the fly and score against a 10-category scorecard.
 
@@ -2048,6 +2072,16 @@ def eval_scorecard(
             f"({remote_url}). LLM judge still runs locally.[/dim]"
         )
 
+    # --variant + --all is unsupported — the comparison table only makes
+    # sense for a single agent. Operators wanting multi-agent variant
+    # comparisons run two separate --all sweeps and diff the JSON outputs.
+    if variant is not None and all_in_project:
+        err_console.print(
+            "[red]✗[/red] [bold]--variant[/bold] is incompatible with [bold]--all[/bold]. "
+            "Run a single agent with --variant, or two separate --all sweeps and diff the JSON."
+        )
+        raise typer.Exit(code=2)
+
     if all_in_project:
         _run_scorecard_all_in_project(
             count=count,
@@ -2092,6 +2126,7 @@ def eval_scorecard(
         remote_api_key=remote_api_key,
         target_name=target_name,
         runs_per_case=runs_per_case,
+        variant=variant,
     )
 
 
@@ -2114,6 +2149,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     target_name: str | None = None,
     pre_generated_entries: list[dict[str, Any]] | None = None,
     runs_per_case: int = 1,
+    variant: str | None = None,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
@@ -2181,6 +2217,55 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             runs_per_case=runs_per_case,
         )
     )
+
+    # A/B variant: run the SAME cases against the challenger model and
+    # show a comparison table. Cases are reconstructed from the baseline
+    # summary's CaseScore.input so we don't re-generate (apples-to-apples).
+    if variant is not None:
+        from movate.core.models import ModelConfig  # noqa: PLC0415
+
+        n_cases = len(summary.cases)
+        console.print(
+            f"[dim]Running variant [bold]{variant}[/bold] "
+            f"on the same {n_cases} case(s)…[/dim]"
+        )
+        # Reconstruct pre_generated_entries from the baseline cases so
+        # both scorecards see exactly the same inputs.
+        variant_entries = [
+            {"input": case.input, "expected": case.output or {}} for case in summary.cases
+        ]
+        # ModelConfig only needs `provider` for the override path;
+        # params default to the agent's declared params.
+        variant_model_override = ModelConfig(provider=variant)
+        reset_logging_worker_for_new_event_loop()
+        variant_summary = asyncio.run(
+            _run_scorecard_single_async(
+                bundle,
+                count=count,
+                mix=mix,
+                mock=mock,
+                judge_model=judge_model,
+                generator_model=generator_model,
+                project_root=project_root,
+                effective=effective,
+                remote_url=remote_url,
+                remote_api_key=remote_api_key,
+                pre_generated_entries=variant_entries,
+                runs_per_case=runs_per_case,
+                model_override=variant_model_override,
+            )
+        )
+        # Render both individual scorecards then the side-by-side table.
+        _render_scorecard(summary)
+        console.print()
+        _render_scorecard(variant_summary)
+        _render_variant_comparison(
+            summary,
+            variant_summary,
+            baseline_label=bundle.spec.model.provider,
+            variant_label=variant,
+        )
+        return
 
     gate_failures = gates.check(summary)
 
@@ -2715,3 +2800,102 @@ def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state mach
         _write_output_baseline(output_baseline, all_payload)
     if failed or agents_failing_gate or agents_with_regressions:
         raise typer.Exit(code=2)
+
+
+# ---------------------------------------------------------------------------
+# A/B variant comparison renderer
+# ---------------------------------------------------------------------------
+
+
+def _render_variant_comparison(
+    baseline: ScorecardSummary,
+    challenger: ScorecardSummary,
+    *,
+    baseline_label: str,
+    variant_label: str,
+) -> None:
+    """Render a side-by-side A/B comparison table for two ScorecardSummary objects.
+
+    Called when ``--variant`` is set in ``eval_scorecard``. Shows per-category
+    means for both variants + a delta column (challenger - baseline) color-coded
+    green for improvements, red for regressions, dim for negligible changes.
+
+    The "winner" for each row is highlighted bold. The overall row is treated
+    as the primary verdict.
+    """
+    console.print()
+    console.print(
+        f"[bold]A/B comparison[/bold]  "
+        f"[cyan]{baseline.agent}[/cyan]  "
+        f"[dim]({baseline.count} cases, mix={baseline.mix})[/dim]"
+    )
+    console.print(
+        f"  [bold]A[/bold] baseline: [bold]{baseline_label}[/bold]   "
+        f"[bold]B[/bold] variant:  [bold]{variant_label}[/bold]"
+    )
+
+    table = Table(show_lines=False, header_style="bold")
+    table.add_column("category", style="bold")
+    table.add_column(f"A  {baseline_label[:20]}", justify="right")
+    table.add_column(f"B  {variant_label[:20]}", justify="right")
+    table.add_column("Δ  (B-A)", justify="right")
+    table.add_column("verdict", justify="center")
+
+    # Collect all categories from both summaries.
+    all_cats = list(dict.fromkeys(
+        list(baseline.category_means.keys()) + list(challenger.category_means.keys())
+    ))
+    for cat in all_cats:
+        a_score = baseline.category_means.get(cat, 0.0)
+        b_score = challenger.category_means.get(cat, 0.0)
+        delta = b_score - a_score
+
+        a_color = _score_color(a_score)
+        b_color = _score_color(b_score)
+        if abs(delta) < _VARIANT_TIE_THRESHOLD:
+            delta_str = "[dim]==[/dim]"
+            verdict = "[dim]tie[/dim]"
+        elif delta > 0:
+            delta_str = f"[green]+{delta:.3f}[/green]"
+            verdict = "[green]B wins[/green]"
+        else:
+            delta_str = f"[red]{delta:.3f}[/red]"
+            verdict = "[red]A wins[/red]"
+
+        table.add_row(
+            cat,
+            f"[{a_color}]{a_score:.3f}[/{a_color}]",
+            f"[{b_color}]{b_score:.3f}[/{b_color}]",
+            delta_str,
+            verdict,
+        )
+
+    # Overall row.
+    table.add_section()
+    a_ov = baseline.overall_mean
+    b_ov = challenger.overall_mean
+    dov = b_ov - a_ov
+    a_ov_color = _score_color(a_ov)
+    b_ov_color = _score_color(b_ov)
+    if abs(dov) < _VARIANT_TIE_THRESHOLD:
+        dov_str = "[dim]==[/dim]"
+        ov_verdict = "[dim]tie[/dim]"
+    elif dov > 0:
+        dov_str = f"[bold green]+{dov:.3f}[/bold green]"
+        ov_verdict = "[bold green]B wins[/bold green]"
+    else:
+        dov_str = f"[bold red]{dov:.3f}[/bold red]"
+        ov_verdict = "[bold red]A wins[/bold red]"
+    table.add_row(
+        "[bold]overall[/bold]",
+        f"[{a_ov_color}][bold]{a_ov:.3f}[/bold][/{a_ov_color}]",
+        f"[{b_ov_color}][bold]{b_ov:.3f}[/bold][/{b_ov_color}]",
+        dov_str,
+        ov_verdict,
+    )
+    console.print(table)
+    console.print(
+        "[dim]Δ = challenger - baseline. "
+        "Green = B improved. Red = B regressed. "
+        "Same cases were scored for both variants (apples-to-apples).[/dim]"
+    )

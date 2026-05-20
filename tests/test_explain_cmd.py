@@ -108,8 +108,8 @@ def test_explain_known_run_shows_decision_chain(monkeypatch: pytest.MonkeyPatch)
     assert "0.1.0" in result.stdout
     # Input section
     assert "What is the return policy" in result.stdout
-    # Step 1 LLM call
-    assert "Step 1" in result.stdout
+    # LLM call section
+    assert "LLM call" in result.stdout
     assert "gpt-4o-mini" in result.stdout
     assert "312" in result.stdout  # tokens_in
     assert "87" in result.stdout  # tokens_out

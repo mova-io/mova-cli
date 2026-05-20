@@ -1,10 +1,12 @@
 """``mdk explain <run-id>`` — decision chain visualization for a completed run.
 
 Renders the reasoning chain behind a run: input, each LLM call's metrics
-(tokens, latency, cost), output, and any error. When step-level tracing is
-available (``MOVATE_TRACER=langfuse``) this will reflect richer per-step
-data; in the current v0.8 storage schema (no ``trace_steps`` field on
-``RunRecord``) it renders the complete picture from what IS persisted.
+(tokens, latency, cost), output, and any error.  With ``--steps``, also
+renders the per-skill-call breakdown captured by the executor's tool-use
+loop — no Langfuse backend required.
+
+When a Langfuse tracer IS configured (``MOVATE_TRACER=langfuse``), the
+richer span tree is available via ``mdk trace`` instead.
 
 Exit codes:
     0 — record found and rendered.
@@ -19,18 +21,19 @@ from typing import Annotated, Any
 import typer
 from rich.console import Console
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
 from movate.cli._runtime import build_storage
-from movate.core.models import JobStatus, RunRecord
+from movate.core.models import JobStatus, RunRecord, SkillCallRecord
 
 console = Console()
 err = Console(stderr=True)
 
 _STEP_TRACER_HINT = (
-    "Step-level tracing not available for this run.\n"
-    "To capture per-step decisions, configure a tracer: "
-    "[bold]MOVATE_TRACER=langfuse[/bold]"
+    "For richer span-level traces configure: "
+    "[bold]MOVATE_TRACER=langfuse[/bold]  "
+    "(then use [bold]mdk trace[/bold])"
 )
 
 
@@ -52,6 +55,17 @@ def explain(
         bool,
         typer.Option("--json", help="Emit machine-readable JSON instead of the human view."),
     ] = False,
+    steps: Annotated[
+        bool,
+        typer.Option(
+            "--steps",
+            help=(
+                "Render per-skill-call breakdown from the executor's tool-use loop. "
+                "Shows each skill invoked, its input, output (truncated), and latency. "
+                "No Langfuse backend required — data is captured by the executor itself."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Render the decision chain behind a completed run.
 
@@ -59,19 +73,20 @@ def explain(
     the final output in the order the executor processed them. When the run
     failed, the error is shown instead of an output section.
 
-    Step-level skill traces (which tool was called, what it returned) require
-    ``MOVATE_TRACER=langfuse`` at run time; without it a summary note is
-    printed.
+    Add ``--steps`` to also see each skill/tool call made during the run:
+    which skill, what input the LLM passed, what it returned, and how long
+    it took.  No external tracing backend required.
 
     Examples::
 
         mdk explain abc123               # explain run abc123
         mdk explain --last               # explain the most-recent run
         mdk explain abc123 --json        # machine-readable JSON
+        mdk explain --last --steps       # include per-skill step breakdown
     """
     import asyncio  # noqa: PLC0415
 
-    asyncio.run(_cmd(run_id=run_id, last=last, as_json=as_json))
+    asyncio.run(_cmd(run_id=run_id, last=last, as_json=as_json, steps=steps))
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +94,7 @@ def explain(
 # ---------------------------------------------------------------------------
 
 
-async def _cmd(*, run_id: str | None, last: bool, as_json: bool) -> None:
+async def _cmd(*, run_id: str | None, last: bool, as_json: bool, steps: bool = False) -> None:
     storage = build_storage()
     await storage.init()
 
@@ -89,10 +104,10 @@ async def _cmd(*, run_id: str | None, last: bool, as_json: bool) -> None:
         raise typer.Exit(code=1)
 
     if as_json:
-        console.print_json(_to_json(record))
+        console.print_json(_to_json(record, steps=steps))
         return
 
-    _render_chain(record)
+    _render_chain(record, show_steps=steps)
 
 
 async def _resolve(storage: Any, *, run_id: str | None, last: bool) -> RunRecord | None:
@@ -107,7 +122,7 @@ async def _resolve(storage: Any, *, run_id: str | None, last: bool) -> RunRecord
 # ---------------------------------------------------------------------------
 
 
-def _to_json(record: RunRecord) -> str:
+def _to_json(record: RunRecord, *, steps: bool = False) -> str:
     """Machine-readable representation of the decision chain."""
     m = record.metrics
     chain: dict[str, Any] = {
@@ -126,8 +141,15 @@ def _to_json(record: RunRecord) -> str:
         },
         "output": record.output,
         "error": record.error.model_dump() if record.error else None,
-        "step_tracing": "unavailable — configure MOVATE_TRACER=langfuse for per-step traces",
     }
+    if steps:
+        chain["skill_calls"] = [s.model_dump() for s in (record.skill_calls or [])]
+    else:
+        chain["skill_calls_hint"] = (
+            f"{len(record.skill_calls)} skill call(s) — add --steps to include details"
+            if record.skill_calls
+            else "no skill calls (single-shot agent)"
+        )
     return json.dumps(chain, indent=2, default=str)
 
 
@@ -148,7 +170,7 @@ def _status_icon(status: str) -> str:
     return f"[yellow]{status}[/yellow]"
 
 
-def _render_chain(record: RunRecord) -> None:
+def _render_chain(record: RunRecord, *, show_steps: bool = False) -> None:
     """Render the full decision chain for *record* to stdout."""
     m = record.metrics
 
@@ -167,9 +189,22 @@ def _render_chain(record: RunRecord) -> None:
     console.print("[bold]Input[/bold]")
     _print_indented_json(record.input)
 
-    # ---- Step 1 — LLM call ----
+    # ---- Skill calls (tool-use loop steps) ----
+    skill_calls = record.skill_calls or []
+    if skill_calls and show_steps:
+        console.print()
+        console.print(f"[bold]Skill calls[/bold]  ({len(skill_calls)} step(s))")
+        _render_skill_calls(skill_calls)
+    elif skill_calls:
+        console.print()
+        console.print(
+            f"  [dim]{len(skill_calls)} skill call(s) captured — "
+            "add [bold]--steps[/bold] to see details[/dim]"
+        )
+
+    # ---- LLM call summary ----
     console.print()
-    console.print("[bold]Step 1 — LLM call[/bold]")
+    console.print("[bold]LLM call[/bold]")
     console.print(f"  [dim]Model:[/dim]   {m.provider or record.provider}")
 
     if m.tokens.input or m.tokens.output:
@@ -199,6 +234,47 @@ def _render_chain(record: RunRecord) -> None:
     # ---- Tracer hint ----
     console.print()
     console.print(f"[dim]{_STEP_TRACER_HINT}[/dim]")
+
+
+# Maximum characters to show for skill input/output in the step table.
+_STEP_PREVIEW_CHARS = 120
+
+
+def _render_skill_calls(calls: list[SkillCallRecord]) -> None:
+    """Render a Rich table of per-step skill invocations."""
+    table = Table(show_lines=True, expand=False)
+    table.add_column("step", justify="right", style="dim", no_wrap=True)
+    table.add_column("skill", style="bold cyan", no_wrap=True)
+    table.add_column("latency", justify="right", style="cyan", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("input → output", overflow="fold", max_width=70)
+
+    for call in calls:
+        if call.error:
+            status = f"[red]✗ {call.error[:60]}[/red]"
+            io_preview = _json_preview(call.input)
+        else:
+            status = "[green]✓[/green]"
+            in_str = _json_preview(call.input)
+            out_str = _json_preview(call.output or {})
+            io_preview = f"{in_str}  →  {out_str}"
+
+        table.add_row(
+            str(call.step),
+            call.skill,
+            f"{call.latency_ms:.0f} ms",
+            status,
+            io_preview,
+        )
+    console.print(table)
+
+
+def _json_preview(data: dict[str, Any], max_chars: int = _STEP_PREVIEW_CHARS) -> str:
+    """Compact single-line JSON preview, truncated to *max_chars*."""
+    raw = json.dumps(data, separators=(",", ":"), default=str)
+    if len(raw) > max_chars:
+        raw = raw[:max_chars] + "…"
+    return raw
 
 
 def _print_indented_json(data: dict[str, Any]) -> None:
