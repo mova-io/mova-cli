@@ -517,14 +517,18 @@ class Executor:
                     check_grounding,
                     kb_call_count_from_records,
                     max_valid_citation_index_from_records,
+                    ocr_cited_indices_from_records,
                 )
 
                 _kb_calls = kb_call_count_from_records(skill_calls)
                 _max_idx = max_valid_citation_index_from_records(skill_calls)
+                _citations = output.get("citations") if isinstance(output, dict) else None
+                _ocr_idx = ocr_cited_indices_from_records(skill_calls, _citations)
                 _g_report = check_grounding(
                     output,
                     kb_call_count=_kb_calls,
                     max_valid_citation_index=_max_idx,
+                    ocr_cited_indices=_ocr_idx,
                     enforcement=_grounding_mode,
                 )
                 if not _g_report.ok:
