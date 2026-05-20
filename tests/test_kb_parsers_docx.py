@@ -183,9 +183,10 @@ def test_find_files_includes_docx(tmp_path: object) -> None:
     root = Path(str(tmp_path))
     (root / "a.md").write_text("md content")
     (root / "b.docx").write_bytes(_make_docx_bytes("docx content"))
-    (root / "skip.html").write_text("html not supported")
+    # PR-M added .html/.htm; pick .xml as the "not supported" example.
+    (root / "skip.xml").write_text("<root>xml not supported</root>")
 
     found = {p.name for p in find_files(root)}
     assert "a.md" in found
     assert "b.docx" in found
-    assert "skip.html" not in found
+    assert "skip.xml" not in found
