@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.24"
+version = "0.8.2.25"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -30,6 +30,14 @@ dependencies = [
     # cryptic ImportError" — is bad UX for the operator's first
     # encounter with the KB upload flow.
     "pypdf>=4.0,<6",
+    # DOCX text extraction for KB ingest (PR-L). Same rationale as
+    # pypdf above — making this a core dep avoids the "drag a .docx,
+    # get ImportError" failure mode. python-docx is ~3MB on disk
+    # (with its lxml dep) — larger than pypdf but still well within
+    # budget for a CLI install. Handles standard Word documents;
+    # malformed / very old .doc (binary) files are rejected with a
+    # clean None at the parser layer.
+    "python-docx>=1.1,<2",
 ]
 
 [project.optional-dependencies]
