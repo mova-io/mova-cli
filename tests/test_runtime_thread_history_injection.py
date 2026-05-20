@@ -274,16 +274,30 @@ async def test_other_tenants_runs_dont_leak_into_history(
         thread_id=thread_id,
     )
     await storage.save_run(other_run)
-    # Also seed a same-tenant run that SHOULD appear.
-    _seed_prior_run(
-        storage,
-        thread_id=thread_id,
-        tenant_id=tenant_id,
+    # Also seed a same-tenant run that SHOULD appear. Inlined here
+    # (instead of calling the sync ``_seed_prior_run`` helper) because
+    # this test is async — pytest-asyncio already owns the event loop,
+    # so the helper's ``asyncio.new_event_loop().run_until_complete()``
+    # crashes with "Cannot run the event loop while another loop is
+    # running".
+    mine_run = RunRecord(
         run_id="r_mine",
-        input_data={"q": "should appear"},
-        output_data={"a": "yes"},
+        job_id="job_r_mine",
+        tenant_id=tenant_id,
+        agent="rag-qa",
+        agent_version="0.1.0",
+        prompt_hash="abc",
+        provider="openai/gpt-4o-mini-2024-07-18",
+        provider_version="1.0",
+        pricing_version="2024-01-01",
+        status=JobStatus.SUCCESS,
+        input={"q": "should appear"},
+        output={"a": "yes"},
+        metrics=Metrics(latency_ms=100, cost_usd=0.001, tokens=TokenUsage(input=10, output=10)),
         created_at=datetime.now(UTC),
+        thread_id=thread_id,
     )
+    await storage.save_run(mine_run)
     client.post(
         f"/api/v1/threads/{thread_id}/messages",
         json={"input": {"q": "next"}},

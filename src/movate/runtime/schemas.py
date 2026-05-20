@@ -133,6 +133,11 @@ class RunView(BaseModel):
     created_at: datetime
     workflow_run_id: str | None = None
     node_id: str | None = None
+    thread_id: str | None = None
+    """For multi-turn conversational runs (PR-N), the id of the
+    ConversationThread this run belongs to. ``None`` for standalone
+    runs. Surfaces here so ``GET /runs/{id}`` clients can navigate
+    back to the parent thread."""
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunView:
@@ -153,6 +158,7 @@ class RunView(BaseModel):
             created_at=record.created_at,
             workflow_run_id=record.workflow_run_id,
             node_id=record.node_id,
+            thread_id=record.thread_id,
         )
 
 
