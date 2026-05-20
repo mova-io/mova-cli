@@ -271,6 +271,10 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS thread_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_runs_thread
     ON runs(thread_id, created_at)
     WHERE thread_id IS NOT NULL;
+
+-- PR-Q: jobs carry the thread linkage from queue time so the worker
+-- can propagate it onto the spawned run. NULL = standalone.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS thread_id TEXT;
 """
 
 
@@ -591,8 +595,11 @@ class PostgresProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email, attempt_count, next_retry_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                notify_email, attempt_count, next_retry_at, thread_id
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16
+            )
             """,
             job.job_id,
             job.tenant_id,
@@ -609,6 +616,7 @@ class PostgresProvider:
             job.notify_email,
             job.attempt_count,
             job.next_retry_at,
+            job.thread_id,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -1263,6 +1271,7 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         notify_email=row["notify_email"],
         attempt_count=row["attempt_count"],
         next_retry_at=row["next_retry_at"],
+        thread_id=row["thread_id"],
     )
 
 

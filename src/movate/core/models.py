@@ -1701,6 +1701,12 @@ class JobRecord(BaseModel):
     jobs and jobs that don't need retry) means "claim immediately."
     Set when the worker re-queues a transient failure; the value is
     ``now + backoff(attempt_count)`` from the retry policy."""
+    thread_id: str | None = None
+    """For threaded runs (Tier 10.5 / PR-Q), the
+    :class:`ConversationThread` id this job belongs to. The worker
+    propagates this onto the spawned :class:`RunRecord.thread_id` so
+    the run joins back to its thread. ``None`` (the common case) for
+    standalone non-threaded jobs."""
 
 
 # ---------------------------------------------------------------------------

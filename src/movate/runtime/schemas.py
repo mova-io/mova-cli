@@ -1335,3 +1335,37 @@ class ThreadListView(BaseModel):
 
     threads: list[ThreadView]
     count: int
+
+
+class ThreadMessageSubmission(BaseModel):
+    """``POST /api/v1/threads/{thread_id}/messages`` body.
+
+    Same shape as the standalone ``/run`` submission's input field —
+    the runtime queues a JobRecord with the thread's agent + the
+    operator-supplied input. The worker propagates the thread_id
+    onto the spawned RunRecord so subsequent
+    ``GET /api/v1/threads/{id}`` calls see the new turn in chronological
+    order.
+
+    The thread's agent is fixed at thread creation (PR-O); messages
+    don't carry an agent override. To target a different agent,
+    open a new thread.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: dict[str, Any] = Field(
+        ...,
+        description=(
+            "The agent's input payload — same shape as a standalone "
+            "``POST /run`` submission. Matches the agent's declared "
+            "input schema."
+        ),
+    )
+    notify_email: str | None = Field(
+        default=None,
+        description=(
+            "Optional email address to notify when the job terminates. "
+            "Same semantics as the standalone /run flow."
+        ),
+    )

@@ -290,6 +290,9 @@ _MIGRATIONS = [
     # Per-run thread linkage. NULL = standalone (non-threaded) run.
     "ALTER TABLE runs ADD COLUMN thread_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_runs_thread ON runs(thread_id, created_at)",
+    # PR-Q: jobs carry the thread linkage from queue time so the
+    # worker can propagate it onto the spawned run. NULL = standalone.
+    "ALTER TABLE jobs ADD COLUMN thread_id TEXT",
 ]
 
 
@@ -547,8 +550,8 @@ class SqliteProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email, attempt_count, next_retry_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notify_email, attempt_count, next_retry_at, thread_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -566,6 +569,7 @@ class SqliteProvider:
                 job.notify_email,
                 job.attempt_count,
                 job.next_retry_at.isoformat() if job.next_retry_at else None,
+                job.thread_id,
             ),
         )
         await self._db.commit()
@@ -1292,6 +1296,9 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         next_retry_at=(
             datetime.fromisoformat(row["next_retry_at"]) if row["next_retry_at"] else None
         ),
+        # PR-Q thread linkage. init() has run the migration by the
+        # time we read here, so the column is guaranteed to exist.
+        thread_id=row["thread_id"],
     )
 
 
