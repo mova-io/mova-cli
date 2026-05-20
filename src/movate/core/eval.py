@@ -1435,8 +1435,20 @@ class EvalEngine:
         accuracy = await self._score_accuracy(case, actual, judge)
 
         faithfulness = DimensionScore()
-        if case.grounding:
-            faithfulness = await self._score_faithfulness(case, actual, judge)
+        # Effective grounding: explicit case.grounding takes priority; when
+        # absent, fall back to the agent's contexts/ files (already loaded
+        # as (name, body) pairs on the bundle).  This lets operators skip the
+        # `grounding` field in their dataset and still get faithfulness scoring
+        # as long as the agent declares at least one context file.
+        _effective_grounding: str | None = case.grounding or (
+            "\n\n---\n\n".join(f"[{name}]\n{body}" for name, body in bundle.contexts)
+            if bundle.contexts
+            else None
+        )
+        if _effective_grounding:
+            faithfulness = await self._score_faithfulness(
+                case, actual, judge, grounding=_effective_grounding
+            )
 
         coverage = DimensionScore()
         if case.expected_coverage is not None:
@@ -1656,6 +1668,8 @@ class EvalEngine:
         case: EvalCase,
         actual: dict[str, Any],
         judge: JudgeConfig,
+        *,
+        grounding: str | None = None,
     ) -> DimensionScore:
         """LLM-judge: does the output stay true to the grounding context?
 
@@ -1664,8 +1678,10 @@ class EvalEngine:
         ``judge.method`` is exact-match (faithfulness inherently needs
         semantic judgment).
 
-        Requires :attr:`EvalCase.grounding` to be set — caller checks
-        that before invoking us.
+        ``grounding`` overrides :attr:`EvalCase.grounding` when provided —
+        used by :meth:`_score_dimensions` to supply the agent's ``contexts/``
+        file content when the dataset case has no explicit grounding string.
+        Caller is responsible for ensuring at least one is set.
         """
         if judge.model is None:
             return DimensionScore(
@@ -1673,8 +1689,9 @@ class EvalEngine:
                 "skipped: faithfulness needs a judge model — add evals/judge.yaml",
             )
 
+        effective_grounding = grounding or case.grounding
         prompt = _FAITHFULNESS_PROMPT.format(
-            grounding=case.grounding,
+            grounding=effective_grounding,
             actual_json=json.dumps(actual),
         )
         req = CompletionRequest(
@@ -2054,6 +2071,8 @@ class WorkflowEvalEngine:
         case: EvalCase,
         actual: dict[str, Any],
         judge: JudgeConfig,
+        *,
+        grounding: str | None = None,
     ) -> DimensionScore:
         """LLM-judge: does final_state stay faithful to the case's grounding?
 
@@ -2061,14 +2080,20 @@ class WorkflowEvalEngine:
         :meth:`EvalEngine._score_faithfulness`. When no LLM judge model is
         configured (exact-match mode), returns a no-score with a readable hint
         so operators know how to enable faithfulness scoring.
+
+        ``grounding`` overrides :attr:`EvalCase.grounding` when provided.
+        Workflow eval does not inject ``contexts/`` automatically (no bundle
+        is available at scoring time); pass ``grounding`` explicitly when
+        needed.
         """
         if judge.model is None:
             return DimensionScore(
                 None,
                 "skipped: faithfulness needs a judge model — add evals/judge.yaml",
             )
+        effective_grounding = grounding or case.grounding
         prompt = _FAITHFULNESS_PROMPT.format(
-            grounding=case.grounding,
+            grounding=effective_grounding,
             actual_json=json.dumps(actual),
         )
         req = CompletionRequest(
