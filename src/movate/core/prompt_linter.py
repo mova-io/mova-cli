@@ -39,6 +39,11 @@ Rules
   skill's declared output schema. Operators who inject skill output
   via the ``<name>_output`` naming convention get early feedback
   instead of a silent ``undefined`` at render time.
+* ``ORPHAN_RETRIEVAL_CONFIG`` (warning) — the agent declares a
+  non-default ``retrieval:`` block but doesn't list the
+  ``kb-vector-lookup`` skill, so the config has nothing to drive.
+  Either the skill name is wrong / missing, or the operator forgot
+  to remove leftover retrieval tuning from a template.
 
 Future rules (not in this pass — add when they catch a real bug):
 
@@ -94,6 +99,7 @@ def lint_prompt(bundle: AgentBundle) -> list[LintIssue]:
     issues.extend(_check_skill_output_refs(bundle))
     issues.extend(_check_json_instruction(bundle))
     issues.extend(_check_output_schema_reference(bundle))
+    issues.extend(_check_orphan_retrieval_config(bundle))
     return issues
 
 
@@ -381,6 +387,95 @@ def _check_output_schema_reference(bundle: AgentBundle) -> list[LintIssue]:
                 "Models tend to hallucinate field names without a sample."
             ),
             hint="include a sample JSON object in the prompt showing the expected keys",
+        )
+    ]
+
+
+# Names the skill might use to surface KB retrieval. Today only
+# the canonical ``kb-vector-lookup`` skill consumes the retrieval
+# config (via SkillExecutionContext.retrieval); operators sometimes
+# rename their copy of the template, so we also accept anything that
+# STARTS with the canonical prefix (e.g. ``kb-vector-lookup-prod``).
+# A skill with a totally different name still passes the lint —
+# false-negative, by design: better to miss a rename than to spam
+# warnings the operator learns to ignore.
+_RETRIEVAL_SKILL_PREFIX = "kb-vector-lookup"
+
+
+def _check_orphan_retrieval_config(bundle: AgentBundle) -> list[LintIssue]:
+    """``ORPHAN_RETRIEVAL_CONFIG`` (warning) — non-default
+    ``retrieval:`` block on an agent that doesn't declare the
+    ``kb-vector-lookup`` skill.
+
+    The retrieval block (PR-I) drives the four optional stages
+    (hybrid / rewrite / rerank / multi_hop) inside the
+    ``kb-vector-lookup`` skill. Without that skill on the agent's
+    declared skill list, the config has nothing to operate on at
+    run time — silently ignored, which is a confusing failure mode
+    for the operator who tuned it.
+
+    Two common causes:
+
+    1. Operator typo'd the skill name in ``skills:`` (or removed
+       it accidentally while editing).
+    2. Operator copy-pasted a ``retrieval:`` block from a template
+       and forgot to also add the skill.
+
+    Both produce identical run-time behavior (vector-only). This
+    rule flips that silent failure into a visible warning.
+
+    Skips entirely when the retrieval block is at its default
+    (all-off) — no signal to warn about.
+    """
+    # Two-stage getattr so stub bundles (used in unit tests for OTHER
+    # rules) without a real ``spec`` attribute don't crash this rule.
+    # AgentBundle always has ``spec``; test SimpleNamespace fixtures
+    # sometimes don't.
+    spec = getattr(bundle, "spec", None)
+    if spec is None:
+        return []
+    retrieval = getattr(spec, "retrieval", None)
+    if retrieval is None:
+        return []
+    is_default_fn = getattr(retrieval, "is_default", None)
+    if callable(is_default_fn) and is_default_fn():
+        return []
+
+    # Any declared skill whose name starts with the canonical
+    # prefix counts (handles renamed copies of the template).
+    declared_skills = list(getattr(spec, "skills", []) or [])
+    if any(isinstance(s, str) and s.startswith(_RETRIEVAL_SKILL_PREFIX) for s in declared_skills):
+        return []
+
+    # Build a short summary of what the operator configured, so the
+    # warning surfaces the SPECIFIC drift (not just "you have a block").
+    parts: list[str] = []
+    if getattr(retrieval, "hybrid", False):
+        parts.append("hybrid=true")
+    rewrite_n = int(getattr(retrieval, "rewrite", 0))
+    if rewrite_n > 0:
+        parts.append(f"rewrite={rewrite_n}")
+    if getattr(retrieval, "rerank", False):
+        parts.append("rerank=true")
+    multi_hop_n = int(getattr(retrieval, "multi_hop", 0))
+    if multi_hop_n > 0:
+        parts.append(f"multi_hop={multi_hop_n}")
+    config_summary = ", ".join(parts) or "non-default"
+
+    return [
+        LintIssue(
+            code="ORPHAN_RETRIEVAL_CONFIG",
+            severity="warning",
+            message=(
+                f"agent.yaml declares retrieval: ({config_summary}) but the "
+                f"agent's skills: list has no entry starting with "
+                f"{_RETRIEVAL_SKILL_PREFIX!r}. The retrieval config will be "
+                "silently ignored at run time."
+            ),
+            hint=(
+                "either add 'kb-vector-lookup' to skills: in agent.yaml, "
+                "or remove the retrieval: block if you don't need KB lookup."
+            ),
         )
     ]
 
