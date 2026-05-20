@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.52"
+version = "0.8.2.53"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -77,8 +77,8 @@ cross-encoder = [
     "sentence-transformers>=2.7,<4",
 ]
 ocr = [
-    # OCR fallback for scanned-image PDFs (PR-CC). pdf2image wraps
-    # Poppler's pdftoppm renderer to rasterise pages at 200 DPI;
+    # OCR fallback for scanned-image PDFs (PR-CC / PR-HH). pdf2image
+    # wraps Poppler's pdftoppm renderer to rasterise pages at 300 DPI;
     # pytesseract calls the system Tesseract binary to extract text.
     # Both require external system dependencies:
     #   - Poppler (e.g. `brew install poppler` / `apt-get install poppler-utils`)
@@ -87,6 +87,24 @@ ocr = [
     # fail at runtime; movate gracefully returns None and logs a warning.
     "pdf2image>=1.17,<2",
     "pytesseract>=0.3,<1",
+]
+easyocr = [
+    # EasyOCR backend for scanned-image PDFs — alternative to the [ocr]
+    # extra when accuracy on noisy / low-contrast / handwritten scans
+    # matters more than install size. EasyOCR is pure Python with no
+    # system binary dependency (unlike Tesseract), but pulls in
+    # torch-cpu (~300 MB) + huggingface-hub for model weight downloads.
+    # Model weights (~67 MB for English) are fetched from HuggingFace
+    # on first use and cached in ~/.EasyOCR.
+    #
+    # Select this backend at runtime via: MOVATE_OCR_BACKEND=easyocr
+    # (default is "tesseract" — install [ocr] for the default path).
+    #
+    # pdf2image is still required to rasterise PDF pages before EasyOCR
+    # can process them; Poppler must be installed as a system binary
+    # (same as the [ocr] extra).
+    "easyocr>=1.7,<2",
+    "pdf2image>=1.17,<2",
 ]
 otel = [
     "opentelemetry-api>=1.25",

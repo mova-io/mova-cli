@@ -1,4 +1,4 @@
-"""Tests for OCR fallback in parse_pdf (PR-CC, PR-HH).
+"""Tests for OCR fallback in parse_pdf (PR-CC, PR-HH, PR-II).
 
 Coverage:
 * text-based PDF → pypdf extraction, no OCR invoked
@@ -13,6 +13,13 @@ Coverage:
 * _ocr_pdf: pdf2image raises → None (graceful)
 * _ocr_pdf: pytesseract raises → None (graceful)
 * _ocr_pdf: OCR returns blank string → None
+* _ocr_pdf: MOVATE_OCR_BACKEND=easyocr → routes to EasyOCR, not Tesseract
+* _ocr_easyocr: gpu=False by default; MOVATE_EASYOCR_GPU=1 → gpu=True
+* _ocr_easyocr: readtext result lines joined with newline
+* _ocr_easyocr: lang mapped from Tesseract code to EasyOCR code
+* _ocr_easyocr: not installed → None (graceful)
+* _ocr_easyocr: Reader raises → None (graceful)
+* _tesseract_to_easyocr_langs: single code, compound +, unknown passthrough, Chinese
 """
 
 from __future__ import annotations
@@ -444,3 +451,250 @@ def test_ocr_pdf_empty_image_list_returns_none() -> None:
 
     assert result is None
     mock_pytesseract.image_to_string.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _ocr_pdf: backend routing — MOVATE_OCR_BACKEND=easyocr
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_ocr_pdf_backend_easyocr_routes_to_easyocr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MOVATE_OCR_BACKEND=easyocr → EasyOCR called; pytesseract NOT called."""
+    monkeypatch.setenv("MOVATE_OCR_BACKEND", "easyocr")
+
+    img = _fake_image("p0")
+    mock_pdf2image = MagicMock()
+    mock_pdf2image.convert_from_bytes.return_value = [img]
+
+    mock_reader = MagicMock()
+    mock_reader.readtext.return_value = ["EasyOCR result."]
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.return_value = mock_reader
+
+    mock_pytesseract = MagicMock()
+
+    with patch.dict(
+        "sys.modules",
+        {"pdf2image": mock_pdf2image, "easyocr": mock_easyocr, "pytesseract": mock_pytesseract},
+    ):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_pdf(b"%PDF-scan", page_num=0)
+
+    assert result == "EasyOCR result."
+    mock_easyocr.Reader.assert_called_once()
+    mock_reader.readtext.assert_called_once_with(img, detail=0)
+    # Tesseract must NOT be called
+    mock_pytesseract.image_to_string.assert_not_called()
+
+
+@pytest.mark.unit
+def test_ocr_pdf_backend_default_routes_to_tesseract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default backend (no env var) → Tesseract called; EasyOCR NOT called."""
+    monkeypatch.delenv("MOVATE_OCR_BACKEND", raising=False)
+
+    img = _fake_image("p0")
+    mock_pdf2image = MagicMock()
+    mock_pdf2image.convert_from_bytes.return_value = [img]
+
+    mock_pytesseract = MagicMock()
+    mock_pytesseract.image_to_string.return_value = "Tesseract result."
+
+    mock_easyocr = MagicMock()
+
+    with patch.dict(
+        "sys.modules",
+        {"pdf2image": mock_pdf2image, "pytesseract": mock_pytesseract, "easyocr": mock_easyocr},
+    ):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_pdf(b"%PDF-scan", page_num=0)
+
+    assert result == "Tesseract result."
+    mock_pytesseract.image_to_string.assert_called_once()
+    # EasyOCR must NOT be called
+    mock_easyocr.Reader.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _ocr_easyocr: direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_returns_joined_lines() -> None:
+    """EasyOCR readtext returns a list of text blocks; they are joined with newlines."""
+    img = _fake_image()
+    mock_reader = MagicMock()
+    mock_reader.readtext.return_value = ["First line.", "Second line.", "Third line."]
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.return_value = mock_reader
+
+    with patch.dict("sys.modules", {"easyocr": mock_easyocr}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_easyocr(img, "eng")
+
+    assert result == "First line.\nSecond line.\nThird line."
+    mock_reader.readtext.assert_called_once_with(img, detail=0)
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_gpu_false_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EasyOCR Reader initialised with gpu=False by default."""
+    monkeypatch.delenv("MOVATE_EASYOCR_GPU", raising=False)
+
+    img = _fake_image()
+    mock_reader = MagicMock()
+    mock_reader.readtext.return_value = ["text"]
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.return_value = mock_reader
+
+    with patch.dict("sys.modules", {"easyocr": mock_easyocr}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        parsers_mod._ocr_easyocr(img, "eng")
+
+    _, kwargs = mock_easyocr.Reader.call_args
+    assert kwargs.get("gpu") is False
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_gpu_enabled_by_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MOVATE_EASYOCR_GPU=1 → Reader initialised with gpu=True."""
+    monkeypatch.setenv("MOVATE_EASYOCR_GPU", "1")
+
+    img = _fake_image()
+    mock_reader = MagicMock()
+    mock_reader.readtext.return_value = ["text"]
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.return_value = mock_reader
+
+    with patch.dict("sys.modules", {"easyocr": mock_easyocr}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        parsers_mod._ocr_easyocr(img, "eng")
+
+    _, kwargs = mock_easyocr.Reader.call_args
+    assert kwargs.get("gpu") is True
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_maps_tesseract_lang_to_easyocr_code() -> None:
+    """lang='fra' is mapped to 'fr' before being passed to easyocr.Reader."""
+    img = _fake_image()
+    mock_reader = MagicMock()
+    mock_reader.readtext.return_value = ["Bonjour."]
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.return_value = mock_reader
+
+    with patch.dict("sys.modules", {"easyocr": mock_easyocr}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_easyocr(img, "fra")
+
+    assert result == "Bonjour."
+    # First positional arg to Reader should be the mapped lang list
+    lang_list = mock_easyocr.Reader.call_args[0][0]
+    assert lang_list == ["fr"]
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_not_installed_returns_none() -> None:
+    """[easyocr] extra not installed → _ocr_easyocr returns None (graceful)."""
+    img = _fake_image()
+    with patch.dict("sys.modules", {"easyocr": None}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_easyocr(img, "eng")
+
+    assert result is None
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_reader_raises_returns_none() -> None:
+    """easyocr.Reader raises (e.g. bad lang code) → None."""
+    img = _fake_image()
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.side_effect = RuntimeError("lang not found")
+
+    with patch.dict("sys.modules", {"easyocr": mock_easyocr}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_easyocr(img, "eng")
+
+    assert result is None
+
+
+@pytest.mark.unit
+def test_ocr_easyocr_readtext_raises_returns_none() -> None:
+    """easyocr reader.readtext raises → None."""
+    img = _fake_image()
+    mock_reader = MagicMock()
+    mock_reader.readtext.side_effect = RuntimeError("CUDA OOM")
+    mock_easyocr = MagicMock()
+    mock_easyocr.Reader.return_value = mock_reader
+
+    with patch.dict("sys.modules", {"easyocr": mock_easyocr}):
+        from movate.kb import parsers as parsers_mod  # noqa: PLC0415
+
+        importlib.reload(parsers_mod)
+        result = parsers_mod._ocr_easyocr(img, "eng")
+
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _tesseract_to_easyocr_langs: language code mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_tesseract_to_easyocr_langs_single_known() -> None:
+    """Single known code is mapped correctly."""
+    from movate.kb.parsers import _tesseract_to_easyocr_langs  # noqa: PLC0415
+
+    assert _tesseract_to_easyocr_langs("eng") == ["en"]
+    assert _tesseract_to_easyocr_langs("fra") == ["fr"]
+    assert _tesseract_to_easyocr_langs("deu") == ["de"]
+    assert _tesseract_to_easyocr_langs("jpn") == ["ja"]
+
+
+@pytest.mark.unit
+def test_tesseract_to_easyocr_langs_compound() -> None:
+    """Compound '+' syntax maps each part independently."""
+    from movate.kb.parsers import _tesseract_to_easyocr_langs  # noqa: PLC0415
+
+    assert _tesseract_to_easyocr_langs("eng+fra") == ["en", "fr"]
+    assert _tesseract_to_easyocr_langs("eng+fra+deu") == ["en", "fr", "de"]
+
+
+@pytest.mark.unit
+def test_tesseract_to_easyocr_langs_unknown_passthrough() -> None:
+    """Unknown codes pass through unchanged (EasyOCR may accept them or silently ignore)."""
+    from movate.kb.parsers import _tesseract_to_easyocr_langs  # noqa: PLC0415
+
+    assert _tesseract_to_easyocr_langs("xyz") == ["xyz"]
+    assert _tesseract_to_easyocr_langs("xyz+eng") == ["xyz", "en"]
+
+
+@pytest.mark.unit
+def test_tesseract_to_easyocr_langs_chinese_scripts() -> None:
+    """Chinese simplified/traditional use EasyOCR's extended codes ch_sim / ch_tra."""
+    from movate.kb.parsers import _tesseract_to_easyocr_langs  # noqa: PLC0415
+
+    assert _tesseract_to_easyocr_langs("chi_sim") == ["ch_sim"]
+    assert _tesseract_to_easyocr_langs("chi_tra") == ["ch_tra"]

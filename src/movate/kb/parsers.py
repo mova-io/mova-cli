@@ -17,9 +17,16 @@ v0.9 MVP scope:
 
 * **PDF** via pypdf (PR-G) — handles text-based PDFs. When
   pypdf extracts no text (scanned-image PDFs), falls back to
-  OCR via the optional ``[ocr]`` extra (pdf2image + pytesseract
-  + system Tesseract binary). Install with
-  ``pip install movate-cli[ocr]``. (PR-CC)
+  OCR. Two backends are available (selected via
+  ``MOVATE_OCR_BACKEND``):
+
+  - ``"tesseract"`` (default) — pdf2image + pytesseract +
+    system Tesseract binary. Install with
+    ``pip install movate-cli[ocr]``. (PR-CC / PR-HH)
+  - ``"easyocr"`` — pdf2image + EasyOCR (pure Python, no system
+    binary). Better accuracy on noisy scans; heavier install
+    (~300 MB for torch-cpu). Install with
+    ``pip install movate-cli[easyocr]``.
 * **DOCX** via python-docx (PR-L) — handles standard Word
   documents. Honors heading levels as paragraph boundaries.
 * **HTML** via readability-lxml + BeautifulSoup (PR-M) — runs
@@ -47,7 +54,7 @@ import io
 import logging
 import os
 import re
-from typing import NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -268,37 +275,41 @@ def parse_pdf(content: bytes) -> ParseResult | None:
 
 
 def _ocr_pdf(content: bytes, *, page_num: int) -> str | None:
-    """OCR a single PDF page (0-based index) using pdf2image + pytesseract.
+    """OCR a single PDF page using the configured backend (Tesseract or EasyOCR).
 
     Called by :func:`parse_pdf` for every page that yields no text from
     pypdf — this per-page design enables **mixed PDFs** (text and scanned
     pages interleaved) rather than only handling fully-scanned documents.
 
-    Pipeline:
+    Backend selection:
 
-    1. **pdf2image** rasterises the requested page at ``_OCR_DPI`` DPI
-       (300 by default) using Poppler's pdftoppm renderer. Passing
-       ``first_page``/``last_page`` means only the target page is decoded,
-       which avoids re-rasterising the entire PDF for every empty page.
-    2. **pytesseract** runs Tesseract with ``_OCR_CONFIG``
-       (``--oem 1 --psm 6`` by default): LSTM engine + single-block
-       page-segmentation mode, which works well for dense prose pages.
-    3. Whitespace is normalised: runs of spaces/tabs are collapsed to a
-       single space, and three or more consecutive newlines are reduced
-       to two, preserving paragraph structure without noisy blank lines.
+    Set ``MOVATE_OCR_BACKEND`` env var to choose the OCR engine:
 
-    Language is read from the ``MOVATE_OCR_LANG`` environment variable
-    (default ``"eng"``). Set it to a Tesseract language code (e.g.
-    ``"fra"`` for French, ``"deu"`` for German, ``"eng+fra"`` for
-    multilingual) before starting the ingest process.
+    * ``"tesseract"`` (default) — pdf2image + pytesseract + system Tesseract
+      binary. Install the ``[ocr]`` extra. Lean install; requires Tesseract
+      on PATH. Best for clean, high-contrast printed scans.
+    * ``"easyocr"`` — pdf2image + easyocr (pure Python, no system binary).
+      Install the ``[easyocr]`` extra. Better accuracy on noisy, low-quality,
+      or handwritten scans. Heavier install (~300 MB for torch-cpu). Model
+      weights (~67 MB for English) are downloaded from HuggingFace on first
+      use and cached in ``~/.EasyOCR``.
+
+    Both backends share the pdf2image rasterisation step at ``_OCR_DPI`` DPI
+    (300 by default). Language is read from ``MOVATE_OCR_LANG`` (default
+    ``"eng"``). EasyOCR uses 2-letter codes — the string is auto-mapped from
+    Tesseract's 3-letter convention (e.g. ``"fra"`` → ``"fr"``).
+
+    Whitespace normalisation is applied to the backend's raw output:
+
+    * Runs of spaces / tabs collapsed to a single space.
+    * Three or more consecutive newlines reduced to two.
 
     Returns the normalised page text, or ``None`` if:
 
-    * ``pdf2image`` or ``pytesseract`` are not installed (``[ocr]``
-      extra missing) — logged at DEBUG so the import absence stays quiet.
-    * Poppler is not installed (pdf2image raises) — logged at WARNING.
-    * Tesseract is not installed or fails — logged at WARNING.
-    * OCR succeeds but produces only whitespace.
+    * pdf2image is not installed (both extras missing).
+    * Poppler is not installed (pdf2image raises at runtime).
+    * The selected backend's Python package is not installed.
+    * The backend fails or returns only whitespace.
 
     Intentionally synchronous — ``parse_pdf`` is also sync; large-batch
     ingest callers off-load the whole parse call to a thread/executor
@@ -306,11 +317,10 @@ def _ocr_pdf(content: bytes, *, page_num: int) -> str | None:
     """
     try:
         import pdf2image  # type: ignore[import-not-found]  # noqa: PLC0415
-        import pytesseract  # type: ignore[import-not-found]  # noqa: PLC0415
     except ImportError:
         logger.debug(
-            "OCR deps not installed (pdf2image / pytesseract). "
-            "Install movate-cli[ocr] to enable OCR for scanned PDFs."
+            "pdf2image not installed. "
+            "Install movate-cli[ocr] (Tesseract) or movate-cli[easyocr] (EasyOCR)."
         )
         return None
 
@@ -329,16 +339,137 @@ def _ocr_pdf(content: bytes, *, page_num: int) -> str | None:
         return None
 
     lang = os.environ.get("MOVATE_OCR_LANG", "eng")
-    try:
-        text: str = pytesseract.image_to_string(images[0], lang=lang, config=_OCR_CONFIG)
-    except Exception as exc:
-        logger.warning("tesseract OCR failed on page %d: %s", page_num, exc)
+    backend = os.environ.get("MOVATE_OCR_BACKEND", "tesseract").lower()
+
+    if backend == "easyocr":
+        text = _ocr_easyocr(images[0], lang)
+    else:
+        text = _ocr_tesseract(images[0], lang)
+
+    if text is None:
         return None
 
     # Normalise whitespace: collapse tab/space runs; trim excess blank lines.
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip() or None
+
+
+def _ocr_tesseract(image: Any, lang: str) -> str | None:
+    """Run Tesseract OCR on a PIL Image via pytesseract.
+
+    Uses ``_OCR_CONFIG`` (``--oem 1 --psm 6``): LSTM engine +
+    single-block page-segmentation mode, which works well for dense
+    prose pages. Returns the raw text string (whitespace normalisation
+    is applied by the caller :func:`_ocr_pdf`).
+
+    Returns ``None`` on ImportError (``[ocr]`` extra missing) or any
+    Tesseract runtime error (binary absent, language pack missing, etc.).
+    """
+    try:
+        import pytesseract  # type: ignore[import-not-found]  # noqa: PLC0415
+    except ImportError:
+        logger.debug("pytesseract not installed — install movate-cli[ocr] to enable Tesseract OCR.")
+        return None
+    try:
+        return pytesseract.image_to_string(image, lang=lang, config=_OCR_CONFIG)  # type: ignore[no-any-return]
+    except Exception as exc:
+        logger.warning("Tesseract OCR failed: %s", exc)
+        return None
+
+
+def _ocr_easyocr(image: Any, lang: str) -> str | None:
+    """Run EasyOCR on a PIL Image.
+
+    EasyOCR uses 2-letter language codes (ISO 639-1) while movate's
+    ``MOVATE_OCR_LANG`` follows Tesseract's 3-letter convention.
+    The ``lang`` string is auto-mapped via
+    :func:`_tesseract_to_easyocr_langs` (e.g. ``"eng+fra"`` →
+    ``["en", "fr"]``).
+
+    GPU usage:
+
+    The ``easyocr.Reader`` is initialised with ``gpu=False`` by default
+    so the ``[easyocr]`` extra works on CPU-only machines (the common
+    case for KB ingest workloads). Operators running on GPU nodes can
+    set ``MOVATE_EASYOCR_GPU=1`` to enable GPU acceleration.
+
+    Model weights (~67 MB for English) are downloaded from HuggingFace
+    on first use and cached in ``~/.EasyOCR``.
+
+    Returns the page text as a newline-joined string — EasyOCR returns
+    text blocks in reading order; newline separation preserves paragraph
+    cues better than space-joining for dense prose pages. Whitespace
+    normalisation is applied by the caller :func:`_ocr_pdf`.
+
+    Returns ``None`` on ImportError (``[easyocr]`` extra missing) or
+    any EasyOCR runtime error.
+    """
+    try:
+        import easyocr  # type: ignore[import-not-found]  # noqa: PLC0415
+    except ImportError:
+        logger.debug("easyocr not installed — install movate-cli[easyocr] to enable EasyOCR.")
+        return None
+
+    lang_codes = _tesseract_to_easyocr_langs(lang)
+    gpu = os.environ.get("MOVATE_EASYOCR_GPU", "0") == "1"
+
+    try:
+        reader = easyocr.Reader(lang_codes, gpu=gpu, verbose=False)
+        result: list[str] = reader.readtext(image, detail=0)
+        return "\n".join(result)
+    except Exception as exc:
+        logger.warning("EasyOCR failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Language code mapping — Tesseract 3-letter → EasyOCR 2-letter
+# ---------------------------------------------------------------------------
+
+# Tesseract follows ISO 639-3 (3-letter); EasyOCR follows ISO 639-1
+# (2-letter), with two extensions for Chinese scripts. Unknown codes
+# are passed through as-is — EasyOCR silently rejects unrecognised
+# codes rather than raising, so callers get an empty result that maps
+# cleanly to a None return from _ocr_easyocr.
+_TESSERACT_TO_EASYOCR: dict[str, str] = {
+    "eng": "en",
+    "fra": "fr",
+    "deu": "de",
+    "spa": "es",
+    "ita": "it",
+    "por": "pt",
+    "nld": "nl",
+    "pol": "pl",
+    "rus": "ru",
+    "ara": "ar",
+    "chi_sim": "ch_sim",
+    "chi_tra": "ch_tra",
+    "jpn": "ja",
+    "kor": "ko",
+    "hin": "hi",
+    "tha": "th",
+    "vie": "vi",
+    "ind": "id",
+}
+
+
+def _tesseract_to_easyocr_langs(lang: str) -> list[str]:
+    """Convert a Tesseract language string to a list of EasyOCR codes.
+
+    Handles Tesseract's compound syntax:
+    ``"eng+fra"`` → ``["en", "fr"]``.
+    Unknown codes are passed through unchanged.
+
+    Args:
+        lang: Tesseract-style language string (e.g. ``"eng"``,
+            ``"eng+fra"``, ``"chi_sim"``).
+
+    Returns:
+        List of EasyOCR language codes ready to pass to
+        ``easyocr.Reader(lang_list=...)``.
+    """
+    return [_TESSERACT_TO_EASYOCR.get(p.strip(), p.strip()) for p in lang.split("+")]
 
 
 def parse_docx(content: bytes) -> ParseResult | None:
