@@ -293,12 +293,148 @@ _STORAGE_AND_PROJECT_EXPLANATIONS: dict[str, CheckExplanation] = {
 }
 
 
+# KB parsing deps — gates `mdk kb ingest` for each document format.
+# Missing = that format silently falls back to "unsupported" at ingest time.
+
+_KB_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
+    "pypdf": CheckExplanation(
+        what="KB dep — pypdf Python PDF parser.",
+        why=(
+            "`mdk kb ingest` extracts text from machine-readable PDFs directly "
+            "(no OCR needed). pypdf reads the PDF text layer and feeds it into "
+            "the chunker + embedder pipeline. Fast, zero system deps."
+        ),
+        failure_impact=(
+            "Machine-readable PDFs are skipped at ingest time. Scanned PDFs "
+            "still work via the OCR path (pdf2image + pytesseract/easyocr), "
+            "but text-layer PDFs lose their content."
+        ),
+        fix="uv add 'movate-cli[kb]'",
+    ),
+    "python-docx": CheckExplanation(
+        what="KB dep — python-docx DOCX parser.",
+        why=(
+            "`mdk kb ingest` extracts text from Word documents (.docx). "
+            "Reads paragraphs, headers, and table cells. Common format for "
+            "HR policies, SOPs, and compliance docs."
+        ),
+        failure_impact="`.docx` files are skipped at ingest time. PDF/MD/HTML paths unaffected.",
+        fix="uv add 'movate-cli[kb]'",
+    ),
+    "beautifulsoup4": CheckExplanation(
+        what="KB dep — BeautifulSoup4 HTML parser.",
+        why=(
+            "`mdk kb ingest` extracts text from `.html` files (knowledge bases "
+            "exported from Confluence, Notion, Zendesk, etc.). BS4 strips nav, "
+            "scripts, and boilerplate; `readability-lxml` cleans article body."
+        ),
+        failure_impact="`.html` files are skipped at ingest time. PDF/MD/DOCX paths unaffected.",
+        fix="uv add 'movate-cli[kb]'",
+    ),
+}
+
+
+# OCR deps — gates scanning of image-backed documents.
+# The four Python packages and one system binary are independent layers;
+# install only what your document mix needs.
+#
+# Typical setups:
+#   Text PDFs only        → pypdf alone (no OCR needed)
+#   Scanned PDFs          → [ocr] extra + tesseract binary
+#   Standalone images     → [ocr] extra (Pillow) + tesseract OR [easyocr]
+#   Noisy/multilingual    → [easyocr] (no system binary, GPU-optional)
+#   Full pipeline         → [kb] + [ocr] + [easyocr] + tesseract binary
+
+_OCR_DEP_EXPLANATIONS: dict[str, CheckExplanation] = {
+    "pillow": CheckExplanation(
+        what="OCR dep — Pillow (Python Imaging Library fork).",
+        why=(
+            "Decodes standalone image files (PNG, JPG, JPEG, TIFF, BMP) into "
+            "PIL.Image objects for OCR. Also used inside the PDF OCR path once "
+            "pdf2image rasterizes a page. `MOVATE_OCR_BACKEND` (tesseract or "
+            "easyocr) receives the PIL.Image — Pillow is the common intake layer "
+            "for BOTH backends. Without Pillow, standalone image KB files are "
+            "silently skipped at ingest time."
+        ),
+        failure_impact=(
+            "PNG/JPG/TIFF/BMP files dropped at `mdk kb ingest` with "
+            "'unsupported extension' warning. PDF OCR path also breaks "
+            "(pdf2image returns PIL images; they can't be decoded further)."
+        ),
+        fix="uv add 'movate-cli[ocr]'",
+    ),
+    "pdf2image": CheckExplanation(
+        what="OCR dep — pdf2image (Poppler wrapper).",
+        why=(
+            "Rasterizes PDF pages to PIL.Image at 300 DPI so Tesseract or "
+            "EasyOCR can read them. Required only for scanned PDFs — PDFs with "
+            "a text layer are parsed directly by pypdf without rasterization. "
+            "Requires Poppler system binaries (`pdftoppm`)."
+        ),
+        failure_impact=(
+            "Scanned / image-only PDFs silently fall back to empty text at "
+            "ingest time. Machine-readable PDFs (text layer) unaffected."
+        ),
+        fix="uv add 'movate-cli[ocr]'  # then: brew install poppler  /  apt-get install poppler-utils",
+    ),
+    "pytesseract": CheckExplanation(
+        what="OCR dep — pytesseract (Tesseract Python wrapper).",
+        why=(
+            "Thin binding around the Tesseract binary. Used when "
+            "`MOVATE_OCR_BACKEND=tesseract` (the default). Works well for "
+            "clean, high-contrast printed text. Supports 100+ languages via "
+            "`MOVATE_OCR_LANG=eng+fra` (Tesseract 3-letter ISO codes)."
+        ),
+        failure_impact=(
+            "The default OCR backend unavailable. `mdk kb ingest` skips "
+            "scanned PDFs and image files. Switch to EasyOCR "
+            "(`MOVATE_OCR_BACKEND=easyocr`) as a drop-in alternative."
+        ),
+        fix="uv add 'movate-cli[ocr]'  # also needs: brew install tesseract  /  apt-get install tesseract-ocr",
+    ),
+    "tesseract": CheckExplanation(
+        what="OCR dep — Tesseract system binary (NOT a Python package).",
+        why=(
+            "The actual OCR engine that pytesseract calls. Apache-2.0 licensed; "
+            "maintained by Google. Must be installed separately from the Python "
+            "packages via your OS package manager. Without it, `pytesseract` "
+            "raises a TesseractNotFoundError at ingest time."
+        ),
+        failure_impact=(
+            "Every OCR call via the default backend fails with TesseractNotFoundError. "
+            "EasyOCR (`MOVATE_OCR_BACKEND=easyocr`) is unaffected — it uses "
+            "PyTorch internally, no system binary."
+        ),
+        fix="brew install tesseract   # macOS\napt-get install tesseract-ocr   # Debian/Ubuntu",
+    ),
+    "easyocr": CheckExplanation(
+        what="OCR dep — EasyOCR (pure-Python, torch-based OCR backend).",
+        why=(
+            "Alternative to Tesseract activated via `MOVATE_OCR_BACKEND=easyocr`. "
+            "Advantages: no system binary, better accuracy on noisy scans, "
+            "handwriting, and non-Latin scripts (Arabic, Japanese, Korean, etc.). "
+            "GPU-optional: set `MOVATE_EASYOCR_GPU=1` to use a CUDA GPU; "
+            "CPU-mode is the default and works fine for batch ingest. "
+            "Downloads model weights (~50 MB) on first use."
+        ),
+        failure_impact=(
+            "`MOVATE_OCR_BACKEND=easyocr` raises ImportError at ingest time. "
+            "Falls back gracefully to `None` (skips the file) rather than "
+            "crashing the ingest run. Tesseract backend unaffected."
+        ),
+        fix="uv add 'movate-cli[easyocr]'",
+    ),
+}
+
+
 # Aggregate registry. Public so the doctor command can look up
 # explanations by check identifier.
 
 EXPLANATIONS: dict[str, CheckExplanation] = {
     **{f"dep: {k}": v for k, v in _REQUIRED_DEP_EXPLANATIONS.items()},
     **{f"opt: {k}": v for k, v in _OPTIONAL_DEP_EXPLANATIONS.items()},
+    **{f"kb: {k}": v for k, v in _KB_DEP_EXPLANATIONS.items()},
+    **{f"ocr: {k}": v for k, v in _OCR_DEP_EXPLANATIONS.items()},
     **{f"runtime: {k}": v for k, v in _RUNTIME_EXPLANATIONS.items()},
     **_PROVIDER_KEY_EXPLANATIONS,
     **_TRACING_EXPLANATIONS,
