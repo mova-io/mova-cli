@@ -99,6 +99,7 @@ class Dimension(StrEnum):
     LATENCY = "latency"  # within budget (deterministic)
     CONTEXT_COMPLIANCE = "context_compliance"  # respects context guidelines
     REFUSAL = "refusal"  # refused when expected (deterministic)
+    RETRIEVAL_ACCURACY = "retrieval_accuracy"  # context relevance — RAG quality signal
     # v0.8+ — movate-evals 10-category additions
     COMPLETENESS = "completeness"  # required fields present + specialist
     TOOL_USAGE = "tool_usage"  # right skills/tools called
@@ -149,6 +150,15 @@ class DimensionScores:
     latency: DimensionScore = field(default_factory=DimensionScore)
     context_compliance: DimensionScore = field(default_factory=DimensionScore)
     refusal: DimensionScore = field(default_factory=DimensionScore)
+    retrieval_accuracy: DimensionScore = field(default_factory=DimensionScore)
+    """Context relevance: how relevant is the retrieved context to the question?
+
+    LLM-judged against the case input. Scores 1.0 when context directly and
+    comprehensively addresses the question; 0.0 when context is irrelevant.
+    Complements faithfulness (output vs context) with context vs question.
+    Fires whenever grounding context is available (case.grounding or bundle.contexts).
+    Skipped when no judge model is configured or no context available.
+    """
     # v0.8 — movate-evals 10-category additions
     completeness: DimensionScore = field(default_factory=DimensionScore)
     """LLM specialist: required output fields present + content complete?
@@ -204,6 +214,7 @@ class DimensionScores:
                 self.latency,
                 self.context_compliance,
                 self.refusal,
+                self.retrieval_accuracy,
                 self.completeness,
                 self.tool_usage,
                 self.workflow_adherence,
@@ -397,6 +408,7 @@ class DimensionalMeans:
     latency: float | None = None
     context_compliance: float | None = None
     refusal: float | None = None
+    retrieval_accuracy: float | None = None
     # v0.8 movate-evals 10-category additions
     completeness: float | None = None
     tool_usage: float | None = None
@@ -832,6 +844,25 @@ Return ONLY a JSON object on a single line, no prose, no code fences:
 {{"score": <float between 0.0 and 1.0>, "rationale": "<brief explanation>"}}
 """
 
+_RETRIEVAL_ACCURACY_PROMPT = """You are an expert evaluator measuring RETRIEVAL ACCURACY.
+
+Your job: determine whether the retrieved context is relevant to the question asked.
+
+Question (input):
+{input_json}
+
+Retrieved context:
+{context}
+
+Score the relevance of the context for answering the question:
+- 1.0 = context directly and comprehensively addresses the question; answer fully groundable here
+- 0.5 = context partially relevant; some useful info but significant gaps or off-topic content
+- 0.0 = context is not relevant to the question; retrieval fetched wrong documents
+
+Return ONLY a JSON object on a single line, no prose, no code fences:
+{{"score": <float between 0.0 and 1.0>, "rationale": "<brief explanation>"}}
+"""
+
 
 # ---------------------------------------------------------------------------
 # v0.8 specialist prompts — one per movate-evals category
@@ -1196,6 +1227,7 @@ def _compute_dimensional_means(cases: list[CaseSummary]) -> DimensionalMeans:
         latency=_mean_for("latency"),
         context_compliance=_mean_for("context_compliance"),
         refusal=_mean_for("refusal"),
+        retrieval_accuracy=_mean_for("retrieval_accuracy"),
         # v0.8 additions
         completeness=_mean_for("completeness"),
         tool_usage=_mean_for("tool_usage"),
@@ -1435,6 +1467,7 @@ class EvalEngine:
         accuracy = await self._score_accuracy(case, actual, judge)
 
         faithfulness = DimensionScore()
+        retrieval_accuracy = DimensionScore()
         # Effective grounding: explicit case.grounding takes priority; when
         # absent, fall back to the agent's contexts/ files (already loaded
         # as (name, body) pairs on the bundle).  This lets operators skip the
@@ -1446,8 +1479,9 @@ class EvalEngine:
             else None
         )
         if _effective_grounding:
-            faithfulness = await self._score_faithfulness(
-                case, actual, judge, grounding=_effective_grounding
+            faithfulness, retrieval_accuracy = await asyncio.gather(
+                self._score_faithfulness(case, actual, judge, grounding=_effective_grounding),
+                self._score_retrieval_accuracy(case, judge, grounding=_effective_grounding),
             )
 
         coverage = DimensionScore()
@@ -1510,6 +1544,7 @@ class EvalEngine:
             latency=latency,
             context_compliance=context_compliance,
             refusal=refusal,
+            retrieval_accuracy=retrieval_accuracy,
             completeness=completeness,
             tool_usage=tool_usage,
             workflow_adherence=workflow_adherence,
@@ -1693,6 +1728,41 @@ class EvalEngine:
         prompt = _FAITHFULNESS_PROMPT.format(
             grounding=effective_grounding,
             actual_json=json.dumps(actual),
+        )
+        req = CompletionRequest(
+            provider=judge.model.provider,
+            messages=[Message(role="user", content=prompt)],
+            params=dict(judge.model.params),
+        )
+        judge_response = await self._provider.complete(req)
+        score, rationale = _parse_judge_response(judge_response.text)
+        return DimensionScore(score, rationale)
+
+    async def _score_retrieval_accuracy(
+        self,
+        case: EvalCase,
+        judge: JudgeConfig,
+        *,
+        grounding: str,
+    ) -> DimensionScore:
+        """LLM-judge: how relevant is the retrieved context to the question?
+
+        Scores the retrieval quality — "did we fetch content that actually
+        helps answer this question?" — rather than the output quality.
+        Complements faithfulness (output ↔ context) with context ↔ question.
+
+        Fires whenever grounding content is available (explicit case.grounding
+        or bundle.contexts). Skipped when no judge model is configured.
+        """
+        if judge.model is None:
+            return DimensionScore(
+                None,
+                "skipped: retrieval_accuracy needs a judge model — add evals/judge.yaml",
+            )
+
+        prompt = _RETRIEVAL_ACCURACY_PROMPT.format(
+            input_json=json.dumps(case.input),
+            context=grounding,
         )
         req = CompletionRequest(
             provider=judge.model.provider,

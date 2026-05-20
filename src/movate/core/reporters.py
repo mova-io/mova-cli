@@ -69,7 +69,7 @@ def render_eval_markdown(summary: EvalSummary, *, gate: float) -> str:
     # accuracy is already covered by the headline ``Mean score`` row.
     # Net: legacy datasets keep the exact v0.5 view, no extra noise.
     dm = summary.dimensional_means
-    if any(v is not None for v in (dm.faithfulness, dm.coverage)):
+    if any(v is not None for v in (dm.faithfulness, dm.coverage, dm.retrieval_accuracy)):
         lines.append("**Dimensional breakdown**")
         lines.append("")
         lines.append("| Dimension | Mean |")
@@ -77,6 +77,7 @@ def render_eval_markdown(summary: EvalSummary, *, gate: float) -> str:
         for name, value in (
             ("accuracy", dm.accuracy),
             ("faithfulness", dm.faithfulness),
+            ("retrieval_accuracy", dm.retrieval_accuracy),
             ("coverage", dm.coverage),
             ("latency", dm.latency),
         ):

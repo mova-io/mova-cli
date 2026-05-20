@@ -433,6 +433,11 @@ class _FaithfulnessStubProvider(BaseLLMProvider):
             return CompletionResponse(
                 text='{"score": 1.0, "rationale": "stub-ctx-compliance"}',
             )
+        if "RETRIEVAL ACCURACY" in body:
+            self.faithfulness_prompts.append(body)
+            return CompletionResponse(
+                text=f'{{"score": {self._faithfulness_score}, "rationale": "stub-retrieval-acc"}}',
+            )
         return CompletionResponse(text=self._agent_response)
 
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamChunk]:
@@ -834,3 +839,94 @@ async def test_faithfulness_not_scored_without_grounding_or_contexts(
 
     assert dims.faithfulness.value is None
     assert not provider.faithfulness_prompts, "Faithfulness judge should NOT have been called"
+
+
+# ---------------------------------------------------------------------------
+# PR-FF: retrieval_accuracy dimension
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_retrieval_accuracy_scored_when_contexts_present(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """When bundle.contexts is non-empty, retrieval_accuracy is scored via LLM judge."""
+    ctx_body = "Refunds are processed within 5 business days."
+    agent_dir = _scaffold_with_contexts(
+        tmp_path / "demo", ctx_name="refund-policy", ctx_body=ctx_body
+    )
+
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "how long for refund?"}, "expected": {"message": "5 days"}}\n'
+    )
+    (agent_dir / "evals" / "judge.yaml").write_text(
+        "method: llm_judge\n"
+        "model:\n  provider: anthropic/claude-haiku-4-5-20251001\n"
+        "rubric: 'be strict'\n"
+        "threshold: 0.7\n"
+    )
+    bundle = load_agent(agent_dir)
+
+    provider = _FaithfulnessStubProvider(
+        agent_response='{"message": "5 days"}', faithfulness_score=0.85
+    )
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    dims = summary.cases[0].runs[0].dimensions
+
+    assert dims.retrieval_accuracy.value is not None
+    assert dims.retrieval_accuracy.value == pytest.approx(0.85)
+    # The judge prompt must reference the input so we can confirm the right prompt was sent.
+    retrieval_prompts = [p for p in provider.faithfulness_prompts if "RETRIEVAL ACCURACY" in p]
+    assert retrieval_prompts, "Retrieval accuracy judge was never called"
+    assert "how long for refund?" in retrieval_prompts[0]
+
+
+@pytest.mark.unit
+async def test_retrieval_accuracy_skipped_when_no_contexts_no_grounding(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """No contexts/ and no grounding field → retrieval_accuracy stays None."""
+    agent_dir = _scaffold(tmp_path / "demo")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hi"}, "expected": {"message": "ok"}}\n'
+    )
+    bundle = load_agent(agent_dir)
+
+    provider = _FaithfulnessStubProvider(agent_response='{"message": "ok"}', faithfulness_score=0.9)
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    dims = summary.cases[0].runs[0].dimensions
+
+    assert dims.retrieval_accuracy.value is None
+
+
+@pytest.mark.unit
+async def test_retrieval_accuracy_skipped_when_no_judge_model(
+    tmp_path: Path, pricing: PricingTable, storage, tracer
+) -> None:
+    """Exact-match judge (no model) → retrieval_accuracy stays None even with grounding."""
+    ctx_body = "Policy: no refunds after 30 days."
+    agent_dir = _scaffold_with_contexts(tmp_path / "demo", ctx_name="policy", ctx_body=ctx_body)
+
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "refund policy?"}, "expected": {"message": "30 days"}}\n'
+    )
+    # Exact-match judge — no model key, so judge.model is None.
+    (agent_dir / "evals" / "judge.yaml").write_text("method: exact\nthreshold: 0.7\n")
+    bundle = load_agent(agent_dir)
+
+    provider = _FaithfulnessStubProvider(
+        agent_response='{"message": "30 days"}', faithfulness_score=0.9
+    )
+    executor = _executor(provider, pricing, storage, tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    dims = summary.cases[0].runs[0].dimensions
+
+    assert dims.retrieval_accuracy.value is None
