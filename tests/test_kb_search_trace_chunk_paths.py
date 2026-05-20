@@ -178,7 +178,7 @@ async def test_search_rerank_stage_stamps_chunk_ids(
             rerank=True,
             trace=trace,
         )
-    rerank = next(s for s in trace.stages if s.name == "rerank")
+    rerank = next(s for s in trace.stages if s.name == "rerank[llm]")
     assert rerank.chunk_ids is not None
     assert len(rerank.chunk_ids) == 3
 
