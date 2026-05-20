@@ -247,9 +247,7 @@ async def on_new_thread(action: cl.Action) -> None:
     try:
         thread = await client.create_thread(agent=agent_name)
     except Exception as exc:
-        await cl.Message(
-            content=f"❌ Could not open thread: {type(exc).__name__}: {exc}"
-        ).send()
+        await cl.Message(content=f"❌ Could not open thread: {type(exc).__name__}: {exc}").send()
         return
     thread_id = thread["thread_id"]
     cl.user_session.set("thread_id", thread_id)
@@ -274,9 +272,7 @@ async def on_resume_thread(action: cl.Action) -> None:
     try:
         thread = await client.get_thread(thread_id, include_runs=True)
     except Exception as exc:
-        await cl.Message(
-            content=f"❌ Could not fetch thread: {type(exc).__name__}: {exc}"
-        ).send()
+        await cl.Message(content=f"❌ Could not fetch thread: {type(exc).__name__}: {exc}").send()
         return
     cl.user_session.set("thread_id", thread_id)
     cl.user_session.set("agent_name", thread["agent"])
@@ -303,9 +299,7 @@ async def on_resume_thread(action: cl.Action) -> None:
             if len(out_str) > _TURN_PREVIEW_CHARS:
                 out_str = out_str[: _TURN_PREVIEW_CHARS - 3] + "..."
             lines.append(f"**Turn {i}** — in: `{inp_str}` → out: `{out_str}`")
-    lines.append(
-        "\nSend your next message in JSON and it'll continue this thread."
-    )
+    lines.append("\nSend your next message in JSON and it'll continue this thread.")
     await cl.Message(content="\n".join(lines)).send()
 
 

@@ -267,11 +267,7 @@ def _format_chunk_path(chunk_ids: list[str] | None) -> str:
     if not chunk_ids:
         return "[dim](empty)[/dim]"
     head = [c[:_CHUNK_ID_PREFIX] for c in chunk_ids[:_CHUNK_PATH_TOP_N]]
-    suffix = (
-        f" +{len(chunk_ids) - _CHUNK_PATH_TOP_N}"
-        if len(chunk_ids) > _CHUNK_PATH_TOP_N
-        else ""
-    )
+    suffix = f" +{len(chunk_ids) - _CHUNK_PATH_TOP_N}" if len(chunk_ids) > _CHUNK_PATH_TOP_N else ""
     return ", ".join(head) + suffix
 
 

@@ -167,9 +167,7 @@ def test_list_threads_returns_tenant_scoped_rows(
 
 
 @pytest.mark.integration
-def test_list_threads_filters_by_agent(
-    client: TestClient, auth_header: dict[str, str]
-) -> None:
+def test_list_threads_filters_by_agent(client: TestClient, auth_header: dict[str, str]) -> None:
     client.post("/api/v1/threads", json={"agent": "rag-qa"}, headers=auth_header)
     client.post("/api/v1/threads", json={"agent": "faq"}, headers=auth_header)
     r = client.get("/api/v1/threads?agent=rag-qa", headers=auth_header)
@@ -180,9 +178,7 @@ def test_list_threads_filters_by_agent(
 
 
 @pytest.mark.integration
-def test_list_threads_respects_limit(
-    client: TestClient, auth_header: dict[str, str]
-) -> None:
+def test_list_threads_respects_limit(client: TestClient, auth_header: dict[str, str]) -> None:
     for _ in range(5):
         client.post("/api/v1/threads", json={"agent": "rag-qa"}, headers=auth_header)
     r = client.get("/api/v1/threads?limit=2", headers=auth_header)
@@ -278,17 +274,13 @@ def test_get_thread_include_runs_false_omits_history(
     clients that just want the thread metadata."""
     r = client.post("/api/v1/threads", json={"agent": "rag-qa"}, headers=auth_header)
     thread_id = r.json()["thread_id"]
-    r = client.get(
-        f"/api/v1/threads/{thread_id}?include_runs=false", headers=auth_header
-    )
+    r = client.get(f"/api/v1/threads/{thread_id}?include_runs=false", headers=auth_header)
     assert r.status_code == 200
     assert r.json()["runs"] is None
 
 
 @pytest.mark.integration
-def test_get_thread_404_on_missing(
-    client: TestClient, auth_header: dict[str, str]
-) -> None:
+def test_get_thread_404_on_missing(client: TestClient, auth_header: dict[str, str]) -> None:
     r = client.get("/api/v1/threads/nonexistent", headers=auth_header)
     assert r.status_code == 404
 

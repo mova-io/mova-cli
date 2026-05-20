@@ -221,8 +221,7 @@ async def test_search_trace_includes_rerank_stage_with_overlap(
 ) -> None:
     """rerank=True → trace has a ``rerank`` stage with top_k_overlap."""
     mock_litellm.return_value = _make_resp(
-        '{"rankings": [{"id": 1, "score": 0.9}, '
-        '{"id": 2, "score": 0.7}, {"id": 3, "score": 0.5}]}'
+        '{"rankings": [{"id": 1, "score": 0.9}, {"id": 2, "score": 0.7}, {"id": 3, "score": 0.5}]}'
     )
 
     trace = SearchTrace()
