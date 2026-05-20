@@ -25,6 +25,14 @@ After the executor gets a final output from the LLM, if the agent has
    source references — the model cited a chunk that was never
    retrieved.
 
+5. **OCR-sourced citations (M2b)** — citations that map to chunks
+   extracted via OCR (``KbChunk.ocr=True``) are flagged with a
+   ``ocr_sourced_citations`` violation.  This violation is *always
+   warn-only* regardless of the enforcement level — OCR quality issues
+   are in the source material, not in the model's reasoning, so they
+   never block a run.  Operators use the warning to identify KB docs
+   that need better text extraction.
+
 Design choices
 --------------
 * **Structural only** — we do NOT re-embed or re-query the KB here.
@@ -62,6 +70,11 @@ class GroundingViolation:
     """Machine identifier for the violation type."""
     message: str
     """Human-readable description."""
+    warn_only: bool = False
+    """When True this violation is informational only — it never raises
+    ``GroundingViolationError`` in strict mode.  Used for M2b OCR-source
+    citations where the quality issue is in the source material rather
+    than the model's reasoning."""
 
 
 @dataclass
@@ -85,6 +98,7 @@ def check_grounding(
     *,
     kb_call_count: int = 0,
     max_valid_citation_index: int = 0,
+    ocr_cited_indices: list[int] | None = None,
     enforcement: str = "off",
 ) -> GroundingReport:
     """Run structural grounding checks on *output*.
@@ -103,11 +117,18 @@ def check_grounding(
         ``chunks_found`` across calls).  When > 0, citation indices are
         validated to be ≤ this value.  Pass 0 to skip the range check
         (e.g. when the KB skill output format does not expose a count).
+    ocr_cited_indices:
+        1-based citation indices that map to OCR-extracted KB chunks.
+        When provided, triggers the warn-only ``ocr_sourced_citations``
+        check (Check 6).  Compute via
+        :func:`ocr_cited_indices_from_records`.  Pass ``None`` or ``[]``
+        to skip.
     enforcement:
         ``"off"`` → always returns a passing report (no-op).
         ``"warn"`` → runs checks, returns the report; caller logs and continues.
-        ``"strict"`` → runs checks; if violations found, raises
-        ``GroundingViolationError``.
+        ``"strict"`` → runs checks; if *blocking* violations found, raises
+        ``GroundingViolationError``.  ``warn_only`` violations (e.g. OCR
+        source citations) never block runs regardless of this setting.
 
     Returns
     -------
@@ -122,12 +143,17 @@ def check_grounding(
         output,
         kb_call_count=kb_call_count,
         max_valid_citation_index=max_valid_citation_index,
+        ocr_cited_indices=ocr_cited_indices or [],
     )
     report = GroundingReport(ok=not violations, violations=violations)
 
     if violations and enforcement == "strict":
-        msgs = "; ".join(v.message for v in violations)
-        raise GroundingViolationError(f"grounding check failed: {msgs}")
+        # Only blocking violations raise — warn_only violations (OCR source
+        # quality issues) are informational and never abort a run.
+        blocking = [v for v in violations if not v.warn_only]
+        if blocking:
+            msgs = "; ".join(v.message for v in blocking)
+            raise GroundingViolationError(f"grounding check failed: {msgs}")
 
     return report
 
@@ -142,6 +168,7 @@ def _run_checks(
     *,
     kb_call_count: int,
     max_valid_citation_index: int = 0,
+    ocr_cited_indices: list[int] | None = None,
 ) -> list[GroundingViolation]:
     """Run all check passes; return a flat list of violations."""
     violations: list[GroundingViolation] = []
@@ -222,6 +249,28 @@ def _run_checks(
                 )
             )
 
+    # Check 6 — OCR-sourced citations (M2b, warn-only).
+    # When cited chunks were extracted via OCR, the text quality may be
+    # lower than natively-extracted text. The model reasoning might still
+    # be correct but the source is noisy. Flag as informational (warn_only)
+    # so operators know which citations came from OCR without blocking runs.
+    if citations and ocr_cited_indices:
+        # Only report indices that are actually cited and OCR-sourced.
+        cited_ocr = [c for c in ocr_cited_indices if c in set(citations)]
+        if cited_ocr:
+            violations.append(
+                GroundingViolation(
+                    code="ocr_sourced_citations",
+                    message=(
+                        f"citation(s) {cited_ocr[:5]} reference chunk(s) extracted via OCR — "
+                        "OCR text may contain recognition errors; consider re-ingesting "
+                        "those documents with a higher-quality text extraction method. "
+                        "This violation is informational and does not block the run."
+                    ),
+                    warn_only=True,
+                )
+            )
+
     return violations
 
 
@@ -244,6 +293,54 @@ def kb_call_count_from_records(
         if getattr(sc, "skill", None) == _KB_LOOKUP_SKILL
         and not getattr(sc, "error", None)
     )
+
+
+def ocr_cited_indices_from_records(
+    skill_calls: list[Any],  # list[SkillCallRecord] — avoid circular import
+    citations: list[int] | None,
+) -> list[int]:
+    """Return citation indices (1-based) that map to OCR-extracted chunks.
+
+    Iterates successful ``kb-vector-lookup`` skill calls in order, builds
+    a cumulative chunk list from their ``output["chunks"]``, then checks
+    which cited 1-based indices correspond to chunks where ``ocr=True``.
+
+    Multi-hop support: when multiple KB calls were made the chunks are
+    numbered sequentially across calls (call-1 chunks are 1..N1, call-2
+    chunks are N1+1..N1+N2, ...) — matching the same assumption used by
+    :func:`max_valid_citation_index_from_records`.
+
+    Returns an empty list when *citations* is None or empty, or when no
+    successful KB calls with chunk data exist.
+    """
+    if not citations:
+        return []
+
+    # Build ordered chunk list from all successful KB calls.
+    all_chunks: list[dict[str, Any]] = []
+    for sc in skill_calls:
+        if getattr(sc, "skill", None) != _KB_LOOKUP_SKILL:
+            continue
+        if getattr(sc, "error", None):
+            continue
+        output = getattr(sc, "output", None) or {}
+        chunks = output.get("chunks", [])
+        if isinstance(chunks, list):
+            all_chunks.extend(chunks)
+
+    if not all_chunks:
+        return []
+
+    ocr_indices: list[int] = []
+    for idx in citations:
+        if not isinstance(idx, int) or idx < 1:
+            continue
+        chunk_pos = idx - 1  # convert 1-based citation to 0-based list position
+        if chunk_pos < len(all_chunks):
+            chunk = all_chunks[chunk_pos]
+            if isinstance(chunk, dict) and chunk.get("ocr"):
+                ocr_indices.append(idx)
+    return ocr_indices
 
 
 def max_valid_citation_index_from_records(

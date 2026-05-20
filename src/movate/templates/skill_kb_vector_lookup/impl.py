@@ -134,6 +134,10 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
                 "text": r.chunk.text,
                 "source": r.chunk.source,
                 "score": round(r.score, 4),
+                # Surfaces the OCR flag so the grounding checker can
+                # identify citations that came from OCR-extracted text
+                # and treat their violations as warn-only (M2b).
+                "ocr": r.chunk.ocr,
             }
             for r in results
         ],

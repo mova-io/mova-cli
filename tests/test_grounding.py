@@ -20,6 +20,7 @@ from movate.core.grounding import (
     check_grounding,
     kb_call_count_from_records,
     max_valid_citation_index_from_records,
+    ocr_cited_indices_from_records,
 )
 from movate.core.models import SkillCallRecord
 
@@ -712,3 +713,221 @@ class TestMaxValidCitationIndexFromRecords:
     def test_failed_and_successful_mixed(self) -> None:
         records = [self._kb(5, error="err"), self._kb(3, step=2)]
         assert max_valid_citation_index_from_records(records) == 3
+
+
+# ---------------------------------------------------------------------------
+# Check 6: OCR-sourced citations (M2b, warn-only)
+# ---------------------------------------------------------------------------
+
+
+def _kb_rec_with_chunks(
+    chunks: list[dict],
+    *,
+    step: int = 1,
+) -> SkillCallRecord:
+    """Return a KB SkillCallRecord whose output has explicit chunks list."""
+    return SkillCallRecord(
+        step=step,
+        skill="kb-vector-lookup",
+        input={"query": "q"},
+        output={"chunks": chunks, "chunks_found": len(chunks)},
+    )
+
+
+def _chunk(*, ocr: bool = False) -> dict:
+    return {"text": "some text", "source": "doc.pdf", "score": 0.9, "ocr": ocr}
+
+
+@pytest.mark.unit
+class TestViolationOcrSourcedCitations:
+    """Check 6: OCR-sourced citations fire warn_only violation."""
+
+    def test_no_ocr_chunks_no_violation(self) -> None:
+        output = {"grounded": True, "citations": [1, 2]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            ocr_cited_indices=[],
+            enforcement="warn",
+        )
+        assert report.ok is True
+
+    def test_ocr_chunk_cited_fires_warn_only(self) -> None:
+        output = {"grounded": True, "citations": [1, 2]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            ocr_cited_indices=[1],  # citation 1 maps to an OCR chunk
+            enforcement="warn",
+        )
+        assert report.ok is False
+        ocr_v = next(v for v in report.violations if v.code == "ocr_sourced_citations")
+        assert ocr_v.warn_only is True
+        assert "1" in ocr_v.message
+
+    def test_strict_mode_does_not_raise_for_ocr_only(self) -> None:
+        """OCR violations never raise even under strict enforcement."""
+        output = {"grounded": True, "citations": [2]}
+        # No other violations — grounded=True + citations=[2] + kb_call_count=1 is clean.
+        # Only ocr_cited_indices triggers a violation.
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=3,
+            ocr_cited_indices=[2],
+            enforcement="strict",
+        )
+        assert report.ok is False
+        assert any(v.code == "ocr_sourced_citations" for v in report.violations)
+        # Would have raised GroundingViolationError if warn_only weren't respected.
+
+    def test_strict_mode_raises_when_blocking_violation_present(self) -> None:
+        """When both a blocking violation and OCR warn-only exist, strict still raises."""
+        output = {"grounded": True, "citations": [1]}
+        # grounded_without_kb_call fires (kb_call_count=0) — that's blocking.
+        with pytest.raises(GroundingViolationError):
+            check_grounding(
+                output,
+                kb_call_count=0,
+                ocr_cited_indices=[1],
+                enforcement="strict",
+            )
+
+    def test_multiple_ocr_citations_all_listed(self) -> None:
+        output = {"grounded": True, "citations": [1, 2, 3]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            ocr_cited_indices=[1, 3],
+            enforcement="warn",
+        )
+        ocr_v = next(v for v in report.violations if v.code == "ocr_sourced_citations")
+        assert "1" in ocr_v.message
+        assert "3" in ocr_v.message
+
+    def test_ocr_index_not_in_citations_ignored(self) -> None:
+        """An OCR chunk that isn't actually cited doesn't produce a violation."""
+        output = {"grounded": True, "citations": [2]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            ocr_cited_indices=[1],  # chunk 1 is OCR but citation is [2]
+            enforcement="warn",
+        )
+        assert not any(v.code == "ocr_sourced_citations" for v in report.violations)
+
+    def test_none_ocr_cited_skips_check(self) -> None:
+        output = {"grounded": True, "citations": [1, 2]}
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            ocr_cited_indices=None,
+            enforcement="warn",
+        )
+        assert not any(v.code == "ocr_sourced_citations" for v in report.violations)
+
+
+# ---------------------------------------------------------------------------
+# ocr_cited_indices_from_records helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOcrCitedIndicesFromRecords:
+    """Unit tests for ocr_cited_indices_from_records()."""
+
+    def test_empty_skill_calls_returns_empty(self) -> None:
+        assert ocr_cited_indices_from_records([], [1, 2]) == []
+
+    def test_no_citations_returns_empty(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=True)])
+        assert ocr_cited_indices_from_records([rec], []) == []
+
+    def test_none_citations_returns_empty(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=True)])
+        assert ocr_cited_indices_from_records([rec], None) == []
+
+    def test_non_ocr_chunk_not_flagged(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=False)])
+        assert ocr_cited_indices_from_records([rec], [1]) == []
+
+    def test_ocr_chunk_first_position_flagged(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=True), _chunk(ocr=False)])
+        assert ocr_cited_indices_from_records([rec], [1, 2]) == [1]
+
+    def test_ocr_chunk_second_position_flagged(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=False), _chunk(ocr=True)])
+        assert ocr_cited_indices_from_records([rec], [1, 2]) == [2]
+
+    def test_all_ocr_chunks_all_flagged(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=True), _chunk(ocr=True)])
+        result = ocr_cited_indices_from_records([rec], [1, 2])
+        assert set(result) == {1, 2}
+
+    def test_citation_not_in_cited_list_not_returned(self) -> None:
+        # Chunk 1 is OCR but citations only include [2]
+        rec = _kb_rec_with_chunks([_chunk(ocr=True), _chunk(ocr=False)])
+        assert ocr_cited_indices_from_records([rec], [2]) == []
+
+    def test_multi_hop_cumulative_indexing(self) -> None:
+        """Two KB calls: call-1 chunks 1-2, call-2 chunks 3-4."""
+        rec1 = _kb_rec_with_chunks([_chunk(ocr=False), _chunk(ocr=True)], step=1)
+        rec2 = _kb_rec_with_chunks([_chunk(ocr=True), _chunk(ocr=False)], step=2)
+        result = ocr_cited_indices_from_records([rec1, rec2], [1, 2, 3, 4])
+        assert set(result) == {2, 3}  # chunk 2 (call-1 pos 2) and chunk 3 (call-2 pos 1)
+
+    def test_failed_kb_call_excluded(self) -> None:
+        rec = SkillCallRecord(
+            step=1, skill="kb-vector-lookup", input={},
+            output={"chunks": [_chunk(ocr=True)], "chunks_found": 1},
+            error="timeout",
+        )
+        assert ocr_cited_indices_from_records([rec], [1]) == []
+
+    def test_non_kb_skill_ignored(self) -> None:
+        rec = SkillCallRecord(
+            step=1, skill="calculator", input={},
+            output={"chunks": [_chunk(ocr=True)]},
+        )
+        assert ocr_cited_indices_from_records([rec], [1]) == []
+
+    def test_chunks_without_ocr_field_treated_as_false(self) -> None:
+        rec = _kb_rec_with_chunks([{"text": "t", "source": "s", "score": 0.9}])
+        assert ocr_cited_indices_from_records([rec], [1]) == []
+
+    def test_out_of_range_citation_index_ignored(self) -> None:
+        rec = _kb_rec_with_chunks([_chunk(ocr=True)])
+        # Citation [5] is beyond the 1 chunk returned; should not error, returns []
+        assert ocr_cited_indices_from_records([rec], [5]) == []
+
+
+# ---------------------------------------------------------------------------
+# warn_only field on GroundingViolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestWarnOnlyViolation:
+    """GroundingViolation.warn_only defaults to False; can be set True."""
+
+    def test_default_is_false(self) -> None:
+        v = GroundingViolation(code="grounded_no_citations", message="msg")
+        assert v.warn_only is False
+
+    def test_explicit_true(self) -> None:
+        v = GroundingViolation(code="ocr_sourced_citations", message="msg", warn_only=True)
+        assert v.warn_only is True
+
+    def test_warn_only_violation_never_raises_in_strict(self) -> None:
+        """A GroundingReport with only warn_only violations should not raise."""
+        output = {"grounded": True, "citations": [1]}
+        # Produce only an OCR warn-only violation (kb_call_count=1, range ok).
+        report = check_grounding(
+            output,
+            kb_call_count=1,
+            max_valid_citation_index=2,
+            ocr_cited_indices=[1],
+            enforcement="strict",
+        )
+        assert report.ok is False
+        assert all(v.warn_only for v in report.violations)
