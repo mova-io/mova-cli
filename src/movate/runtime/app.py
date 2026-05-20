@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, File, Request, Response, UploadFile
@@ -421,6 +422,60 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
 # different window can pre-supply ``conversation_history`` in the
 # request body (the endpoint preserves caller-supplied values).
 _THREAD_HISTORY_TURNS = 20
+
+# Char-based budget cap on the injected history (PR-U). 40000 chars
+# ≈ 10k tokens by the 4-chars-per-token rule of thumb. When the
+# turn-count cap above pulls more bytes than this, we drop OLDEST
+# turns first so the most recent context survives. Without this
+# cap, a thread with verbose turns could blow past the model's
+# context window even though the turn count is under the limit.
+#
+# Belt-and-braces: real callers who hit this often should be
+# pre-summarizing older turns via the caller-supplied-wins path
+# rather than relying on raw truncation. The cap just stops the
+# pathological case (single 50KB turn) from breaking everyone else.
+_THREAD_HISTORY_CHAR_BUDGET = 40000
+
+
+def _apply_history_char_budget(
+    turns: list[dict[str, Any]],
+    *,
+    budget: int = _THREAD_HISTORY_CHAR_BUDGET,
+) -> list[dict[str, Any]]:
+    """Trim the OLDEST turns from ``turns`` until total char count
+    fits within ``budget``.
+
+    Most-recent turns survive — they're the highest-value context
+    for the next message. Returns a NEW list (input untouched).
+
+    Char count = ``len(json.dumps(turn))`` for each turn. Approximate
+    by ~4 chars per token; the default 40000-char budget ≈ 10k tokens.
+
+    Empty input or budget>=total → return input unchanged. Single-turn
+    overflow → return a one-element list with that turn (we don't
+    drop the most recent turn to fit budget — better to overflow
+    than send empty history). Operators with consistently huge turns
+    should pre-summarize via the caller-supplied-wins path.
+    """
+    import json  # noqa: PLC0415 — lazy: most requests don't hit the budget
+
+    if not turns:
+        return turns
+    sizes = [len(json.dumps(t, default=str)) for t in turns]
+    total = sum(sizes)
+    if total <= budget:
+        return list(turns)
+    # Drop oldest first. Keep the most recent N that fit; always
+    # keep at least the last turn even if it alone exceeds budget.
+    kept_reverse: list[dict[str, Any]] = []
+    remaining = budget
+    for turn, size in zip(reversed(turns), reversed(sizes), strict=True):
+        if not kept_reverse or remaining - size >= 0:
+            kept_reverse.append(turn)
+            remaining -= size
+        else:
+            break
+    return list(reversed(kept_reverse))
 
 
 def build_app(
@@ -2707,13 +2762,18 @@ def build_app(
         )
         augmented_input = dict(body.input)
         if "conversation_history" not in augmented_input:
-            augmented_input["conversation_history"] = [
+            raw_turns = [
                 {
                     "input": r.input,
                     "output": r.output,
                 }
                 for r in prior_runs
             ]
+            # PR-U: budget-aware truncation — drops OLDEST turns
+            # first when the raw history exceeds the char budget.
+            # Most recent context survives; pathological 50KB-turn
+            # threads no longer break everyone else.
+            augmented_input["conversation_history"] = _apply_history_char_budget(raw_turns)
 
         # Queue the job with the thread linkage. Worker dispatch
         # (``runtime/dispatch.py``) reads ``job.thread_id`` and passes
