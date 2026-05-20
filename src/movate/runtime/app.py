@@ -414,6 +414,15 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
     )
 
 
+# How many prior turns to inject into a threaded message's input
+# under ``conversation_history`` (PR-R). 20 turns at ~500 tokens each
+# is ~10k tokens of context — comfortable for modern models, leaves
+# room for the current input + prompt + output. Operators wanting a
+# different window can pre-supply ``conversation_history`` in the
+# request body (the endpoint preserves caller-supplied values).
+_THREAD_HISTORY_TURNS = 20
+
+
 def build_app(
     storage: StorageProvider,
     *,
@@ -2642,6 +2651,31 @@ def build_app(
         if thread is None:
             raise not_found("thread", thread_id)
 
+        # Inject prior conversation turns into the input dict so the
+        # agent's prompt template can render them via
+        # ``{{ input.conversation_history }}``. Agents that don't
+        # reference the field ignore it (Jinja's StrictUndefined fires
+        # only when an *unused* template variable is missing AND
+        # referenced — here we ADD a variable the schema doesn't
+        # know about, which the templating layer tolerates).
+        #
+        # The pre-existing key wins on collision: if the caller
+        # supplies their own ``conversation_history``, we don't
+        # overwrite it. Lets advanced operators pre-format the
+        # history (e.g. summarize older turns) before submission.
+        prior_runs = await store.list_runs_for_thread(
+            thread_id, tenant_id=ctx.tenant_id, limit=_THREAD_HISTORY_TURNS
+        )
+        augmented_input = dict(body.input)
+        if "conversation_history" not in augmented_input:
+            augmented_input["conversation_history"] = [
+                {
+                    "input": r.input,
+                    "output": r.output,
+                }
+                for r in prior_runs
+            ]
+
         # Queue the job with the thread linkage. Worker dispatch
         # (``runtime/dispatch.py``) reads ``job.thread_id`` and passes
         # it as ``thread_id`` to ``Executor.execute``, which stamps it
@@ -2652,7 +2686,7 @@ def build_app(
             kind=JobKind.AGENT,
             target=thread.agent,
             status=JobStatus.QUEUED,
-            input=body.input,
+            input=augmented_input,
             api_key_id=ctx.api_key_id,
             notify_email=body.notify_email,
             thread_id=thread_id,
