@@ -51,6 +51,10 @@ TEMPLATES: dict[str, str] = {
     "compliance-checker": "compliance_checker_agent",
     # Research agent: topic + sources → executive summary with citations.
     "research-agent": "research_agent",
+    # HR policy agent: employee questions → grounded policy answer +
+    # citations + escalation flag. Multi-format KB (MD, HTML, PDF,
+    # DOCX, images). Best demo of the full KB ingest pipeline.
+    "hr-policy": "hr_policy_agent",
     # --- Skill-using demo templates ---
     # calc-agent: arithmetic agent wired to a Python calculator skill.
     # Ships with the skill impl — demonstrates Python skill kind.

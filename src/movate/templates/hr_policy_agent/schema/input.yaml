@@ -1,0 +1,31 @@
+version: 1
+type: object
+title: HR Policy Question
+description: >
+  An employee's HR policy question plus the retrieved policy chunks
+  that ground the answer. The `context` array is populated by the
+  kb-vector-lookup skill at run time; it can also be passed directly
+  for testing or eval harness scenarios.
+
+fields:
+  question:
+    type: string
+    description: The employee's HR policy question.
+    min_length: 1
+    example: "How many days of PTO do I accrue per year?"
+
+  context:
+    type: list[string]
+    description: >
+      Retrieved HR policy chunks the model must answer from.
+      Each entry is one passage from the company's policy KB.
+      Pass an empty list to force a "not covered in policy" response
+      without retrieval.
+    min_items: 0
+    example:
+      - "Full-time employees accrue 15 days of paid time off per calendar year..."
+      - "PTO accrual begins on the first day of employment for employees hired..."
+
+required:
+  - question
+  - context

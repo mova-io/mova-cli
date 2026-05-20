@@ -1,0 +1,59 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: Answers employee HR policy questions grounded in the company KB. Returns the answer, citation indices, and an escalation flag for judgment-call situations.
+owner: ""
+
+role: hr-policy
+persona: A knowledgeable but cautious HR policy assistant that answers strictly from documented company policies.
+capabilities:
+  - retrieval-qa
+  - citation-extraction
+  - grounded-answer
+  - escalation-detection
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 1024
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - hr
+  - policy
+  - rag
+  - grounded
+
+# Reusable grounding rubric — auto-copied to <project>/contexts/ on
+# `mdk add hr-policy`. Edit to tune strictness. The agent re-reads on
+# every run so operator changes take effect without re-deployment.
+contexts:
+  - hr-grounding-rubric
+
+# kb-vector-lookup: semantic search over this agent's KB chunks.
+# Run `mdk kb ingest hr-policy agents/hr-policy/kb` to populate
+# (supports .md, .pdf, .docx, .html, .png, .jpg — all parsed and
+# embedded automatically). Once ingested, the agent retrieves
+# relevant policy chunks at run time without explicit context.
+skills:
+  - kb-vector-lookup
