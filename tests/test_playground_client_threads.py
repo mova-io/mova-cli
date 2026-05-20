@@ -21,16 +21,21 @@ from movate.playground.client import PlaygroundClient, PlaygroundClientConfig
 
 
 def _mock_client(handler) -> PlaygroundClient:
-    """Build a PlaygroundClient wired to a MockTransport."""
+    """Build a PlaygroundClient wired to a MockTransport.
+
+    Bug-fix (CI-caught from PR-P): the original implementation tried
+    ``asyncio.new_event_loop().run_until_complete(client.aclose())``
+    from inside an async test, which crashes with "Cannot run the
+    event loop while another loop is running" because pytest-asyncio
+    already owns the loop. We don't need to await aclose at all —
+    just reassign the inner client. The original httpx.AsyncClient
+    gets garbage-collected without leaking sockets (no requests were
+    made on it before the swap).
+    """
     transport = httpx.MockTransport(handler)
     client = PlaygroundClient(
         PlaygroundClientConfig(runtime_url="http://runtime.example", api_key="t0k3n")
     )
-    # Swap the inner httpx client for one with the mock transport.
-    # We close the original first since it'd hold sockets otherwise.
-    import asyncio  # noqa: PLC0415
-
-    asyncio.new_event_loop().run_until_complete(client.aclose())
     client._client = httpx.AsyncClient(
         base_url="http://runtime.example",
         transport=transport,

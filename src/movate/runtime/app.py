@@ -2777,9 +2777,16 @@ def build_app(
                     history_char_budget = cfg.history_char_budget
                 break
 
-        prior_runs = await store.list_runs_for_thread(
-            thread_id, tenant_id=ctx.tenant_id, limit=history_turns
+        # Bug fix (CI-caught from PR-W): list_runs_for_thread returns
+        # ASC by created_at, so a small LIMIT here would return the
+        # OLDEST N turns. We want the MOST RECENT N. Fetch a wide
+        # window + slice [-history_turns:] — matches operator expectation
+        # of "show me the last 20 turns of context", not "show me the
+        # first 20 turns the thread ever had".
+        prior_runs_all = await store.list_runs_for_thread(
+            thread_id, tenant_id=ctx.tenant_id, limit=1000
         )
+        prior_runs = prior_runs_all[-history_turns:]
         augmented_input = dict(body.input)
         if "conversation_history" not in augmented_input:
             raw_turns = [
