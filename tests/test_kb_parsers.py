@@ -121,10 +121,11 @@ def test_parse_document_routes_md_to_text() -> None:
 
 @pytest.mark.unit
 def test_parse_document_returns_none_for_unsupported() -> None:
-    # .html / unknown extensions / extensionless / empty filenames.
-    # PR-L moved .docx into supported; test_kb_parsers_docx.py covers it.
-    assert parse_document("doc.html", b"anything") is None
+    # Legacy .doc / unknown extensions / extensionless / empty filenames.
+    # PR-L added .docx; PR-M added .html/.htm (see test_kb_parsers_docx.py
+    # / test_kb_parsers_html.py respectively).
     assert parse_document("legacy.doc", b"anything") is None
+    assert parse_document("data.xml", b"anything") is None
     assert parse_document("noext", b"anything") is None
     assert parse_document("", b"anything") is None
 
@@ -251,9 +252,8 @@ def test_find_files_includes_pdf(tmp_path: object) -> None:
     (root / "a.md").write_text("md content")
     (root / "b.txt").write_text("txt content")
     (root / "c.pdf").write_bytes(_make_pdf_bytes("pdf content"))
-    # Legacy .doc is not in the supported set (PR-L kept it out;
-    # python-docx rejects the binary format). .html is also TBD.
-    (root / "skip.html").write_text("html not supported")
+    # PR-M added .html/.htm; pick .xml as the "not supported" example.
+    (root / "skip.xml").write_text("<root>xml</root>")
 
     found = {p.name for p in find_files(root)}
     assert found == {"a.md", "b.txt", "c.pdf"}

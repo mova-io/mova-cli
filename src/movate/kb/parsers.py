@@ -20,15 +20,19 @@ v0.9 MVP scope:
   ``[ocr]`` extra with tesseract.
 * **DOCX** via python-docx (PR-L) — handles standard Word
   documents. Honors heading levels as paragraph boundaries.
+* **HTML** via readability-lxml + BeautifulSoup (PR-M) — runs
+  Mozilla's Readability algorithm to extract just the main-article
+  content, then strips tags. Right tier for Confluence / Notion /
+  blog exports which carry heavy nav / sidebar / ad chrome.
 * **Markdown / plain text** via UTF-8 decode (already supported
   by the runtime endpoint; included here for unified dispatch).
 
 Out of scope (tracked in BACKLOG §10.6):
 
-* **HTML** — needs readability-lxml to extract main-article content
-  from messy nav/sidebar/ad noise.
 * **Legacy .doc** (binary Word format pre-2007) — python-docx
   rejects these; operators should convert to .docx first.
+* **Scanned-image PDFs / EPUB / PPTX / scanned-image content** —
+  each needs its own parser tier; tackle by demand.
 
 The :class:`DocumentParser` Protocol lays the groundwork for
 per-format entry-point registration when more formats land — but
@@ -55,6 +59,8 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
         ".txt",
         ".pdf",
         ".docx",
+        ".html",
+        ".htm",
     }
 )
 
@@ -271,6 +277,108 @@ def parse_docx(content: bytes) -> str | None:
     return "\n\n".join(paragraphs)
 
 
+def parse_html(content: bytes) -> str | None:
+    """Extract main-article text from HTML via Readability + BeautifulSoup.
+
+    Two-stage pipeline:
+
+    1. **Readability** — runs Mozilla's algorithm against the DOM,
+       extracts the ``<article>`` / main-content block, throws away
+       nav / sidebar / footer / ads. Same heuristic browsers' Reader
+       View uses. This step is the difference between "useful for
+       retrieval" and "garbage with menu items embedded in every
+       chunk".
+    2. **BeautifulSoup strip-tags** on the extracted block, with
+       paragraph-break preservation between block-level elements
+       (``<p>``, ``<h1>``-``<h6>``, ``<li>``, ``<br>``).
+
+    Returns ``None`` if:
+
+    * The bytes don't decode as text (rare — HTML is text-based, but
+      arbitrary binary uploads with a ``.html`` extension hit this).
+    * Readability can't find a main-content block AND the strip-tags
+      fallback produces empty output (e.g. ``<html></html>``).
+
+    Why readability + BeautifulSoup vs alternatives:
+
+    * **Naive strip-all-tags**: keeps the whole page including nav /
+      sidebar / footer junk. Useless for retrieval over real
+      Confluence / Notion exports.
+    * **trafilatura** (~600KB + deps): broader feature set
+      (boilerplate detection, metadata extraction). Right tier for
+      a content-pipeline product, overkill for KB ingest.
+    * **html2text**: produces clean Markdown but ~100KB + slower
+      to extract main content. We don't need Markdown round-trip —
+      plain text feeds the chunker fine.
+    """
+    try:
+        from bs4 import BeautifulSoup  # noqa: PLC0415 — lazy: only paid for HTML uploads
+        from readability import Document  # noqa: PLC0415
+    except ImportError:
+        logger.warning(
+            "readability-lxml or beautifulsoup4 not installed — HTML parsing unavailable. "
+            "Install via: uv pip install readability-lxml beautifulsoup4"
+        )
+        return None
+
+    # Decode bytes. HTML in the wild uses many encodings (latin-1,
+    # cp1252, gbk, ...); try utf-8 first, fall back to latin-1 (which
+    # never fails). The lossy fallback is acceptable because we're
+    # extracting for retrieval, not round-tripping the original.
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("latin-1")
+        except UnicodeDecodeError:
+            return None
+
+    # Stage 1: Readability picks the main-article block.
+    main_html: str
+    try:
+        doc = Document(text)
+        main_html = doc.summary(html_partial=True)
+    except Exception as exc:
+        logger.warning("readability failed: %s; falling back to raw strip", exc)
+        main_html = text
+
+    # Stage 2: BeautifulSoup strip-tags with block-element paragraph
+    # breaks. Replace block-level tags with `\n\n` before text
+    # extraction so paragraphs / headings / list items become natural
+    # chunk boundaries.
+    try:
+        soup = BeautifulSoup(main_html, "html.parser")
+    except Exception as exc:
+        logger.warning("BeautifulSoup failed to parse HTML: %s", exc)
+        return None
+
+    # Drop script / style / noscript outright — even when readability
+    # selects them, they're never useful retrieval content.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    # Insert paragraph breaks before block-level elements so the
+    # chunker's \n\n splitter respects HTML's visual structure.
+    for tag_name in ("p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br", "div"):
+        for tag in soup.find_all(tag_name):
+            tag.insert_before("\n\n")
+
+    raw = soup.get_text()
+    # Collapse runs of whitespace within paragraphs; preserve the
+    # \n\n paragraph boundaries between them.
+    paragraphs: list[str] = []
+    for para in raw.split("\n\n"):
+        # Normalize internal whitespace to single spaces — preserves
+        # readability without keeping HTML's stray tab/newline noise.
+        cleaned = " ".join(para.split())
+        if cleaned:
+            paragraphs.append(cleaned)
+
+    if not paragraphs:
+        return None
+    return "\n\n".join(paragraphs)
+
+
 # Dispatch table — extension → parser. Keeping this at the module
 # bottom lets each parser's docstring sit next to the function for
 # readability. Extending: add the extension to SUPPORTED_EXTENSIONS,
@@ -281,4 +389,6 @@ _PARSERS: dict[str, DocumentParser] = {
     ".txt": parse_text,
     ".pdf": parse_pdf,
     ".docx": parse_docx,
+    ".html": parse_html,
+    ".htm": parse_html,
 }

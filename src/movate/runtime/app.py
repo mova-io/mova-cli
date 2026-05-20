@@ -1581,12 +1581,14 @@ def build_app(
         Supported extensions: ``.md``, ``.markdown``, ``.txt``,
         ``.pdf`` (text-based; scanned-image PDFs need OCR, deferred
         to a future extras flag), ``.docx`` (Word documents; legacy
-        binary .doc not supported — convert to .docx first). Files
-        with unsupported extensions OR parser failures (corrupt PDF,
-        non-UTF-8 text, encrypted PDF, malformed DOCX) get
-        ``status="skipped"`` in the per-file result but the overall
-        upload still returns 200 — the operator sees the mix instead
-        of getting a 400 that blocks the whole batch.
+        binary .doc not supported — convert to .docx first),
+        ``.html`` / ``.htm`` (extracted main-article content via
+        Readability — strips nav / sidebar / ads). Files with
+        unsupported extensions OR parser failures (corrupt PDF,
+        non-UTF-8 text, encrypted PDF, malformed DOCX, empty HTML)
+        get ``status="skipped"`` in the per-file result but the
+        overall upload still returns 200 — the operator sees the
+        mix instead of getting a 400 that blocks the whole batch.
 
         Wraps the same ingest path as ``mdk kb ingest`` (see
         :func:`movate.kb.ingest.ingest_text`); this endpoint exists so

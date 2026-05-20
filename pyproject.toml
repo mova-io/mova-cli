@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.25"
+version = "0.8.2.26"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -38,6 +38,21 @@ dependencies = [
     # malformed / very old .doc (binary) files are rejected with a
     # clean None at the parser layer.
     "python-docx>=1.1,<2",
+    # HTML main-content extraction for KB ingest (PR-M). The naive
+    # approach — strip all tags + return the text — keeps too much
+    # nav / sidebar / ad noise. readability-lxml runs Mozilla's
+    # Readability algorithm against the DOM and extracts just the
+    # main-article body (the same heuristic that powers browser
+    # "Reader View"). Critical for Confluence / Notion / blog
+    # exports which carry heavy chrome around the actual content.
+    # ~30KB; depends on lxml which is already transitive via
+    # python-docx. Strip-tags fallback at the parser layer when
+    # readability can't find a main-content block.
+    "readability-lxml>=0.8,<1",
+    # BeautifulSoup4 is the strip-tags fallback after readability
+    # extracts the main-content HTML. Together they cover the
+    # "messy HTML → plain text" round-trip. ~250KB; same lxml dep.
+    "beautifulsoup4>=4.12,<5",
 ]
 
 [project.optional-dependencies]
@@ -209,6 +224,8 @@ module = [
     "opentelemetry.*",
     "asyncpg.*",
     "chainlit.*",
+    "readability.*",
+    "bs4.*",
 ]
 ignore_missing_imports = true
 
