@@ -85,6 +85,7 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
             "hybrid": bool(getattr(cfg, "hybrid", False)),
             "rewrite_variants": int(getattr(cfg, "rewrite", 0)),
             "rerank": bool(getattr(cfg, "rerank", False)),
+            "rerank_mode": str(getattr(cfg, "rerank_mode", "llm")),
             "multi_hop": int(getattr(cfg, "multi_hop", 0)),
         }
         # PR-W: per-agent override for multi-hop's aggregated-chunks

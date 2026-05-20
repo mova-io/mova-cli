@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.44"
+version = "0.8.2.45"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -68,6 +68,14 @@ runtime = [
     "python-multipart>=0.0.9",
 ]
 langfuse = ["langfuse>=2.30,<3"]
+cross-encoder = [
+    # Local cross-encoder reranker (PR-BB). sentence-transformers pulls
+    # in torch-cpu (~300MB) + huggingface-hub + tokenizers. The model
+    # weights are downloaded from HuggingFace on first use (~67MB for
+    # the default cross-encoder/ms-marco-MiniLM-L-6-v2). Opt-in only
+    # so the vast majority of operators don't pay the disk/memory cost.
+    "sentence-transformers>=2.7,<4",
+]
 otel = [
     "opentelemetry-api>=1.25",
     "opentelemetry-sdk>=1.25",
