@@ -203,6 +203,16 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "Exit 1 if refusal mean is below this threshold."
         ),
     ),
+    gate_retrieval_accuracy: float = typer.Option(
+        None,
+        "--gate-retrieval-accuracy",
+        help=(
+            "Minimum mean retrieval-accuracy score (0.0-1.0) required to pass. "
+            "Only fires when the agent has grounding context (contexts/ files or "
+            "dataset grounding fields) and a judge model. "
+            "Exit 1 if retrieval_accuracy mean is below this threshold."
+        ),
+    ),
     compare: bool = typer.Option(
         False,
         "--compare",
@@ -508,6 +518,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             gate_latency=gate_latency,
             gate_context_compliance=gate_context_compliance,
             gate_refusal=gate_refusal,
+            gate_retrieval_accuracy=gate_retrieval_accuracy,
         )
         return
 
@@ -558,6 +569,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
                 gate_latency=gate_latency,
                 gate_context_compliance=gate_context_compliance,
                 gate_refusal=gate_refusal,
+                gate_retrieval_accuracy=gate_retrieval_accuracy,
                 baseline_file=baseline_file,
                 output_baseline=output_baseline,
                 regression_tolerance=regression_tolerance,
@@ -628,6 +640,7 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             gate_latency=gate_latency,
             gate_context_compliance=gate_context_compliance,
             gate_refusal=gate_refusal,
+            gate_retrieval_accuracy=gate_retrieval_accuracy,
             judge_override=judge_override,
         )
     )
@@ -1898,6 +1911,7 @@ def _eval_all_in_project(
     gate_latency: float | None = None,
     gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
+    gate_retrieval_accuracy: float | None = None,
 ) -> None:
     """Evaluate every agent under ``./agents/`` in the current project.
 
@@ -1988,6 +2002,7 @@ def _eval_all_in_project(
                     gate_latency=gate_latency,
                     gate_context_compliance=gate_context_compliance,
                     gate_refusal=gate_refusal,
+                    gate_retrieval_accuracy=gate_retrieval_accuracy,
                     compact=True,
                 )
             )
@@ -2063,6 +2078,7 @@ async def _run_workflow_eval(  # noqa: PLR0912 — orchestrator mirrors _run_eva
     gate_latency: float | None = None,
     gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
+    gate_retrieval_accuracy: float | None = None,
     baseline_file: Path | None = None,
     output_baseline: Path | None = None,
     regression_tolerance: float = 0.0,
@@ -2190,6 +2206,7 @@ async def _run_workflow_eval(  # noqa: PLR0912 — orchestrator mirrors _run_eva
         gate_latency=gate_latency,
         gate_context_compliance=gate_context_compliance,
         gate_refusal=gate_refusal,
+        gate_retrieval_accuracy=gate_retrieval_accuracy,
     )
 
     failed_gate = not overall_pass
@@ -2218,6 +2235,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     gate_latency: float | None = None,
     gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
+    gate_retrieval_accuracy: float | None = None,
     judge_override: JudgeConfig | None = None,
     compact: bool = False,
 ) -> None:
@@ -2401,6 +2419,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
         gate_latency=gate_latency,
         gate_context_compliance=gate_context_compliance,
         gate_refusal=gate_refusal,
+        gate_retrieval_accuracy=gate_retrieval_accuracy,
     )
 
     # Exit codes: gate failure OR baseline regression OR dim gate all fail.
@@ -2555,7 +2574,13 @@ def _has_extra_dims(means: DimensionalMeans) -> bool:
     """
     return any(
         v is not None
-        for v in (means.faithfulness, means.coverage, means.context_compliance, means.refusal)
+        for v in (
+            means.faithfulness,
+            means.coverage,
+            means.context_compliance,
+            means.refusal,
+            means.retrieval_accuracy,
+        )
     )
 
 
@@ -2583,6 +2608,7 @@ def _emit_dimensional_breakdown(means: DimensionalMeans) -> None:
         ("latency", means.latency, "1.0 within budget, decays to 2x budget"),
         ("context_compliance", means.context_compliance, "output respects context guidelines"),
         ("refusal", means.refusal, "1.0 = agent refused as expected"),
+        ("retrieval_accuracy", means.retrieval_accuracy, "retrieved context relevant to question"),
     ]
     for name, value, note in rows:
         if value is None:
@@ -2599,6 +2625,7 @@ def _check_dimensional_gates(
     gate_latency: float | None,
     gate_context_compliance: float | None = None,
     gate_refusal: float | None = None,
+    gate_retrieval_accuracy: float | None = None,
 ) -> bool:
     """Check per-dimension CI gates. Prints a verdict line for each and
     returns True if any gate failed. Skips silently when the dataset
@@ -2611,6 +2638,7 @@ def _check_dimensional_gates(
         ("latency", gate_latency, means.latency, None),
         ("context_compliance", gate_context_compliance, means.context_compliance, None),
         ("refusal", gate_refusal, means.refusal, "refusal_expected"),
+        ("retrieval_accuracy", gate_retrieval_accuracy, means.retrieval_accuracy, None),
     ]
     for dim_name, threshold, actual, field_hint in _dim_checks:
         if threshold is None:
@@ -2782,6 +2810,7 @@ def _emit_json(
             "faithfulness": _round_or_none(summary.dimensional_means.faithfulness),
             "coverage": _round_or_none(summary.dimensional_means.coverage),
             "latency": _round_or_none(summary.dimensional_means.latency),
+            "retrieval_accuracy": _round_or_none(summary.dimensional_means.retrieval_accuracy),
         },
         "cases": [
             {
@@ -2836,7 +2865,7 @@ def _serialize_dimensions(dims: object) -> dict[str, dict[str, float | str | Non
     file's import surface narrow.
     """
     out: dict[str, dict[str, float | str | None]] = {}
-    for name in ("accuracy", "faithfulness", "coverage", "latency"):
+    for name in ("accuracy", "faithfulness", "coverage", "latency", "retrieval_accuracy"):
         ds = getattr(dims, name)
         out[name] = {
             "value": _round_or_none(ds.value),
