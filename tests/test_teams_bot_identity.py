@@ -23,6 +23,13 @@ from typing import Any
 
 import pytest
 
+# ``cryptography`` is an optional dep (``movate-cli[teams]``).
+# Skip this entire module gracefully when it isn't installed.
+pytest.importorskip(
+    "cryptography",
+    reason="cryptography not installed — install with: uv add 'movate-cli[teams]'",
+)
+
 from movate.core.models import JobStatus
 from movate.runtime.schemas import JobView, RunAccepted, RunView
 from movate.teams_bot.activity import Activity

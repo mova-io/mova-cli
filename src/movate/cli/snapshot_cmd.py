@@ -288,6 +288,8 @@ def show(
         f"[bold]agents:[/bold]    {manifest.agent_count}\n"
         f"[bold]workflows:[/bold] {manifest.workflow_count}\n"
     )
+    if manifest.git_sha:
+        body += f"[bold]git sha:[/bold]   {manifest.git_sha}\n"
     if manifest.description:
         body += f"[bold]desc:[/bold]      {manifest.description}\n"
     body += (

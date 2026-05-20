@@ -45,6 +45,7 @@ from movate.snapshot.manifest import (
     FileEntry,
     SnapshotManifest,
     SnapshotManifestError,
+    _git_short_sha,
     compute_snapshot_hash,
     load_manifest,
     now_iso8601,
@@ -166,6 +167,7 @@ def create_snapshot(
         files=files,
         agent_count=agent_count,
         workflow_count=workflow_count,
+        git_sha=_git_short_sha(cwd=project_root),
         extras=extras_dict,
     )
 

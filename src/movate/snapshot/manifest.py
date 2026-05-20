@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,6 +77,10 @@ class SnapshotManifest:
     files: tuple[FileEntry, ...]
     agent_count: int
     workflow_count: int = 0
+    git_sha: str = ""
+    """Short git SHA of HEAD at capture time, or ``""`` when not in a
+    git repo or git is not on PATH. Populated by :func:`_git_short_sha`
+    using a subprocess call — zero extra deps, fails gracefully."""
     extras: dict[str, str] = field(default_factory=dict)
 
     def to_yaml(self) -> str:
@@ -99,9 +105,40 @@ class SnapshotManifest:
             "project_root": self.project_root,
             "agent_count": self.agent_count,
             "workflow_count": self.workflow_count,
+            "git_sha": self.git_sha,
             "files": [{"path": f.path, "sha256": f.sha256, "size": f.size} for f in self.files],
             "extras": dict(self.extras),
         }
+
+
+def _git_short_sha(cwd: Path | None = None) -> str:
+    """Return the short git SHA of HEAD, or ``""`` when unavailable.
+
+    Fails gracefully when:
+    * ``git`` is not on PATH
+    * the directory is not inside a git repo (git exits non-zero)
+    * any subprocess / OS error occurs
+
+    Uses ``cwd`` as the working directory for the git command so the
+    snapshot captures the SHA of the project's own repo, not wherever
+    the Python process happens to be running from.
+    """
+    if shutil.which("git") is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            cwd=cwd,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 def compute_snapshot_hash(
@@ -215,5 +252,6 @@ def load_manifest(path: str | Path) -> SnapshotManifest:
         files=tuple(files),
         agent_count=int(raw["agent_count"]),
         workflow_count=int(raw.get("workflow_count") or 0),
+        git_sha=str(raw.get("git_sha") or ""),
         extras=dict(raw.get("extras") or {}),
     )
