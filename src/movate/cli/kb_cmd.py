@@ -207,6 +207,7 @@ def _print_trace_table(trace: object) -> None:
     table.add_column("stage", style="cyan", no_wrap=True)
     table.add_column("latency", justify="right", style="bold")
     table.add_column("in → out", justify="right", style="dim")
+    table.add_column("top chunks", overflow="fold", max_width=40)
     table.add_column("details", overflow="fold")
 
     stages = getattr(trace, "stages", []) or []
@@ -218,6 +219,10 @@ def _print_trace_table(trace: object) -> None:
             io = f"{stage.input_count} → {stage.output_count}"
         else:
             io = f"→ {stage.output_count}"
+        # Per-chunk path (PR-S). Operators can read down the column
+        # to see which chunks survived each stage; "where did chunk X
+        # drop out?" is now answerable by inspection.
+        chunk_path = _format_chunk_path(stage.chunk_ids)
         # Compact the details dict into one line. Skip noisy
         # internals (full variant lists, full sub-query strings).
         details_str = _format_stage_details(stage.details)
@@ -225,6 +230,7 @@ def _print_trace_table(trace: object) -> None:
             stage.name,
             f"{stage.duration_ms:.1f}ms",
             io,
+            chunk_path,
             details_str,
         )
 
@@ -235,11 +241,38 @@ def _print_trace_table(trace: object) -> None:
         f"[bold]{total_ms:.1f}ms[/bold]",
         "",
         "",
+        "",
     )
     stdout.print(table)
 
 
 _MAX_DETAILS_LEN = 80
+# Per-stage chunk-path summary cap. Showing more than the top N
+# chunk-id prefixes per stage spams the table; the full list is
+# still on the trace object for programmatic readers.
+_CHUNK_PATH_TOP_N = 3
+_CHUNK_ID_PREFIX = 8
+
+
+def _format_chunk_path(chunk_ids: list[str] | None) -> str:
+    """Render a stage's chunk-id list compactly for the trace table.
+
+    Shows the first ``_CHUNK_PATH_TOP_N`` chunk ids (truncated to
+    ``_CHUNK_ID_PREFIX`` chars each) with a "+N more" tail when
+    the stage produced more. ``None`` (the rewriter and other
+    non-chunk stages) renders as a placeholder.
+    """
+    if chunk_ids is None:
+        return "[dim]—[/dim]"
+    if not chunk_ids:
+        return "[dim](empty)[/dim]"
+    head = [c[:_CHUNK_ID_PREFIX] for c in chunk_ids[:_CHUNK_PATH_TOP_N]]
+    suffix = (
+        f" +{len(chunk_ids) - _CHUNK_PATH_TOP_N}"
+        if len(chunk_ids) > _CHUNK_PATH_TOP_N
+        else ""
+    )
+    return ", ".join(head) + suffix
 
 
 def _format_stage_details(details: dict[str, object]) -> str:

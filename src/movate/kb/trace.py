@@ -57,6 +57,14 @@ class StageRecord:
     going in and coming out. For stages with no meaningful input
     (the first retrieve), input is 0. The total across stages tells
     the operator how the candidate pool widened / narrowed.
+
+    ``chunk_ids`` records the ORDERED list of chunk identifiers that
+    each stage produced (PR-S). Lets an operator answer "where did
+    chunk X drop out?" by reading down the stages and noting the
+    first stage from which X is absent. ``None`` means the stage
+    doesn't surface chunks (e.g. the rewriter, whose output is
+    query variants, not chunks); empty list means the stage ran
+    but produced no chunks.
     """
 
     name: str
@@ -64,6 +72,7 @@ class StageRecord:
     input_count: int = 0
     output_count: int = 0
     details: dict[str, Any] = field(default_factory=dict)
+    chunk_ids: list[str] | None = None
 
 
 @dataclass
@@ -96,12 +105,17 @@ class SearchTrace:
         input_count: int = 0,
         output_count: int = 0,
         details: dict[str, Any] | None = None,
+        chunk_ids: list[str] | None = None,
     ) -> None:
         """Append a stage record. Caller owns the timing measurement.
 
         Used when the caller has already timed the operation
         externally (e.g. the rewriter returns + we measured the LLM
         call separately).
+
+        ``chunk_ids`` (optional) records the ORDERED chunk ids the
+        stage produced (PR-S). Pass ``None`` for stages that don't
+        produce chunks (e.g. the rewriter).
         """
         self.stages.append(
             StageRecord(
@@ -110,6 +124,7 @@ class SearchTrace:
                 input_count=input_count,
                 output_count=output_count,
                 details=dict(details or {}),
+                chunk_ids=list(chunk_ids) if chunk_ids is not None else None,
             )
         )
 
@@ -138,10 +153,19 @@ class _StageTimer:
     """Internal context manager returned by :meth:`SearchTrace.time`.
 
     Mutate ``self.output_count`` / ``self.input_count`` / ``self.details``
-    inside the body to attach those to the recorded stage.
+    / ``self.chunk_ids`` inside the body to attach those to the
+    recorded stage.
     """
 
-    __slots__ = ("_name", "_start", "_trace", "details", "input_count", "output_count")
+    __slots__ = (
+        "_name",
+        "_start",
+        "_trace",
+        "chunk_ids",
+        "details",
+        "input_count",
+        "output_count",
+    )
 
     def __init__(self, trace: SearchTrace, name: str, initial_details: dict[str, Any]) -> None:
         self._trace = trace
@@ -150,6 +174,7 @@ class _StageTimer:
         self.input_count = 0
         self.output_count = 0
         self.details: dict[str, Any] = dict(initial_details)
+        self.chunk_ids: list[str] | None = None
 
     def __enter__(self) -> _StageTimer:
         self._start = time.perf_counter()
@@ -166,4 +191,5 @@ class _StageTimer:
             input_count=self.input_count,
             output_count=self.output_count,
             details=self.details,
+            chunk_ids=self.chunk_ids,
         )
