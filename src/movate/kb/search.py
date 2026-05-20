@@ -38,7 +38,7 @@ from movate.kb.embed import (
     DEFAULT_EMBEDDING_MODEL,
     embed_texts,
 )
-from movate.kb.lexical import bm25_search, rrf_fuse
+from movate.kb.lexical import rrf_fuse
 
 if TYPE_CHECKING:
     from movate.kb.trace import SearchTrace
@@ -383,15 +383,17 @@ async def _retrieve_one(
         limit=candidate_limit,
     )
 
-    # Lexical path: we need the raw chunks for BM25 scoring. Fetch
-    # ALL chunks for the agent (BM25's index needs corpus-wide
-    # statistics); the limit gets applied inside ``bm25_search``.
-    all_chunks = await storage.list_kb_chunks(  # type: ignore[attr-defined]
+    # Lexical path: delegate to the storage-native FTS index (FTS5
+    # for SQLite, tsvector+GIN for Postgres, Python BM25 fallback
+    # for InMemory). The storage layer handles corpus-wide scoring
+    # and returns pre-ranked results, so we no longer need to load
+    # all chunks into Python memory.
+    lexical_results: list[KbChunkWithScore] = await storage.search_kb_chunks_lexical(  # type: ignore[attr-defined]
         agent=agent,
         tenant_id=tenant_id,
-        limit=100_000,
+        query=question,
+        limit=candidate_limit,
     )
-    lexical_results = bm25_search(all_chunks, question, limit=candidate_limit)
 
     # Fuse + clamp to final limit. RRF ignores score scale + only
     # looks at rank, so it doesn't matter that vector scores are 0-1

@@ -376,6 +376,20 @@ class InMemoryStorage:
         chunks = [c for c in self.kb_chunks if c.agent == agent and c.tenant_id == tenant_id]
         return _rank_chunks_by_cosine(chunks, query_embedding, limit)
 
+    async def search_kb_chunks_lexical(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        """Python BM25 fallback — InMemory has no native FTS index."""
+        from movate.kb.lexical import bm25_search  # noqa: PLC0415
+
+        chunks = [c for c in self.kb_chunks if c.agent == agent and c.tenant_id == tenant_id]
+        return bm25_search(chunks, query, limit=limit)
+
     async def list_kb_chunks(
         self,
         *,

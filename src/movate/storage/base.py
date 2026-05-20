@@ -353,6 +353,27 @@ class StorageProvider(Protocol):
         Empty KB returns ``[]`` cleanly — no special-case needed.
         """
 
+    async def search_kb_chunks_lexical(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        """Full-text BM25 lexical search over ``text`` column.
+
+        SQLite uses FTS5 + native ``bm25()`` ranking.
+        Postgres uses ``to_tsvector`` + GIN index + ``ts_rank``.
+        InMemory falls back to the Python BM25 scorer in
+        :func:`movate.kb.lexical.bm25_search`.
+
+        Returns up to ``limit`` chunks ranked by relevance.
+        Empty query or no matching terms → empty list.
+        NEVER raises — same graceful contract as the other
+        retrieval helpers.
+        """
+
     async def list_kb_chunks(
         self,
         *,

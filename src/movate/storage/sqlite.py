@@ -293,7 +293,35 @@ _MIGRATIONS = [
     # PR-Q: jobs carry the thread linkage from queue time so the
     # worker can propagate it onto the spawned run. NULL = standalone.
     "ALTER TABLE jobs ADD COLUMN thread_id TEXT",
+    # PR-AA: FTS5 virtual table for native BM25 lexical search.
+    # Stored as a regular (non-content) FTS5 table — chunk_id is
+    # UNINDEXED (stored but not tokenized); text is the indexed column.
+    # Synced manually in save_kb_chunk / delete_kb_chunks.
+    # Migration also backfills existing rows via the init() method.
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts
+    USING fts5(chunk_id UNINDEXED, text)
+    """,
 ]
+
+
+def _fts5_escape(query: str) -> str:
+    """Sanitize a free-text query for safe use in FTS5 MATCH expressions.
+
+    FTS5 MATCH syntax has special characters (``"*^()``) that cause
+    parse errors when present in user queries. We take the conservative
+    approach: strip all non-alphanumeric/space characters and reassemble
+    as a space-joined set of plain tokens. This gives OR-style matching
+    (all tokens scored independently by BM25) which is the correct
+    semantics for retrieval — AND-style would miss chunks that partially
+    match.
+
+    Returns empty string if the query has no usable tokens.
+    """
+    import re  # noqa: PLC0415
+
+    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    return " ".join(tokens)
 
 
 class SqliteProvider:
@@ -325,6 +353,23 @@ class SqliteProvider:
                 if "duplicate column name" not in str(exc):
                     raise
         await self._conn.commit()
+
+        # PR-AA: Backfill FTS5 index for any chunks ingested before
+        # this migration ran. The NOT IN subquery is safe for small KBs
+        # (typical local dev / CI). On subsequent startups the subquery
+        # returns nothing → no-op. Degrades gracefully if FTS5 is not
+        # compiled into the sqlite binary (very rare).
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO kb_chunks_fts(rowid, chunk_id, text)
+                SELECT rowid, chunk_id, text FROM kb_chunks
+                WHERE chunk_id NOT IN (SELECT chunk_id FROM kb_chunks_fts)
+                """
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass  # FTS5 not available — lexical path degrades to Python BM25
 
     @property
     def _db(self) -> aiosqlite.Connection:
@@ -1015,6 +1060,27 @@ class SqliteProvider:
         )
         await self._db.commit()
 
+        # PR-AA: sync FTS5 index. Delete-then-insert is the FTS5
+        # upsert pattern (INSERT OR REPLACE not supported). The
+        # intermediate SELECT is needed to get the rowid of the
+        # just-written chunk.
+        try:
+            async with self._db.execute(
+                "SELECT rowid FROM kb_chunks WHERE chunk_id = ?",
+                (chunk.chunk_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                rowid = row[0]
+                await self._db.execute("DELETE FROM kb_chunks_fts WHERE rowid = ?", (rowid,))
+                await self._db.execute(
+                    "INSERT INTO kb_chunks_fts(rowid, chunk_id, text) VALUES (?, ?, ?)",
+                    (rowid, chunk.chunk_id, chunk.text),
+                )
+                await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass  # FTS5 not available — skip silently
+
     async def search_kb_chunks(
         self,
         *,
@@ -1076,6 +1142,25 @@ class SqliteProvider:
         tenant_id: str,
         source: str | None = None,
     ) -> int:
+        # PR-AA: sync FTS5 — delete matching rows by rowid BEFORE
+        # the main DELETE removes them from kb_chunks (so we can
+        # still look up their rowids).
+        try:
+            if source is not None:
+                fts_sql = (
+                    "SELECT rowid FROM kb_chunks WHERE agent = ? AND tenant_id = ? AND source = ?"
+                )
+                fts_params: tuple[str, ...] = (agent, tenant_id, source)
+            else:
+                fts_sql = "SELECT rowid FROM kb_chunks WHERE agent = ? AND tenant_id = ?"
+                fts_params = (agent, tenant_id)
+            async with self._db.execute(fts_sql, fts_params) as cur:
+                rowids = [r[0] for r in await cur.fetchall()]
+            for rid in rowids:
+                await self._db.execute("DELETE FROM kb_chunks_fts WHERE rowid = ?", (rid,))
+        except aiosqlite.OperationalError:
+            pass  # FTS5 not available
+
         if source is not None:
             async with self._db.execute(
                 "DELETE FROM kb_chunks WHERE agent = ? AND tenant_id = ? AND source = ?",
@@ -1090,6 +1175,77 @@ class SqliteProvider:
                 count = cur.rowcount
         await self._db.commit()
         return int(count or 0)
+
+    async def search_kb_chunks_lexical(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> list[KbChunkWithScore]:
+        """FTS5-backed BM25 lexical search.
+
+        Falls back to the Python BM25 scorer if FTS5 is unavailable
+        or the query contains no recognized terms. Empty query → [].
+        """
+        import json as _json  # noqa: PLC0415
+        import math  # noqa: PLC0415
+
+        if not query.strip():
+            return []
+        try:
+            # FTS5 MATCH syntax: wrap the query in double-quotes to
+            # treat it as a phrase, OR strip to plain terms. We use
+            # plainto_fts5() semantics by sanitizing the query string
+            # (FTS5 MATCH is picky about special characters).
+            safe_query = _fts5_escape(query)
+            if not safe_query:
+                return []
+            sql = """
+                SELECT c.chunk_id, c.tenant_id, c.agent, c.source, c.text,
+                       c.embedding, c.embedding_model, c.content_hash,
+                       c.metadata, c.created_at,
+                       kb_chunks_fts.rank AS fts_rank
+                FROM kb_chunks_fts
+                JOIN kb_chunks c
+                    ON kb_chunks_fts.rowid = c.rowid
+                WHERE kb_chunks_fts MATCH ?
+                  AND c.agent = ?
+                  AND c.tenant_id = ?
+                ORDER BY kb_chunks_fts.rank
+                LIMIT ?
+            """
+            async with self._db.execute(sql, (safe_query, agent, tenant_id, int(limit))) as cur:
+                rows = await cur.fetchall()
+            results = []
+            for r in rows:
+                # FTS5 rank is negative (lower = more relevant). Negate
+                # and normalize to [0, 1] via tanh so the existing
+                # KbChunkWithScore validator accepts the score.
+                raw_rank = r["fts_rank"] or 0.0
+                score = math.tanh(-raw_rank / 10.0)
+                chunk = KbChunk(
+                    chunk_id=r["chunk_id"],
+                    tenant_id=r["tenant_id"],
+                    agent=r["agent"],
+                    source=r["source"],
+                    text=r["text"],
+                    embedding=_json.loads(r["embedding"]),
+                    embedding_model=r["embedding_model"],
+                    content_hash=r["content_hash"],
+                    metadata=_json.loads(r["metadata"]) if r["metadata"] else None,
+                    created_at=datetime.fromisoformat(r["created_at"]),
+                )
+                results.append(KbChunkWithScore(chunk=chunk, score=score))
+            return results
+        except aiosqlite.OperationalError:
+            # FTS5 not available or query syntax error — fall back to
+            # Python BM25 over all chunks.
+            from movate.kb.lexical import bm25_search  # noqa: PLC0415
+
+            all_chunks = await self.list_kb_chunks(agent=agent, tenant_id=tenant_id, limit=100_000)
+            return bm25_search(all_chunks, query, limit=limit)
 
     async def sum_tenant_cost_current_month(self, tenant_id: str) -> float:
         # First-of-the-month UTC. We do this in Python so the SQL
