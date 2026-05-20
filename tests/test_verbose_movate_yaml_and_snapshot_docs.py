@@ -27,14 +27,6 @@ from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)
 
-# PR #78's verbose movate.yaml + .movate/README.md content didn't
-# survive the May-2026 stack cascade cleanly (post-PR #87 the
-# template was further trimmed). Skip until the verbose-content
-# blocks are re-landed (chip filed).
-pytestmark = pytest.mark.skip(
-    reason="PR #78 verbose content incomplete on main (May-2026 cascade); chip filed."
-)
-
 
 def _bootstrap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Bootstrap a fresh project, chdir in, return project root."""
@@ -62,7 +54,7 @@ class TestVerboseMovateYaml:
         from movate.core.config import ProjectConfig  # noqa: PLC0415
 
         proj = _bootstrap(tmp_path, monkeypatch)
-        data = yaml.safe_load((proj / "movate.yaml").read_text())
+        data = yaml.safe_load((proj / "project.yaml").read_text())
         cfg = ProjectConfig.model_validate(data)
         # Headline fields still present.
         assert cfg.agents_dir == "./agents"
@@ -76,7 +68,7 @@ class TestVerboseMovateYaml:
         commented-out as a 'how to enable' example. Operators get a
         survey of the surface area without leaving the file."""
         proj = _bootstrap(tmp_path, monkeypatch)
-        body = (proj / "movate.yaml").read_text()
+        body = (proj / "project.yaml").read_text()
         for marker in (
             "defaults:",  # active
             "# policy:",  # commented-out example
@@ -94,7 +86,7 @@ class TestVerboseMovateYaml:
         comments so operators understand what gets created when they
         start running commands."""
         proj = _bootstrap(tmp_path, monkeypatch)
-        body = (proj / "movate.yaml").read_text()
+        body = (proj / "project.yaml").read_text()
         # The doc block mentions the directory.
         assert ".movate/" in body
         assert "snapshots/" in body
@@ -109,7 +101,7 @@ class TestVerboseMovateYaml:
         Verbose form is 100+. Floor at 80 to catch accidental
         truncation regressions while leaving wording flexibility."""
         proj = _bootstrap(tmp_path, monkeypatch)
-        body = (proj / "movate.yaml").read_text()
+        body = (proj / "project.yaml").read_text()
         line_count = len(body.splitlines())
         assert line_count >= 80, (
             f"movate.yaml is {line_count} lines; expected ≥80 for the verbose template"

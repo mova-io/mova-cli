@@ -30,14 +30,6 @@ import pytest
 
 from movate.templates import get_template_path
 
-# PR #77's verbose role-agent prompts didn't survive the May-2026 stack
-# cascade cleanly — the template prompt.md files on main are the leaner
-# pre-#77 versions. Skip until the curated prompts are re-landed
-# (chip filed).
-pytestmark = pytest.mark.skip(
-    reason="PR #77 verbose prompts incomplete on main (May-2026 cascade); chip filed."
-)
-
 # Demo-flow templates this bundle targets. Each must contain ALL the
 # structural markers. Adding a new role template to this list is the
 # explicit opt-in for the verbose-prompt contract.
@@ -120,21 +112,31 @@ class TestPromptsStillValidate:
         self,
         template: str,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Scaffold the template into a tmpdir and round-trip through
-        `load_agent` — same path `mdk add` would take. Catches Jinja
-        syntax errors + schema-vs-prompt mismatches at template-
-        ship time."""
-        import shutil  # noqa: PLC0415
+        """Scaffold the template into a project via `mdk init --project +
+        mdk add` and round-trip through `load_agent`.
 
+        The bare `shutil.copytree` approach fails for templates that
+        declare `skills:` — `load_agent` needs the project's skill
+        registry, which `mdk add` populates. Using the realistic CLI
+        flow also catches any breakage introduced by the add-cmd's
+        context/skill auto-scaffold logic.
+        """
+        from typer.testing import CliRunner  # noqa: PLC0415
+
+        from movate.cli.main import app  # noqa: PLC0415
         from movate.core.loader import load_agent  # noqa: PLC0415
 
-        template_dir = get_template_path(template)
-        dest = tmp_path / template
-        shutil.copytree(template_dir, dest)
-        # __AGENT_NAME__ substitution (mirrors _init_agent's behavior).
-        yaml_path = dest / "agent.yaml"
-        yaml_path.write_text(yaml_path.read_text().replace("__AGENT_NAME__", template))
+        cli = CliRunner(mix_stderr=False)
+        monkeypatch.chdir(tmp_path)
+        r = cli.invoke(app, ["init", "--project", "proj", "--skip-snapshot"])
+        assert r.exit_code == 0, r.stdout + r.stderr
+        project = tmp_path / "proj"
+        monkeypatch.chdir(project)
+        r = cli.invoke(app, ["add", template])
+        assert r.exit_code == 0, r.stdout + r.stderr
+        agent_dir = project / "agents" / template
         # If this raises, the verbose prompt broke the template.
-        bundle = load_agent(dest)
+        bundle = load_agent(agent_dir)
         assert bundle.spec.name == template

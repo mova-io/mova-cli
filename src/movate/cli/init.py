@@ -396,6 +396,61 @@ The per-agent version wins for that one agent. `mdk doctor agent
 """
 
 
+_MOVATE_STATE_README = """\
+# `.movate/` — Runtime State Directory
+
+This directory is created and managed by `mdk`. It holds runtime state
+that is intentionally separate from your source-controlled agent
+definitions.
+
+## What lives here
+
+```
+.movate/
+├── local.db           — SQLite: run history, eval results, failures
+├── snapshots/         — content-addressed snapshots of project state
+│   └── <sha256>/      — immutable: agent.yaml + prompt.md + schemas
+│       ├── manifest.json
+│       └── <files...>
+└── baselines/         — eval baselines stored by `mdk eval --baseline`
+```
+
+## Snapshots — the central operational primitive
+
+Snapshots are **content-addressed** and **immutable**: the directory
+name IS the SHA-256 of the manifest, so re-snapshotting identical
+state produces the same hash. They record exactly what shipped — agent
+definitions, prompts, and schemas — at the moment you captured them.
+
+Key commands:
+
+| Command | What it does |
+|---|---|
+| `mdk snapshot create` | Capture current project state |
+| `mdk diff <a> <b>` | What changed between two snapshots? |
+| `mdk rollback <hash>` | Restore project state to a prior snapshot |
+| `mdk audit` | Scan snapshots for drift or dangling refs |
+| `mdk promote --from <hash>` | Copy a tested snapshot dev → staging |
+
+## `.gitignore` policy
+
+The project `.gitignore` ships with these entries:
+
+```
+.movate/local.db          # machine-local run history
+.movate/baselines/        # machine-local eval baselines
+# .movate/snapshots/      # UNCOMMENT to treat snapshots as machine-local
+```
+
+`local.db` is always gitignored — it contains run history and
+credentials that must not go into source control. Snapshots are
+tracked by default so your repo carries a verifiable history of
+"what shipped when". Uncomment the `snapshots/` entry if you prefer
+to treat them as machine-local (e.g. you use a separate artifact
+store for snapshot archival).
+"""
+
+
 _KB_README = """\
 # `kb/` — Knowledge Assets
 
@@ -633,6 +688,15 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
     (project_root / "kb" / "README.md").write_text(_KB_README)
     (project_root / "contexts" / "README.md").write_text(_CONTEXTS_README)
     (project_root / "skills" / "README.md").write_text(_SKILLS_README)
+
+    # Bootstrap the .movate/ runtime-state directory and land a README
+    # explaining it. Operators who poke into .movate/ wondering "what is
+    # this?" find the answer in-place. The snapshot sub-command creates
+    # the full tree; we create the top-level dir here so the README
+    # exists even when --skip-snapshot is passed.
+    movate_state_dir = project_root / ".movate"
+    movate_state_dir.mkdir(exist_ok=True)
+    (movate_state_dir / "README.md").write_text(_MOVATE_STATE_README)
 
     # Initial snapshot — operators get a baseline for diff / rollback.
     snapshot_short: str | None = None
