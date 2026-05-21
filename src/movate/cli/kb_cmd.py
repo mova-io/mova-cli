@@ -404,6 +404,11 @@ def kb_root(ctx: typer.Context) -> None:
 # is reachable by `mdk run` later without per-call tenant juggling.
 _DEFAULT_TENANT = "local"
 
+# HTTP status codes used by the --target remote-upload path.
+_HTTP_OK = 200
+_HTTP_UNAUTHORIZED = 401
+_HTTP_NOT_FOUND = 404
+
 # Chunk-text truncation in the search table — keeps the table
 # readable without losing too much context. ``--full`` overrides.
 _CHUNK_PREVIEW_CHARS = 200
@@ -448,6 +453,119 @@ def _estimate_embedding_cost(files: list[Path]) -> float:
             pass
     est_tokens = total_chars / 4
     return est_tokens * 0.02 / 1_000_000
+
+
+def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> None:
+    """Upload KB docs to a deployed runtime's ``POST /api/v1/agents/<name>/kb``.
+
+    The runtime parses + embeds server-side into its own storage backend
+    (Azure Postgres in prod), so this needs no local embedding key or DB
+    connection — just the target's URL + bearer. We only filter the files
+    by supported extension client-side; the runtime does the parsing.
+    """
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
+    from movate.kb.parsers import is_supported_extension  # noqa: PLC0415
+
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        err_console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    if not api_key:
+        err_console.print(
+            f"[red]✗[/red] env var [bold]${target_cfg.key_env}[/bold] is empty — "
+            f"needed to authenticate to [bold]{target_name}[/bold]. "
+            f"Run [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    # Discover supported files under `path` (the runtime parses them; we
+    # only filter by extension so we don't upload junk). Hidden dirs skipped.
+    if path.is_file():
+        candidates = [path]
+    else:
+        candidates = [
+            p
+            for p in sorted(path.rglob("*"))
+            if p.is_file()
+            and not any(part.startswith(".") for part in p.relative_to(path).parts)
+        ]
+    uploadable = [p for p in candidates if is_supported_extension(p.name)]
+    if not uploadable:
+        err_console.print(
+            f"[yellow]⚠[/yellow] no supported KB files under [bold]{path}[/bold] "
+            "(.md/.txt/.pdf/.docx/.html/images)."
+        )
+        raise typer.Exit(code=2)
+
+    base_url = target_cfg.url.rstrip("/")
+    endpoint = f"{base_url}/api/v1/agents/{agent}/kb"
+
+    if dry_run:
+        console.print(
+            f"[bold]Would upload {len(uploadable)} file(s)[/bold] to {endpoint}:"
+        )
+        for p in uploadable:
+            console.print(f"  • {p.name}")
+        console.print("[dim](dry-run — nothing uploaded)[/dim]")
+        return
+
+    files = [
+        ("files", (p.name, p.read_bytes(), "application/octet-stream")) for p in uploadable
+    ]
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
+            resp = client.post(endpoint, files=files, headers=headers)
+    except httpx.HTTPError as exc:
+        err_console.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code == _HTTP_UNAUTHORIZED:
+        err_console.print(
+            f"[red]✗[/red] runtime rejected the bearer (${target_cfg.key_env}). "
+            f"Refresh it: [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
+        )
+        raise typer.Exit(code=2)
+    if resp.status_code == _HTTP_NOT_FOUND:
+        err_console.print(
+            f"[red]✗[/red] agent [bold]{agent}[/bold] not found on "
+            f"[bold]{target_name}[/bold]. Deploy it first: "
+            f"[bold]mdk deploy --target {target_name}[/bold]."
+        )
+        raise typer.Exit(code=2)
+    if resp.status_code != _HTTP_OK:
+        err_console.print(f"[red]✗[/red] HTTP {resp.status_code}: {resp.text[:200]}")
+        raise typer.Exit(code=2)
+
+    body = resp.json() if resp.content else {}
+    results = body.get("files", []) if isinstance(body, dict) else []
+    total = body.get("total_chunks_saved", 0) if isinstance(body, dict) else 0
+    console.print(
+        f"[bold]Uploaded to {target_name}[/bold] [dim]({endpoint})[/dim]"
+    )
+    ingested = skipped = 0
+    for r in results:
+        src = r.get("source", "?")
+        status = r.get("status", "?")
+        chunks = r.get("chunks_saved", 0)
+        if status == "ingested":
+            ingested += 1
+            console.print(f"  [green]✓[/green] {src} [dim]({chunks} chunks)[/dim]")
+        else:
+            skipped += 1
+            console.print(f"  [yellow]∅[/yellow] {src} [dim]({status})[/dim]")
+    console.print(
+        f"[dim]mdk_kb_ingest_summary: target={target_name} agent={agent} "
+        f"files={len(results)} ingested={ingested} skipped={skipped} "
+        f"chunks_saved={total} ok=true[/dim]"
+    )
 
 
 @kb_app.command("ingest")
@@ -546,6 +664,18 @@ def ingest(
             "Sets MOVATE_OCR_BACKEND for this invocation only."
         ),
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Upload to a DEPLOYED runtime's KB endpoint instead of ingesting "
+            "locally. Resolves URL + bearer from ~/.movate/config.yaml; the "
+            "runtime parses + embeds server-side into ITS storage (e.g. Azure "
+            "Postgres). The agent must already exist on the target. Local-only "
+            "flags (--model, --api-key-env, --tenant-id, --clean-source, "
+            "--changed-only, --ocr-*) don't apply — the runtime owns those."
+        ),
+    ),
 ) -> None:
     """Ingest a knowledge-base file or directory into ``agent``'s KB.
 
@@ -603,6 +733,15 @@ def ingest(
         )
         raise typer.Exit(code=2)
     # ── End guided helpers ─────────────────────────────────────────────────
+
+    # Remote upload: hand the files to a deployed runtime's KB endpoint,
+    # which parses + embeds them into ITS storage (e.g. Azure Postgres).
+    # Skips all local-ingest machinery (storage, embedding key, OCR env) —
+    # the runtime owns those. Dispatched here, after agent + path are
+    # resolved/validated.
+    if target is not None:
+        _ingest_remote(agent=agent, path=path, target=target, dry_run=dry_run)
+        return
 
     # --ocr-lang / --ocr-backend set env vars for this process only so
     # the parsers module picks them up without changing its signature.
