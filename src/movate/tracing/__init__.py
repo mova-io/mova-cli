@@ -32,6 +32,11 @@ from movate.tracing.composite import CompositeTracer
 from movate.tracing.null import SilentTracer
 from movate.tracing.stdout import StdoutTracer
 
+# Track which backend warning messages have already been emitted this
+# process so multi-case eval runs don't repeat the same "Langfuse
+# unavailable" line once per case.
+_warned: set[str] = set()
+
 __all__ = [
     "CompositeTracer",
     "SilentTracer",
@@ -78,12 +83,22 @@ def build_tracer() -> Tracer:
 
 def _build_langfuse_or_fallback() -> Tracer:
     tracer = _try_build_langfuse()
-    return tracer if tracer is not None else StdoutTracer(stream=sys.stderr)
+    if tracer is not None:
+        return tracer
+    # Langfuse was configured (keys present) but unavailable — the one-time
+    # warning from _try_build_langfuse already told the operator what to fix.
+    # Fall back to SilentTracer, NOT StdoutTracer: the operator asked for
+    # Langfuse, not a flood of JSON spans interleaved with progress bars.
+    # Use MOVATE_TRACER=stdout explicitly if you want span output.
+    return SilentTracer()
 
 
 def _build_otel_or_fallback() -> Tracer:
     tracer = _try_build_otel()
-    return tracer if tracer is not None else StdoutTracer(stream=sys.stderr)
+    if tracer is not None:
+        return tracer
+    # Same rationale as Langfuse fallback above.
+    return SilentTracer()
 
 
 def _build_composite_or_fallback(*, explicit_request: bool) -> Tracer:
@@ -121,10 +136,10 @@ def _try_build_langfuse() -> Tracer | None:
         try:
             return LangfuseTracer()
         except LangfuseUnavailableError as exc:
-            sys.stderr.write(f"[movate] Langfuse unavailable, skipping: {exc}\n")
+            _warn_once("langfuse", f"[movate] Langfuse unavailable, skipping: {exc}")
             return None
     except ImportError as exc:  # pragma: no cover - tracer module has no deps
-        sys.stderr.write(f"[movate] Langfuse tracer module failed to import: {exc}\n")
+        _warn_once("langfuse-import", f"[movate] Langfuse tracer module failed to import: {exc}")
         return None
 
 
@@ -138,8 +153,20 @@ def _try_build_otel() -> Tracer | None:
         try:
             return OtelTracer()
         except OtelUnavailableError as exc:
-            sys.stderr.write(f"[movate] OTel unavailable, skipping: {exc}\n")
+            _warn_once("otel", f"[movate] OTel unavailable, skipping: {exc}")
             return None
     except ImportError as exc:  # pragma: no cover - tracer module has no deps
-        sys.stderr.write(f"[movate] OTel tracer module failed to import: {exc}\n")
+        _warn_once("otel-import", f"[movate] OTel tracer module failed to import: {exc}")
         return None
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Emit ``message`` to stderr at most once per process for ``key``.
+
+    Prevents repeated identical warnings when ``build_tracer()`` is called
+    for every agent execution in a multi-case eval run. The first call for
+    each ``key`` writes the message; subsequent calls are no-ops.
+    """
+    if key not in _warned:
+        _warned.add(key)
+        sys.stderr.write(message + "\n")

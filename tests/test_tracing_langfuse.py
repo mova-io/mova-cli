@@ -97,7 +97,10 @@ def test_build_tracer_langfuse_falls_back_when_package_missing(
     capsys: pytest.CaptureFixture,
 ) -> None:
     """If MOVATE_TRACER=langfuse but the package isn't installed, fall back
-    to stdout with a stderr warning. Never let tracing break a run."""
+    to SilentTracer with a one-time stderr warning. Never let tracing break
+    a run, and never flood the terminal with JSON span lines."""
+    import movate.tracing as _t
+    _t._warned.discard("langfuse")  # reset per-process guard for test isolation
     monkeypatch.setenv("MOVATE_TRACER", "langfuse")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-set")
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-set")
@@ -105,9 +108,7 @@ def test_build_tracer_langfuse_falls_back_when_package_missing(
     monkeypatch.setitem(sys.modules, "langfuse", None)  # type: ignore[arg-type]
 
     tracer = build_tracer()
-    assert isinstance(tracer, StdoutTracer)
-    # Message changed in v0.4 stage 2 from "falling back to stdout" to
-    # "skipping" because composite mode uses the same builder.
+    assert isinstance(tracer, SilentTracer)
     assert "Langfuse unavailable" in capsys.readouterr().err
 
 
@@ -116,12 +117,14 @@ def test_build_tracer_langfuse_falls_back_without_keys(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """MOVATE_TRACER=langfuse explicitly but keys missing → stdout fallback."""
+    """MOVATE_TRACER=langfuse explicitly but keys missing → SilentTracer fallback."""
+    import movate.tracing as _t
+    _t._warned.discard("langfuse")  # reset per-process guard for test isolation
     monkeypatch.setenv("MOVATE_TRACER", "langfuse")
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     tracer = build_tracer()
-    assert isinstance(tracer, StdoutTracer)
+    assert isinstance(tracer, SilentTracer)
     assert "must both be set" in capsys.readouterr().err
 
 

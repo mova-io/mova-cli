@@ -322,7 +322,8 @@ def _build_client_from_env() -> Any:
         from langfuse import Langfuse  # noqa: PLC0415 - lazy by design
     except ImportError as exc:
         raise LangfuseUnavailableError(
-            "langfuse package not installed; `uv sync --extra langfuse`"
+            "langfuse package not installed; "
+            "install with: uv tool install --reinstall movate-cli --extra langfuse"
         ) from exc
     # Accept LANGFUSE_HOST (canonical) or LANGFUSE_BASE_URL (Langfuse SDK
     # alias) so both spellings work when stored in ~/.movate/credentials.
