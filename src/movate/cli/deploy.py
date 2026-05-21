@@ -337,7 +337,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         err.print(
             f"  [cyan]curl -sS -X POST {base_url}/run "
             f"-H 'content-type: application/json' "
-            f'-H "x-api-key: $MDK_DEV_KEY" '
+            f'-H "Authorization: Bearer ${target_cfg.key_env}" '
             f'-d \'{{"agent": "{first_agent}", "input": {{}}}}\'[/cyan]'
         )
     err.print(
@@ -759,6 +759,25 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             )
             raise typer.Exit(code=2)
 
+    # Persist the working bearer to ~/.movate/credentials so the
+    # post-deploy curl example works from any new shell without a manual
+    # `export`. The auto-recovery path already saves via
+    # CredentialsStore; this also covers the common case where the key
+    # arrived via a shell export and was never written to the file.
+    # Best-effort — a credentials write failure must never abort a
+    # deploy that otherwise succeeded.
+    try:
+        from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+        CredentialsStore().set(target_cfg.key_env, api_key)
+        err.print(
+            f"  [dim]bearer key ensured in [cyan]~/.movate/credentials[/cyan] "
+            f"as [cyan]{target_cfg.key_env}[/cyan] — "
+            "the curl example below will work in any new shell.[/dim]"
+        )
+    except Exception:  # never fail deploy for a credentials write
+        pass
+
     base_url = target_cfg.url.rstrip("/")
     headers = {"Authorization": f"Bearer {api_key}"}
 
@@ -980,7 +999,7 @@ def _render_post_deploy_next_steps(
         err.print(
             f"  curl -sS -X POST {base_url}/run \\\n"
             f"    -H 'content-type: application/json' \\\n"
-            f'    -H "x-api-key: ${key_env}" \\\n'
+            f'    -H "Authorization: Bearer ${key_env}" \\\n'
             f"    --data-binary @- <<'JSON'\n"
             f"{body}\n"
             f"JSON",

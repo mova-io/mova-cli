@@ -1414,8 +1414,17 @@ def _fmt_field_value(value: Any, max_width: int = 80) -> str:
     rendered as separate indented lines instead of Python list syntax —
     ``['chunk one', 'chunk two']`` → ``chunk one\\n  chunk two``.
 
+    Lists of integers are treated as citation indices and rendered as a
+    compact human-readable label — ``[1, 2, 3]`` → ``ctx #1, ctx #2, ctx #3``.
+    This matches what a rag-qa agent's ``citations`` expected-output field
+    carries and avoids the confusing ``list(N) 1, 2, 3`` rendering that
+    Rich produces when a multi-line cell is squeezed into a narrow column.
+
     Scalars are stringified and truncated at ``max_width``.
     """
+    # Citation indices: list[int] → compact "ctx #N, ctx #M" label.
+    if isinstance(value, list) and value and all(isinstance(i, int) for i in value):
+        return ", ".join(f"ctx #{i}" for i in value)
     if isinstance(value, list):
         items: list[str] = []
         for item in value[:3]:  # cap at 3 items to keep cell height sane
@@ -2448,8 +2457,7 @@ def _run_scorecard_single_agent(
     # callers set ``preview=False`` for those paths.
     if preview and pre_generated_entries is None and output_format == Report.TABLE:
         console.print(
-            f"[dim]Generating {count} {mix} test case(s) for "
-            f"[bold]{bundle.spec.name}[/bold]…[/dim]"
+            f"[dim]Generating {count} {mix} test case(s) for [bold]{bundle.spec.name}[/bold]…[/dim]"
         )
         reset_logging_worker_for_new_event_loop()
         preview_entries, resolved_gen_model, preview_kb_seeds = asyncio.run(
@@ -2540,8 +2548,7 @@ def _run_scorecard_single_agent(
 
         n_cases = len(summary.cases)
         console.print(
-            f"[dim]Running variant [bold]{variant}[/bold] "
-            f"on the same {n_cases} case(s)…[/dim]"
+            f"[dim]Running variant [bold]{variant}[/bold] on the same {n_cases} case(s)…[/dim]"
         )
         # Reconstruct pre_generated_entries from the baseline cases so
         # both scorecards see exactly the same inputs.
@@ -3156,9 +3163,9 @@ def _render_variant_comparison(
     table.add_column("verdict", justify="center")
 
     # Collect all categories from both summaries.
-    all_cats = list(dict.fromkeys(
-        list(baseline.category_means.keys()) + list(challenger.category_means.keys())
-    ))
+    all_cats = list(
+        dict.fromkeys(list(baseline.category_means.keys()) + list(challenger.category_means.keys()))
+    )
     for cat in all_cats:
         a_score = baseline.category_means.get(cat, 0.0)
         b_score = challenger.category_means.get(cat, 0.0)
