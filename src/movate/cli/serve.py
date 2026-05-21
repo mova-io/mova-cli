@@ -20,13 +20,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import typer
-import uvicorn
 from rich.console import Console
 from rich.panel import Panel
 
 from movate.cli._console import success
-from movate.runtime.app import build_app
-from movate.runtime.registry import scan_agents
 from movate.storage import build_storage
 
 if TYPE_CHECKING:
@@ -134,6 +131,15 @@ async def _run_serve(
     first request. Running uvicorn via ``Server.serve()`` inside
     this async function keeps everything on one loop.
     """
+    # Lazy imports — uvicorn, build_app, and scan_agents all require
+    # optional [runtime] deps (uvicorn, fastapi). Deferring to here
+    # means ``mdk kb ingest``, ``mdk eval``, and other non-serve
+    # commands don't crash when the [runtime] extra isn't installed.
+    import uvicorn  # noqa: PLC0415
+
+    from movate.runtime.app import build_app  # noqa: PLC0415
+    from movate.runtime.registry import scan_agents  # noqa: PLC0415
+
     storage = build_storage()
     await storage.init()
     await _seed_bootstrap_key(storage)
