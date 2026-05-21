@@ -35,8 +35,10 @@ Design rules:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -235,8 +237,14 @@ def replay(
         )
         raise typer.Exit(code=2)
 
+    _ctx = (
+        console.status("[dim]Replaying…[/dim]", spinner="dots")
+        if not json_output and sys.stderr.isatty()
+        else contextlib.nullcontext()
+    )
     try:
-        replayed = asyncio.run(_replay(original=original, agent_dir=agent_dir, mock=mock))
+        with _ctx:
+            replayed = asyncio.run(_replay(original=original, agent_dir=agent_dir, mock=mock))
     except AgentLoadError as exc:
         err_console.print(f"[red]✗ load failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
