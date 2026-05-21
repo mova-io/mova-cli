@@ -208,6 +208,7 @@ async def _ingest_one_file(
         embedding_model=embedding_model,
         api_key=api_key,
         ocr=result.ocr_used,
+        page_texts=result.page_texts,
     )
     if summary is not None:
         summary.chunks_removed = chunks_removed
@@ -224,6 +225,7 @@ async def ingest_text(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
     ocr: bool = False,
+    page_texts: tuple[str, ...] | None = None,
 ) -> IngestSummary | None:
     """Chunk + embed + persist ``text`` as KB content for ``agent``.
 
@@ -241,11 +243,32 @@ async def ingest_text(
     actual filesystem path. Pass an empty string to get a generic
     ``"<inline>"`` label.
 
+    ``page_texts``, when provided (PDF ingest), contains one text
+    string per page. The chunker is run per-page so that
+    ``metadata["page"]`` (1-indexed) is stamped on every resulting
+    :class:`~movate.core.models.KbChunk`. This lets the search table
+    display the source page number alongside each result.
+
     Empty / whitespace-only input → ``None`` (idempotent no-op,
     matches :func:`_ingest_one_file`).
     """
     label = source or "<inline>"
-    chunks = split_paragraphs(text, source=label)
+
+    if page_texts:
+        # Per-page chunking: run the splitter on each page individually
+        # so we can stamp metadata["page"] = <1-indexed page number> on
+        # every chunk. The paragraph_index from _make_chunk is kept too
+        # so downstream code that reads it doesn't break.
+        all_chunks: list[Chunk] = []
+        for page_num, page_text in enumerate(page_texts, start=1):
+            page_chunks = split_paragraphs(page_text, source=label)
+            for chunk in page_chunks:
+                chunk.metadata = {**(chunk.metadata or {}), "page": page_num}
+            all_chunks.extend(page_chunks)
+        chunks = all_chunks
+    else:
+        chunks = split_paragraphs(text, source=label)
+
     if not chunks:
         return None
 

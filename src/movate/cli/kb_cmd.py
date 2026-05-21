@@ -1278,9 +1278,13 @@ def search(
                 if show_full or len(r.chunk.text) <= _CHUNK_PREVIEW_CHARS
                 else r.chunk.text[:_CHUNK_PREVIEW_CHARS].rstrip() + "…"
             )
-            # Short source name (last path segment) — full path is in
-            # the table title's tooltip if Rich's terminal supports it.
+            # Short source name (last path segment) + optional page
+            # number. ``metadata["page"]`` is set for PDF chunks ingested
+            # after the page-aware ingest path landed (PR-CC-page).
             short_source = Path(r.chunk.source).name if r.chunk.source else "?"
+            page = (r.chunk.metadata or {}).get("page")
+            if page is not None:
+                short_source = f"{short_source} p.{page}"
             score_color = (
                 "green"
                 if r.score >= _SCORE_GREEN_THRESHOLD

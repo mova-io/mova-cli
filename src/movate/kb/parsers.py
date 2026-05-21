@@ -95,6 +95,13 @@ class ParseResult(NamedTuple):
     native text-extraction path (pypdf text layer, docx paragraphs,
     readability HTML strip). Always False for non-PDF formats."""
 
+    page_texts: tuple[str, ...] | None = None
+    """Per-page text for paginated formats (PDFs). ``page_texts[i]`` is
+    the extracted text for page ``i+1`` (1-indexed). When present, the
+    ingest pipeline uses this to stamp ``metadata["page"]`` on each
+    chunk so operators can trace results back to the source page.
+    ``None`` for non-paginated formats (Markdown, DOCX, HTML, images)."""
+
 
 # File extensions the dispatch layer accepts. Sorted by frequency
 # of operator-uploaded format (rough — refine when we have telemetry).
@@ -297,8 +304,14 @@ def parse_pdf(content: bytes) -> ParseResult | None:
         return None
 
     # Join pages with the paragraph boundary the chunker uses so
-    # natural page breaks become chunk breaks.
-    return ParseResult(text="\n\n".join(pages), ocr_used=ocr_used)
+    # natural page breaks become chunk breaks. Also pass the per-page
+    # list so the ingest pipeline can stamp metadata["page"] on chunks
+    # and the search table can show which page each result came from.
+    return ParseResult(
+        text="\n\n".join(pages),
+        ocr_used=ocr_used,
+        page_texts=tuple(pages),
+    )
 
 
 def _ocr_pdf(content: bytes, *, page_num: int) -> str | None:
