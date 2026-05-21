@@ -247,12 +247,32 @@ def parse_pdf(content: bytes) -> ParseResult | None:
         logger.warning("pypdf failed to open PDF: %s", exc)
         return None
 
-    # Encrypted PDFs need a password to extract. We don't have a
-    # password channel in the upload UI; surface as ``None`` so the
-    # operator sees ``status="skipped"`` rather than a partial extract.
+    # Encrypted PDFs come in two flavours:
+    #
+    #   1. Owner-restricted (permissions-only, no user password) — the
+    #      most common case for manufacturer / corporate PDFs. These
+    #      decrypt successfully with an empty password and all text is
+    #      accessible. We attempt decrypt("") first and continue if it
+    #      works (pypdf returns PasswordType.USER_PASSWORD = 1 or
+    #      PasswordType.OWNER_PASSWORD = 2).
+    #
+    #   2. User-password-protected — we genuinely can't read these
+    #      without the password. Log a clear actionable warning and skip.
     if reader.is_encrypted:
-        logger.warning("PDF is encrypted; skipping")
-        return None
+        try:
+            result = reader.decrypt("")
+            if not result:
+                # result == 0 means the empty password was rejected — the
+                # PDF requires a real user password. Nothing we can do.
+                logger.warning(
+                    "PDF is password-protected; provide the password or "
+                    "export to an unprotected PDF before ingesting"
+                )
+                return None
+            # result 1 or 2 — decrypted OK, fall through to text extraction
+        except Exception as exc:
+            logger.warning("PDF decryption failed: %s; skipping", exc)
+            return None
 
     pages: list[str] = []
     ocr_used = False
