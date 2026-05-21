@@ -99,6 +99,14 @@ def run(
             "this flag only adds a live preview. Workflow + replay modes ignore it."
         ),
     ),
+    trace: bool = typer.Option(
+        False,
+        "--trace",
+        help=(
+            "After the run, print a table of KB chunks retrieved by any "
+            "kb-vector-lookup skill calls. Useful for debugging retrieval quality."
+        ),
+    ),
     output_format: Run = typer.Option(Run.JSON, "--output", "-o", case_sensitive=False),
 ) -> None:
     """Run an agent or workflow against the given input.
@@ -193,7 +201,12 @@ def run(
         _dispatch_workflow(path, input_flag or input_arg, mock=mock, output_format=output_format)
     else:
         _dispatch_agent(
-            path, input_flag or input_arg, mock=mock, stream=stream, output_format=output_format
+            path,
+            input_flag or input_arg,
+            mock=mock,
+            stream=stream,
+            trace=trace,
+            output_format=output_format,
         )
 
 
@@ -208,6 +221,7 @@ def _dispatch_agent(
     *,
     mock: bool,
     stream: bool,
+    trace: bool = False,
     output_format: Run,
 ) -> None:
     try:
@@ -223,7 +237,9 @@ def _dispatch_agent(
     payload = _coerce_agent_input(raw, bundle)
 
     asyncio.run(
-        _run_local_agent(bundle, payload, output_format=output_format, mock=mock, stream=stream)
+        _run_local_agent(
+            bundle, payload, output_format=output_format, mock=mock, stream=stream, trace=trace
+        )
     )
 
 
@@ -337,6 +353,7 @@ async def _run_local_agent(
     output_format: Run,
     mock: bool,
     stream: bool = False,
+    trace: bool = False,
 ) -> None:
     rt = await build_local_runtime(mock=mock)
     # Dataset-aware mock (PR #104): when running --mock against an
@@ -360,6 +377,13 @@ async def _run_local_agent(
             # below starts on its own line.
             sys.stderr.write("\n")
             sys.stderr.flush()
+        if trace and response.run_id:
+            try:
+                record = await rt.storage.get_run(response.run_id, tenant_id="local")
+                if record and record.skill_calls:
+                    _print_kb_trace(record.skill_calls)
+            except Exception:
+                pass  # never break the run for trace display failures
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
@@ -399,6 +423,52 @@ async def _run_local_agent(
 
     if response.status == "error":
         raise typer.Exit(code=1)
+
+
+def _print_kb_trace(skill_calls: list[Any]) -> None:
+    """Print a Rich dim table of KB chunks retrieved during a run.
+
+    Filters for skill calls whose name contains 'kb' (case-insensitive),
+    extracts the ``chunks`` list from each call's output dict, and renders
+    a compact table per matching call to stderr.
+
+    Never raises — all failures are silently suppressed so ``--trace`` can
+    never break a run.
+    """
+    try:
+        kb_calls = [sc for sc in skill_calls if "kb" in sc.skill.lower()]
+        if not kb_calls:
+            return
+
+        sys.stderr.write("─── KB retrieval trace " + "─" * 37 + "\n")
+        sys.stderr.flush()
+
+        for sc in kb_calls:
+            output = sc.output or {}
+            chunks = output.get("chunks") or []
+            if not chunks:
+                continue
+
+            latency = f"{int(sc.latency_ms)}ms" if sc.latency_ms else "?ms"
+            sys.stderr.write(f"  skill: {sc.skill}  latency: {latency}\n")
+            sys.stderr.flush()
+
+            table = Table(style="dim", show_header=True, header_style="bold dim")
+            table.add_column("#", width=4)
+            table.add_column("score", width=6)
+            table.add_column("source / content preview")
+
+            for i, chunk in enumerate(chunks, start=1):
+                score_val = chunk.get("score")
+                score_str = f"{score_val:.2f}" if isinstance(score_val, (int, float)) else "?"
+                source = str(chunk.get("source") or "")
+                content = str(chunk.get("content") or "").replace("\n", " ")[:80]
+                preview = f'{source} · "{content}"' if source else f'"{content}"'
+                table.add_row(str(i), score_str, preview)
+
+            console.print(table)
+    except Exception:
+        pass  # trace display must never fail
 
 
 def _streaming_callback() -> Callable[[str], None]:

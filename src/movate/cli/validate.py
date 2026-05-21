@@ -6,6 +6,7 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -510,6 +511,7 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             raise typer.Exit(code=2)
 
     _check_kb_corpus(bundle)
+    _check_vector_kb_empty(bundle, console)
     _check_marketplace_metadata(spec)
 
     # Context size + content advisory. Contexts are prepended to the system
@@ -764,6 +766,56 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
         console.print(
             "    [dim]hint: run [bold]mdk knowledge list[/bold] to inspect "
             "and [bold]mdk knowledge remove <id>[/bold] to delete the duplicate.[/dim]"
+        )
+
+
+def _check_vector_kb_empty(bundle: AgentBundle, con: Console) -> None:
+    """Warn when a kb-vector-lookup skill is declared but the vector KB has 0 chunks.
+
+    The #1 silent RAG failure: operator adds ``kb-vector-lookup`` to skills
+    but never ran ``mdk kb ingest``, so every retrieval call returns empty.
+    This check probes the local vector KB and warns if no chunks are indexed.
+
+    Wrapped in a broad ``except Exception`` so a missing or uninitialized
+    database never causes validate to fail.
+    """
+    # Only relevant when the agent uses a vector KB skill.
+    has_vector_skill = any(
+        "kb-vector" in s.spec.name.lower() for s in bundle.skills
+    )
+    if not has_vector_skill:
+        return
+
+    async def _probe() -> bool:
+        """Return True if >=1 chunk exists, False if 0.  Raise on any error."""
+        from movate.storage import build_storage  # noqa: PLC0415
+
+        s = build_storage()
+        await s.init()
+        try:
+            chunks = await s.list_kb_chunks(
+                agent=bundle.spec.name, tenant_id="local", limit=1
+            )
+            return len(chunks) > 0
+        finally:
+            await s.close()
+
+    try:
+        has_chunks = asyncio.run(_probe())
+    except Exception:
+        return  # storage not ready / DB missing — skip silently
+
+    if not has_chunks:
+        con.print(
+            "  [yellow]![/yellow] skill [bold]'kb-vector-lookup'[/bold] is wired "
+            "but the vector KB has 0 chunks."
+        )
+        con.print(
+            f"    hint: run [bold]mdk kb ingest {bundle.spec.name} "
+            f"./agents/{bundle.spec.name}/kb/[/bold]"
+        )
+        con.print(
+            "          or   [bold]mdk kb ingest-all[/bold] to scan the whole project."
         )
 
 
