@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-__version__ = "0.8.2.62"
+__version__ = "0.8.2.63"
 
 
 class _LiteLLMBotocoreNoiseFilter(logging.Filter):
