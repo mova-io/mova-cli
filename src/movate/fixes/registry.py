@@ -18,8 +18,11 @@ one bad permission shouldn't block creating ``.movate/``.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import stat
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -255,6 +258,77 @@ def _apply_agents_dir(root: Path, dry_run: bool) -> FixResult:
 
 
 # ---------------------------------------------------------------------------
+# OCR optional-package fix helpers
+# ---------------------------------------------------------------------------
+
+def _uv_pip_install(packages: list[str], fix_id: str) -> FixResult:
+    """Install ``packages`` into the current Python interpreter via uv pip.
+
+    Works for both ``uv tool install``-ed mdk binaries (isolated venv in
+    ``~/.local/share/uv/tools/movate-cli/``) and project-venv installs —
+    ``--python sys.executable`` always targets the running interpreter's
+    environment, bypassing any outer venv resolution.
+
+    Raises on non-zero returncode so the caller's ``try/except`` in
+    :meth:`Fix.run` converts it to ``FixStatus.FAILED``.
+    """
+    result = subprocess.run(
+        ["uv", "pip", "install", "--python", sys.executable, *packages],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or result.stdout or "uv pip install failed").strip()
+        )
+    return FixResult(
+        fix_id=fix_id,
+        status=FixStatus.APPLIED,
+        message=f"installed {', '.join(packages)}",
+    )
+
+
+def _check_ocr_extra(_root: Path) -> bool:
+    """True when pdf2image or pytesseract is not importable."""
+    return (
+        importlib.util.find_spec("pdf2image") is None
+        or importlib.util.find_spec("pytesseract") is None
+    )
+
+
+def _apply_ocr_extra(_root: Path, dry_run: bool) -> FixResult:
+    packages = ["pdf2image", "pytesseract"]
+    if dry_run:
+        return FixResult(
+            fix_id="install-ocr-extra",
+            status=FixStatus.WOULD_APPLY,
+            message=f"would install: {', '.join(packages)} (enables scanned PDF OCR via Tesseract)",
+        )
+    return _uv_pip_install(packages, "install-ocr-extra")
+
+
+def _check_easyocr_extra(_root: Path) -> bool:
+    """True when easyocr is not importable."""
+    return importlib.util.find_spec("easyocr") is None
+
+
+def _apply_easyocr_extra(_root: Path, dry_run: bool) -> FixResult:
+    packages = ["easyocr"]
+    if dry_run:
+        return FixResult(
+            fix_id="install-easyocr-extra",
+            status=FixStatus.WOULD_APPLY,
+            message=(
+                "would install: easyocr (~300 MB, includes torch-cpu) — "
+                "enables MOVATE_OCR_BACKEND=easyocr for noisy / low-quality scans"
+            ),
+        )
+    return _uv_pip_install(packages, "install-easyocr-extra")
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -321,6 +395,30 @@ def available_fixes() -> list[Fix]:
             ),
             check=_check_secrets_permissions,
             apply_fn=_apply_secrets_permissions,
+        ),
+        Fix(
+            id="install-ocr-extra",
+            label="Install OCR deps (pdf2image + pytesseract)",
+            description=(
+                "Install pdf2image and pytesseract into the active Python "
+                "environment. Required for mdk kb ingest to OCR scanned / "
+                "mixed PDFs via the default Tesseract backend. The Tesseract "
+                "system binary (brew install tesseract) must also be on PATH."
+            ),
+            check=_check_ocr_extra,
+            apply_fn=_apply_ocr_extra,
+        ),
+        Fix(
+            id="install-easyocr-extra",
+            label="Install EasyOCR (~300 MB)",
+            description=(
+                "Install easyocr (pure-Python, no system binary required). "
+                "Enables MOVATE_OCR_BACKEND=easyocr — better accuracy on "
+                "noisy or low-quality scans. Downloads ~300 MB of torch-cpu "
+                "and model weights on first use. Skipped if already installed."
+            ),
+            check=_check_easyocr_extra,
+            apply_fn=_apply_easyocr_extra,
         ),
     ]
 
