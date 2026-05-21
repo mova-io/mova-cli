@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
-import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
+
+from movate.utils.git import git_short_sha
 
 
 class SnapshotManifestError(Exception):
@@ -111,34 +111,10 @@ class SnapshotManifest:
         }
 
 
-def _git_short_sha(cwd: Path | None = None) -> str:
-    """Return the short git SHA of HEAD, or ``""`` when unavailable.
-
-    Fails gracefully when:
-    * ``git`` is not on PATH
-    * the directory is not inside a git repo (git exits non-zero)
-    * any subprocess / OS error occurs
-
-    Uses ``cwd`` as the working directory for the git command so the
-    snapshot captures the SHA of the project's own repo, not wherever
-    the Python process happens to be running from.
-    """
-    if shutil.which("git") is None:
-        return ""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-            cwd=cwd,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+# Back-compat alias so existing ``from movate.snapshot.manifest import
+# _git_short_sha`` call-sites (snapshot/store.py) keep working without
+# changes. New code should import directly from movate.utils.git.
+_git_short_sha = git_short_sha
 
 
 def compute_snapshot_hash(

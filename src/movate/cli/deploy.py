@@ -45,6 +45,7 @@ from movate.core.user_config import (
     resolve_target,
 )
 from movate.notify import DeployEvent, notify_deploy_success
+from movate.utils.git import git_short_sha
 
 err = Console(stderr=True)
 stdout = Console()
@@ -363,7 +364,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
                 target=target_name,
                 image_tag=plan.image_tag,
                 runtime_url=target_cfg.url,
-                git_sha=_git_short_sha() or "",
+                git_sha=git_short_sha(),
                 deployer=os.environ.get("USER", "unknown"),
                 duration_seconds=time.monotonic() - started_at,
                 version=plan.version,
@@ -447,7 +448,7 @@ def _build_plan(
 
     version = movate.__version__
     if image_tag is None:
-        sha = _git_short_sha() or "unknown"
+        sha = git_short_sha() or "unknown"
         image_tag = f"movate:{version}-{sha}"
 
     apps = [f"movate-{target_cfg.azure_env}-api", f"movate-{target_cfg.azure_env}-worker"]
@@ -1537,26 +1538,6 @@ def _first_agent_name() -> str | None:
         if entry.is_dir() and (entry / "agent.yaml").is_file():
             return entry.name
     return None
-
-
-def _git_short_sha() -> str | None:
-    """Return the short git sha of HEAD, or None if not in a git repo
-    or git isn't on PATH."""
-    if shutil.which("git") is None:
-        return None
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
 
 
 def _print_plan(plan: DeployPlan, *, dry_run: bool) -> None:
