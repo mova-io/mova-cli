@@ -45,6 +45,17 @@ When to adapt:
 Given `input.question` and `input.context` (a numbered list of
 retrieved text chunks), follow this sequence:
 
+0. **Retrieve context if none was passed.** If `input.context` is
+   empty or missing, call the **`kb-vector-lookup`** skill with
+   `input.question`. It returns the most relevant chunks from this
+   agent's ingested knowledge base. Number the returned chunks 1..N
+   in the order given and treat them exactly as you would
+   `input.context` for every step below — same grounding discipline,
+   same 1-based citations. If the skill finds nothing relevant
+   (`chunks_found: 0`), set `grounded: false` and say the knowledge
+   base doesn't cover the question. When `input.context` IS passed,
+   skip retrieval and answer only from the passed chunks.
+
 1. **Understand the question.** Paraphrase it internally. Note any
    temporal, numerical, or comparative qualifications.
 
@@ -98,8 +109,10 @@ A high-quality response:
   knowledge base for this call. Do not supplement it.
 - **Over-citing.** Only list chunks that contributed a claim.
   Listing all chunks to "be safe" makes citations meaningless.
-- **Under-refusing.** If `input.context` is empty or contains only
-  tangentially related chunks, set `grounded: false`.
+- **Under-refusing.** Only set `grounded: false` after you actually
+  have chunks to judge — if `input.context` was empty, retrieve via
+  `kb-vector-lookup` FIRST. Refuse when the chunks you have (passed or
+  retrieved) are missing or only tangentially related.
 - **Merging contradictory chunks silently.** Surface the
   contradiction in `answer` rather than picking a side.
 - **Preamble or meta-commentary.** The caller renders the JSON.
@@ -124,8 +137,9 @@ Rules:
 - `answer`: quoted if the answer is a direct verbatim extract;
   paraphrased otherwise. If `grounded` is false, explain what
   information is missing.
-- `citations`: 1-based indices matching the `input.context` list.
-  Empty array `[]` only when `grounded` is false.
+- `citations`: 1-based indices into your numbered context — the
+  passed `input.context`, or the chunks returned by `kb-vector-lookup`
+  when you retrieved them. Empty array `[]` only when `grounded` is false.
 - `grounded`: `true` only when the context directly supports the
   answer. `false` for missing information, contradictions, or
   ambiguity the agent cannot resolve.
