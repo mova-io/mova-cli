@@ -1,0 +1,38 @@
+Support SLA — Response Time Commitments
+========================================
+
+Starter tier
+  - First response: within 48 business hours
+  - Resolved: within 10 business days
+  - Channels: email only (support@example.com)
+  - Coverage: Monday–Friday 09:00–17:00 UTC
+
+Growth tier
+  - First response: within 24 business hours
+  - Resolved: within 5 business days
+  - Channels: email + in-app chat
+  - Coverage: Monday–Friday 08:00–20:00 UTC
+
+Enterprise tier
+  - First response: within 4 hours (including weekends)
+  - Resolved: within 1 business day for P1, 3 days for P2/P3
+  - Channels: email, chat, dedicated Slack channel, phone
+  - Coverage: 24 × 7 × 365
+  - Named Customer Success Manager assigned on contract signing
+
+SLA credits
+  If response SLAs are missed, customers may request a service credit
+  equal to 5% of their monthly invoice for each business day the SLA
+  is exceeded, up to a maximum of 30% per invoice period.
+
+Escalation path
+  1. Front-line support agent (first contact)
+  2. Senior Support Engineer (if unresolved after 2 business days)
+  3. Engineering on-call (P1 incidents, < 4 hour breach)
+  4. VP Engineering (P1 incidents breaching 8 hours)
+
+Priority definitions
+  P1 — Service unavailable or data loss in progress
+  P2 — Major feature broken, no workaround
+  P3 — Minor feature degraded, workaround exists
+  P4 — Cosmetic or documentation issue
