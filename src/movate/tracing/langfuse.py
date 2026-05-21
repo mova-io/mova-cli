@@ -120,12 +120,22 @@ class LangfuseTracer(Tracer):
         handle = self._handles.pop(span.span_id, None)
         if handle is None:
             return
-        # Langfuse ``end`` shape varies between trace-roots and child spans.
-        # Try the rich form first, fall back to the simple one.
-        try:
-            handle.end(metadata={"status": status})
-        except TypeError:  # pragma: no cover - SDK quirk
-            handle.end()
+        # Langfuse v2 capability split: child spans (StatefulSpanClient)
+        # expose ``.end()``; the trace ROOT (StatefulTraceClient) does NOT —
+        # it has no ``.end()`` at all and is finalized via ``.update()`` +
+        # flushed at shutdown. Route by which method the handle actually
+        # has so a trace root doesn't raise AttributeError (which used to
+        # abort the whole run). Wrapped fail-soft: tracing must never break
+        # a run.
+        with contextlib.suppress(Exception):
+            end = getattr(handle, "end", None)
+            if callable(end):
+                try:
+                    end(metadata={"status": status})
+                except TypeError:  # SDK quirk: some .end() take no kwargs
+                    end()
+            else:
+                handle.update(metadata={"status": status})
 
     # ----- events / attributes ---------------------------------------------
 
