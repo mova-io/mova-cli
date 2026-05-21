@@ -14,7 +14,9 @@ Powers ``mdk kb ingest`` (the CLI command lives in ``cli/kb.py``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from movate.core.models import KbChunk
@@ -24,6 +26,8 @@ from movate.kb.embed import (
     embed_texts,
     qualified_model_name,
 )
+
+log = logging.getLogger(__name__)
 
 # How many chunks to embed per OpenAI API call. OpenAI accepts up to
 # 2048 inputs per request — we use 64 because that's the largest size
@@ -50,6 +54,17 @@ class IngestSummary:
 
     embedding_model: str
     """The full ``provider/model`` identifier embedded with."""
+
+    chunks_removed: int = field(default=0)
+    """Old chunks deleted before re-ingest when ``clean_source=True``.
+    Zero unless the caller passed ``--clean-source``."""
+
+
+# File-size guard — default 50 MB. Operators with large scanned PDFs
+# can raise this via MOVATE_MAX_FILE_MB. The guard fires before any
+# parsing so it catches multi-hundred-MB uploads before pdf2image
+# tries to rasterise every page.
+_MAX_FILE_MB: float = float(os.environ.get("MOVATE_MAX_FILE_MB", "50"))
 
 
 def find_files(path: Path) -> list[Path]:
@@ -87,6 +102,7 @@ async def ingest_path(
     tenant_id: str,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
+    clean_source: bool = False,
 ) -> list[IngestSummary]:
     """Ingest a file or directory tree. Returns one summary per file.
 
@@ -95,6 +111,12 @@ async def ingest_path(
     the storage state is left at whatever was saved before the
     failure (no rollback, but the dedup key makes the next attempt
     pick up where this one stopped).
+
+    ``clean_source=True`` deletes all existing chunks for each file's
+    source URI before ingesting it — use this when you want re-ingest
+    to fully replace old content rather than dedup on content_hash.
+    Equivalent to: delete old chunks → ingest new chunks. Reported
+    in :attr:`IngestSummary.chunks_removed`.
     """
     files = find_files(path)
     summaries: list[IngestSummary] = []
@@ -106,6 +128,7 @@ async def ingest_path(
             tenant_id=tenant_id,
             embedding_model=embedding_model,
             api_key=api_key,
+            clean_source=clean_source,
         )
         if summary is not None:
             summaries.append(summary)
@@ -120,6 +143,7 @@ async def _ingest_one_file(
     tenant_id: str,
     embedding_model: str,
     api_key: str | None,
+    clean_source: bool = False,
 ) -> IngestSummary | None:
     """Read + parse + ingest a single file.
 
@@ -132,11 +156,38 @@ async def _ingest_one_file(
     from movate.kb.parsers import parse_document  # noqa: PLC0415 — keep parsers import lazy
 
     content = file_path.read_bytes()
+
+    # File-size guard — warn and skip before any expensive parsing.
+    # Default 50 MB; raise via MOVATE_MAX_FILE_MB env var.
+    file_mb = len(content) / (1024 * 1024)
+    if file_mb > _MAX_FILE_MB:
+        log.warning(
+            "Skipping %s (%.1f MB) — exceeds MOVATE_MAX_FILE_MB=%.0f MB. "
+            "Raise the limit or split the file.",
+            file_path.name,
+            file_mb,
+            _MAX_FILE_MB,
+        )
+        return None
+
     source = str(file_path.resolve())
+
+    # --clean-source: delete all existing chunks for this source so
+    # re-ingest fully replaces stale content. Without this flag the
+    # dedup key (content_hash) means unchanged chunks are no-ops and
+    # deleted paragraphs stick around forever.
+    chunks_removed = 0
+    if clean_source:
+        chunks_removed = await storage.delete_kb_chunks(  # type: ignore[attr-defined]
+            agent=agent,
+            tenant_id=tenant_id,
+            source=source,
+        )
+
     result = parse_document(file_path.name, content)
     if result is None:
         return None
-    return await ingest_text(
+    summary = await ingest_text(
         storage=storage,
         text=result.text,
         source=source,
@@ -146,6 +197,9 @@ async def _ingest_one_file(
         api_key=api_key,
         ocr=result.ocr_used,
     )
+    if summary is not None:
+        summary.chunks_removed = chunks_removed
+    return summary
 
 
 async def ingest_text(
