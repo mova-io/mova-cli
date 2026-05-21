@@ -26,9 +26,10 @@ fields:
   context:
     type: list[string]
     description: >
-      Retrieved context chunks the model should answer from.
-      Indexed 1..N; the agent's output cites these by index.
-    min_items: 1
+      Retrieved context chunks the model should answer from, indexed
+      1..N (cited by index). Optional: when omitted or empty, the agent
+      retrieves its own chunks from the ingested KB via the
+      kb-vector-lookup skill before answering.
     example:
       - >
         Our refund policy: annual subscriptions are refundable within
@@ -39,4 +40,3 @@ fields:
 
 required:
   - question
-  - context
