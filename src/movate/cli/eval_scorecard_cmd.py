@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.prompt import Confirm
 from rich.table import Table
 
 from movate.cli._output import Report
@@ -1355,6 +1357,139 @@ def _offer_inline_auth_recovery() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Case-preview helpers — generate first, show table, then confirm
+# ---------------------------------------------------------------------------
+
+
+async def _generate_entries_preview_async(
+    bundle: AgentBundle,
+    *,
+    count: int,
+    mix: str,
+    mock: bool,
+    generator_model: str | None,
+    project_root: Path | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Preflight + generate *count* test cases; return ``(entries, resolved_model)``.
+
+    Separated from the scoring phase so the operator can review the cases
+    in a preview table before committing to agent + judge LLM calls.
+    The resolved model is threaded back so the second event-loop (scoring)
+    can pass it directly and skip a redundant preflight probe.
+    """
+    resolved = await _preflight_with_retry(
+        declared_per_agent={bundle.spec.name: bundle.spec.model.provider},
+        generator_model_flag=generator_model,
+        mock=mock,
+        is_json=False,
+    )
+    effective_generator_model: str | None = (
+        generator_model
+        if generator_model is not None
+        else resolved.get(bundle.spec.name, bundle.spec.model.provider)
+    )
+
+    kb_seeds: list[str] | None = None
+    if mix == "domain" and project_root is not None:
+        kb_seeds = _load_kb_seeds(bundle, project_root) or None
+
+    entries = await _generate_entries(
+        bundle,
+        num=count,
+        sample_input=None,
+        mock=mock,
+        with_dimensions=False,
+        mode=mix,
+        kb_seeds=kb_seeds,
+        generator_model=effective_generator_model,
+    )
+    return entries, effective_generator_model
+
+
+def _render_cases_preview_table(
+    entries: list[dict[str, Any]],
+    agent_name: str,
+    mix: str,
+) -> None:
+    """Rich table — one row per generated test case.
+
+    Shows ``#``, a condensed view of the ``input`` fields, and a brief
+    preview of the ``expected`` output so the operator can judge whether
+    the cases are reasonable before spending API budget on scoring.
+
+    Input fields are rendered as ``field: value`` pairs — up to 3 fields
+    per case, each value truncated at 80 chars. When the input has a
+    ``question`` or ``query`` key it is shown first (RAG/FAQ agents), so
+    the most meaningful field is always visible regardless of schema order.
+    """
+    if not entries:
+        return
+
+    # Input character budget per cell — keeps the table readable without
+    # truncating aggressively on short questions.
+    field_val_width = 80
+    max_fields = 3
+
+    table = Table(
+        title=(
+            f"[bold]{agent_name}[/bold] — {len(entries)} generated test case(s) "
+            f"[dim](mix={mix})[/dim]"
+        ),
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=True,
+        min_width=60,
+    )
+    table.add_column("#", justify="right", style="dim", no_wrap=True, width=3)
+    table.add_column("Input", overflow="fold", min_width=36)
+    table.add_column("Expected (preview)", overflow="fold", min_width=20)
+
+    for i, entry in enumerate(entries, start=1):
+        input_data: dict[str, Any] = entry.get("input", {})
+        expected: Any = entry.get("expected", {})
+
+        # Reorder so question/query/text shows first (common RAG pattern).
+        priority_keys = {"question", "query", "text", "message", "input", "prompt"}
+        ordered_keys = sorted(
+            input_data.keys(),
+            key=lambda k: (0 if k.lower() in priority_keys else 1, k),
+        )
+        input_parts: list[str] = []
+        for k in ordered_keys[:max_fields]:
+            raw = str(input_data[k])
+            val = raw if len(raw) <= field_val_width else raw[: field_val_width - 1] + "…"
+            input_parts.append(f"[dim]{k}:[/dim] {val}")
+        remaining = len(input_data) - max_fields
+        if remaining > 0:
+            input_parts.append(f"[dim]… +{remaining} field(s)[/dim]")
+        input_str = "\n".join(input_parts)
+
+        # Expected output — show up to 2 key=value pairs for dicts, or
+        # a plain truncated string for scalar/list outputs.
+        exp_fields_shown = 2
+        exp_val_width = 50
+        exp_scalar_width = 80
+        if isinstance(expected, dict):
+            exp_parts: list[str] = []
+            for k, v in list(expected.items())[:exp_fields_shown]:
+                vstr = str(v)
+                if len(vstr) > exp_val_width:
+                    vstr = vstr[: exp_val_width - 1] + "…"
+                exp_parts.append(f"[dim]{k}:[/dim] {vstr}")
+            if len(expected) > exp_fields_shown:
+                exp_parts.append(f"[dim]… +{len(expected) - exp_fields_shown} field(s)[/dim]")
+            expected_str = "\n".join(exp_parts)
+        else:
+            raw_exp = str(expected)
+            trunc = exp_scalar_width - 1
+            expected_str = raw_exp if len(raw_exp) <= exp_scalar_width else raw_exp[:trunc] + "…"
+
+        table.add_row(str(i), input_str, expected_str)
+
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # Sweep wrappers — one event loop per top-level CLI invocation
 # ---------------------------------------------------------------------------
 
@@ -1950,6 +2085,29 @@ def eval_scorecard(
             "(run per-agent instead and compare the resulting tables)."
         ),
     ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help=(
+            "Skip the preview confirmation prompt — generate test cases, "
+            "show the preview table, then proceed directly to scoring without "
+            "asking 'Score these N cases?'. Useful when you want to SEE the "
+            "cases before they run but don't need to confirm manually. "
+            "Has no effect when [bold]--no-preview[/bold] is also set."
+        ),
+    ),
+    no_preview: bool = typer.Option(
+        False,
+        "--no-preview",
+        help=(
+            "Skip the generate-and-preview step entirely — go straight to "
+            "scoring (the pre-2026 behaviour). Implied in [bold]--all[/bold] "
+            "mode, JSON output ([bold]-o json[/bold]), and non-TTY contexts "
+            "(CI pipelines). Use this flag for the same effect in an "
+            "interactive terminal when you already trust the generator."
+        ),
+    ),
 ) -> None:
     """Generate test cases on the fly and score against a 10-category scorecard.
 
@@ -2109,6 +2267,16 @@ def eval_scorecard(
         )
         raise typer.Exit(code=2)
 
+    # Preview is active in single-agent TABLE mode on a TTY, unless the
+    # operator explicitly opted out with --no-preview.
+    show_preview = (
+        output_format == Report.TABLE
+        and not no_preview
+        and not all_in_project
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+
     _run_scorecard_single_agent(
         agent_path_str=agent,
         count=count,
@@ -2127,6 +2295,8 @@ def eval_scorecard(
         target_name=target_name,
         runs_per_case=runs_per_case,
         variant=variant,
+        preview=show_preview,
+        preview_yes=yes,
     )
 
 
@@ -2150,6 +2320,8 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     pre_generated_entries: list[dict[str, Any]] | None = None,
     runs_per_case: int = 1,
     variant: str | None = None,
+    preview: bool = False,
+    preview_yes: bool = False,
 ) -> None:
     """Single-agent scorecard: load, run, render. Shared by the
     positional-arg path and (one iteration of) the --all loop.
@@ -2182,6 +2354,68 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     # event loop (LiteLLM LoggingWorker bug) AND so the retry path
     # can re-resolve when a provider's key turns out to be set-but-
     # invalid (e.g. a placeholder ``sk-test-*2345``).
+    from movate.providers.litellm import (  # noqa: PLC0415
+        reset_logging_worker_for_new_event_loop,
+    )
+
+    # ── Case-preview flow (single-agent TABLE mode only) ──────────────────
+    # When ``preview=True`` and no caller-supplied entries:
+    # 1. Generate the test cases up front (preflight + _generate_entries).
+    # 2. Render them in a Rich table so the operator sees what will be run.
+    # 3. Ask "Proceed?" — unless ``preview_yes`` is set (CI / --yes flag).
+    # 4. If confirmed, pass the entries as ``pre_generated_entries`` to
+    #    the scoring run so they're not re-generated (avoids double-cost
+    #    and ensures the operator scores exactly what they reviewed).
+    # Non-TTY, JSON mode, and ``--all`` never reach this branch — the
+    # callers set ``preview=False`` for those paths.
+    if preview and pre_generated_entries is None and output_format == Report.TABLE:
+        console.print(
+            f"[dim]Generating {count} {mix} test case(s) for "
+            f"[bold]{bundle.spec.name}[/bold]…[/dim]"
+        )
+        reset_logging_worker_for_new_event_loop()
+        preview_entries, resolved_gen_model = asyncio.run(
+            _generate_entries_preview_async(
+                bundle,
+                count=count,
+                mix=mix,
+                mock=mock,
+                generator_model=generator_model,
+                project_root=project_root,
+            )
+        )
+        if not preview_entries:
+            # Generation failed — the 0-entries hint is already printed
+            # inside _run_scorecard (it will fire again below). Let the
+            # normal path handle exit rather than duplicating the message.
+            pass
+        else:
+            console.print()
+            _render_cases_preview_table(preview_entries, bundle.spec.name, mix)
+            console.print()
+
+            # Confirm before scoring — gated on TTY so piped/scripted
+            # runs that somehow land here still don't block.
+            if not preview_yes and sys.stdin.isatty() and sys.stdout.isatty():
+                runs_note = f" x {runs_per_case} run(s) each" if runs_per_case > 1 else ""
+                proceed = Confirm.ask(
+                    f"[bold]Score these {len(preview_entries)} case(s){runs_note}?[/bold]",
+                    default=True,
+                )
+                if not proceed:
+                    console.print("[dim]Eval cancelled.[/dim]")
+                    raise typer.Exit(code=0)
+
+            # Pass the already-generated entries to the scoring run so
+            # we don't pay for generation twice. Also pass the resolved
+            # generator model so the second preflight uses the same one
+            # (avoids the "declared provider has no key, re-routing"
+            # note printing twice).
+            pre_generated_entries = preview_entries
+            if generator_model is None:
+                generator_model = resolved_gen_model
+
+    # ── End case-preview flow ─────────────────────────────────────────────
 
     if output_format == Report.TABLE and pre_generated_entries is None:
         # The wizard-preview path already showed + confirmed the cases;
@@ -2196,10 +2430,6 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
     # queue stranded on the closed loop. Without this reset the next
     # ``acompletion`` inside the scorecard blows up with
     # ``RuntimeError: <Queue> is bound to a different event loop``.
-    from movate.providers.litellm import (  # noqa: PLC0415
-        reset_logging_worker_for_new_event_loop,
-    )
-
     reset_logging_worker_for_new_event_loop()
     summary = asyncio.run(
         _run_scorecard_single_async(
