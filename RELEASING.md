@@ -30,19 +30,26 @@ Every release:
        --baseline-file "$tmp/baseline.json" -o json | jq .baseline.regression
    ```
    The last command must exit 1 with `regression: true`.
-6. Bump version in `pyproject.toml` AND `src/movate/__init__.py`
-   (these must match — no auto-sync today). One-liner that does the
-   patch bump + lockfile refresh + ready-to-commit staging:
+6. Versioning is **CalVer** `YYYY.M.D.N` (date-based; `N` is the Nth
+   commit of that day on the branch). Normally you don't bump by hand:
+   the `.githooks/pre-commit` hook runs `scripts/bump_version.py` on
+   every commit and re-stages `pyproject.toml`, `src/movate/__init__.py`,
+   and `uv.lock` (kept in lockstep — date segments are unpadded so the
+   string is PEP 440-canonical). Enable the hook once per clone:
    ```bash
-   new=$(python scripts/bump_version.py) && uv lock \
+   ./scripts/install-hooks.sh      # sets core.hooksPath=.githooks
+   ```
+   If you haven't enabled the hook, bump manually before committing:
+   ```bash
+   new=$(python scripts/bump_version.py) \
      && git add pyproject.toml src/movate/__init__.py uv.lock \
      && echo "Bumped to $new — review with 'git diff --cached' and commit."
    ```
-   For a minor/major bump, edit `pyproject.toml` + `__init__.py` by
-   hand and run `uv lock` afterward. The previous CI-driven
-   per-merge auto-bump was removed in 2026-05 (the mova-io org
-   policy blocks GitHub Actions from opening PRs, so the bump never
-   landed and dangling `bot/bump-v*` branches accumulated on origin).
+   `python scripts/bump_version.py --check` fails loudly if the three
+   sinks ever drift. (A CI-driven per-merge auto-bump existed before
+   2026-05 but was removed — the mova-io org policy blocks GitHub
+   Actions from opening PRs — and the SemVer scheme it bumped was
+   replaced by CalVer.)
 7. Move `[Unreleased]` content in `CHANGELOG.md` under a new
    `[X.Y.Z] — YYYY-MM-DD` heading; update the link refs at the bottom
    of the file.

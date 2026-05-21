@@ -1,0 +1,23 @@
+#!/bin/sh
+# Auto-bump the CalVer version (YYYY.M.D.N) on every commit, then re-stage
+# the version files so the bump is part of THIS commit.
+#
+# Enable once per clone:  ./scripts/install-hooks.sh
+#   (sets core.hooksPath=.githooks; hooks are not shared by git automatically)
+#
+# Fail-soft: if the bump can't run, warn but let the commit proceed — a
+# version-script hiccup must never block committing.
+
+PY="$(command -v python3 || command -v python)"
+if [ -z "$PY" ]; then
+	echo "pre-commit: python not found on PATH; skipping version bump" >&2
+	exit 0
+fi
+
+if "$PY" scripts/bump_version.py >/dev/null; then
+	git add pyproject.toml src/movate/__init__.py uv.lock
+else
+	echo "pre-commit: version bump failed; committing without a bump" >&2
+fi
+
+exit 0
