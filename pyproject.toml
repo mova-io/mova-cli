@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.95"
+version = "0.8.2.96"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -264,6 +264,11 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # kb-dir → skills → contexts → validate) — branch count is inherent to the
 # orchestration shape. PLR0912 is inappropriate here.
 "src/movate/cli/add_cmd.py" = ["PLR0912"]
+# eval_scorecard_cmd._render_cases_preview_table is a table-rendering pipeline:
+# one branch per field type (list vs scalar), one branch per output format,
+# one branch for the optional KB-seed column. Splitting would obscure the
+# single-pass rendering intent. PLR0912 is wrong for this shape.
+"src/movate/cli/eval_scorecard_cmd.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 

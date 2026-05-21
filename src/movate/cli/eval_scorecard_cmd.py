@@ -539,7 +539,7 @@ def _format_live_stats(
     return f"{position} · {last_token} · {agg}"
 
 
-async def _run_scorecard(  # noqa: PLR0912 — per-case loop has N-runs branch; splitting hides shared setup
+async def _run_scorecard(
     bundle: AgentBundle,
     *,
     count: int,
@@ -1369,13 +1369,14 @@ async def _generate_entries_preview_async(
     mock: bool,
     generator_model: str | None,
     project_root: Path | None,
-) -> tuple[list[dict[str, Any]], str | None]:
-    """Preflight + generate *count* test cases; return ``(entries, resolved_model)``.
+) -> tuple[list[dict[str, Any]], str | None, list[str]]:
+    """Preflight + generate *count* test cases.
 
-    Separated from the scoring phase so the operator can review the cases
-    in a preview table before committing to agent + judge LLM calls.
-    The resolved model is threaded back so the second event-loop (scoring)
-    can pass it directly and skip a redundant preflight probe.
+    Returns ``(entries, resolved_model, kb_seeds)`` so the caller can:
+    * pass ``resolved_model`` to the scoring run (avoids a redundant
+      preflight probe on the second event-loop)
+    * pass ``kb_seeds`` to the preview table renderer so each case can
+      be annotated with the KB scenario that seeded it (domain mix)
     """
     resolved = await _preflight_with_retry(
         declared_per_agent={bundle.spec.name: bundle.spec.model.provider},
@@ -1389,9 +1390,9 @@ async def _generate_entries_preview_async(
         else resolved.get(bundle.spec.name, bundle.spec.model.provider)
     )
 
-    kb_seeds: list[str] | None = None
+    kb_seeds: list[str] = []
     if mix == "domain" and project_root is not None:
-        kb_seeds = _load_kb_seeds(bundle, project_root) or None
+        kb_seeds = _load_kb_seeds(bundle, project_root)
 
     entries = await _generate_entries(
         bundle,
@@ -1400,34 +1401,105 @@ async def _generate_entries_preview_async(
         mock=mock,
         with_dimensions=False,
         mode=mix,
-        kb_seeds=kb_seeds,
+        kb_seeds=kb_seeds or None,
         generator_model=effective_generator_model,
     )
-    return entries, effective_generator_model
+    return entries, effective_generator_model, kb_seeds
+
+
+def _fmt_field_value(value: Any, max_width: int = 80) -> str:
+    """Format one input-field value for the preview table cell.
+
+    Lists of strings (e.g. the ``context`` field of a rag-qa agent) are
+    rendered as separate indented lines instead of Python list syntax —
+    ``['chunk one', 'chunk two']`` → ``chunk one\\n  chunk two``.
+
+    Scalars are stringified and truncated at ``max_width``.
+    """
+    if isinstance(value, list):
+        items: list[str] = []
+        for item in value[:3]:  # cap at 3 items to keep cell height sane
+            s = str(item)
+            if len(s) > max_width:
+                s = s[: max_width - 1] + "…"
+            items.append(s)
+        remaining = len(value) - 3
+        if remaining > 0:
+            items.append(f"[dim]… +{remaining} more[/dim]")
+        # First item inline, subsequent items indented
+        if not items:
+            return "[dim](empty list)[/dim]"
+        return items[0] + "".join(f"\n  {it}" for it in items[1:])
+    raw = str(value)
+    return raw if len(raw) <= max_width else raw[: max_width - 1] + "…"
+
+
+def _render_agent_resources_line(bundle: AgentBundle, mix: str, kb_seeds: list[str]) -> None:
+    """Print a compact one-liner above the preview table showing what
+    resources the generator drew on: skills, context files, KB seeds.
+
+    Gives the operator an at-a-glance answer to "what did these cases
+    come from?" before reading the individual rows.
+    """
+    parts: list[str] = []
+
+    skill_names = [s.spec.name for s in (getattr(bundle, "skills", None) or [])]
+    if skill_names:
+        parts.append(f"[dim]skills:[/dim] {', '.join(skill_names)}")
+
+    ctx_names = [name for name, _ in (getattr(bundle, "contexts", None) or [])]
+    if ctx_names:
+        parts.append(f"[dim]contexts:[/dim] {', '.join(ctx_names)}")
+
+    if kb_seeds:
+        parts.append(f"[dim]KB seeds:[/dim] {len(kb_seeds)} scenario(s)")
+    elif mix == "domain":
+        parts.append("[dim]KB seeds:[/dim] [yellow]none found — falling back to standard[/yellow]")
+
+    model_str = getattr(getattr(bundle, "spec", None), "model", None)
+    if model_str is not None:
+        provider = getattr(model_str, "provider", str(model_str))
+        parts.append(f"[dim]model:[/dim] {provider}")
+
+    if parts:
+        console.print("  " + "  ·  ".join(parts))
 
 
 def _render_cases_preview_table(
     entries: list[dict[str, Any]],
     agent_name: str,
     mix: str,
+    *,
+    bundle: AgentBundle | None = None,
+    kb_seeds: list[str] | None = None,
 ) -> None:
-    """Rich table — one row per generated test case.
+    """Rich table — one row per generated test case, with agent-resource context.
 
-    Shows ``#``, a condensed view of the ``input`` fields, and a brief
-    preview of the ``expected`` output so the operator can judge whether
-    the cases are reasonable before spending API budget on scoring.
-
-    Input fields are rendered as ``field: value`` pairs — up to 3 fields
-    per case, each value truncated at 80 chars. When the input has a
-    ``question`` or ``query`` key it is shown first (RAG/FAQ agents), so
-    the most meaningful field is always visible regardless of schema order.
+    What it shows:
+    * A one-liner above the table: which skills + context files + KB seeds
+      drove the generator (so the operator knows what the cases were derived
+      from, not just what the inputs look like).
+    * ``#``, ``Input``, optional ``KB seed`` column (domain mix only),
+      ``Expected (preview)``.
+    * Input fields: question/query floated first; list values (e.g. the
+      ``context`` field of a rag-qa agent) rendered as readable lines
+      instead of Python list syntax.
+    * For domain mix: a ``KB seed`` column naming the KB scenario that
+      seeded each case (rotated the same way the generator does, so the
+      annotation is exact).
     """
     if not entries:
         return
 
-    # Input character budget per cell — keeps the table readable without
-    # truncating aggressively on short questions.
-    field_val_width = 80
+    seeds = kb_seeds or []
+    show_seed_col = mix == "domain" and bool(seeds)
+
+    # Agent resources banner
+    if bundle is not None:
+        _render_agent_resources_line(bundle, mix, seeds)
+        console.print()
+
+    field_val_width = 78  # slightly narrower to leave room for seed col
     max_fields = 3
 
     table = Table(
@@ -1441,14 +1513,16 @@ def _render_cases_preview_table(
         min_width=60,
     )
     table.add_column("#", justify="right", style="dim", no_wrap=True, width=3)
-    table.add_column("Input", overflow="fold", min_width=36)
+    table.add_column("Input", overflow="fold", min_width=34)
+    if show_seed_col:
+        table.add_column("KB seed", overflow="fold", max_width=28, style="dim")
     table.add_column("Expected (preview)", overflow="fold", min_width=20)
 
     for i, entry in enumerate(entries, start=1):
         input_data: dict[str, Any] = entry.get("input", {})
         expected: Any = entry.get("expected", {})
 
-        # Reorder so question/query/text shows first (common RAG pattern).
+        # Float question/query/text to top; everything else alphabetically.
         priority_keys = {"question", "query", "text", "message", "input", "prompt"}
         ordered_keys = sorted(
             input_data.keys(),
@@ -1456,35 +1530,39 @@ def _render_cases_preview_table(
         )
         input_parts: list[str] = []
         for k in ordered_keys[:max_fields]:
-            raw = str(input_data[k])
-            val = raw if len(raw) <= field_val_width else raw[: field_val_width - 1] + "…"
-            input_parts.append(f"[dim]{k}:[/dim] {val}")
+            val_str = _fmt_field_value(input_data[k], max_width=field_val_width)
+            input_parts.append(f"[dim]{k}:[/dim] {val_str}")
         remaining = len(input_data) - max_fields
         if remaining > 0:
             input_parts.append(f"[dim]… +{remaining} field(s)[/dim]")
         input_str = "\n".join(input_parts)
 
-        # Expected output — show up to 2 key=value pairs for dicts, or
-        # a plain truncated string for scalar/list outputs.
+        # KB seed annotation (domain mix) — use the same rotation the
+        # generator uses so the label is exact, not a guess.
+        seed_str = ""
+        if show_seed_col:
+            seed = seeds[(i - 1) % len(seeds)]
+            seed_max = 30
+            seed_str = seed if len(seed) <= seed_max else seed[: seed_max - 1] + "…"
+
+        # Expected output preview
         exp_fields_shown = 2
-        exp_val_width = 50
-        exp_scalar_width = 80
+        exp_val_width = 48
         if isinstance(expected, dict):
             exp_parts: list[str] = []
             for k, v in list(expected.items())[:exp_fields_shown]:
-                vstr = str(v)
-                if len(vstr) > exp_val_width:
-                    vstr = vstr[: exp_val_width - 1] + "…"
+                vstr = _fmt_field_value(v, max_width=exp_val_width)
                 exp_parts.append(f"[dim]{k}:[/dim] {vstr}")
             if len(expected) > exp_fields_shown:
                 exp_parts.append(f"[dim]… +{len(expected) - exp_fields_shown} field(s)[/dim]")
             expected_str = "\n".join(exp_parts)
         else:
-            raw_exp = str(expected)
-            trunc = exp_scalar_width - 1
-            expected_str = raw_exp if len(raw_exp) <= exp_scalar_width else raw_exp[:trunc] + "…"
+            expected_str = _fmt_field_value(expected, max_width=80)
 
-        table.add_row(str(i), input_str, expected_str)
+        if show_seed_col:
+            table.add_row(str(i), input_str, seed_str, expected_str)
+        else:
+            table.add_row(str(i), input_str, expected_str)
 
     console.print(table)
 
@@ -2300,7 +2378,7 @@ def eval_scorecard(
     )
 
 
-def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispatch + gate + baseline branches
+def _run_scorecard_single_agent(
     *,
     agent_path_str: str,
     count: int,
@@ -2374,7 +2452,7 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             f"[bold]{bundle.spec.name}[/bold]…[/dim]"
         )
         reset_logging_worker_for_new_event_loop()
-        preview_entries, resolved_gen_model = asyncio.run(
+        preview_entries, resolved_gen_model, preview_kb_seeds = asyncio.run(
             _generate_entries_preview_async(
                 bundle,
                 count=count,
@@ -2391,7 +2469,13 @@ def _run_scorecard_single_agent(  # noqa: PLR0912 — orchestrator; format dispa
             pass
         else:
             console.print()
-            _render_cases_preview_table(preview_entries, bundle.spec.name, mix)
+            _render_cases_preview_table(
+                preview_entries,
+                bundle.spec.name,
+                mix,
+                bundle=bundle,
+                kb_seeds=preview_kb_seeds,
+            )
             console.print()
 
             # Confirm before scoring — gated on TTY so piped/scripted
@@ -2764,7 +2848,7 @@ def _summary_to_json(summary: ScorecardSummary) -> dict[str, Any]:
     }
 
 
-def _run_scorecard_all_in_project(  # noqa: PLR0912 — orchestrator: state machine + format + gate + baseline + effective
+def _run_scorecard_all_in_project(
     *,
     count: int,
     mix: str,
