@@ -70,8 +70,24 @@ class LangfuseTracer(Tracer):
         parent: SpanCtx | None = None,
     ) -> SpanCtx:
         attributes = dict(attrs or {})
+        # Pop Langfuse-native first-class fields before forwarding attrs as
+        # metadata. Keys prefixed with ``_`` are executor-private signals
+        # that should map to Langfuse's dedicated trace parameters rather
+        # than landing in the generic metadata blob.
+        session_id: str | None = attributes.pop("_session_id", None) or None
+        user_id: str | None = attributes.pop("_user_id", None) or None
+        tags: list[str] = attributes.pop("_tags", None) or []
         if parent is None:
-            handle = self._client.trace(name=name, metadata=attributes)
+            # Build kwargs for client.trace() selectively so we don't pass
+            # None for optional fields the SDK might reject.
+            trace_kwargs: dict[str, Any] = {"name": name, "metadata": attributes}
+            if session_id:
+                trace_kwargs["session_id"] = session_id
+            if user_id:
+                trace_kwargs["user_id"] = user_id
+            if tags:
+                trace_kwargs["tags"] = tags
+            handle = self._client.trace(**trace_kwargs)
             trace_id = getattr(handle, "id", None) or str(uuid4())
             ctx = SpanCtx(
                 trace_id=trace_id,
@@ -238,6 +254,49 @@ class LangfuseTracer(Tracer):
             # The feedback row in Postgres is the source of truth.
             return None
         return score_id
+
+    async def score_trace(
+        self,
+        *,
+        trace_id: str,
+        name: str,
+        value: float,
+        comment: str | None = None,
+    ) -> str | None:
+        """Push a named numeric score to an existing Langfuse trace.
+
+        Used by the eval engine to record the accuracy dimension score so
+        it appears on the Langfuse Generations / Traces view alongside the
+        per-run token usage. Dispatched via ``asyncio.to_thread`` so the
+        synchronous Langfuse v2 ``score()`` call doesn't block the eval
+        event loop. Fail-soft: returns ``None`` on any error.
+
+        This method is NOT part of the :class:`Tracer` Protocol — it's a
+        Langfuse-specific extension. Callers access it via ``getattr``
+        (or ``isinstance(tracer, LangfuseTracer)``) so other tracers don't
+        need to implement it.
+        """
+        if not trace_id:
+            return None
+
+        import asyncio  # noqa: PLC0415
+
+        def _do_score() -> str | None:
+            try:
+                score_obj = self._client.score(
+                    trace_id=trace_id,
+                    name=name,
+                    value=value,
+                    comment=comment,
+                )
+            except Exception:
+                return None
+            return getattr(score_obj, "id", None)
+
+        try:
+            return await asyncio.to_thread(_do_score)
+        except Exception:
+            return None
 
 
 # ---------------------------------------------------------------------------

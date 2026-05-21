@@ -142,6 +142,11 @@ class Executor:
         # full schema and ``movate.guardrails`` for the engine.
         self._guardrails = guardrails or GuardrailsConfig()
 
+    @property
+    def tracer(self) -> Tracer:
+        """Expose the underlying tracer for callers that need to push scores."""
+        return self._tracer
+
     async def execute(
         self,
         bundle: AgentBundle,
@@ -215,6 +220,14 @@ class Executor:
                 "job_id": job_id,
                 "run_id": run_id,
                 "model_override": model_override is not None,
+                # _-prefixed keys are LangfuseTracer-private: extracted
+                # from attrs before metadata is forwarded so they hit
+                # Langfuse's first-class trace fields (user_id / session_id
+                # / tags) rather than the metadata blob. Other tracers
+                # receive them as regular attributes (harmless).
+                "_session_id": request.session_id,
+                "_user_id": request.user_id,
+                "_tags": spec.tags or [],
             },
         )
 
