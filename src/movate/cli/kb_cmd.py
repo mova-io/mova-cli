@@ -79,6 +79,78 @@ def _kb_wizard_detect_agents(project_root: Path) -> list[tuple[str, Path]]:
     return candidates
 
 
+def _prompt_agent_picker(verb: str = "work with") -> str | None:
+    """Interactive agent picker used by per-subcommand guided helpers.
+
+    Returns the canonical agent name (suitable as a CLI argument), or
+    ``None`` when no project was found, no agents were detected, or the
+    operator cancelled.
+
+    Non-TTY: prints the list of available agents so the operator can see
+    what choices exist, then returns ``None`` — callers should emit an
+    "agent argument required" error.
+    """
+    from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
+
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        err_console.print(
+            "[yellow]⚠[/yellow]  No project found. "
+            "Run [bold]mdk init --project <name>[/bold] to create one."
+        )
+        return None
+
+    agents = _kb_wizard_detect_agents(project_root)
+    if not agents:
+        err_console.print(
+            "[yellow]⚠[/yellow]  No agents found under [bold]agents/[/bold].\n"
+            "  Run [bold]mdk add rag-qa[/bold] to scaffold a KB-enabled agent."
+        )
+        return None
+
+    if len(agents) == 1:
+        agent_name, _ = agents[0]
+        agent_arg = "__shared__" if agent_name.startswith("__shared__") else agent_name
+        console.print(f"[dim]Agent:[/dim]  [bold]{agent_arg}[/bold]")
+        return agent_arg
+
+    # Multiple agents — show numbered picker with a ✓ indicator when the
+    # kb/ directory is already populated.
+    console.print(f"[bold]Which agent would you like to {verb}?[/bold]")
+    for i, (name, kb_path) in enumerate(agents, start=1):
+        try:
+            kb_note = " [green]✓[/green]" if kb_path.is_dir() and any(kb_path.iterdir()) else ""
+        except PermissionError:
+            kb_note = ""
+        display = "__shared__" if name.startswith("__shared__") else name
+        console.print(f"  [bold cyan][{i}][/bold cyan]  {display}{kb_note}")
+    console.print(r"  [bold cyan]\[q][/bold cyan]  Cancel")
+    console.print()
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        err_console.print(
+            "[yellow]⚠[/yellow]  Multiple agents found — pass the agent name explicitly:\n"
+            "  [bold]mdk kb <subcommand> <agent>[/bold]"
+        )
+        return None
+
+    try:
+        pick = Prompt.ask(
+            "[bold]Pick agent[/bold]",
+            choices=[str(i) for i in range(1, len(agents) + 1)] + ["q"],
+            default="q",
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+    if pick == "q":
+        return None
+
+    agent_name, _ = agents[int(pick) - 1]
+    return "__shared__" if agent_name.startswith("__shared__") else agent_name
+
+
 def _kb_guided_wizard() -> None:
     """Interactive guided menu for the most common KB operations.
 
@@ -380,23 +452,23 @@ def _estimate_embedding_cost(files: list[Path]) -> float:
 
 @kb_app.command("ingest")
 def ingest(
-    agent: str = typer.Argument(
-        ...,
+    agent: str | None = typer.Argument(
+        None,
         help=(
             "Agent name (must match a directory under ./agents/ — "
             "we don't enforce this at the storage layer, but the "
             "skill-side lookup at run time scopes by agent so a "
-            "mismatch returns no results)."
+            "mismatch returns no results). Omit for interactive picker."
         ),
     ),
-    path: Path = typer.Argument(
-        ...,
-        exists=True,
-        readable=True,
+    path: Path | None = typer.Argument(
+        None,
         help=(
             "File or directory to ingest. Directories are walked "
-            "recursively; .md, .markdown, .txt files are picked up. "
-            "Hidden dirs (.git, .venv) skipped."
+            "recursively; supported formats: .md, .txt, .pdf, .docx, "
+            ".html, .png, .jpg, .jpeg, .tiff. "
+            "Hidden dirs (.git, .venv) skipped. "
+            "Defaults to agents/<agent>/kb/ when omitted."
         ),
     ),
     tenant_id: str = typer.Option(
@@ -477,6 +549,10 @@ def ingest(
 ) -> None:
     """Ingest a knowledge-base file or directory into ``agent``'s KB.
 
+    Both arguments are optional — omit them to get an interactive picker
+    that auto-detects agents in the current project and defaults the
+    path to ``agents/<agent>/kb/``.
+
     Use ``--dry-run`` to preview chunk count + size distribution
     without consuming any embedding budget. Useful when tuning a
     new corpus before committing to the real ingest.
@@ -491,6 +567,44 @@ def ingest(
     Use ``--ocr-lang`` / ``--ocr-backend`` for non-English or noisy scans.
     """
     import os  # noqa: PLC0415
+
+    # ── Interactive guided helpers when arguments are omitted ──────────────
+    if agent is None:
+        agent = _prompt_agent_picker(verb="ingest files for")
+        if agent is None:
+            raise typer.Exit(code=1)
+
+    if path is None:
+        from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
+
+        project_root = walk_up_for_project_root()
+        default_path = (
+            str(project_root / "agents" / agent / "kb")
+            if project_root
+            else f"agents/{agent}/kb"
+        )
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                path_str = Prompt.ask(
+                    "[bold]Path to ingest[/bold]",
+                    default=default_path,
+                )
+            except (KeyboardInterrupt, EOFError):
+                raise typer.Exit(code=0)  # noqa: B904
+            path = Path(path_str)
+        else:
+            path = Path(default_path)
+        console.print()
+
+    # Manual existence check (Typer's ``exists=`` was removed so we can
+    # accept None and fill in the default above).
+    if not path.exists():
+        err_console.print(
+            f"[red]✗[/red]  Path not found: [bold]{path}[/bold]\n"
+            "  Create the directory and add documents, then run ingest again."
+        )
+        raise typer.Exit(code=2)
+    # ── End guided helpers ─────────────────────────────────────────────────
 
     # --ocr-lang / --ocr-backend set env vars for this process only so
     # the parsers module picks them up without changing its signature.
@@ -929,13 +1043,13 @@ def _run_dry(*, path: Path, agent: str) -> None:
 
 @kb_app.command("search")
 def search(
-    agent: str = typer.Argument(
-        ...,
-        help="Agent whose KB to search.",
+    agent: str | None = typer.Argument(
+        None,
+        help="Agent whose KB to search. Omit for interactive picker.",
     ),
-    question: str = typer.Argument(
-        ...,
-        help="Free-text question to retrieve against.",
+    question: str | None = typer.Argument(
+        None,
+        help="Free-text question to retrieve against. Omit to be prompted.",
     ),
     k: int = typer.Option(
         5,
@@ -1050,6 +1164,9 @@ def search(
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
+    Both arguments are optional — omit them to get an interactive picker
+    that auto-detects agents and prompts for the search question.
+
     Use this to validate that retrieval is finding the right chunks
     BEFORE running the agent end-to-end — saves the cost of agent
     iterations on a bad KB.
@@ -1062,6 +1179,29 @@ def search(
     or under-specified questions.
     """
     import os  # noqa: PLC0415
+
+    # ── Interactive guided helpers when arguments are omitted ──────────────
+    if agent is None:
+        agent = _prompt_agent_picker(verb="search")
+        if agent is None:
+            raise typer.Exit(code=1)
+
+    if question is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                question = Prompt.ask("[bold]Search question[/bold]")
+            except (KeyboardInterrupt, EOFError):
+                raise typer.Exit(code=0)  # noqa: B904
+            if not question.strip():
+                err_console.print("[yellow]Empty question — nothing to search.[/yellow]")
+                raise typer.Exit(code=1)
+        else:
+            err_console.print(
+                "[red]✗[/red]  Missing argument: question.\n"
+                "  Usage: [bold]mdk kb search <agent> '<question>'[/bold]"
+            )
+            raise typer.Exit(code=2)
+    # ── End guided helpers ─────────────────────────────────────────────────
 
     api_key = os.environ.get(api_key_env, "").strip()
     if not api_key:
@@ -1161,7 +1301,7 @@ def search(
 
 @kb_app.command("list")
 def list_chunks(
-    agent: str = typer.Argument(..., help="Agent whose KB to inspect."),
+    agent: str | None = typer.Argument(None, help="Agent whose KB to inspect. Omit for picker."),
     source: str | None = typer.Option(
         None,
         "--source",
@@ -1182,7 +1322,15 @@ def list_chunks(
 ) -> None:
     """List chunks in ``agent``'s KB. Useful for debugging
     "is my content actually in there?" without dropping into SQL.
+
+    Omit ``agent`` for an interactive picker.
     """
+    # ── Interactive guided helper ──────────────────────────────────────────
+    if agent is None:
+        agent = _prompt_agent_picker(verb="list chunks for")
+        if agent is None:
+            raise typer.Exit(code=1)
+    # ── End guided helper ──────────────────────────────────────────────────
 
     async def _run() -> None:
         storage = await _build_storage()
@@ -1232,7 +1380,7 @@ def list_chunks(
 
 @kb_app.command("stats")
 def stats(
-    agent: str = typer.Argument(..., help="Agent whose KB to summarize."),
+    agent: str | None = typer.Argument(None, help="Agent whose KB to summarize. Omit for picker."),
     tenant_id: str = typer.Option(
         _DEFAULT_TENANT,
         "--tenant-id",
@@ -1267,7 +1415,15 @@ def stats(
     Use ``--by-source`` to flip the per-source table into a
     distribution view (sorted by chunk count DESC with a %-of-total
     column) — quick triage for 'is one document dominating?'.
+
+    Omit ``agent`` for an interactive picker.
     """
+    # ── Interactive guided helper ──────────────────────────────────────────
+    if agent is None:
+        agent = _prompt_agent_picker(verb="view stats for")
+        if agent is None:
+            raise typer.Exit(code=1)
+    # ── End guided helper ──────────────────────────────────────────────────
 
     async def _run() -> None:
         storage = await _build_storage()
@@ -1823,7 +1979,7 @@ def ingest_all(
 
 @kb_app.command("clear")
 def clear(
-    agent: str = typer.Argument(..., help="Agent whose KB to clear."),
+    agent: str | None = typer.Argument(None, help="Agent whose KB to clear. Omit for picker."),
     source: str | None = typer.Option(
         None,
         "--source",
@@ -1843,7 +1999,17 @@ def clear(
 ) -> None:
     """Delete chunks from ``agent``'s KB. Use ``--source`` to remove
     just one document; omit for a full wipe. Confirmation required
-    unless ``--yes`` is set."""
+    unless ``--yes`` is set.
+
+    Omit ``agent`` for an interactive picker.
+    """
+    # ── Interactive guided helper ──────────────────────────────────────────
+    if agent is None:
+        agent = _prompt_agent_picker(verb="clear the KB for")
+        if agent is None:
+            raise typer.Exit(code=1)
+    # ── End guided helper ──────────────────────────────────────────────────
+
     target = (
         f"all chunks for agent [bold]{agent}[/bold]"
         if source is None
