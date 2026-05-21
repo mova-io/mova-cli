@@ -29,6 +29,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from movate.cli._progress import progress_bar
 from movate.kb.embed import DEFAULT_EMBEDDING_MODEL
 
 console = Console()
@@ -74,6 +75,27 @@ async def _build_storage() -> object:
     s = build_storage()
     await s.init()
     return s
+
+
+def _estimate_embedding_cost(files: list[Path]) -> float:
+    """Rough cost estimate for embedding all files (text-embedding-3-small pricing).
+
+    Heuristic: read each file, count chars, convert to tokens (~4 chars/token),
+    apply $0.02/1M tokens. Returns float USD. Binary files (PDFs) are estimated
+    by byte count as a proxy; actual token count will differ.
+    """
+    total_chars = 0
+    for file_path in files:
+        try:
+            # Try UTF-8 text first; fall back to byte count for binary files.
+            try:
+                total_chars += len(file_path.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, OSError):
+                total_chars += file_path.stat().st_size
+        except OSError:
+            pass
+    est_tokens = total_chars / 4
+    return est_tokens * 0.02 / 1_000_000
 
 
 @kb_app.command("ingest")
@@ -144,6 +166,15 @@ def ingest(
             "means deleted paragraphs remain in the KB."
         ),
     ),
+    changed_only: bool = typer.Option(
+        False,
+        "--changed-only",
+        help=(
+            "Skip files whose content hasn't changed since last ingest. "
+            "Compares file mtime against the most recent chunk's created_at "
+            "for that source path. Useful in CI to avoid re-embedding unchanged docs."
+        ),
+    ),
     ocr_lang: str = typer.Option(
         "",
         "--ocr-lang",
@@ -207,24 +238,93 @@ def ingest(
         return
 
     async def _run() -> None:
-        from movate.kb.ingest import ingest_path  # noqa: PLC0415
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        from movate.kb.ingest import find_files, ingest_path  # noqa: PLC0415
+
+        files_to_ingest = find_files(path)
+        total_files = len(files_to_ingest)
+
+        console.print(f"[bold cyan]Ingesting[/bold cyan] {path} -> agent [bold]{agent}[/bold]…")
+        if clean_source:
+            console.print(
+                "[dim]--clean-source: deleting existing chunks before re-ingest[/dim]"
+            )
+
+        if total_files > 0:
+            est_cost = _estimate_embedding_cost(files_to_ingest)
+            if est_cost > 0.0:
+                console.print(
+                    f"[dim]→ ~${est_cost:.5f} estimated embedding cost "
+                    f"(text-embedding-3-small) · Ctrl-C to abort[/dim]"
+                )
 
         storage = await _build_storage()
+        summaries: list[object] = []
         try:
-            console.print(f"[bold cyan]Ingesting[/bold cyan] {path} -> agent [bold]{agent}[/bold]…")
-            if clean_source:
-                console.print(
-                    "[dim]--clean-source: deleting existing chunks before re-ingest[/dim]"
-                )
-            summaries = await ingest_path(
-                storage=storage,
-                path=path,
-                agent=agent,
-                tenant_id=tenant_id,
-                embedding_model=model,
-                api_key=api_key,
-                clean_source=clean_source,
-            )
+            if total_files == 0:
+                pass  # nothing to ingest; skip progress bar
+            elif changed_only:
+                # Loop files individually, checking mtime vs last chunk created_at.
+                with progress_bar(
+                    description="Ingesting", total=total_files, transient=False
+                ) as advance:
+                    for i, file_path in enumerate(files_to_ingest):
+                        source_uri = str(file_path.resolve())
+                        # Check whether this file has changed since last ingest.
+                        skip = False
+                        try:
+                            existing = await storage.list_kb_chunks(  # type: ignore[attr-defined]
+                                agent=agent,
+                                tenant_id=tenant_id,
+                                source=source_uri,
+                                limit=1,
+                            )
+                            if existing:
+                                chunk = existing[0]
+                                created_at_str: str = getattr(chunk, "created_at", "") or ""
+                                if created_at_str:
+                                    chunk_ts = datetime.fromisoformat(
+                                        created_at_str.removesuffix("Z")
+                                    ).replace(tzinfo=UTC).timestamp()
+                                    if chunk_ts > file_path.stat().st_mtime:
+                                        skip = True
+                        except Exception:
+                            pass  # on any error, proceed with ingest
+                        advance(suffix=f" [cyan]{file_path.name}[/cyan]  [{i + 1}/{total_files}]")
+                        if skip:
+                            console.print(
+                                f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]"
+                            )
+                            continue
+                        file_summaries = await ingest_path(
+                            storage=storage,  # type: ignore[arg-type]
+                            path=file_path,
+                            agent=agent,
+                            tenant_id=tenant_id,
+                            embedding_model=model,
+                            api_key=api_key,
+                            clean_source=clean_source,
+                        )
+                        summaries.extend(file_summaries)
+            else:
+                with progress_bar(
+                    description="Ingesting", total=total_files, transient=False
+                ) as advance:
+                    def _on_file(name: str, current: int, total: int) -> None:
+                        advance(suffix=f" [cyan]{name}[/cyan]  [{current}/{total}]")
+
+                    file_summaries = await ingest_path(
+                        storage=storage,  # type: ignore[arg-type]
+                        path=path,
+                        agent=agent,
+                        tenant_id=tenant_id,
+                        embedding_model=model,
+                        api_key=api_key,
+                        clean_source=clean_source,
+                        on_file_start=_on_file,
+                    )
+                    summaries.extend(file_summaries)
         finally:
             await storage.close()  # type: ignore[attr-defined]
 
@@ -235,7 +335,9 @@ def ingest(
             return
 
         # Render a summary table — one row per source.
-        show_removed = clean_source and any(s.chunks_removed > 0 for s in summaries)
+        show_removed = clean_source and any(
+            getattr(s, "chunks_removed", 0) > 0 for s in summaries
+        )
         table = Table(title=f"[bold]Ingest summary[/bold] — agent [bold]{agent}[/bold]")
         table.add_column("source", overflow="fold")
         if show_removed:
@@ -243,13 +345,13 @@ def ingest(
         table.add_column("chunks", justify="right")
         table.add_column("embedding model")
         for s in summaries:
-            row = [s.source]
+            row = [getattr(s, "source", "?")]
             if show_removed:
-                row.append(str(s.chunks_removed))
-            row.extend([str(s.chunks_saved), s.embedding_model])
+                row.append(str(getattr(s, "chunks_removed", 0)))
+            row.extend([str(getattr(s, "chunks_saved", 0)), getattr(s, "embedding_model", "")])
             table.add_row(*row)
         console.print(table)
-        total = sum(s.chunks_saved for s in summaries)
+        total = sum(getattr(s, "chunks_saved", 0) for s in summaries)
         console.print(f"[green]✓[/green] {total} chunks saved across {len(summaries)} file(s).")
         console.print(f'[dim]Try it: [bold]mdk kb search {agent} "your question here"[/bold][/dim]')
 
@@ -975,6 +1077,23 @@ def ingest_all(
             "Use when updating documents to remove stale paragraphs."
         ),
     ),
+    changed_only: bool = typer.Option(
+        False,
+        "--changed-only",
+        help=(
+            "Skip files whose content hasn't changed since last ingest. "
+            "Compares file mtime against the most recent chunk's created_at "
+            "for that source path. Useful in CI to avoid re-embedding unchanged docs."
+        ),
+    ),
+    watch_mode: bool = typer.Option(
+        False,
+        "--watch",
+        help=(
+            "Watch KB directories for file changes and re-ingest automatically. "
+            "Polls every 2 seconds. Ctrl-C to stop."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -1079,27 +1198,134 @@ def ingest_all(
         )
         raise typer.Exit(code=2)
 
-    async def _run() -> None:
+    async def _ingest_one_file_standalone(
+        *,
+        file_path: Path,
+        agent_name: str,
+        tenant_id: str,
+        model: str,
+        api_key: str,
+        clean_source: bool,
+    ) -> None:
+        """Build storage, ingest a single file, print chunk count, close storage."""
         from movate.kb.ingest import ingest_path  # noqa: PLC0415
+
+        storage = await _build_storage()
+        try:
+            summaries = await ingest_path(
+                storage=storage,  # type: ignore[arg-type]
+                path=file_path,
+                agent=agent_name,
+                tenant_id=tenant_id,
+                embedding_model=model,
+                api_key=api_key,
+                clean_source=clean_source,
+            )
+        finally:
+            await storage.close()  # type: ignore[attr-defined]
+        chunks = sum(getattr(s, "chunks_saved", 0) for s in summaries)
+        console.print(f"  [green]✓[/green] {file_path.name}: {chunks} chunks saved.")
+
+    async def _run() -> None:
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        from movate.kb.ingest import find_files, ingest_path  # noqa: PLC0415
+
+        # Compute total file count across all targets for the progress bar.
+        all_files: list[tuple[str, Path]] = []
+        for agent_name, kb_dir in targets:
+            for f in find_files(kb_dir):
+                all_files.append((agent_name, f))
+        total_files = len(all_files)
+
+        if total_files > 0:
+            all_paths = [f for _, f in all_files]
+            est_cost = _estimate_embedding_cost(all_paths)
+            if est_cost > 0.0:
+                console.print(
+                    f"[dim]→ ~${est_cost:.5f} estimated embedding cost "
+                    f"(text-embedding-3-small) · Ctrl-C to abort[/dim]"
+                )
 
         storage = await _build_storage()
         all_summaries: list[tuple[str, object]] = []  # [(agent_name, IngestSummary)]
         try:
-            for agent_name, kb_dir in targets:
-                console.print(
-                    f"[bold cyan]Ingesting[/bold cyan] "
-                    f"[dim]{kb_dir}[/dim] → agent [bold]{agent_name}[/bold]…"
-                )
-                summaries = await ingest_path(
-                    storage=storage,  # type: ignore[arg-type]
-                    path=kb_dir,
-                    agent=agent_name,
-                    tenant_id=tenant_id,
-                    embedding_model=model,
-                    api_key=api_key,
-                    clean_source=clean_source,
-                )
-                all_summaries.extend((agent_name, s) for s in summaries)
+            if total_files == 0:
+                pass  # nothing to ingest
+            elif changed_only:
+                with progress_bar(
+                    description="Ingesting", total=total_files, transient=False
+                ) as advance:
+                    for i, (agent_name, file_path) in enumerate(all_files):
+                        source_uri = str(file_path.resolve())
+                        skip = False
+                        try:
+                            existing = await storage.list_kb_chunks(  # type: ignore[attr-defined]
+                                agent=agent_name,
+                                tenant_id=tenant_id,
+                                source=source_uri,
+                                limit=1,
+                            )
+                            if existing:
+                                chunk = existing[0]
+                                created_at_str: str = getattr(chunk, "created_at", "") or ""
+                                if created_at_str:
+                                    chunk_ts = datetime.fromisoformat(
+                                        created_at_str.removesuffix("Z")
+                                    ).replace(tzinfo=UTC).timestamp()
+                                    if chunk_ts > file_path.stat().st_mtime:
+                                        skip = True
+                        except Exception:
+                            pass
+                        advance(
+                            suffix=f" [cyan]{file_path.name}[/cyan]  [{i + 1}/{total_files}]"
+                        )
+                        if skip:
+                            console.print(
+                                f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]"
+                            )
+                            continue
+                        file_summaries = await ingest_path(
+                            storage=storage,  # type: ignore[arg-type]
+                            path=file_path,
+                            agent=agent_name,
+                            tenant_id=tenant_id,
+                            embedding_model=model,
+                            api_key=api_key,
+                            clean_source=clean_source,
+                        )
+                        all_summaries.extend((agent_name, s) for s in file_summaries)
+            else:
+                with progress_bar(
+                    description="Ingesting", total=total_files, transient=False
+                ) as advance:
+                    for agent_name, kb_dir in targets:
+                        console.print(
+                            f"[bold cyan]Ingesting[/bold cyan] "
+                            f"[dim]{kb_dir}[/dim] → agent [bold]{agent_name}[/bold]…"
+                        )
+
+                        def _on_file(
+                            name: str,
+                            current: int,
+                            total: int,
+                            _agent: str = agent_name,
+                        ) -> None:
+                            advance(
+                                suffix=f" [cyan]{name}[/cyan] ({_agent})  [{current}/{total}]"
+                            )
+
+                        dir_summaries = await ingest_path(
+                            storage=storage,  # type: ignore[arg-type]
+                            path=kb_dir,
+                            agent=agent_name,
+                            tenant_id=tenant_id,
+                            embedding_model=model,
+                            api_key=api_key,
+                            clean_source=clean_source,
+                            on_file_start=_on_file,
+                        )
+                        all_summaries.extend((agent_name, s) for s in dir_summaries)
         finally:
             await storage.close()  # type: ignore[attr-defined]
 
@@ -1107,37 +1333,74 @@ def ingest_all(
             console.print(
                 "[yellow]⚠[/yellow] no ingestible files found in any KB directory."
             )
-            return
-
-        # Summary table — one row per source file across all agents.
-        show_removed = clean_source and any(
-            getattr(s, "chunks_removed", 0) > 0 for _, s in all_summaries
-        )
-        table = Table(title="[bold]Ingest summary[/bold]")
-        table.add_column("agent", style="bold cyan")
-        table.add_column("source", overflow="fold")
-        if show_removed:
-            table.add_column("removed", justify="right")
-        table.add_column("chunks", justify="right")
-
-        for agent_name, s in all_summaries:
-            row = [agent_name, getattr(s, "source", "?")]
+            if not watch_mode:
+                return
+        else:
+            # Summary table — one row per source file across all agents.
+            show_removed = clean_source and any(
+                getattr(s, "chunks_removed", 0) > 0 for _, s in all_summaries
+            )
+            table = Table(title="[bold]Ingest summary[/bold]")
+            table.add_column("agent", style="bold cyan")
+            table.add_column("source", overflow="fold")
             if show_removed:
-                row.append(str(getattr(s, "chunks_removed", 0)))
-            row.append(str(getattr(s, "chunks_saved", 0)))
-            table.add_row(*row)
+                table.add_column("removed", justify="right")
+            table.add_column("chunks", justify="right")
 
-        console.print(table)
-        total_chunks = sum(getattr(s, "chunks_saved", 0) for _, s in all_summaries)
-        total_files = len(all_summaries)
-        console.print(
-            f"[green]✓[/green] {total_chunks} chunks saved from "
-            f"{total_files} file(s) across "
-            f"{len(targets)} agent(s)."
-        )
-        console.print(
-            "[dim]Run [bold]mdk kb stats <agent>[/bold] to inspect per-agent chunk counts.[/dim]"
-        )
+            for agent_name, s in all_summaries:
+                row = [agent_name, getattr(s, "source", "?")]
+                if show_removed:
+                    row.append(str(getattr(s, "chunks_removed", 0)))
+                row.append(str(getattr(s, "chunks_saved", 0)))
+                table.add_row(*row)
+
+            console.print(table)
+            total_chunks = sum(getattr(s, "chunks_saved", 0) for _, s in all_summaries)
+            ingest_file_count = len(all_summaries)
+            console.print(
+                f"[green]✓[/green] {total_chunks} chunks saved from "
+                f"{ingest_file_count} file(s) across "
+                f"{len(targets)} agent(s)."
+            )
+            console.print(
+                "[dim]Run [bold]mdk kb stats <agent>[/bold] to inspect "
+                "per-agent chunk counts.[/dim]"
+            )
+
+        # --watch: poll for file changes and re-ingest automatically.
+        if watch_mode:
+            mtimes: dict[Path, float] = {}
+            for _, kb_dir in targets:
+                for f in find_files(kb_dir):
+                    mtimes[f] = f.stat().st_mtime
+
+            console.print("[dim]Watching for changes… Ctrl-C to stop.[/dim]")
+            try:
+                while True:
+                    await asyncio.sleep(2.0)
+                    changed: list[tuple[str, Path]] = []
+                    for watch_agent_name, kb_dir in targets:
+                        for f in find_files(kb_dir):
+                            current_mtime = f.stat().st_mtime
+                            if mtimes.get(f) != current_mtime:
+                                mtimes[f] = current_mtime
+                                changed.append((watch_agent_name, f))
+                    if changed:
+                        for watch_agent_name, f in changed:
+                            console.print(
+                                f"[dim]🔄 change detected: [bold]{f.name}[/bold] "
+                                f"→ re-ingesting into [bold]{watch_agent_name}[/bold]…[/dim]"
+                            )
+                            await _ingest_one_file_standalone(
+                                file_path=f,
+                                agent_name=watch_agent_name,
+                                tenant_id=tenant_id,
+                                model=model,
+                                api_key=api_key,
+                                clean_source=True,
+                            )
+            except KeyboardInterrupt:
+                console.print("\n[dim]Watch stopped.[/dim]")
 
     asyncio.run(_run())
 

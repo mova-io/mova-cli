@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -107,6 +108,7 @@ async def ingest_path(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
     clean_source: bool = False,
+    on_file_start: Callable[[str, int, int], None] | None = None,
 ) -> list[IngestSummary]:
     """Ingest a file or directory tree. Returns one summary per file.
 
@@ -121,10 +123,16 @@ async def ingest_path(
     to fully replace old content rather than dedup on content_hash.
     Equivalent to: delete old chunks → ingest new chunks. Reported
     in :attr:`IngestSummary.chunks_removed`.
+
+    ``on_file_start`` is an optional progress callback invoked just
+    before each file is ingested. Signature:
+    ``(filename_str, current_1based_idx, total_files) -> None``.
     """
     files = find_files(path)
     summaries: list[IngestSummary] = []
-    for file_path in files:
+    for i, file_path in enumerate(files):
+        if on_file_start is not None:
+            on_file_start(file_path.name, i + 1, len(files))
         summary = await _ingest_one_file(
             storage=storage,
             file_path=file_path,
