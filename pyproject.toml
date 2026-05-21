@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.96"
+version = "0.8.2.97"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -30,6 +30,15 @@ dependencies = [
     # cryptic ImportError" — is bad UX for the operator's first
     # encounter with the KB upload flow.
     "pypdf>=4.0,<6",
+    # AES-encrypted PDF support for KB ingest. Many real-world PDFs
+    # (manufacturer user guides, DRM-protected documents, corporate
+    # exports) are encrypted with AES-256. pypdf can read the PDF
+    # structure but silently fails to extract text without the
+    # cryptography package — producing the misleading "skipped"
+    # warning operators saw on e.g. SanDisk user guide PDFs.
+    # cryptography is ~2MB on disk, pure-Python for the AES path,
+    # and has no system binary dependencies.
+    "cryptography>=3.1",
     # DOCX text extraction for KB ingest (PR-L). Same rationale as
     # pypdf above — making this a core dep avoids the "drag a .docx,
     # get ImportError" failure mode. python-docx is ~3MB on disk

@@ -2212,11 +2212,12 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "0.8.2.96"
+version = "0.8.2.97"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "beautifulsoup4" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "jinja2" },
     { name = "jsonschema" },
@@ -2312,6 +2313,7 @@ requires-dist = [
     { name = "bcrypt", marker = "extra == 'runtime'", specifier = ">=4.0" },
     { name = "beautifulsoup4", specifier = ">=4.12,<5" },
     { name = "chainlit", marker = "extra == 'playground'", specifier = ">=1.3" },
+    { name = "cryptography", specifier = ">=3.1" },
     { name = "cryptography", marker = "extra == 'github'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'teams'", specifier = ">=42" },
     { name = "easyocr", marker = "extra == 'easyocr'", specifier = ">=1.7,<2" },
