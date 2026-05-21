@@ -23,12 +23,17 @@ it imports from ``movate.kb.search`` under the hood.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 
+from movate.cli._next_steps import mdk_bin_name
 from movate.cli._progress import progress_bar
 from movate.kb.embed import DEFAULT_EMBEDDING_MODEL
 
@@ -39,12 +44,287 @@ err_console = Console(stderr=True)
 kb_app = typer.Typer(
     name="kb",
     help=(
-        "Knowledge-base ingest + search for the v0.9 RAG MVP. "
-        "Stores chunks in the local sqlite DB (or Postgres if "
-        "MOVATE_DB_URL is set); embeddings via OpenAI."
+        "Knowledge-base ingest + search. "
+        "Run [bold]mdk kb[/bold] with no arguments for an interactive guided menu."
     ),
-    no_args_is_help=True,
+    invoke_without_command=True,
+    no_args_is_help=False,
 )
+
+
+# ---------------------------------------------------------------------------
+# Guided KB wizard — shown when `mdk kb` is run with no subcommand
+# ---------------------------------------------------------------------------
+
+def _kb_wizard_detect_agents(project_root: Path) -> list[tuple[str, Path]]:
+    """Return [(agent_name, kb_dir)] for every agent that *could* use a KB
+    (has an agent.yaml), regardless of whether the kb/ dir is populated yet.
+    Also includes the project-level kb/ dir as "__shared__" if it exists.
+    """
+    candidates: list[tuple[str, Path]] = []
+
+    project_kb = project_root / "kb"
+    if project_kb.is_dir():
+        candidates.append(("__shared__ (project-level kb/)", project_kb))
+
+    agents_dir = project_root / "agents"
+    if agents_dir.is_dir():
+        for agent_dir in sorted(agents_dir.iterdir()):
+            if not agent_dir.is_dir():
+                continue
+            if not (agent_dir / "agent.yaml").is_file():
+                continue
+            candidates.append((agent_dir.name, agent_dir / "kb"))
+
+    return candidates
+
+
+def _kb_guided_wizard() -> None:
+    """Interactive guided menu for the most common KB operations.
+
+    Runs when the user types `mdk kb` with no subcommand.  Detects the
+    current project, lists agents, and offers a numbered action menu —
+    no need to remember argument order.
+    """
+    from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold]Knowledge Base Manager[/bold]\n"
+            "[dim]Ingest documents · Search chunks · View stats · Clear index[/dim]",
+            border_style="cyan",
+        )
+    )
+    console.print()
+
+    # ── 1. Locate project root ──────────────────────────────────────────────
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        console.print(
+            "[yellow]⚠[/yellow]  No project found in this directory or any parent.\n"
+            "  Run [bold]mdk init --project <name>[/bold] to create one."
+        )
+        return
+
+    # ── 2. Find available agents ────────────────────────────────────────────
+    agents = _kb_wizard_detect_agents(project_root)
+    if not agents:
+        console.print(
+            "[yellow]⚠[/yellow]  No agents found under [bold]agents/[/bold].\n"
+            "  Run [bold]mdk add rag-qa[/bold] to scaffold a KB-enabled agent."
+        )
+        return
+
+    # ── 3. Agent picker ─────────────────────────────────────────────────────
+    if len(agents) == 1:
+        agent_name, agent_kb_dir = agents[0]
+        console.print(f"[dim]Agent:[/dim]  [bold]{agent_name}[/bold]")
+        console.print()
+    else:
+        console.print("[bold]Select an agent:[/bold]")
+        for i, (name, _) in enumerate(agents, start=1):
+            console.print(f"  [bold cyan][{i}][/bold cyan]  {name}")
+        console.print(r"  [bold cyan]\[s][/bold cyan]  Exit")
+        console.print()
+
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return  # non-TTY: show list only
+
+        try:
+            pick = Prompt.ask(
+                "[bold]Pick agent[/bold]",
+                choices=[str(i) for i in range(1, len(agents) + 1)] + ["s"],
+                default="s",
+                show_choices=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return
+        if pick == "s":
+            return
+        agent_name, agent_kb_dir = agents[int(pick) - 1]
+
+    # Strip the display-only suffix from __shared__
+    agent_arg = "__shared__" if agent_name.startswith("__shared__") else agent_name
+
+    # ── 4. Action loop ──────────────────────────────────────────────────────
+    while True:
+        # KB dir exists and is non-empty?
+        kb_populated = agent_kb_dir.is_dir() and any(agent_kb_dir.iterdir())
+
+        rel_kb = agent_kb_dir.relative_to(project_root)
+        console.print("[bold]What would you like to do?[/bold]")
+        console.print(
+            f"  [bold cyan][1][/bold cyan]  Ingest KB files"
+            f"   [dim]{bin_name} kb ingest {agent_arg} {rel_kb}[/dim]"
+        )
+        console.print(
+            f"  [bold cyan][2][/bold cyan]  Search the KB"
+            f"   [dim]{bin_name} kb search {agent_arg} '<question>'[/dim]"
+        )
+        console.print(
+            f"  [bold cyan][3][/bold cyan]  KB stats"
+            f"   [dim]{bin_name} kb stats {agent_arg} --by-source[/dim]"
+        )
+        console.print(
+            f"  [bold cyan][4][/bold cyan]  Ingest all agents"
+            f"   [dim]{bin_name} kb ingest-all[/dim]"
+        )
+        console.print(
+            f"  [bold cyan][5][/bold cyan]  List KB chunks"
+            f"   [dim]{bin_name} kb list {agent_arg}[/dim]"
+        )
+        console.print(
+            f"  [bold cyan][6][/bold cyan]  Clear KB index"
+            f"   [dim]{bin_name} kb clear {agent_arg}[/dim]"
+        )
+        console.print(r"  [bold cyan]\[s][/bold cyan]  Exit")
+        console.print()
+
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return  # non-TTY: printed menu, exit cleanly
+
+        try:
+            action = Prompt.ask(
+                "[bold]Pick action[/bold]",
+                choices=["1", "2", "3", "4", "5", "6", "s"],
+                default="s",
+                show_choices=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return
+
+        if action == "s":
+            return
+
+        # ── Build argv for the chosen action ──────────────────────────────
+        if action == "1":
+            # Ingest — prompt for path, default to the agent's kb/ dir
+            default_path = (
+                str(agent_kb_dir.relative_to(project_root))
+                if agent_kb_dir.is_dir()
+                else f"agents/{agent_arg}/kb/"
+            )
+            try:
+                path_str = Prompt.ask(
+                    "[bold]Path to ingest[/bold]",
+                    default=default_path,
+                )
+            except (KeyboardInterrupt, EOFError):
+                return
+
+            # Offer --dry-run preview first if kb dir is populated
+            if kb_populated:
+                try:
+                    dry = Prompt.ask(
+                        "[bold]Preview chunk counts first?[/bold] (dry-run)",
+                        choices=["y", "n"],
+                        default="y",
+                        show_choices=True,
+                    )
+                except (KeyboardInterrupt, EOFError):
+                    dry = "n"
+                if dry == "y":
+                    argv = [bin_name, "kb", "ingest", agent_arg, path_str, "--dry-run"]
+                    console.print(f"\n[dim]$ {' '.join(argv)}[/dim]\n")
+                    subprocess.run(argv, check=False)
+                    console.print()
+                    try:
+                        proceed = Prompt.ask(
+                            "[bold]Proceed with real ingest?[/bold]",
+                            choices=["y", "n"],
+                            default="y",
+                            show_choices=True,
+                        )
+                    except (KeyboardInterrupt, EOFError):
+                        proceed = "n"
+                    if proceed != "y":
+                        console.print()
+                        continue
+
+            argv = [bin_name, "kb", "ingest", agent_arg, path_str]
+
+        elif action == "2":
+            # Search — prompt for question
+            try:
+                question = Prompt.ask("[bold]Search question[/bold]")
+            except (KeyboardInterrupt, EOFError):
+                return
+            if not question.strip():
+                console.print("[yellow]Empty question — skipping.[/yellow]\n")
+                continue
+            argv = [bin_name, "kb", "search", agent_arg, question, "--k", "5"]
+
+        elif action == "3":
+            argv = [bin_name, "kb", "stats", agent_arg, "--by-source"]
+
+        elif action == "4":
+            argv = [bin_name, "kb", "ingest-all"]
+
+        elif action == "5":
+            argv = [bin_name, "kb", "list", agent_arg]
+
+        elif action == "6":
+            # Clear — require explicit confirmation
+            console.print(
+                f"\n[yellow]⚠[/yellow]  This will delete [bold]all[/bold] KB chunks for "
+                f"[bold]{agent_arg}[/bold]."
+            )
+            try:
+                confirm = Prompt.ask(
+                    "[bold]Are you sure?[/bold]",
+                    choices=["y", "n"],
+                    default="n",
+                    show_choices=True,
+                )
+            except (KeyboardInterrupt, EOFError):
+                confirm = "n"
+            if confirm != "y":
+                console.print("[dim]Cancelled.[/dim]\n")
+                continue
+            argv = [bin_name, "kb", "clear", agent_arg, "--yes"]
+
+        else:
+            return
+
+        # ── Execute ────────────────────────────────────────────────────────
+        console.print(f"\n[dim]$ {' '.join(argv)}[/dim]\n")
+        try:
+            subprocess.run(argv, check=False)
+        except FileNotFoundError:
+            err_console.print(
+                f"[yellow]⚠[/yellow] couldn't run [bold]{argv[0]}[/bold] — "
+                "try running the command manually."
+            )
+
+        # ── Loop: another action? ──────────────────────────────────────────
+        console.print()
+        try:
+            again = Prompt.ask(
+                "[bold]Another KB action?[/bold]",
+                choices=["y", "n"],
+                default="n",
+                show_choices=True,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return
+        if again != "y":
+            return
+        console.print()
+
+
+@kb_app.callback()
+def kb_root(ctx: typer.Context) -> None:
+    """Knowledge-base ingest + search.
+
+    Run [bold]mdk kb[/bold] with no arguments for a guided interactive menu.
+    Add a subcommand ([bold]ingest[/bold], [bold]search[/bold], [bold]stats[/bold],
+    [bold]list[/bold], [bold]ingest-all[/bold], [bold]clear[/bold]) to run directly.
+    """
+    if ctx.invoked_subcommand is None:
+        _kb_guided_wizard()
 
 
 # Default tenant for local CLI use. Matches the convention in
