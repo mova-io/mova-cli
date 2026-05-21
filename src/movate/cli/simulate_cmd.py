@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -506,7 +507,7 @@ def _resolve_agent_path(name_or_path: str, project_root: Path) -> Path:
     raise typer.Exit(code=2)
 
 
-def simulate(
+def simulate(  # noqa: PLR0912
     name: str = typer.Argument(
         ...,
         help=(
@@ -613,15 +614,71 @@ def simulate(
         err_console.print(f"[red]✗ load failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
 
-    results = asyncio.run(
-        _simulate_all(
-            bundle=bundle,
-            num=num,
-            scenarios_file=scenarios_file,
-            max_turns=max_turns,
-            mock=mock,
+    # Upfront cost estimate — shown before the run so the operator knows what
+    # they're about to spend. Each scenario drives (max_turns) turns of the
+    # simulated user + (max_turns) agent calls = 2 x max_turns LLM calls per
+    # scenario. This is a rough ceiling (some scenarios end early).
+    if not mock and not scenarios_file and sys.stderr.isatty():
+        est_calls = num * max_turns * 2
+        console.print(
+            f"[dim]Estimated LLM calls: ~{est_calls} "
+            f"({num} scenario{'s' if num != 1 else ''} x {max_turns} turns x 2). "
+            f"Pass [bold]--mock[/bold] for a free offline run.[/dim]"
         )
-    )
+
+    # Determine scenario count for the progress bar total
+    if scenarios_file:
+        try:
+            _bar_total = sum(
+                1
+                for ln in Path(scenarios_file).read_text().splitlines()
+                if ln.strip()
+            )
+        except OSError:
+            _bar_total = num  # fallback
+    else:
+        _bar_total = num
+
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn  # noqa: PLC0415
+
+    _show_bar = sys.stderr.isatty()
+    if _show_bar:
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as _prog:
+            _sim_task = _prog.add_task(
+                f"Simulating [bold]{bundle.spec.name}[/bold]",
+                total=_bar_total,
+            )
+
+            def _on_sim_progress(cur: int, _tot: int) -> None:
+                _prog.update(_sim_task, completed=cur)
+
+            results = asyncio.run(
+                _simulate_all(
+                    bundle=bundle,
+                    num=num,
+                    scenarios_file=scenarios_file,
+                    max_turns=max_turns,
+                    mock=mock,
+                    on_progress=_on_sim_progress,
+                )
+            )
+    else:
+        results = asyncio.run(
+            _simulate_all(
+                bundle=bundle,
+                num=num,
+                scenarios_file=scenarios_file,
+                max_turns=max_turns,
+                mock=mock,
+            )
+        )
 
     _render_summary(results)
 
@@ -664,6 +721,7 @@ async def _simulate_all(
     scenarios_file: str,
     max_turns: int,
     mock: bool,
+    on_progress: Any | None = None,
 ) -> list[SimulationResult]:
     """Build the scenario list + run them all under one runtime."""
     rt = await build_local_runtime(mock=mock)
@@ -689,9 +747,11 @@ async def _simulate_all(
         ]
 
         results: list[SimulationResult] = []
-        for s in scenarios:
+        for i, s in enumerate(scenarios):
             result = await _run_one_scenario(rt, bundle, s, mock=mock)
             results.append(result)
+            if on_progress is not None:
+                on_progress(i + 1, len(scenarios))
         return results
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
