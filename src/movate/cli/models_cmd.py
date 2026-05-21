@@ -187,11 +187,15 @@ def _build_rows(
     provider_filter: str | None = None,
     has_tools: bool = False,
     has_vision: bool = False,
+    search_filter: str | None = None,
 ) -> list[_ModelRow]:
+    needle = search_filter.lower() if search_filter else None
     rows: list[_ModelRow] = []
     for model_id, price in sorted(table_data.models.items()):
         provider = model_id.split("/")[0] if "/" in model_id else model_id
         if provider_filter and provider != provider_filter:
+            continue
+        if needle and needle not in model_id.lower():
             continue
         caps = _caps_for(model_id)
         if has_tools and not caps.supports_tools:
@@ -234,6 +238,12 @@ def models_list(
         "-p",
         help=("Only show models from this provider (e.g. ``anthropic``, ``openai``, ``azure``)."),
     ),
+    search: str = typer.Option(
+        None,
+        "--search",
+        "-s",
+        help="Case-insensitive substring filter on model ID (e.g. ``gpt-4o``, ``sonnet``).",
+    ),
     has_tools: bool = typer.Option(
         False,
         "--has-tools",
@@ -262,6 +272,9 @@ def models_list(
       [dim]# Anthropic models only[/dim]
       $ mdk models list --provider anthropic
 
+      [dim]# Search for GPT-4o variants[/dim]
+      $ mdk models list --search gpt-4o
+
       [dim]# Models that support tool-use and vision[/dim]
       $ mdk models list --has-tools --has-vision
 
@@ -277,6 +290,7 @@ def models_list(
     rows = _build_rows(
         table_data,
         provider_filter=provider,
+        search_filter=search,
         has_tools=has_tools,
         has_vision=has_vision,
     )
