@@ -337,7 +337,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         err.print(
             f"  [cyan]curl -sS -X POST {base_url}/run "
             f"-H 'content-type: application/json' "
-            f'-H "Authorization: Bearer ${target_cfg.key_env}" '
+            f'-H "Authorization: Bearer {_bearer_shell_expr(target_cfg.key_env)}" '
             f'-d \'{{"agent": "{first_agent}", "input": {{}}}}\'[/cyan]'
         )
     err.print(
@@ -930,6 +930,27 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
         raise typer.Exit(code=2)
 
 
+def _bearer_shell_expr(key_env: str) -> str:
+    """Shell expression that resolves the runtime bearer at curl-run time.
+
+    Prefers an exported ``$<key_env>``; otherwise reads it straight out of
+    the credentials file ``mdk deploy`` already wrote the key to. This is
+    why the printed curl works in any fresh shell without a manual
+    ``export``: the shell never sources ``~/.movate/credentials`` (only the
+    ``mdk`` process autoloads it), so a bare ``$<key_env>`` would expand to
+    empty and the runtime would 401 with ``auth_required``. Reading the file
+    at curl-time also keeps the secret out of terminal scrollback.
+    """
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    path = CredentialsStore().path
+    try:
+        display = f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        display = str(path)  # honors MOVATE_CREDENTIALS_PATH override
+    return f"${{{key_env}:-$(grep -m1 '^{key_env}=' {display} | cut -d= -f2-)}}"
+
+
 def _render_post_deploy_next_steps(
     *,
     target_name: str,
@@ -999,7 +1020,7 @@ def _render_post_deploy_next_steps(
         err.print(
             f"  curl -sS -X POST {base_url}/run \\\n"
             f"    -H 'content-type: application/json' \\\n"
-            f'    -H "Authorization: Bearer ${key_env}" \\\n'
+            f'    -H "Authorization: Bearer {_bearer_shell_expr(key_env)}" \\\n'
             f"    --data-binary @- <<'JSON'\n"
             f"{body}\n"
             f"JSON",
