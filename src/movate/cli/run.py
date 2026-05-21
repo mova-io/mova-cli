@@ -319,6 +319,35 @@ def _suggest_dataset_example(bundle: AgentBundle) -> None:
         )
 
 
+def _run_hint(run_short: str, metrics: Any, output_format: Run) -> str:
+    """Build the dim footer printed to stderr after a successful agent run.
+
+    Text mode (TTY): run-id · latency · cost · tokens · mdk explain hint.
+    JSON / pipe mode: minimal hint (metadata already in the JSON body).
+    """
+    if output_format != Run.TEXT:
+        return (
+            f"[dim]→ run [bold]{run_short}[/bold] · "
+            f"[cyan]mdk explain {run_short}[/cyan][/dim]"
+        )
+    parts: list[str] = [f"[bold]{run_short}[/bold]"]
+    if metrics is not None:
+        latency = getattr(metrics, "latency_ms", 0) or 0
+        cost = getattr(metrics, "cost_usd", 0.0) or 0.0
+        tokens_obj = getattr(metrics, "tokens", None)
+        tok_in = getattr(tokens_obj, "input", 0) if tokens_obj else 0
+        tok_out = getattr(tokens_obj, "output", 0) if tokens_obj else 0
+        if latency:
+            parts.append(f"{latency:,}ms")
+        if cost:
+            parts.append(f"${cost:.4f}")
+        total = tok_in + tok_out
+        if total:
+            parts.append(f"{total:,} tok ({tok_in}↑ {tok_out}↓)")
+    parts.append(f"[cyan]mdk explain {run_short}[/cyan]")
+    return "[dim]→ " + " · ".join(parts) + "[/dim]"
+
+
 def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
     """Best-effort interpretation of an agent's positional input.
 
@@ -385,7 +414,17 @@ async def _run_local_agent(
         # (which carries the schema-validated final JSON). The MockProvider
         # has no real stream path, so silently skip streaming under --mock.
         on_token = _streaming_callback() if stream and not mock else None
-        response = await rt.executor.execute(bundle, request, on_token=on_token)
+        # Show a spinner while the LLM responds (text mode + interactive + no streaming).
+        # Cleared automatically by the Status context when the await returns.
+        _spin = output_format == Run.TEXT and not stream and sys.stderr.isatty()
+        if _spin:
+            with console.status(
+                f"Running [bold]{bundle.spec.name}[/bold]…",
+                spinner="dots",
+            ):
+                response = await rt.executor.execute(bundle, request, on_token=on_token)
+        else:
+            response = await rt.executor.execute(bundle, request, on_token=on_token)
         if on_token is not None:
             # End the streamed preview with a newline so the JSON output
             # below starts on its own line.
@@ -412,10 +451,7 @@ async def _run_local_agent(
     # `mdk replay` / `mdk explain` next. Honors --quiet via _console.hint.
     if response.run_id:
         short = response.run_id[:8]
-        _console.hint(
-            f"[dim]→ saved as run_id [bold]{short}[/bold] · "
-            f"replay: [cyan]mdk replay {short}[/cyan][/dim]"
-        )
+        _console.hint(_run_hint(short, response.metrics, output_format))
 
     # Greppable summary line — mirrors mdk_init_summary / mdk_add_summary
     # / mdk_validate_summary / mdk_eval_*_summary so CI workflows can
