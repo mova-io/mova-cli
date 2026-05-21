@@ -510,6 +510,32 @@ def ingest(
         )
         raise typer.Exit(code=2)
 
+    # Guard: warn if the path looks like an agent root (has agent.yaml) rather
+    # than a kb/ directory.  A common mistake is `mdk kb ingest rag-qa agents/rag-qa`
+    # which picks up prompt.md / contexts/*.md alongside the actual KB docs and
+    # pollutes the search index.  The correct path is `agents/rag-qa/kb/`.
+    if (path / "agent.yaml").is_file():
+        kb_subdir = path / "kb"
+        hint = f"[bold]mdk kb ingest {agent} {path / 'kb'}[/bold]"
+        if kb_subdir.is_dir():
+            err_console.print(
+                f"[yellow]⚠[/yellow]  [bold]{path}[/bold] looks like an agent root "
+                f"(it contains [bold]agent.yaml[/bold]).\n"
+                f"  Ingesting the full agent directory will include [bold]prompt.md[/bold],\n"
+                f"  context files, and schema files — not just your KB documents.\n\n"
+                f"  Did you mean to ingest just the kb/ subfolder?\n"
+                f"  {hint}"
+            )
+            raise typer.Exit(code=2)
+        else:
+            err_console.print(
+                f"[yellow]⚠[/yellow]  [bold]{path}[/bold] is an agent root with no "
+                f"[bold]kb/[/bold] subdirectory yet.\n"
+                f"  Create it and drop your documents there first:\n"
+                f"  [bold]mkdir -p {path / 'kb'}[/bold]"
+            )
+            raise typer.Exit(code=2)
+
     if dry_run:
         # No storage writes, no embedding calls — just walk + chunk.
         # Renders the same table shape so the operator can compare
