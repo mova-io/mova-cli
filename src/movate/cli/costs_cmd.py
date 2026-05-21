@@ -305,6 +305,14 @@ def report(
     if by not in ("agent", "provider"):
         err_console.print(f"[red]✗[/red] --by must be 'agent' or 'provider'; got {by!r}")
         raise typer.Exit(code=2)
+    if since_days < 0:
+        err_console.print(
+            f"[red]✗[/red] --since-days must be ≥ 0 (0 = no filter); got {since_days}"
+        )
+        raise typer.Exit(code=2)
+    if limit < 1:
+        err_console.print(f"[red]✗[/red] --limit must be ≥ 1; got {limit}")
+        raise typer.Exit(code=2)
 
     storage = build_storage()
 

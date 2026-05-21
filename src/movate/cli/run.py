@@ -389,7 +389,7 @@ def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
     )
 
 
-async def _run_local_agent(
+async def _run_local_agent(  # noqa: PLR0912 — linear pipeline + error branches; extraction hurts readability
     bundle: AgentBundle,
     payload: dict[str, Any],
     *,
@@ -417,19 +417,23 @@ async def _run_local_agent(
         # Show a spinner while the LLM responds (text mode + interactive + no streaming).
         # Cleared automatically by the Status context when the await returns.
         _spin = output_format == Run.TEXT and not stream and sys.stderr.isatty()
-        if _spin:
-            with console.status(
-                f"Running [bold]{bundle.spec.name}[/bold]…",
-                spinner="dots",
-            ):
+        try:
+            if _spin:
+                with console.status(
+                    f"Running [bold]{bundle.spec.name}[/bold]…",
+                    spinner="dots",
+                ):
+                    response = await rt.executor.execute(bundle, request, on_token=on_token)
+            else:
                 response = await rt.executor.execute(bundle, request, on_token=on_token)
-        else:
-            response = await rt.executor.execute(bundle, request, on_token=on_token)
-        if on_token is not None:
-            # End the streamed preview with a newline so the JSON output
-            # below starts on its own line.
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+        finally:
+            if on_token is not None:
+                # End the streamed preview with a newline so the JSON output
+                # below starts on its own line. Inner try/finally guarantees
+                # this fires even if execute() raises (rare: most errors
+                # are returned as RunResponse status="error", not exceptions).
+                sys.stderr.write("\n")
+                sys.stderr.flush()
         if trace and response.run_id:
             try:
                 record = await rt.storage.get_run(response.run_id, tenant_id="local")

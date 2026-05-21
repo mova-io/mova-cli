@@ -29,6 +29,8 @@ from movate.core.config import PROJECT_MARKER_FILES
 err = Console(stderr=True)
 out = Console()
 
+_TOP_K_MAX = 50  # max results for mdk knowledge query --top-k
+
 knowledge_app = typer.Typer(
     name="knowledge",
     help=(
@@ -598,6 +600,10 @@ def knowledge_list(
       [dim]$ mdk knowledge list --limit 10[/dim]
       [dim]$ mdk knowledge list --corpus kb/custom-corpus.json[/dim]
     """
+    if limit < 0:
+        err.print(f"[red]✗[/red] --limit must be ≥ 0 (0 = show all); got {limit}")
+        raise typer.Exit(code=2)
+
     root = Path(project_root).resolve()
     corpus_path = _resolve_corpus_path(corpus, root)
     if not corpus_path.is_file():
@@ -714,6 +720,10 @@ def knowledge_query(
           --body-field question --body-field answer \\
           --corpus kb/faq.json
     """
+    if not 1 <= top_k <= _TOP_K_MAX:
+        err.print(f"[red]✗[/red] --top-k must be between 1 and {_TOP_K_MAX}; got {top_k}")
+        raise typer.Exit(code=2)
+
     # Local imports keep the CLI cold-start cheap.
     from movate.core.models import KnowledgeRetrieverKind  # noqa: PLC0415
     from movate.knowledge import (  # noqa: PLC0415
