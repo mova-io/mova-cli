@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -22,6 +23,7 @@ from movate.cli.main import app
 from movate.memory import (
     InMemoryStore,
     MemoryEntry,
+    PostgresStore,
     SqliteStore,
     build_memory_store,
 )
@@ -328,6 +330,180 @@ class TestSqliteStore:
         assert a_entry is not None and a_entry.value["who"] == "a"
         assert b_entry is not None and b_entry.value["who"] == "b"
         assert asyncio.run(sqlite_store.list("agent-a")) == [a_entry]
+
+
+# ---------------------------------------------------------------------------
+# PostgresStore — mocked asyncpg, no real DB connection required
+# ---------------------------------------------------------------------------
+
+
+def _make_pg_conn(rows: list[dict] | None = None, fetchrow_result: dict | None = None,
+                  execute_tag: str = "DELETE 0") -> MagicMock:
+    """Return a mock asyncpg connection with async fetch/fetchrow/execute/close."""
+    conn = MagicMock()
+    # _ensure_schema calls conn.execute (CREATE TABLE / INDEX)
+    conn.execute = AsyncMock(return_value=execute_tag)
+    conn.fetch = AsyncMock(return_value=[_make_record(r) for r in (rows or [])])
+    conn.fetchrow = AsyncMock(return_value=_make_record(fetchrow_result) if fetchrow_result else None)
+    conn.fetchval = AsyncMock(return_value=None)
+    conn.close = AsyncMock()
+    return conn
+
+
+def _make_record(data: dict | None) -> MagicMock:
+    """Minimal asyncpg.Record stand-in that supports dict-style access."""
+    if data is None:
+        return None  # type: ignore[return-value]
+    rec = MagicMock()
+    rec.__getitem__ = lambda self, key: data[key]
+    return rec
+
+
+@pytest.mark.unit
+class TestPostgresStore:
+    """Unit tests for PostgresStore — asyncpg is fully mocked; no DB needed."""
+
+    def test_postgres_set_and_get(self) -> None:
+        """set() stores a value; get() retrieves it with correct fields."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+
+        set_conn = _make_pg_conn(execute_tag="INSERT 0 1")
+        get_conn = _make_pg_conn(
+            fetchrow_result={
+                "agent": "triage",
+                "key": "k1",
+                "value_json": '{"x": 42}',
+                "created_at": "2024-01-01T00:00:00.000Z",
+                "ttl_seconds": 0,
+            }
+        )
+
+        with patch("asyncpg.connect", side_effect=[set_conn, get_conn]):
+            asyncio.run(store.set("triage", "k1", {"x": 42}))
+            entry = asyncio.run(store.get("triage", "k1"))
+
+        assert entry is not None
+        assert entry.agent == "triage"
+        assert entry.key == "k1"
+        assert entry.value == {"x": 42}
+        assert entry.ttl_seconds == 0
+
+    def test_postgres_delete(self) -> None:
+        """delete() returns True after removing a row."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+
+        set_conn = _make_pg_conn(execute_tag="INSERT 0 1")
+        del_conn = _make_pg_conn(execute_tag="DELETE 1")
+        get_conn = _make_pg_conn(fetchrow_result=None)
+
+        with patch("asyncpg.connect", side_effect=[set_conn, del_conn, get_conn]):
+            asyncio.run(store.set("a", "k1", {"v": 1}))
+            deleted = asyncio.run(store.delete("a", "k1"))
+            result = asyncio.run(store.get("a", "k1"))
+
+        assert deleted is True
+        assert result is None
+
+    def test_postgres_delete_missing_returns_false(self) -> None:
+        """delete() returns False when the key does not exist."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+        conn = _make_pg_conn(execute_tag="DELETE 0")
+
+        with patch("asyncpg.connect", return_value=conn):
+            result = asyncio.run(store.delete("nobody", "missing"))
+
+        assert result is False
+
+    def test_postgres_list_empty(self) -> None:
+        """list() returns [] for an agent with no entries."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+        conn = _make_pg_conn(rows=[])
+
+        with patch("asyncpg.connect", return_value=conn):
+            entries = asyncio.run(store.list("unknown-agent"))
+
+        assert entries == []
+
+    def test_postgres_list_returns_entries(self) -> None:
+        """list() deserialises rows into MemoryEntry objects."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+        conn = _make_pg_conn(rows=[
+            {
+                "agent": "a",
+                "key": "k1",
+                "value_json": '{"n": 1}',
+                "created_at": "2024-01-01T00:00:00.000Z",
+                "ttl_seconds": 0,
+            },
+            {
+                "agent": "a",
+                "key": "k2",
+                "value_json": '{"n": 2}',
+                "created_at": "2024-01-02T00:00:00.000Z",
+                "ttl_seconds": 0,
+            },
+        ])
+
+        with patch("asyncpg.connect", return_value=conn):
+            entries = asyncio.run(store.list("a"))
+
+        assert len(entries) == 2
+        assert entries[0].key == "k1"
+        assert entries[1].key == "k2"
+
+    def test_postgres_evict_older_than(self) -> None:
+        """evict_older_than() returns the count of deleted rows."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+        conn = _make_pg_conn(execute_tag="DELETE 3")
+
+        with patch("asyncpg.connect", return_value=conn):
+            count = asyncio.run(store.evict_older_than("a", "9999-01-01T00:00:00.000Z"))
+
+        assert count == 3
+
+    def test_postgres_evict_returns_zero_on_no_match(self) -> None:
+        """evict_older_than() returns 0 when nothing is deleted."""
+        store = PostgresStore(dsn="postgresql://test/fake")
+        conn = _make_pg_conn(execute_tag="DELETE 0")
+
+        with patch("asyncpg.connect", return_value=conn):
+            count = asyncio.run(store.evict_older_than("a", "1900-01-01T00:00:00.000Z"))
+
+        assert count == 0
+
+    def test_postgres_dsn_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Constructor reads MOVATE_PG_URL when dsn arg is omitted."""
+        monkeypatch.setenv("MOVATE_PG_URL", "postgresql://env-host/db")
+        store = PostgresStore()
+        assert store._dsn == "postgresql://env-host/db"
+
+    def test_postgres_dsn_arg_takes_precedence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit dsn= arg overrides MOVATE_PG_URL env var."""
+        monkeypatch.setenv("MOVATE_PG_URL", "postgresql://env-host/db")
+        store = PostgresStore(dsn="postgresql://explicit/db")
+        assert store._dsn == "postgresql://explicit/db"
+
+
+# ---------------------------------------------------------------------------
+# build_memory_store — postgres case
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBuildMemoryStorePostgres:
+    def test_postgres_selected_via_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MOVATE_MEMORY_BACKEND", "postgres")
+        monkeypatch.setenv("MOVATE_PG_URL", "postgresql://localhost/test")
+        store = build_memory_store()
+        assert isinstance(store, PostgresStore)
+
+    def test_postgres_missing_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MOVATE_MEMORY_BACKEND", "postgres")
+        monkeypatch.delenv("MOVATE_PG_URL", raising=False)
+        with pytest.raises(RuntimeError, match="MOVATE_PG_URL"):
+            build_memory_store()
 
 
 # ---------------------------------------------------------------------------

@@ -549,3 +549,164 @@ def test_show_footer_mentions_lines_and_size(tmp_path: Path) -> None:
     assert "lines" in out
     # At minimum, a byte-count indicator appears.
     assert any(unit in out for unit in (" B", "KB", "MB"))
+
+
+# ===========================================================================
+# mdk contexts create
+# ===========================================================================
+
+
+def _invoke_create(name: str, project: Path, *extra_args: str) -> object:
+    return runner.invoke(
+        app,
+        ["contexts", "create", name, "--project", str(project), *extra_args],
+        env={"COLUMNS": "200"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Project-level context creation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_project_context(tmp_path: Path) -> None:
+    """``mdk contexts create policy`` creates ``contexts/policy.md`` at the
+    project level and exits 0."""
+    result = _invoke_create("policy", tmp_path)
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+
+    ctx_file = tmp_path / "contexts" / "policy.md"
+    assert ctx_file.is_file(), f"Expected {ctx_file} to exist"
+
+
+@pytest.mark.unit
+def test_create_project_context_output_mentions_path(tmp_path: Path) -> None:
+    """The success message includes the created file path."""
+    result = _invoke_create("policy", tmp_path)
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    out = _strip_ansi(result.stdout + (result.stderr or ""))
+    assert "policy" in out
+
+
+@pytest.mark.unit
+def test_create_project_context_template_has_name_heading(tmp_path: Path) -> None:
+    """The created file contains a Markdown heading with the context name."""
+    _invoke_create("my-policy", tmp_path)
+    content = (tmp_path / "contexts" / "my-policy.md").read_text(encoding="utf-8")
+    assert "# my-policy" in content
+
+
+@pytest.mark.unit
+def test_create_project_context_template_has_comment(tmp_path: Path) -> None:
+    """The created file has the template comment that points to mdk contexts list."""
+    _invoke_create("policy", tmp_path)
+    content = (tmp_path / "contexts" / "policy.md").read_text(encoding="utf-8")
+    assert "mdk contexts list" in content
+
+
+@pytest.mark.unit
+def test_create_project_context_hint_mentions_agent_yaml(tmp_path: Path) -> None:
+    """The success output tells the operator to reference the context in agent.yaml."""
+    result = _invoke_create("policy", tmp_path)
+    assert result.exit_code == 0
+    out = _strip_ansi(result.stdout + (result.stderr or ""))
+    assert "agent.yaml" in out or "contexts:" in out
+
+
+# ---------------------------------------------------------------------------
+# Agent-level context creation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_agent_context(tmp_path: Path) -> None:
+    """``mdk contexts create policy --agent demo`` creates
+    ``agents/demo/contexts/policy.md`` and exits 0."""
+    # Create the agent directory first.
+    _write_agent(tmp_path, "demo")
+
+    result = _invoke_create("policy", tmp_path, "--agent", "demo")
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+
+    ctx_file = tmp_path / "agents" / "demo" / "contexts" / "policy.md"
+    assert ctx_file.is_file(), f"Expected {ctx_file} to exist"
+
+
+@pytest.mark.unit
+def test_create_agent_context_creates_parent_dir(tmp_path: Path) -> None:
+    """The ``agents/<agent>/contexts/`` directory is created if it doesn't exist."""
+    _write_agent(tmp_path, "demo")
+
+    # Ensure contexts/ doesn't exist yet.
+    ctx_dir = tmp_path / "agents" / "demo" / "contexts"
+    assert not ctx_dir.exists()
+
+    result = _invoke_create("faq", tmp_path, "--agent", "demo")
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    assert ctx_dir.is_dir()
+
+
+@pytest.mark.unit
+def test_create_agent_context_unknown_agent_exits_2(tmp_path: Path) -> None:
+    """``--agent ghost`` exits 2 when the agent directory does not exist."""
+    result = _invoke_create("policy", tmp_path, "--agent", "ghost")
+    assert result.exit_code == 2
+    combined = _strip_ansi(result.stdout + (result.stderr or ""))
+    assert "ghost" in combined
+
+
+# ---------------------------------------------------------------------------
+# Error handling: already exists without --force
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_fails_if_exists(tmp_path: Path) -> None:
+    """Creating a context that already exists exits 2 without --force."""
+    # Create the file first.
+    _write_context(tmp_path, "policy", "# Existing policy")
+
+    result = _invoke_create("policy", tmp_path)
+    assert result.exit_code == 2
+    combined = _strip_ansi(result.stdout + (result.stderr or ""))
+    assert "already exists" in combined or "force" in combined.lower()
+
+
+@pytest.mark.unit
+def test_create_fails_if_exists_mentions_force_flag(tmp_path: Path) -> None:
+    """The error message for an existing file suggests --force."""
+    _write_context(tmp_path, "policy", "# Existing policy")
+
+    result = _invoke_create("policy", tmp_path)
+    assert result.exit_code == 2
+    combined = _strip_ansi(result.stdout + (result.stderr or ""))
+    assert "--force" in combined or "force" in combined.lower()
+
+
+# ---------------------------------------------------------------------------
+# --force overwrites
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_force_overwrites(tmp_path: Path) -> None:
+    """``--force`` overwrites an existing context file and exits 0."""
+    original = "# Original content"
+    _write_context(tmp_path, "policy", original)
+
+    result = _invoke_create("policy", tmp_path, "--force")
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+
+    content = (tmp_path / "contexts" / "policy.md").read_text(encoding="utf-8")
+    # The file was replaced with the template (no longer the original).
+    assert original not in content
+    assert "# policy" in content
+
+
+@pytest.mark.unit
+def test_create_force_on_new_file_also_works(tmp_path: Path) -> None:
+    """``--force`` on a file that doesn't yet exist creates it normally."""
+    result = _invoke_create("new-ctx", tmp_path, "--force")
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    assert (tmp_path / "contexts" / "new-ctx.md").is_file()
