@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime, timedelta
 
 import typer
@@ -81,7 +82,11 @@ def list_(
     ),
 ) -> None:
     """List every memory entry for an agent."""
-    entries = asyncio.run(_store().list(agent))
+    store = _store()
+    _backend = os.environ.get("MOVATE_MEMORY_BACKEND", "memory").lower()
+    _backend_label = "sqlite" if _backend == "sqlite" else "json-file"
+    console.print(f"[dim]memory backend: {_backend_label}[/dim]")
+    entries = asyncio.run(store.list(agent))
     if since_days > 0:
         entries = _filter_entries_by_age(entries, since_days)
     if json_output:

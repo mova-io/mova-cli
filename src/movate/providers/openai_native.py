@@ -150,8 +150,9 @@ class OpenAIProvider(BaseLLMProvider):
 
     async def embed(self, text: str, *, model: str) -> list[float]:  # pragma: no cover
         raise NotImplementedError(
-            "embedding support lands separately — for now use openai's SDK "
-            "directly in your agent code if you need embeddings."
+            "runtime: native_openai does not proxy embedding calls — "
+            "switch to runtime: litellm and set an openai/text-embedding-* "
+            "provider, or call the OpenAI embeddings API directly."
         )
 
     def pricing_key(self, provider: str) -> str:

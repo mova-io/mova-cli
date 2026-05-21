@@ -18,6 +18,7 @@ the permissive default (everything allowed, no cost ceiling).
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -25,6 +26,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from movate.core.models import AgentRuntime, SkillSideEffects
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from movate.core.models import AgentSpec
@@ -916,13 +919,10 @@ def _warn_legacy_movate_yaml_once() -> None:
     if _LEGACY_WARN_FIRED:
         return
     _LEGACY_WARN_FIRED = True
-    import sys  # noqa: PLC0415
-
-    print(
-        "⚠ movate.yaml is deprecated — rename to project.yaml. "
+    log.warning(
+        "movate.yaml is deprecated — rename to project.yaml. "
         "movate.yaml will continue to load through v1.x; "
-        "removed in a future major release.",
-        file=sys.stderr,
+        "removed in a future major release."
     )
 
 
@@ -937,13 +937,10 @@ def _warn_legacy_policy_yaml_once() -> None:
     if _POLICY_LEGACY_WARN_FIRED:
         return
     _POLICY_LEGACY_WARN_FIRED = True
-    import sys  # noqa: PLC0415
-
-    print(
-        "⚠ policy.yaml is deprecated — rename to project.yaml. "
+    log.warning(
+        "policy.yaml is deprecated — rename to project.yaml. "
         "policy.yaml will continue to load through v1.x; "
-        "removed in a future major release.",
-        file=sys.stderr,
+        "removed in a future major release."
     )
 
 
@@ -957,11 +954,8 @@ def _warn_field_moved_once(*, field: str, dedicated_file: str) -> None:
     if field in _MOVED_FIELD_WARNINGS:
         return
     _MOVED_FIELD_WARNINGS.add(field)
-    import sys  # noqa: PLC0415
-
-    print(
-        f"⚠ policy.yaml contains a `{field}:` block, but {dedicated_file} "
+    log.warning(
+        f"policy.yaml contains a `{field}:` block, but {dedicated_file} "
         f"also defines `{field}`. {dedicated_file} wins; remove "
-        f"`{field}:` from policy.yaml to silence this warning.",
-        file=sys.stderr,
+        f"`{field}:` from policy.yaml to silence this warning."
     )
