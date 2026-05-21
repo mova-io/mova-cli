@@ -100,6 +100,47 @@ paths:
        -p main.${ENV}.bicepparam
    ```
 
+### Self-hosted Langfuse (optional)
+
+By default tracing goes to Langfuse Cloud (the api/worker just carry the
+`langfuse-public-key` / `langfuse-secret-key`). To self-host Langfuse v2 on
+Azure instead — backed by a `langfuse` database on the *same* Postgres
+Flexible Server — set `deployLangfuse = true` in your `.bicepparam` and
+populate four extra Key Vault secrets BEFORE the deploy:
+
+```bash
+ENV=dev; KV=movate-${ENV}-kv
+PG_FQDN=$(az postgres flexible-server show -g movate-${ENV}-rg \
+    -n movate-${ENV}-pg --query fullyQualifiedDomainName -o tsv)
+# Reuse the Postgres admin password from the pg-admin-password secret.
+PG_PW=$(az keyvault secret show --vault-name $KV --name pg-admin-password --query value -o tsv)
+
+# Full connection string pointing at the `langfuse` database (Bicep creates
+# it when deployLangfuse=true). ACA can't interpolate a secret into a value,
+# so Langfuse's DATABASE_URL must be a single secret.
+az keyvault secret set --vault-name $KV --name langfuse-database-url \
+    --value "postgresql://movateadmin:${PG_PW}@${PG_FQDN}:5432/langfuse?sslmode=require"
+az keyvault secret set --vault-name $KV --name langfuse-nextauth-secret --value "$(openssl rand -base64 32)"
+az keyvault secret set --vault-name $KV --name langfuse-salt            --value "$(openssl rand -base64 32)"
+az keyvault secret set --vault-name $KV --name langfuse-encryption-key  --value "$(openssl rand -hex 32)"
+```
+
+Then deploy. Langfuse runs its own DB migrations at boot. Afterwards:
+
+1. Open the `langfuseUrl` deployment output, sign up (first user becomes
+   admin), create an org + project.
+2. Mint project API keys and store them so the movate apps pick them up:
+   ```bash
+   az keyvault secret set --vault-name $KV --name langfuse-public-key --value "pk-lf-..."
+   az keyvault secret set --vault-name $KV --name langfuse-secret-key --value "sk-lf-..."
+   ```
+3. Re-deploy (or `az containerapp revision restart`) so the api/worker pick
+   up the new keys. `LANGFUSE_HOST` is already pointed at the self-hosted
+   URL automatically when `deployLangfuse=true`.
+
+To tighten signup after your admin account exists, set `disableSignup=true`
+on the langfuse module (param surfaced for a follow-up `.bicepparam` knob).
+
 ### Option B: Bootstrap KV first
 
 Create a "bootstrap" Key Vault in a separate resource group, populate

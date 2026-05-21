@@ -138,6 +138,21 @@ and wired to the Container Apps Environment via a storages binding.
 ''')
 param useAzureFiles bool = false
 
+@description('''
+Deploy a self-hosted Langfuse v2 instance (Container App + a `langfuse`
+database on the shared Postgres) and point the API + worker tracing at it
+via LANGFUSE_HOST. Off by default — when false, tracing uses whatever
+LANGFUSE_HOST/keys are configured on the apps (Langfuse Cloud by default).
+
+Requires the langfuse-* Key Vault secrets to be populated first (see
+scripts/azure-bootstrap.sh). Two-pass like the apps: deploy infra + set
+secrets, then flip this true.
+''')
+param deployLangfuse bool = false
+
+@description('Langfuse image. Pin a 2.x tag (e.g. langfuse/langfuse:2.95.0) for reproducible deploys.')
+param langfuseImage string = 'langfuse/langfuse:2'
+
 // ---------------------------------------------------------------------------
 // Per-env defaults — keep in sync with docs/v1.0-azure-design §4
 // ---------------------------------------------------------------------------
@@ -201,6 +216,8 @@ var botServiceName = 'movate-${env}-bot'
 var apiUaiName = 'movate-${env}-api-mi'
 var workerUaiName = 'movate-${env}-worker-mi'
 var teamsBotUaiName = 'movate-${env}-teams-bot-mi'
+var langfuseName = 'movate-${env}-langfuse'
+var langfuseUaiName = 'movate-${env}-langfuse-mi'
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -248,6 +265,7 @@ module pg 'modules/postgres.bicep' = {
     storageSizeGB: pgStorageGB
     backupRetentionDays: pgBackupDays
     adminPassword: postgresAdminPassword
+    createLangfuseDatabase: deployLangfuse
     tags: tags
   }
 }
@@ -353,6 +371,15 @@ resource teamsBotUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
   tags: tags
 }
 
+// Langfuse app UAI. Created unconditionally (cheap, idempotent) so its
+// KV-secrets-read grant lands before the app's first revision — even
+// though the app itself is gated on deployLangfuse.
+resource langfuseUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: langfuseUaiName
+  location: location
+  tags: tags
+}
+
 // Both Container Apps are gated on ``enableApiWorker`` so a fresh
 // deployment can run "infra-only" first, the operator populates KV
 // secrets, then the second pass deploys the apps. See param doc above.
@@ -375,6 +402,7 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     memory: apiMemory
     userAssignedIdentityId: apiUai.id
     corsAllowedOrigins: corsAllowedOrigins
+    langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
     // Pass the CAE storage config name when Azure Files is enabled;
     // empty string means no volume mount (pod-local /app/agents).
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
@@ -402,6 +430,29 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     queueDepthPerReplica: workerQueueDepthPerReplica
     userAssignedIdentityId: workerUai.id
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
+    langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Self-hosted Langfuse (observability on Azure). Gated on deployLangfuse.
+// Pulls the public langfuse/langfuse image, talks to the `langfuse`
+// database on the shared Postgres (created by the pg module when
+// deployLangfuse=true), and reads its secrets from Key Vault. NEXTAUTH_URL
+// is built from the CAE default domain so it matches the app's own ingress
+// FQDN. The api + worker modules pick up its URL as LANGFUSE_HOST above.
+// ---------------------------------------------------------------------------
+module langfuse 'modules/langfuse.bicep' = if (deployLangfuse) {
+  name: 'langfuse-${env}'
+  params: {
+    name: langfuseName
+    location: location
+    environmentId: cae.outputs.envId
+    keyVaultUri: kv.outputs.vaultUri
+    publicUrl: 'https://${langfuseName}.${cae.outputs.defaultDomain}'
+    image: langfuseImage
+    userAssignedIdentityId: langfuseUai.id
     tags: tags
   }
 }
@@ -565,6 +616,19 @@ resource teamsBotKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+// Langfuse needs KV-secrets-read (DB URL + nextauth/salt/encryption-key).
+// No AcrPull grant — it runs the public langfuse/langfuse image, not ours.
+// Un-gated (the UAI always exists) so it lands on pass 1.
+resource langfuseKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, langfuseUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: langfuseUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
@@ -586,3 +650,6 @@ output teamsBotWebhookUrl string = enableTeamsBot ? teamsBot!.outputs.webhookUrl
 
 @description('Bot Service resource id. Empty when enableTeamsBot=false. Used by Teams Admin Center when publishing.')
 output botServiceId string = enableTeamsBot ? botService!.outputs.botServiceId : ''
+
+@description('Self-hosted Langfuse URL. Empty when deployLangfuse=false. Open it to create a project + mint keys, then store them in KV as langfuse-public-key / langfuse-secret-key.')
+output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''
