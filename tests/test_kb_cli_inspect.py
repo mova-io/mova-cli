@@ -345,6 +345,96 @@ def test_kb_vector_lookup_in_skill_templates_map() -> None:
     assert (template_dir / "impl.py").is_file()
 
 
+# ---------------------------------------------------------------------------
+# New tests: last-ingested timestamp in stats + file-type breakdown in dry-run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_stats_shows_last_ingested(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``mdk kb stats`` after ingest shows 'last ingested' in the output."""
+    import asyncio  # noqa: PLC0415
+
+    from movate.core.models import KbChunk  # noqa: PLC0415
+    from movate.storage import build_storage  # noqa: PLC0415
+
+    async def _seed() -> None:
+        storage = build_storage()
+        await storage.init()
+        try:
+            await storage.save_kb_chunk(
+                KbChunk(
+                    tenant_id="local",
+                    agent="rag-qa",
+                    source="/tmp/doc.md",
+                    text="Sample chunk text for last-ingested test",
+                    embedding=[1.0, 0.0],
+                    embedding_model="openai/text-embedding-3-small",
+                    content_hash="hash-last-ingested",
+                )
+            )
+        finally:
+            await storage.close()
+
+    asyncio.new_event_loop().run_until_complete(_seed())
+
+    r = runner.invoke(app, ["kb", "stats", "rag-qa"], env={"COLUMNS": "200"})
+    assert r.exit_code == 0, r.stdout + r.stderr
+    assert "last ingested" in r.stdout
+
+
+@pytest.mark.unit
+def test_format_age_just_now() -> None:
+    """_format_age with a timestamp 30 seconds ago returns 'just now'."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from movate.cli.kb_cmd import _format_age  # noqa: PLC0415
+
+    ts = datetime.now(UTC) - timedelta(seconds=30)
+    result = _format_age(ts.isoformat())
+    assert result == "just now"
+
+
+@pytest.mark.unit
+def test_format_age_days_ago() -> None:
+    """_format_age with a timestamp 3 days ago returns '3d ago'."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from movate.cli.kb_cmd import _format_age  # noqa: PLC0415
+
+    ts = datetime.now(UTC) - timedelta(days=3)
+    result = _format_age(ts.isoformat())
+    assert result == "3d ago"
+
+
+@pytest.mark.unit
+def test_dry_run_shows_file_type_breakdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mdk kb ingest --dry-run`` shows file-type breakdown (e.g. PDF · MD)."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    (kb / "note.md").write_text(
+        "Markdown paragraph one.\n\nMarkdown paragraph two.\n", encoding="utf-8"
+    )
+    (kb / "readme.txt").write_text(
+        "Text file paragraph.\n\nAnother paragraph here.\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        ["kb", "ingest", "rag-qa", str(kb), "--dry-run"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # The breakdown footer should mention both extension types.
+    assert "types:" in result.stdout
+    assert "MD" in result.stdout
+    assert "TXT" in result.stdout
+
+
 @pytest.mark.unit
 def test_rag_qa_agent_yaml_declares_kb_vector_lookup_skill() -> None:
     """Wiring check: the ``rag_qa_agent`` template's agent.yaml lists

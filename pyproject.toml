@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.77"
+version = "0.8.2.78"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -256,6 +256,10 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # with progress tracking and summary rendering; the branches correspond to
 # distinct operator-facing behaviors, not logic that benefits from extraction.
 "src/movate/cli/kb_cmd.py" = ["PLR0912"]
+# add_cmd._add_one runs the full scaffolding pipeline (template copy → stamp →
+# kb-dir → skills → contexts → validate) — branch count is inherent to the
+# orchestration shape. PLR0912 is inappropriate here.
+"src/movate/cli/add_cmd.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 

@@ -471,6 +471,25 @@ def _format_stage_details(details: dict[str, object]) -> str:
     return ", ".join(parts)
 
 
+def _format_age(iso_ts: str) -> str:
+    """Return human-readable age string for an ISO-8601 UTC timestamp."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+    try:
+        ts = datetime.fromisoformat(iso_ts.removesuffix("Z")).replace(tzinfo=UTC)
+        delta = datetime.now(UTC) - ts
+        if delta < timedelta(minutes=1):
+            return "just now"
+        if delta < timedelta(hours=1):
+            return f"{int(delta.total_seconds() // 60)}m ago"
+        if delta < timedelta(days=1):
+            return f"{int(delta.total_seconds() // 3600)}h ago"
+        if delta < timedelta(days=30):
+            return f"{delta.days}d ago"
+        return ts.strftime("%Y-%m-%d")
+    except Exception:
+        return iso_ts[:19]  # fallback: truncated raw string
+
+
 def _run_dry(*, path: Path, agent: str) -> None:
     """Dry-run path for ``mdk kb ingest --dry-run``.
 
@@ -537,6 +556,16 @@ def _run_dry(*, path: Path, agent: str) -> None:
         "[dim]To commit: rerun without [bold]--dry-run[/bold] "
         "(writes to storage + embeds via OpenAI).[/dim]"
     )
+
+    # File-type breakdown
+    from collections import Counter  # noqa: PLC0415
+    ext_counts = Counter(p.suffix.lower() for p in files)
+    if ext_counts:
+        parts = [
+            f"[bold]{count}[/bold] {ext.lstrip('.').upper()}"
+            for ext, count in sorted(ext_counts.items(), key=lambda x: -x[1])
+        ]
+        console.print(f"  [dim]types: {' · '.join(parts)}[/dim]")
 
 
 @kb_app.command("search")
@@ -909,12 +938,28 @@ def stats(
             if c.ocr:
                 ocr_count += 1
 
+        # Last ingested: max(created_at) across all chunks
+        if chunks:
+            last_ts = max(
+                (c.created_at for c in chunks if getattr(c, "created_at", "")),
+                default="",
+            )
+            if last_ts:
+                # Parse ISO-8601 and render as "3 days ago" or absolute if > 30 days
+                ts_str = last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts)
+                _last_ingested_str = _format_age(ts_str)
+            else:
+                _last_ingested_str = "unknown"
+        else:
+            _last_ingested_str = "unknown"
+
         # Top-level summary.
         console.print(
             f"\n[bold]KB summary[/bold] — agent [bold]{agent}[/bold] "
             f"(tenant [dim]{tenant_id}[/dim])"
         )
         console.print(f"  total chunks: [bold]{len(chunks)}[/bold]")
+        console.print(f"  last ingested: [bold]{_last_ingested_str}[/bold]")
         console.print(f"  total chars:  [bold]{total_chars:,}[/bold]")
         console.print(f"  sources:      [bold]{len(per_source)}[/bold]")
         console.print(f"  models:       [bold]{', '.join(sorted(models))}[/bold]")
@@ -1181,11 +1226,23 @@ def ingest_all(
             files = find_files(kb_dir)
             table.add_row(agent_name, str(kb_dir), str(len(files)))
         console.print(table)
-        total_files = sum(len(find_files(d)) for _, d in targets)
+        all_files: list[Path] = []
+        for _, kb_dir in targets:
+            all_files.extend(find_files(kb_dir))
+        total_files = len(all_files)
         console.print(
             f"[dim]{len(targets)} KB director{'y' if len(targets) == 1 else 'ies'}, "
             f"{total_files} file(s) would be ingested.[/dim]"
         )
+        # File-type breakdown
+        from collections import Counter  # noqa: PLC0415
+        ext_counts = Counter(p.suffix.lower() for p in all_files)
+        if ext_counts:
+            parts = [
+                f"[bold]{count}[/bold] {ext.lstrip('.').upper()}"
+                for ext, count in sorted(ext_counts.items(), key=lambda x: -x[1])
+            ]
+            console.print(f"  [dim]types: {' · '.join(parts)}[/dim]")
         return
 
     api_key = os.environ.get(api_key_env, "").strip()

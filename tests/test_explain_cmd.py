@@ -427,3 +427,69 @@ def test_explain_steps_shows_error_skill_call(monkeypatch: pytest.MonkeyPatch) -
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "external-lookup" in result.stdout
     assert "connection refused" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Part 2: --steps renders KB chunks inline
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_explain_steps_renders_kb_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--steps expands kb-vector-lookup output into a readable chunk table."""
+    skill_calls = [
+        SkillCallRecord(
+            step=1,
+            skill="kb-vector-lookup",
+            input={"query": "refund policy"},
+            output={
+                "chunks": [
+                    {
+                        "content": "Customers may return items within 30 days.",
+                        "score": 0.87,
+                        "source": "docs/policy.pdf",
+                    }
+                ]
+            },
+            latency_ms=55.0,
+        )
+    ]
+    rec = _make_run(output={"answer": "30 days"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # The chunk table rule should appear with skill name and chunk count
+    assert "kb-vector-lookup" in result.stdout
+    assert "1 chunk(s) retrieved" in result.stdout
+    # Score, source filename, and content preview should be present
+    assert "0.87" in result.stdout
+    assert "policy.pdf" in result.stdout
+    assert "Customers may return items" in result.stdout
+
+
+@pytest.mark.unit
+def test_explain_steps_no_kb_chunks_no_extra_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-KB skill calls should not trigger any chunk table rendering."""
+    skill_calls = [
+        SkillCallRecord(
+            step=1,
+            skill="send-email",
+            input={"to": "user@example.com", "subject": "hi"},
+            output={"status": "sent"},
+            latency_ms=30.0,
+        )
+    ]
+    rec = _make_run(output={"answer": "email sent"})
+    rec = RunRecord(**{**rec.model_dump(), "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # send-email should appear in the skill table
+    assert "send-email" in result.stdout
+    # No chunk table should appear
+    assert "chunk(s) retrieved" not in result.stdout

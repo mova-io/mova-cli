@@ -238,6 +238,8 @@ def _render_chain(record: RunRecord, *, show_steps: bool = False) -> None:
 
 # Maximum characters to show for skill input/output in the step table.
 _STEP_PREVIEW_CHARS = 120
+# Maximum characters to show for KB chunk content in the inline chunk table.
+_KB_CONTENT_PREVIEW_CHARS = 80
 
 
 def _render_skill_calls(calls: list[SkillCallRecord]) -> None:
@@ -266,6 +268,46 @@ def _render_skill_calls(calls: list[SkillCallRecord]) -> None:
             status,
             io_preview,
         )
+    console.print(table)
+
+    # For KB skill calls, render retrieved chunks as a separate readable table.
+    for call in calls:
+        if "kb" in call.skill.lower() and call.output:
+            chunks = call.output.get("chunks") if isinstance(call.output, dict) else None
+            if chunks and isinstance(chunks, list):
+                _render_kb_chunks_inline(call.skill, chunks, call.latency_ms)
+
+
+def _render_kb_chunks_inline(skill_name: str, chunks: list[Any], latency_ms: float) -> None:
+    """Render KB chunks from a skill output as a readable dim table."""
+    console.print(
+        Rule(
+            f"[dim]  {skill_name} — {len(chunks)} chunk(s) retrieved  "
+            f"[dim]({latency_ms:.0f} ms)[/dim]",
+            style="dim",
+        )
+    )
+    table = Table(style="dim", show_lines=False, expand=False)
+    table.add_column("#", justify="right", style="dim", no_wrap=True, width=3)
+    table.add_column("score", justify="right", no_wrap=True, width=6)
+    table.add_column("source", overflow="fold", max_width=30)
+    table.add_column("content preview", overflow="fold", max_width=60)
+
+    for i, chunk in enumerate(chunks, 1):
+        if not isinstance(chunk, dict):
+            continue
+        score = chunk.get("score") or chunk.get("similarity") or ""
+        score_str = f"{float(score):.2f}" if score != "" else "—"
+        source = str(chunk.get("source", chunk.get("chunk_id", "—")))
+        source_short = source.rsplit("/", maxsplit=1)[-1][:30]  # just filename
+        content = str(chunk.get("content", chunk.get("text", ""))).replace("\n", " ")
+        content_preview = (
+            content[:_KB_CONTENT_PREVIEW_CHARS] + "…"
+            if len(content) > _KB_CONTENT_PREVIEW_CHARS
+            else content
+        )
+        table.add_row(str(i), score_str, source_short, content_preview)
+
     console.print(table)
 
 
