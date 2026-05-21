@@ -42,6 +42,7 @@ from movate.providers.base import (
     CompletionRequest,
     CompletionResponse,
     StreamChunk,
+    ToolCallSpec,
 )
 
 log = logging.getLogger(__name__)
@@ -226,6 +227,35 @@ def _extract_retry_after(exc: Exception) -> float | None:
     return None
 
 
+def _parse_openai_style_tool_call(tc: Any) -> ToolCallSpec:
+    """Parse one OpenAI-style tool-call object → :class:`ToolCallSpec`.
+
+    LiteLLM normalises upstream shapes to the OpenAI wire structure:
+    ``{id, type: "function", function: {name, arguments: str}}``.
+    In practice we see both attribute-access and dict-key access
+    depending on LiteLLM version — handle both. ``arguments`` is a
+    JSON-encoded string; parse it. A malformed JSON argument is surfaced
+    as an empty dict so the executor's input-schema validator catches the
+    issue with a readable error rather than crashing here.
+    """
+    import json  # noqa: PLC0415
+
+    function = getattr(tc, "function", None)
+    if function is None and isinstance(tc, dict):
+        function = tc.get("function") or {}
+    if function is None:
+        function = {}
+    name = _func_field(function, "name")
+    args_raw = _func_field(function, "arguments")
+    call_id = getattr(tc, "id", "") or (tc.get("id", "") if isinstance(tc, dict) else "")
+    try:
+        parsed = json.loads(args_raw) if args_raw else {}
+    except (TypeError, ValueError):
+        parsed = {}
+    inp = parsed if isinstance(parsed, dict) else {}
+    return ToolCallSpec(name=name, call_id=call_id, input=inp)
+
+
 def _to_completion_response(resp: Any) -> CompletionResponse:
     """Convert a LiteLLM ModelResponse to our CompletionResponse.
 
@@ -266,41 +296,21 @@ def _to_completion_response(resp: Any) -> CompletionResponse:
             raw["litellm_cost_usd"] = float(cost)
 
     if tool_calls:
-        first = tool_calls[0]
-        # LiteLLM normalizes upstream shapes to the OpenAI structure:
-        # ``{id, type: "function", function: {name, arguments: str}}``.
-        # In practice we see both attribute-access and dict-key access
-        # depending on LiteLLM version — handle both. ``arguments`` is
-        # a JSON-encoded string; parse it. A malformed JSON argument is
-        # the provider's bug — we surface it as an empty dict so the
-        # executor's input-schema validator catches the issue with a
-        # readable error rather than crashing here.
-        function = getattr(first, "function", None)
-        if function is None and isinstance(first, dict):
-            function = first.get("function") or {}
-        if function is None:
-            function = {}
-        tool_name = _func_field(function, "name")
-        args_raw = _func_field(function, "arguments")
-        tool_id = getattr(first, "id", "") or (
-            first.get("id", "") if isinstance(first, dict) else ""
-        )
-        try:
-            import json  # noqa: PLC0415
-
-            tool_input = json.loads(args_raw) if args_raw else {}
-        except (TypeError, ValueError):
-            tool_input = {}
-        if not isinstance(tool_input, dict):
-            tool_input = {}
+        # Parse ALL tool calls (not just the first) so the executor can
+        # dispatch parallel calls when the model emits more than one.
+        # The singular tool_name/tool_id/tool_input fields mirror
+        # parallel_tool_calls[0] for backward compatibility.
+        specs = [_parse_openai_style_tool_call(tc) for tc in tool_calls]
+        first = specs[0]
         return CompletionResponse(
             text=text,
             tokens=tokens,
             raw=raw,
             kind="tool_use",
-            tool_name=tool_name,
-            tool_id=tool_id,
-            tool_input=tool_input,
+            tool_name=first.name,
+            tool_id=first.call_id,
+            tool_input=first.input,
+            parallel_tool_calls=specs,
         )
 
     return CompletionResponse(text=text, tokens=tokens, raw=raw)

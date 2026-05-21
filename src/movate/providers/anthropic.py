@@ -63,6 +63,7 @@ from movate.providers.base import (
     CompletionResponse,
     Message,
     StreamChunk,
+    ToolCallSpec,
 )
 
 if TYPE_CHECKING:
@@ -317,21 +318,21 @@ def _to_completion_response(resp: Any) -> CompletionResponse:
     Thinking blocks are still deferred (separate API surface).
     """
     text_parts: list[str] = []
-    tool_name = ""
-    tool_id = ""
-    tool_input: dict[str, Any] = {}
-    saw_tool_use = False
+    tool_use_blocks: list[ToolCallSpec] = []
 
     for block in getattr(resp, "content", []) or []:
         block_type = getattr(block, "type", "")
         if block_type == "text":
             text_parts.append(getattr(block, "text", "") or "")
-        elif block_type == "tool_use" and not saw_tool_use:
-            saw_tool_use = True
-            tool_name = getattr(block, "name", "") or ""
-            tool_id = getattr(block, "id", "") or ""
+        elif block_type == "tool_use":
+            # Collect ALL tool_use blocks — Anthropic can emit multiple
+            # in one turn (parallel tool-use). The executor dispatches
+            # them concurrently via asyncio.gather.
+            name = getattr(block, "name", "") or ""
+            bid = getattr(block, "id", "") or ""
             raw_input = getattr(block, "input", None)
-            tool_input = raw_input if isinstance(raw_input, dict) else {}
+            inp = raw_input if isinstance(raw_input, dict) else {}
+            tool_use_blocks.append(ToolCallSpec(name=name, call_id=bid, input=inp))
 
     tokens = _tokens_from_usage(getattr(resp, "usage", None))
     raw = {
@@ -340,15 +341,17 @@ def _to_completion_response(resp: Any) -> CompletionResponse:
     }
     text = "".join(text_parts)
 
-    if saw_tool_use:
+    if tool_use_blocks:
+        first = tool_use_blocks[0]
         return CompletionResponse(
             text=text,
             tokens=tokens,
             raw=raw,
             kind="tool_use",
-            tool_name=tool_name,
-            tool_id=tool_id,
-            tool_input=tool_input,
+            tool_name=first.name,
+            tool_id=first.call_id,
+            tool_input=first.input,
+            parallel_tool_calls=tool_use_blocks,
         )
 
     return CompletionResponse(text=text, tokens=tokens, raw=raw)

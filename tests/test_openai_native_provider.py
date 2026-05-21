@@ -485,10 +485,13 @@ async def test_complete_surfaces_tool_call_response() -> None:
 
 
 @pytest.mark.unit
-async def test_complete_takes_first_tool_call_when_multiple_emitted() -> None:
-    """Parallel tool calls aren't supported in this cut — first wins,
-    matches LiteLLM PR 1 and native_anthropic PR 6a. Multi-dispatch
-    lands when the executor's tool-use loop gains a parallel path."""
+async def test_complete_populates_parallel_tool_calls_for_multiple_calls() -> None:
+    """All tool calls from one turn land in ``parallel_tool_calls``.
+    The singular fields (tool_name/tool_id/tool_input) still mirror the
+    first call for backward compatibility with callers that predate parallel
+    tool-use support."""
+    from movate.providers.base import ToolCallSpec  # noqa: PLC0415
+
     fake = _FakeClient()
     msg = _FakeMessageWithTools(
         tool_calls=[
@@ -514,8 +517,17 @@ async def test_complete_takes_first_tool_call_when_multiple_emitted() -> None:
             messages=[Message(role="user", content="?")],
         )
     )
+    # Singular fields still mirror the first call (backward compat).
+    assert resp.kind == "tool_use"
     assert resp.tool_id == "call_1"
     assert resp.tool_name == "calc"
+    assert resp.tool_input == {"a": 1, "b": 2}
+    # parallel_tool_calls carries all calls.
+    assert len(resp.parallel_tool_calls) == 2
+    first: ToolCallSpec = resp.parallel_tool_calls[0]
+    second: ToolCallSpec = resp.parallel_tool_calls[1]
+    assert first.name == "calc" and first.call_id == "call_1" and first.input == {"a": 1, "b": 2}
+    assert second.name == "other" and second.call_id == "call_2" and second.input == {"x": 99}
 
 
 @pytest.mark.unit

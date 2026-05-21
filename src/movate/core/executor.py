@@ -13,6 +13,7 @@ Workflow orchestration lives in ``movate.core.workflow``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -59,6 +60,7 @@ from movate.providers.base import (
     CompletionRequest,
     CompletionResponse,
     Message,
+    ToolCallSpec,
 )
 from movate.providers.pricing import PricingTable
 from movate.providers.registry import ProviderRegistry, UnregisteredRuntimeError
@@ -800,38 +802,52 @@ class Executor:
                 )
                 return final, accumulated_skill_cost, skill_call_records
 
-            tool_name = completion.tool_name
-            tool_id = completion.tool_id
-            tool_input = completion.tool_input
+            # Collect all tool calls for this turn.  parallel_tool_calls
+            # is always populated for kind="tool_use" turns (all three
+            # providers now set it); fall back to the singular fields in
+            # case an older/custom provider only sets those.
+            calls: list[ToolCallSpec] = completion.parallel_tool_calls or [
+                ToolCallSpec(
+                    name=completion.tool_name,
+                    call_id=completion.tool_id,
+                    input=completion.tool_input,
+                )
+            ]
 
-            skill = skill_index.get(tool_name)
-            if skill is None:
-                # The model invented a tool name. Emit a NOT_FOUND
-                # tool_result and let the model recover.
-                err = SkillError(
-                    type=SkillErrorType.NOT_FOUND,
-                    message=(f"unknown tool {tool_name!r}; available: {sorted(skill_index)}"),
-                )
-                tool_result_content = json.dumps({"error": err.type.value, "message": err.message})
-            elif skill_fixture is not None and tool_name in skill_fixture:
-                # Fixture short-circuit: eval dataset provided a canned
-                # response for this skill. Return it immediately without
-                # any real network/python dispatch. Cost stays zero —
-                # fixtures are deterministic stand-ins, not real calls.
-                tool_result_content = json.dumps(skill_fixture[tool_name])
-                self._tracer.log_event(
-                    span,
-                    {"skill_fixture_used": tool_name, "turn": turns_taken},
-                )
-            else:
-                # Effective per-call budget is skill override OR agent
-                # inheritance (ADR 002 D3).
+            async def _dispatch_one_call(
+                call: ToolCallSpec,
+                _turn: int = turns_taken,
+            ) -> tuple[str, str, float, SkillCallRecord | None]:
+                """Dispatch one tool call. Returns (call_id, result_json, cost_usd, record).
+
+                Extracted from the loop body so ``asyncio.gather`` can run
+                parallel calls concurrently when the model emits more than
+                one tool call in a single turn (e.g. Claude Sonnet or GPT-4o
+                with parallel_tool_calls enabled).
+                """
+                _name = call.name
+                _input = call.input
+
+                skill = skill_index.get(_name)
+                if skill is None:
+                    # Model invented a tool name — emit NOT_FOUND so it can
+                    # recover on the next turn (surface all available names).
+                    err = SkillError(
+                        type=SkillErrorType.NOT_FOUND,
+                        message=f"unknown tool {_name!r}; available: {sorted(skill_index)}",
+                    )
+                    err_result = json.dumps({"error": err.type.value, "message": err.message})
+                    return call.call_id, err_result, 0.0, None
+
+                if skill_fixture is not None and _name in skill_fixture:
+                    # Fixture short-circuit: eval provided a canned response.
+                    # Cost stays zero — fixtures are deterministic stand-ins.
+                    result = json.dumps(skill_fixture[_name])
+                    self._tracer.log_event(span, {"skill_fixture_used": _name, "turn": _turn})
+                    return call.call_id, result, 0.0, None
+
+                # Real dispatch.  Per-call budget = skill override OR agent default.
                 call_ms = skill.spec.timeout_call_ms or agent_call_ms
-                # ``agent_name`` + ``storage`` + ``retrieval`` plumbed
-                # through for skills that introspect the calling agent
-                # (the ``kb-vector-lookup`` skill needs all three to
-                # query the agent's KB chunks with the operator's
-                # configured retrieval pipeline — PR-I).
                 ctx = SkillExecutionContext(
                     trace_id=span.trace_id,
                     tenant_id=tenant_id,
@@ -840,82 +856,81 @@ class Executor:
                     agent_name=bundle.spec.name,
                     storage=self._storage,
                     retrieval=bundle.spec.retrieval,
-                    # PR-V: skill emits retrieval stages as child
-                    # spans under the agent's run span. ``span`` is
-                    # the executor's per-run tracing context.
                     tracer=self._tracer,
                     parent_span=span,
                 )
-                _skill_t0 = time.monotonic()
+                _t0 = time.monotonic()
                 try:
-                    output = await dispatch_skill(skill, tool_input, ctx)
-                    _skill_latency_ms = (time.monotonic() - _skill_t0) * 1000
-                    tool_result_content = json.dumps(output)
-                    # Add this skill's cost to the run total.
-                    accumulated_skill_cost += skill.spec.cost.per_call_usd
+                    output = await dispatch_skill(skill, _input, ctx)
+                    lat = (time.monotonic() - _t0) * 1000
+                    result = json.dumps(output)
+                    cost = skill.spec.cost.per_call_usd
                     self._tracer.log_event(
-                        span,
-                        {
-                            "skill_invoked": tool_name,
-                            "skill_cost_usd": skill.spec.cost.per_call_usd,
-                            "turn": turns_taken,
-                        },
+                        span, {"skill_invoked": _name, "skill_cost_usd": cost, "turn": _turn}
                     )
-                    skill_call_records.append(
-                        SkillCallRecord(
-                            step=turns_taken,
-                            skill=tool_name,
-                            input=tool_input,
-                            output=output,
-                            latency_ms=round(_skill_latency_ms, 1),
-                        )
+                    rec = SkillCallRecord(
+                        step=_turn,
+                        skill=_name,
+                        input=_input,
+                        output=output,
+                        latency_ms=round(lat, 1),
                     )
+                    return call.call_id, result, cost, rec
                 except SkillError as exc:
-                    _skill_latency_ms = (time.monotonic() - _skill_t0) * 1000
-                    tool_result_content = json.dumps(
-                        {"error": exc.type.value, "message": exc.message}
-                    )
+                    lat = (time.monotonic() - _t0) * 1000
+                    result = json.dumps({"error": exc.type.value, "message": exc.message})
                     self._tracer.log_event(
                         span,
-                        {
-                            "skill_error": tool_name,
-                            "skill_error_type": exc.type.value,
-                            "turn": turns_taken,
-                        },
+                        {"skill_error": _name, "skill_error_type": exc.type.value, "turn": _turn},
                     )
-                    skill_call_records.append(
-                        SkillCallRecord(
-                            step=turns_taken,
-                            skill=tool_name,
-                            input=tool_input,
-                            error=f"{exc.type.value}: {exc.message}",
-                            latency_ms=round(_skill_latency_ms, 1),
-                        )
+                    rec = SkillCallRecord(
+                        step=_turn,
+                        skill=_name,
+                        input=_input,
+                        error=f"{exc.type.value}: {exc.message}",
+                        latency_ms=round(lat, 1),
                     )
+                    return call.call_id, result, 0.0, rec
 
-            # Append assistant's tool_use turn + the matching tool
-            # result. The assistant turn carries the original tool_call
-            # so the model sees its own action when we re-prompt.
+            # Dispatch: parallel when model issued multiple calls in one
+            # turn, sequential (still uses gather for code-path unity)
+            # for single calls.
+            if len(calls) > 1:
+                self._tracer.log_event(
+                    span, {"parallel_tool_calls": len(calls), "turn": turns_taken}
+                )
+            dispatch_results = list(await asyncio.gather(*[_dispatch_one_call(c) for c in calls]))
+
+            # Accumulate costs and records from all dispatched calls.
+            for _cid, _res, _cost, _rec in dispatch_results:
+                accumulated_skill_cost += _cost
+                if _rec is not None:
+                    skill_call_records.append(_rec)
+
+            # Append one assistant turn carrying ALL tool calls, then one
+            # tool result message per call.  The OpenAI / Anthropic spec
+            # requires this exact structure so the model can correlate
+            # each result to its originating call.
             assistant_turn = Message(
                 role="assistant",
-                content="",
+                content=completion.text or "",
                 tool_calls=[
                     {
-                        "id": tool_id,
+                        "id": c.call_id,
                         "type": "function",
                         "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(tool_input),
+                            "name": c.name,
+                            "arguments": json.dumps(c.input),
                         },
                     }
+                    for c in calls
                 ],
             )
-            tool_turn = Message(
-                role="tool",
-                content=tool_result_content,
-                tool_call_id=tool_id,
-            )
-            messages.extend([assistant_turn, tool_turn])
+            tool_turns = [
+                Message(role="tool", content=_res, tool_call_id=_cid)
+                for _cid, _res, _cost, _rec in dispatch_results
+            ]
+            messages.extend([assistant_turn, *tool_turns])
 
     async def _invoke_streaming(
         self,

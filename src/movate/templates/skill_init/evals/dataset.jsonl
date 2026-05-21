@@ -1,0 +1,6 @@
+{"input": {"query": "hello world"}, "expected": {"result": "echo: hello world"}}
+{"input": {"query": "what is the capital of France?"}, "expected": {"result": "echo: what is the capital of France?"}}
+{"input": {"query": "summarize the quarterly earnings report for Q3 2024"}, "expected": {"result": "echo: summarize the quarterly earnings report for Q3 2024"}}
+{"input": {"query": "extract all email addresses from the following text: contact us at support@acme.com or sales@acme.com"}, "expected": {"result": "echo: extract all email addresses from the following text: contact us at support@acme.com or sales@acme.com"}}
+{"input": {"query": "the product shipping was delayed and I am very frustrated with the service"}, "expected": {"result": "echo: the product shipping was delayed and I am very frustrated with the service"}}
+{"input": {"query": "{\"name\": \"Alice\", \"age\": 30, \"city\": \"Seattle\"}"}, "expected": {"result": "echo: {\"name\": \"Alice\", \"age\": 30, \"city\": \"Seattle\"}"}}
