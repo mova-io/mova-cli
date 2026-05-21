@@ -31,3 +31,23 @@ class Tracer(Protocol):
     def log_event(self, span: SpanCtx, event: dict[str, Any]) -> None: ...
 
     def set_attribute(self, span: SpanCtx, key: str, value: Any) -> None: ...
+
+    def log_generation(
+        self,
+        span: SpanCtx,
+        *,
+        model: str,
+        input_messages: list[dict[str, Any]],
+        output_text: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """Record an LLM completion as a first-class Langfuse Generation.
+
+        No-op on non-Langfuse tracers — each backend provides its own
+        implementation. Declared on the Protocol with a default body so
+        all existing Tracer implementations stay valid without change.
+        Callers (executor) always call this; only LangfuseTracer produces
+        observable output from it.
+        """

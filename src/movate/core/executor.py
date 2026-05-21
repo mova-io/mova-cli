@@ -375,12 +375,15 @@ class Executor:
             if bundle.skills:
                 tool_specs = [provider_for_run.to_tool_spec(s) for s in bundle.skills]
 
+            # Track the messages sent to the LLM so log_generation can
+            # emit the prompt to Langfuse after the run completes.
+            conversation: list[Message] = []
             for provider_str, params in chain:
                 # Prepend conversation history (chat memory) before the
                 # newly-rendered current turn. History entries are passed
                 # through as-is; the renderer only sees the current
                 # request.input (history isn't fed to the Jinja template).
-                conversation: list[Message] = [
+                conversation = [
                     *(history or []),
                     Message(role="user", content=rendered),
                 ]
@@ -600,6 +603,22 @@ class Executor:
                 cost_usd=cost,
                 provider=chosen_provider,
                 pricing_version=self._pricing.version,
+                trace_id=span.trace_id,
+            )
+
+            # Emit a Langfuse Generation object so token-usage charts and
+            # the Generations tab populate. No-op on non-Langfuse tracers.
+            self._tracer.log_generation(
+                span,
+                model=chosen_provider,
+                input_messages=[
+                    {"role": m.role, "content": m.content or ""}
+                    for m in conversation
+                ],
+                output_text=completion.text or "",
+                input_tokens=completion.tokens.input,
+                output_tokens=completion.tokens.output,
+                cost_usd=cost,
             )
 
             response = RunResponse(
@@ -1300,7 +1319,7 @@ class Executor:
             data={},
             human_readable=f"**Error**: {err}",
             trace_id=span.trace_id,
-            metrics=Metrics(latency_ms=elapsed_ms, tokens=TokenUsage()),
+            metrics=Metrics(latency_ms=elapsed_ms, tokens=TokenUsage(), trace_id=span.trace_id),
             error=info,
         )
 
