@@ -56,6 +56,7 @@ kb_app = typer.Typer(
 # Guided KB wizard — shown when `mdk kb` is run with no subcommand
 # ---------------------------------------------------------------------------
 
+
 def _kb_wizard_detect_agents(project_root: Path) -> list[tuple[str, Path]]:
     """Return [(agent_name, kb_dir)] for every agent that *could* use a KB
     (has an agent.yaml), regardless of whether the kb/ dir is populated yet.
@@ -241,8 +242,7 @@ def _kb_guided_wizard() -> None:
             f"   [dim]{bin_name} kb stats {agent_arg} --by-source[/dim]"
         )
         console.print(
-            f"  [bold cyan][4][/bold cyan]  Ingest all agents"
-            f"   [dim]{bin_name} kb ingest-all[/dim]"
+            f"  [bold cyan][4][/bold cyan]  Ingest all agents   [dim]{bin_name} kb ingest-all[/dim]"
         )
         console.print(
             f"  [bold cyan][5][/bold cyan]  List KB chunks"
@@ -579,9 +579,7 @@ def ingest(
 
         project_root = walk_up_for_project_root()
         default_path = (
-            str(project_root / "agents" / agent / "kb")
-            if project_root
-            else f"agents/{agent}/kb"
+            str(project_root / "agents" / agent / "kb") if project_root else f"agents/{agent}/kb"
         )
         if sys.stdin.isatty() and sys.stdout.isatty():
             try:
@@ -667,9 +665,7 @@ def ingest(
 
         console.print(f"[bold cyan]Ingesting[/bold cyan] {path} -> agent [bold]{agent}[/bold]…")
         if clean_source:
-            console.print(
-                "[dim]--clean-source: deleting existing chunks before re-ingest[/dim]"
-            )
+            console.print("[dim]--clean-source: deleting existing chunks before re-ingest[/dim]")
 
         if total_files > 0:
             est_cost = _estimate_embedding_cost(files_to_ingest)
@@ -704,20 +700,20 @@ def ingest(
                                 chunk = existing[0]
                                 created_at_str: str = getattr(chunk, "created_at", "") or ""
                                 if created_at_str:
-                                    chunk_ts = datetime.fromisoformat(
-                                        created_at_str.removesuffix("Z")
-                                    ).replace(tzinfo=UTC).timestamp()
+                                    chunk_ts = (
+                                        datetime.fromisoformat(created_at_str.removesuffix("Z"))
+                                        .replace(tzinfo=UTC)
+                                        .timestamp()
+                                    )
                                     if chunk_ts > file_path.stat().st_mtime:
                                         skip = True
                         except Exception:
                             pass  # on any error, proceed with ingest
                         advance(suffix=f" [cyan]{file_path.name}[/cyan]  [{i + 1}/{total_files}]")
                         if skip:
-                            console.print(
-                                f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]"
-                            )
+                            console.print(f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]")
                             continue
-                        file_summaries = await ingest_path(
+                        file_summaries, file_failed = await ingest_path(
                             storage=storage,  # type: ignore[arg-type]
                             path=file_path,
                             agent=agent,
@@ -727,14 +723,20 @@ def ingest(
                             clean_source=clean_source,
                         )
                         summaries.extend(file_summaries)
+                        for fname, reason in file_failed:
+                            console.print(
+                                f"  [yellow]⚠[/yellow] [bold]{fname}[/bold] — "
+                                f"embedding failed: {reason}"
+                            )
             else:
                 with progress_bar(
                     description="Ingesting", total=total_files, transient=False
                 ) as advance:
+
                     def _on_file(name: str, current: int, total: int) -> None:
                         advance(suffix=f" [cyan]{name}[/cyan]  [{current}/{total}]")
 
-                    file_summaries = await ingest_path(
+                    file_summaries, file_failed = await ingest_path(
                         storage=storage,  # type: ignore[arg-type]
                         path=path,
                         agent=agent,
@@ -745,6 +747,11 @@ def ingest(
                         on_file_start=_on_file,
                     )
                     summaries.extend(file_summaries)
+                    for fname, reason in file_failed:
+                        console.print(
+                            f"  [yellow]⚠[/yellow] [bold]{fname}[/bold] — "
+                            f"embedding failed: {reason}"
+                        )
         finally:
             await storage.close()  # type: ignore[attr-defined]
 
@@ -773,9 +780,7 @@ def ingest(
             return
 
         # Render a summary table — one row per source.
-        show_removed = clean_source and any(
-            getattr(s, "chunks_removed", 0) > 0 for s in summaries
-        )
+        show_removed = clean_source and any(getattr(s, "chunks_removed", 0) > 0 for s in summaries)
         table = Table(title=f"[bold]Ingest summary[/bold] — agent [bold]{agent}[/bold]")
         table.add_column("source", overflow="fold")
         if show_removed:
@@ -796,9 +801,7 @@ def ingest(
         # (corrupt files, parse errors, or — most commonly — image files when
         # the Tesseract binary is absent).
         _skip_preview = 3
-        ingested_sources = {
-            Path(getattr(s, "source", "")).name for s in summaries
-        }
+        ingested_sources = {Path(getattr(s, "source", "")).name for s in summaries}
         skipped = [f for f in files_to_ingest if f.name not in ingested_sources]
         if skipped:
             image_exts = {".png", ".jpg", ".jpeg", ".tiff", ".gif"}
@@ -945,6 +948,7 @@ def _format_stage_details(details: dict[str, object]) -> str:
 def _format_age(iso_ts: str) -> str:
     """Return human-readable age string for an ISO-8601 UTC timestamp."""
     from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
     try:
         ts = datetime.fromisoformat(iso_ts.removesuffix("Z")).replace(tzinfo=UTC)
         delta = datetime.now(UTC) - ts
@@ -1032,6 +1036,7 @@ def _run_dry(*, path: Path, agent: str) -> None:
 
     # File-type breakdown
     from collections import Counter  # noqa: PLC0415
+
     ext_counts = Counter(p.suffix.lower() for p in files)
     if ext_counts:
         parts = [
@@ -1721,8 +1726,7 @@ def ingest_all(
 
     # Remap __shared__ to the operator's chosen agent name.
     targets = [
-        (shared_agent if agent == "__shared__" else agent, kb_dir)
-        for agent, kb_dir in targets
+        (shared_agent if agent == "__shared__" else agent, kb_dir) for agent, kb_dir in targets
     ]
 
     if not targets:
@@ -1755,6 +1759,7 @@ def ingest_all(
         )
         # File-type breakdown
         from collections import Counter  # noqa: PLC0415
+
         ext_counts = Counter(p.suffix.lower() for p in all_files)
         if ext_counts:
             parts = [
@@ -1788,7 +1793,7 @@ def ingest_all(
 
         storage = await _build_storage()
         try:
-            summaries = await ingest_path(
+            summaries, failed = await ingest_path(
                 storage=storage,  # type: ignore[arg-type]
                 path=file_path,
                 agent=agent_name,
@@ -1800,7 +1805,10 @@ def ingest_all(
         finally:
             await storage.close()  # type: ignore[attr-defined]
         chunks = sum(getattr(s, "chunks_saved", 0) for s in summaries)
-        console.print(f"  [green]✓[/green] {file_path.name}: {chunks} chunks saved.")
+        if chunks:
+            console.print(f"  [green]✓[/green] {file_path.name}: {chunks} chunks saved.")
+        for fname, reason in failed:
+            console.print(f"  [yellow]⚠[/yellow] [bold]{fname}[/bold] — embedding failed: {reason}")
 
     async def _run() -> None:
         from datetime import UTC, datetime  # noqa: PLC0415
@@ -1825,6 +1833,7 @@ def ingest_all(
 
         storage = await _build_storage()
         all_summaries: list[tuple[str, object]] = []  # [(agent_name, IngestSummary)]
+        all_failed: list[tuple[str, str, str]] = []  # [(agent_name, filename, reason)]
         try:
             if total_files == 0:
                 pass  # nothing to ingest
@@ -1846,22 +1855,20 @@ def ingest_all(
                                 chunk = existing[0]
                                 created_at_str: str = getattr(chunk, "created_at", "") or ""
                                 if created_at_str:
-                                    chunk_ts = datetime.fromisoformat(
-                                        created_at_str.removesuffix("Z")
-                                    ).replace(tzinfo=UTC).timestamp()
+                                    chunk_ts = (
+                                        datetime.fromisoformat(created_at_str.removesuffix("Z"))
+                                        .replace(tzinfo=UTC)
+                                        .timestamp()
+                                    )
                                     if chunk_ts > file_path.stat().st_mtime:
                                         skip = True
                         except Exception:
                             pass
-                        advance(
-                            suffix=f" [cyan]{file_path.name}[/cyan]  [{i + 1}/{total_files}]"
-                        )
+                        advance(suffix=f" [cyan]{file_path.name}[/cyan]  [{i + 1}/{total_files}]")
                         if skip:
-                            console.print(
-                                f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]"
-                            )
+                            console.print(f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]")
                             continue
-                        file_summaries = await ingest_path(
+                        file_summaries, file_failed = await ingest_path(
                             storage=storage,  # type: ignore[arg-type]
                             path=file_path,
                             agent=agent_name,
@@ -1871,6 +1878,7 @@ def ingest_all(
                             clean_source=clean_source,
                         )
                         all_summaries.extend((agent_name, s) for s in file_summaries)
+                        all_failed.extend((agent_name, fn, r) for fn, r in file_failed)
             else:
                 with progress_bar(
                     description="Ingesting", total=total_files, transient=False
@@ -1887,11 +1895,9 @@ def ingest_all(
                             total: int,
                             _agent: str = agent_name,
                         ) -> None:
-                            advance(
-                                suffix=f" [cyan]{name}[/cyan] ({_agent})  [{current}/{total}]"
-                            )
+                            advance(suffix=f" [cyan]{name}[/cyan] ({_agent})  [{current}/{total}]")
 
-                        dir_summaries = await ingest_path(
+                        dir_summaries, dir_failed = await ingest_path(
                             storage=storage,  # type: ignore[arg-type]
                             path=kb_dir,
                             agent=agent_name,
@@ -1902,13 +1908,21 @@ def ingest_all(
                             on_file_start=_on_file,
                         )
                         all_summaries.extend((agent_name, s) for s in dir_summaries)
+                        all_failed.extend((agent_name, fn, r) for fn, r in dir_failed)
         finally:
             await storage.close()  # type: ignore[attr-defined]
 
-        if not all_summaries:
+        # Surface any per-file embedding failures collected above.
+        for agent_name, fname, reason in all_failed:
             console.print(
-                "[yellow]⚠[/yellow] no ingestible files found in any KB directory."
+                f"  [yellow]⚠[/yellow] [{agent_name}] [bold]{fname}[/bold] — "
+                f"embedding failed: {reason}\n"
+                f"    Re-run [bold]mdk kb ingest {agent_name}[/bold] to retry, "
+                "or set [bold]MOVATE_EMBED_TIMEOUT[/bold] to a higher value."
             )
+
+        if not all_summaries:
+            console.print("[yellow]⚠[/yellow] no ingestible files found in any KB directory.")
             if not watch_mode:
                 return
         else:

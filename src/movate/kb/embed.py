@@ -21,6 +21,7 @@ stored under ``openai/text-embedding-3-small`` are unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -36,13 +37,22 @@ we persist to ``KbChunk.embedding_model``."""
 
 OPENAI_EMBEDDINGS_ENDPOINT = "https://api.openai.com/v1/embeddings"
 
-# Generous per-request timeout. Embedding calls are typically <1s but
-# can spike during provider incidents.
-DEFAULT_TIMEOUT_S = 60.0
+# Per-request timeout for the embedding HTTP call.  Large PDFs produce
+# many chunks and the batch can take longer than expected when OpenAI
+# is under load.  Overridable via ``MOVATE_EMBED_TIMEOUT`` env var
+# (seconds, int or float).
+_ENV_TIMEOUT = os.environ.get("MOVATE_EMBED_TIMEOUT", "").strip()
+DEFAULT_TIMEOUT_S: float = float(_ENV_TIMEOUT) if _ENV_TIMEOUT else 120.0
+
+# Retry config for transient network errors (ReadTimeout, ConnectTimeout).
+# Three attempts with exponential back-off: 2 s → 4 s → give up.
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY_S = 2.0
 
 # HTTP status constants — avoids PLR2004 (magic number) lint warnings.
 _HTTP_OK = 200
 _HTTP_UNAUTHORIZED = 401
+_HTTP_TOO_MANY = 429
 
 # Model name prefixes that we route through the direct OpenAI httpx path.
 # Everything else goes through LiteLLM.
@@ -146,22 +156,54 @@ async def _embed_via_openai(
     }
     payload: dict[str, Any] = {"model": bare_model, "input": texts}
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+    # Retry loop — transient timeouts and 429 rate-limit responses are
+    # retried with exponential back-off.  Hard auth failures (401) and
+    # unexpected 4xx/5xx are not retried — they need operator action.
+    for attempt in range(_MAX_RETRIES):
         try:
-            resp = await client.post(OPENAI_EMBEDDINGS_ENDPOINT, json=payload, headers=headers)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+                resp = await client.post(OPENAI_EMBEDDINGS_ENDPOINT, json=payload, headers=headers)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            delay = _RETRY_BASE_DELAY_S * (2**attempt)
+            if attempt + 1 < _MAX_RETRIES:
+                await asyncio.sleep(delay)
+                continue
+            raise EmbeddingError(
+                f"OpenAI embeddings timed out after {_MAX_RETRIES} attempts "
+                f"({type(exc).__name__}). Consider setting MOVATE_EMBED_TIMEOUT "
+                f"to a higher value (current: {timeout_s}s)."
+            ) from exc
         except httpx.HTTPError as exc:
             raise EmbeddingError(
                 f"network error reaching OpenAI embeddings: {type(exc).__name__}: {exc}"
             ) from exc
 
-    if resp.status_code == _HTTP_UNAUTHORIZED:
-        raise EmbeddingError(
-            "OpenAI rejected the key (HTTP 401). Run "
-            "``mdk auth status`` to verify, or ``mdk auth login openai`` to rotate."
-        )
-    if resp.status_code != _HTTP_OK:
-        body = resp.text[:500]
-        raise EmbeddingError(f"OpenAI returned HTTP {resp.status_code}: {body}")
+        # Non-retriable auth failure.
+        if resp.status_code == _HTTP_UNAUTHORIZED:
+            raise EmbeddingError(
+                "OpenAI rejected the key (HTTP 401). Run "
+                "``mdk auth status`` to verify, or ``mdk auth login openai`` to rotate."
+            )
+
+        # 429 rate-limit: back off and retry.
+        if resp.status_code == _HTTP_TOO_MANY:
+            delay = _RETRY_BASE_DELAY_S * (2**attempt)
+            retry_after = resp.headers.get("retry-after", "")
+            if retry_after.isdigit():
+                delay = max(delay, float(retry_after))
+            if attempt + 1 < _MAX_RETRIES:
+                await asyncio.sleep(delay)
+                continue
+            raise EmbeddingError(
+                f"OpenAI rate-limited ({_HTTP_TOO_MANY}) after {_MAX_RETRIES} retries. "
+                "Wait a moment and try again."
+            )
+
+        if resp.status_code != _HTTP_OK:
+            body = resp.text[:500]
+            raise EmbeddingError(f"OpenAI returned HTTP {resp.status_code}: {body}")
+
+        break  # success — exit retry loop
 
     try:
         data = resp.json()

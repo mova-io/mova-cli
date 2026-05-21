@@ -25,6 +25,7 @@ from movate.core.models import KbChunk
 from movate.kb.chunk import Chunk, split_paragraphs
 from movate.kb.embed import (
     DEFAULT_EMBEDDING_MODEL,
+    EmbeddingError,
     embed_texts,
     qualified_model_name,
 )
@@ -109,14 +110,18 @@ async def ingest_path(
     api_key: str | None = None,
     clean_source: bool = False,
     on_file_start: Callable[[str, int, int], None] | None = None,
-) -> list[IngestSummary]:
+) -> tuple[list[IngestSummary], list[tuple[str, str]]]:
     """Ingest a file or directory tree. Returns one summary per file.
 
     Empty directory / unsupported file = empty list (not an error).
-    Embedding-call failures propagate as :class:`EmbeddingError` —
-    the storage state is left at whatever was saved before the
-    failure (no rollback, but the dedup key makes the next attempt
-    pick up where this one stopped).
+
+    :class:`EmbeddingError` from a single file is caught, logged at
+    WARNING level, and recorded in ``failed_files`` — the remaining
+    files in the batch are still attempted so one timeout or bad PDF
+    doesn't abort an entire ``mdk kb ingest-all`` run.  The partial
+    results are returned together with ``failed_files`` via the tuple;
+    callers that previously ignored the return value are unaffected
+    (the first element is the old ``list[IngestSummary]``).
 
     ``clean_source=True`` deletes all existing chunks for each file's
     source URI before ingesting it — use this when you want re-ingest
@@ -130,21 +135,29 @@ async def ingest_path(
     """
     files = find_files(path)
     summaries: list[IngestSummary] = []
+    failed_files: list[tuple[str, str]] = []  # (filename, error_message)
     for i, file_path in enumerate(files):
         if on_file_start is not None:
             on_file_start(file_path.name, i + 1, len(files))
-        summary = await _ingest_one_file(
-            storage=storage,
-            file_path=file_path,
-            agent=agent,
-            tenant_id=tenant_id,
-            embedding_model=embedding_model,
-            api_key=api_key,
-            clean_source=clean_source,
-        )
+        try:
+            summary = await _ingest_one_file(
+                storage=storage,
+                file_path=file_path,
+                agent=agent,
+                tenant_id=tenant_id,
+                embedding_model=embedding_model,
+                api_key=api_key,
+                clean_source=clean_source,
+            )
+        except EmbeddingError as exc:
+            # Transient network or rate-limit failure — continue with
+            # the rest of the batch and surface at the end.
+            log.warning("embedding failed for %s: %s", file_path.name, exc)
+            failed_files.append((file_path.name, str(exc)))
+            continue
         if summary is not None:
             summaries.append(summary)
-    return summaries
+    return summaries, failed_files
 
 
 async def _ingest_one_file(
