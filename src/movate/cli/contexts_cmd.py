@@ -444,3 +444,100 @@ def show_context(
         f"[dim]{len(body.splitlines())} lines  "
         f"{_fmt_size(len(body.encode('utf-8')))}[/dim]"
     )
+
+
+# ---------------------------------------------------------------------------
+# `mdk contexts create <name>`
+# ---------------------------------------------------------------------------
+
+_CONTEXT_TEMPLATE = """\
+# {name}
+
+<!-- Replace this with your context content. This file is injected into the
+     agent's system prompt at run time. See: mdk contexts list --verbose -->
+"""
+
+
+@contexts_app.command("create")
+def create_context(
+    name: str = typer.Argument(
+        ...,
+        help="Name for the new context file (stem, no extension).",
+    ),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        "-a",
+        help=(
+            "Create the context inside agents/<agent>/contexts/ instead of the "
+            "project-level contexts/ directory. The agent directory must already exist."
+        ),
+    ),
+    project: Path = typer.Option(
+        Path("."),
+        "--project",
+        "-p",
+        help="Project root. Defaults to the current directory.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Overwrite the file if it already exists.",
+    ),
+) -> None:
+    """Create a new context file pre-filled with a minimal template.
+
+    Creates ``contexts/<name>.md`` at the project level by default. With
+    ``--agent <name>``, creates ``agents/<agent>/contexts/<name>.md`` instead.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Create a project-level context[/dim]
+      $ mdk contexts create policy
+
+      [dim]# Create a context private to one agent[/dim]
+      $ mdk contexts create grounded-rubric --agent rag-qa
+
+      [dim]# Overwrite an existing context[/dim]
+      $ mdk contexts create policy --force
+    """
+    root = _project_root(project)
+
+    if agent is not None:
+        # Validate that the agent directory exists.
+        agent_dir = _agents_dir(project) / agent
+        if not agent_dir.is_dir():
+            err_console.print(
+                f"[red]✗[/red] agent [bold]{agent}[/bold] not found: "
+                f"{agent_dir}"
+            )
+            raise typer.Exit(code=2)
+        target_dir = agent_dir / _AGENT_CONTEXTS_SUBDIR
+    else:
+        target_dir = _contexts_dir(project)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / f"{name}.md"
+
+    if dest.exists() and not force:
+        err_console.print(
+            f"[red]✗[/red] context file already exists: [bold]{dest}[/bold]\n"
+            "[dim]Pass [bold]--force[/bold] to overwrite.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    body = _CONTEXT_TEMPLATE.format(name=name)
+    dest.write_text(body, encoding="utf-8")
+
+    # Compute a display path relative to root when possible.
+    try:
+        display = dest.relative_to(root)
+    except ValueError:
+        display = dest
+
+    console.print(f"[green]✓[/green] Created [bold]{display}[/bold]")
+    console.print(
+        f"[dim]Reference it in agent.yaml under "
+        f"[bold]contexts: [{name}][/bold][/dim]"
+    )

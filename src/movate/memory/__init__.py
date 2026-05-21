@@ -1,6 +1,6 @@
 """``movate.memory`` — agent memory layer.
 
-A :class:`MemoryStore` Protocol with two shipped backends:
+A :class:`MemoryStore` Protocol with three shipped backends:
 
 * ``InMemoryStore`` (default) — JSON-file-backed, persists to
   ``~/.movate/memory.json`` across process restarts. Thread-safe
@@ -8,6 +8,9 @@ A :class:`MemoryStore` Protocol with two shipped backends:
 * ``SqliteStore``              — aiosqlite-backed with WAL mode.
   Enabled via ``MOVATE_MEMORY_BACKEND=sqlite``. Better concurrency
   for multi-reader workloads; same Protocol surface as InMemoryStore.
+* ``PostgresStore``            — asyncpg-backed multi-worker backend.
+  Enabled via ``MOVATE_MEMORY_BACKEND=postgres`` + ``MOVATE_PG_URL``.
+  Suitable for production deployments with multiple workers.
 * ``VectorStore``  (deferred) — semantic recall via pgvector
   / Azure AI Search. Follow-up once traffic patterns are clear.
 
@@ -35,6 +38,7 @@ from movate.memory.store import (
     InMemoryStore,
     MemoryEntry,
     MemoryStore,
+    PostgresStore,
     SqliteStore,
     build_memory_store,
 )
@@ -43,6 +47,7 @@ __all__ = [
     "InMemoryStore",
     "MemoryEntry",
     "MemoryStore",
+    "PostgresStore",
     "SqliteStore",
     "build_memory_store",
 ]

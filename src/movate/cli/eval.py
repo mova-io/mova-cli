@@ -224,6 +224,16 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             "--output-baseline evals/.last-run.json[/bold]."
         ),
     ),
+    variant: str | None = typer.Option(
+        None,
+        "--variant",
+        help=(
+            "Path to a second agent directory to run A/B comparison against. "
+            "Runs the same dataset against both agents and prints a side-by-side "
+            "score table. The primary agent's gate still applies; the variant "
+            "is informational. Example: --variant agents/rag-qa-v2"
+        ),
+    ),
     judge_model: list[str] = typer.Option(
         [],
         "--judge-model",
@@ -644,6 +654,29 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
             judge_override=judge_override,
         )
     )
+
+    # --variant A/B comparison: run the same dataset against a second agent
+    # configuration and print a side-by-side score table. The variant eval
+    # result is informational — exit code is determined by the primary only.
+    if variant is not None:
+        try:
+            variant_bundle = load_agent(Path(variant))
+        except AgentLoadError as exc:
+            err_console.print(f"[red]✗ variant load failed:[/red] {exc}")
+            raise typer.Exit(code=2) from None
+
+        asyncio.run(
+            _run_variant_comparison(
+                primary_bundle=bundle,
+                variant_bundle=variant_bundle,
+                gate=gate,
+                gate_mode=gate_mode,
+                runs=runs,
+                mock=mock,
+                objective=objective,
+                judge_override=judge_override,
+            )
+        )
 
 
 @dataclass
@@ -2427,6 +2460,115 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     failed_regression = diff is not None and diff.is_regression(tolerance=regression_tolerance)
     if failed_gate or failed_regression or failed_dim:
         raise typer.Exit(code=1)
+
+
+async def _run_variant_comparison(
+    primary_bundle: AgentBundle,
+    variant_bundle: AgentBundle,
+    *,
+    gate: float,
+    gate_mode: str,
+    runs: int,
+    mock: bool,
+    objective: str | None,
+    judge_override: JudgeConfig | None,
+) -> None:
+    """Run the dataset against the variant bundle and print a side-by-side table.
+
+    Both primary and variant are run fresh here so the comparison is on equal
+    footing (same runtime, same mock config). The primary eval already ran and
+    its exit code is already settled — this function is purely informational.
+    """
+    summaries: list[EvalSummary] = []
+    for label, bundle in (("primary", primary_bundle), ("variant", variant_bundle)):
+        rt = await build_local_runtime(mock=mock)
+        if mock:
+            _configure_mock_for_bundle(rt.provider, bundle)
+        try:
+            engine = EvalEngine(
+                executor=rt.executor,
+                provider=rt.provider,
+                runs_per_case=runs,
+                gate_mode=gate_mode,
+                objective_filter=objective,
+                judge_override=judge_override,
+            )
+            try:
+                s = await engine.run(bundle)
+            except EvalConfigError as exc:
+                err_console.print(f"[red]✗ {label} variant eval error:[/red] {exc}")
+                return
+        finally:
+            await shutdown_runtime(rt.storage, rt.tracer)
+        summaries.append(s)
+
+    primary_summary, variant_summary = summaries
+    _print_variant_comparison_table(primary_summary, variant_summary)
+
+
+def _print_variant_comparison_table(
+    primary: EvalSummary,
+    variant: EvalSummary,
+) -> None:
+    """Print a side-by-side A/B score table comparing primary vs variant."""
+    console.print()
+    console.rule("[bold cyan]A/B Variant Comparison[/bold cyan]")
+
+    # Determine which extra dimensions are present in BOTH summaries.
+    dim_names: list[str] = []
+    for dim_attr in (
+        "accuracy",
+        "faithfulness",
+        "coverage",
+        "latency",
+        "context_compliance",
+        "refusal",
+        "retrieval_accuracy",
+        "completeness",
+        "tool_usage",
+        "safety",
+        "ux_tone",
+        "task_success",
+    ):
+        p_val = getattr(primary.dimensional_means, dim_attr, None)
+        v_val = getattr(variant.dimensional_means, dim_attr, None)
+        if p_val is not None and v_val is not None:
+            dim_names.append(dim_attr)
+
+    table = Table(show_lines=False)
+    table.add_column("Agent", style="bold cyan")
+    table.add_column("Mean Score", justify="right")
+    table.add_column("Cases", justify="right")
+    table.add_column("Pass Rate", justify="right")
+    for dim in dim_names:
+        table.add_column(dim.replace("_", " ").title(), justify="right")
+
+    def _fmt(v: float | None) -> str:
+        return f"{v:.3f}" if v is not None else "—"
+
+    for label, s in (("primary", primary), ("variant", variant)):
+        row: list[str] = [
+            f"{s.agent} ({label})",
+            _fmt(s.mean_score),
+            str(s.sample_count),
+            _fmt(s.pass_rate),
+        ]
+        for dim in dim_names:
+            row.append(_fmt(getattr(s.dimensional_means, dim, None)))
+        table.add_row(*row)
+
+    console.print(table)
+
+    # Winner announcement.
+    if primary.mean_score >= variant.mean_score:
+        winner_label = f"{primary.agent} (primary)"
+    else:
+        winner_label = f"{variant.agent} (variant)"
+    console.print(
+        f"\n\U0001f3c6  {winner_label} wins with mean score "
+        f"{max(primary.mean_score, variant.mean_score):.3f}"
+    )
+    console.print()
 
 
 def _emit_header_line(

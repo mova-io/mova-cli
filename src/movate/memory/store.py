@@ -396,6 +396,189 @@ def _row_to_entry(row: Any) -> MemoryEntry:
 
 
 # ---------------------------------------------------------------------------
+# PostgresStore — asyncpg-backed multi-worker production memory
+# ---------------------------------------------------------------------------
+
+_CREATE_PG_TABLE_SQL = """\
+CREATE TABLE IF NOT EXISTS agent_memory (
+    agent       TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value_json  TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    ttl_seconds INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent, key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_agent ON agent_memory (agent);
+"""
+
+# TTL filter using Postgres date arithmetic.
+# ``ttl_seconds = 0`` means immortal — never filtered.
+# ``created_at::timestamptz`` casts the stored ISO-8601 string to a
+# timestamptz so Postgres can compute the interval offset natively.
+_PG_TTL_ALIVE_CLAUSE = (
+    "AND (ttl_seconds = 0 "
+    "OR created_at::timestamptz + (ttl_seconds || ' seconds')::interval "
+    "> now() AT TIME ZONE 'UTC')"
+)
+
+
+class PostgresStore:
+    """Persistent memory backed by PostgreSQL via ``asyncpg``.
+
+    Enabled by setting ``MOVATE_MEMORY_BACKEND=postgres``. Requires
+    ``MOVATE_PG_URL`` to be set to a valid asyncpg DSN (e.g.
+    ``postgresql://user:pass@host/dbname``), or pass the DSN directly
+    via the ``dsn`` constructor argument.
+
+    Design choices mirror :class:`SqliteStore`:
+    * Schema is a single ``agent_memory`` table with ``(agent, key)`` as
+      the composite primary key — upsert via ``INSERT ... ON CONFLICT``.
+    * ``value`` is stored as JSON text; round-trips cleanly for any
+      JSON-serializable dict.
+    * Each async method opens + closes its own connection so the store is
+      safe to share across async tasks without connection-pool overhead.
+      Writes are infrequent and connections are lightweight.
+    * ``asyncpg`` is already in the ``[runtime]`` extra — no new deps.
+    * Table is named ``agent_memory`` (distinct from the SQLite
+      ``memory_entries`` table to avoid confusion when inspecting a
+      shared Postgres instance).
+    """
+
+    def __init__(self, dsn: str = "") -> None:
+        self._dsn = dsn or os.environ.get("MOVATE_PG_URL", "")
+
+    async def _ensure_schema(self, conn: Any) -> None:
+        """Create the ``agent_memory`` table and index if they don't exist."""
+        await conn.execute(_CREATE_PG_TABLE_SQL)
+
+    async def list(self, agent: str) -> list[MemoryEntry]:
+        """All non-expired entries for ``agent``, sorted by created_at ascending."""
+        import asyncpg  # noqa: PLC0415 — optional at module level
+
+        conn = await asyncpg.connect(self._dsn)
+        try:
+            await self._ensure_schema(conn)
+            rows = await conn.fetch(
+                "SELECT agent, key, value_json, created_at, ttl_seconds "
+                "FROM agent_memory WHERE agent = $1 "
+                + _PG_TTL_ALIVE_CLAUSE
+                + " ORDER BY created_at ASC",
+                agent,
+            )
+        finally:
+            await conn.close()
+        return [_pg_row_to_entry(row) for row in rows]
+
+    async def get(self, agent: str, key: str) -> MemoryEntry | None:
+        """One non-expired entry; ``None`` when absent or expired."""
+        import asyncpg  # noqa: PLC0415 — optional at module level
+
+        conn = await asyncpg.connect(self._dsn)
+        try:
+            await self._ensure_schema(conn)
+            row = await conn.fetchrow(
+                "SELECT agent, key, value_json, created_at, ttl_seconds "
+                "FROM agent_memory WHERE agent = $1 AND key = $2 "
+                + _PG_TTL_ALIVE_CLAUSE,
+                agent,
+                key,
+            )
+        finally:
+            await conn.close()
+        return _pg_row_to_entry(row) if row else None
+
+    async def set(
+        self,
+        agent: str,
+        key: str,
+        value: dict[str, Any],
+        *,
+        ttl_seconds: int = 0,
+    ) -> MemoryEntry:
+        """Insert or replace. Returns the stored entry."""
+        import asyncpg  # noqa: PLC0415 — optional at module level
+
+        entry = MemoryEntry(
+            agent=agent,
+            key=key,
+            value=value,
+            created_at=_now_iso(),
+            ttl_seconds=ttl_seconds,
+        )
+        conn = await asyncpg.connect(self._dsn)
+        try:
+            await self._ensure_schema(conn)
+            await conn.execute(
+                "INSERT INTO agent_memory (agent, key, value_json, created_at, ttl_seconds) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (agent, key) DO UPDATE SET "
+                "value_json = EXCLUDED.value_json, "
+                "created_at = EXCLUDED.created_at, "
+                "ttl_seconds = EXCLUDED.ttl_seconds",
+                agent,
+                key,
+                json.dumps(value, ensure_ascii=False),
+                entry.created_at,
+                ttl_seconds,
+            )
+        finally:
+            await conn.close()
+        return entry
+
+    async def delete(self, agent: str, key: str) -> bool:
+        """Delete one entry. Returns ``True`` if a row was removed."""
+        import asyncpg  # noqa: PLC0415 — optional at module level
+
+        conn = await asyncpg.connect(self._dsn)
+        try:
+            await self._ensure_schema(conn)
+            result = await conn.execute(
+                "DELETE FROM agent_memory WHERE agent = $1 AND key = $2",
+                agent,
+                key,
+            )
+        finally:
+            await conn.close()
+        # asyncpg returns a tag string like "DELETE 1" or "DELETE 0"
+        return bool(str(result).endswith(" 1"))
+
+    async def evict_older_than(self, agent: str, before_iso: str) -> int:
+        """Delete entries whose created_at < ``before_iso``. Returns count."""
+        import asyncpg  # noqa: PLC0415 — optional at module level
+
+        conn = await asyncpg.connect(self._dsn)
+        try:
+            await self._ensure_schema(conn)
+            result = await conn.execute(
+                "DELETE FROM agent_memory WHERE agent = $1 AND created_at < $2",
+                agent,
+                before_iso,
+            )
+        finally:
+            await conn.close()
+        # asyncpg returns a tag string like "DELETE 3"; parse the count.
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except (ValueError, AttributeError):
+            return 0
+
+
+def _pg_row_to_entry(row: Any) -> MemoryEntry:
+    """Convert an ``asyncpg.Record`` to a :class:`MemoryEntry`."""
+    try:
+        value = json.loads(row["value_json"])
+    except (TypeError, ValueError):
+        value = {}
+    return MemoryEntry(
+        agent=row["agent"],
+        key=row["key"],
+        value=value if isinstance(value, dict) else {},
+        created_at=row["created_at"],
+        ttl_seconds=int(row["ttl_seconds"]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Backend selection
 # ---------------------------------------------------------------------------
 
@@ -404,16 +587,23 @@ def build_memory_store() -> MemoryStore:
     """Auto-select a backend based on ``MOVATE_MEMORY_BACKEND`` env var.
 
     Values:
-      * ``memory`` (default) — :class:`InMemoryStore`
-      * ``sqlite``           — :class:`SqliteStore`
+      * ``memory``   (default) — :class:`InMemoryStore`
+      * ``sqlite``             — :class:`SqliteStore`
+      * ``postgres``           — :class:`PostgresStore`
 
     Future:
-      * ``postgres`` — multi-worker production backend
-      * ``vector``   — semantic recall via pgvector / Azure AI Search
+      * ``vector`` — semantic recall via pgvector / Azure AI Search
     """
     backend = os.environ.get("MOVATE_MEMORY_BACKEND", "memory").lower()
     if backend == "sqlite":
         return SqliteStore()
+    if backend == "postgres":
+        dsn = os.environ.get("MOVATE_PG_URL", "")
+        if not dsn:
+            raise RuntimeError(
+                "MOVATE_PG_URL must be set to use MOVATE_MEMORY_BACKEND=postgres"
+            )
+        return PostgresStore(dsn=dsn)
     # Default = in-memory + JSON-file persistence so CLI invocations
     # see each other's writes. Honors MOVATE_MEMORY_FILE for tests +
     # operators who want a non-default location.
