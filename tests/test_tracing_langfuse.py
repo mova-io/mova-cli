@@ -24,7 +24,12 @@ from movate.tracing.langfuse import (
 
 
 class _FakeHandle:
-    """Stand-in for either a Langfuse trace or span. Records calls in lists."""
+    """Stand-in for a Langfuse v2 trace ROOT (StatefulTraceClient).
+
+    Deliberately has NO ``end()`` — matching the real v2 SDK, where the
+    trace root is finalized via ``update()`` and flushed at shutdown.
+    Only child spans (:class:`_FakeSpan`) expose ``end()``.
+    """
 
     def __init__(self, kind: str, name: str, metadata: dict[str, Any]) -> None:
         self.kind = kind
@@ -36,8 +41,8 @@ class _FakeHandle:
         self.children: list[_FakeHandle] = []
         self.ended_with: dict[str, Any] | None = None
 
-    def span(self, *, name: str, metadata: dict[str, Any]) -> _FakeHandle:
-        child = _FakeHandle("span", name, metadata)
+    def span(self, *, name: str, metadata: dict[str, Any]) -> _FakeSpan:
+        child = _FakeSpan("span", name, metadata)
         self.children.append(child)
         return child
 
@@ -46,6 +51,10 @@ class _FakeHandle:
 
     def update(self, *, metadata: dict[str, Any]) -> None:
         self.updates.append(dict(metadata))
+
+
+class _FakeSpan(_FakeHandle):
+    """Child span (StatefulSpanClient) — adds ``end()`` like the real SDK."""
 
     def end(self, **kwargs: Any) -> None:
         self.ended_with = dict(kwargs)
@@ -178,16 +187,47 @@ def test_langfuse_tracer_log_event_and_set_attribute() -> None:
 
 
 @pytest.mark.unit
-def test_langfuse_tracer_end_span_closes_handle_and_pops_lookup() -> None:
+def test_langfuse_tracer_end_span_closes_trace_root_via_update() -> None:
+    """The trace ROOT has no ``end()`` in Langfuse v2; ``end_span`` must
+    finalize it via ``update()`` (recording terminal status) rather than
+    calling a non-existent ``end()`` — which previously raised
+    ``AttributeError: 'StatefulTraceClient' object has no attribute 'end'``
+    and aborted the run."""
     fake = _FakeClient()
     t = LangfuseTracer(client=fake)
     ctx = t.start_span("agent.execute")
     t.end_span(ctx, status="ok")
 
-    assert fake.traces[0].ended_with == {"metadata": {"status": "ok"}}
+    root = fake.traces[0]
+    assert root.ended_with is None  # never tried to .end() the root
+    assert {"status": "ok"} in root.updates
     # Calls after end are no-ops (no AttributeError, no second event).
     t.log_event(ctx, {"too": "late"})
-    assert len(fake.traces[0].events) == 0
+    assert len(root.events) == 0
+
+
+@pytest.mark.unit
+def test_langfuse_tracer_end_span_closes_child_via_end() -> None:
+    """A child span (StatefulSpanClient) DOES have ``end()`` — use it."""
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    parent = t.start_span("agent.execute")
+    child = t.start_span("tool.call", parent=parent)
+    t.end_span(child, status="ok")
+
+    child_handle = fake.traces[0].children[0]
+    assert child_handle.ended_with == {"metadata": {"status": "ok"}}
+
+
+@pytest.mark.unit
+def test_langfuse_tracer_end_span_never_raises_on_v2_trace_root() -> None:
+    """Regression for the reported failure: ending a trace-root handle
+    that lacks ``end()`` must not raise (tracing never breaks a run)."""
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    ctx = t.start_span("eval.generate")
+    # Would raise AttributeError before the capability-routing fix.
+    t.end_span(ctx, status="ok")
 
 
 @pytest.mark.unit
