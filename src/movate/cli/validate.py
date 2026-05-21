@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 if TYPE_CHECKING:
@@ -554,18 +555,22 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     if lint_issues:
         _render_lint_issues(lint_issues)
 
-    console.print(f"[green]✓[/green] {spec.name} [dim]v{spec.version}[/dim] [dim](agent)[/dim]")
-    console.print(f"  api_version: {spec.api_version}")
-    console.print(f"  runtime:     {spec.runtime.value}")
-    console.print(f"  provider:    {spec.model.provider}")
-    console.print(f"  prompt:      {bundle.prompt_hash[:12]}…")
+    # ── Success banner ──────────────────────────────────────────────────────
+    # Collect the metadata lines first so the Panel body is built before
+    # we call console.print() — keeps the output as a single atomic render.
+    _detail_lines: list[str] = [
+        f"api_version: {spec.api_version}",
+        f"runtime:     {spec.runtime.value}",
+        f"provider:    {spec.model.provider}",
+        f"prompt:      {bundle.prompt_hash[:12]}…",
+    ]
     if spec.model.fallback:
         fbs = ", ".join(f.provider for f in spec.model.fallback)
-        console.print(f"  fallback:    {fbs}")
+        _detail_lines.append(f"fallback:    {fbs}")
     if not policy.is_permissive():
-        console.print("  [dim]policy:      ✓ compliant[/dim]")
+        _detail_lines.append("[dim]policy:      ✓ compliant[/dim]")
     if run_linter and not lint_issues:
-        console.print("  [dim]lint:        ✓ clean[/dim]")
+        _detail_lines.append("[dim]lint:        ✓ clean[/dim]")
 
     # Cost forecast — silent when no dataset / no pricing for model /
     # empty dataset. The estimate_eval_cost helper returns None in
@@ -577,8 +582,8 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
         pricing = None
         forecast = None
     if forecast is not None:
-        console.print(
-            f"  [dim]eval cost:   ~${forecast.total_cost_usd:.4f} "
+        _detail_lines.append(
+            f"[dim]eval cost:   ~${forecast.total_cost_usd:.4f} "
             f"({forecast.cases} cases x "
             f"~{forecast.input_tokens_per_call} in + "
             f"~{forecast.output_tokens_per_call} out tokens)[/dim]"
@@ -589,11 +594,23 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
         # Let the operator know rather than staying silent.
         model_provider = bundle.spec.model.provider
         if model_provider not in pricing.models:
-            console.print(
-                f"  [yellow]![/yellow] eval cost: no pricing entry for "
+            _detail_lines.append(
+                f"[yellow]![/yellow] eval cost: no pricing entry for "
                 f"[bold]{model_provider!r}[/bold] — add it to "
                 "providers/pricing.yaml for a forecast."
             )
+
+    console.print(
+        Panel(
+            "\n".join(_detail_lines),
+            title=(
+                f"[green]✓[/green] {spec.name} "
+                f"[dim]v{spec.version}[/dim] [dim](agent)[/dim]"
+            ),
+            title_align="left",
+            border_style="green",
+        )
+    )
 
     # Exit non-zero if there are real errors (always) or warnings
     # under --strict (CI gate mode).
