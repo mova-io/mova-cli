@@ -22,7 +22,12 @@ from movate.core.failures import (
 )
 from movate.core.failures import RateLimitError as MovateRateLimitError
 from movate.providers.base import CompletionRequest, Message
-from movate.providers.openai_native import OpenAIProvider
+from movate.providers.openai_native import (
+    OpenAIProvider,
+    _stream_chunk_from_openai,
+    _tokens_from_usage,
+    _translate_exception,
+)
 
 # ---------------------------------------------------------------------------
 # Fakes that mimic the openai SDK surface
@@ -627,6 +632,143 @@ async def test_complete_passes_through_openai_style_tool_history() -> None:
     assert sent[1]["tool_calls"][0]["id"] == "call_42"
     assert sent[2]["role"] == "tool"
     assert sent[2]["tool_call_id"] == "call_42"
+
+
+# ---------------------------------------------------------------------------
+# _translate_exception — direct unit tests (including unmapped paths)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_translate_exception_direct_auth() -> None:
+    """AuthenticationError → AuthError (direct call, not via complete)."""
+    AuthenticationError = type("AuthenticationError", (Exception,), {})
+    with pytest.raises(AuthError):
+        _translate_exception(AuthenticationError("bad key"))
+
+
+@pytest.mark.unit
+def test_translate_exception_direct_permission_denied_is_auth_error() -> None:
+    """PermissionDeniedError → AuthError."""
+    PermissionDeniedError = type("PermissionDeniedError", (Exception,), {})
+    with pytest.raises(AuthError):
+        _translate_exception(PermissionDeniedError("denied"))
+
+
+@pytest.mark.unit
+def test_translate_exception_direct_internal_server_is_model_unavailable() -> None:
+    """InternalServerError → ModelUnavailableError."""
+    InternalServerError = type("InternalServerError", (Exception,), {})
+    with pytest.raises(ModelUnavailableError):
+        _translate_exception(InternalServerError("500"))
+
+
+@pytest.mark.unit
+def test_translate_exception_direct_not_found_is_model_unavailable() -> None:
+    """NotFoundError → ModelUnavailableError."""
+    NotFoundError = type("NotFoundError", (Exception,), {})
+    with pytest.raises(ModelUnavailableError):
+        _translate_exception(NotFoundError("not found"))
+
+
+@pytest.mark.unit
+def test_translate_exception_unknown_class_is_model_unavailable_with_prefix() -> None:
+    """Unknown exception class → ModelUnavailableError with 'unmapped openai.' prefix."""
+    SomeWeirdError = type("SomeWeirdError", (Exception,), {})
+    with pytest.raises(ModelUnavailableError, match="unmapped openai.SomeWeirdError"):
+        _translate_exception(SomeWeirdError("oops"))
+
+
+@pytest.mark.unit
+def test_translate_exception_bad_request_context_window_variant() -> None:
+    """BadRequestError with 'context window' text → ContextLengthError."""
+    BadRequestError = type("BadRequestError", (Exception,), {})
+    with pytest.raises(ContextLengthError):
+        _translate_exception(BadRequestError("context window exceeded"))
+
+
+# ---------------------------------------------------------------------------
+# _stream_chunk_from_openai — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_openai_mid_stream_text() -> None:
+    """Mid-stream chunk with text → StreamChunk(text=..., tokens=None)."""
+    chunk = _stream_chunk_from_openai(
+        _FakeChatChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(content="hello"))])
+    )
+    assert chunk is not None
+    assert chunk.text == "hello"
+    assert chunk.tokens is None
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_openai_final_usage_chunk() -> None:
+    """Final chunk with usage and no text → StreamChunk(text='', tokens=...)."""
+    chunk = _stream_chunk_from_openai(
+        _FakeChatChunk(usage=_FakeUsage(prompt_tokens=10, completion_tokens=4))
+    )
+    assert chunk is not None
+    assert chunk.text == ""
+    assert chunk.tokens is not None
+    assert chunk.tokens.input == 10
+    assert chunk.tokens.output == 4
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_openai_empty_chunk_returns_none() -> None:
+    """Chunk with no text and no usage → None (filtered out by iterator)."""
+    chunk = _stream_chunk_from_openai(_FakeChatChunk())
+    assert chunk is None
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_openai_empty_delta_content_no_usage_returns_none() -> None:
+    """Chunk where delta.content is '' and no usage → None."""
+    chunk = _stream_chunk_from_openai(
+        _FakeChatChunk(choices=[_FakeStreamChoice(delta=_FakeDelta(content=""))])
+    )
+    assert chunk is None
+
+
+# ---------------------------------------------------------------------------
+# _tokens_from_usage — direct unit tests (OpenAI)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_tokens_from_usage_none_returns_empty() -> None:
+    """None usage → empty TokenUsage."""
+    tokens = _tokens_from_usage(None)
+    assert tokens.input == 0
+    assert tokens.output == 0
+    assert tokens.cached_input == 0
+
+
+@pytest.mark.unit
+def test_tokens_from_usage_maps_all_fields() -> None:
+    """prompt_tokens, completion_tokens, and cached_tokens all map correctly."""
+    tokens = _tokens_from_usage(
+        _FakeUsage(
+            prompt_tokens=100,
+            completion_tokens=25,
+            prompt_tokens_details=_FakePromptDetails(cached_tokens=60),
+        )
+    )
+    assert tokens.input == 100
+    assert tokens.output == 25
+    assert tokens.cached_input == 60
+
+
+@pytest.mark.unit
+def test_tokens_from_usage_no_cached_tokens_details() -> None:
+    """Usage with no prompt_tokens_details → cached_input=0."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    usage = SimpleNamespace(prompt_tokens=5, completion_tokens=2, prompt_tokens_details=None)
+    tokens = _tokens_from_usage(usage)
+    assert tokens.cached_input == 0
 
 
 # ---------------------------------------------------------------------------

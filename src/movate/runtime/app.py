@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse
 import movate
 from movate.core.auth import mint_api_key
 from movate.core.loader import AgentBundle
-from movate.core.models import ApiKeyEnv, JobKind, JobRecord, JobStatus
+from movate.core.models import ApiKeyEnv, EvalRecord, JobKind, JobRecord, JobStatus
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.runtime.agent_creation import (
     AgentCreationError,
@@ -310,31 +310,26 @@ def _render_agent_validation(bundle: AgentBundle) -> AgentValidationView:
     )
 
 
-def _eval_record_to_view(record: object) -> EvalScorecardView:
+def _eval_record_to_view(record: EvalRecord) -> EvalScorecardView:
     """Map an :class:`EvalRecord` to the wire view. Pulled out so
     the kickoff endpoint, retrieval endpoint, and list endpoint all
     use the same field-mapping logic.
-
-    Takes ``object`` (not a typed EvalRecord) to keep this module's
-    import footprint small — eval module is imported lazily at
-    request time. mypy-strict elsewhere validates the actual call
-    site via attribute access.
     """
     return EvalScorecardView(
-        eval_id=record.eval_id,  # type: ignore[attr-defined]
-        agent=record.agent,  # type: ignore[attr-defined]
-        agent_version=record.agent_version,  # type: ignore[attr-defined]
-        dataset_hash=record.dataset_hash,  # type: ignore[attr-defined]
-        judge_method=record.judge_method.value,  # type: ignore[attr-defined]
-        judge_provider=record.judge_provider,  # type: ignore[attr-defined]
-        runs_per_case=record.runs_per_case,  # type: ignore[attr-defined]
-        gate_mode=record.gate_mode,  # type: ignore[attr-defined]
-        threshold=record.threshold,  # type: ignore[attr-defined]
-        mean_score=record.mean_score,  # type: ignore[attr-defined]
-        pass_rate=record.pass_rate,  # type: ignore[attr-defined]
-        sample_count=record.sample_count,  # type: ignore[attr-defined]
-        total_cost_usd=record.total_cost_usd,  # type: ignore[attr-defined]
-        created_at=record.created_at.isoformat(),  # type: ignore[attr-defined]
+        eval_id=record.eval_id,
+        agent=record.agent,
+        agent_version=record.agent_version,
+        dataset_hash=record.dataset_hash,
+        judge_method=record.judge_method.value,
+        judge_provider=record.judge_provider,
+        runs_per_case=record.runs_per_case,
+        gate_mode=record.gate_mode,
+        threshold=record.threshold,
+        mean_score=record.mean_score,
+        pass_rate=record.pass_rate,
+        sample_count=record.sample_count,
+        total_cost_usd=record.total_cost_usd,
+        created_at=record.created_at.isoformat(),
     )
 
 
@@ -2035,6 +2030,7 @@ def build_app(
             # Lazy imports keep cold-start light for the async path.
             from movate.core.executor import Executor  # noqa: PLC0415
             from movate.core.models import RunRequest as _RunRequest  # noqa: PLC0415
+            from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
             from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
             from movate.providers.mock import MockProvider  # noqa: PLC0415
             from movate.providers.pricing import load_pricing  # noqa: PLC0415
@@ -2043,10 +2039,10 @@ def build_app(
             # mock=true → deterministic MockProvider (sub-second, no
             # API keys). Default uses the agent's declared model via
             # LiteLLM. Same pattern the eval endpoint uses.
-            provider: object = MockProvider() if body.mock else LiteLLMProvider()
+            provider: BaseLLMProvider = MockProvider() if body.mock else LiteLLMProvider()
 
             executor = Executor(
-                provider=provider,  # type: ignore[arg-type]
+                provider=provider,
                 pricing=load_pricing(),
                 storage=store,
                 tracer=build_tracer(),
@@ -2280,14 +2276,15 @@ def build_app(
         # ── Sync path (wait=true) ─────────────────────────────────────────
         from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
         from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
         from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
         from movate.providers.mock import MockProvider  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
         from movate.tracing import build_tracer  # noqa: PLC0415
 
-        provider: object = MockProvider() if body.mock else LiteLLMProvider()
+        provider: BaseLLMProvider = MockProvider() if body.mock else LiteLLMProvider()
         executor = Executor(
-            provider=provider,  # type: ignore[arg-type]
+            provider=provider,
             pricing=load_pricing(),
             storage=store,
             tracer=build_tracer(),
@@ -2297,7 +2294,7 @@ def build_app(
         try:
             engine = EvalEngine(
                 executor=executor,
-                provider=provider,  # type: ignore[arg-type]
+                provider=provider,
                 runs_per_case=body.runs,
                 gate_mode=body.gate_mode,
                 objective_filter=body.objective,
