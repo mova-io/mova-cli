@@ -19,17 +19,16 @@ schema migration, and vice versa.
 
 from __future__ import annotations
 
-# ``AuthContext`` is lightweight (no FastAPI dep) — import eagerly so
-# handlers can do ``from movate.runtime import AuthContext``.
-from movate.runtime.middleware import AuthContext
-
-# ``build_app`` is NOT imported eagerly — it pulls in FastAPI which is
-# an optional [runtime] dep. Any code that actually needs build_app
-# (i.e. ``mdk serve``) imports it directly from ``movate.runtime.app``.
-# Lazy __getattr__ preserves the public API for callers that do
-# ``from movate.runtime import build_app`` without forcing the import
-# at package-load time (which would break non-serve commands like
-# ``mdk kb ingest`` when the [runtime] extra isn't installed).
+# Both ``build_app`` and ``AuthContext`` live in modules that import
+# FastAPI, which is an optional [runtime] dep. Eagerly importing them
+# here would crash every non-serve mdk command (kb ingest, eval, run,
+# …) when FastAPI isn't installed — e.g. in a plain uv tool install
+# that only includes core deps.
+#
+# Solution: __getattr__ defers the import until the name is actually
+# accessed, so ``import movate.runtime`` (triggered by any
+# ``from movate.runtime.schemas import …`` in the codebase) no longer
+# pulls in FastAPI transitively.
 
 __all__ = ["AuthContext", "build_app"]
 
@@ -38,4 +37,7 @@ def __getattr__(name: str) -> object:
     if name == "build_app":
         from movate.runtime.app import build_app  # noqa: PLC0415
         return build_app
+    if name == "AuthContext":
+        from movate.runtime.middleware import AuthContext  # noqa: PLC0415
+        return AuthContext
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
