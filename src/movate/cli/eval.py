@@ -1304,12 +1304,130 @@ def _render_cases_preview_table(entries: list[dict[str, Any]], mix: str) -> None
     table.add_column("Expected", overflow="fold", max_width=55)
 
     for i, entry in enumerate(entries, start=1):
-        input_str = _format_for_preview_cell(entry.get("input"))
-        expected_str = _format_for_preview_cell(entry.get("expected"))
+        if _looks_like_rag_case(entry):
+            # RAG cases (question + context chunks, citations indexing
+            # back into context) get a source-resolved rendering: the
+            # numeric citations become the actual cited passages so the
+            # operator sees WHERE each expected answer is grounded.
+            context = entry["input"]["context"]
+            input_str = _format_rag_input_cell(entry["input"], context=context)
+            expected_str = _format_rag_expected_cell(entry.get("expected") or {}, context=context)
+        else:
+            input_str = _format_for_preview_cell(entry.get("input"))
+            expected_str = _format_for_preview_cell(entry.get("expected"))
         table.add_row(str(i), input_str, expected_str)
 
     console.print()
     console.print(table)
+
+
+# Snippet budgets for the RAG-aware preview cells. Tuned so each line
+# roughly fits the preview columns (Input max_width=60, Expected
+# max_width=55) without Rich folding mid-passage too aggressively. The
+# question is shown in full — operators asked to read the whole prompt.
+_RAG_CONTEXT_SNIPPET_CHARS = 54
+_RAG_CITATION_SNIPPET_CHARS = 48
+_RAG_ANSWER_SNIPPET_CHARS = 180
+
+
+def _looks_like_rag_case(entry: dict[str, Any]) -> bool:
+    """Detect the canonical RAG-QA case shape.
+
+    True when ``input`` carries a non-empty ``question`` string plus a
+    ``context`` list of strings, and ``expected`` carries an ``answer``
+    string plus a ``citations`` list. This is the only schema where the
+    numeric ``citations`` index back into ``context`` (see the rag_qa
+    template's output schema), so it's the only one where resolving
+    citations → source passages is meaningful. Every other agent falls
+    through to the generic ``_format_for_preview_cell`` renderer.
+    """
+    inp = entry.get("input")
+    exp = entry.get("expected")
+    if not isinstance(inp, dict) or not isinstance(exp, dict):
+        return False
+    question = inp.get("question")
+    context = inp.get("context")
+    if not isinstance(question, str) or not question.strip():
+        return False
+    if not isinstance(context, list) or not context:
+        return False
+    if not all(isinstance(c, str) for c in context):
+        return False
+    if not isinstance(exp.get("answer"), str):
+        return False
+    return isinstance(exp.get("citations"), list)
+
+
+def _rag_snippet(text: str, max_chars: int) -> str:
+    """Collapse whitespace and truncate ``text`` to ``max_chars`` with an
+    ellipsis. Used for the per-passage source snippets in RAG previews."""
+    flat = " ".join(text.split())
+    if len(flat) > max_chars:
+        return flat[: max_chars - 1] + "…"
+    return flat
+
+
+def _format_rag_input_cell(inp: dict[str, Any], *, context: list[str]) -> str:
+    """Render a RAG case's Input cell: the full question plus a numbered
+    list of context passages so the citation markers in the Expected
+    cell line up with a visible source."""
+    from rich.markup import escape  # noqa: PLC0415
+
+    lines: list[str] = []
+    question = str(inp.get("question", "")).strip()
+    if question:
+        lines.append("[bold]Question[/bold]")
+        lines.append(escape(question))
+    n = len(context)
+    lines.append(f"[cyan]Context[/cyan] [dim]({n} source passage{'s' if n != 1 else ''})[/dim]")
+    for idx, passage in enumerate(context, start=1):
+        marker = escape(f"[{idx}]")
+        snippet = escape(_rag_snippet(str(passage), _RAG_CONTEXT_SNIPPET_CHARS))
+        lines.append(f"[dim]{marker}[/dim] {snippet}")
+    return "\n".join(lines)
+
+
+def _format_rag_expected_cell(exp: dict[str, Any], *, context: list[str]) -> str:
+    """Render a RAG case's Expected cell with citations resolved to the
+    actual cited passages plus human-friendly grounded/confidence lines.
+
+    ``citations`` are 1-indexed into ``context``; each is resolved to a
+    short snippet of the passage it points at. Out-of-range indices
+    (LLM hallucinations) are flagged rather than silently dropped."""
+    from rich.markup import escape  # noqa: PLC0415
+
+    lines: list[str] = []
+    answer = exp.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        lines.append("[bold]Answer[/bold]")
+        lines.append(escape(_rag_snippet(answer.strip(), _RAG_ANSWER_SNIPPET_CHARS)))
+
+    citations = exp.get("citations")
+    grounded = exp.get("grounded")
+    cite_ints = [c for c in citations if isinstance(c, int)] if isinstance(citations, list) else []
+    if cite_ints:
+        markers = " ".join(f"[dim]{escape(f'[{c}]')}[/dim]" for c in cite_ints)
+        lines.append(f"[green]Cited sources[/green] → {markers}")
+        for c in cite_ints:
+            marker = escape(f"[{c}]")
+            if 1 <= c <= len(context):
+                snippet = escape(_rag_snippet(str(context[c - 1]), _RAG_CITATION_SNIPPET_CHARS))
+                lines.append(f"  [dim]{marker}[/dim] {snippet}")
+            else:
+                lines.append(f"  [dim]{marker}[/dim] [red](no such passage)[/red]")
+    elif grounded is False:
+        lines.append("[yellow]No citations[/yellow] [dim](not grounded)[/dim]")
+
+    meta: list[str] = []
+    if isinstance(grounded, bool):
+        meta.append("[green]Grounded ✓[/green]" if grounded else "[red]Not grounded ✗[/red]")
+    confidence = exp.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        meta.append(f"[yellow]Confidence {round(confidence * 100)}%[/yellow]")
+    if meta:
+        lines.append("  ".join(meta))
+
+    return "\n".join(lines)
 
 
 def _format_for_preview_cell(value: Any, *, max_lines: int = 6, max_value_chars: int = 60) -> str:

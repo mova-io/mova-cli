@@ -698,10 +698,11 @@ def test_post_deploy_block_curl_includes_content_type_and_api_key_headers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every curl must surface the two required headers — content-type
-    (so the runtime parses the body as JSON) and x-api-key (so the
-    bearer auth passes). The api-key value renders as a shell
-    expansion of the target's key_env so the operator's shell pulls
-    the actual key at curl-time."""
+    (so the runtime parses the body as JSON) and Authorization: Bearer
+    (so auth passes). The bearer renders as a shell expression that
+    prefers an exported $key_env but falls back to reading the token
+    from the credentials file, so the curl works in a fresh shell that
+    never sourced ~/.movate/credentials."""
     (tmp_path / "agents" / "alpha").mkdir(parents=True)
 
     out = _capture_post_deploy_block(
@@ -713,7 +714,47 @@ def test_post_deploy_block_curl_includes_content_type_and_api_key_headers(
     )
 
     assert "content-type: application/json" in out
-    assert '"x-api-key: $MDK_PROD_KEY"' in out
+    # Bearer falls back to grepping the credentials file when the env
+    # var is unset. Assert the structural prefix + suffix so the test
+    # doesn't depend on the developer's home path in the middle.
+    assert "Authorization: Bearer ${MDK_PROD_KEY:-$(grep -m1 '^MDK_PROD_KEY=' " in out
+    assert "| cut -d= -f2-)}" in out
+    # Regression: the bare `$MDK_PROD_KEY` form (empty in a fresh shell
+    # → auth_required) must NOT be what we emit.
+    assert '"Authorization: Bearer $MDK_PROD_KEY"' not in out
+
+
+@pytest.mark.unit
+def test_bearer_shell_expr_default_path_renders_tilde(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the default credentials location the expression greps
+    ``~/.movate/credentials`` (so the shell expands ``~`` to the
+    operator's home), prefers an exported env var, and never embeds
+    the literal token."""
+    monkeypatch.delenv("MOVATE_CREDENTIALS_PATH", raising=False)
+
+    expr = deploy_mod._bearer_shell_expr("MDK_DEV_KEY")
+
+    assert expr == (
+        "${MDK_DEV_KEY:-$(grep -m1 '^MDK_DEV_KEY=' ~/.movate/credentials | cut -d= -f2-)}"
+    )
+
+
+@pytest.mark.unit
+def test_bearer_shell_expr_honors_credentials_path_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When MOVATE_CREDENTIALS_PATH points outside $HOME the expression
+    greps that absolute path (the curl must read the same file the
+    deploy wrote to, not a hardcoded ~/.movate/credentials)."""
+    creds = tmp_path / "creds"
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(creds))
+
+    expr = deploy_mod._bearer_shell_expr("MDK_STAGING_KEY")
+
+    assert f"grep -m1 '^MDK_STAGING_KEY=' {creds.resolve()} " in expr
+    assert expr.startswith("${MDK_STAGING_KEY:-$(")
 
 
 @pytest.mark.unit
@@ -1001,7 +1042,7 @@ def test_post_deploy_block_renders_on_successful_e2e_deploy(
     assert "Next: run inference against the deployed runtime" in combined
     # curl with the target's base_url + key_env both surfaced.
     assert "curl -sS -X POST https://fake.example.com/run" in combined
-    assert '"x-api-key: $FAKE_KEY"' in combined
+    assert "Authorization: Bearer ${FAKE_KEY:-$(grep -m1 '^FAKE_KEY=' " in combined
     assert '"agent": "faq"' in combined
     # The old mdk-submit / mdk-jobs lines must NOT appear.
     assert "mdk submit" not in combined
