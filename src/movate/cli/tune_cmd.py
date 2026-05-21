@@ -173,6 +173,7 @@ async def _run_sweep(
     runs: int,
     mock: bool,
     persist: bool,
+    on_progress: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Run the sweep. Returns one dict per (value, sample) pair.
 
@@ -181,6 +182,7 @@ async def _run_sweep(
     "don't persist" hook in the executor today. The flag is reserved
     for a future ``--no-persist`` once the executor exposes that.
     """
+    total_calls = len(values) * runs
     rt = await build_local_runtime(mock=mock)
     results: list[dict[str, Any]] = []
     try:
@@ -204,6 +206,8 @@ async def _run_sweep(
                         "run_id": response.run_id,
                     }
                 )
+                if on_progress is not None:
+                    on_progress(len(results), total_calls)
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
     # Suppress unused-arg lint on persist — it's reserved for the future.
@@ -386,17 +390,60 @@ def tune(
         err_console.print(f"[red]✗[/red] --runs must be ≥ 1; got {runs}")
         raise typer.Exit(code=2)
 
-    results = asyncio.run(
-        _run_sweep(
-            bundle,
-            payload,
-            key=key,
-            values=values,
-            runs=runs,
-            mock=mock,
-            persist=persist,
-        )
+    # Upfront sweep-space preview so the operator knows what's coming.
+    total_calls = len(values) * runs
+    err_console.print(
+        f"[dim]Sweep: [bold]{key}[/bold] across {len(values)} value(s) x {runs} run(s) "
+        f"= [bold]{total_calls}[/bold] LLM call{'s' if total_calls != 1 else ''}."
+        + (" [yellow]Use --mock for a free offline run.[/yellow]" if not mock else "")
+        + "[/dim]"
     )
+
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn  # noqa: PLC0415
+
+    total_calls = len(values) * runs
+    _show_bar = sys.stderr.isatty() and not mock
+    if _show_bar:
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as _prog:
+            _sweep_task = _prog.add_task(
+                f"Sweeping [bold]{key}[/bold]",
+                total=total_calls,
+            )
+
+            def _on_progress(cur: int, _tot: int) -> None:
+                _prog.update(_sweep_task, completed=cur)
+
+            results = asyncio.run(
+                _run_sweep(
+                    bundle,
+                    payload,
+                    key=key,
+                    values=values,
+                    runs=runs,
+                    mock=mock,
+                    persist=persist,
+                    on_progress=_on_progress,
+                )
+            )
+    else:
+        results = asyncio.run(
+            _run_sweep(
+                bundle,
+                payload,
+                key=key,
+                values=values,
+                runs=runs,
+                mock=mock,
+                persist=persist,
+            )
+        )
 
     if json_output:
         # Per-sample raw results — easiest to pipe to jq / pandas.
