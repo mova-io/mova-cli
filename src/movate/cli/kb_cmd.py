@@ -134,6 +134,35 @@ def ingest(
             "sizes + counts before paying for embeddings."
         ),
     ),
+    clean_source: bool = typer.Option(
+        False,
+        "--clean-source",
+        help=(
+            "Delete all existing chunks for each source file before re-ingesting. "
+            "Use when updating a document — ensures stale paragraphs don't persist "
+            "alongside the new content. Without this flag, dedup on content_hash "
+            "means deleted paragraphs remain in the KB."
+        ),
+    ),
+    ocr_lang: str = typer.Option(
+        "",
+        "--ocr-lang",
+        help=(
+            "Tesseract language code(s) for scanned PDFs / images. "
+            "Accepts Tesseract 3-letter codes; use '+' for multi-language "
+            "(e.g. 'eng+fra'). Defaults to 'eng'. Sets MOVATE_OCR_LANG for "
+            "this invocation only."
+        ),
+    ),
+    ocr_backend: str = typer.Option(
+        "",
+        "--ocr-backend",
+        help=(
+            "OCR engine: 'tesseract' (default, needs pytesseract + Tesseract binary) "
+            "or 'easyocr' (pure-Python, better on noisy scans, larger install). "
+            "Sets MOVATE_OCR_BACKEND for this invocation only."
+        ),
+    ),
 ) -> None:
     """Ingest a knowledge-base file or directory into ``agent``'s KB.
 
@@ -144,8 +173,20 @@ def ingest(
     Use ``--model`` to select a non-default embedding provider, e.g.
     ``--model cohere/embed-english-v3.0``. The model used at ingest
     MUST match the model used at search time.
+
+    Use ``--clean-source`` when updating an existing document to remove
+    stale chunks before writing new ones.
+
+    Use ``--ocr-lang`` / ``--ocr-backend`` for non-English or noisy scans.
     """
     import os  # noqa: PLC0415
+
+    # --ocr-lang / --ocr-backend set env vars for this process only so
+    # the parsers module picks them up without changing its signature.
+    if ocr_lang:
+        os.environ["MOVATE_OCR_LANG"] = ocr_lang
+    if ocr_backend:
+        os.environ["MOVATE_OCR_BACKEND"] = ocr_backend
 
     # --dry-run skips the API key check (no embedding calls).
     api_key = os.environ.get(api_key_env, "").strip()
@@ -171,6 +212,10 @@ def ingest(
         storage = await _build_storage()
         try:
             console.print(f"[bold cyan]Ingesting[/bold cyan] {path} -> agent [bold]{agent}[/bold]…")
+            if clean_source:
+                console.print(
+                    "[dim]--clean-source: deleting existing chunks before re-ingest[/dim]"
+                )
             summaries = await ingest_path(
                 storage=storage,
                 path=path,
@@ -178,6 +223,7 @@ def ingest(
                 tenant_id=tenant_id,
                 embedding_model=model,
                 api_key=api_key,
+                clean_source=clean_source,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
@@ -189,12 +235,19 @@ def ingest(
             return
 
         # Render a summary table — one row per source.
+        show_removed = clean_source and any(s.chunks_removed > 0 for s in summaries)
         table = Table(title=f"[bold]Ingest summary[/bold] — agent [bold]{agent}[/bold]")
         table.add_column("source", overflow="fold")
+        if show_removed:
+            table.add_column("removed", justify="right")
         table.add_column("chunks", justify="right")
         table.add_column("embedding model")
         for s in summaries:
-            table.add_row(s.source, str(s.chunks_saved), s.embedding_model)
+            row = [s.source]
+            if show_removed:
+                row.append(str(s.chunks_removed))
+            row.extend([str(s.chunks_saved), s.embedding_model])
+            table.add_row(*row)
         console.print(table)
         total = sum(s.chunks_saved for s in summaries)
         console.print(f"[green]✓[/green] {total} chunks saved across {len(summaries)} file(s).")

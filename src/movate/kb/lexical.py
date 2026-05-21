@@ -36,6 +36,7 @@ Implementation choices (v0.9 MVP):
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -46,8 +47,11 @@ from movate.core.models import KbChunk, KbChunkWithScore
 # how quickly term saturation kicks in (higher = each repeat of a term
 # matters more); ``b`` is the length normalization weight (higher =
 # shorter docs win, 0 = no length norm).
-_BM25_K1 = 1.5
-_BM25_B = 0.75
+# Override via env vars: MOVATE_BM25_K1 / MOVATE_BM25_B.
+# Tuning guidance: corpora with short repeated tokens (error codes, SKUs)
+# benefit from higher k1 (e.g. 2.0); uniform-length corpora can drop b to 0.5.
+_BM25_K1: float = float(os.environ.get("MOVATE_BM25_K1", "1.5"))
+_BM25_B: float = float(os.environ.get("MOVATE_BM25_B", "0.75"))
 
 # Stopwords to drop before scoring. Tiny English set — only the most
 # damaging ones (function words that appear in almost every chunk).
@@ -236,7 +240,8 @@ def bm25_search(chunks: list[KbChunk], query: str, limit: int = 5) -> list[KbChu
 # Reciprocal-rank-fusion constant. Standard Lucene-recommended k=60.
 # Higher k = flatter contribution from each list's top-ranked items;
 # lower k = a #1 in either list dominates the fused ranking.
-RRF_K = 60
+# Override via env var: MOVATE_RRF_K (integer, default 60).
+RRF_K: int = int(os.environ.get("MOVATE_RRF_K", "60"))
 
 
 def rrf_fuse(
