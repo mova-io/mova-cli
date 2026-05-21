@@ -1,2 +1,8 @@
-{"input": {"text": "hello"}, "expected": {"message": "Hello!"}}
-{"input": {"text": "what's 2+2?"}, "expected": {"message": "4"}}
+{"input": {"text": "hello"}, "expected": {"message": "Hello! How can I help you today?"}}
+{"input": {"text": "what's 2+2?"}, "expected": {"message": "2 + 2 equals 4."}}
+{"input": {"text": "Summarize the following in one sentence: The mitochondria is the powerhouse of the cell because it generates most of the cell's supply of ATP through a process called oxidative phosphorylation."}, "expected": {"message": "Mitochondria produce most of a cell's energy (ATP) through oxidative phosphorylation, earning their nickname as the cell's powerhouse."}}
+{"input": {"text": "What are three best practices for writing clean Python code?"}, "expected": {"message": "Three key Python best practices are: (1) follow PEP 8 style guidelines for consistent formatting, (2) write small, focused functions that do one thing well, and (3) use descriptive variable and function names that make the code self-documenting."}}
+{"input": {"text": "Translate 'Good morning, how are you?' into French."}, "expected": {"message": "\"Good morning, how are you?\" in French is: \"Bonjour, comment allez-vous ?\""}}
+{"input": {"text": "hi"}, "expected": {"message": "Hi! What can I help you with?"}}
+{"input": {"text": "What is the capital of Japan?"}, "expected": {"message": "The capital of Japan is Tokyo."}}
+{"input": {"text": "Write a one-sentence product description for a waterproof running shoe."}, "expected": {"message": "Built for all-weather performance, this waterproof running shoe keeps your feet dry and comfortable on wet roads and trails without sacrificing breathability or speed."}}
