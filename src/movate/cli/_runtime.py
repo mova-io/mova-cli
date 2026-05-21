@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from movate.core.config import load_project_config
 from movate.core.executor import Executor
 from movate.core.models import AgentRuntime
+from movate.memory import build_memory_store
 from movate.providers.base import BaseLLMProvider
 from movate.providers.litellm import LiteLLMProvider
 from movate.providers.mock import MockProvider
@@ -127,6 +128,7 @@ async def build_local_runtime(*, mock: bool) -> LocalRuntime:
         runtime_policy=project_cfg.runtime,
         skill_policy=project_cfg.skills,
         guardrails=project_cfg.guardrails,
+        memory_store=build_memory_store(),
     )
     return LocalRuntime(executor=executor, provider=provider, storage=storage, tracer=tracer)
 
