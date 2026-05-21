@@ -105,6 +105,33 @@ class CompositeTracer(Tracer):
             except Exception:  # pragma: no cover
                 continue
 
+    # ----- generation -------------------------------------------------------
+
+    def log_generation(
+        self,
+        span: SpanCtx,
+        *,
+        model: str,
+        input_messages: list[dict[str, Any]],
+        output_text: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float = 0.0,
+    ) -> None:
+        for delegate, delegate_ctx in self._mappings.get(span.span_id, []):
+            try:
+                delegate.log_generation(
+                    delegate_ctx,
+                    model=model,
+                    input_messages=input_messages,
+                    output_text=output_text,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_usd=cost_usd,
+                )
+            except Exception:  # pragma: no cover
+                continue
+
     # ----- lifecycle --------------------------------------------------------
 
     def flush(self) -> None:

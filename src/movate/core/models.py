@@ -1321,6 +1321,10 @@ class Metrics(BaseModel):
     cost_usd: float = 0.0
     provider: str = ""
     pricing_version: str = ""
+    trace_id: str = ""
+    """Langfuse / OTel trace ID for the run. Populated by the executor from
+    ``span.trace_id`` so feedback endpoints can attach scores to the correct
+    trace without a separate lookup. Empty when tracing is off (SilentTracer)."""
 
 
 class ErrorInfo(BaseModel):

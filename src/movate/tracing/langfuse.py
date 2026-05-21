@@ -29,6 +29,7 @@ in a private dict keyed by ``span_id`` so callers never see SDK objects.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import Any
 from uuid import uuid4
@@ -125,6 +126,45 @@ class LangfuseTracer(Tracer):
         if handle is None:
             return
         handle.update(metadata={key: value})
+
+    # ----- generation -------------------------------------------------------
+
+    def log_generation(
+        self,
+        span: SpanCtx,
+        *,
+        model: str,
+        input_messages: list[dict[str, Any]],
+        output_text: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """Emit a Langfuse Generation object for the LLM completion.
+
+        This populates the Generations tab in Langfuse UI and feeds the
+        model-level token-usage + cost dashboards. Called once per
+        ``executor.execute()`` call after the final response is received.
+        Fail-soft: any SDK exception is swallowed so tracing never breaks
+        a run.
+        """
+        handle = self._handles.get(span.span_id)
+        if handle is None:
+            return
+        with contextlib.suppress(Exception):  # never let tracing break a run
+            handle.generation(
+                name="llm-completion",
+                model=model,
+                input=input_messages,
+                output=output_text,
+                usage={
+                    "input": input_tokens,
+                    "output": output_tokens,
+                    "total": input_tokens + output_tokens,
+                    "unit": "TOKENS",
+                },
+                metadata={"cost_usd": cost_usd} if cost_usd else None,
+            )
 
     # ----- lifecycle --------------------------------------------------------
 
