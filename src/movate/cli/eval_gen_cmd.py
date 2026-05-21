@@ -78,6 +78,10 @@ _MAX_GENERATE = 200
 _PREVIEW_MAX_CASES = 5
 # Max chars shown per field value in the preview table.
 _PREVIEW_FIELD_MAX = 60
+# Max inputs shown in the pre-execution inputs preview (Phase 1 review).
+# Higher than _PREVIEW_MAX_CASES since each row only shows input fields —
+# no expected / grounding columns — so rows stay compact.
+_INPUTS_PREVIEW_MAX = 20
 
 
 def _resolve_agent_path(name_or_path: str, project_root: Path) -> Path:
@@ -469,6 +473,103 @@ def _load_kb_seeds(bundle: AgentBundle, project_root: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+async def _generate_inputs_only(
+    bundle: AgentBundle,
+    *,
+    num: int,
+    sample_input: dict[str, Any] | None,
+    mock: bool,
+    kb_seeds: list[str] | None = None,
+    mode: str = "standard",
+    target_dims: list[str] | None = None,
+    generator_model: str | None = None,
+    on_progress: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Phase 1 — generate and schema-validate ``num`` input dicts.
+
+    Does NOT call the agent. Returns the list of validated inputs so
+    the caller can preview them and confirm before Phase 2 (agent
+    execution). ``on_progress(current, total)`` is called after each
+    successful generation so the caller can drive a progress bar.
+    """
+    rt = await build_local_runtime(mock=mock)
+    validator = Draft202012Validator(bundle.input_schema)
+    inputs: list[dict[str, Any]] = []
+    try:
+        for i in range(num):
+            kb_seed = kb_seeds[i % len(kb_seeds)] if kb_seeds else None
+            if mock:
+                generated_input = _mock_input_for_schema(bundle.input_schema, seed=i)
+            else:
+                generated_input = await _generate_one_input(
+                    rt,
+                    bundle,
+                    index=i,
+                    sample_input=sample_input,
+                    kb_seed=kb_seed,
+                    mode=mode,
+                    target_dims=target_dims,
+                    generator_model=generator_model,
+                )
+            try:
+                validator.validate(generated_input)
+            except ValidationError as exc:
+                log.warning(
+                    "skipped generated input #%d: failed schema validation (%s)",
+                    i + 1,
+                    exc.message,
+                )
+                continue
+            inputs.append(generated_input)
+            if on_progress is not None:
+                on_progress(len(inputs), num)
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+    return inputs
+
+
+async def _execute_inputs(
+    bundle: AgentBundle,
+    inputs: list[dict[str, Any]],
+    *,
+    mock: bool,
+    with_dimensions: bool = True,
+    mode: str = "standard",
+    on_progress: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Phase 2 — run the agent on each validated input to capture expected output.
+
+    Returns full entries ``{input, expected, generated: true, ...}``.
+    ``on_progress(current, total)`` is called after each agent call.
+    """
+    rt = await build_local_runtime(mock=mock)
+    entries: list[dict[str, Any]] = []
+    try:
+        for i, generated_input in enumerate(inputs):
+            request = RunRequest(agent=bundle.spec.name, input=generated_input)
+            response = await rt.executor.execute(bundle, request)
+            entry: dict[str, Any] = {
+                "input": generated_input,
+                "expected": response.data,
+                "generated": True,
+            }
+            if mode != "standard":
+                entry["mode"] = mode
+            if mode == "refusal":
+                entry["refusal_expected"] = True
+            if with_dimensions:
+                dims = await _enrich_with_dimensions(
+                    rt, bundle, generated_input, response.data, mock=mock
+                )
+                entry.update(dims)
+            entries.append(entry)
+            if on_progress is not None:
+                on_progress(i + 1, len(inputs))
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+    return entries
+
+
 async def _generate_entries(
     bundle: AgentBundle,
     *,
@@ -482,6 +583,10 @@ async def _generate_entries(
     generator_model: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build ``num`` ``{input, expected, generated: true}`` entries.
+
+    Convenience wrapper used by ``--all`` sweep path. Single-agent path
+    calls ``_generate_inputs_only`` + ``_execute_inputs`` directly so it
+    can show the preview table between phases.
 
     ``mock=True`` skips the LLM entirely — synthesizes inputs from the
     schema + runs the agent under MockProvider to fill ``expected``.
@@ -503,66 +608,25 @@ async def _generate_entries(
     * ``refusal`` — inputs the agent should decline; also sets
       ``refusal_expected: true`` on each entry for the D-dimension gate
     """
-    rt = await build_local_runtime(mock=mock)
-    validator = Draft202012Validator(bundle.input_schema)
-    entries: list[dict[str, Any]] = []
-    try:
-        for i in range(num):
-            kb_seed = kb_seeds[i % len(kb_seeds)] if kb_seeds else None
-            if mock:
-                generated_input = _mock_input_for_schema(bundle.input_schema, seed=i)
-            else:
-                generated_input = await _generate_one_input(
-                    rt,
-                    bundle,
-                    index=i,
-                    sample_input=sample_input,
-                    kb_seed=kb_seed,
-                    mode=mode,
-                    target_dims=target_dims,
-                    generator_model=generator_model,
-                )
-            # Validate before running the agent — a bad-schema input
-            # blows up the executor with a confusing error. Skip + log.
-            try:
-                validator.validate(generated_input)
-            except ValidationError as exc:
-                # Route through the logger (not ``err_console.print``)
-                # so the wizard's spinner-wrapped capture handler can
-                # collect this with the same machinery that handles
-                # "non-JSON" / "generator-call-failed" warnings — and
-                # so a clean summary panel can render counts by
-                # category instead of N raw lines interleaving with
-                # the spinner. The "skipped" prefix is preserved in
-                # the message body so legacy log scrapers still match.
-                log.warning(
-                    "skipped generated input #%d: failed schema validation (%s)",
-                    i + 1,
-                    exc.message,
-                )
-                continue
-            # Execute to capture the expected output. Same path
-            # the real eval runs would use.
-            request = RunRequest(agent=bundle.spec.name, input=generated_input)
-            response = await rt.executor.execute(bundle, request)
-            entry: dict[str, Any] = {
-                "input": generated_input,
-                "expected": response.data,
-                "generated": True,
-            }
-            if mode != "standard":
-                entry["mode"] = mode
-            if mode == "refusal":
-                entry["refusal_expected"] = True
-            if with_dimensions:
-                dims = await _enrich_with_dimensions(
-                    rt, bundle, generated_input, response.data, mock=mock
-                )
-                entry.update(dims)
-            entries.append(entry)
-    finally:
-        await shutdown_runtime(rt.storage, rt.tracer)
-    return entries
+    inputs = await _generate_inputs_only(
+        bundle,
+        num=num,
+        sample_input=sample_input,
+        mock=mock,
+        kb_seeds=kb_seeds,
+        mode=mode,
+        target_dims=target_dims,
+        generator_model=generator_model,
+    )
+    if not inputs:
+        return []
+    return await _execute_inputs(
+        bundle,
+        inputs,
+        mock=mock,
+        with_dimensions=with_dimensions,
+        mode=mode,
+    )
 
 
 _RETRY_NUDGE = (
@@ -1280,6 +1344,71 @@ def _print_entries_preview(entries: list[dict[str, Any]]) -> None:
     console.print()
 
 
+def _print_inputs_preview(
+    inputs: list[dict[str, Any]],
+    *,
+    mode: str = "standard",
+    num_requested: int,
+) -> None:
+    """Render a Rich table of ALL generated inputs BEFORE agent execution.
+
+    Lets the operator review — and abort if needed — before Phase 2
+    spends tokens running the agent. Shows up to _INPUTS_PREVIEW_MAX rows
+    (enough for the default --num 10; truncated with a note for larger
+    batches).
+    """
+    from rich.table import Table  # noqa: PLC0415
+
+    total = len(inputs)
+    shown = inputs[:_INPUTS_PREVIEW_MAX]
+    show_mode = mode != "standard"
+
+    truncated = total > _INPUTS_PREVIEW_MAX
+    title = (
+        f"[bold]Phase 1 complete[/bold] — {total} input(s) generated"
+        f" of {num_requested} requested"
+        + (
+            f" [dim](showing first {_INPUTS_PREVIEW_MAX})[/dim]"
+            if truncated
+            else ""
+        )
+    )
+
+    table = Table(
+        title=title,
+        title_style="bold",
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=True,
+        expand=False,
+    )
+    table.add_column("#", style="dim", width=3, no_wrap=True)
+    if show_mode:
+        table.add_column("Mode", no_wrap=True, style="yellow")
+    table.add_column("Input fields", min_width=40, max_width=80)
+
+    for i, inp in enumerate(shown, start=1):
+        lines = []
+        for k, v in (inp.items() if isinstance(inp, dict) else {}.items()):
+            vstr = str(v)
+            vstr = vstr[:_PREVIEW_FIELD_MAX] + "…" if len(vstr) > _PREVIEW_FIELD_MAX else vstr
+            lines.append(f"[dim]{k}:[/dim] {vstr}")
+        row: list[str] = [str(i)]
+        if show_mode:
+            row.append(mode)
+        row.append("\n".join(lines) if lines else "—")
+        table.add_row(*row)
+
+    console.print()
+    console.print(table)
+    if truncated:
+        console.print(
+            f"[dim]  … and {total - _INPUTS_PREVIEW_MAX} more input(s) not shown above. "
+            f"All {total} will be sent to the agent in Phase 2.[/dim]"
+        )
+    console.print()
+
+
 # ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
@@ -1382,6 +1511,16 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
         "--force",
         "-f",
         help="Overwrite OUTPUT if it already exists.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help=(
+            "Skip the confirmation prompt between Phase 1 (input generation) "
+            "and Phase 2 (agent execution). The prompt is also skipped "
+            "automatically when stdin is not a TTY (e.g. CI pipelines)."
+        ),
     ),
     target_dim: list[str] = typer.Option(
         [],
@@ -1533,27 +1672,99 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
     kb_seeds = _load_kb_seeds(bundle, root)
     seed_note = f", seeding from {len(kb_seeds)} KB symptom(s)" if kb_seeds else ""
     mode_note = f" mode={mode}" if mode != "standard" else ""
+
+    # ── Phase 1: generate + validate inputs (no agent calls) ─────────────
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn  # noqa: PLC0415
+
     console.print(
-        f"[dim]Generating {num} case(s) for [bold]{bundle.spec.name}[/bold]"
+        f"[dim]Phase 1 — generating {num} input(s) for "
+        f"[bold]{bundle.spec.name}[/bold]"
         f"{' (mock)' if mock else ''}{mode_note}{seed_note}…[/dim]"
     )
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as _prog:
+        _gen_task = _prog.add_task(f"Generating inputs [{mode}]", total=num)
 
-    entries = asyncio.run(
-        _generate_entries(
-            bundle,
-            num=num,
-            sample_input=parsed_sample,
-            mock=mock,
-            with_dimensions=with_dimensions,
-            kb_seeds=kb_seeds or None,
-            mode=mode,
-            target_dims=target_dim or None,
+        def _on_gen_progress(cur: int, _tot: int) -> None:
+            _prog.update(_gen_task, completed=cur)
+
+        inputs = asyncio.run(
+            _generate_inputs_only(
+                bundle,
+                num=num,
+                sample_input=parsed_sample,
+                mock=mock,
+                kb_seeds=kb_seeds or None,
+                mode=mode,
+                target_dims=target_dim or None,
+                on_progress=_on_gen_progress,
+            )
         )
+
+    if not inputs:
+        err_console.print(
+            "[red]✗[/red] generated 0 valid inputs. "
+            "[dim]Check the agent's input schema; the generator's output "
+            "may not be matching it cleanly. Try [bold]--mock[/bold] to "
+            "confirm the schema accepts synthetic inputs.[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    # Show the inputs table so the operator can review before Phase 2.
+    _print_inputs_preview(inputs, mode=mode, num_requested=num)
+
+    # Confirmation gate — skip when --yes or stdin is not a TTY (CI / pipe).
+    if not yes and sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            confirmed = Confirm.ask(
+                f"[bold]Run agent on these {len(inputs)} input(s)?[/bold] "
+                "[dim](Phase 2 — captures expected outputs)[/dim]",
+                default=True,
+            )
+        except (KeyboardInterrupt, EOFError):
+            confirmed = False
+        if not confirmed:
+            console.print("[yellow]Aborted.[/yellow] No file written.")
+            raise typer.Exit(code=0)
+
+    # ── Phase 2: run agent to capture expected outputs ────────────────────
+    console.print(
+        f"[dim]Phase 2 — running [bold]{bundle.spec.name}[/bold] "
+        f"on {len(inputs)} input(s)…[/dim]"
     )
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as _prog2:
+        _run_task = _prog2.add_task("Running agent", total=len(inputs))
+
+        def _on_run_progress(cur: int, _tot: int) -> None:
+            _prog2.update(_run_task, completed=cur)
+
+        entries = asyncio.run(
+            _execute_inputs(
+                bundle,
+                inputs,
+                mock=mock,
+                with_dimensions=with_dimensions,
+                mode=mode,
+                on_progress=_on_run_progress,
+            )
+        )
 
     if not entries:
         err_console.print(
-            "[red]✗[/red] generated 0 valid entries. "
+            "[red]✗[/red] agent returned 0 valid entries. "
             "[dim]Check the agent's input schema; the generator's output "
             "may not be matching it cleanly. Try [bold]--mock[/bold] to "
             "confirm the schema accepts synthetic inputs.[/dim]"
