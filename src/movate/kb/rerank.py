@@ -48,6 +48,7 @@ import json
 import logging
 import math
 import re
+from typing import Any
 
 from movate.core.models import KbChunkWithScore
 
@@ -72,7 +73,7 @@ DEFAULT_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 # call. CPython's GIL makes single-assignment dict writes atomic,
 # so this is safe without a lock for the typical "one model per
 # process" case.
-_CE_CACHE: dict[str, object] = {}
+_CE_CACHE: dict[str, Any] = {}
 
 # Max chars of each candidate's text we feed to the reranker.
 # Caps the prompt's total length so 20 candidates with 2000-char
@@ -260,12 +261,12 @@ def _format_candidates(candidates: list[KbChunkWithScore]) -> str:
     return "\n".join(lines)
 
 
-def _extract_content(resp: object) -> str:
+def _extract_content(resp: Any) -> str:
     """Pull the text content from a LiteLLM response. Same defensive
     extraction as the query rewriter — any structural surprise
     returns ``""`` so the caller triggers fallback."""
     try:
-        choices = resp.choices  # type: ignore[attr-defined]
+        choices = resp.choices
         first = choices[0]
         message = first.message
         content = message.content
@@ -405,14 +406,14 @@ async def cross_encoder_rerank(
             """Load model (cached) + run batch inference in a thread."""
             # Lazy import: sentence-transformers is an optional dep.
             # ImportError propagates to the outer try/except.
-            import sentence_transformers as _st  # type: ignore[import-not-found]  # noqa: PLC0415
+            import sentence_transformers as _st  # noqa: PLC0415
 
             _ce_cls = _st.CrossEncoder
             if model not in _CE_CACHE:
                 _CE_CACHE[model] = _ce_cls(model)
             ce = _CE_CACHE[model]
             pairs = [(q, c.chunk.text[:_MAX_CHUNK_CHARS_FOR_RERANK]) for c in truncated]
-            raw = ce.predict(pairs)  # type: ignore[attr-defined]
+            raw = ce.predict(pairs)
             # ``predict`` returns a numpy array or list of floats.
             # Convert to plain Python list for simplicity.
             return [float(s) for s in raw]

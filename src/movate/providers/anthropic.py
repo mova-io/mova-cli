@@ -119,7 +119,7 @@ class AnthropicProvider(BaseLLMProvider):
             # check rejects without an explicit cast.
             resp = await self._client.messages.create(
                 model=request.provider,
-                messages=user_messages,  # type: ignore[arg-type]
+                messages=user_messages,
                 system=system,
                 **extra_kwargs,
                 **_translate_params(request.params),
@@ -142,7 +142,7 @@ class AnthropicProvider(BaseLLMProvider):
             system, user_messages = _translate_messages(request.messages)
             async with self._client.messages.stream(
                 model=request.provider,
-                messages=user_messages,  # type: ignore[arg-type]
+                messages=user_messages,
                 system=system,
                 **_translate_params(request.params),
             ) as event_stream:

@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 
+import click
 import typer
 from dotenv import load_dotenv
 
@@ -227,10 +228,12 @@ class FuzzySuggestionGroup(TyperGroup):
     ``--help``.
     """
 
-    def resolve_command(self, ctx, args):  # type: ignore[no-untyped-def, override]
+    def resolve_command(
+        self,
+        ctx: click.Context,
+        args: list[str],
+    ) -> tuple[str | None, click.Command | None, list[str]]:
         from difflib import get_close_matches  # noqa: PLC0415
-
-        import click  # noqa: PLC0415
 
         try:
             return super().resolve_command(ctx, args)

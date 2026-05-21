@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 import uvicorn
@@ -26,6 +27,9 @@ from movate.cli._console import hint, success
 from movate.runtime.app import build_app
 from movate.runtime.registry import scan_agents
 from movate.storage import build_storage
+
+if TYPE_CHECKING:
+    from movate.storage.base import StorageProvider
 
 err = Console(stderr=True)
 
@@ -191,7 +195,7 @@ async def _run_serve(
         await storage.close()
 
 
-async def _seed_bootstrap_key(storage: object) -> None:
+async def _seed_bootstrap_key(storage: StorageProvider) -> None:
     """Seed a known API key on startup if ``MOVATE_SEED_API_KEY`` is set.
 
     Solves the chicken-and-egg bootstrap problem on fresh deployments
@@ -216,7 +220,7 @@ async def _seed_bootstrap_key(storage: object) -> None:
         err.print(f"[yellow]⚠[/yellow] MOVATE_SEED_API_KEY is malformed, skipping: {exc}")
         return
 
-    existing = await storage.get_api_key(parsed.key_id)  # type: ignore[attr-defined]
+    existing = await storage.get_api_key(parsed.key_id)
     if existing is not None:
         err.print(f"[dim]bootstrap key {parsed.key_id} already present — skipping seed[/dim]")
         return
@@ -235,5 +239,5 @@ async def _seed_bootstrap_key(storage: object) -> None:
         label="seed",
         created_at=datetime.now(UTC),
     )
-    await storage.save_api_key(record)  # type: ignore[attr-defined]
+    await storage.save_api_key(record)
     err.print(f"[dim]seeded bootstrap key {parsed.key_id} from MOVATE_SEED_API_KEY[/dim]")

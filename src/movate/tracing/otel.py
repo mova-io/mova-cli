@@ -43,13 +43,15 @@ from movate.tracing.base import SpanCtx, Tracer
 
 # Import OTel lazily so the module loads even when the optional dep isn't
 # installed. Tests that inject a fake tracer don't need the real SDK.
+_otel_trace: Any = None
+_OTEL_AVAILABLE = False
 try:
-    from opentelemetry import trace as _otel_trace
+    import opentelemetry.trace as _otel_trace_module
 
+    _otel_trace = _otel_trace_module
     _OTEL_AVAILABLE = True
 except ImportError:  # pragma: no cover - covered by env tests
-    _otel_trace = None  # type: ignore[assignment]
-    _OTEL_AVAILABLE = False
+    pass
 
 
 class OtelUnavailableError(Exception):

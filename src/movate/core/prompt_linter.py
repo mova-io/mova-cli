@@ -60,6 +60,7 @@ that operators learn to ignore.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -169,7 +170,8 @@ def _check_undeclared_input_refs(bundle: AgentBundle) -> list[LintIssue]:
     # non-Getattr instances (the cls filter limits to Getattr, but
     # the type-checker doesn't know that).
     getattr_cls = _jinja_getattr_class()
-    for node in ast.find_all((getattr_cls,)):  # type: ignore[var-annotated]
+    _getattr_iter: Iterator[Any] = ast.find_all((getattr_cls,))
+    for node in _getattr_iter:
         target = getattr(node, "node", None)
         attr = getattr(node, "attr", None)
         if (
@@ -291,7 +293,8 @@ def _check_skill_output_refs(bundle: AgentBundle) -> list[LintIssue]:
     # Walk AST: collect all Getattr nodes of the form `<var_name>.X`.
     issues: list[LintIssue] = []
     seen: set[tuple[str, str]] = set()
-    for node in ast.find_all((getattr_cls,)):  # type: ignore[var-annotated]
+    _skill_getattr_iter: Iterator[Any] = ast.find_all((getattr_cls,))
+    for node in _skill_getattr_iter:
         target = getattr(node, "node", None)
         attr = getattr(node, "attr", None)
         if target is None or not isinstance(attr, str):

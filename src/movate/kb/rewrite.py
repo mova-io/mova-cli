@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +192,7 @@ async def rewrite_query(
     return out
 
 
-def _extract_content(resp: object) -> str:
+def _extract_content(resp: Any) -> str:
     """Pull the text content out of a LiteLLM response.
 
     LiteLLM normalizes to OpenAI's response shape:
@@ -200,7 +201,7 @@ def _extract_content(resp: object) -> str:
     triggers the fallback.
     """
     try:
-        choices = resp.choices  # type: ignore[attr-defined]
+        choices = resp.choices
         first = choices[0]
         message = first.message
         content = message.content

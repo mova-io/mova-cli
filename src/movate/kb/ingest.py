@@ -18,6 +18,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from movate.core.models import KbChunk
 from movate.kb.chunk import Chunk, split_paragraphs
@@ -26,6 +27,9 @@ from movate.kb.embed import (
     embed_texts,
     qualified_model_name,
 )
+
+if TYPE_CHECKING:
+    from movate.storage.base import StorageProvider
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +100,7 @@ def find_files(path: Path) -> list[Path]:
 
 async def ingest_path(
     *,
-    storage: object,
+    storage: StorageProvider,
     path: Path,
     agent: str,
     tenant_id: str,
@@ -137,7 +141,7 @@ async def ingest_path(
 
 async def _ingest_one_file(
     *,
-    storage: object,
+    storage: StorageProvider,
     file_path: Path,
     agent: str,
     tenant_id: str,
@@ -178,7 +182,7 @@ async def _ingest_one_file(
     # deleted paragraphs stick around forever.
     chunks_removed = 0
     if clean_source:
-        chunks_removed = await storage.delete_kb_chunks(  # type: ignore[attr-defined]
+        chunks_removed = await storage.delete_kb_chunks(
             agent=agent,
             tenant_id=tenant_id,
             source=source,
@@ -204,7 +208,7 @@ async def _ingest_one_file(
 
 async def ingest_text(
     *,
-    storage: object,
+    storage: StorageProvider,
     text: str,
     source: str,
     agent: str,
@@ -263,7 +267,7 @@ async def ingest_text(
             )
             # Duck-typed: any storage backend implementing
             # ``save_kb_chunk`` works (Postgres / sqlite / in-memory).
-            await storage.save_kb_chunk(kb_chunk)  # type: ignore[attr-defined]
+            await storage.save_kb_chunk(kb_chunk)
             saved += 1
     return IngestSummary(
         source=label,

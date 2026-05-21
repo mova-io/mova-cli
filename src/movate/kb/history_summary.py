@@ -177,11 +177,11 @@ def _format_turns_for_summary(turns: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _extract_content(resp: object) -> str:
+def _extract_content(resp: Any) -> str:
     """Pull text content from a LiteLLM response. Same defensive
     extraction as the rewriter / reranker / multi-hop planner."""
     try:
-        choices = resp.choices  # type: ignore[attr-defined]
+        choices = resp.choices
         first = choices[0]
         message = first.message
         content = message.content

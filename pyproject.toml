@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.73"
+version = "0.8.2.74"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -275,6 +275,16 @@ module = [
     # stubs don't always match the installed version and PIL is an
     # optional extra dep, so we suppress missing-import errors here.
     "PIL.*",
+    # Optional OCR extras — no type stubs shipped; suppress import errors
+    # so CI stays green whether or not the [ocr] / [easyocr] extras are
+    # installed.
+    "pdf2image.*",
+    "pytesseract.*",
+    "easyocr.*",
+    # Optional cross-encoder reranker extra — no type stubs.
+    "sentence_transformers.*",
+    # Anthropic SDK — optional native-anthropic runtime extra.
+    "anthropic.*",
 ]
 ignore_missing_imports = true
 

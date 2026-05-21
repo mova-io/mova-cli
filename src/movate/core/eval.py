@@ -68,6 +68,7 @@ from movate.providers.base import (
 if TYPE_CHECKING:
     from movate.core.executor import Executor
     from movate.core.loader import AgentBundle
+    from movate.core.remote_executor import RemoteExecutor
     from movate.core.workflow.ir import WorkflowGraph
     from movate.core.workflow.spec import WorkflowEvalsSpec
     from movate.storage.base import StorageProvider
@@ -1356,7 +1357,7 @@ class EvalEngine:
     def __init__(
         self,
         *,
-        executor: Executor,
+        executor: Executor | RemoteExecutor,
         provider: BaseLLMProvider,
         runs_per_case: int = 1,
         gate_mode: str = "mean",
