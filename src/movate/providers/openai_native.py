@@ -60,6 +60,7 @@ from movate.providers.base import (
     CompletionRequest,
     CompletionResponse,
     StreamChunk,
+    ToolCallSpec,
 )
 
 if TYPE_CHECKING:
@@ -203,33 +204,46 @@ def _to_completion_response(resp: Any) -> CompletionResponse:
     }
 
     if tool_calls:
-        first = tool_calls[0]
-        function = getattr(first, "function", None)
-        if function is None and isinstance(first, dict):
-            function = first.get("function") or {}
-        if function is None:
-            function = {}
-        tool_name = _func_field(function, "name")
-        args_raw = _func_field(function, "arguments")
-        tool_id = getattr(first, "id", "") or (
-            first.get("id", "") if isinstance(first, dict) else ""
-        )
-        try:
-            parsed = json.loads(args_raw) if args_raw else {}
-        except (TypeError, ValueError):
-            parsed = {}
-        tool_input = parsed if isinstance(parsed, dict) else {}
+        # Parse ALL tool calls so the executor can dispatch parallel calls
+        # when the model emits more than one in a single turn.
+        specs = [_parse_openai_style_tool_call(tc) for tc in tool_calls]
+        first = specs[0]
         return CompletionResponse(
             text=text,
             tokens=tokens,
             raw=raw,
             kind="tool_use",
-            tool_name=tool_name,
-            tool_id=tool_id,
-            tool_input=tool_input,
+            tool_name=first.name,
+            tool_id=first.call_id,
+            tool_input=first.input,
+            parallel_tool_calls=specs,
         )
 
     return CompletionResponse(text=text, tokens=tokens, raw=raw)
+
+
+def _parse_openai_style_tool_call(tc: Any) -> ToolCallSpec:
+    """Parse one OpenAI-style tool-call object → :class:`ToolCallSpec`.
+
+    Handles both attribute-style objects (SDK Pydantic models) and plain
+    dicts (test fakes). ``arguments`` is a JSON-encoded string; a parse
+    failure surfaces as an empty dict so the executor's schema validator
+    catches it with a readable error.
+    """
+    function = getattr(tc, "function", None)
+    if function is None and isinstance(tc, dict):
+        function = tc.get("function") or {}
+    if function is None:
+        function = {}
+    name = _func_field(function, "name")
+    args_raw = _func_field(function, "arguments")
+    call_id = getattr(tc, "id", "") or (tc.get("id", "") if isinstance(tc, dict) else "")
+    try:
+        parsed = json.loads(args_raw) if args_raw else {}
+    except (TypeError, ValueError):
+        parsed = {}
+    inp = parsed if isinstance(parsed, dict) else {}
+    return ToolCallSpec(name=name, call_id=call_id, input=inp)
 
 
 def _func_field(function: Any, name: str) -> str:

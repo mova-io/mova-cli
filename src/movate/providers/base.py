@@ -56,6 +56,25 @@ class CompletionRequest(BaseModel):
     the agent's resolved :class:`SkillBundle` list."""
 
 
+class ToolCallSpec(BaseModel):
+    """One tool call in a model turn — name, correlation id, and arguments.
+
+    Used in :attr:`CompletionResponse.parallel_tool_calls` to carry all
+    tool calls a model emits in a single turn. A turn with a single tool
+    call still populates the list with one entry so the executor can use
+    a unified dispatch path regardless of call count.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Tool (skill) name the model wants invoked."""
+    call_id: str
+    """Provider-assigned correlation id, echoed back in the tool_result."""
+    input: dict[str, Any] = Field(default_factory=dict)
+    """Parsed arguments the model wants the tool called with."""
+
+
 class CompletionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -72,15 +91,25 @@ class CompletionResponse(BaseModel):
     wants the executor to invoke a tool and feed the result back."""
     tool_name: str = ""
     """Name of the skill the model wants invoked (matches
-    ``SkillSpec.name``). Empty unless ``kind == "tool_use"``."""
+    ``SkillSpec.name``). Empty unless ``kind == "tool_use"``.
+    Always mirrors ``parallel_tool_calls[0].name`` for backward compat."""
     tool_id: str = ""
     """Provider-assigned identifier for this tool call. The executor
     must echo it back in the matching ``tool_result`` so the model can
-    correlate. Empty unless ``kind == "tool_use"``."""
+    correlate. Empty unless ``kind == "tool_use"``.
+    Always mirrors ``parallel_tool_calls[0].call_id`` for backward compat."""
     tool_input: dict[str, Any] = Field(default_factory=dict)
     """The arguments the model wants the tool called with. Validated
     by :func:`dispatch_skill` against the skill's input schema before
-    the backend is invoked. Empty unless ``kind == "tool_use"``."""
+    the backend is invoked. Empty unless ``kind == "tool_use"``.
+    Always mirrors ``parallel_tool_calls[0].input`` for backward compat."""
+
+    parallel_tool_calls: list[ToolCallSpec] = Field(default_factory=list)
+    """All tool calls emitted in this turn.
+    Always has one entry when ``kind == "tool_use"`` (matching the
+    singular ``tool_name / tool_id / tool_input`` fields); has two or
+    more when the model issued parallel calls in a single turn.
+    Empty for ``kind == "final"`` responses."""
 
 
 class StreamChunk(BaseModel):
