@@ -1302,6 +1302,10 @@ class RunRequest(BaseModel):
     agent: str
     input: dict[str, Any]
     session_id: str | None = None
+    """Groups runs into a conversation in Langfuse. Propagated to the root trace."""
+    user_id: str | None = None
+    """Identifies the end-user making the request. Propagated to the root trace
+    for per-user filtering in Langfuse. Optional — CLI runs omit it."""
     request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 

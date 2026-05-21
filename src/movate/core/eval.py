@@ -1472,6 +1472,27 @@ class EvalEngine:
                     agent_call_ms=agent_call_ms,
                     bundle=bundle,
                 )
+                # Push the accuracy score back to the run's Langfuse trace
+                # so it appears on the Generations / Traces view alongside
+                # token-usage. Best-effort: if the tracer doesn't expose
+                # score_trace (e.g. stdout, OTel) or the trace_id is empty
+                # (tracing off), this is a no-op. Never let score push
+                # break an eval run.
+                _eval_trace_id = response.metrics.trace_id or response.trace_id
+                if _eval_trace_id:
+                    _tracer = getattr(self._executor, "tracer", None)
+                    _score_fn = getattr(_tracer, "score_trace", None) if _tracer else None
+                    if callable(_score_fn):
+                        _acc_val = (
+                            dims.accuracy.value if dims.accuracy.value is not None else 0.0
+                        )
+                        with contextlib.suppress(Exception):
+                            await _score_fn(
+                                trace_id=_eval_trace_id,
+                                name="eval_accuracy",
+                                value=_acc_val,
+                                comment=dims.accuracy.rationale,
+                            )
                 # The gate uses accuracy alone — back-compat with v0.5.
                 # Faithfulness/coverage/latency are *additional* reporting
                 # surfaces, not gate inputs. A future PR can add

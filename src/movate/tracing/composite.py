@@ -132,6 +132,36 @@ class CompositeTracer(Tracer):
             except Exception:  # pragma: no cover
                 continue
 
+    # ----- score_trace (Langfuse extension, fan-out) -----------------------
+
+    async def score_trace(
+        self,
+        *,
+        trace_id: str,
+        name: str,
+        value: float,
+        comment: str | None = None,
+    ) -> str | None:
+        """Fan-out :meth:`LangfuseTracer.score_trace` to all delegates that
+        support it. Returns the first non-None score id, or None if none
+        do. Fail-soft: exceptions from individual delegates are swallowed."""
+        for delegate in self._tracers:
+            fn = getattr(delegate, "score_trace", None)
+            if not callable(fn):
+                continue
+            try:
+                result = await fn(
+                    trace_id=trace_id,
+                    name=name,
+                    value=value,
+                    comment=comment,
+                )
+                if result is not None:
+                    return result
+            except Exception:  # pragma: no cover
+                continue
+        return None
+
     # ----- lifecycle --------------------------------------------------------
 
     def flush(self) -> None:
