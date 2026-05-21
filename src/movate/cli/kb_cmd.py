@@ -880,6 +880,268 @@ def stats(
     asyncio.run(_run())
 
 
+# ---------------------------------------------------------------------------
+# `mdk kb ingest-all` — scan the whole project and ingest every KB dir
+# ---------------------------------------------------------------------------
+
+# Conventional sub-directory name inside each agent folder that holds
+# KB documents. Operators drop PDFs / Markdown / DOCX here and
+# `ingest-all` picks them up automatically.
+_AGENT_KB_SUBDIR = "kb"
+# Project-level shared KB directory (project root / kb/).
+_PROJECT_KB_DIR = "kb"
+
+
+def _discover_ingest_targets(project: Path) -> list[tuple[str, Path]]:
+    """Return ``[(agent_name, kb_dir), ...]`` for every agent that has
+    a non-empty ``kb/`` sub-directory, plus a special ``__shared__``
+    entry when a project-level ``kb/`` directory exists.
+
+    Discovery rules (in order):
+    1. Project-level ``<project>/kb/`` → agent name ``__shared__``
+       (operator can override with ``--shared-agent``).
+    2. Per-agent ``<project>/agents/<name>/kb/`` → agent name ``<name>``.
+
+    Hidden dirs and empty kb directories are silently skipped.
+    """
+    from movate.kb.ingest import find_files  # noqa: PLC0415
+
+    targets: list[tuple[str, Path]] = []
+
+    # Project-level kb/
+    project_kb = (project / _PROJECT_KB_DIR).resolve()
+    if project_kb.is_dir() and find_files(project_kb):
+        targets.append(("__shared__", project_kb))
+
+    # Per-agent kb/
+    agents_dir = project / "agents"
+    if agents_dir.is_dir():
+        for agent_dir in sorted(agents_dir.iterdir()):
+            if not agent_dir.is_dir():
+                continue
+            if not (agent_dir / "agent.yaml").is_file():
+                continue
+            kb_dir = (agent_dir / _AGENT_KB_SUBDIR).resolve()
+            if kb_dir.is_dir() and find_files(kb_dir):
+                targets.append((agent_dir.name, kb_dir))
+
+    return targets
+
+
+@kb_app.command("ingest-all")
+def ingest_all(
+    project: Path = typer.Option(
+        Path("."),
+        "--project",
+        "-p",
+        help=(
+            "Project root to scan. Defaults to the current directory. "
+            "Looks for ``kb/`` at the project root and ``agents/<name>/kb/`` "
+            "for each agent."
+        ),
+    ),
+    shared_agent: str = typer.Option(
+        "__shared__",
+        "--shared-agent",
+        help=(
+            "Agent name to use for files ingested from the project-level ``kb/`` "
+            "directory. Defaults to [bold]__shared__[/bold]. Override when you "
+            "want the shared KB scoped to a specific agent at search time."
+        ),
+    ),
+    model: str = typer.Option(
+        DEFAULT_EMBEDDING_MODEL,
+        "--model",
+        help=(
+            "Embedding model for all ingested files. Bare names go directly to "
+            "OpenAI; any ``provider/model`` string is routed through LiteLLM."
+        ),
+    ),
+    api_key_env: str = typer.Option(
+        "OPENAI_API_KEY",
+        "--api-key-env",
+        help="Env var holding the API key for embedding calls.",
+    ),
+    tenant_id: str = typer.Option(
+        _DEFAULT_TENANT,
+        "--tenant-id",
+        help="Tenant scope. Defaults to 'local'.",
+    ),
+    clean_source: bool = typer.Option(
+        False,
+        "--clean-source",
+        help=(
+            "Delete existing chunks for each source file before re-ingesting. "
+            "Use when updating documents to remove stale paragraphs."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Preview what WOULD be ingested without calling the embedding API "
+            "or writing to storage. Prints a table of discovered directories "
+            "and file counts."
+        ),
+    ),
+    ocr_lang: str = typer.Option(
+        "",
+        "--ocr-lang",
+        help="Tesseract language code(s) for scanned PDFs / images (e.g. 'eng+fra').",
+    ),
+    ocr_backend: str = typer.Option(
+        "",
+        "--ocr-backend",
+        help="OCR engine: 'tesseract' (default) or 'easyocr'.",
+    ),
+) -> None:
+    """Scan the project and ingest every KB directory found.
+
+    Looks in two places:
+
+    \b
+    1. ``<project>/kb/``              → scoped to ``--shared-agent`` (default: __shared__)
+    2. ``<project>/agents/<name>/kb/`` → scoped to agent ``<name>``
+
+    Each directory is walked recursively; files with extensions
+    ``.md``, ``.markdown``, ``.txt``, ``.pdf``, ``.docx``, ``.html``,
+    ``.png``, ``.jpg``, ``.jpeg``, ``.tiff`` are ingested. Hidden
+    directories (``.git``, ``.venv``) are skipped.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Ingest every KB dir in the current project[/dim]
+      $ mdk kb ingest-all
+
+      [dim]# Preview what would be ingested (no API calls)[/dim]
+      $ mdk kb ingest-all --dry-run
+
+      [dim]# Re-ingest after updating documents[/dim]
+      $ mdk kb ingest-all --clean-source
+
+      [dim]# Scope the project-level kb/ to a specific agent[/dim]
+      $ mdk kb ingest-all --shared-agent rag-qa
+    """
+    import os  # noqa: PLC0415
+
+    if ocr_lang:
+        os.environ["MOVATE_OCR_LANG"] = ocr_lang
+    if ocr_backend:
+        os.environ["MOVATE_OCR_BACKEND"] = ocr_backend
+
+    project_root = project.resolve()
+    if not project_root.is_dir():
+        err_console.print(f"[red]✗[/red] project path not found: {project_root}")
+        raise typer.Exit(code=2)
+
+    targets = _discover_ingest_targets(project_root)
+
+    # Remap __shared__ to the operator's chosen agent name.
+    targets = [
+        (shared_agent if agent == "__shared__" else agent, kb_dir)
+        for agent, kb_dir in targets
+    ]
+
+    if not targets:
+        console.print(
+            "[yellow]⚠[/yellow] no KB directories found.\n"
+            "[dim]Create one of:\n"
+            f"  {project_root / 'kb' / '<file>'}  (project-level, shared)\n"
+            f"  {project_root / 'agents' / '<agent>' / 'kb' / '<file>'}  (per-agent)[/dim]"
+        )
+        raise typer.Exit(code=0)
+
+    from movate.kb.ingest import find_files  # noqa: PLC0415
+
+    if dry_run:
+        table = Table(title="[bold]Discovered KB directories[/bold] (dry run — no changes)")
+        table.add_column("agent", style="bold cyan")
+        table.add_column("directory", overflow="fold")
+        table.add_column("files", justify="right")
+        for agent_name, kb_dir in targets:
+            files = find_files(kb_dir)
+            table.add_row(agent_name, str(kb_dir), str(len(files)))
+        console.print(table)
+        total_files = sum(len(find_files(d)) for _, d in targets)
+        console.print(
+            f"[dim]{len(targets)} KB director{'y' if len(targets) == 1 else 'ies'}, "
+            f"{total_files} file(s) would be ingested.[/dim]"
+        )
+        return
+
+    api_key = os.environ.get(api_key_env, "").strip()
+    if not api_key:
+        err_console.print(
+            f"[red]✗[/red] no API key found in [bold]${api_key_env}[/bold]. "
+            "Set the env var or pass [bold]--api-key-env[/bold] to point at "
+            "the correct env var for your embedding provider. Pass "
+            "[bold]--dry-run[/bold] to preview without embedding."
+        )
+        raise typer.Exit(code=2)
+
+    async def _run() -> None:
+        from movate.kb.ingest import ingest_path  # noqa: PLC0415
+
+        storage = await _build_storage()
+        all_summaries: list[tuple[str, object]] = []  # [(agent_name, IngestSummary)]
+        try:
+            for agent_name, kb_dir in targets:
+                console.print(
+                    f"[bold cyan]Ingesting[/bold cyan] "
+                    f"[dim]{kb_dir}[/dim] → agent [bold]{agent_name}[/bold]…"
+                )
+                summaries = await ingest_path(
+                    storage=storage,  # type: ignore[arg-type]
+                    path=kb_dir,
+                    agent=agent_name,
+                    tenant_id=tenant_id,
+                    embedding_model=model,
+                    api_key=api_key,
+                    clean_source=clean_source,
+                )
+                all_summaries.extend((agent_name, s) for s in summaries)
+        finally:
+            await storage.close()  # type: ignore[attr-defined]
+
+        if not all_summaries:
+            console.print(
+                "[yellow]⚠[/yellow] no ingestible files found in any KB directory."
+            )
+            return
+
+        # Summary table — one row per source file across all agents.
+        show_removed = clean_source and any(
+            getattr(s, "chunks_removed", 0) > 0 for _, s in all_summaries
+        )
+        table = Table(title="[bold]Ingest summary[/bold]")
+        table.add_column("agent", style="bold cyan")
+        table.add_column("source", overflow="fold")
+        if show_removed:
+            table.add_column("removed", justify="right")
+        table.add_column("chunks", justify="right")
+
+        for agent_name, s in all_summaries:
+            row = [agent_name, getattr(s, "source", "?")]
+            if show_removed:
+                row.append(str(getattr(s, "chunks_removed", 0)))
+            row.append(str(getattr(s, "chunks_saved", 0)))
+            table.add_row(*row)
+
+        console.print(table)
+        total_chunks = sum(getattr(s, "chunks_saved", 0) for _, s in all_summaries)
+        total_files = len(all_summaries)
+        console.print(
+            f"[green]✓[/green] {total_chunks} chunks saved from "
+            f"{total_files} file(s) across "
+            f"{len(targets)} agent(s)."
+        )
+        console.print(
+            "[dim]Run [bold]mdk kb stats <agent>[/bold] to inspect per-agent chunk counts.[/dim]"
+        )
+
+    asyncio.run(_run())
+
+
 @kb_app.command("clear")
 def clear(
     agent: str = typer.Argument(..., help="Agent whose KB to clear."),
