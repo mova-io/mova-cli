@@ -48,7 +48,14 @@ def tracer() -> NullTracer:
 async def test_eval_markdown_pass_verdict(
     tmp_path: Path, pricing: PricingTable, storage: InMemoryStorage, tracer: NullTracer
 ) -> None:
-    bundle = load_agent(scaffold_agent(tmp_path / "demo", template="default"))
+    agent_dir = scaffold_agent(tmp_path / "demo", template="default")
+    # Controlled 2-case dataset so the rendered row counts are deterministic
+    # regardless of how many rows the template ships.
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hello"}, "expected": {"message": "Hello!"}}\n'
+        '{"input": {"text": "bye"}, "expected": {"message": "Goodbye!"}}\n'
+    )
+    bundle = load_agent(agent_dir)
     provider = MockProvider(response='{"message": "Hello!"}')
     executor = Executor(provider=provider, pricing=pricing, storage=storage, tracer=tracer)
     summary = await EvalEngine(executor=executor, provider=provider).run(bundle)
@@ -67,7 +74,12 @@ async def test_eval_markdown_pass_verdict(
 async def test_eval_markdown_fail_verdict(
     tmp_path: Path, pricing: PricingTable, storage: InMemoryStorage, tracer: NullTracer
 ) -> None:
-    bundle = load_agent(scaffold_agent(tmp_path / "demo", template="default"))
+    agent_dir = scaffold_agent(tmp_path / "demo", template="default")
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hello"}, "expected": {"message": "Hello!"}}\n'
+        '{"input": {"text": "bye"}, "expected": {"message": "Goodbye!"}}\n'
+    )
+    bundle = load_agent(agent_dir)
     provider = MockProvider(response='{"message": "wrong"}')
     executor = Executor(provider=provider, pricing=pricing, storage=storage, tracer=tracer)
     summary = await EvalEngine(executor=executor, provider=provider).run(bundle)

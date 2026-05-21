@@ -12,15 +12,16 @@ dropped in a future major release). Every example in this README uses `mdk`; sub
 
 ## Status
 
-**Current: `0.8.2.7`** (May 2026) — eval wizard polish cascade. Per-PR
-micro version bumps (PEP 440 4-part) ride inside each feature PR so
-`mdk --version` matches the merge ordinal between tagged releases.
+**Current: `0.8.2.71`** (May 2026) — guardrails type-safety, CHANGELOG
+backfill, release tags. Per-PR micro version bumps (PEP 440 4-part) ride
+inside each feature PR so `mdk --version` matches the merge ordinal
+between tagged releases.
 
 | version | tag | what landed |
 |---|---|---|
-| 0.8.x | — | Guided `mdk eval` wizard: generate-and-preview test cases, runs-per-case averaging, 10-category scorecard, live progress bar with score min/max, live-verify API keys before eval starts. Domain-scoped post-success menus. |
-| 0.7.x | — | Microsoft Teams bot (alpha — slices 3.1.a–3.1.d): bot framework integration, per-user identity binding, file uploads. See [ADR 003](docs/adr/003-teams-integration.md). |
-| 0.6.x | — | Canonical config split (`policy.yaml` + `runtime.yaml` + `movate.yaml`), four-dimension eval scoring (accuracy + faithfulness + coverage + latency). |
+| 0.8.x | [`v0.8.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.8.0) | Knowledge Base pipeline: `mdk kb ingest` (PDF/DOCX/HTML/OCR), hybrid BM25+vector+RRF search, multi-hop retrieval, LLM rerank, citation accuracy eval, conversation threads, memory subsystem. Guided `mdk eval` wizard, 10-category scorecard, live progress. |
+| 0.7.x | [`v0.7.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.7.0) | Native Anthropic + OpenAI providers, parallel tool-use dispatch, Microsoft Teams bot (slices 3.1.a–3.1.e), Runtime API (agent CRUD, runs, eval, trace endpoints). |
+| 0.6.x | [`v0.6.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.6.0) | Skills system (Python/HTTP/MCP backends, `mdk skills list|scaffold|run`), four-dimension eval scoring, per-objective gating, Azure Bicep IaC + `mdk deploy`, `movate watch` hot-reload. |
 | 0.5.0 | [`v0.5.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.5.0) | HTTP runtime + worker + Postgres — movate is now a service |
 | 0.4.0 | [`v0.4.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.4.0) | Observability + regression-detection (Langfuse, OTel, trace replay, eval baseline diff, run replay, CI eval-gate) |
 | 0.3.1 | [`v0.3.1`](https://github.com/mova-io/mova-cli/releases/tag/v0.3.1) | Workflow runner double-save fix |
@@ -71,6 +72,19 @@ that v1.0 builds on.
 | Worker autoscaling on queue depth | KEDA postgresql scaler in `containerapp-worker.bicep` | ✓ post-v1.0 |
 | Per-tenant monthly cost ceiling | `mdk tenants set-budget <id> --monthly-usd 500` | ✓ post-v1.0 |
 | Model policy enforcement | `movate.yaml: policy:` (allowed_providers, deny_models, max cost) | ✓ v1.0 stage 3 |
+| **Skills** (Python / HTTP / MCP) | `mdk skills list\|scaffold\|run` | ✓ v0.6 |
+| Native Anthropic provider | `runtime: native_anthropic` in `agent.yaml` | ✓ v0.7 |
+| Native OpenAI provider | `runtime: native_openai` in `agent.yaml` | ✓ v0.7 |
+| Parallel tool-use (multi-call in one turn) | automatic when model emits multiple calls | ✓ v0.7 |
+| Knowledge Base ingest | `mdk kb ingest <path>` (PDF, DOCX, HTML, Markdown, OCR) | ✓ v0.8 |
+| KB hybrid search | `mdk kb search <agent> <query>` (BM25 + vector + RRF) | ✓ v0.8 |
+| KB stats | `mdk kb stats [--by-source]` | ✓ v0.8 |
+| Auto-retrieval on agent runs | `retrieval:` stanza in `agent.yaml` | ✓ v0.8 |
+| Citation accuracy eval dimension | `citation_accuracy` in scorecard | ✓ v0.8 |
+| Conversation threads | `mdk threads list\|show\|delete` · `POST /threads` | ✓ v0.8 |
+| Thread history auto-injection | `thread_id` in run request | ✓ v0.8 |
+| Agent-level guardrails (PII / topic / content) | `guardrails:` in `agent.yaml` or `policy.yaml` | ✓ v0.8 |
+| Memory subsystem | `mdk memory set\|get\|list` · `SqliteStore` / `InMemoryStore` | ✓ v0.8 |
 
 ## Prerequisites
 

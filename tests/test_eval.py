@@ -138,9 +138,9 @@ def test_aggregate_unknown_mode_raises() -> None:
 def test_load_dataset_template(tmp_path: Path) -> None:
     bundle = load_agent(_scaffold(tmp_path / "demo"))
     cases, digest = load_dataset(bundle)
-    assert len(cases) == 2
+    assert len(cases) == 8  # agent_init template ships 8 eval cases
     assert cases[0].input == {"text": "hello"}
-    assert cases[0].expected == {"message": "Hello!"}
+    assert cases[0].expected == {"message": "Hello! How can I help you today?"}
     assert len(digest) == 64  # sha256 hex
 
 
@@ -215,15 +215,22 @@ def test_load_judge_invalid_yaml_raises(tmp_path: Path) -> None:
 async def test_engine_exact_match_pass(
     tmp_path: Path, pricing: PricingTable, storage, tracer
 ) -> None:
-    bundle = load_agent(_scaffold(tmp_path / "demo"))
-    # MockProvider returns exactly what the dataset's first case expects.
+    agent_dir = _scaffold(tmp_path / "demo")
+    # Write a controlled 2-case dataset so the test is independent of the
+    # template's shipped fixture count.
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hello"}, "expected": {"message": "Hello!"}}\n'
+        '{"input": {"text": "bye"}, "expected": {"message": "Goodbye!"}}\n'
+    )
+    bundle = load_agent(agent_dir)
+    # MockProvider returns exactly what the first case expects.
     provider = MockProvider(response='{"message": "Hello!"}')
     executor = _executor(provider, pricing, storage, tracer)
     engine = EvalEngine(executor=executor, provider=provider)
 
     summary = await engine.run(bundle)
     assert summary.sample_count == 2
-    # First case matches → 1.0; second ("4") doesn't → 0.0.
+    # First case matches → 1.0; second ("Goodbye!") doesn't → 0.0.
     assert summary.cases[0].aggregated_score == 1.0
     assert summary.cases[0].passed
     assert summary.cases[1].aggregated_score == 0.0
@@ -369,7 +376,14 @@ async def test_engine_llm_judge_requires_rubric(
 async def test_summary_to_record_round_trips(
     tmp_path: Path, pricing: PricingTable, storage, tracer
 ) -> None:
-    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    agent_dir = _scaffold(tmp_path / "demo")
+    # Controlled 2-case dataset so this test is independent of the template
+    # fixture count.
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "a"}, "expected": {"message": "A"}}\n'
+        '{"input": {"text": "b"}, "expected": {"message": "B"}}\n'
+    )
+    bundle = load_agent(agent_dir)
     provider = MockProvider(response='{"message": "Hello!"}')
     executor = _executor(provider, pricing, storage, tracer)
     engine = EvalEngine(executor=executor, provider=provider)
