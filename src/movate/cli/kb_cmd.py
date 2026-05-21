@@ -609,9 +609,27 @@ def ingest(
             await storage.close()  # type: ignore[attr-defined]
 
         if not summaries:
-            console.print(
-                "[yellow]⚠[/yellow] no ingestible files found (looked for .md / .markdown / .txt)."
-            )
+            if total_files == 0:
+                console.print(
+                    "[yellow]⚠[/yellow] no ingestible files found under "
+                    f"[bold]{path}[/bold]. "
+                    "Supported formats: .md .txt .pdf .docx .html .png .jpg .tiff"
+                )
+            else:
+                # Files were found but all failed to parse — most likely OCR missing.
+                _has_images = any(
+                    f.suffix.lower() in {".png", ".jpg", ".jpeg", ".tiff", ".gif"}
+                    for f in files_to_ingest
+                )
+                console.print(
+                    f"[yellow]⚠[/yellow] {total_files} file(s) found but none produced text. "
+                )
+                if _has_images:
+                    console.print(
+                        "  Image files detected. If Tesseract is not installed:\n"
+                        "  [bold]macOS:[/bold]  brew install tesseract\n"
+                        "  [bold]Linux:[/bold]  apt-get install tesseract-ocr"
+                    )
             return
 
         # Render a summary table — one row per source.
@@ -633,6 +651,39 @@ def ingest(
         console.print(table)
         total = sum(getattr(s, "chunks_saved", 0) for s in summaries)
         console.print(f"[green]✓[/green] {total} chunks saved across {len(summaries)} file(s).")
+
+        # Surface any files that were found but silently skipped by the parser
+        # (corrupt files, parse errors, or — most commonly — image files when
+        # the Tesseract binary is absent).
+        _skip_preview = 3
+        ingested_sources = {
+            Path(getattr(s, "source", "")).name for s in summaries
+        }
+        skipped = [f for f in files_to_ingest if f.name not in ingested_sources]
+        if skipped:
+            image_exts = {".png", ".jpg", ".jpeg", ".tiff", ".gif"}
+            image_skipped = [f for f in skipped if f.suffix.lower() in image_exts]
+            other_skipped = [f for f in skipped if f.suffix.lower() not in image_exts]
+            if image_skipped:
+                names = ", ".join(f.name for f in image_skipped[:_skip_preview])
+                ellipsis = "…" if len(image_skipped) > _skip_preview else ""
+                console.print(
+                    f"\n[yellow]⚠[/yellow]  {len(image_skipped)} image file(s) were skipped "
+                    f"({names}{ellipsis}).\n"
+                    "  OCR requires the Tesseract binary:\n"
+                    "  [bold]macOS:[/bold]  brew install tesseract\n"
+                    "  [bold]Linux:[/bold]  apt-get install tesseract-ocr\n"
+                    "  Then re-run [bold]mdk kb ingest[/bold] to pick up the skipped files."
+                )
+            if other_skipped:
+                names = ", ".join(f.name for f in other_skipped[:_skip_preview])
+                ellipsis = "…" if len(other_skipped) > _skip_preview else ""
+                console.print(
+                    f"\n[yellow]⚠[/yellow]  {len(other_skipped)} file(s) produced no text "
+                    f"and were skipped ({names}{ellipsis}).\n"
+                    "  Possible causes: corrupt file, encrypted PDF, or unsupported format."
+                )
+
         console.print(f'[dim]Try it: [bold]mdk kb search {agent} "your question here"[/bold][/dim]')
 
     asyncio.run(_run())
@@ -784,7 +835,9 @@ def _run_dry(*, path: Path, agent: str) -> None:
     files = find_files(path)
     if not files:
         err_console.print(
-            "[yellow]⚠[/yellow] no ingestible files found (looked for .md / .markdown / .txt)."
+            "[yellow]⚠[/yellow] no ingestible files found under "
+            f"[bold]{path}[/bold]. "
+            "Supported formats: .md .txt .pdf .docx .html .png .jpg .tiff"
         )
         return
 

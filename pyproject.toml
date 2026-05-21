@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "0.8.2.92"
+version = "0.8.2.93"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -53,6 +53,18 @@ dependencies = [
     # extracts the main-content HTML. Together they cover the
     # "messy HTML → plain text" round-trip. ~250KB; same lxml dep.
     "beautifulsoup4>=4.12,<5",
+    # OCR Python bindings for image files (PNG / JPG / TIFF) in the KB.
+    # pytesseract wraps the system Tesseract binary; Pillow decodes the
+    # raw bytes into PIL Image objects. Both are listed as core deps —
+    # same rationale as pypdf: silently skipping image files on first
+    # `mdk kb ingest` is far worse UX than a slightly larger install.
+    # The Python packages install cleanly even when the Tesseract binary
+    # is absent; `mdk kb ingest` detects the missing binary and prints
+    # an actionable `brew install tesseract` message at that point.
+    # pdf2image (for scanned PDF pages) stays in the [ocr] extra because
+    # it requires Poppler — a heavier system dependency than Tesseract.
+    "pytesseract>=0.3,<1",
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
@@ -77,23 +89,15 @@ cross-encoder = [
     "sentence-transformers>=2.7,<4",
 ]
 ocr = [
-    # OCR fallback for scanned-image PDFs and standalone image files
-    # (PR-CC / PR-HH / PR-JJ). pdf2image wraps Poppler's pdftoppm
-    # renderer to rasterise PDF pages at 300 DPI; pytesseract calls
-    # the system Tesseract binary to extract text; Pillow decodes
-    # standalone image files (PNG/JPG/TIFF) directly.
-    # System dependencies required:
-    #   - Poppler (for PDF pages: `brew install poppler` / `apt-get install poppler-utils`)
-    #   - Tesseract (`brew install tesseract` / `apt-get install tesseract-ocr`)
-    # Without the system binaries the Python packages install fine but
-    # fail at runtime; movate gracefully returns None and logs a warning.
+    # Scanned-image PDF support: pdf2image wraps Poppler's pdftoppm
+    # renderer to rasterise each PDF page at 300 DPI before passing to
+    # Tesseract. Requires the Poppler system binary:
+    #   macOS: brew install poppler
+    #   Linux: apt-get install poppler-utils
+    # pytesseract and Pillow are now core deps (see [project.dependencies])
+    # so this extra only adds the pdf2image rasteriser for the scanned-PDF
+    # path. Standalone image files (PNG/JPG/TIFF) work out-of-the-box.
     "pdf2image>=1.17,<2",
-    "pytesseract>=0.3,<1",
-    # Pillow is used to decode standalone image files (PNG/JPG/TIFF)
-    # into PIL Image objects before passing to Tesseract or EasyOCR.
-    # EasyOCR already pulls Pillow in transitively via torchvision, but
-    # listing it here keeps the [ocr] extra self-contained.
-    "pillow>=10.0",
 ]
 easyocr = [
     # EasyOCR backend for scanned-image PDFs — alternative to the [ocr]

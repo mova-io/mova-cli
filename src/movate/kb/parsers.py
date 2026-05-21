@@ -376,10 +376,21 @@ def _ocr_tesseract(image: Any, lang: str) -> str | None:
     try:
         import pytesseract  # noqa: PLC0415
     except ImportError:
-        logger.debug("pytesseract not installed — install movate-cli[ocr] to enable Tesseract OCR.")
+        logger.warning(
+            "pytesseract not installed — OCR unavailable for this file. "
+            "Run: uv pip install --python "
+            "$(which mdk | xargs dirname)/../bin/python pytesseract pillow"
+        )
         return None
     try:
         return pytesseract.image_to_string(image, lang=lang, config=_OCR_CONFIG)  # type: ignore[no-any-return]
+    except pytesseract.TesseractNotFoundError:
+        logger.warning(
+            "Tesseract binary not found — image OCR skipped. "
+            "Install it with: brew install tesseract  (macOS) "
+            "or: apt-get install tesseract-ocr  (Linux/WSL)"
+        )
+        return None
     except Exception as exc:
         logger.warning("Tesseract OCR failed: %s", exc)
         return None
@@ -705,9 +716,9 @@ def parse_image(content: bytes) -> ParseResult | None:
     try:
         from PIL import Image as _PILImage  # noqa: PLC0415
     except ImportError:
-        logger.debug(
+        logger.warning(
             "Pillow not installed — image OCR unavailable. "
-            "Install movate-cli[ocr] or movate-cli[easyocr] to enable image parsing."
+            "Run: uv pip install --python $(which mdk | xargs dirname)/../bin/python pillow"
         )
         return None
 

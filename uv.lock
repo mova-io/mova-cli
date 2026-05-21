@@ -2212,7 +2212,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "0.8.2.92"
+version = "0.8.2.93"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -2221,8 +2221,10 @@ dependencies = [
     { name = "jinja2" },
     { name = "jsonschema" },
     { name = "litellm" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "pypdf" },
+    { name = "pytesseract" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -2263,8 +2265,6 @@ langfuse = [
 ]
 ocr = [
     { name = "pdf2image" },
-    { name = "pillow" },
-    { name = "pytesseract" },
 ]
 openai = [
     { name = "openai" },
@@ -2331,10 +2331,10 @@ requires-dist = [
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.25" },
     { name = "pdf2image", marker = "extra == 'easyocr'", specifier = ">=1.17,<2" },
     { name = "pdf2image", marker = "extra == 'ocr'", specifier = ">=1.17,<2" },
-    { name = "pillow", marker = "extra == 'ocr'", specifier = ">=10.0" },
+    { name = "pillow", specifier = ">=10.0" },
     { name = "pydantic", specifier = ">=2.6,<3" },
     { name = "pypdf", specifier = ">=4.0,<6" },
-    { name = "pytesseract", marker = "extra == 'ocr'", specifier = ">=0.3,<1" },
+    { name = "pytesseract", specifier = ">=0.3,<1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1" },
