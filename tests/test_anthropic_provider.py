@@ -23,7 +23,15 @@ from movate.core.failures import (
     SchemaError,
 )
 from movate.core.failures import RateLimitError as MovateRateLimitError
-from movate.providers.anthropic import AnthropicProvider
+from movate.providers.anthropic import (
+    AnthropicProvider,
+    _stream_chunk_from_event,
+    _to_completion_response,
+    _translate_exception,
+    _translate_messages,
+    _translate_params,
+    _tokens_from_usage,
+)
 from movate.providers.base import CompletionRequest, Message
 
 # ---------------------------------------------------------------------------
@@ -760,6 +768,416 @@ async def test_complete_handles_malformed_tool_call_arguments() -> None:
     await provider.complete(CompletionRequest(provider="claude-sonnet-4-6", messages=history))
     sent_messages = fake.messages.last_create_call["messages"]
     assert sent_messages[0]["content"][0]["input"] == {}
+
+
+# ---------------------------------------------------------------------------
+# _translate_messages — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_translate_messages_system_extracted_to_string() -> None:
+    """System role is extracted to a separate string; non-system messages remain."""
+    system_text, messages = _translate_messages(
+        [
+            Message(role="system", content="be concise"),
+            Message(role="user", content="hello"),
+        ]
+    )
+    assert system_text == "be concise"
+    assert messages == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.unit
+def test_translate_messages_multiple_system_parts_joined() -> None:
+    """Multiple system messages are joined with double newline."""
+    system_text, messages = _translate_messages(
+        [
+            Message(role="system", content="part one"),
+            Message(role="system", content="part two"),
+            Message(role="user", content="hi"),
+        ]
+    )
+    assert system_text == "part one\n\npart two"
+    assert len(messages) == 1
+
+
+@pytest.mark.unit
+def test_translate_messages_no_system_returns_empty_string() -> None:
+    """When there is no system message the system string is empty."""
+    system_text, messages = _translate_messages(
+        [Message(role="user", content="hello")]
+    )
+    assert system_text == ""
+    assert messages == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.unit
+def test_translate_messages_plain_user_and_assistant_pass_through() -> None:
+    """Plain user and assistant text messages pass through as string content."""
+    _, messages = _translate_messages(
+        [
+            Message(role="user", content="what is 2+2?"),
+            Message(role="assistant", content="4"),
+        ]
+    )
+    assert messages == [
+        {"role": "user", "content": "what is 2+2?"},
+        {"role": "assistant", "content": "4"},
+    ]
+
+
+@pytest.mark.unit
+def test_translate_messages_tool_role_becomes_tool_result_in_user_message() -> None:
+    """role=tool message becomes a tool_result content block inside a user message."""
+    _, messages = _translate_messages(
+        [
+            Message(role="tool", content='{"result": 42}', tool_call_id="call_x"),
+        ]
+    )
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == [
+        {"type": "tool_result", "tool_use_id": "call_x", "content": '{"result": 42}'}
+    ]
+
+
+@pytest.mark.unit
+def test_translate_messages_consecutive_tool_results_coalesce() -> None:
+    """Multiple consecutive tool results land in a single user message."""
+    _, messages = _translate_messages(
+        [
+            Message(role="tool", content="a", tool_call_id="id1"),
+            Message(role="tool", content="b", tool_call_id="id2"),
+        ]
+    )
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert len(messages[0]["content"]) == 2
+    assert messages[0]["content"][0]["tool_use_id"] == "id1"
+    assert messages[0]["content"][1]["tool_use_id"] == "id2"
+
+
+@pytest.mark.unit
+def test_translate_messages_assistant_with_tool_calls_becomes_tool_use_blocks() -> None:
+    """Assistant message with tool_calls becomes tool_use content blocks."""
+    _, messages = _translate_messages(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "toolu_abc",
+                        "type": "function",
+                        "function": {"name": "my_tool", "arguments": '{"x": 1}'},
+                    }
+                ],
+            )
+        ]
+    )
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == [
+        {"type": "tool_use", "id": "toolu_abc", "name": "my_tool", "input": {"x": 1}}
+    ]
+
+
+@pytest.mark.unit
+def test_translate_messages_assistant_text_plus_tool_call_includes_text_block() -> None:
+    """Text prelude before a tool call is preserved as a text block."""
+    _, messages = _translate_messages(
+        [
+            Message(
+                role="assistant",
+                content="Let me check.",
+                tool_calls=[
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            )
+        ]
+    )
+    content = messages[0]["content"]
+    assert content[0] == {"type": "text", "text": "Let me check."}
+    assert content[1]["type"] == "tool_use"
+    assert content[1]["name"] == "lookup"
+
+
+@pytest.mark.unit
+def test_translate_messages_malformed_arguments_yields_empty_input() -> None:
+    """Malformed tool_call arguments fall back to empty dict without crashing."""
+    _, messages = _translate_messages(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "toolu_bad",
+                        "type": "function",
+                        "function": {"name": "tool", "arguments": "{not json"},
+                    }
+                ],
+            )
+        ]
+    )
+    assert messages[0]["content"][0]["input"] == {}
+
+
+# ---------------------------------------------------------------------------
+# _to_completion_response — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_to_completion_response_text_only() -> None:
+    """Text-only response → kind='final' with text."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    resp = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="hello there")],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0),
+        model="claude-haiku",
+        stop_reason="end_turn",
+    )
+    result = _to_completion_response(resp)
+    assert result.kind == "final"
+    assert result.text == "hello there"
+    assert result.tokens.input == 10
+    assert result.tokens.output == 5
+
+
+@pytest.mark.unit
+def test_to_completion_response_single_tool_use() -> None:
+    """Single tool_use block → kind='tool_use', correct fields."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    resp = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="tool_use", id="toolu_1", name="calc", input={"a": 2, "b": 3}),
+        ],
+        usage=SimpleNamespace(input_tokens=8, output_tokens=3, cache_read_input_tokens=0),
+        model="claude-sonnet",
+        stop_reason="tool_use",
+    )
+    result = _to_completion_response(resp)
+    assert result.kind == "tool_use"
+    assert result.tool_name == "calc"
+    assert result.tool_id == "toolu_1"
+    assert result.tool_input == {"a": 2, "b": 3}
+
+
+@pytest.mark.unit
+def test_to_completion_response_multiple_parallel_tool_use() -> None:
+    """Multiple tool_use blocks → parallel_tool_calls has all; first is primary."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    resp = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="tool_use", id="toolu_1", name="first", input={"k": 1}),
+            SimpleNamespace(type="tool_use", id="toolu_2", name="second", input={"k": 2}),
+        ],
+        usage=SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_input_tokens=0),
+        model="claude-sonnet",
+        stop_reason="tool_use",
+    )
+    result = _to_completion_response(resp)
+    assert result.tool_name == "first"
+    assert result.tool_id == "toolu_1"
+    assert len(result.parallel_tool_calls) == 2
+    assert result.parallel_tool_calls[1].name == "second"
+    assert result.parallel_tool_calls[1].call_id == "toolu_2"
+    assert result.parallel_tool_calls[1].input == {"k": 2}
+
+
+@pytest.mark.unit
+def test_to_completion_response_text_preceding_tool_use() -> None:
+    """Text block before tool_use is preserved in .text field."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    resp = SimpleNamespace(
+        content=[
+            SimpleNamespace(type="text", text="I'll use the tool."),
+            SimpleNamespace(type="tool_use", id="toolu_x", name="do_it", input={}),
+        ],
+        usage=SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_input_tokens=0),
+        model="claude-sonnet",
+        stop_reason="tool_use",
+    )
+    result = _to_completion_response(resp)
+    assert result.kind == "tool_use"
+    assert result.text == "I'll use the tool."
+
+
+@pytest.mark.unit
+def test_to_completion_response_usage_cache_tokens_mapped() -> None:
+    """cache_read_input_tokens → TokenUsage.cached_input."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    resp = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="ok")],
+        usage=SimpleNamespace(
+            input_tokens=100, output_tokens=20, cache_read_input_tokens=75
+        ),
+        model="claude-sonnet",
+        stop_reason="end_turn",
+    )
+    result = _to_completion_response(resp)
+    assert result.tokens.input == 100
+    assert result.tokens.output == 20
+    assert result.tokens.cached_input == 75
+
+
+# ---------------------------------------------------------------------------
+# _translate_exception — direct unit tests (including unmapped paths)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_translate_exception_permission_denied_is_auth_error() -> None:
+    """PermissionDeniedError → AuthError (same as AuthenticationError)."""
+    PermissionDeniedError = type("PermissionDeniedError", (Exception,), {})
+    with pytest.raises(AuthError):
+        _translate_exception(PermissionDeniedError("denied"))
+
+
+@pytest.mark.unit
+def test_translate_exception_internal_server_is_model_unavailable() -> None:
+    """InternalServerError → ModelUnavailableError."""
+    InternalServerError = type("InternalServerError", (Exception,), {})
+    with pytest.raises(ModelUnavailableError):
+        _translate_exception(InternalServerError("500"))
+
+
+@pytest.mark.unit
+def test_translate_exception_not_found_is_model_unavailable() -> None:
+    """NotFoundError → ModelUnavailableError."""
+    NotFoundError = type("NotFoundError", (Exception,), {})
+    with pytest.raises(ModelUnavailableError):
+        _translate_exception(NotFoundError("not found"))
+
+
+@pytest.mark.unit
+def test_translate_exception_unknown_class_is_model_unavailable_with_prefix() -> None:
+    """Unknown exception class → ModelUnavailableError with 'unmapped anthropic.' prefix."""
+    SomeWeirdError = type("SomeWeirdError", (Exception,), {})
+    with pytest.raises(ModelUnavailableError, match="unmapped anthropic.SomeWeirdError"):
+        _translate_exception(SomeWeirdError("oops"))
+
+
+@pytest.mark.unit
+def test_translate_exception_bad_request_context_window_variant() -> None:
+    """BadRequestError with 'context window' text → ContextLengthError."""
+    BadRequestError = type("BadRequestError", (Exception,), {})
+    with pytest.raises(ContextLengthError):
+        _translate_exception(BadRequestError("context window exceeded"))
+
+
+# ---------------------------------------------------------------------------
+# _translate_params — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_translate_params_defaults_max_tokens_when_absent() -> None:
+    """max_tokens is injected when missing."""
+    result = _translate_params({})
+    assert result["max_tokens"] == 4096
+
+
+@pytest.mark.unit
+def test_translate_params_preserves_user_max_tokens() -> None:
+    """User-supplied max_tokens is NOT overridden."""
+    result = _translate_params({"max_tokens": 512})
+    assert result["max_tokens"] == 512
+
+
+@pytest.mark.unit
+def test_translate_params_passes_other_keys_unchanged() -> None:
+    """Non-max_tokens keys pass through untouched."""
+    result = _translate_params({"temperature": 0.5, "top_p": 0.9})
+    assert result["temperature"] == 0.5
+    assert result["top_p"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# _tokens_from_usage — direct unit tests (Anthropic)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_tokens_from_usage_none_returns_empty() -> None:
+    """None usage → empty TokenUsage (all zeros)."""
+    tokens = _tokens_from_usage(None)
+    assert tokens.input == 0
+    assert tokens.output == 0
+    assert tokens.cached_input == 0
+
+
+@pytest.mark.unit
+def test_tokens_from_usage_maps_all_fields() -> None:
+    """All three usage fields map correctly."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    usage = SimpleNamespace(input_tokens=50, output_tokens=15, cache_read_input_tokens=30)
+    tokens = _tokens_from_usage(usage)
+    assert tokens.input == 50
+    assert tokens.output == 15
+    assert tokens.cached_input == 30
+
+
+# ---------------------------------------------------------------------------
+# _stream_chunk_from_event — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_event_text_delta() -> None:
+    """content_block_delta with text_delta type → StreamChunk with text."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    event = SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text="some text"),
+    )
+    chunk = _stream_chunk_from_event(event)
+    assert chunk is not None
+    assert chunk.text == "some text"
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_event_message_start_returns_none() -> None:
+    """message_start event → None (we don't surface it)."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    event = SimpleNamespace(type="message_start", message=SimpleNamespace())
+    assert _stream_chunk_from_event(event) is None
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_event_other_type_returns_none() -> None:
+    """Unrecognised event types → None."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    for event_type in ("content_block_start", "message_delta", "message_stop", "ping"):
+        event = SimpleNamespace(type=event_type)
+        assert _stream_chunk_from_event(event) is None, f"expected None for {event_type}"
+
+
+@pytest.mark.unit
+def test_stream_chunk_from_event_non_text_delta_returns_none() -> None:
+    """content_block_delta with non-text_delta (e.g. input_json_delta) → None."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    event = SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="input_json_delta", partial_json='{"a":'),
+    )
+    assert _stream_chunk_from_event(event) is None
 
 
 # ---------------------------------------------------------------------------
