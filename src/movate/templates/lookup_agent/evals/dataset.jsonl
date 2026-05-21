@@ -1,3 +1,10 @@
 {"input": {"user_id": 1, "question": "What is their email address?"}, "expected": {"answer": "Their email address is Sincere@april.biz.", "user_found": true}}
 {"input": {"user_id": 2, "question": "What company do they work for?"}, "expected": {"answer": "They work for Romaguera-Jacobson.", "user_found": true}}
 {"input": {"user_id": 3, "question": "What city are they in?"}, "expected": {"answer": "They are in McKenziehaven.", "user_found": true}}
+{"input": {"user_id": 1, "question": "What is their username?"}, "expected": {"answer": "Their username is Bret.", "user_found": true}}
+{"input": {"user_id": 2, "question": "What is their username?"}, "expected": {"answer": "Their username is Antonette.", "user_found": true}}
+{"input": {"user_id": 5, "question": "What company do they work for?"}, "expected": {"answer": "They work for Keebler LLC.", "user_found": true}}
+{"input": {"user_id": 99, "question": "What is their email address?"}, "expected": {"answer": "No user found with ID 99.", "user_found": false}}
+{"input": {"user_id": 3, "question": "What is their phone number?"}, "expected": {"answer": "Their phone number is 1-463-123-4447.", "user_found": true}}
+{"input": {"user_id": 7, "question": "What city do they live in?"}, "expected": {"answer": "They live in Howell-Reichert.", "user_found": true}}
+{"input": {"user_id": 4, "question": "What is their address?"}, "expected": {"answer": "Their address is Hoeger Mall, Keeble, South Elvis.", "user_found": true}}

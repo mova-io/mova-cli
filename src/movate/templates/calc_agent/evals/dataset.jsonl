@@ -1,3 +1,8 @@
 {"input": {"expression": "2 + 3"}, "expected": {"result": 5.0, "explanation": "2 plus 3 equals 5."}}
 {"input": {"expression": "(10 - 4) * 3 / 2"}, "expected": {"result": 9.0, "explanation": "10 minus 4 is 6, times 3 is 18, divided by 2 is 9."}}
 {"input": {"expression": "100 / 4 + 7 * 3"}, "expected": {"result": 46.0, "explanation": "100 divided by 4 is 25, 7 times 3 is 21, 25 plus 21 is 46."}}
+{"input": {"expression": "(100 - 25) / (5 * 3)"}, "expected": {"result": 5.0, "explanation": "100 minus 25 is 75, 5 times 3 is 15, 75 divided by 15 is 5."}}
+{"input": {"expression": "3.14 * 2"}, "expected": {"result": 6.28, "explanation": "3.14 multiplied by 2 equals 6.28."}}
+{"input": {"expression": "-5 * 3 + 20"}, "expected": {"result": 5.0, "explanation": "Negative 5 times 3 is negative 15, plus 20 equals 5."}}
+{"input": {"expression": "2 + 3 * 4"}, "expected": {"result": 14.0, "explanation": "Following order of operations, 3 times 4 is 12 first, then 2 plus 12 equals 14."}}
+{"input": {"expression": "((2 + 3) * (4 - 1)) / 5 + 10"}, "expected": {"result": 13.0, "explanation": "2 plus 3 is 5, 4 minus 1 is 3, 5 times 3 is 15, 15 divided by 5 is 3, 3 plus 10 equals 13."}}
