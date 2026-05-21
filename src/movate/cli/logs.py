@@ -55,6 +55,18 @@ def logs(
         bool,
         typer.Option("--raw", help="Print the raw RunRecord JSON and exit."),
     ] = False,
+    timeout: Annotated[
+        int,
+        typer.Option(
+            "--timeout",
+            "-t",
+            help=(
+                f"Seconds to wait before giving up when --tail is active "
+                f"(default: {_TAIL_TIMEOUT_S}s)."
+            ),
+            min=1,
+        ),
+    ] = _TAIL_TIMEOUT_S,
 ) -> None:
     """Inspect a run record: input, output, cost, latency, errors.
 
@@ -63,10 +75,11 @@ def logs(
         mdk logs abc123               # show run abc123
         mdk logs --last               # show the most-recent run
         mdk logs --last --agent faq   # most-recent faq run
-        mdk logs abc123 --tail        # poll until terminal
+        mdk logs abc123 --tail        # poll until terminal (default 300s)
+        mdk logs abc123 --tail -t 60  # poll with 60s timeout
         mdk logs abc123 --raw         # raw JSON record
     """
-    asyncio.run(_cmd(run_id=run_id, agent=agent, last=last, tail=tail, raw=raw))
+    asyncio.run(_cmd(run_id=run_id, agent=agent, last=last, tail=tail, raw=raw, timeout=timeout))
 
 
 async def _cmd(
@@ -76,6 +89,7 @@ async def _cmd(
     last: bool,
     tail: bool,
     raw: bool,
+    timeout: int = _TAIL_TIMEOUT_S,
 ) -> None:
     storage = build_storage()
     await storage.init()
@@ -92,7 +106,7 @@ async def _cmd(
     _render(record)
 
     if tail and record.status not in _TERMINAL:
-        await _poll(storage, run_id=record.run_id)
+        await _poll(storage, run_id=record.run_id, timeout=timeout)
 
 
 async def _resolve(
@@ -108,8 +122,8 @@ async def _resolve(
     return await storage.get_run(run_id, tenant_id="local")
 
 
-async def _poll(storage, *, run_id: str) -> None:
-    deadline = time.monotonic() + _TAIL_TIMEOUT_S
+async def _poll(storage, *, run_id: str, timeout: int = _TAIL_TIMEOUT_S) -> None:
+    deadline = time.monotonic() + timeout
     last_status: str | None = None
     console.print("[dim]watching for terminal status…[/dim]")
     while time.monotonic() < deadline:
@@ -123,7 +137,7 @@ async def _poll(storage, *, run_id: str) -> None:
             _render(record)
             return
         await asyncio.sleep(_POLL_INTERVAL_S)
-    err.print(f"[yellow]⚠[/yellow] timed out after {_TAIL_TIMEOUT_S}s — run still in progress")
+    err.print(f"[yellow]⚠[/yellow] timed out after {timeout}s — run still in progress")
 
 
 # ---------------------------------------------------------------------------
