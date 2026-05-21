@@ -154,6 +154,11 @@ async def _chat_loop(
             f"({'mock' if mock else bundle.spec.model.provider}, {mem_status})  "
             f"— Ctrl-C, Ctrl-D, or :q to exit[/dim]"
         )
+        if memory:
+            hint(
+                "[dim]tip: [bold]--no-memory[/bold] makes each turn "
+                "independent (no context carryover — good for prompt iteration)[/dim]"
+            )
         while True:
             try:
                 user_message = Prompt.ask("[bold cyan]you[/bold cyan]", console=err)

@@ -381,6 +381,14 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
         err_console.print("[red]✗[/red] --baseline and --baseline-file are mutually exclusive")
         raise typer.Exit(code=2)
 
+    _valid_gate_modes = ("mean", "min", "p10")
+    if gate_mode not in _valid_gate_modes:
+        err_console.print(
+            f"[red]✗[/red] --gate-mode {gate_mode!r} is not valid. "
+            f"Choose one of: {', '.join(_valid_gate_modes)}"
+        )
+        raise typer.Exit(code=2)
+
     # --judge-model / --judge-rubric: build an inline JudgeConfig that
     # bypasses judge.yaml. Validated here so errors surface before any
     # network / dataset work begins.
@@ -2008,13 +2016,15 @@ def _eval_all_in_project(
     rows: list[tuple[str, str]] = []
     failed = 0
 
-    for agent_dir in agent_dirs:
+    def _run_one_agent(agent_dir: Path) -> None:
+        """Run eval for a single agent dir; mutates ``rows`` / ``failed``."""
+        nonlocal failed
         try:
             bundle = load_agent(agent_dir)
         except AgentLoadError as exc:
             rows.append((agent_dir.name, f"[red]✗ load failed[/red]: {str(exc)[:80]}"))
             failed += 1
-            continue
+            return
 
         # Run eval; capture pass/fail from the same async path that the
         # single-agent `mdk eval` uses. Re-raises typer.Exit on gate
@@ -2054,6 +2064,20 @@ def _eval_all_in_project(
             else:
                 rows.append((agent_dir.name, "[red]✗ gate failed[/red]"))
                 failed += 1
+
+    with progress_bar(
+        description="[dim]Evaluating agents[/dim]",
+        total=len(agent_dirs),
+        transient=True,
+    ) as advance:
+        for agent_dir in agent_dirs:
+            # Update description to show the agent currently being evaluated,
+            # then run, then advance the counter. The compact eval output
+            # (one greppable summary line per agent) goes to stdout so it
+            # doesn't fight the progress bar on stderr.
+            advance(0, suffix=f" [dim]({agent_dir.name})[/dim]")
+            _run_one_agent(agent_dir)
+            advance()
 
     # Render the summary table.
     table = Table(
