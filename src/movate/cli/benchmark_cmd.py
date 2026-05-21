@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import statistics
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -48,6 +49,7 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
@@ -400,7 +402,14 @@ def benchmark_live(
             f"[bold]{candidate_model}[/bold]{' (mock)' if mock else ''}…[/dim]"
         )
 
-    rows = asyncio.run(_replay_all(candidate_bundle=candidate_bundle, runs=runs, mock=mock))
+    rows = asyncio.run(
+        _replay_all(
+            candidate_bundle=candidate_bundle,
+            runs=runs,
+            mock=mock,
+            show_progress=not json_output and sys.stderr.isatty(),
+        )
+    )
     summary = summarize(rows)
 
     if json_output:
@@ -443,12 +452,35 @@ def benchmark_live(
 
 
 async def _replay_all(
-    *, candidate_bundle: Any, runs: list[RunRecord], mock: bool
+    *,
+    candidate_bundle: Any,
+    runs: list[RunRecord],
+    mock: bool,
+    show_progress: bool = False,
 ) -> list[ReplayRow]:
-    """Drive sequential replay under one runtime."""
+    """Drive sequential replay under one runtime.
+
+    ``show_progress`` renders a Rich Progress bar to stderr — suppressed
+    in JSON mode and non-TTY environments so CI log captures stay clean.
+    """
     rt = await build_local_runtime(mock=mock)
+    rows: list[ReplayRow] = []
     try:
-        rows = [await _replay_run(rt, candidate_bundle, r) for r in runs]
+        if show_progress:
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=err_console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task("[dim]Replaying…[/dim]", total=len(runs))
+                for run in runs:
+                    rows.append(await _replay_run(rt, candidate_bundle, run))
+                    progress.advance(task)
+        else:
+            rows = [await _replay_run(rt, candidate_bundle, r) for r in runs]
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
     return rows
