@@ -1098,10 +1098,10 @@ class SqliteProvider:
     ) -> list[KbChunkWithScore]:
         # Same Python-cosine ranking as Postgres path. The index on
         # (agent, tenant_id) keeps the SELECT cheap; ranking dominates.
-        from movate.storage.postgres import _rank_chunks_by_cosine  # noqa: PLC0415
+        from movate.storage._cosine import rank_chunks_by_cosine  # noqa: PLC0415
 
         chunks = await self.list_kb_chunks(agent=agent, tenant_id=tenant_id, limit=100_000)
-        return _rank_chunks_by_cosine(chunks, query_embedding, limit)
+        return rank_chunks_by_cosine(chunks, query_embedding, limit)
 
     async def list_kb_chunks(
         self,

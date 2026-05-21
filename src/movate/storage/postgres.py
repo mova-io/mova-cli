@@ -47,6 +47,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.storage._cosine import rank_chunks_by_cosine as _rank_chunks_by_cosine  # noqa: F401
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -1028,7 +1029,8 @@ class PostgresProvider:
             tenant_id,
         )
         chunks = [_row_to_kb_chunk(r) for r in rows]
-        return _rank_chunks_by_cosine(chunks, query_embedding, limit)
+        from movate.storage._cosine import rank_chunks_by_cosine  # noqa: PLC0415
+        return rank_chunks_by_cosine(chunks, query_embedding, limit)
 
     async def list_kb_chunks(
         self,
@@ -1371,42 +1373,6 @@ def _row_to_kb_chunk(row: asyncpg.Record) -> KbChunk:
         created_at=row_dict["created_at"],
     )
 
-
-def _rank_chunks_by_cosine(
-    chunks: list[KbChunk], query: list[float], limit: int
-) -> list[KbChunkWithScore]:
-    """Score every chunk against ``query`` by cosine similarity,
-    return the top ``limit`` descending. Shared between Postgres and
-    Sqlite paths so both return identical ranking semantics.
-
-    Cosine = dot(a, b) / (||a|| * ||b||). Both vectors are produced
-    by the same embedding model so the normalization is well-defined;
-    a length mismatch (e.g. caller embedded with a different model
-    than the chunks) raises ValueError — silent dim-mismatch would
-    return garbage scores."""
-    import math  # noqa: PLC0415
-
-    if not chunks:
-        return []
-    q_norm = math.sqrt(sum(x * x for x in query))
-    if q_norm == 0.0:
-        return []
-    scored: list[KbChunkWithScore] = []
-    for c in chunks:
-        if len(c.embedding) != len(query):
-            raise ValueError(
-                f"embedding dim mismatch: chunk {c.chunk_id} is "
-                f"{len(c.embedding)}-dim but query is {len(query)}-dim. "
-                f"Re-embed the query with {c.embedding_model!r} or "
-                f"re-ingest the KB with the query's model."
-            )
-        c_norm = math.sqrt(sum(x * x for x in c.embedding))
-        if c_norm == 0.0:
-            continue  # zero-vector chunks (shouldn't happen) — skip
-        dot = sum(a * b for a, b in zip(c.embedding, query, strict=True))
-        scored.append(KbChunkWithScore(chunk=c, score=dot / (q_norm * c_norm)))
-    scored.sort(key=lambda s: s.score, reverse=True)
-    return scored[: int(limit)]
 
 
 def _row_to_feedback(row: asyncpg.Record) -> FeedbackRecord:
