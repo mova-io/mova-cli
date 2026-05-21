@@ -405,7 +405,7 @@ def build_memory_store() -> MemoryStore:
 
     Values:
       * ``memory`` (default) — :class:`InMemoryStore`
-      * ``sqlite``           — :class:`SqliteStore` (scaffold)
+      * ``sqlite``           — :class:`SqliteStore`
 
     Future:
       * ``postgres`` — multi-worker production backend

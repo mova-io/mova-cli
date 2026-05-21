@@ -36,6 +36,12 @@ from typing import Any
 
 import httpx
 import pytest
+
+pytest.importorskip(
+    "cryptography",
+    reason="cryptography not installed — install with: uv add 'movate-cli[github]'",
+)
+
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 

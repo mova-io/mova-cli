@@ -30,7 +30,6 @@ What ships in the MVP:
 
 What does NOT ship (future):
 
-* Git SHA capture (TODO marker — needs gitpython or git subprocess)
 * Pricing / provider version capture (~30 min add when Sprint N
   Day 4-5 `mdk diff` needs it for cost-drift detection)
 * Cross-snapshot eval-score persistence (lands with Sprint S audit v2)
