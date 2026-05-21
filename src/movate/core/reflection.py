@@ -40,6 +40,7 @@ from movate.providers.base import (
 
 if TYPE_CHECKING:
     from movate.core.models import ReflectionConfig
+    from movate.providers.pricing import PricingTable
 
 log = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ async def call_judge(
     config: ReflectionConfig,
     output_text: str,
     judge_provider: BaseLLMProvider,
-    pricing_lookup: object,
+    pricing_lookup: PricingTable,
 ) -> JudgeVerdict:
     """Invoke the judge once against ``output_text``.
 
@@ -150,7 +151,7 @@ async def call_judge(
     # ``compute_cost`` is the canonical surface on PricingTable.
     cost_usd = 0.0
     try:
-        cost_usd = pricing_lookup.cost_for(  # type: ignore[attr-defined]
+        cost_usd = pricing_lookup.cost_for(
             provider=config.judge_model,
             tokens=response.tokens,
         )

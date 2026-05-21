@@ -626,3 +626,459 @@ async def test_agents_requires_auth(storage: InMemoryStorage) -> None:
     r = test_client.get("/agents")
     assert r.status_code == 401
     assert r.json()["detail"]["error"]["code"] == "auth_required"
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the v1 endpoint tests below
+# ---------------------------------------------------------------------------
+
+
+import asyncio
+from pathlib import Path
+
+from movate.testing import scaffold_agent
+from movate.runtime.registry import scan_agents
+
+
+async def _make_authed_client(
+    storage: InMemoryStorage,
+    *,
+    agents_path: Path | None = None,
+    agents=None,
+) -> tuple[TestClient, dict[str, str]]:
+    """Build an app + TestClient with a fresh auth key and return both the
+    client and a pre-built Authorization header dict."""
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="v1-tests")
+    await storage.save_api_key(minted.record)
+    app = build_app(storage, agents=agents or [], agents_path=agents_path)
+    client = TestClient(app)
+    return client, {"Authorization": f"Bearer {minted.full_key}"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/agents — versioned catalog
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_list_agents_empty_catalog(storage: InMemoryStorage) -> None:
+    """When the registry is empty the catalog endpoint returns count=0."""
+    client, headers = await _make_authed_client(storage)
+    r = client.get("/api/v1/agents", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 0
+    assert body["agents"] == []
+
+
+@pytest.mark.unit
+async def test_v1_list_agents_contains_scaffolded_agent(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "my-bot", name="my-bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+    r = client.get("/api/v1/agents", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 1
+    names = [a["name"] for a in body["agents"]]
+    assert "my-bot" in names
+
+
+@pytest.mark.unit
+async def test_v1_list_agents_filter_returns_empty_on_miss(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "bot", name="bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+    r = client.get("/api/v1/agents?role=role-that-does-not-exist", headers=headers)
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+
+
+@pytest.mark.unit
+async def test_v1_list_agents_401_without_auth(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.get("/api/v1/agents")
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/agents/{name} — agent detail
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_get_agent_detail_happy_path(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "detail-bot", name="detail-bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+    r = client.get("/api/v1/agents/detail-bot", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "detail-bot"
+    assert "version" in body
+    assert "prompt" in body
+    assert "input_schema" in body
+    assert "output_schema" in body
+
+
+@pytest.mark.unit
+async def test_v1_get_agent_detail_404_unknown(storage: InMemoryStorage) -> None:
+    client, headers = await _make_authed_client(storage)
+    r = client.get("/api/v1/agents/does-not-exist", headers=headers)
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"]["code"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_v1_get_agent_detail_401_no_auth(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.get("/api/v1/agents/anything")
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/agents/{name}/runs — agent run endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_agent_runs_queues_job(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "run-bot", name="run-bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+    r = client.post(
+        "/api/v1/agents/run-bot/runs",
+        json={"input": {"q": "hello"}},
+        headers=headers,
+    )
+    assert r.status_code == 202
+    body = r.json()
+    assert "job_id" in body
+    assert body["status"] == "queued"
+
+
+@pytest.mark.unit
+async def test_v1_agent_runs_404_unknown_agent(storage: InMemoryStorage) -> None:
+    client, headers = await _make_authed_client(storage)
+    r = client.post(
+        "/api/v1/agents/ghost/runs",
+        json={"input": {}},
+        headers=headers,
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"]["code"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_v1_agent_runs_inline_mock(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    """?wait=true + mock=true executes synchronously and returns RunView (200)."""
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "inline-bot", name="inline-bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+    r = client.post(
+        "/api/v1/agents/inline-bot/runs?wait=true",
+        json={"input": {"q": "hi"}, "mock": True},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "run_id" in body
+    assert body["agent"] == "inline-bot"
+
+
+@pytest.mark.unit
+async def test_v1_agent_runs_401_without_auth(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.post("/api/v1/agents/anything/runs", json={"input": {}})
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/v1/agents/{name} — soft-delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_delete_agent_happy_path(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "bye-bot", name="bye-bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+
+    # Confirm it's present
+    r = client.get("/api/v1/agents/bye-bot", headers=headers)
+    assert r.status_code == 200
+
+    # Delete it
+    r = client.delete("/api/v1/agents/bye-bot", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "bye-bot"
+    assert "deleted_dir" in body
+
+    # Confirm it's gone from the catalog
+    r = client.get("/api/v1/agents/bye-bot", headers=headers)
+    assert r.status_code == 404
+
+
+@pytest.mark.unit
+async def test_v1_delete_agent_404_unknown(storage: InMemoryStorage, tmp_path: Path) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    client, headers = await _make_authed_client(storage, agents_path=agents_path)
+
+    r = client.delete("/api/v1/agents/phantom", headers=headers)
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"]["code"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_v1_delete_agent_503_no_agents_path(storage: InMemoryStorage) -> None:
+    """Runtime built without agents_path → 503 on delete."""
+    client, headers = await _make_authed_client(storage)
+    r = client.delete("/api/v1/agents/demo", headers=headers)
+    assert r.status_code == 503
+
+
+@pytest.mark.unit
+async def test_v1_delete_agent_401_without_auth(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.delete("/api/v1/agents/demo")
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/agents — create agent (multipart)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_create_agent_503_without_agents_path(storage: InMemoryStorage) -> None:
+    """When agents_path is None, POST /api/v1/agents must return 503."""
+    client, headers = await _make_authed_client(storage)
+    r = client.post(
+        "/api/v1/agents",
+        headers=headers,
+        files={"agent_yaml": ("agent.yaml", b"name: test\n")},
+    )
+    assert r.status_code == 503
+
+
+@pytest.mark.unit
+async def test_v1_create_agent_400_no_files(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    """Posting neither bundle nor individual files → 400."""
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    client, headers = await _make_authed_client(storage, agents_path=agents_path)
+    r = client.post("/api/v1/agents", headers=headers)
+    assert r.status_code == 400
+
+
+@pytest.mark.unit
+async def test_v1_create_agent_422_invalid_bundle(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    """Bundle with a bad agent.yaml (invalid YAML) → 422."""
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    client, headers = await _make_authed_client(storage, agents_path=agents_path)
+    r = client.post(
+        "/api/v1/agents",
+        headers=headers,
+        files={
+            "agent_yaml": ("agent.yaml", b": invalid: : yaml::"),
+            "prompt": ("prompt.md", b"Hello"),
+            "input_schema": ("input.json", b'{"type":"object","properties":{"q":{"type":"string"}}}'),
+            "output_schema": ("output.json", b'{"type":"object","properties":{"a":{"type":"string"}}}'),
+        },
+    )
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/agents/from-wizard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_create_agent_from_wizard_happy_path(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    """Wizard submission with minimal valid fields creates an agent."""
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    client, headers = await _make_authed_client(storage, agents_path=agents_path)
+
+    r = client.post(
+        "/api/v1/agents/from-wizard",
+        json={
+            "name": "wizard-agent",
+            "description": "Test agent from wizard",
+            "ai_model": "openai/gpt-4o-mini",
+            "agent_prompt": "You are a helpful assistant.",
+            "role": "assistant",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["name"] == "wizard-agent"
+    assert "agent_dir" in body
+    assert "files_persisted" in body
+
+
+@pytest.mark.unit
+async def test_v1_create_agent_from_wizard_503_no_agents_path(
+    storage: InMemoryStorage,
+) -> None:
+    client, headers = await _make_authed_client(storage)
+    r = client.post(
+        "/api/v1/agents/from-wizard",
+        json={
+            "name": "wiz",
+            "description": "x",
+            "ai_model": "openai/gpt-4o-mini",
+            "agent_prompt": "Be helpful.",
+            "role": "assistant",
+        },
+        headers=headers,
+    )
+    assert r.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/jobs — versioned job list
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_list_jobs_empty(storage: InMemoryStorage) -> None:
+    client, headers = await _make_authed_client(storage)
+    r = client.get("/api/v1/jobs", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["jobs"] == []
+    assert body["count"] == 0
+
+
+@pytest.mark.unit
+async def test_v1_list_jobs_after_run(
+    storage: InMemoryStorage, tmp_path: Path
+) -> None:
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    scaffold_agent(agents_path / "list-bot", name="list-bot")
+    agents = scan_agents(agents_path)
+
+    client, headers = await _make_authed_client(storage, agents_path=agents_path, agents=agents)
+    # Queue a job via the v1 run endpoint
+    client.post(
+        "/api/v1/agents/list-bot/runs",
+        json={"input": {"q": "x"}},
+        headers=headers,
+    )
+    r = client.get("/api/v1/jobs", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] >= 1
+
+
+@pytest.mark.unit
+async def test_v1_list_jobs_401_without_auth(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.get("/api/v1/jobs")
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/auth/me — whoami
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_v1_auth_whoami_returns_identity(storage: InMemoryStorage) -> None:
+    client, headers = await _make_authed_client(storage)
+    r = client.get("/api/v1/auth/me", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert "key_id" in body
+    assert "tenant_id" in body
+    assert "env" in body
+
+
+@pytest.mark.unit
+async def test_v1_auth_whoami_401_without_auth(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.get("/api/v1/auth/me")
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Error shapes — all errors must return JSON (never HTML)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_404_error_shape_is_json(storage: InMemoryStorage) -> None:
+    client, headers = await _make_authed_client(storage)
+    r = client.get("/jobs/nonexistent", headers=headers)
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert "detail" in body
+    assert body["detail"]["error"]["code"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_401_error_shape_is_json(storage: InMemoryStorage) -> None:
+    client = TestClient(build_app(storage))
+    r = client.get("/agents")
+    assert r.status_code == 401
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert "detail" in body
+    assert body["detail"]["error"]["code"] == "auth_required"
+
+
+@pytest.mark.unit
+async def test_422_error_shape_is_json(storage: InMemoryStorage) -> None:
+    """FastAPI validation errors (field missing / wrong type) return JSON."""
+    client, headers = await _make_authed_client(storage)
+    # POST /run with entirely wrong body shape → 422 from FastAPI
+    r = client.post("/run", json={"bad_field": True}, headers=headers)
+    assert r.status_code == 422
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    # FastAPI's standard 422 body has "detail" as a list of validation errors
+    assert "detail" in body

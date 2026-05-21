@@ -323,7 +323,7 @@ def _ocr_pdf(content: bytes, *, page_num: int) -> str | None:
     at a higher level.
     """
     try:
-        import pdf2image  # type: ignore[import-not-found]  # noqa: PLC0415
+        import pdf2image  # noqa: PLC0415
     except ImportError:
         logger.debug(
             "pdf2image not installed. "
@@ -374,7 +374,7 @@ def _ocr_tesseract(image: Any, lang: str) -> str | None:
     Tesseract runtime error (binary absent, language pack missing, etc.).
     """
     try:
-        import pytesseract  # type: ignore[import-not-found]  # noqa: PLC0415
+        import pytesseract  # noqa: PLC0415
     except ImportError:
         logger.debug("pytesseract not installed — install movate-cli[ocr] to enable Tesseract OCR.")
         return None
@@ -413,7 +413,7 @@ def _ocr_easyocr(image: Any, lang: str) -> str | None:
     any EasyOCR runtime error.
     """
     try:
-        import easyocr  # type: ignore[import-not-found]  # noqa: PLC0415
+        import easyocr  # noqa: PLC0415
     except ImportError:
         logger.debug("easyocr not installed — install movate-cli[easyocr] to enable EasyOCR.")
         return None

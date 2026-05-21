@@ -48,7 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -308,11 +308,11 @@ def _format_chunks_for_planner(chunks: list[KbChunkWithScore]) -> str:
     return "\n".join(lines)
 
 
-def _extract_content(resp: object) -> str:
+def _extract_content(resp: Any) -> str:
     """Pull text content from a LiteLLM response. Defensive — any
     structural surprise returns ``""``."""
     try:
-        choices = resp.choices  # type: ignore[attr-defined]
+        choices = resp.choices
         first = choices[0]
         message = first.message
         content = message.content

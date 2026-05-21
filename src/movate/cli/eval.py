@@ -2274,7 +2274,7 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
 
         with _maybe_eval_progress(show_progress) as on_case:
             engine = EvalEngine(
-                executor=executor_for_eval,  # type: ignore[arg-type]
+                executor=executor_for_eval,
                 provider=rt.provider,
                 runs_per_case=runs,
                 gate_mode=gate_mode,

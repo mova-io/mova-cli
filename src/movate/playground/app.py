@@ -40,7 +40,7 @@ from typing import Any
 # from a no-extras install raises a clear error instead of a cryptic
 # ModuleNotFoundError mid-decorator.
 try:
-    import chainlit as cl  # type: ignore[import-untyped]
+    import chainlit as cl
 except ImportError as exc:  # pragma: no cover - covered by CLI hint
     raise ImportError(
         "movate.playground requires the [playground] extra. "

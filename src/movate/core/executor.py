@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -39,6 +39,7 @@ from movate.core.failures import (
 )
 from movate.core.loader import AgentBundle
 from movate.core.models import (
+    AgentSpec,
     ErrorInfo,
     FailureRecord,
     JobStatus,
@@ -973,7 +974,7 @@ class Executor:
     async def _reflect(
         self,
         *,
-        spec: object,
+        spec: AgentSpec,
         bundle: AgentBundle,
         provider_for_run: BaseLLMProvider,
         provider_str: str,
@@ -1001,10 +1002,7 @@ class Executor:
         surface as separate events under the agent's main span so the
         operator can see reflection overhead in Langfuse.
         """
-        # mypy: AgentSpec for ``spec`` (typed as ``object`` here to
-        # avoid a circular type import). We access ``.reflection``
-        # which is the runtime contract.
-        reflect_cfg = spec.reflection  # type: ignore[attr-defined]
+        reflect_cfg = spec.reflection
         # Resolve the judge provider. For MVP we route every judge
         # call through LiteLLM regardless of the agent's runtime —
         # ``reflection.judge_model`` is documented as a LiteLLM-style
@@ -1275,7 +1273,9 @@ class Executor:
     ) -> RunResponse:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _safety_types = {"content_filter", "grounding_violation"}
-        status = "safety_blocked" if err.failure_type.value in _safety_types else "error"
+        status: Literal["safety_blocked", "error"] = (
+            "safety_blocked" if err.failure_type.value in _safety_types else "error"
+        )
         info = ErrorInfo(type=err.failure_type.value, message=str(err), retryable=err.retryable)
         self._tracer.log_event(span, {"error": info.model_dump()})
         self._tracer.end_span(span, status="error")
@@ -1295,7 +1295,7 @@ class Executor:
         _ = job_id
 
         return RunResponse(
-            status=status,  # type: ignore[arg-type]
+            status=status,
             run_id=run_id,
             data={},
             human_readable=f"**Error**: {err}",

@@ -40,6 +40,7 @@ testable without spinning up FastAPI.
 
 from __future__ import annotations
 
+import io
 import re
 import shutil
 import tempfile
@@ -307,7 +308,7 @@ def unzip_bundle(zip_bytes: bytes) -> dict[str, bytes]:
         ) from exc
 
 
-def _bytesio(data: bytes):  # type: ignore[no-untyped-def]
+def _bytesio(data: bytes) -> io.BytesIO:
     """Tiny indirection so the zipfile call site stays one line."""
     from io import BytesIO  # noqa: PLC0415
 

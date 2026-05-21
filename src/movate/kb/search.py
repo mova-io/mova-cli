@@ -42,11 +42,12 @@ from movate.kb.lexical import rrf_fuse
 
 if TYPE_CHECKING:
     from movate.kb.trace import SearchTrace
+    from movate.storage.base import StorageProvider
 
 
 async def search(  # noqa: PLR0912 — orchestrator naturally branches across stages
     *,
-    storage: object,
+    storage: StorageProvider,
     question: str,
     agent: str,
     tenant_id: str,
@@ -345,7 +346,7 @@ async def search(  # noqa: PLR0912 — orchestrator naturally branches across st
 
 async def _retrieve_one(
     *,
-    storage: object,
+    storage: StorageProvider,
     question: str,
     agent: str,
     tenant_id: str,
@@ -368,7 +369,7 @@ async def _retrieve_one(
     )
 
     if not hybrid:
-        result: list[KbChunkWithScore] = await storage.search_kb_chunks(  # type: ignore[attr-defined]
+        result: list[KbChunkWithScore] = await storage.search_kb_chunks(
             agent=agent,
             tenant_id=tenant_id,
             query_embedding=query_embedding,
@@ -385,7 +386,7 @@ async def _retrieve_one(
 
     # Vector path: same as the default branch above, just with a
     # wider limit.
-    vector_results: list[KbChunkWithScore] = await storage.search_kb_chunks(  # type: ignore[attr-defined]
+    vector_results: list[KbChunkWithScore] = await storage.search_kb_chunks(
         agent=agent,
         tenant_id=tenant_id,
         query_embedding=query_embedding,
@@ -397,7 +398,7 @@ async def _retrieve_one(
     # for InMemory). The storage layer handles corpus-wide scoring
     # and returns pre-ranked results, so we no longer need to load
     # all chunks into Python memory.
-    lexical_results: list[KbChunkWithScore] = await storage.search_kb_chunks_lexical(  # type: ignore[attr-defined]
+    lexical_results: list[KbChunkWithScore] = await storage.search_kb_chunks_lexical(
         agent=agent,
         tenant_id=tenant_id,
         query=question,
