@@ -438,6 +438,14 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
     # the operator through 4-5 prompts only to discover at the end
     # that they can't run. Skipped under --mock (offline mode).
     if not mock:
+        # Remind interactive users that --mock is available before hitting
+        # the key-check prompt — useful the first time they run mdk eval
+        # in a fresh environment or CI without keys configured.
+        if sys.stderr.isatty():
+            err_console.print(
+                "[dim]tip: [bold]mdk eval --mock[/bold] runs without API keys "
+                "(deterministic, great for CI and offline validation)[/dim]"
+            )
         _require_llm_provider_key_or_offer_setup()
 
     # Guided wizard — explicit `--guided`, OR auto-trigger when an
