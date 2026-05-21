@@ -255,6 +255,14 @@ def monitor(
         err_console.print(f"[red]✗[/red] --limit must be ≥ 1; got {limit}")
         raise typer.Exit(code=2)
 
+    _valid_statuses = ("success", "error", "queued", "running", "safety_blocked", "dead_letter")
+    if status and status not in _valid_statuses:
+        err_console.print(
+            f"[red]✗[/red] --status {status!r} is not a valid run status. "
+            f"Valid values: {', '.join(_valid_statuses)}"
+        )
+        raise typer.Exit(code=2)
+
     title = _title(agent=agent, status=status, limit=limit)
 
     if once:
