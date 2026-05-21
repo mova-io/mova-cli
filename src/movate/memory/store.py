@@ -14,7 +14,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,6 +39,25 @@ def _now_iso() -> str:
     now = datetime.now(UTC)
     millis = now.microsecond // 1000
     return now.strftime(f"%Y-%m-%dT%H:%M:%S.{millis:03d}Z")
+
+
+def _is_alive(entry: MemoryEntry) -> bool:
+    """Return True when the entry has not yet expired.
+
+    ``ttl_seconds == 0`` means no expiration — always alive.
+    An unparseable ``created_at`` is treated as alive (we'd rather
+    surface a stale entry than silently lose data due to a bad
+    timestamp).
+    """
+    if entry.ttl_seconds == 0:
+        return True
+    try:
+        created = datetime.fromisoformat(entry.created_at.removesuffix("Z")).replace(
+            tzinfo=UTC
+        )
+    except (ValueError, AttributeError):
+        return True  # malformed timestamp — don't silently evict
+    return created + timedelta(seconds=entry.ttl_seconds) > datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +168,16 @@ class InMemoryStore:
     async def list(self, agent: str) -> list[MemoryEntry]:
         with self._lock:
             data = self._load()
-        entries = list(data.get(agent, {}).values())
+        entries = [e for e in data.get(agent, {}).values() if _is_alive(e)]
         return sorted(entries, key=lambda e: e.created_at)
 
     async def get(self, agent: str, key: str) -> MemoryEntry | None:
         with self._lock:
             data = self._load()
-        return data.get(agent, {}).get(key)
+        entry = data.get(agent, {}).get(key)
+        if entry is None or not _is_alive(entry):
+            return None
+        return entry
 
     async def set(
         self,
@@ -258,13 +280,27 @@ class SqliteStore:
         await conn.commit()
         return conn
 
+    # SQL fragment that filters out rows whose TTL has passed.
+    # ``ttl_seconds = 0`` means immortal — never filtered.
+    # ``replace(created_at, 'Z', '')`` strips the trailing 'Z' so
+    # SQLite's datetime() receives a bare ISO-8601 string it can
+    # parse on all supported SQLite versions (3.8+). The 'Z' suffix
+    # is only accepted by SQLite >= 3.38.0.
+    _TTL_ALIVE_CLAUSE = (
+        "AND (ttl_seconds = 0 "
+        "OR datetime(replace(created_at, 'Z', ''), '+' || ttl_seconds || ' seconds')"
+        " > datetime('now'))"
+    )
+
     async def list(self, agent: str) -> list[MemoryEntry]:
-        """All entries for ``agent``, sorted by created_at ascending."""
+        """All non-expired entries for ``agent``, sorted by created_at ascending."""
         conn = await self._conn()
         try:
             async with conn.execute(
                 "SELECT agent, key, value_json, created_at, ttl_seconds "
-                "FROM memory_entries WHERE agent = ? ORDER BY created_at ASC",
+                "FROM memory_entries WHERE agent = ? "
+                + self._TTL_ALIVE_CLAUSE
+                + " ORDER BY created_at ASC",
                 (agent,),
             ) as cursor:
                 rows = await cursor.fetchall()
@@ -273,12 +309,13 @@ class SqliteStore:
         return [_row_to_entry(row) for row in rows]
 
     async def get(self, agent: str, key: str) -> MemoryEntry | None:
-        """One entry; ``None`` when absent."""
+        """One non-expired entry; ``None`` when absent or expired."""
         conn = await self._conn()
         try:
             async with conn.execute(
                 "SELECT agent, key, value_json, created_at, ttl_seconds "
-                "FROM memory_entries WHERE agent = ? AND key = ?",
+                "FROM memory_entries WHERE agent = ? AND key = ? "
+                + self._TTL_ALIVE_CLAUSE,
                 (agent, key),
             ) as cursor:
                 row = await cursor.fetchone()

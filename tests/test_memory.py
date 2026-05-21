@@ -101,6 +101,67 @@ class TestInMemoryStore:
         entries = asyncio.run(store.list("any"))
         assert entries == []
 
+    def test_ttl_expired_entry_invisible_to_get(self, store_path: Path) -> None:
+        """get() returns None for an entry whose TTL has elapsed."""
+        store = InMemoryStore(_path=store_path)
+        # Inject an entry with a 1-second TTL whose created_at is far in the past.
+        entry = MemoryEntry(
+            agent="a",
+            key="k",
+            value={"x": 1},
+            created_at="2020-01-01T00:00:00.000Z",
+            ttl_seconds=1,
+        )
+        with store._lock:
+            data = store._load()
+            data.setdefault("a", {})["k"] = entry
+            store._save(data)
+        result = asyncio.run(store.get("a", "k"))
+        assert result is None
+
+    def test_ttl_expired_entry_invisible_to_list(self, store_path: Path) -> None:
+        """list() silently drops entries whose TTL has elapsed."""
+        store = InMemoryStore(_path=store_path)
+        entry = MemoryEntry(
+            agent="a",
+            key="k",
+            value={"x": 1},
+            created_at="2020-01-01T00:00:00.000Z",
+            ttl_seconds=1,
+        )
+        with store._lock:
+            data = store._load()
+            data.setdefault("a", {})["k"] = entry
+            store._save(data)
+        entries = asyncio.run(store.list("a"))
+        assert entries == []
+
+    def test_ttl_zero_means_no_expiry(self, store_path: Path) -> None:
+        """ttl_seconds=0 means immortal — entry survives any amount of time."""
+        store = InMemoryStore(_path=store_path)
+        # Entry with ttl_seconds=0 and ancient created_at — should still be alive.
+        entry = MemoryEntry(
+            agent="a",
+            key="k",
+            value={"x": 1},
+            created_at="2020-01-01T00:00:00.000Z",
+            ttl_seconds=0,
+        )
+        with store._lock:
+            data = store._load()
+            data.setdefault("a", {})["k"] = entry
+            store._save(data)
+        result = asyncio.run(store.get("a", "k"))
+        assert result is not None
+        assert result.value == {"x": 1}
+
+    def test_ttl_live_entry_still_visible(self, store_path: Path) -> None:
+        """An entry with a future expiry is still returned."""
+        store = InMemoryStore(_path=store_path)
+        asyncio.run(store.set("a", "k", {"x": 1}, ttl_seconds=3600))
+        result = asyncio.run(store.get("a", "k"))
+        assert result is not None
+
 
 # ---------------------------------------------------------------------------
 # SqliteStore — full implementation tests
@@ -191,6 +252,73 @@ class TestSqliteStore:
         entry = asyncio.run(sqlite_store.get("a", "k"))
         assert entry is not None
         assert entry.ttl_seconds == 3600
+
+    def test_ttl_expired_entry_invisible_to_get(self, sqlite_store: SqliteStore) -> None:
+        """get() returns None for an entry whose TTL has elapsed."""
+
+        async def _insert_expired() -> None:
+            conn = await sqlite_store._conn()
+            try:
+                await conn.execute(
+                    "INSERT OR REPLACE INTO memory_entries "
+                    "(agent, key, value_json, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("a", "k", '{"x": 1}', "2020-01-01T00:00:00.000Z", 1),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_insert_expired())
+        result = asyncio.run(sqlite_store.get("a", "k"))
+        assert result is None
+
+    def test_ttl_expired_entry_invisible_to_list(self, sqlite_store: SqliteStore) -> None:
+        """list() silently drops entries whose TTL has elapsed."""
+
+        async def _insert_expired() -> None:
+            conn = await sqlite_store._conn()
+            try:
+                await conn.execute(
+                    "INSERT OR REPLACE INTO memory_entries "
+                    "(agent, key, value_json, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("a", "k", '{"x": 1}', "2020-01-01T00:00:00.000Z", 1),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_insert_expired())
+        entries = asyncio.run(sqlite_store.list("a"))
+        assert entries == []
+
+    def test_ttl_zero_means_no_expiry(self, sqlite_store: SqliteStore) -> None:
+        """ttl_seconds=0 means immortal regardless of created_at."""
+
+        async def _insert_immortal() -> None:
+            conn = await sqlite_store._conn()
+            try:
+                await conn.execute(
+                    "INSERT OR REPLACE INTO memory_entries "
+                    "(agent, key, value_json, created_at, ttl_seconds) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("a", "k", '{"x": 1}', "2020-01-01T00:00:00.000Z", 0),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_insert_immortal())
+        result = asyncio.run(sqlite_store.get("a", "k"))
+        assert result is not None
+        assert result.value == {"x": 1}
+
+    def test_ttl_live_entry_still_visible(self, sqlite_store: SqliteStore) -> None:
+        """An entry with a future expiry is still returned."""
+        asyncio.run(sqlite_store.set("a", "k", {"x": 1}, ttl_seconds=3600))
+        result = asyncio.run(sqlite_store.get("a", "k"))
+        assert result is not None
 
     def test_agent_isolation(self, sqlite_store: SqliteStore) -> None:
         asyncio.run(sqlite_store.set("agent-a", "k", {"who": "a"}))
