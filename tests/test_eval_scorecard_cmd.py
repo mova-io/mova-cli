@@ -21,7 +21,7 @@ import json as _json
 import logging
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest import mock
 
 import pytest
@@ -4585,6 +4585,133 @@ class TestPreviewCellFormatter:
         # 3 visible lines + 1 footer = 4 lines (3 newlines).
         assert out.count("\n") == 3
         assert "7 more field(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# RAG-aware preview rendering — citations resolve to the actual cited
+# context passages, the full question is shown, and grounded/confidence
+# get human-friendly labels. Non-RAG agents fall through to the generic
+# formatter unchanged.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRagPreviewRendering:
+    _RAG_ENTRY: ClassVar[dict[str, Any]] = {
+        "input": {
+            "question": (
+                "Can you tell me what our refund policy is, including any "
+                "exceptions for enterprise customers on their first year?"
+            ),
+            "context": [
+                "Refund policy for annual subscriptions: refundable within 14 days, prorated.",
+                "Monthly subscriptions are non-refundable but cancel-anytime.",
+                "Enterprise tier includes a 90-day money-back guarantee on the first year only.",
+            ],
+        },
+        "expected": {
+            "answer": "Annual subs refundable within 14 days; enterprise first-year has 90 days.",
+            "citations": [1, 3],
+            "grounded": True,
+            "confidence": 0.9,
+        },
+    }
+
+    def test_looks_like_rag_case_accepts_canonical_shape(self) -> None:
+        from movate.cli.eval import _looks_like_rag_case  # noqa: PLC0415
+
+        assert _looks_like_rag_case(self._RAG_ENTRY) is True
+
+    def test_looks_like_rag_case_rejects_non_rag_shapes(self) -> None:
+        from movate.cli.eval import _looks_like_rag_case  # noqa: PLC0415
+
+        # No context list.
+        assert not _looks_like_rag_case(
+            {"input": {"question": "hi"}, "expected": {"answer": "x", "citations": []}}
+        )
+        # No citations key.
+        assert not _looks_like_rag_case(
+            {"input": {"question": "hi", "context": ["a"]}, "expected": {"answer": "x"}}
+        )
+        # Classifier-style case (decision/risk_score) — must use generic path.
+        assert not _looks_like_rag_case(
+            {"input": {"decision": "human_review"}, "expected": {"answer": "ok"}}
+        )
+        # expected=None (adversarial refusal cases).
+        assert not _looks_like_rag_case(
+            {"input": {"question": "hi", "context": ["a"]}, "expected": None}
+        )
+
+    def test_input_cell_shows_full_question_untruncated(self) -> None:
+        from movate.cli.eval import _format_rag_input_cell  # noqa: PLC0415
+
+        ctx = self._RAG_ENTRY["input"]["context"]
+        out = _format_rag_input_cell(self._RAG_ENTRY["input"], context=ctx)
+        # The full question text is present verbatim — no mid-sentence ellipsis.
+        assert self._RAG_ENTRY["input"]["question"] in out
+        assert "…" not in out.split("Context")[0]  # question half has no truncation
+        # Context rendered as numbered source passages.
+        assert "3 source passages" in out
+        assert "[1]" in out and "[2]" in out and "[3]" in out
+
+    def test_expected_cell_resolves_citations_to_source_passages(self) -> None:
+        from movate.cli.eval import _format_rag_expected_cell  # noqa: PLC0415
+
+        ctx = self._RAG_ENTRY["input"]["context"]
+        out = _format_rag_expected_cell(self._RAG_ENTRY["expected"], context=ctx)
+        # The numeric citations are surfaced AND resolved to the passages.
+        assert "Cited sources" in out
+        assert "Refund policy for annual subscriptions" in out  # passage [1]
+        assert "Enterprise tier includes a 90-day" in out  # passage [3]
+        # Passage [2] is NOT cited, so its text must not leak into Expected.
+        assert "Monthly subscriptions" not in out
+        # Human-friendly grounded + confidence.
+        assert "Grounded ✓" in out
+        assert "Confidence 90%" in out
+
+    def test_expected_cell_handles_not_grounded_no_citations(self) -> None:
+        from movate.cli.eval import _format_rag_expected_cell  # noqa: PLC0415
+
+        exp = {"answer": "Declined.", "citations": [], "grounded": False, "confidence": 0.0}
+        out = _format_rag_expected_cell(exp, context=["a", "b"])
+        assert "No citations" in out
+        assert "Not grounded ✗" in out
+        assert "Confidence 0%" in out
+
+    def test_expected_cell_flags_out_of_range_citation(self) -> None:
+        from movate.cli.eval import _format_rag_expected_cell  # noqa: PLC0415
+
+        # Citation 5 with only 2 context passages = LLM hallucination.
+        exp = {"answer": "x", "citations": [5], "grounded": True, "confidence": 0.5}
+        out = _format_rag_expected_cell(exp, context=["a", "b"])
+        assert "no such passage" in out
+
+    def test_render_table_uses_rag_path_and_keeps_generic_fallback(
+        self, capsys: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from rich.console import Console  # noqa: PLC0415
+
+        import movate.cli.eval as eval_mod  # noqa: PLC0415
+
+        # Pin a wide console so Rich doesn't fold our assertion substrings
+        # mid-word at the default 80-col capture width.
+        monkeypatch.setattr(eval_mod, "console", Console(width=240))
+
+        entries = [
+            self._RAG_ENTRY,
+            # Non-RAG classifier case — must still render via generic path.
+            {
+                "input": {"decision": "human_review", "risk_score": 0.65},
+                "expected": {"answer": "ok"},
+            },
+        ]
+        eval_mod._render_cases_preview_table(entries, mix="adversarial")
+        out = capsys.readouterr().out
+        # RAG row resolved the citation to its source passage text.
+        assert "Refund policy for annual subscriptions" in out
+        assert "Cited sources" in out
+        # Generic row still shows its raw fields.
+        assert "decision" in out and "human_review" in out
 
 
 # ---------------------------------------------------------------------------
