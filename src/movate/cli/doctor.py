@@ -435,6 +435,22 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     state = "exists" if sqlite_path.exists() else "will be created on first run"
     _add("storage (sqlite)", f"{sqlite_path} [dim]({state})[/dim]")
 
+    # Memory store — shows the active backend and file path so operators
+    # know which backend their `mdk memory` commands are reading/writing.
+    mem_backend = os.environ.get("MOVATE_MEMORY_BACKEND", "memory").lower()
+    if mem_backend == "sqlite":
+        mem_label = "sqlite (MOVATE_MEMORY_BACKEND=sqlite)"
+        mem_file_default = "~/.movate/memory.db"
+    else:
+        mem_label = "json-file (default)"
+        mem_file_default = "~/.movate/memory.json"
+    mem_file_env = os.environ.get("MOVATE_MEMORY_FILE", "")
+    mem_file = mem_file_env if mem_file_env else mem_file_default
+    _add(
+        "memory store",
+        f"{mem_label} [dim]→ {mem_file}[/dim]",
+    )
+
     # Pricing
     try:
         pricing = load_pricing()
