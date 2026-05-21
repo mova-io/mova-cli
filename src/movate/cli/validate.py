@@ -10,10 +10,14 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from jsonschema import Draft202012Validator
 
 from movate.cli._completion import complete_agent_path
 from movate.cli._resolve import walk_up_for_project_root
@@ -538,7 +542,7 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     if bundle.spec.evals.dataset:
         dataset_path = bundle.agent_dir / bundle.spec.evals.dataset
         if dataset_path.is_file():
-            _check_dataset_jsonl(dataset_path)
+            _check_dataset_jsonl(dataset_path, input_validator=bundle.input_validator)
 
     # Prompt linter — runs by default; --no-lint to skip; --strict to
     # promote warnings to errors. Reports BEFORE the success banner so
@@ -597,7 +601,11 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
         raise typer.Exit(code=2)
 
 
-def _check_dataset_jsonl(path: Path) -> None:
+def _check_dataset_jsonl(
+    path: Path,
+    *,
+    input_validator: Draft202012Validator | None = None,
+) -> None:
     """Validate that every non-blank line in a dataset JSONL file is a
     parseable JSON object with at least an ``input`` key.
 
@@ -635,6 +643,21 @@ def _check_dataset_jsonl(path: Path) -> None:
                 f"  [yellow]![/yellow] dataset [bold]{path.name}:{i}[/bold] "
                 "missing [bold]'input'[/bold] key — this case will be skipped by mdk eval."
             )
+        elif input_validator is not None:
+            from jsonschema import ValidationError as _JsonSchemaError  # noqa: PLC0415
+
+            try:
+                input_validator.validate(obj["input"])
+            except _JsonSchemaError as exc:
+                # Report the first validation error as a warning — not fatal
+                # because the schema may be intentionally flexible or the
+                # dataset may include edge-case inputs the operator wants to
+                # explore. Surfacing it here beats a cryptic failure mid-eval.
+                short = exc.message[:120]
+                console.print(
+                    f"  [yellow]![/yellow] dataset [bold]{path.name}:{i}[/bold] "
+                    f"input fails schema: {short}"
+                )
 
 
 def _find_project_root_from_bundle(bundle: AgentBundle) -> Path | None:
