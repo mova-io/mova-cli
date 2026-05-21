@@ -224,6 +224,20 @@ def _scaffold_default_agent(parent: Path) -> Path:
     return parent / "demo-agent"
 
 
+def _write_two_case_dataset(agent_dir: Path) -> None:
+    """Overwrite the templated dataset with a minimal controlled 2-case fixture.
+
+    The 'Hello!' mock matches case 1 exactly; case 2 never matches. This gives
+    a deterministic 0.5 mean when the mock response is '{"message": "Hello!"}'
+    and 0.0 when the mock is anything else — needed by the baseline regression
+    tests regardless of how many rows the template ships.
+    """
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        '{"input": {"text": "hello"}, "expected": {"message": "Hello!"}}\n'
+        '{"input": {"text": "bye"}, "expected": {"message": "Goodbye!"}}\n'
+    )
+
+
 def _read_latest_eval_id(home: Path) -> str:
     db_path = home / ".movate" / "local.db"
     with sqlite3.connect(db_path) as conn:
@@ -289,6 +303,7 @@ def test_cli_eval_baseline_regression_exits_one(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_dir = _scaffold_default_agent(tmp_path)
+    _write_two_case_dataset(agent_dir)  # controlled 2-case fixture; see helper docstring
 
     # Baseline: mock response matches the dataset's first case → 0.5 mean (half pass).
     monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "Hello!"}')
@@ -349,6 +364,7 @@ def test_cli_eval_baseline_with_tolerance_allows_drop(
     """A small drop within --regression-tolerance should NOT fail the gate."""
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_dir = _scaffold_default_agent(tmp_path)
+    _write_two_case_dataset(agent_dir)  # controlled 2-case fixture; see helper docstring
 
     # Baseline → 1.0 mean (mock matches first dataset row exactly).
     monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "Hello!"}')
@@ -431,6 +447,7 @@ def test_cli_eval_baseline_file_diffs_correctly(
     """End-to-end CI flow: write baseline file, then re-run eval against it."""
     monkeypatch.setenv("HOME", str(tmp_path))
     agent_dir = _scaffold_default_agent(tmp_path)
+    _write_two_case_dataset(agent_dir)  # controlled 2-case fixture; see helper docstring
     baseline_path = tmp_path / "baseline.json"
 
     # Step 1: pre-merge run, write baseline file.

@@ -8,6 +8,12 @@ description: >-
   Demonstrates an HTTP skill wired to an agent — no API key required.
 owner: ""
 
+# runtime selects the LLM execution path. Options:
+#   litellm          — default; routes through LiteLLM (100+ providers)
+#   native_anthropic — direct Anthropic SDK (tool-use, prompt caching, vision)
+#   native_openai    — direct OpenAI SDK (structured outputs, parallel tool-use)
+runtime: litellm
+
 model:
   provider: openai/gpt-4o-mini-2024-07-18
   params:
