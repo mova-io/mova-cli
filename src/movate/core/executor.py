@@ -17,8 +17,11 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from movate.memory import MemoryStore
 
 from jsonschema import ValidationError as JsonSchemaError
 
@@ -89,6 +92,7 @@ class Executor:
         runtime_policy: RuntimePolicy | None = None,
         skill_policy: SkillPolicy | None = None,
         guardrails: GuardrailsConfig | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> None:
         """One of ``provider`` (legacy single-runtime) OR ``registry``
         (multi-runtime, v0.6+) must be set. Passing ``provider`` is
@@ -123,6 +127,11 @@ class Executor:
         # enforced at the top of execute() so a bundle that bypasses
         # `mdk validate` can't sneak past the gate.
         self._skill_policy = skill_policy or SkillPolicy()
+        # Optional per-agent memory store. When set, every successful run
+        # writes {input, output, run_id} under key "last_run" for the
+        # agent — visible via `mdk memory get <agent> last_run`. Failure
+        # to write is non-fatal (logged at WARNING, run still succeeds).
+        self._memory_store = memory_store
         # Safe-AI guardrails (PII / topic / content) for input + output.
         # Permissive default — every sub-block ``enabled: false`` means
         # the input/output check fast-paths to allow. Wired at execute()
@@ -612,6 +621,29 @@ class Executor:
                 thread_id=thread_id,
                 skill_calls=skill_calls,
             )
+
+            # Persist the run's input + output to the memory store so
+            # `mdk memory get <agent> last_run` always shows the most
+            # recent successful output. Non-fatal — a full disk or
+            # misconfigured store must not kill an otherwise-successful
+            # run.
+            if self._memory_store is not None:
+                try:
+                    await self._memory_store.set(
+                        spec.name,
+                        "last_run",
+                        {
+                            "input": request.input,
+                            "output": output,
+                            "run_id": run_id,
+                        },
+                    )
+                except Exception:  # broad-catch intentional — must not kill the run
+                    log.warning(
+                        "memory_store.set failed — last_run not persisted for agent %r",
+                        spec.name,
+                    )
+
             self._tracer.end_span(span, status="ok")
             return response
 

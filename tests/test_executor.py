@@ -31,6 +31,7 @@ from movate.providers.base import (
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import PricingTable, load_pricing
 from movate.providers.registry import ProviderRegistry
+from movate.memory import InMemoryStore
 from movate.testing import InMemoryStorage, NullTracer, scaffold_agent
 
 # ---------------------------------------------------------------------------
@@ -804,3 +805,90 @@ async def test_cost_drift_logs_event(
 def test_typed_failure_types_distinct() -> None:
     assert SchemaError("x").__class__ is not RateLimitError("y").__class__
     assert isinstance(SchemaError("x"), MovateError)
+
+
+# ---------------------------------------------------------------------------
+# Memory-store wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_executor_writes_last_run_to_memory_store(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """After a successful run the executor persists last_run to the memory store."""
+    mem = InMemoryStore()
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+        memory_store=mem,
+    )
+    response = await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hello"}))
+    assert response.status == "success"
+
+    entry = await mem.get("demo", "last_run")
+    assert entry is not None
+    record = entry.value
+    assert record["input"] == {"text": "hello"}
+    assert "output" in record
+    assert "run_id" in record
+
+
+@pytest.mark.unit
+async def test_executor_no_memory_store_still_succeeds(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """Executor with no memory_store (default) completes successfully — back-compat."""
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    executor = Executor(provider=MockProvider(), pricing=pricing, storage=storage, tracer=tracer)
+    response = await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+    assert response.status == "success"
+
+
+@pytest.mark.unit
+async def test_executor_memory_failure_does_not_kill_run(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken memory store must not propagate — the run still returns success."""
+
+    class _BrokenStore:
+        async def get(self, ns: str, key: str) -> None:
+            return None
+
+        async def set(self, ns: str, key: str, value: object, *, ttl: int | None = None) -> None:
+            raise OSError("disk full")
+
+        async def delete(self, ns: str, key: str) -> None:
+            pass
+
+        async def list_keys(self, ns: str) -> list[str]:
+            return []
+
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=pricing,
+        storage=storage,
+        tracer=tracer,
+        memory_store=_BrokenStore(),  # type: ignore[arg-type]
+    )
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="movate"):
+        response = await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+
+    assert response.status == "success"
+    assert any("memory_store.set failed" in r.message for r in caplog.records)
