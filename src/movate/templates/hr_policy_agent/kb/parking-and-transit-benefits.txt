@@ -1,0 +1,33 @@
+Commuter Benefits — Parking & Transit
+======================================
+
+Transit subsidy
+  Full-time employees receive a pre-tax transit benefit of up to
+  $315 per month (IRS 2026 limit) toward eligible mass transit
+  expenses: subway, bus, light rail, commuter rail, vanpool.
+  Funds are loaded to your Commuter Benefits Card by the 25th
+  of the preceding month. Unused funds roll over for up to
+  12 months, then expire.
+
+Parking subsidy
+  Employees who commute by personal vehicle may claim up to
+  $315 per month (IRS 2026 limit) in pre-tax parking benefits.
+  Eligible: qualified parking at or near the workplace, or at
+  a transit facility for a park-and-ride commute.
+
+How to enroll
+  1. Log in to BambooHR → Benefits → Commuter Benefits.
+  2. Select Transit, Parking, or both.
+  3. Enter your monthly election amount (up to the IRS limit).
+  4. Changes take effect the 1st of the following month.
+  5. Enrollment open year-round (no open-enrollment window).
+
+Remote employees
+  Employees who are 100% remote and have no designated office
+  are not eligible for the commuter benefit. Employees on a
+  hybrid schedule (any in-office days) are fully eligible.
+
+Eligible providers (transit card)
+  Clipper (Bay Area), Metro SmarTrip (DC), CharlieCard (Boston),
+  ORCA (Seattle), TAP (LA), Ventra (Chicago), OMNY (NYC), and
+  all NTD-registered transit agencies.
