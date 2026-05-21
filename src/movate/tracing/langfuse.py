@@ -324,7 +324,13 @@ def _build_client_from_env() -> Any:
         raise LangfuseUnavailableError(
             "langfuse package not installed; `uv sync --extra langfuse`"
         ) from exc
-    host = os.environ.get("LANGFUSE_HOST") or "https://cloud.langfuse.com"
+    # Accept LANGFUSE_HOST (canonical) or LANGFUSE_BASE_URL (Langfuse SDK
+    # alias) so both spellings work when stored in ~/.movate/credentials.
+    host = (
+        os.environ.get("LANGFUSE_HOST")
+        or os.environ.get("LANGFUSE_BASE_URL")
+        or "https://cloud.langfuse.com"
+    )
     try:
         return Langfuse(secret_key=secret, public_key=public, host=host)
     except Exception as exc:

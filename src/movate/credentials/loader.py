@@ -39,13 +39,29 @@ NOTIFICATION_KEY_ENV_VARS: tuple[str, ...] = (
     "MOVATE_DEPLOY_WEBHOOK",
 )
 
+# Observability env vars — Langfuse tracing. Set via ``mdk auth login
+# langfuse`` (or by hand). The tracer auto-activates when
+# ``LANGFUSE_SECRET_KEY`` is present in the environment; all three
+# vars need the same autoload-from-credentials-file treatment so
+# traces are emitted without requiring a manual ``export`` each shell.
+# Both ``LANGFUSE_HOST`` (canonical) and ``LANGFUSE_BASE_URL`` (alias
+# accepted for compatibility with the Langfuse SDK default name) are
+# included — the tracer checks both.
+OBSERVABILITY_KEY_ENV_VARS: tuple[str, ...] = (
+    "LANGFUSE_SECRET_KEY",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_HOST",
+    "LANGFUSE_BASE_URL",
+)
+
 # Every env var the credentials store should autoload. Union of the
-# two groups above; surfaced as a constant so `autoload_credentials`
+# groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
 # canonical list.
 ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *PROVIDER_KEY_ENV_VARS,
     *NOTIFICATION_KEY_ENV_VARS,
+    *OBSERVABILITY_KEY_ENV_VARS,
 )
 
 
