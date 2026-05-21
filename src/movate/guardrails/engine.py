@@ -38,7 +38,12 @@ from movate.guardrails import pii as pii_module
 from movate.guardrails import topic as topic_module
 
 if TYPE_CHECKING:
-    from movate.core.config import GuardrailDirection
+    from movate.core.config import (
+        ContentGuardrailConfig,
+        GuardrailDirection,
+        PiiGuardrailConfig,
+        TopicGuardrailConfig,
+    )
 
 
 Action = Literal["allow", "redact", "warn", "block"]
@@ -136,16 +141,16 @@ class _ModuleOutcome:
     reason: str = ""
 
 
-def _check_pii(text: str, cfg: object) -> _ModuleOutcome:
+def _check_pii(text: str, cfg: PiiGuardrailConfig) -> _ModuleOutcome:
     """Run the PII module; return outcome for the orchestrator."""
     # Empty `types` list = "all supported categories" (see
     # PiiGuardrailConfig docstring) — pass None to ``scan`` so the
     # default-all path engages.
-    types_filter = list(cfg.types) if cfg.types else None  # type: ignore[attr-defined]
+    types_filter = list(cfg.types) if cfg.types else None
     matches = pii_module.scan(text, types=types_filter)
     if not matches:
         return _ModuleOutcome()
-    if cfg.mode == "block":  # type: ignore[attr-defined]
+    if cfg.mode == "block":
         return _ModuleOutcome(
             terminate=GuardrailVerdict(
                 action="block",
@@ -153,7 +158,7 @@ def _check_pii(text: str, cfg: object) -> _ModuleOutcome:
                 triggered_by=("pii",),
             )
         )
-    if cfg.mode == "redact":  # type: ignore[attr-defined]
+    if cfg.mode == "redact":
         return _ModuleOutcome(
             new_text=pii_module.redact(text, matches),
             action_upgrade="redact",
@@ -168,15 +173,15 @@ def _check_pii(text: str, cfg: object) -> _ModuleOutcome:
     )
 
 
-def _check_topic(text: str, cfg: object) -> _ModuleOutcome:
+def _check_topic(text: str, cfg: TopicGuardrailConfig) -> _ModuleOutcome:
     verdict = topic_module.check(
         text,
-        allowed_topics=list(cfg.allowed_topics) or None,  # type: ignore[attr-defined]
-        banned_topics=list(cfg.banned_topics) or None,  # type: ignore[attr-defined]
+        allowed_topics=list(cfg.allowed_topics) or None,
+        banned_topics=list(cfg.banned_topics) or None,
     )
     if verdict.status != "violation":
         return _ModuleOutcome()
-    if cfg.on_violation == "block":  # type: ignore[attr-defined]
+    if cfg.on_violation == "block":
         return _ModuleOutcome(
             terminate=GuardrailVerdict(
                 action="block",
@@ -193,14 +198,14 @@ def _check_topic(text: str, cfg: object) -> _ModuleOutcome:
     )
 
 
-def _check_content(text: str, cfg: object) -> _ModuleOutcome:
+def _check_content(text: str, cfg: ContentGuardrailConfig) -> _ModuleOutcome:
     verdict = content_module.check(
         text,
-        banned_terms=list(cfg.banned_terms) or None,  # type: ignore[attr-defined]
+        banned_terms=list(cfg.banned_terms) or None,
     )
     if verdict.status != "violation":
         return _ModuleOutcome()
-    if cfg.on_violation == "block":  # type: ignore[attr-defined]
+    if cfg.on_violation == "block":
         return _ModuleOutcome(
             terminate=GuardrailVerdict(
                 action="block",
@@ -232,19 +237,15 @@ def _orchestrate(text: str, config: GuardrailDirection) -> GuardrailVerdict:
     final_action: Action = "allow"
     redacted_text_out: str | None = None
 
-    # Each tuple: (enabled-predicate, callable-on-current-text).
-    checks: list[tuple[bool, object, object]] = [
-        (config.pii.enabled, config.pii, _check_pii),
-        (config.topic.enabled, config.topic, _check_topic),
-        (config.content.enabled, config.content, _check_content),
-    ]
+    def _apply(outcome: _ModuleOutcome) -> GuardrailVerdict | None:
+        """Fold one module outcome into the running state.
 
-    for enabled, cfg, check_fn in checks:
-        if not enabled:
-            continue
-        outcome = check_fn(working_text, cfg)  # type: ignore[operator]
+        Returns the block verdict if the module requested a hard stop,
+        ``None`` otherwise so the caller continues to the next module.
+        """
+        nonlocal working_text, final_action, redacted_text_out
         if outcome.terminate is not None:
-            return outcome.terminate  # type: ignore[no-any-return]
+            return outcome.terminate
         if outcome.new_text is not None:
             working_text = outcome.new_text
             redacted_text_out = outcome.new_text
@@ -256,6 +257,22 @@ def _orchestrate(text: str, config: GuardrailDirection) -> GuardrailVerdict:
             matched_terms.extend(outcome.matched_terms)
         if outcome.reason:
             reasons.append(outcome.reason)
+        return None
+
+    if config.pii.enabled and (block := _apply(_check_pii(working_text, config.pii))) is not None:
+        return block
+
+    if (
+        config.topic.enabled
+        and (block := _apply(_check_topic(working_text, config.topic))) is not None
+    ):
+        return block
+
+    if (
+        config.content.enabled
+        and (block := _apply(_check_content(working_text, config.content))) is not None
+    ):
+        return block
 
     return GuardrailVerdict(
         action=final_action,

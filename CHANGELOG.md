@@ -900,6 +900,217 @@ to several minutes now show what's happening.
   escapes. Real-binary smoke validated the worker live feed against
   three queued jobs.
 
+## [0.8.0] — 2026-05-19
+
+**movate now has a Knowledge Base.** v0.8 ships a full RAG pipeline —
+ingest → embed → hybrid search → rerank — integrated end-to-end into
+the agent executor. Agents can retrieve from their own KB on every
+run without any custom code.
+
+| PR | what shipped |
+|---|---|
+| A | `kb_chunks` storage layer (SQLite FTS5 + Postgres GIN); `mdk kb ingest` CLI |
+| B | `citation_accuracy` eval dimension; automated grounding scorecard |
+| C | Hybrid BM25 + vector search with Reciprocal Rank Fusion |
+| D | KB upload via Chainlit playground (`mdk playground`) |
+| E | Query rewriter + fan-out retrieval (multi-query expansion) |
+| F | LLM rerank stage — cross-encoder scoring over top-k candidates |
+| G | PDF parser for KB ingest |
+| H | Multi-hop retrieval loop; agent can issue follow-up queries |
+| I | Per-agent retrieval config in `agent.yaml` (`retrieval:` stanza) |
+| J | `mdk validate` warns on orphan retrieval config |
+| K | Retrieval observability: per-stage latency + chunk counts in trace |
+| L | DOCX parser (python-docx) |
+| M | HTML parser (BeautifulSoup) |
+
+### Added — Knowledge Base storage and ingestion
+
+- **`movate.kb.storage`** — `kb_chunks` table with FTS5 (SQLite) and
+  GIN (Postgres) full-text indexes. Supports per-agent, per-source,
+  and per-tenant isolation. `delete_kb_chunks` for clean re-ingest.
+- **`mdk kb ingest <path>`** — recursively ingest PDF, DOCX, HTML,
+  Markdown, and plain-text files into the agent's KB. Env-var tunable:
+  `MOVATE_BM25_K1`, `MOVATE_BM25_B`, `MOVATE_RRF_K`. Options:
+  `--clean-source` (delete old chunks before re-ingest),
+  `--ocr-lang`, `--ocr-backend` (Tesseract or EasyOCR).
+- **`mdk kb search <agent> <query>`** — interactive retrieval CLI;
+  shows raw hybrid-search output with BM25 + vector + RRF scores.
+- **`mdk kb stats [--by-source]`** — chunk counts and size breakdown.
+
+### Added — Retrieval pipeline internals
+
+- **Hybrid search** (`movate.kb.lexical` + `movate.kb.search`):
+  BM25 scores from FTS5/GIN merged with cosine-similarity vector
+  scores via Reciprocal Rank Fusion. All three constants are
+  env-var tunable for operator A/B testing.
+- **Query rewriter** (`movate.kb.rewrite`): expands the user query
+  into up to N variants; fan-out retrieves from each; results
+  deduplicated before rerank.
+- **LLM rerank** (`movate.kb.rerank`): sends the top-k retrieval
+  candidates back to the model for cross-encoder-style scoring;
+  returns a re-ordered slice the executor injects as context.
+- **Multi-hop loop**: executor runs up to `retrieval.max_hops`
+  retrieval rounds when the model signals it needs more evidence.
+- **File-size guard**: files above `MOVATE_MAX_FILE_MB` (default 50)
+  are skipped with a warning rather than silently timing out the
+  PDF parser.
+
+### Added — Document parsers
+
+- **PDF** (`movate.kb.parsers.pdf`): pdfminer.six text extraction
+  with Tesseract OCR fallback for scanned/image-only pages.
+  Per-page mixed mode, DPI 300, `--oem 1 --psm 6`, whitespace normalisation.
+  EasyOCR backend selectable via `MOVATE_OCR_BACKEND=easyocr`.
+- **DOCX** (`movate.kb.parsers.docx`): python-docx; preserves
+  paragraph structure and table cells as separate chunks.
+- **HTML** (`movate.kb.parsers.html`): BeautifulSoup; strips
+  scripts/styles, preserves heading hierarchy as chunk metadata.
+- **Image OCR** (`movate.kb.parsers.image`): standalone Tesseract
+  / EasyOCR wrapper for PNG/JPG KB assets.
+
+### Added — Eval: citation accuracy dimension
+
+- **`citation_accuracy`** scorecard category: checks that every
+  factual claim in the agent output is supported by a retrieved
+  chunk. Rubric is configurable per agent in `evals/dataset.jsonl`
+  (`contexts` field). Grounding enforcement modes M2-M6 let operators
+  gate deploys on minimum citation scores.
+
+---
+
+## [0.7.0] — 2026-05-13
+
+**movate grows a Teams front door and a native provider layer.** v0.7
+ships native Anthropic and OpenAI providers (bypassing LiteLLM for
+features LiteLLM doesn't yet surface), a full Microsoft Teams bot
+integration, and the Runtime API that the Angular `mova.io` front end
+consumes.
+
+### Added — Native LLM providers
+
+- **`runtime: native_anthropic`** (`movate.providers.anthropic`):
+  calls the official `anthropic` SDK directly. Supports `to_tool_spec`
+  in Anthropic's flat `{name, description, input_schema}` shape;
+  translates the executor's OpenAI-style message history (tool_calls +
+  tool results) into Anthropic content blocks transparently.
+  Prompt caching, thinking blocks, and vision are architecturally
+  ready; deferred to follow-ups.
+- **`runtime: native_openai`** (`movate.providers.openai_native`):
+  calls the official `openai` SDK directly. Same executor contract
+  as LiteLLM; `tools=` passthrough; `tool_calls` parsing. `pricing_key`
+  bridges bare model ids (`gpt-4o-mini-2024-07-18`) to the
+  `openai/...` pricing-table keys.
+- Both providers implement full exception translation
+  (`AuthError`, `RateLimitError`, `MovateTimeoutError`, etc.) matching
+  the LiteLLM taxonomy so the executor's retry/fallback layer is
+  provider-agnostic.
+
+### Added — Microsoft Teams bot (Slices 3.1.a–e)
+
+- **Slice 3.1.a** — Bot Framework webhook skeleton: POST `/api/messages`
+  receives Activity objects, dispatches text messages to the executor.
+- **Slice 3.1.b** — Adaptive Cards: agent responses render as rich
+  cards with collapsible source citations.
+- **Slice 3.1.c** — Per-user identity binding: `/movate connect`,
+  `/whoami`, `/disconnect` slash commands map Teams user ids to
+  movate tenant identities.
+- **Slice 3.1.d** — File attachment handling: users can upload
+  documents directly in Teams; files are ingested into the agent's KB.
+- **Slice 3.1.e** — Azure Bot Service manifest + registration Bicep;
+  UAI for ACA. `mdk teams deploy` one-command bot provisioning.
+
+### Added — Runtime API (Groups G + H)
+
+- **Group G** — Angular cross-cutting: CORS headers, `/api/v1` prefix
+  mount, OpenAPI client generation docs.
+- **Agent CRUD**: `POST /api/v1/agents` (create from wizard payload),
+  `GET /api/v1/agents`, `GET /api/v1/agents/{name}` (profile detail).
+- **Run + eval endpoints**: `POST /api/v1/agents/{name}/runs`,
+  `POST /api/v1/agents/{name}/validate` (shippability gate),
+  `GET /api/v1/runs/{run_id}/trace` (replay for trace-viewer).
+- **Group H** — Eval endpoints: kickoff, retrieval, list.
+- **GitHub integration** (ADR 007): `POST /agents/{name}/publish`
+  (feature-flagged), `GET /agents/{name}/history` (commit log).
+- **`mdk rename`** — rename an agent in place (updates agent.yaml,
+  directory, and all cross-references).
+
+---
+
+## [0.6.0] — 2026-05-13
+
+**movate gains a skills system and ships to Azure.** v0.6 extends
+the agent model with callable skills (Python functions, HTTP
+endpoints, MCP servers), adds an eval gating system for CI, and ships
+the first full Azure production deployment.
+
+### Added — Skills system (PRs 1–7)
+
+- **Python skill backend** (`implementation.kind: python`): entry-point
+  import path resolves at load time; callable is invoked with
+  `(input: dict, ctx: SkillExecutionContext)`.
+- **HTTP skill backend** (`implementation.kind: http`): calls an
+  external REST endpoint; supports Bearer auth, timeout, schema
+  validation of the response.
+- **MCP skill backend** (`implementation.kind: mcp`): wraps an MCP
+  server tool call; the executor manages the MCP session lifecycle.
+- **`SkillPolicy`**: per-skill call budget, timeout, and allowed-input
+  schema enforcement — violations surface as typed `SkillError`.
+- **`mdk skills list`** — show all skills in scope with backend type,
+  version, and cost.
+- **`mdk skills scaffold <name>`** — generate a new skill directory
+  with `skill.yaml` + implementation stub.
+- **`mdk skills run <name> --input '{"k":"v"}'`** — invoke a skill
+  directly from the CLI for local iteration without running a full agent.
+
+### Added — Eval and validation improvements
+
+- **`mdk eval <url>`** — run an eval against a remotely-served agent;
+  no local project required.
+- **Four-dimension eval reporting**: `accuracy`, `completeness`,
+  `format`, `safety` — each dimension scored separately, displayed in
+  a colour-coded table.
+- **Per-objective gating**: `evals/dataset.jsonl` entries can specify
+  `min_score` per dimension; `mdk eval --gate 0.8` blocks on any
+  failing objective.
+- **`mdk doctor --explain`** — each diagnostic prints a remediation
+  hint rather than a bare pass/fail.
+- **`mdk import json <file>`** — convert a JSON array of
+  `{input, expected}` objects into a `dataset.jsonl` eval file.
+
+### Added — Agent config and templates
+
+- **Inline YAML schema shorthand**: `input: {field: type}` instead of
+  full JSON Schema — the loader expands it automatically.
+- **Canonical config split**: `agent.yaml` holds the agent declaration;
+  `policy.yaml` holds guardrails + budget limits (optional, merged at
+  load time).
+- **`mdk` binary alias**: `mdk` is now the preferred short alias
+  alongside `movate`.
+- **FAQ agent template** (`mdk add faq`): pre-wired with a confidence
+  rubric, grounding enforcement, and a 15-case eval dataset.
+- **Lyzr adapter** (`runtime: lyzr`): thin shim routing to Lyzr's
+  hosted agent API; maps the response to `CompletionResponse`.
+
+### Added — Production deployment
+
+- **Azure Bicep IaC**: Azure Container Apps + Postgres Flex Server +
+  ACR + Key Vault + Log Analytics — full production stack in one
+  `az deployment` invocation.
+- **`movate deploy`** (`mdk deploy`): builds image, pushes to ACR,
+  triggers ACA revision.
+- **Per-tenant monthly cost ceiling**: `budget.monthly_usd_ceiling`
+  in `policy.yaml`; the executor soft-blocks new runs once the limit
+  is reached (returns `cost_limit_exceeded`).
+- **Per-API-key rate limiting**: token bucket, `429 + Retry-After`
+  headers, configurable per key.
+- **Job retry policy**: exponential backoff + dead-letter after max
+  attempts; worker continues on adjacent jobs after a failing one.
+- **`movate watch`**: polls agent files every 0.5s; re-runs
+  `movate validate` (with cost forecast + prompt lint) on any change.
+  200ms debounce, resilient to mid-save broken YAML.
+
+---
+
 ## [0.5.0] — 2026-05-09
 
 **movate is now a service.** v0.5 takes the framework from "library +
