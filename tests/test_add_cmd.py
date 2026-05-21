@@ -245,3 +245,32 @@ def test_no_template_arg_errors_with_hint_to_use_list(
     result = runner.invoke(app, ["add"])
     assert result.exit_code == 2
     assert "mdk add --list" in result.stderr or "required" in result.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# KB dir creation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_add_rag_qa_creates_kb_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """mdk add rag-qa should create agents/rag-qa/kb/ so that
+    `mdk kb ingest-all` discovers it automatically."""
+    proj = _bootstrap_project(tmp_path)
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "rag-qa"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    kb_dir = proj / "agents" / "rag-qa" / "kb"
+    assert kb_dir.is_dir(), f"Expected kb/ dir at {kb_dir}"
+
+
+@pytest.mark.unit
+def test_add_non_kb_template_no_kb_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """mdk add faq should NOT create agents/faq/kb/ because the faq
+    template does not declare a kb-vector skill."""
+    proj = _bootstrap_project(tmp_path)
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "faq"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    kb_dir = proj / "agents" / "faq" / "kb"
+    assert not kb_dir.exists(), f"Unexpected kb/ dir at {kb_dir}"

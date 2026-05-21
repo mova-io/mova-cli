@@ -48,6 +48,10 @@ from movate.core.workflow.spec import WorkflowSpecLoadError
 
 console = Console(stderr=True)
 
+# Auto-select output format: text for interactive terminals, JSON for pipes/CI.
+# `--output json` / `--output text` always override.
+_default_output_format: Run = Run.TEXT if sys.stdout.isatty() else Run.JSON
+
 
 def run(
     path: Path = typer.Argument(
@@ -107,7 +111,17 @@ def run(
             "kb-vector-lookup skill calls. Useful for debugging retrieval quality."
         ),
     ),
-    output_format: Run = typer.Option(Run.JSON, "--output", "-o", case_sensitive=False),
+    output_format: Run = typer.Option(
+        _default_output_format,
+        "--output",
+        "-o",
+        case_sensitive=False,
+        help=(
+            "Output format. Defaults to [bold]text[/bold] on interactive terminals "
+            "and [bold]json[/bold] when stdout is piped. Use [bold]--output json[/bold] "
+            "to force JSON from a terminal (e.g. for scripting)."
+        ),
+    ),
 ) -> None:
     """Run an agent or workflow against the given input.
 

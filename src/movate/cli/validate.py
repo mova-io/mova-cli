@@ -779,11 +779,8 @@ def _check_vector_kb_empty(bundle: AgentBundle, con: Console) -> None:
     Wrapped in a broad ``except Exception`` so a missing or uninitialized
     database never causes validate to fail.
     """
-    # Only relevant when the agent uses a vector KB skill.
-    has_vector_skill = any(
-        "kb-vector" in s.spec.name.lower() for s in bundle.skills
-    )
-    if not has_vector_skill:
+    # Fast path: skip entirely if no KB-vector skill is declared.
+    if not any("kb-vector" in s.spec.name.lower() for s in bundle.skills):
         return
 
     async def _probe() -> bool:

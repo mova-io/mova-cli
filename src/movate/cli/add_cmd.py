@@ -531,7 +531,7 @@ def _suggest_template(unknown: str) -> str | None:
     return close[0] if close else None
 
 
-def add(  # noqa: PLR0912 — orchestrator; flag-parsing branches are inherent
+def add(
     args: list[str] = typer.Argument(
         None,
         help=(
@@ -883,6 +883,10 @@ def _add_one(
     # AgentSpec doesn't fight us when the loader runs.
     _stamp_template_source(dest, template=template)
 
+    # Create agents/<name>/kb/ for KB-using templates so that
+    # `mdk kb ingest-all` discovers the directory automatically.
+    kb_dir_created = _maybe_create_kb_dir(dest)
+
     # Auto-scaffold any skills the template declares. Closes the rough
     # edge where a template references `skills: [web-search]` but the
     # skill dir doesn't exist in the project — without this the agent
@@ -958,6 +962,7 @@ def _add_one(
             "validates": validates_token,
             "skills_scaffolded": skills_scaffolded,
             "contexts_scaffolded": contexts_scaffolded,
+            "kb_dir_created": kb_dir_created,
         }
 
     body = (
@@ -966,6 +971,11 @@ def _add_one(
         f"[bold]Path:[/bold]     [cyan]{dest}[/cyan]\n"
         f"[bold]Project:[/bold]  [dim]{project_root}[/dim]\n"
     )
+    if kb_dir_created:
+        body += (
+            f"[bold]KB dir:[/bold]   [cyan]agents/{agent_name}/kb/[/cyan] "
+            f"[dim](drop PDFs/docs here, then run mdk kb ingest-all)[/dim]\n"
+        )
     if skills_scaffolded:
         skills_str = ", ".join(skills_scaffolded)
         body += f"[bold]Skills:[/bold]   [cyan]{skills_str}[/cyan] (auto-scaffolded)\n"
@@ -1015,17 +1025,24 @@ def _add_one(
     from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
 
     bin_name = mdk_bin_name()
-    prompt_next_step(
-        console=console,
-        steps=[
+    steps: list[NextStep] = []
+    if kb_dir_created:
+        steps.append(
             NextStep(
-                label="Add another role agent",
-                command=f"{bin_name} add --list",
-                argv=[bin_name, "add", "--list"],
-                callback=lambda: _pick_and_add_role_agent(bin_name),
-            ),
-        ],
+                label=f"Ingest KB docs for {agent_name!r} (drop files in agents/{agent_name}/kb/)",
+                command=f"{bin_name} kb ingest-all --dry-run",
+                argv=[bin_name, "kb", "ingest-all", "--dry-run"],
+            )
+        )
+    steps.append(
+        NextStep(
+            label="Add another role agent",
+            command=f"{bin_name} add --list",
+            argv=[bin_name, "add", "--list"],
+            callback=lambda: _pick_and_add_role_agent(bin_name),
+        )
     )
+    prompt_next_step(console=console, steps=steps)
     return None
 
 
@@ -1082,9 +1099,24 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
 
     _ = active  # silence unused-variable in this scoped-down menu
     bin_name = mdk_bin_name()
-    prompt_next_step(
-        console=console,
-        steps=[
+
+    # Check whether any of the added agents created a kb/ dir. If so,
+    # surface the ingest-all step before the validate step so the operator
+    # sees the KB hint before running validation.
+    any_kb_dir = any(
+        (project_root / "agents" / name / "kb").is_dir() for name in added_names
+    )
+    batch_steps: list[NextStep] = []
+    if any_kb_dir:
+        batch_steps.append(
+            NextStep(
+                label="Ingest KB docs (drop files in agents/<name>/kb/ first)",
+                command=f"{bin_name} kb ingest-all --dry-run",
+                argv=[bin_name, "kb", "ingest-all", "--dry-run"],
+            )
+        )
+    batch_steps.extend(
+        [
             NextStep(
                 label="Validate all agents",
                 command=f"{bin_name} validate --all",
@@ -1095,8 +1127,43 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
                 command=f"{bin_name} doctor agent {added_names[0]}",
                 argv=[bin_name, "doctor", "agent", added_names[0]],
             ),
-        ],
+        ]
     )
+    prompt_next_step(
+        console=console,
+        steps=batch_steps,
+    )
+
+
+def _maybe_create_kb_dir(agent_dir: Path) -> bool:
+    """Create ``<agent_dir>/kb/`` when the agent template uses a kb-vector skill.
+
+    Reads ``agent.yaml`` directly (without calling ``load_agent``, which would
+    fail before skills are scaffolded) and checks whether any declared skill
+    name contains ``"kb-vector"``.  Creates ``<agent_dir>/kb/`` and returns
+    ``True`` when the directory is freshly created; returns ``False`` when the
+    agent has no kb-vector skill or when the YAML can't be read.
+
+    Used by ``_add_one`` so that ``mdk kb ingest-all`` (which discovers
+    ``agents/*/kb/``) finds the directory on the very first run.
+    """
+    yaml_path = agent_dir / "agent.yaml"
+    if not yaml_path.is_file():
+        return False
+
+    import yaml as _yaml  # noqa: PLC0415
+
+    try:
+        data = _yaml.safe_load(yaml_path.read_text()) or {}
+    except Exception:
+        return False
+
+    declared_skills: list[str] = data.get("skills") or []
+    if not any("kb-vector" in skill_name.lower() for skill_name in declared_skills):
+        return False
+
+    (agent_dir / "kb").mkdir(exist_ok=True)
+    return True
 
 
 def _try_post_scaffold_validate(agent_dir: Path, *, skip: bool) -> str | None:
@@ -1732,7 +1799,7 @@ def _do_add_skill_bare(args: list[str]) -> None:
     )
 
 
-def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
+def _do_remove(args: list[str], *, apply: bool) -> None:
     """Remove an existing agent (dry-run by default).
 
     Surfaces dangling references in workflows + baselines so operators
@@ -1835,7 +1902,7 @@ def _do_remove(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
     )
 
 
-def _do_update(args: list[str], *, apply: bool) -> None:  # noqa: PLR0912
+def _do_update(args: list[str], *, apply: bool) -> None:
     """Refresh an existing agent against the latest template version.
 
     Reads `_template_source` from the agent's agent.yaml, diffs each
