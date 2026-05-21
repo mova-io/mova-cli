@@ -22,8 +22,9 @@ from typing import TYPE_CHECKING
 import typer
 import uvicorn
 from rich.console import Console
+from rich.panel import Panel
 
-from movate.cli._console import hint, success
+from movate.cli._console import success
 from movate.runtime.app import build_app
 from movate.runtime.registry import scan_agents
 from movate.storage import build_storage
@@ -168,15 +169,39 @@ async def _run_serve(
         rate_limit_per_minute=rate_limit_per_minute,
         cors_allowed_origins=parsed_origins,
     )
-    err.print(f"[bold]movate[/bold] serving on http://{host}:{port}")
-    if rate_limit_per_minute > 0:
-        hint(f"[dim]  rate limit: {rate_limit_per_minute} req/min per API key[/dim]")
-    else:
-        hint("[dim]  rate limit: [yellow]DISABLED[/yellow][/dim]")
-    if parsed_origins:
-        hint(f"[dim]  CORS allowed origins: {', '.join(parsed_origins)}[/dim]")
-    else:
-        hint("[dim]  CORS: [yellow]OFF[/yellow] (set --cors-origins for browser callers)[/dim]")
+    _rate_line = (
+        f"rate limit:  {rate_limit_per_minute} req/min per API key"
+        if rate_limit_per_minute > 0
+        else "rate limit:  [yellow]DISABLED[/yellow]"
+    )
+    _cors_line = (
+        f"CORS:        {', '.join(parsed_origins)}"
+        if parsed_origins
+        else "CORS:        [yellow]OFF[/yellow] [dim](pass --cors-origins for browsers)[/dim]"
+    )
+    _agent_line = (
+        f"agents:      {len(agents)} loaded"
+        if agents
+        else "agents:      [yellow]none loaded[/yellow] [dim](GET /agents returns empty)[/dim]"
+    )
+    _body_lines = [
+        f"[bold cyan]http://{host}:{port}[/bold cyan]",
+        "",
+        _agent_line,
+        _rate_line,
+        _cors_line,
+        "",
+        "[dim]mdk run <agent> '<input>'   →  invoke an agent[/dim]",
+        "[dim]mdk logs --last             →  inspect last run[/dim]",
+    ]
+    err.print(
+        Panel(
+            "\n".join(_body_lines),
+            title="[green]✓[/green] movate runtime ready",
+            title_align="left",
+            border_style="green",
+        )
+    )
 
     config = uvicorn.Config(
         app,

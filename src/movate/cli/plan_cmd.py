@@ -26,9 +26,11 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -344,8 +346,16 @@ def plan(
       [dim]$ mdk plan --from "rag Q&A over company docs" --apply[/dim]
       [dim]$ mdk plan --from "sql assistant" --json | jq .agents[/dim]
     """
+    # Show a spinner for the LLM planner call (1-3s). Skip in mock mode
+    # (instant) or when stderr isn't a TTY (CI / pipe).
+    _ctx = (
+        console.status("[dim]Planning…[/dim]", spinner="dots")
+        if not output_json and not mock and sys.stderr.isatty()
+        else contextlib.nullcontext()
+    )
     try:
-        plan_data = asyncio.run(_call_planner(description, model=model, mock=mock))
+        with _ctx:
+            plan_data = asyncio.run(_call_planner(description, model=model, mock=mock))
     except json.JSONDecodeError as exc:
         err_console.print(f"[red]✗[/red] planner returned invalid JSON: {exc}")
         raise typer.Exit(code=1) from exc
