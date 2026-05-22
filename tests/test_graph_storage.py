@@ -15,6 +15,7 @@ import hashlib
 import pytest
 
 from movate.core.models import Entity, KbChunk, Relation
+from movate.kb.embed import embedding_dim
 from movate.storage.base import StorageProvider
 
 pytestmark = pytest.mark.unit
@@ -22,6 +23,18 @@ pytestmark = pytest.mark.unit
 
 def _hash(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def _pad(vec: list[float]) -> list[float]:
+    """Pad a short test vector to the configured embedding dim with zeros.
+
+    The short literals (``[1, 0, 0]``) only fit memory/sqlite; the real
+    Postgres backend stores entity embeddings in a fixed ``vector(N)`` column
+    (ADR 009 D1), so they must be N-dim. Trailing zeros preserve the cosine
+    relationships among the leading components, so search ordering is unchanged.
+    """
+    dim = embedding_dim()
+    return vec if len(vec) >= dim else vec + [0.0] * (dim - len(vec))
 
 
 def _entity(
@@ -38,7 +51,7 @@ def _entity(
         agent=agent,
         name=name,
         type=type,
-        embedding=embedding,
+        embedding=_pad(embedding),
         embedding_model="test-embed",
         content_hash=_hash(agent, tenant_id, name, type),
         source_chunk_ids=source_chunk_ids or [],
@@ -120,7 +133,7 @@ async def test_upsert_entity_dedup_merges_provenance(storage: StorageProvider) -
     assert merged.entity_id == first.entity_id
     # Provenance is the UNION; embedding/description refreshed to latest.
     assert set(merged.source_chunk_ids) == {"c1", "c2"}
-    assert merged.embedding == [0.5, 0.5, 0.0]
+    assert merged.embedding == _pad([0.5, 0.5, 0.0])
 
 
 async def test_upsert_relation_dedup_merges_provenance(storage: StorageProvider) -> None:
@@ -147,7 +160,7 @@ async def test_search_entities_ranks_by_cosine(storage: StorageProvider) -> None
     await storage.upsert_entity(_entity("Z axis", "Axis", [0.0, 0.0, 1.0]))
 
     hits = await storage.search_entities(
-        agent="a1", tenant_id="t1", query_embedding=[0.9, 0.1, 0.0], limit=2
+        agent="a1", tenant_id="t1", query_embedding=_pad([0.9, 0.1, 0.0]), limit=2
     )
     assert len(hits) == 2
     assert hits[0].entity.name == "X axis"
@@ -156,7 +169,7 @@ async def test_search_entities_ranks_by_cosine(storage: StorageProvider) -> None
 
 async def test_search_entities_empty_graph(storage: StorageProvider) -> None:
     hits = await storage.search_entities(
-        agent="a1", tenant_id="t1", query_embedding=[1.0, 0.0, 0.0], limit=5
+        agent="a1", tenant_id="t1", query_embedding=_pad([1.0, 0.0, 0.0]), limit=5
     )
     assert hits == []
 
@@ -165,7 +178,7 @@ async def test_search_entities_agent_scoped(storage: StorageProvider) -> None:
     await storage.upsert_entity(_entity("Shared name", "T", [1.0, 0.0, 0.0], agent="a1"))
     await storage.upsert_entity(_entity("Shared name", "T", [1.0, 0.0, 0.0], agent="a2"))
     hits = await storage.search_entities(
-        agent="a1", tenant_id="t1", query_embedding=[1.0, 0.0, 0.0], limit=10
+        agent="a1", tenant_id="t1", query_embedding=_pad([1.0, 0.0, 0.0]), limit=10
     )
     assert len(hits) == 1
 
