@@ -9,7 +9,7 @@ in ``uv.lock`` — because drift would ship a wheel where ``pip show`` and
 Two layers of coverage:
 
 * In-process unit tests of ``compute_version`` with injected ``today`` /
-  ``commits_today`` (deterministic — no dependence on the wall clock or git).
+  ``current`` (deterministic — no dependence on the wall clock or git).
 * Subprocess integration tests that invoke the script against a scaffolded
   tmp repo, exercising the real file rewrites + ``--check`` + drift guard.
 """
@@ -44,25 +44,41 @@ _CALVER_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 @pytest.mark.unit
 class TestComputeVersion:
     def test_first_commit_of_day_is_n_equals_one(self) -> None:
-        assert bump.compute_version(today="2026-05-21", commits_today=0) == "2026.5.21.1"
+        # A non-CalVer / non-today current version → N resets to 1.
+        assert bump.compute_version(today="2026-05-21", current="0.0.0") == "2026.5.21.1"
 
-    def test_n_increments_with_existing_commits(self) -> None:
-        # 21 already today → this commit is the 22nd (the user's example).
-        assert bump.compute_version(today="2026-05-21", commits_today=21) == "2026.5.21.22"
+    def test_n_increments_from_current_version(self) -> None:
+        # Current is the 21st of today → this commit is the 22nd.
+        assert bump.compute_version(today="2026-05-21", current="2026.5.21.21") == "2026.5.21.22"
 
     def test_date_segments_are_unpadded(self) -> None:
-        assert bump.compute_version(today="2026-05-05", commits_today=2) == "2026.5.5.3"
-        assert bump.compute_version(today="2026-01-09", commits_today=0) == "2026.1.9.1"
+        assert bump.compute_version(today="2026-05-05", current="2026.5.5.2") == "2026.5.5.3"
+        assert bump.compute_version(today="2026-01-09", current="0.0.0") == "2026.1.9.1"
 
     def test_output_is_pep440_canonical(self) -> None:
         # The literal we write MUST equal its own PEP 440 normalization so
         # `mdk --version` agrees with pip/uv metadata (no leading-zero drift).
-        for today, n in [("2026-05-05", 0), ("2026-05-21", 21), ("2026-12-31", 99)]:
-            v = bump.compute_version(today=today, commits_today=n)
+        for today, cur in [
+            ("2026-05-05", "0.0.0"),
+            ("2026-05-21", "2026.5.21.21"),
+            ("2026-12-31", "2026.12.31.99"),
+        ]:
+            v = bump.compute_version(today=today, current=cur)
             assert str(Version(v)) == v
 
     def test_new_day_resets_n(self) -> None:
-        assert bump.compute_version(today="2026-05-22", commits_today=0) == "2026.5.22.1"
+        # Current is yesterday's date → today's first commit is .1.
+        assert bump.compute_version(today="2026-05-22", current="2026.5.21.9") == "2026.5.22.1"
+
+    def test_squash_robust_bumps_from_current_not_commit_count(self) -> None:
+        # The whole point of the fix: the next version is current N + 1,
+        # independent of how many commits exist — so a squash merge that
+        # collapsed several bumps into one commit doesn't cause a collision.
+        assert bump.compute_version(today="2026-05-22", current="2026.5.22.4") == "2026.5.22.5"
+
+    def test_prefix_collision_guarded(self) -> None:
+        # Day 2's prefix ("2026.5.2") must not match a day-22 current version.
+        assert bump.compute_version(today="2026-05-02", current="2026.5.22.7") == "2026.5.2.1"
 
 
 # ---------------------------------------------------------------------------

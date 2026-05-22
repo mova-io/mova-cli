@@ -7,10 +7,14 @@ Two files hold the version string in lockstep:
 * ``src/movate/__init__.py`` — ``__version__`` exposed to runtime callers
   (e.g. ``mdk --version``, ``GET /healthz``).
 
-Versioning scheme (2026-05 onward): **CalVer** ``YYYY.M.D.N`` where ``N`` is
-the 1-based ordinal of the commit being made among commits whose
-committer-date is *today* and that are reachable from ``HEAD`` (so the first
-commit of a day is ``.1``, the next ``.2``, …). Date segments are UNPADDED
+Versioning scheme (2026-05 onward): **CalVer** ``YYYY.M.D.N`` where ``N``
+increments per commit within a day and resets to ``1`` on a new day. The
+bump is derived from the *current* version string already in the tree
+(``N+1`` when its date is today, else ``1``), NOT from a commit count.
+Reading the current version keeps the bump monotonic and **squash-robust**:
+a commit count assumes one commit == one version slot, which squash merges
+violate (they collapse several per-commit bumps into one commit, so the
+next branch recomputes a colliding ``N``). Date segments are UNPADDED
 (``2026.5.21.7``, not ``2026.05.21.7``) so the string is PEP 440-canonical —
 pip / uv / hatchling strip leading zeros anyway, and an unpadded literal
 keeps ``mdk --version`` in agreement with the installed-package metadata.
@@ -36,7 +40,6 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -65,38 +68,37 @@ def _read_version(path: Path, pattern: re.Pattern[str]) -> str:
     return match.group(1)
 
 
-def _commits_today(today: str) -> int:
-    """Count commits reachable from HEAD whose committer-date is ``today``.
+def compute_version(today: str | None = None, current: str | None = None) -> str:
+    """Return the next ``YYYY.M.D.N`` version for a commit made ``today``.
 
-    ``today`` is an ISO ``YYYY-MM-DD`` string in local time. Returns 0 when
-    there's no git history (fresh repo) or git isn't available — so the
-    first commit of a day always lands on ``.1``.
-    """
-    try:
-        out = subprocess.run(
-            ["git", "log", "--pretty=%cd", "--date=format:%Y-%m-%d"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=REPO_ROOT,
-        ).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return 0
-    return sum(1 for line in out.splitlines() if line.strip() == today)
+    Monotonic and **squash-robust**: the bump is derived from the *current*
+    version string (the last one written into the tree), not a commit count.
+    If the current version's date is ``today``, increment ``N``; otherwise
+    it's a new day and ``N`` resets to ``1``.
 
+    Why not count commits: a commit count assumes one commit == one version
+    slot, which squash merges violate — they collapse several per-commit
+    bumps into a single commit, so the count desyncs and the next branch
+    recomputes a colliding ``N``. Reading the current version sidesteps that
+    (the squashed commit still carries the highest ``N`` written so far).
 
-def compute_version(today: str | None = None, commits_today: int | None = None) -> str:
-    """Return the ``YYYY.M.D.N`` version for a commit made ``today``.
-
-    ``today`` (ISO ``YYYY-MM-DD``) and ``commits_today`` are injectable for
-    tests; in normal use they default to the system date and a ``git log``
-    count. ``N = commits_today + 1`` — the 1-based ordinal of the commit
-    being made.
+    ``today`` (ISO ``YYYY-MM-DD``) and ``current`` (the existing version
+    string) are injectable for tests; in normal use they default to the
+    system date and the version pinned in ``pyproject.toml``. A ``current``
+    that isn't today's CalVer (a fresh ``0.0.0``, or yesterday's date) yields
+    ``N=1`` — so the first commit of a day always lands on ``.1``.
     """
     day = _dt.date.fromisoformat(today) if today else _dt.date.today()
-    iso = day.isoformat()
-    existing = commits_today if commits_today is not None else _commits_today(iso)
-    return f"{day.year}.{day.month}.{day.day}.{existing + 1}"
+    prefix = f"{day.year}.{day.month}.{day.day}"
+    cur = current if current is not None else _read_version(PYPROJECT, _PYPROJECT_RE)
+    n = 1
+    # The trailing dot in the prefix guards against a shorter date being a
+    # textual prefix of a longer one (e.g. day "2" vs "22").
+    if cur.startswith(f"{prefix}."):
+        tail = cur[len(prefix) + 1 :]
+        if tail.isdigit():
+            n = int(tail) + 1
+    return f"{prefix}.{n}"
 
 
 def _read_uv_lock_version() -> str | None:
