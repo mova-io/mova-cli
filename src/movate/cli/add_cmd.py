@@ -650,6 +650,10 @@ def add(
 
       [dim]# Refresh against the latest template version[/dim]
       $ mdk add --update rag-qa --apply
+
+    [bold]See also:[/bold] [bold]mdk dev <name>[/bold] for a guided
+    scaffold → edit → live-test → deploy loop (the front door for
+    authoring a single agent end-to-end).
     """
     if list_only:
         # `--list` (and the `mdk add list` subcommand alias below)
@@ -1619,6 +1623,11 @@ def _do_add_context(args: list[str]) -> None:
             title_align="left",
             border_style="green",
         )
+    )
+    console.print(
+        f"[dim]Tip: wire it into an agent in one step with "
+        f"[bold]mdk contexts attach {context_name} --agent <agent>[/bold] — or use "
+        f"[bold]mdk contexts create[/bold] (its [bold]--agent[/bold] auto-attaches).[/dim]"
     )
     console.print(
         f"[dim]mdk_add_context_summary: "

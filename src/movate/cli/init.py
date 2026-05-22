@@ -1788,6 +1788,11 @@ def init(
       [dim]$ mdk init faq               # add one agent from the faq template[/dim]
       [dim]$ mdk init my-bot --template chatbot[/dim]
       [dim]$ mdk init faq-agent --llm "FAQ agent for our SaaS pricing"  # Phase 2[/dim]
+
+    [bold]See also:[/bold] [bold]mdk dev <name>[/bold] is the guided front
+    door — it scaffolds (if needed), then drops you into a live
+    edit → test → deploy loop. [bold]mdk add <template>[/bold] is the
+    quick "drop another role agent into this project" command.
     """
     # Mutual-exclusion guard: --llm only makes sense in agent mode.
     # Project mode is just a movate.yaml + .gitignore + empty agents/ —
