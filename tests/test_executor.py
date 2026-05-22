@@ -125,6 +125,49 @@ async def test_executor_happy_path(
 
 
 # ---------------------------------------------------------------------------
+# Tracing — the prompt event carries the rendered prompt + injected contexts
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTracer(NullTracer):
+    """NullTracer that records every log_event payload for assertions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[dict] = []
+
+    def log_event(self, span, event) -> None:  # type: ignore[override]
+        self.events.append(dict(event))
+
+
+@pytest.mark.unit
+async def test_executor_traces_rendered_prompt_and_contexts(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+) -> None:
+    """The prompt trace event includes the full rendered prompt text (not
+    just a hash) and the names of injected contexts — so Langfuse traces
+    show what was actually sent + the context-injection step."""
+    bundle = load_agent(_scaffold(tmp_path / "demo"))
+    rec = _RecordingTracer()
+    executor = Executor(
+        provider=MockProvider(response='{"message": "hi"}'),
+        pricing=pricing,
+        storage=storage,
+        tracer=rec,
+    )
+    await executor.execute(bundle, RunRequest(agent="demo", input={"text": "hi"}))
+
+    prompt_events = [e for e in rec.events if "rendered_prompt" in e]
+    assert prompt_events, "expected a trace event carrying rendered_prompt"
+    evt = prompt_events[0]
+    assert isinstance(evt["rendered_prompt"], str) and evt["rendered_prompt"].strip()
+    assert "prompt_hash" in evt
+    assert "contexts" in evt and isinstance(evt["contexts"], list)
+
+
+# ---------------------------------------------------------------------------
 # Streaming (executor.execute with on_token callback)
 # ---------------------------------------------------------------------------
 

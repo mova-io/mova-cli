@@ -357,7 +357,18 @@ class Executor:
                         },
                     )
 
-            self._tracer.log_event(span, {"prompt_hash": bundle.prompt_hash})
+            self._tracer.log_event(
+                span,
+                {
+                    "prompt_hash": bundle.prompt_hash,
+                    # Full rendered system prompt actually sent to the model
+                    # (contexts already prepended) — so traces show the real
+                    # text, not just a hash. Names of injected contexts are
+                    # logged alongside as the context-injection step.
+                    "rendered_prompt": rendered,
+                    "contexts": [name for name, _ in bundle.contexts],
+                },
+            )
 
             chain: list[tuple[str, dict[str, Any]]] = [
                 (effective_model.provider, dict(effective_model.params))
