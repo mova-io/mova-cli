@@ -148,6 +148,8 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             _grounding_action(agent_dir)
         elif action == "deploy":
             target = _deploy_action(agent_name, target)
+        elif action == "ingest_kb":
+            target = _ingest_kb_action(agent_name, agent_dir, target)
         elif action == "test_deployed":
             target = _test_deployed_action(agent_dir, test_input, target)
 
@@ -367,13 +369,14 @@ def _actions_menu() -> str:
     )
     stdout.print(
         "  [bold cyan]d[/bold cyan] deploy to Azure      "
-        "[bold cyan]x[/bold cyan] test deployed agent   "
-        "[bold cyan]q[/bold cyan] quit"
+        "[bold cyan]k[/bold cyan] ingest knowledge base "
+        "[bold cyan]x[/bold cyan] test deployed agent"
     )
+    stdout.print("  [bold cyan]q[/bold cyan] quit")
     try:
         choice = Prompt.ask(
             "[bold]Pick[/bold]",
-            choices=["r", "i", "c", "e", "g", "d", "x", "o", "q"],
+            choices=["r", "i", "c", "e", "g", "d", "k", "x", "o", "q"],
             default="r",
             show_choices=False,
         )
@@ -386,6 +389,7 @@ def _actions_menu() -> str:
         "e": "eval",
         "g": "grounding",
         "d": "deploy",
+        "k": "ingest_kb",
         "x": "test_deployed",
         "o": "edit",
         "q": "quit",
@@ -450,6 +454,45 @@ def _deploy_action(agent_name: str, target: str | None) -> str | None:
         "\n[dim]Note: knowledge base is not synced by deploy. If this agent uses a KB:\n"
         f"  {mdk_bin_name()} kb ingest {agent_name} <path> --target {target}[/dim]"
     )
+    return target
+
+
+def _ingest_kb_action(agent_name: str, agent_dir: Path, target: str | None) -> str | None:
+    """Ingest a knowledge-base path for this agent — locally or to a target.
+
+    Closes the deploy→KB gap: ``deploy`` ships the prompt + contexts, but the
+    knowledge base is a separate ingest step. This runs it without leaving the
+    session, paralleling the ``c`` (add-context) action.
+
+    The KB path defaults to ``agents/<name>/kb/`` (the convention ``kb ingest``
+    itself uses). Target is optional: a remembered/entered target ingests to the
+    deployed runtime so the live agent can retrieve it; blank ingests into the
+    local store (handy for the grounding check before you ship). Returns the
+    (possibly newly-prompted) target so the caller remembers it.
+    """
+    default_kb = agent_dir / "kb"
+    default_hint = str(default_kb) if default_kb.is_dir() else ""
+    try:
+        raw = Prompt.ask(
+            "[bold]KB path[/bold] to ingest (file or dir)",
+            default=default_hint,
+            show_default=bool(default_hint),
+        ).strip()
+    except (KeyboardInterrupt, EOFError):
+        return target
+    if not raw:
+        _console.warn("no path — skipping KB ingest")
+        return target
+    kb_path = Path(raw).expanduser()
+    if not kb_path.exists():
+        _console.warn(f"{kb_path} does not exist — skipping KB ingest")
+        return target
+
+    target = _ensure_target(target, purpose="KB ingest (leave blank = local store)")
+    argv = [mdk_bin_name(), "kb", "ingest", agent_name, str(kb_path)]
+    if target:
+        argv += ["--target", target]
+    _run_subcommand(argv)
     return target
 
 
@@ -545,6 +588,10 @@ def _print_noninteractive_guide(agent_dir: Path, agent_name: str, target: str | 
     stdout.print(f"  3. watch  {bin_name} watch {agent_dir}")
     stdout.print(f"  4. eval   {bin_name} eval {agent_dir}")
     stdout.print(f"  5. ship   {bin_name} deploy --target {deploy_target} --mode agents")
+    stdout.print(
+        f"  6. kb     {bin_name} kb ingest {agent_name} {agent_dir / 'kb'} "
+        f"--target {deploy_target}   [dim](if the agent uses a knowledge base)[/dim]"
+    )
     stdout.print(f"\nmdk_dev_summary: agent={agent_name} dir={agent_dir} interactive=false")
 
 

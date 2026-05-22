@@ -27,6 +27,7 @@ from movate.cli.deploy import (
     DeployConfigError,
     DeployPlan,
     _build_plan,
+    _ingest_bundled_kb,
     _print_plan,
     _wait_for_healthz,
 )
@@ -598,3 +599,70 @@ async def _no_sleep(_seconds: float) -> None:
     """Patched-in replacement for ``asyncio.sleep`` so the poll loop
     doesn't actually wait between iterations."""
     return None
+
+
+# ---------------------------------------------------------------------------
+# --with-kb: post-deploy bundled-KB ingest (_ingest_bundled_kb)
+# ---------------------------------------------------------------------------
+
+
+def _project_with_kb(root: Path, *agents_with_kb: str) -> Path:
+    """Scaffold a project tree with agents/<name>/ dirs; the named ones get a
+    non-empty kb/ subdir."""
+    for name in ("alpha", "beta"):
+        (root / "agents" / name).mkdir(parents=True)
+    for name in agents_with_kb:
+        kb = root / "agents" / name / "kb"
+        kb.mkdir(parents=True, exist_ok=True)
+        (kb / "doc.md").write_text("# doc")
+    return root
+
+
+@pytest.mark.unit
+def test_ingest_bundled_kb_ingests_only_agents_with_kb(tmp_path: Path, monkeypatch) -> None:
+    """Each uploaded agent with a non-empty kb/ dir → one `kb ingest … --target`
+    call; agents without a kb/ dir are skipped."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    root = _project_with_kb(tmp_path, "alpha")  # only alpha has a kb/
+
+    _ingest_bundled_kb(uploaded=["alpha", "beta"], project_root=root, target_name="prod")
+
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[1:3] == ["kb", "ingest"]
+    assert "alpha" in argv
+    assert str(root / "agents" / "alpha" / "kb") in argv
+    assert argv[-2:] == ["--target", "prod"]
+
+
+@pytest.mark.unit
+def test_ingest_bundled_kb_skips_empty_kb_dir(tmp_path: Path, monkeypatch) -> None:
+    """An agent whose kb/ exists but is empty → no ingest."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    root = tmp_path
+    (root / "agents" / "alpha" / "kb").mkdir(parents=True)  # empty kb/
+
+    _ingest_bundled_kb(uploaded=["alpha"], project_root=root, target_name="prod")
+
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_ingest_bundled_kb_failure_is_non_fatal(tmp_path: Path, monkeypatch) -> None:
+    """A non-zero ingest exit warns but does not raise (deploy already won)."""
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "boom"),
+    )
+    root = _project_with_kb(tmp_path, "alpha")
+
+    # Must not raise.
+    _ingest_bundled_kb(uploaded=["alpha"], project_root=root, target_name="prod")
