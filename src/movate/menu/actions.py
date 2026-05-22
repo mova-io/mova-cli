@@ -86,9 +86,11 @@ class Action:
 def build_actions(status: WorkspaceStatus) -> list[Action]:
     """Build a sorted action list from the workspace status.
 
-    Returns at most ~7 actions — the menu's value is in *focus*, not
-    completeness. Operators who want the full surface area run
-    ``mdk --help``.
+    Ordered as the agent-authoring lifecycle so the menu reads as a
+    guided walkthrough: develop (``mdk dev``) → validate → run → grounding
+    check → deploy → test-deployed, with project/agent bootstrap ahead of
+    it and housekeeping (doctor / --help) behind. Operators who want the
+    full surface area run ``mdk --help``.
     """
     actions: list[Action] = []
 
@@ -105,14 +107,25 @@ def build_actions(status: WorkspaceStatus) -> list[Action]:
     if not status.has_agents:
         actions.append(
             Action(
-                label="Scaffold your first agent",
-                command="mdk init <agent-name>",
-                argv=("init",),
+                label="Scaffold your first agent (guided dev loop)",
+                command="mdk dev <agent-name>",
+                argv=("dev",),
                 priority=2,
                 needs_user_input=True,
             )
         )
     else:
+        # Lifecycle step 1 — the front door: a scaffold-aware loop to edit
+        # the prompt, add a context, and live-test it.
+        first_agent = status.agents[0]
+        actions.append(
+            Action(
+                label=f"Develop {first_agent.name!r} — edit prompt, add context, live-test",
+                command=f"mdk dev {first_agent.name}",
+                argv=("dev", first_agent.name),
+                priority=10,
+            )
+        )
         # Validate is cheap + safe; surface it whenever there are agents.
         actions.append(
             Action(
@@ -145,11 +158,42 @@ def build_actions(status: WorkspaceStatus) -> list[Action]:
         example = _first_agent_dataset_input(first.path)
         actions.append(
             Action(
-                label=f"Run {first.name!r}",
+                label=f"Run {first.name!r} locally",
                 command=f"mdk run {first.name} '{example}'",
                 argv=("run", first.name, example),
                 priority=30,
                 needs_user_input=example == "{}",  # only prompt if no real example
+            )
+        )
+        # Lifecycle: grounding check — does it obey context + not hallucinate?
+        actions.append(
+            Action(
+                label=f"Grounding check {first.name!r} (hallucination / context obedience)",
+                command=f"mdk eval-scorecard {first.name}",
+                argv=("eval-scorecard", first.name),
+                priority=35,
+            )
+        )
+        # Lifecycle: ship to Azure. Needs a deploy target only the operator
+        # knows, so we print the template rather than auto-running (also
+        # avoids auto-firing a destructive deploy from the menu).
+        actions.append(
+            Action(
+                label="Deploy agents to Azure",
+                command="mdk deploy --target <env> --mode agents",
+                argv=("deploy", "--target", "<env>", "--mode", "agents"),
+                priority=50,
+                needs_user_input=True,
+            )
+        )
+        # Lifecycle: confirm the deployed agent behaves like local.
+        actions.append(
+            Action(
+                label=f"Test {first.name!r} on the deployed runtime",
+                command=f"mdk run {first.name} --target <env> '{example}'",
+                argv=("run", first.name, "--target", "<env>", example),
+                priority=55,
+                needs_user_input=True,
             )
         )
 

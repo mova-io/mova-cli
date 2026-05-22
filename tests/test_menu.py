@@ -221,6 +221,37 @@ class TestBuildActions:
             # Command starts with "mdk "
             assert action.command.startswith("mdk ") or action.command.startswith("movate ")
 
+    def test_lifecycle_walkthrough_present_and_ordered(self) -> None:
+        """With an agent, the menu reads as the authoring lifecycle:
+        develop → validate → run → grounding → deploy → test-deployed."""
+        status = _make_status(
+            has_movate_yaml=True,
+            movate_yaml_version="movate/v1",
+            agents=(AgentInfo(name="triage", path=Path("/x")),),
+        )
+        actions = build_actions(status)
+        argvs = [a.argv for a in actions]
+        assert ("dev", "triage") in argvs
+        assert ("validate",) in argvs
+        assert ("eval-scorecard", "triage") in argvs
+        assert ("deploy", "--target", "<env>", "--mode", "agents") in argvs
+        # Test-on-deployed is a run carrying --target.
+        assert any(a.argv[:2] == ("run", "triage") and "--target" in a.argv for a in actions)
+
+        def idx(target: tuple[str, ...]) -> int:
+            return next(i for i, a in enumerate(actions) if a.argv == target)
+
+        assert idx(("dev", "triage")) < idx(("validate",))
+        assert idx(("validate",)) < next(
+            i for i, a in enumerate(actions) if a.argv[:1] == ("deploy",)
+        )
+
+    def test_no_agents_offers_guided_dev_scaffold(self) -> None:
+        actions = build_actions(_make_status(has_movate_yaml=True))
+        dev = [a for a in actions if a.argv == ("dev",)]
+        assert dev, "no-agents menu should offer the guided dev scaffold"
+        assert dev[0].needs_user_input
+
 
 # ---------------------------------------------------------------------------
 # CLI: --dry-run
