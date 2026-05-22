@@ -22,6 +22,7 @@ The watcher itself is split from the dispatcher so tests can drive
 from __future__ import annotations
 
 import contextlib
+import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ from rich.console import Console
 
 from movate.cli._completion import complete_agent_path
 from movate.cli._console import hint, warn
-from movate.core.loader import AgentLoadError, load_agent
+from movate.core.loader import AgentLoadError, _resolve_project_root, load_agent
 
 stdout = Console()
 err = Console(stderr=True)
@@ -171,6 +172,19 @@ def _compute_watched_paths(agent_dir: Path) -> _WatchedSet:
         if jc.exists():
             paths.append(jc)
 
+    # Contexts the agent renders: project-level
+    # (``<project_root>/contexts/*.md``) and agent-local
+    # (``<agent_dir>/contexts/*.md``). The loader prepends these to the
+    # prompt, so an edit must re-fire the dispatch. We watch the whole
+    # dir's markdown — not just the names listed in ``contexts:`` — so a
+    # NEWLY added file is caught too (the ``mdk dev`` "add a context"
+    # flow creates the file then wires it into agent.yaml; watching the
+    # dir means the create alone already registers as a change).
+    project_root = _resolve_project_root(agent_dir)
+    for ctx_dir in (project_root / "contexts", agent_dir / "contexts"):
+        if ctx_dir.is_dir():
+            paths.extend(sorted(ctx_dir.glob("*.md")))
+
     return _WatchedSet(agent_dir=agent_dir, paths=tuple(paths))
 
 
@@ -208,4 +222,73 @@ def dispatch_once(agent_dir: Path, *, strict: bool) -> int:
     return 0
 
 
-__all__ = ["dispatch_once", "watch"]
+def dispatch_run_once(
+    agent_dir: Path, test_input: str, *, mock: bool
+) -> tuple[int, str | None]:
+    """Re-run the agent against ``test_input``, print its output, and
+    return ``(exit_code, output_text)``.
+
+    The live-reload counterpart to :func:`dispatch_once` (which only
+    validates). Reloads the agent fresh from disk — ``load_agent``
+    re-reads the prompt + contexts on every call, so an edited prompt or
+    a changed context is reflected with no cache to invalidate.
+
+    ``exit_code`` is 0 on a clean run, 2 on any failure (load, input
+    coercion, or execution); ``output_text`` is the run's stdout on
+    success and ``None`` on failure, so callers can diff successive runs
+    without re-deriving it. Never raises except :class:`KeyboardInterrupt`,
+    which the caller relies on to break out of the watch loop — a
+    transient provider or load error must not kill the dev session.
+    """
+    import asyncio  # noqa: PLC0415
+
+    # Local imports keep watch's import path light: these pull in the
+    # full runtime stack we only need when actually executing.
+    from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.cli.run import _coerce_agent_input, _configure_mock_for_bundle  # noqa: PLC0415
+    from movate.core.models import RunRequest  # noqa: PLC0415
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    err.print(f"\n[dim]── {ts} ──[/dim]")
+    try:
+        bundle = load_agent(agent_dir)
+    except AgentLoadError as exc:
+        warn(f"load failed: {exc}")
+        return 2, None
+    try:
+        payload = _coerce_agent_input(test_input, bundle)
+    except typer.BadParameter as exc:
+        warn(f"input error: {exc}")
+        return 2, None
+
+    # Run the executor directly and return its text, rather than reusing
+    # run._run_local_agent. That helper renders a status spinner (rich
+    # Live) when stderr is a tty; capturing its stdout with
+    # redirect_stdout to diff successive runs conflicts with the Live
+    # display and silently stalls the watch loop. Calling the executor
+    # gives us the response text cleanly — no spinner, no stdout capture.
+    async def _execute() -> str:
+        rt = await build_local_runtime(mock=mock)
+        if mock:
+            _configure_mock_for_bundle(rt.provider, bundle)
+        try:
+            request = RunRequest(agent=bundle.spec.name, input=payload)
+            response = await rt.executor.execute(bundle, request)
+        finally:
+            await shutdown_runtime(rt.storage, rt.tracer)
+        return response.human_readable
+
+    try:
+        output = asyncio.run(_execute())
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        # Broad on purpose: a transient provider / runtime error must not
+        # kill the dev session — report it and keep the loop alive.
+        warn(f"run failed: {exc}")
+        return 2, None
+    sys.stdout.write(output + "\n")
+    return 0, output
+
+
+__all__ = ["dispatch_once", "dispatch_run_once", "watch"]

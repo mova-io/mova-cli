@@ -135,6 +135,7 @@ from movate.cli import (  # noqa: E402
     audit_cmd,
     compose_cmd,
     demo_cmd,
+    dev_cmd,
     diff_cmd,
     eval_gen_cmd,
     eval_scorecard_cmd,
@@ -176,6 +177,7 @@ from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
+from movate.cli.contexts_cmd import contexts_app  # noqa: E402
 from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.doctor import doctor_app  # noqa: E402
@@ -184,7 +186,6 @@ from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.infra_cmd import infra_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
-from movate.cli.contexts_cmd import contexts_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.kb_cmd import kb_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
@@ -360,6 +361,7 @@ def _main(
 # status + contextual next-step suggestions. Lives at the top of the
 # Develop panel so it surfaces prominently in `mdk --help`.
 app.command("menu", rich_help_panel=PANEL_DEVELOP)(menu_cmd.menu)
+app.command("dev", rich_help_panel=PANEL_DEVELOP)(dev_cmd.dev)
 app.command("demo", rich_help_panel=PANEL_DEVELOP)(demo_cmd.demo)
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 # `mdk add` — project-aware ergonomic wrapper around `mdk init -t <template>`.
