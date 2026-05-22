@@ -59,7 +59,9 @@ def _ensure_chainlit_installed() -> None:
             "The playground is gated behind an optional extra to keep "
             "the default install size down.\n\n"
             "Install with:\n  "
-            "[bold]uv pip install 'movate-cli[playground]'[/bold]\n\n"
+            "[bold]uv pip install 'movate-cli\\[playground]'[/bold]\n\n"
+            "Or, if you installed mdk as a uv tool:\n  "
+            "[bold]uv tool install 'movate-cli\\[playground]'[/bold]\n\n"
             "Or, for a development install of this repo:\n  "
             "[bold]uv sync --extra playground[/bold]"
         )

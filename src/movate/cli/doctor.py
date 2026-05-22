@@ -18,6 +18,7 @@ from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from movate import __version__
@@ -828,11 +829,11 @@ def _render_explanations() -> None:
         for cid in check_ids:
             entry = EXPLANATIONS[cid]
             console.print(f"  [bold]{cid}[/bold]")
-            console.print(f"    [dim]WHAT:[/dim]   {entry.what}")
-            console.print(f"    [dim]WHY:[/dim]    {entry.why}")
-            console.print(f"    [dim]ON FAIL:[/dim] {entry.failure_impact}")
+            console.print(f"    [dim]WHAT:[/dim]   {escape(entry.what)}")
+            console.print(f"    [dim]WHY:[/dim]    {escape(entry.why)}")
+            console.print(f"    [dim]ON FAIL:[/dim] {escape(entry.failure_impact)}")
             if entry.fix:
-                console.print(f"    [dim]FIX:[/dim]    [green]{entry.fix}[/green]")
+                console.print(f"    [dim]FIX:[/dim]    [green]{escape(entry.fix)}[/green]")
             console.print()
 
 

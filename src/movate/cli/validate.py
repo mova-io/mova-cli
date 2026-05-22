@@ -385,11 +385,11 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
         )
         # Hint how to enable the missing runtime.
         if spec.runtime == AgentRuntime.NATIVE_ANTHROPIC:
-            console.print("[dim]  Install with: uv add 'movate-cli[anthropic]'[/dim]")
+            console.print("[dim]  Install with: uv add 'movate-cli\\[anthropic]'[/dim]")
         elif spec.runtime == AgentRuntime.NATIVE_OPENAI:
-            console.print("[dim]  Install with: uv add 'movate-cli[openai]'[/dim]")
+            console.print("[dim]  Install with: uv add 'movate-cli\\[openai]'[/dim]")
         elif spec.runtime == AgentRuntime.LANGCHAIN:
-            console.print("[dim]  Install with: uv add 'movate-cli[langchain]'[/dim]")
+            console.print("[dim]  Install with: uv add 'movate-cli\\[langchain]'[/dim]")
         raise typer.Exit(code=2)
 
     # Project-wide runtime policy. Distinct from the model policy below —
