@@ -1,0 +1,35 @@
+# CODEOWNERS — route high-risk / direction-setting changes to the maintainer
+# for review. Humans own architectural direction; AI accelerates within it
+# (see CLAUDE.md, docs/architecture-principles.md).
+#
+# Deliberately scoped to the high-risk surfaces ONLY — routine changes are not
+# owner-gated, so they can still auto-merge once CI is green. These rules
+# become a hard review requirement only when branch protection enables
+# "Require review from Code Owners" on `main`.
+#
+# Order matters: the LAST matching pattern wins.
+
+# --- Architectural decisions + the contracts that define the platform -------
+/docs/adr/                              @jeremyyuAWS
+/CLAUDE.md                              @jeremyyuAWS
+/docs/architecture-principles.md        @jeremyyuAWS
+
+# --- Adapter seams + core contracts (the layer boundaries) ------------------
+/src/movate/core/models.py              @jeremyyuAWS
+/src/movate/core/canonical_schema.py    @jeremyyuAWS
+/src/movate/storage/                    @jeremyyuAWS
+/src/movate/providers/base.py           @jeremyyuAWS
+/src/movate/tracing/base.py             @jeremyyuAWS
+
+# --- Execution plane + deployment + auth (operational blast radius) ---------
+/src/movate/runtime/                    @jeremyyuAWS
+/infra/                                 @jeremyyuAWS
+/src/movate/core/auth.py                @jeremyyuAWS
+
+# --- Dependency + license posture -------------------------------------------
+/pyproject.toml                         @jeremyyuAWS
+/uv.lock                                @jeremyyuAWS
+/scripts/check_licenses.py              @jeremyyuAWS
+
+# --- CI / release machinery -------------------------------------------------
+/.github/workflows/                     @jeremyyuAWS
