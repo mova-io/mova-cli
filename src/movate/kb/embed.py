@@ -35,7 +35,39 @@ DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 The ``openai/`` prefix is added via :func:`qualified_model_name` when
 we persist to ``KbChunk.embedding_model``."""
 
+# Dimension of DEFAULT_EMBEDDING_MODEL. The pgvector KB column is
+# ``vector(N)`` (ADR 009); N must match the model. One model per deployment.
+EMBED_DIM_DEFAULT = 1536
+
 OPENAI_EMBEDDINGS_ENDPOINT = "https://api.openai.com/v1/embeddings"
+
+
+def embedding_model() -> str:
+    """The configured embedding model — ``MOVATE_EMBED_MODEL`` or the default.
+
+    Single source of truth for "which embedding model does this deployment
+    use", read by ingest (CLI + the runtime upload endpoint) so server-side
+    embedding matches the dimension of the ``vector(N)`` column.
+    """
+    return os.environ.get("MOVATE_EMBED_MODEL", "").strip() or DEFAULT_EMBEDDING_MODEL
+
+
+def embedding_dim() -> int:
+    """The configured embedding dimension — ``MOVATE_EMBED_DIM`` or 1536.
+
+    Must match the ``vector(N)`` KB column (ADR 009 D1). The storage layer
+    reads the same env var independently (it must not import ``kb``); this is
+    the documented twin for ``kb`` / runtime / doctor callers.
+    """
+    raw = os.environ.get("MOVATE_EMBED_DIM", "").strip()
+    if not raw:
+        return EMBED_DIM_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return EMBED_DIM_DEFAULT
+    return n if n > 0 else EMBED_DIM_DEFAULT
+
 
 # Per-request timeout for the embedding HTTP call.  Large PDFs produce
 # many chunks and the batch can take longer than expected when OpenAI

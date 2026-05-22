@@ -22,9 +22,12 @@ import pytest
 
 from movate.kb.embed import (
     DEFAULT_EMBEDDING_MODEL,
+    EMBED_DIM_DEFAULT,
     EmbeddingError,
     _is_openai_model,
     embed_texts,
+    embedding_dim,
+    embedding_model,
     qualified_model_name,
 )
 
@@ -405,3 +408,39 @@ async def test_embed_texts_litellm_count_mismatch_raises() -> None:
             model="cohere/embed-english-v3.0",
             api_key="key",
         )
+
+
+# ---------------------------------------------------------------------------
+# embedding_model() / embedding_dim() — deployment config resolvers (ADR 009 Task 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_embedding_model_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MOVATE_EMBED_MODEL", raising=False)
+    assert embedding_model() == DEFAULT_EMBEDDING_MODEL
+
+
+@pytest.mark.unit
+def test_embedding_model_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOVATE_EMBED_MODEL", "cohere/embed-english-v3.0")
+    assert embedding_model() == "cohere/embed-english-v3.0"
+
+
+@pytest.mark.unit
+def test_embedding_dim_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MOVATE_EMBED_DIM", raising=False)
+    assert embedding_dim() == EMBED_DIM_DEFAULT == 1536
+
+
+@pytest.mark.unit
+def test_embedding_dim_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOVATE_EMBED_DIM", "1024")
+    assert embedding_dim() == 1024
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["", "abc", "0", "-5", "  "])
+def test_embedding_dim_invalid_falls_back(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    monkeypatch.setenv("MOVATE_EMBED_DIM", bad)
+    assert embedding_dim() == EMBED_DIM_DEFAULT

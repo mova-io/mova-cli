@@ -59,7 +59,12 @@ _EMBED_DIM_DEFAULT = 1536
 
 
 def _embedding_dim() -> int:
-    """Configured embedding dimension (``MOVATE_EMBED_DIM``, default 1536)."""
+    """Configured embedding dimension (``MOVATE_EMBED_DIM``, default 1536).
+
+    Read here independently (storage must not import ``kb``); the documented
+    twin for ``kb`` / runtime / doctor callers is ``kb.embed.embedding_dim``.
+    Both read the same env var, so they agree.
+    """
     import os  # noqa: PLC0415
 
     raw = os.environ.get("MOVATE_EMBED_DIM", "").strip()
