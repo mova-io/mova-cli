@@ -154,6 +154,7 @@ from movate.cli import (  # noqa: E402
     fmt_cmd,
     menu_cmd,
     migrate_cmd,
+    migrate_state_cmd,
     monitor_cmd,
     plan_cmd,
     promote_cmd,
@@ -505,6 +506,7 @@ app.add_typer(snapshot_app, name="snapshot", rich_help_panel=PANEL_MANAGE)
 app.command("diff", rich_help_panel=PANEL_MANAGE)(diff_cmd.diff)
 app.command("rollback", rich_help_panel=PANEL_MANAGE)(rollback_cmd.rollback)
 app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
+app.command("migrate-state", rich_help_panel=PANEL_MANAGE)(migrate_state_cmd.migrate_state)
 app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
