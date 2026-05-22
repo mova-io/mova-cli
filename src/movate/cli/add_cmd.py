@@ -507,6 +507,11 @@ def _render_list(search: str | None = None) -> None:
         "Batch-add: [bold]mdk add rag-qa ticket-triager[/bold]. "
         "Filter: [bold]mdk add --list --search <term>[/bold].[/dim]"
     )
+    console.print(
+        "[dim]Blank start: [bold]mdk add default <name>[/bold] — a minimal agent "
+        "(string in → string out) to draft your own prompt. Other core templates: "
+        "[bold]faq, summarizer, classifier, chatbot, extractor[/bold].[/dim]"
+    )
 
 
 def _suggest_template(unknown: str) -> str | None:
@@ -641,6 +646,9 @@ def add(
 
       [dim]# Drop a RAG Q&A agent into ./agents/rag-qa/[/dim]
       $ mdk add rag-qa
+
+      [dim]# Start blank — minimal agent (string in → string out), draft the prompt yourself[/dim]
+      $ mdk add default my-agent
 
       [dim]# Batch: bootstrap a support workspace in one command[/dim]
       $ mdk add rag-qa ticket-triager email-responder
