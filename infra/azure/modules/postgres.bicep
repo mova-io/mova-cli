@@ -40,6 +40,9 @@ param adminPassword string
 @description('Default database name to create.')
 param databaseName string = 'movate'
 
+@description('Also create a `langfuse` database on this server (for self-hosted Langfuse). Off by default so non-Langfuse deploys stay lean.')
+param createLangfuseDatabase bool = false
+
 @description('Common tags.')
 param tags object = {}
 
@@ -85,6 +88,17 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
 
   resource db 'databases@2023-12-01-preview' = {
     name: databaseName
+    properties: {
+      charset: 'UTF8'
+      collation: 'en_US.utf8'
+    }
+  }
+
+  // Dedicated database for self-hosted Langfuse (its Prisma schema lives
+  // here, isolated from the movate app tables). Created only when
+  // createLangfuseDatabase=true.
+  resource langfuseDb 'databases@2023-12-01-preview' = if (createLangfuseDatabase) {
+    name: 'langfuse'
     properties: {
       charset: 'UTF8'
       collation: 'en_US.utf8'
