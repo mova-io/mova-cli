@@ -34,6 +34,8 @@ from typing import Any
 
 import yaml
 
+from movate.core.paths import project_state_dir
+
 # ---------------------------------------------------------------------------
 # Data shapes
 # ---------------------------------------------------------------------------
@@ -104,8 +106,8 @@ def build_context(project_root: Path) -> RunbookContext:
         required_env_vars=required,
         optional_env_vars=optional,
         has_movate_yaml=(root / "movate.yaml").is_file(),
-        has_snapshots=(root / ".movate" / "snapshots").is_dir()
-        and any((root / ".movate" / "snapshots").iterdir()),
+        has_snapshots=(project_state_dir(root) / "snapshots").is_dir()
+        and any((project_state_dir(root) / "snapshots").iterdir()),
     )
 
 

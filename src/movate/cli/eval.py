@@ -41,6 +41,7 @@ from movate.core.eval import (
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.models import EvalRecord, JudgeConfig, JudgeMethod, ModelConfig
+from movate.core.paths import project_state_dir
 from movate.core.remote_executor import RemoteExecutor
 from movate.core.reporters import render_eval_markdown
 from movate.storage.base import StorageProvider
@@ -963,7 +964,7 @@ def _run_eval_wizard() -> _EvalWizardChoices | None:  # noqa: PLR0912 — orches
     runs = runs_choices[runs_idx][0]
 
     # Q5: Baseline behavior.
-    project_baseline = cwd / ".movate" / "baseline.json"
+    project_baseline = project_state_dir(cwd) / "baseline.json"
     has_existing_baseline = project_baseline.is_file()
     baseline_choices: dict[str, tuple[str, str]] = {
         "1": ("none", "just run + show scores (no drift check)"),

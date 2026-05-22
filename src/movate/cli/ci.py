@@ -38,6 +38,7 @@ from movate.core.config import load_project_config
 from movate.core.eval import EvalConfigError, EvalEngine, EvalSummary
 from movate.core.loader import AgentBundle
 from movate.core.models import EvalRecord
+from movate.core.paths import project_state_dir
 from movate.runtime.registry import scan_agents
 
 ci_app = typer.Typer(
@@ -50,13 +51,13 @@ ci_app = typer.Typer(
 
 @ci_app.command("eval")
 def eval_all(
-    baselines_dir: Path = typer.Option(
-        Path(".movate"),
+    baselines_dir: Path | None = typer.Option(
+        None,
         "--baselines-dir",
         help=(
             "Root dir under which each agent's baseline is "
-            "``<dir>/<agent_name>/baseline.json``. Default ``.movate`` "
-            "matches the convention shipped templates use."
+            "``<dir>/<agent_name>/baseline.json``. "
+            "Default: the project's .mdk/ (or legacy .movate/)."
         ),
     ),
     regression_tolerance: float = typer.Option(
@@ -96,6 +97,8 @@ def eval_all(
       [dim]# Real-LLM eval with provider keys in env[/dim]
       $ movate ci eval --runs 3 --regression-tolerance 0.05
     """
+    if baselines_dir is None:
+        baselines_dir = project_state_dir(Path.cwd())
     project = load_project_config()
     agents_root = Path(project.agents_dir)
     bundles = scan_agents(agents_root)

@@ -68,13 +68,13 @@ class TestEnsureMovateDir:
         fix = next(f for f in available_fixes() if f.id == "ensure-movate-dir")
         result = fix.run(tmp_path, dry_run=False)
         assert result.status is FixStatus.APPLIED
-        assert (tmp_path / ".movate").is_dir()
+        assert (tmp_path / ".mdk").is_dir()
 
     def test_dry_run_does_not_create(self, tmp_path: Path) -> None:
         fix = next(f for f in available_fixes() if f.id == "ensure-movate-dir")
         result = fix.run(tmp_path, dry_run=True)
         assert result.status is FixStatus.WOULD_APPLY
-        assert not (tmp_path / ".movate").exists()
+        assert not (tmp_path / ".mdk").exists()
 
     def test_idempotent_in_apply_mode(self, tmp_path: Path) -> None:
         """Running fix twice on a clean tree is a no-op."""
@@ -92,7 +92,7 @@ class TestEnsureGitignore:
         result = fix.run(tmp_path, dry_run=False)
         assert result.status is FixStatus.APPLIED
         text = (tmp_path / ".gitignore").read_text()
-        assert ".movate/local.db" in text
+        assert ".mdk/local.db" in text
         assert ".env" in text
 
     def test_does_not_overwrite_existing(self, tmp_path: Path) -> None:
@@ -263,15 +263,15 @@ def test_cli_fix_default_is_dry_run(project_root: Path) -> None:
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "dry-run" in result.stdout.lower() or "would apply" in result.stdout.lower()
     # Nothing actually written
-    assert not (project_root / ".movate").exists()
+    assert not (project_root / ".mdk").exists()
 
 
 @pytest.mark.unit
 def test_cli_fix_apply_writes(project_root: Path) -> None:
     result = runner.invoke(app, ["fix", "--apply", "--project-root", str(project_root)])
     assert result.exit_code == 0, result.stdout + result.stderr
-    # At minimum, .movate/ was created
-    assert (project_root / ".movate").is_dir()
+    # At minimum, .mdk/ was created
+    assert (project_root / ".mdk").is_dir()
 
 
 @pytest.mark.unit
@@ -290,8 +290,8 @@ def test_cli_fix_only_runs_named_fix(project_root: Path) -> None:
     assert result.exit_code == 0
     # The named fix ran
     assert (project_root / ".gitignore").is_file()
-    # Others did NOT run (e.g. .movate/ wasn't created)
-    assert not (project_root / ".movate").exists()
+    # Others did NOT run (e.g. .mdk/ wasn't created)
+    assert not (project_root / ".mdk").exists()
 
 
 @pytest.mark.unit

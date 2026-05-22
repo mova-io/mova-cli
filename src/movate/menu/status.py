@@ -16,6 +16,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from movate.core.paths import project_state_dir
+
 
 @dataclass(frozen=True)
 class AgentInfo:
@@ -107,7 +109,7 @@ def inspect_workspace(project_root: Path | str = ".") -> WorkspaceStatus:
         active_profile=_active_profile(),
         agents=_find_agents(root),
         env_vars=_check_env_vars(root),
-        has_local_db=(root / ".movate" / "local.db").is_file(),
+        has_local_db=(project_state_dir(root) / "local.db").is_file(),
         snapshot_count=_count_snapshots(root),
         has_dotenv_file=(root / ".env").is_file(),
     )
@@ -251,7 +253,7 @@ def _parse_env_example(root: Path) -> list[str]:
 
 def _count_snapshots(root: Path) -> int:
     """Count subdirectories in ``.movate/snapshots/``."""
-    snapshots_dir = root / ".movate" / "snapshots"
+    snapshots_dir = project_state_dir(root) / "snapshots"
     if not snapshots_dir.is_dir():
         return 0
     try:

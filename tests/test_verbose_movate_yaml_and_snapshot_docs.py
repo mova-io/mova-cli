@@ -1,4 +1,4 @@
-"""Verbose `movate.yaml` + `.movate/README.md` for new projects.
+"""Verbose `movate.yaml` + `.mdk/README.md` for new projects.
 
 Two operator-facing improvements to `mdk init --project`:
 
@@ -7,9 +7,9 @@ Two operator-facing improvements to `mdk init --project`:
    / runtime / skills / eval / bench), so prospects opening the file
    immediately see WHAT can be configured, not just a minimal skeleton.
 
-2. A `.movate/README.md` lands at project root, explaining the
-   runtime-state directory (`.movate/`) and snapshots as the central
-   operational primitive. Operators who poke into `.movate/snapshots/`
+2. A `.mdk/README.md` lands at project root, explaining the
+   runtime-state directory (`.mdk/`) and snapshots as the central
+   operational primitive. Operators who poke into `.mdk/snapshots/`
    wondering "what is this?" find the answer in-place.
 
 Tests lock in the structural markers; wording can evolve.
@@ -82,13 +82,13 @@ class TestVerboseMovateYaml:
     def test_yaml_documents_snapshot_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The `.movate/` + snapshot story appears in the YAML
+        """The `.mdk/` + snapshot story appears in the YAML
         comments so operators understand what gets created when they
         start running commands."""
         proj = _bootstrap(tmp_path, monkeypatch)
         body = (proj / "project.yaml").read_text()
         # The doc block mentions the directory.
-        assert ".movate/" in body
+        assert ".mdk/" in body
         assert "snapshots/" in body
         # And the commands that operate on snapshots.
         assert "mdk diff" in body
@@ -109,7 +109,7 @@ class TestVerboseMovateYaml:
 
 
 # ---------------------------------------------------------------------------
-# .movate/README.md
+# .mdk/README.md
 # ---------------------------------------------------------------------------
 
 
@@ -119,7 +119,7 @@ class TestMovateStateReadme:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         proj = _bootstrap(tmp_path, monkeypatch)
-        readme = proj / ".movate" / "README.md"
+        readme = proj / ".mdk" / "README.md"
         assert readme.is_file(), f"expected {readme} to be created"
 
     def test_readme_explains_snapshots_concretely(
@@ -129,7 +129,7 @@ class TestMovateStateReadme:
         operate on them — operators landing here should leave with a
         concrete next step, not just abstract context."""
         proj = _bootstrap(tmp_path, monkeypatch)
-        body = (proj / ".movate" / "README.md").read_text()
+        body = (proj / ".mdk" / "README.md").read_text()
         # Concept marker.
         assert "snapshot" in body.lower()
         # Concrete commands.
@@ -147,6 +147,6 @@ class TestMovateStateReadme:
         """`.gitignore` policy for snapshots vs. local.db is a common
         operator question — README answers it."""
         proj = _bootstrap(tmp_path, monkeypatch)
-        body = (proj / ".movate" / "README.md").read_text()
+        body = (proj / ".mdk" / "README.md").read_text()
         assert ".gitignore" in body
         assert "local.db" in body

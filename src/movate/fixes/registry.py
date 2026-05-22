@@ -13,7 +13,7 @@ declares:
 
 Fixes that fail mid-apply return ``FixStatus.FAILED`` with a
 human-readable reason. The dispatcher continues with the next fix —
-one bad permission shouldn't block creating ``.movate/``.
+one bad permission shouldn't block creating ``.mdk/``.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from movate.core.paths import LEGACY_STATE_DIR_NAME, STATE_DIR_NAME
 
 # Canonical "tight" mode for secrets files. Lifted to a constant so the
 # perms-check logic doesn't sprinkle 0o600 magic numbers all over.
@@ -97,11 +99,11 @@ class Fix:
 
 _GITIGNORE_BODY = """\
 # movate runtime state — never commit
-.movate/local.db
-.movate/local.db-*
+.mdk/local.db
+.mdk/local.db-*
 
 # Snapshots are commit-friendly by default; uncomment to opt out:
-# .movate/snapshots/
+# .mdk/snapshots/
 
 # Python
 __pycache__/
@@ -118,12 +120,12 @@ __pycache__/
 
 
 def _check_movate_dir(root: Path) -> bool:
-    """Fix needed when .movate/ doesn't exist yet."""
-    return not (root / ".movate").is_dir()
+    """Fix needed when neither .mdk/ nor legacy .movate/ exists yet."""
+    return not (root / STATE_DIR_NAME).is_dir() and not (root / LEGACY_STATE_DIR_NAME).is_dir()
 
 
 def _apply_movate_dir(root: Path, dry_run: bool) -> FixResult:
-    target = root / ".movate"
+    target = root / STATE_DIR_NAME
     if dry_run:
         return FixResult(
             fix_id="ensure-movate-dir",
@@ -342,9 +344,9 @@ def available_fixes() -> list[Fix]:
     return [
         Fix(
             id="ensure-movate-dir",
-            label="Create .movate/",
+            label="Create .mdk/",
             description=(
-                "Create the .movate/ runtime directory. Houses local.db, "
+                "Create the .mdk/ runtime directory. Houses local.db, "
                 "snapshots/, promotions.yaml. Created lazily by most "
                 "commands; this fix is for when ops want it eagerly."
             ),
@@ -356,7 +358,7 @@ def available_fixes() -> list[Fix]:
             label="Create .gitignore",
             description=(
                 "Create a movate-aware .gitignore with the standard "
-                "ignores (.movate/local.db, .env, __pycache__, etc.). "
+                "ignores (.mdk/local.db, .env, __pycache__, etc.). "
                 "Does NOT overwrite an existing .gitignore."
             ),
             check=_check_gitignore,

@@ -41,6 +41,7 @@ import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
+from movate.core.paths import project_state_dir
 from movate.snapshot.manifest import (
     FileEntry,
     SnapshotManifest,
@@ -111,7 +112,7 @@ _SKIP_FILE_SUFFIXES: frozenset[str] = frozenset({".pyc", ".pyo"})
 
 def snapshot_path(project_root: Path, short_hash: str) -> Path:
     """Resolve the on-disk dir for a snapshot's short hash."""
-    return project_root / ".movate" / "snapshots" / short_hash
+    return project_state_dir(project_root) / "snapshots" / short_hash
 
 
 def create_snapshot(
@@ -177,7 +178,7 @@ def create_snapshot(
 
 def list_snapshots(project_root: Path) -> list[SnapshotManifest]:
     """Return every snapshot's manifest, newest first."""
-    snapshots_root = project_root / ".movate" / "snapshots"
+    snapshots_root = project_state_dir(project_root) / "snapshots"
     if not snapshots_root.is_dir():
         return []
     manifests: list[SnapshotManifest] = []
@@ -211,7 +212,7 @@ def resolve_snapshot(project_root: Path, hash_or_prefix: str) -> SnapshotManifes
        raises :class:`SnapshotNotFoundError`.
     """
     bare = hash_or_prefix.removeprefix("sha256:")
-    snapshots_root = project_root / ".movate" / "snapshots"
+    snapshots_root = project_state_dir(project_root) / "snapshots"
     if not snapshots_root.is_dir():
         raise SnapshotNotFoundError(
             f"no snapshots in {snapshots_root} — run `mdk snapshot create` first"
