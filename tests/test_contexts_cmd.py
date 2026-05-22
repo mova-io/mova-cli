@@ -17,9 +17,13 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
+from movate.cli.contexts_cmd import attach_context_to_agent, detach_context_from_agent
 from movate.cli.main import app
+from movate.core.loader import load_agent
+from movate.testing import scaffold_agent
 
 runner = CliRunner(mix_stderr=False)
 
@@ -710,3 +714,146 @@ def test_create_force_on_new_file_also_works(tmp_path: Path) -> None:
     result = _invoke_create("new-ctx", tmp_path, "--force")
     assert result.exit_code == 0, result.stdout + (result.stderr or "")
     assert (tmp_path / "contexts" / "new-ctx.md").is_file()
+
+
+# ---------------------------------------------------------------------------
+# attach_context_to_agent — the three contexts: forms (operate on the flat,
+# canonical agent.yaml that `scaffold_agent` produces)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_attach_when_key_absent_appends_block(tmp_path: Path) -> None:
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    yaml_path = agent_dir / "agent.yaml"
+    before_comments = yaml_path.read_text().count("#")
+
+    assert attach_context_to_agent(yaml_path, "policy") is True
+
+    text = yaml_path.read_text()
+    assert "contexts:" in text
+    assert "- policy" in text
+    # Targeted edit, not a yaml round-trip — comments survive.
+    assert text.count("#") == before_comments
+    # The agent still loads and resolves the wired context.
+    (agent_dir / "contexts").mkdir(exist_ok=True)
+    (agent_dir / "contexts" / "policy.md").write_text("# policy\nbe nice")
+    assert "policy" in load_agent(agent_dir).spec.contexts
+
+
+@pytest.mark.unit
+def test_attach_inline_list_splices(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts: [icp]\n")
+    assert attach_context_to_agent(yaml_path, "tone") is True
+    assert "contexts: [icp, tone]" in yaml_path.read_text()
+
+
+@pytest.mark.unit
+def test_attach_inline_empty_list(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts: []\n")
+    assert attach_context_to_agent(yaml_path, "tone") is True
+    assert "contexts: [tone]" in yaml_path.read_text()
+
+
+@pytest.mark.unit
+def test_attach_block_form_inserts_after_last_item(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts:\n  - icp\n  - tone\n")
+    assert attach_context_to_agent(yaml_path, "safety") is True
+    parsed = yaml.safe_load(yaml_path.read_text())
+    assert parsed["contexts"] == ["icp", "tone", "safety"]
+
+
+@pytest.mark.unit
+def test_attach_idempotent_when_present(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts: [icp]\n")
+    assert attach_context_to_agent(yaml_path, "icp") is False
+    assert yaml_path.read_text().count("icp") == 1
+
+
+# ---------------------------------------------------------------------------
+# detach_context_from_agent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_detach_inline_list(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts: [icp, tone]\n")
+    assert detach_context_from_agent(yaml_path, "icp") is True
+    assert yaml.safe_load(yaml_path.read_text())["contexts"] == ["tone"]
+
+
+@pytest.mark.unit
+def test_detach_block_form(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts:\n  - icp\n  - tone\n")
+    assert detach_context_from_agent(yaml_path, "tone") is True
+    assert yaml.safe_load(yaml_path.read_text())["contexts"] == ["icp"]
+
+
+@pytest.mark.unit
+def test_detach_absent_returns_false(tmp_path: Path) -> None:
+    yaml_path = scaffold_agent(tmp_path / "demo", name="demo") / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text() + "\ncontexts: [icp]\n")
+    assert detach_context_from_agent(yaml_path, "ghost") is False
+    assert yaml.safe_load(yaml_path.read_text())["contexts"] == ["icp"]
+
+
+# ---------------------------------------------------------------------------
+# `mdk contexts create --agent` auto-attach + attach/detach commands
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_agent_auto_attaches(tmp_path: Path) -> None:
+    scaffold_agent(tmp_path / "agents" / "demo", name="demo")
+    result = _invoke_create("policy", tmp_path, "--agent", "demo")
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    # File created agent-local AND wired into agent.yaml.
+    assert (tmp_path / "agents" / "demo" / "contexts" / "policy.md").is_file()
+    refs = yaml.safe_load((tmp_path / "agents" / "demo" / "agent.yaml").read_text())["contexts"]
+    assert "policy" in refs
+
+
+@pytest.mark.unit
+def test_create_agent_no_attach_leaves_yaml(tmp_path: Path) -> None:
+    scaffold_agent(tmp_path / "agents" / "demo", name="demo")
+    result = _invoke_create("draft", tmp_path, "--agent", "demo", "--no-attach")
+    assert result.exit_code == 0, result.stdout + (result.stderr or "")
+    assert (tmp_path / "agents" / "demo" / "contexts" / "draft.md").is_file()
+    # agent.yaml has no contexts: key (scaffold ships none) → draft not wired.
+    data = yaml.safe_load((tmp_path / "agents" / "demo" / "agent.yaml").read_text())
+    assert "draft" not in (data.get("contexts") or [])
+
+
+@pytest.mark.unit
+def test_cli_attach_missing_context_errors(tmp_path: Path) -> None:
+    scaffold_agent(tmp_path / "agents" / "demo", name="demo")
+    result = runner.invoke(
+        app, ["contexts", "attach", "ghost", "--agent", "demo", "--project", str(tmp_path)]
+    )
+    assert result.exit_code == 2
+    assert "not found" in _strip_ansi(result.stdout + (result.stderr or ""))
+
+
+@pytest.mark.unit
+def test_cli_attach_then_detach(tmp_path: Path) -> None:
+    scaffold_agent(tmp_path / "agents" / "demo", name="demo")
+    _invoke_create("policy", tmp_path, "--agent", "demo", "--no-attach")  # create only
+    yaml_path = tmp_path / "agents" / "demo" / "agent.yaml"
+
+    r1 = runner.invoke(
+        app, ["contexts", "attach", "policy", "--agent", "demo", "--project", str(tmp_path)]
+    )
+    assert r1.exit_code == 0, r1.stdout + (r1.stderr or "")
+    assert "policy" in (yaml.safe_load(yaml_path.read_text()).get("contexts") or [])
+
+    r2 = runner.invoke(
+        app, ["contexts", "detach", "policy", "--agent", "demo", "--project", str(tmp_path)]
+    )
+    assert r2.exit_code == 0, r2.stdout + (r2.stderr or "")
+    assert "policy" not in (yaml.safe_load(yaml_path.read_text()).get("contexts") or [])

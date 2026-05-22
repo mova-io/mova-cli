@@ -27,9 +27,11 @@ Subcommands
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import typer
+import yaml
 from rich.console import Console
 from rich.rule import Rule
 from rich.table import Table
@@ -132,6 +134,112 @@ def _load_agent_context_refs(agent_dir: Path) -> list[str]:
         return spec.get("contexts", []) or []
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# agent.yaml `contexts:` editing — wire a context into / out of an agent
+# ---------------------------------------------------------------------------
+
+
+def attach_context_to_agent(agent_yaml: Path, name: str) -> bool:
+    """Append ``name`` to agent.yaml's ``contexts:`` list, preserving the
+    file's comments and formatting via a targeted text edit.
+
+    Returns ``True`` if added, ``False`` if it was already present. Raises
+    ``ValueError`` if ``contexts:`` exists but isn't a list. Handles the
+    three forms the key can take: absent, inline (``contexts: [a, b]``),
+    and block (``- a`` lines under the key).
+    """
+    text = agent_yaml.read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+    existing = data.get("contexts")
+    if existing is None:
+        existing = []
+    if not isinstance(existing, list):
+        raise ValueError("agent.yaml `contexts:` is not a list")
+    if name in existing:
+        return False
+
+    lines = text.splitlines()
+    key_idx = next((i for i, ln in enumerate(lines) if re.match(r"^contexts\s*:", ln)), None)
+
+    if key_idx is None:
+        # No key — append a fresh block at end of file.
+        while lines and lines[-1].strip() == "":
+            lines.pop()
+        lines.extend(["", "contexts:", f"  - {name}"])
+        agent_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return True
+
+    rest = lines[key_idx].split(":", 1)[1].strip()
+    if rest.startswith("[") and rest.endswith("]"):
+        # Inline list — splice the new name before the closing bracket.
+        inner = rest[1:-1].strip()
+        lines[key_idx] = f"contexts: [{inner}, {name}]" if inner else f"contexts: [{name}]"
+        agent_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return True
+
+    # Block form — insert after the last consecutive list item.
+    insert_idx = key_idx + 1
+    indent = "  "
+    j = key_idx + 1
+    while j < len(lines):
+        line = lines[j]
+        stripped = line.strip()
+        if line[:1] in (" ", "\t") and stripped.startswith("- "):
+            indent = line[: len(line) - len(line.lstrip())]
+            insert_idx = j + 1
+            j += 1
+            continue
+        if stripped == "" or stripped.startswith("#"):
+            j += 1
+            continue
+        break
+    lines.insert(insert_idx, f"{indent}- {name}")
+    agent_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def detach_context_from_agent(agent_yaml: Path, name: str) -> bool:
+    """Remove ``name`` from agent.yaml's ``contexts:`` list, preserving the
+    file's comments and formatting. Returns ``True`` if removed, ``False``
+    if it wasn't present. The context file itself is left on disk.
+    """
+    text = agent_yaml.read_text(encoding="utf-8")
+    data = yaml.safe_load(text) or {}
+    existing = data.get("contexts") or []
+    if not isinstance(existing, list) or name not in existing:
+        return False
+
+    lines = text.splitlines()
+    key_idx = next((i for i, ln in enumerate(lines) if re.match(r"^contexts\s*:", ln)), None)
+    if key_idx is None:
+        return False
+
+    rest = lines[key_idx].split(":", 1)[1].strip()
+    if rest.startswith("[") and rest.endswith("]"):
+        remaining = [c for c in existing if c != name]
+        lines[key_idx] = f"contexts: [{', '.join(remaining)}]" if remaining else "contexts: []"
+        agent_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return True
+
+    # Block form — delete the `- name` line within the contexts block.
+    j = key_idx + 1
+    while j < len(lines):
+        line = lines[j]
+        stripped = line.strip()
+        if line[:1] in (" ", "\t") and stripped.startswith("- "):
+            if stripped[2:].strip() == name:
+                del lines[j]
+                agent_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return True
+            j += 1
+            continue
+        if stripped == "" or stripped.startswith("#"):
+            j += 1
+            continue
+        break
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -485,19 +593,33 @@ def create_context(
         "-f",
         help="Overwrite the file if it already exists.",
     ),
+    no_attach: bool = typer.Option(
+        False,
+        "--no-attach",
+        help=(
+            "Don't wire the new context into the agent's agent.yaml. Only "
+            "meaningful with [bold]--agent[/bold] (project-level contexts "
+            "aren't tied to a single agent, so they're never auto-attached)."
+        ),
+    ),
 ) -> None:
     """Create a new context file pre-filled with a minimal template.
 
     Creates ``contexts/<name>.md`` at the project level by default. With
-    ``--agent <name>``, creates ``agents/<agent>/contexts/<name>.md`` instead.
+    ``--agent <name>``, creates ``agents/<agent>/contexts/<name>.md`` AND
+    wires it into that agent's ``agent.yaml`` ``contexts:`` list so it takes
+    effect on the next run (pass ``--no-attach`` to skip the wiring).
 
     [bold]Examples:[/bold]
 
-      [dim]# Create a project-level context[/dim]
+      [dim]# Create a project-level context (shared; not auto-attached)[/dim]
       $ mdk contexts create policy
 
-      [dim]# Create a context private to one agent[/dim]
+      [dim]# Create + wire a context into one agent in a single step[/dim]
       $ mdk contexts create grounded-rubric --agent rag-qa
+
+      [dim]# Create agent-local but leave agent.yaml untouched[/dim]
+      $ mdk contexts create draft --agent rag-qa --no-attach
 
       [dim]# Overwrite an existing context[/dim]
       $ mdk contexts create policy --force
@@ -537,7 +659,126 @@ def create_context(
         display = dest
 
     console.print(f"[green]✓[/green] Created [bold]{display}[/bold]")
+
+    # When created for a specific agent, wire it into that agent's
+    # agent.yaml so it takes effect on the next run — the step operators
+    # most often forgot when contexts/create only wrote the file.
+    if agent is not None and not no_attach:
+        try:
+            added = attach_context_to_agent(agent_dir / "agent.yaml", name)
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            err_console.print(
+                f"[yellow]⚠[/yellow] created the file but couldn't update "
+                f"agent.yaml: {exc}"
+            )
+            err_console.print(
+                f"[dim]Wire it manually with "
+                f"[bold]mdk contexts attach {name} --agent {agent}[/bold].[/dim]"
+            )
+            return
+        if added:
+            console.print(
+                f"[green]✓[/green] Wired [bold]{name}[/bold] into "
+                f"[bold]{agent}[/bold]'s agent.yaml contexts"
+            )
+        else:
+            console.print(f"[dim]{name} was already in {agent}'s contexts[/dim]")
+        return
+
     console.print(
         f"[dim]Reference it in agent.yaml under "
-        f"[bold]contexts: [{name}][/bold][/dim]"
+        f"[bold]contexts: [{name}][/bold]  (or: mdk contexts attach {name} --agent <agent>)[/dim]"
     )
+
+
+# ---------------------------------------------------------------------------
+# `mdk contexts attach` / `mdk contexts detach`
+# ---------------------------------------------------------------------------
+
+
+def _context_exists(project: Path, agent: str, name: str) -> bool:
+    """True if context *name* resolves for *agent* — either a project-level
+    ``contexts/<name>.md`` or the agent's own ``contexts/<name>.md``."""
+    project_ctx = _contexts_dir(project) / f"{name}.md"
+    agent_ctx = _agents_dir(project) / agent / _AGENT_CONTEXTS_SUBDIR / f"{name}.md"
+    return project_ctx.is_file() or agent_ctx.is_file()
+
+
+@contexts_app.command("attach")
+def attach_context(
+    name: str = typer.Argument(..., help="Context name (stem, no extension) to wire in."),
+    agent: str = typer.Option(
+        ..., "--agent", "-a", help="Agent whose agent.yaml gains the context."
+    ),
+    project: Path = typer.Option(
+        Path("."), "--project", "-p", help="Project root. Defaults to the current directory."
+    ),
+) -> None:
+    """Wire an existing context into an agent's ``contexts:`` list.
+
+    The context must already exist (project-level or agent-local). Create
+    one first with [bold]mdk contexts create[/bold].
+
+    [bold]Examples:[/bold]
+
+      [dim]# Attach a shared project context to an agent[/dim]
+      $ mdk contexts attach policy --agent rag-qa
+    """
+    agent_dir = _agents_dir(project) / agent
+    agent_yaml = agent_dir / "agent.yaml"
+    if not agent_yaml.is_file():
+        err_console.print(f"[red]✗[/red] agent [bold]{agent}[/bold] not found: {agent_dir}")
+        raise typer.Exit(code=2)
+    if not _context_exists(project, agent, name):
+        err_console.print(
+            f"[red]✗[/red] context [bold]{name}[/bold] not found "
+            f"(looked in contexts/ and agents/{agent}/contexts/)."
+        )
+        err_console.print(
+            f"[dim]Create it first: "
+            f"[bold]mdk contexts create {name} --agent {agent}[/bold].[/dim]"
+        )
+        raise typer.Exit(code=2)
+    try:
+        added = attach_context_to_agent(agent_yaml, name)
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        err_console.print(f"[red]✗[/red] couldn't update agent.yaml: {exc}")
+        raise typer.Exit(code=2) from None
+    if added:
+        console.print(f"[green]✓[/green] Attached [bold]{name}[/bold] to [bold]{agent}[/bold]")
+    else:
+        console.print(f"[dim]{name} was already attached to {agent}[/dim]")
+
+
+@contexts_app.command("detach")
+def detach_context(
+    name: str = typer.Argument(..., help="Context name to remove from the agent."),
+    agent: str = typer.Option(
+        ..., "--agent", "-a", help="Agent whose agent.yaml loses the context."
+    ),
+    project: Path = typer.Option(
+        Path("."), "--project", "-p", help="Project root. Defaults to the current directory."
+    ),
+) -> None:
+    """Remove a context from an agent's ``contexts:`` list.
+
+    Leaves the context file on disk — only the wiring in agent.yaml is removed.
+
+    [bold]Examples:[/bold]
+
+      $ mdk contexts detach policy --agent rag-qa
+    """
+    agent_dir = _agents_dir(project) / agent
+    agent_yaml = agent_dir / "agent.yaml"
+    if not agent_yaml.is_file():
+        err_console.print(f"[red]✗[/red] agent [bold]{agent}[/bold] not found: {agent_dir}")
+        raise typer.Exit(code=2)
+    try:
+        removed = detach_context_from_agent(agent_yaml, name)
+    except (OSError, yaml.YAMLError) as exc:
+        err_console.print(f"[red]✗[/red] couldn't update agent.yaml: {exc}")
+        raise typer.Exit(code=2) from None
+    if removed:
+        console.print(f"[green]✓[/green] Detached [bold]{name}[/bold] from [bold]{agent}[/bold]")
+    else:
+        console.print(f"[dim]{name} was not in {agent}'s contexts — nothing to do[/dim]")
