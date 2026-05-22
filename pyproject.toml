@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.22.19"
+version = "2026.5.22.20"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -81,6 +81,11 @@ runtime = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "asyncpg>=0.29",
+    # pgvector ships `pgvector.asyncpg.register_vector` so asyncpg round-trips
+    # Python lists ↔ Postgres `vector(N)` natively. Durable vector store for
+    # KB embeddings on Azure Postgres (replaces brute-force Python cosine over
+    # JSONB). See docs/adr/009-pgvector-kb-storage.md.
+    "pgvector>=0.3",
     "bcrypt>=4.0",
     # python-multipart is FastAPI's required dep for parsing
     # multipart/form-data uploads. Used by POST /api/v1/agents
@@ -305,6 +310,7 @@ module = [
     "langfuse.*",
     "opentelemetry.*",
     "asyncpg.*",
+    "pgvector.*",
     "chainlit.*",
     "readability.*",
     "bs4.*",
