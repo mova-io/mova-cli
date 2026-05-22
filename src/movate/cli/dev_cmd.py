@@ -144,8 +144,12 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             _open_in_editor(agent_dir / "prompt.md")
         elif action == "eval":
             _run_subcommand([mdk_bin_name(), "eval", str(agent_dir)])
+        elif action == "grounding":
+            _grounding_action(agent_dir)
         elif action == "deploy":
             target = _deploy_action(agent_name, target)
+        elif action == "test_deployed":
+            target = _test_deployed_action(agent_dir, test_input, target)
 
     _console.success("dev session ended")
 
@@ -355,14 +359,18 @@ def _actions_menu() -> str:
     )
     stdout.print(
         "  [bold cyan]e[/bold cyan] run evals           "
-        "[bold cyan]d[/bold cyan] deploy to Azure       "
+        "[bold cyan]g[/bold cyan] grounding check       "
         "[bold cyan]o[/bold cyan] open prompt in editor"
     )
-    stdout.print("  [bold cyan]q[/bold cyan] quit")
+    stdout.print(
+        "  [bold cyan]d[/bold cyan] deploy to Azure      "
+        "[bold cyan]x[/bold cyan] test deployed agent   "
+        "[bold cyan]q[/bold cyan] quit"
+    )
     try:
         choice = Prompt.ask(
             "[bold]Pick[/bold]",
-            choices=["r", "i", "c", "e", "d", "o", "q"],
+            choices=["r", "i", "c", "e", "g", "d", "x", "o", "q"],
             default="r",
             show_choices=False,
         )
@@ -373,7 +381,9 @@ def _actions_menu() -> str:
         "i": "input",
         "c": "context",
         "e": "eval",
+        "g": "grounding",
         "d": "deploy",
+        "x": "test_deployed",
         "o": "edit",
         "q": "quit",
     }[choice]
@@ -411,13 +421,22 @@ def _add_context_action(agent_dir: Path) -> None:
     err.print(f"[dim]edit {dest}, then resume the live loop to see it take effect[/dim]")
 
 
+def _ensure_target(target: str | None, *, purpose: str) -> str | None:
+    """Return a deploy target — the one passed, or prompt for it."""
+    if target:
+        return target
+    try:
+        target = Prompt.ask(
+            f"[bold]Target[/bold] for {purpose} (from ~/.movate/config.yaml)"
+        ).strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return target or None
+
+
 def _deploy_action(agent_name: str, target: str | None) -> str | None:
     """Deploy the project's agents to Azure, then hint at KB sync."""
-    if not target:
-        try:
-            target = Prompt.ask("[bold]Deploy target[/bold] (from ~/.movate/config.yaml)").strip()
-        except (KeyboardInterrupt, EOFError):
-            return None
+    target = _ensure_target(target, purpose="deploy")
     if not target:
         _console.warn("no target — skipping deploy")
         return None
@@ -429,6 +448,46 @@ def _deploy_action(agent_name: str, target: str | None) -> str | None:
         f"  {mdk_bin_name()} kb ingest {agent_name} <path> --target {target}[/dim]"
     )
     return target
+
+
+def _test_deployed_action(
+    agent_dir: Path, test_input: str | None, target: str | None
+) -> str | None:
+    """Run the *deployed* agent on the test input — confirms the prompt +
+    contexts you've been editing actually shipped and behave the same.
+
+    Returns the (possibly newly-prompted) target so the caller remembers it.
+    """
+    target = _ensure_target(target, purpose="the deployed runtime")
+    if not target:
+        _console.warn("no target — skipping deployed test")
+        return None
+    if not test_input:
+        test_input = _prompt_for_input(agent_dir)
+    if not test_input:
+        return target
+    err.print(
+        f"[dim]running {agent_dir.name} on target '{target}' "
+        f"— compare against the local output above[/dim]"
+    )
+    _run_subcommand(
+        [mdk_bin_name(), "run", str(agent_dir), "--target", target, "-i", test_input]
+    )
+    return target
+
+
+def _grounding_action(agent_dir: Path) -> None:
+    """Score the agent for hallucination / faithfulness / context-obedience.
+
+    Runs `mdk eval-scorecard` locally — generates test cases on the fly and
+    scores them, so "does it obey my context and not make things up?" is one
+    keystroke. (For the deployed agent, add `--target` to the command.)
+    """
+    err.print(
+        "[dim]generating test cases + scoring (hallucination, faithfulness, "
+        "instruction-following)…[/dim]"
+    )
+    _run_subcommand([mdk_bin_name(), "eval-scorecard", str(agent_dir)])
 
 
 # ---------------------------------------------------------------------------

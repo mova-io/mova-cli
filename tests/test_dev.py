@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import movate.cli.dev_cmd as dc
 from movate.cli.dev_cmd import _print_output_diff
 from movate.cli.main import app as cli_app
 from movate.cli.watch import _compute_watched_paths, dispatch_run_once
@@ -111,3 +112,56 @@ def test_cli_dev_non_interactive_prints_guide(tmp_path: Path) -> None:
     assert r.exit_code == 0
     assert "mdk_dev_summary" in r.stdout
     assert "agent=demo" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# Actions: grounding check + test-on-deployed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_grounding_action_invokes_eval_scorecard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    dc._grounding_action(agent_dir)
+
+    assert calls, "expected a subprocess invocation"
+    assert calls[0][1] == "eval-scorecard"
+    assert str(agent_dir) in calls[0]
+
+
+@pytest.mark.unit
+def test_test_deployed_action_runs_against_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    out = dc._test_deployed_action(agent_dir, "hello", "prod")
+
+    assert out == "prod"  # target remembered
+    assert calls and calls[0][1] == "run"
+    assert "--target" in calls[0] and "prod" in calls[0]
+    assert "-i" in calls[0] and "hello" in calls[0]
+
+
+@pytest.mark.unit
+def test_test_deployed_action_skips_without_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No target and a non-interactive _ensure_target → skip, no subprocess."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(dc, "_ensure_target", lambda target, *, purpose: None)
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    assert dc._test_deployed_action(agent_dir, "hello", None) is None
+    assert calls == []
