@@ -473,6 +473,146 @@ def _load_kb_seeds(bundle: AgentBundle, project_root: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# KB-grounded generation — source provenance.
+#
+# When an agent has an ingested KB AND a RAG-context input schema
+# (``question`` + ``context: list[string]``), we generate test cases
+# GROUNDED in real KB chunks instead of synthesizing context: sample real
+# chunks, use their verbatim text as ``context``, ask the LLM for only a
+# ``question`` answerable from them, and record each case's source document
+# + page in a sibling ``source`` field. This makes generated cases
+# traceable to the KB they exercise (no fabricated provenance).
+#
+# Listing stored chunks needs no embedding call (unlike vector SEARCH), so
+# grounding works with just the generator LLM — no extra embedding key.
+# ---------------------------------------------------------------------------
+
+_GROUND_CHUNKS_PER_CASE = 3
+
+# Reserved key used to carry the per-case source provenance from Phase 1
+# (input generation) to Phase 2 (entry assembly), where it's popped off the
+# input and promoted to the entry's top-level ``source`` field. Never
+# reaches the agent — _execute_inputs strips it before the RunRequest.
+_SOURCE_SIDECAR_KEY = "__source__"
+
+
+def _is_rag_context_schema(bundle: AgentBundle) -> bool:
+    """True when the input schema is ``question`` (string) + ``context``
+    (array) — the only shape where grounding context in real KB chunks is
+    meaningful."""
+    schema = bundle.input_schema or {}
+    if not isinstance(schema, dict):
+        return False
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return False
+    question = props.get("question")
+    context = props.get("context")
+    return (
+        isinstance(question, dict)
+        and question.get("type") == "string"
+        and isinstance(context, dict)
+        and context.get("type") == "array"
+    )
+
+
+async def _list_agent_kb_chunks(
+    rt: Any, bundle: AgentBundle, *, tenant_id: str = "local"
+) -> list[Any]:
+    """Return the agent's ingested KB chunks (empty list when none / on error)."""
+    try:
+        return await rt.storage.list_kb_chunks(
+            agent=bundle.spec.name, tenant_id=tenant_id, limit=1000
+        )
+    except Exception as exc:  # storage may not support KB, or none ingested
+        log.debug("KB chunk listing failed for %s: %s", bundle.spec.name, exc)
+        return []
+
+
+def _sample_chunks(chunks: list[Any], *, k: int, seed: int) -> list[Any]:
+    """Deterministically pick up to ``k`` chunks for case ``seed``, rotating
+    the window so successive cases draw different passages."""
+    if not chunks:
+        return []
+    n = len(chunks)
+    start = (seed * k) % n
+    return [chunks[(start + j) % n] for j in range(min(k, n))]
+
+
+def _source_for_chunks(chunks: list[Any]) -> list[dict[str, Any]]:
+    """Per-case ``source`` sidecar, aligned 1:1 with the context list:
+    ``[{"document": <source>, "page": <int|None>}, ...]``."""
+    out: list[dict[str, Any]] = []
+    for c in chunks:
+        meta = getattr(c, "metadata", None)
+        page = meta.get("page") if isinstance(meta, dict) else None
+        out.append({"document": getattr(c, "source", "?"), "page": page})
+    return out
+
+
+async def _generate_question_for_chunks(
+    rt: Any,
+    bundle: AgentBundle,
+    *,
+    passages: list[str],
+    index: int,
+    mode: str,
+    generator_model: str | None,
+) -> str | None:
+    """Ask the LLM for ONE question answerable from ``passages``. Returns
+    the question string, or None on failure (caller falls back / skips)."""
+    from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
+
+    numbered = "\n".join(f"[{i + 1}] {p}" for i, p in enumerate(passages))
+    mode_hint = {
+        "adversarial": (
+            " Phrase it as a tricky / adversarial question that still has a "
+            "grounded answer in the passages."
+        ),
+        "edge": (
+            " Make it a boundary / edge-case question (a very specific detail "
+            "or multi-part ask) still answerable from the passages."
+        ),
+    }.get(mode, "")
+    system = (
+        "You write evaluation questions for a retrieval-augmented QA agent. "
+        "Given numbered context passages from a knowledge base, produce ONE "
+        "realistic user question answerable using ONLY those passages." + mode_hint
+        + ' Reply with a single JSON object: {"question": "<the question>"}. '
+        "No markdown."
+    )
+    request = CompletionRequest(
+        provider=generator_model or bundle.spec.model.provider,
+        messages=[
+            Message(role="system", content=system),
+            Message(
+                role="user",
+                content=f"Context passages:\n{numbered}\n\nProduce question #{index + 1}.",
+            ),
+        ],
+        params={"temperature": 0.9, "max_tokens": 256},
+    )
+    try:
+        response = await rt.provider.complete(request)
+    except Exception as exc:
+        log.warning("KB-grounded question gen failed for case #%d: %s", index + 1, exc)
+        return None
+    text = (response.text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text or None  # tolerate a bare-question reply
+    if isinstance(parsed, dict) and isinstance(parsed.get("question"), str):
+        return parsed["question"].strip() or None
+    return None
+
+
 async def _generate_inputs_only(
     bundle: AgentBundle,
     *,
@@ -495,12 +635,40 @@ async def _generate_inputs_only(
     rt = await build_local_runtime(mock=mock)
     validator = Draft202012Validator(bundle.input_schema)
     inputs: list[dict[str, Any]] = []
+
+    # KB-grounding eligibility: only for non-mock RAG-context agents that
+    # actually have ingested chunks. Otherwise fall back to synthesis.
+    kb_chunks: list[Any] = []
+    ground_from_kb = (not mock) and _is_rag_context_schema(bundle)
+    if ground_from_kb:
+        kb_chunks = await _list_agent_kb_chunks(rt, bundle)
+        if not kb_chunks:
+            ground_from_kb = False
+
     try:
         for i in range(num):
-            kb_seed = kb_seeds[i % len(kb_seeds)] if kb_seeds else None
-            if mock:
+            source_sidecar: list[dict[str, Any]] | None = None
+            if ground_from_kb:
+                # Real chunks become verbatim context; the LLM writes only a
+                # question answerable from them, and we record their source.
+                sampled = _sample_chunks(kb_chunks, k=_GROUND_CHUNKS_PER_CASE, seed=i)
+                passages = [str(getattr(c, "text", "")) for c in sampled]
+                question = await _generate_question_for_chunks(
+                    rt,
+                    bundle,
+                    passages=passages,
+                    index=i,
+                    mode=mode,
+                    generator_model=generator_model,
+                )
+                if question is None:
+                    continue  # question gen failed for this case; skip
+                generated_input = {"question": question, "context": passages}
+                source_sidecar = _source_for_chunks(sampled)
+            elif mock:
                 generated_input = _mock_input_for_schema(bundle.input_schema, seed=i)
             else:
+                kb_seed = kb_seeds[i % len(kb_seeds)] if kb_seeds else None
                 generated_input = await _generate_one_input(
                     rt,
                     bundle,
@@ -520,6 +688,10 @@ async def _generate_inputs_only(
                     exc.message,
                 )
                 continue
+            # Attach provenance AFTER validation so the reserved key never
+            # trips additionalProperties; _execute_inputs pops it off.
+            if source_sidecar is not None:
+                generated_input[_SOURCE_SIDECAR_KEY] = source_sidecar
             inputs.append(generated_input)
             if on_progress is not None:
                 on_progress(len(inputs), num)
@@ -546,6 +718,9 @@ async def _execute_inputs(
     entries: list[dict[str, Any]] = []
     try:
         for i, generated_input in enumerate(inputs):
+            # Strip the source sidecar before the agent ever sees the input;
+            # promote it to the entry's top-level `source` field.
+            source = generated_input.pop(_SOURCE_SIDECAR_KEY, None)
             request = RunRequest(agent=bundle.spec.name, input=generated_input)
             response = await rt.executor.execute(bundle, request)
             entry: dict[str, Any] = {
@@ -553,6 +728,8 @@ async def _execute_inputs(
                 "expected": response.data,
                 "generated": True,
             }
+            if source is not None:
+                entry["source"] = source
             if mode != "standard":
                 entry["mode"] = mode
             if mode == "refusal":

@@ -1311,7 +1311,11 @@ def _render_cases_preview_table(entries: list[dict[str, Any]], mix: str) -> None
             # operator sees WHERE each expected answer is grounded.
             context = entry["input"]["context"]
             input_str = _format_rag_input_cell(entry["input"], context=context)
-            expected_str = _format_rag_expected_cell(entry.get("expected") or {}, context=context)
+            expected_str = _format_rag_expected_cell(
+                entry.get("expected") or {},
+                context=context,
+                source=entry.get("source"),
+            )
         else:
             input_str = _format_for_preview_cell(entry.get("input"))
             expected_str = _format_for_preview_cell(entry.get("expected"))
@@ -1387,13 +1391,59 @@ def _format_rag_input_cell(inp: dict[str, Any], *, context: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _format_rag_expected_cell(exp: dict[str, Any], *, context: list[str]) -> str:
+_RAG_SOURCE_SUMMARY_MAX = 3  # distinct source docs shown in the summary line
+
+
+def _rag_source_summary(source: Any) -> str | None:
+    """Compact ``Source: doc.pdf p.4, …`` line for a KB-grounded case, or
+    None when there's no provenance sidecar."""
+    from rich.markup import escape  # noqa: PLC0415
+
+    if not isinstance(source, list) or not source:
+        return None
+    seen: list[str] = []
+    for s in source:
+        if isinstance(s, dict) and s.get("document"):
+            label = str(s["document"]) + (f" p.{s['page']}" if s.get("page") else "")
+            if label not in seen:
+                seen.append(label)
+    if not seen:
+        return None
+    shown = ", ".join(seen[:_RAG_SOURCE_SUMMARY_MAX])
+    if len(seen) > _RAG_SOURCE_SUMMARY_MAX:
+        shown += "…"
+    return f"[cyan]Source[/cyan] [dim]{escape(shown)}[/dim]"
+
+
+def _rag_source_label(source: Any, idx: int) -> str:
+    """Render ``— <document> p.<page>`` for the source entry aligned to
+    context index ``idx`` (0-based), or ``""`` when no provenance is known.
+
+    ``source`` is the case's optional sidecar: a list aligned 1:1 with
+    ``context``, each ``{"document": str, "page": int|None}``."""
+    from rich.markup import escape  # noqa: PLC0415
+
+    if not isinstance(source, list) or idx < 0 or idx >= len(source):
+        return ""
+    entry = source[idx]
+    if not isinstance(entry, dict) or not entry.get("document"):
+        return ""
+    page = entry.get("page")
+    loc = escape(str(entry["document"])) + (f" p.{page}" if page else "")
+    return f" [cyan]— {loc}[/cyan]"
+
+
+def _format_rag_expected_cell(
+    exp: dict[str, Any], *, context: list[str], source: Any | None = None
+) -> str:
     """Render a RAG case's Expected cell with citations resolved to the
     actual cited passages plus human-friendly grounded/confidence lines.
 
     ``citations`` are 1-indexed into ``context``; each is resolved to a
     short snippet of the passage it points at. Out-of-range indices
-    (LLM hallucinations) are flagged rather than silently dropped."""
+    (LLM hallucinations) are flagged rather than silently dropped. When a
+    ``source`` sidecar is present (KB-grounded cases), each cited passage
+    is annotated with the document + page it came from."""
     from rich.markup import escape  # noqa: PLC0415
 
     lines: list[str] = []
@@ -1412,11 +1462,17 @@ def _format_rag_expected_cell(exp: dict[str, Any], *, context: list[str]) -> str
             marker = escape(f"[{c}]")
             if 1 <= c <= len(context):
                 snippet = escape(_rag_snippet(str(context[c - 1]), _RAG_CITATION_SNIPPET_CHARS))
-                lines.append(f"  [dim]{marker}[/dim] {snippet}")
+                lines.append(f"  [dim]{marker}[/dim] {snippet}{_rag_source_label(source, c - 1)}")
             else:
                 lines.append(f"  [dim]{marker}[/dim] [red](no such passage)[/red]")
     elif grounded is False:
         lines.append("[yellow]No citations[/yellow] [dim](not grounded)[/dim]")
+
+    # Provenance summary — always surface the source docs for KB-grounded
+    # cases, even when the agent's answer didn't cite every passage.
+    summary = _rag_source_summary(source)
+    if summary is not None:
+        lines.append(summary)
 
     meta: list[str] = []
     if isinstance(grounded, bool):
