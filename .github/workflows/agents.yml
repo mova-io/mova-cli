@@ -20,7 +20,8 @@ on:
     paths:
       - "agents/**"
       - ".movate/**"
-      - "movate.yaml"
+      - "project.yaml"
+      - "movate.yaml"   # legacy name; still loads through v1.x
       - "src/movate/**"   # changes to the framework can break agent loading
       - ".github/workflows/agents.yml"
   push:
