@@ -2,6 +2,9 @@ name: ci
 
 on:
   pull_request:
+    # Include ready_for_review so the version gate (skipped on drafts, below)
+    # runs when a draft is marked ready — not only on a subsequent push.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 
@@ -30,7 +33,10 @@ jobs:
       # before this step runs, so fetching live main would compare the PR
       # against its own already-merged version and false-fail.
       - name: Version bump gate
-        if: github.event_name == 'pull_request'
+        # Skip on drafts: they aren't merging, so the "must bump past base"
+        # rule is pure churn (a draft can't stay ahead of a moving main). The
+        # gate re-applies when the PR is marked ready (ready_for_review above).
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
