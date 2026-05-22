@@ -108,6 +108,41 @@ class TestCredentialsStore:
         isolated_creds.write_text('OPENAI_API_KEY="sk-quoted"\n')
         assert CredentialsStore().read() == {"OPENAI_API_KEY": "sk-quoted"}
 
+    def test_set_preserves_comments_and_ordering(self, isolated_creds: Path) -> None:
+        """A hand-edited file survives set(): comments, other keys, and
+        ordering stay intact — only the target key's line is rewritten."""
+        isolated_creds.parent.mkdir(parents=True, exist_ok=True)
+        isolated_creds.write_text(
+            "# my notes\nOPENAI_API_KEY=sk-old\n# section two\nANTHROPIC_API_KEY=ant-1\n"
+        )
+        CredentialsStore().set("OPENAI_API_KEY", "sk-new")
+        text = isolated_creds.read_text()
+        assert "# my notes" in text
+        assert "# section two" in text
+        assert "OPENAI_API_KEY=sk-new" in text
+        assert "sk-old" not in text
+        assert "ANTHROPIC_API_KEY=ant-1" in text
+        # Ordering preserved: the OPENAI line is still before the section-two comment.
+        assert text.index("OPENAI_API_KEY") < text.index("# section two")
+
+    def test_set_new_key_appends_and_keeps_comments(self, isolated_creds: Path) -> None:
+        isolated_creds.parent.mkdir(parents=True, exist_ok=True)
+        isolated_creds.write_text("# keep me\nOPENAI_API_KEY=sk-1\n")
+        CredentialsStore().set("ANTHROPIC_API_KEY", "ant-1")
+        text = isolated_creds.read_text()
+        assert "# keep me" in text
+        assert "OPENAI_API_KEY=sk-1" in text
+        assert "ANTHROPIC_API_KEY=ant-1" in text
+
+    def test_delete_preserves_comments(self, isolated_creds: Path) -> None:
+        isolated_creds.parent.mkdir(parents=True, exist_ok=True)
+        isolated_creds.write_text("# notes\nOPENAI_API_KEY=sk-1\nANTHROPIC_API_KEY=ant-1\n")
+        assert CredentialsStore().delete("OPENAI_API_KEY") is True
+        text = isolated_creds.read_text()
+        assert "# notes" in text
+        assert "OPENAI_API_KEY" not in text
+        assert "ANTHROPIC_API_KEY=ant-1" in text
+
 
 # ---------------------------------------------------------------------------
 # autoload_credentials — fills unset env vars; doesn't clobber set ones

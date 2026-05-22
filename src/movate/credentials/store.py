@@ -80,49 +80,60 @@ class CredentialsStore:
     # ------------------------------------------------------------------
 
     def set(self, key: str, value: str) -> None:
-        """Insert or update one ``KEY=value`` entry in-place.
+        """Insert or update one ``KEY=value`` entry, preserving everything else.
 
-        Preserves existing comments and ordering. New keys are
-        appended at the end. The file is written with mode 0600
-        regardless of platform — Windows ignores the chmod, which
-        is OK since Windows has its own ACL story for the user's
-        home directory.
+        A targeted line edit — existing comments, blank lines, ordering, and
+        unrelated keys are left byte-for-byte intact; only the matching key's
+        line is rewritten (or, for a new key, appended at the end). This is
+        what lets operators keep hand-added comments/structure in the file
+        without ``mdk auth login`` clobbering them on the next write.
+
+        A fresh file gets the standard narration header. The file is written
+        mode 0600 (Windows ignores the chmod — its home-dir ACLs cover it).
         """
-        existing = self.read()
-        existing[key] = value
-        self._write_atomic(existing)
+        if not self.path.is_file():
+            self._write_atomic_text(_render_new_file(key, value))
+            return
+
+        new_line = f"{key}={value}"
+        out: list[str] = []
+        replaced = False
+        for raw in self.path.read_text().splitlines():
+            if not replaced and _entry_key(raw) == key:
+                out.append(new_line)
+                replaced = True
+            else:
+                out.append(raw)
+        if not replaced:
+            out.append(new_line)
+        self._write_atomic_text("\n".join(out) + "\n")
 
     def delete(self, key: str) -> bool:
-        """Remove ``key`` if present. Returns True if anything changed."""
-        existing = self.read()
-        if key not in existing:
+        """Remove ``key`` if present. Returns True if anything changed.
+
+        Comments + other entries are preserved — only the matching line drops.
+        """
+        if not self.path.is_file():
             return False
-        existing.pop(key)
-        self._write_atomic(existing)
+        out: list[str] = []
+        removed = False
+        for raw in self.path.read_text().splitlines():
+            if not removed and _entry_key(raw) == key:
+                removed = True
+                continue
+            out.append(raw)
+        if not removed:
+            return False
+        self._write_atomic_text("\n".join(out) + "\n")
         return True
 
-    def _write_atomic(self, entries: dict[str, str]) -> None:
-        """Write the entire file as one transaction.
+    def _write_atomic_text(self, body: str) -> None:
+        """Write ``body`` as one transaction (tempfile + rename), mode 0600.
 
-        We rebuild from scratch rather than line-edit because the
-        ``.env`` syntax doesn't have a stable parse/emit story for
-        comments. The narration comment at the top is re-emitted on
-        every write so operators editing manually have context.
+        Atomic-ish: write to a sibling tempfile + rename, so an interrupted
+        write never leaves a half-written credentials file.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            "# movate machine-global credentials",
-            "# Managed by `mdk auth login` / `mdk auth status`.",
-            "# Hand-editable — same syntax as .env.",
-            "# Mode 0600 — owner read/write only.",
-            "",
-        ]
-        for key, value in sorted(entries.items()):
-            lines.append(f"{key}={value}")
-        body = "\n".join(lines) + "\n"
-
-        # Atomic-ish: write to a sibling tempfile + rename. Avoids
-        # half-written files if the process is interrupted mid-write.
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(body)
         # Tighten permissions BEFORE the rename so the final file is
@@ -137,6 +148,34 @@ def _chmod_owner_only(path: Path) -> None:
     support POSIX mode bits (Windows)."""
     with contextlib.suppress(OSError, NotImplementedError):  # pragma: no cover
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _entry_key(raw: str) -> str | None:
+    """Return the key of a ``KEY=value`` line, or ``None`` for comments,
+    blank lines, and lines without ``=`` — so line edits skip non-entries."""
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    return line.partition("=")[0].strip()
+
+
+def _render_new_file(key: str, value: str) -> str:
+    """Body for a freshly-created credentials file: narration header + entry.
+
+    Only used when the file doesn't exist yet; subsequent writes preserve
+    whatever the operator has in the file (header + comments included)."""
+    return (
+        "\n".join(
+            [
+                "# movate machine-global credentials",
+                "# Managed by `mdk auth login` / `mdk auth status`.",
+                "# Hand-editable — same syntax as .env.",
+                "# Mode 0600 — owner read/write only.",
+                f"{key}={value}",
+            ]
+        )
+        + "\n"
+    )
 
 
 def write_credential_to(stream: IO[str], key: str, value: str) -> None:
