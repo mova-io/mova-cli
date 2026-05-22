@@ -19,6 +19,17 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
+      # Enforce "increment the version on every PR". The pre-commit hook
+      # bumps the CalVer version locally; this catches a stale/colliding
+      # version (e.g. two PRs branched off the same base computing the same
+      # next N — which is how 2026.5.22.19 once landed on two merges). Only
+      # meaningful on PRs; skipped on push-to-main. Pure stdlib, no deps.
+      - name: Version bump gate
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          python3 scripts/bump_version.py --gate-ahead-of FETCH_HEAD
+
       # Catches pyproject.toml ↔ uv.lock drift. If you bump a dep in
       # pyproject.toml without re-running `uv lock`, the Docker build's
       # `uv sync --frozen` installs the OLD lockfile contents — which

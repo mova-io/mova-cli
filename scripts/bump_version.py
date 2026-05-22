@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +67,55 @@ def _read_version(path: Path, pattern: re.Pattern[str]) -> str:
     if not match:
         raise SystemExit(f"could not find version in {path}")
     return match.group(1)
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Parse a CalVer string into an int tuple for ordering (``()`` if unparseable)."""
+    try:
+        return tuple(int(p) for p in v.split("."))
+    except ValueError:
+        return ()
+
+
+def is_strictly_ahead(current: str, base: str) -> bool:
+    """True iff ``current`` is a strictly newer CalVer version than ``base``."""
+    return _version_tuple(current) > _version_tuple(base)
+
+
+def _version_at_ref(ref: str) -> str | None:
+    """Read the pyproject version at a git ref (e.g. the PR base), or ``None``."""
+    result = subprocess.run(
+        ["git", "show", f"{ref}:pyproject.toml"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    match = _PYPROJECT_RE.search(result.stdout)
+    return match.group(1) if match else None
+
+
+def _gate_ahead_of(ref: str) -> None:
+    """Fail unless the working-tree version is strictly newer than ``ref``'s.
+
+    This is the per-PR enforcement of "increment the version on every merge":
+    the pre-commit hook bumps locally, and this gate (run in CI on pull
+    requests against the base branch) catches a stale/colliding version — e.g.
+    two PRs branched off the same base that both computed the same next ``N``.
+    """
+    current = _read_version(PYPROJECT, _PYPROJECT_RE)
+    base = _version_at_ref(ref)
+    if base is None:
+        print(f"version gate: could not read base version at {ref!r}; skipping", file=sys.stderr)
+        return
+    if not is_strictly_ahead(current, base):
+        raise SystemExit(
+            f"version gate FAILED: this branch is {current}, base ({ref}) is {base}. "
+            "Every PR must increment the CalVer version. Make a commit so the "
+            "pre-commit hook bumps it, or run `python scripts/bump_version.py`."
+        )
+    print(f"version gate OK: {current} > {base} (base {ref})")
 
 
 def compute_version(today: str | None = None, current: str | None = None) -> str:
@@ -127,7 +177,7 @@ def _write_version(new: str) -> None:
     # Keep uv.lock's own-package pin in lockstep so CI's `uv lock --check`
     # stays green without a (slow) dependency re-resolve.
     if UV_LOCK.is_file():
-        UV_LOCK.write_text(_UV_LOCK_RE.sub(rf'\g<1>{new}\g<3>', UV_LOCK.read_text(), count=1))
+        UV_LOCK.write_text(_UV_LOCK_RE.sub(rf"\g<1>{new}\g<3>", UV_LOCK.read_text(), count=1))
 
 
 def main() -> None:
@@ -143,7 +193,20 @@ def main() -> None:
         dest="print_only",
         help="Print the computed CalVer version without writing any files.",
     )
+    parser.add_argument(
+        "--gate-ahead-of",
+        metavar="REF",
+        help=(
+            "CI gate: exit nonzero unless the tree's version is strictly newer "
+            "than the version at git REF (the PR base). Enforces a version bump "
+            "per PR. Writes nothing."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.gate_ahead_of:
+        _gate_ahead_of(args.gate_ahead_of)
+        return
 
     _check_in_sync()
     if args.check:
