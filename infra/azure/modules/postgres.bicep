@@ -43,6 +43,9 @@ param databaseName string = 'movate'
 @description('Also create a `langfuse` database on this server (for self-hosted Langfuse). Off by default so non-Langfuse deploys stay lean.')
 param createLangfuseDatabase bool = false
 
+@description('Allow-list the pgvector extension (Azure blocks extensions until named in the azure.extensions server parameter). Required for the KB vector store — see docs/adr/009-pgvector-kb-storage.md.')
+param enablePgvector bool = true
+
 @description('Common tags.')
 param tags object = {}
 
@@ -113,6 +116,20 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
     properties: {
       startIpAddress: '0.0.0.0'
       endIpAddress: '0.0.0.0'
+    }
+  }
+
+  // Allow-list the pgvector extension. Azure Postgres Flexible Server
+  // refuses `CREATE EXTENSION vector` until the extension is named in the
+  // `azure.extensions` server parameter; the runtime creates the extension
+  // at boot (PostgresProvider._ensure_pgvector). `azure.extensions` is a
+  // dynamic parameter, so this takes effect without a server restart.
+  // See docs/adr/009-pgvector-kb-storage.md.
+  resource extensionsAllowlist 'configurations@2023-12-01-preview' = if (enablePgvector) {
+    name: 'azure.extensions'
+    properties: {
+      value: 'VECTOR'
+      source: 'user-override'
     }
   }
 }
