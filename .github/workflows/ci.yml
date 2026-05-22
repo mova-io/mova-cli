@@ -98,7 +98,7 @@ jobs:
           MOVATE_PG_TEST_URL: postgresql://movate:movate@127.0.0.1:5432/movate_test
         # Only the storage suites need PG; rest of the suite ran in
         # the lint-and-test job already.
-        run: uv run pytest tests/test_jobs_storage.py tests/test_auth.py tests/test_sqlite.py tests/test_pgvector_extension.py -v
+        run: uv run pytest tests/test_jobs_storage.py tests/test_auth.py tests/test_sqlite.py tests/test_pgvector_extension.py tests/test_pgvector_search.py -v
 
   # Lint every .yml under .github/workflows/ — including the example
   # workflow we ship for downstream consumers (eval-gate.example.yml).

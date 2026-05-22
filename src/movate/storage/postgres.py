@@ -52,6 +52,38 @@ from movate.storage._cosine import rank_chunks_by_cosine as _rank_chunks_by_cosi
 
 logger = logging.getLogger(__name__)
 
+# Embedding dimension for the KB ``vector(N)`` column (ADR 009 D1). A vector
+# column needs a fixed N; one embedding model per deployment is the product
+# reality. Override via MOVATE_EMBED_DIM for a non-1536-dim model.
+_EMBED_DIM_DEFAULT = 1536
+
+
+def _embedding_dim() -> int:
+    """Configured embedding dimension (``MOVATE_EMBED_DIM``, default 1536)."""
+    import os  # noqa: PLC0415
+
+    raw = os.environ.get("MOVATE_EMBED_DIM", "").strip()
+    if not raw:
+        return _EMBED_DIM_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return _EMBED_DIM_DEFAULT
+    return n if n > 0 else _EMBED_DIM_DEFAULT
+
+
+def _vec_literal(embedding: list[float]) -> str:
+    """Render an embedding as a pgvector text literal — ``[0.1,0.2,...]``.
+
+    We bind vectors as text + an explicit ``::vector`` cast rather than a
+    client-side codec, so the runtime needs no numpy/pgvector-python at query
+    time — only the server-side extension. pgvector's ``vector_in`` tolerates
+    the whitespace JSONB casts produce, and its text output is JSON-parseable
+    on the way back (see ``_parse_embedding``).
+    """
+    return "[" + ",".join(repr(float(x)) for x in embedding) + "]"
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id           TEXT PRIMARY KEY,
@@ -222,11 +254,12 @@ CREATE INDEX IF NOT EXISTS idx_run_feedback_agent_created
 CREATE INDEX IF NOT EXISTS idx_run_feedback_tenant_created
     ON run_feedback(tenant_id, created_at DESC);
 
--- KB chunks for vector retrieval (added 0.8.2.13). Embeddings stored
--- as JSONB float arrays — NOT pgvector yet. Cosine similarity is
--- computed in Python at query time. Future: swap to ``embedding
--- vector(1536)`` + ivfflat index when KB sizes warrant the perf
--- jump; the storage protocol stays unchanged.
+-- KB chunks for vector retrieval (added 0.8.2.13). The base column is
+-- JSONB here; migration ``001_kb_embedding_to_vector`` converts it to
+-- pgvector ``vector(N)`` + an HNSW index and search runs as a SQL `<=>`
+-- ANN query (ADR 009). The base stays JSONB so this CREATE works without
+-- the extension and the conversion lives in exactly one place (the
+-- migration), handling fresh and existing DBs uniformly.
 CREATE TABLE IF NOT EXISTS kb_chunks (
     chunk_id        TEXT PRIMARY KEY,
     tenant_id       TEXT NOT NULL,
@@ -317,6 +350,67 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Migrations (ADR 009 D5) — ordered, idempotent, transactional
+# ---------------------------------------------------------------------------
+
+
+async def _migrate_kb_embedding_to_vector(conn: asyncpg.Connection) -> None:
+    """Convert ``kb_chunks.embedding`` from JSONB to pgvector ``vector(N)``.
+
+    Handles fresh DBs (the base schema created a JSONB column, immediately
+    converted here) and existing DBs (data is cast in place) uniformly.
+
+    Safety (ADR 009 D4): the cast ``jsonb -> text -> vector`` is done on a new
+    column; every existing row's dimension is validated against the configured
+    N *before* the destructive drop/rename, and the migration aborts (rolling
+    back the whole transaction) if any row mismatches. ``vector`` stores
+    float4, so this is effectively lossless for embeddings.
+    """
+    dim = _embedding_dim()
+
+    # Already a vector column? (idempotent guard beyond schema_migrations).
+    udt = await conn.fetchval(
+        "SELECT udt_name FROM information_schema.columns "
+        "WHERE table_name = 'kb_chunks' AND column_name = 'embedding'"
+    )
+    if udt == "vector":
+        return
+
+    # Validate dimensions of existing rows BEFORE any destructive change.
+    bad = await conn.fetch(
+        "SELECT chunk_id, jsonb_array_length(embedding) AS dim "
+        "FROM kb_chunks WHERE jsonb_array_length(embedding) <> $1 LIMIT 5",
+        dim,
+    )
+    if bad:
+        sample = ", ".join(f"{r['chunk_id']}(dim={r['dim']})" for r in bad)
+        raise RuntimeError(
+            f"cannot migrate kb_chunks.embedding to vector({dim}): some rows "
+            f"have a different dimension (e.g. {sample}). Re-ingest with a "
+            "consistent embedding model, or set MOVATE_EMBED_DIM to match."
+        )
+
+    await conn.execute(f"ALTER TABLE kb_chunks ADD COLUMN embedding_vec vector({dim})")
+    await conn.execute("UPDATE kb_chunks SET embedding_vec = embedding::text::vector")
+    await conn.execute("ALTER TABLE kb_chunks DROP COLUMN embedding")
+    await conn.execute("ALTER TABLE kb_chunks RENAME COLUMN embedding_vec TO embedding")
+    await conn.execute("ALTER TABLE kb_chunks ALTER COLUMN embedding SET NOT NULL")
+    # ANN index for cosine distance (`<=>`). HNSW: good recall/latency, no
+    # pre-populated table needed to build well (ADR 009 D3).
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kb_chunks_embedding_hnsw "
+        "ON kb_chunks USING hnsw (embedding vector_cosine_ops)"
+    )
+
+
+# Ordered list of (version, coroutine). Append new migrations; never edit or
+# reorder shipped ones.
+_MIGRATIONS: list[tuple[str, Any]] = [
+    ("001_kb_embedding_to_vector", _migrate_kb_embedding_to_vector),
+]
+
+
+# ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
 
@@ -366,30 +460,51 @@ class PostgresProvider:
         async with self._pool.acquire() as conn:
             await self._ensure_pgvector(conn)
             await conn.execute(_SCHEMA)
+            await self._run_migrations(conn)
 
     @staticmethod
     async def _ensure_pgvector(conn: asyncpg.Connection) -> None:
-        """Create the pgvector extension if it isn't already present.
+        """Create the pgvector extension. **Required** — KB embeddings are
+        stored in a ``vector(N)`` column (ADR 009).
 
-        KB embeddings move to a ``vector(N)`` column (ADR 009); the extension
-        must exist first. On Azure Postgres Flexible Server the extension also
-        has to be allow-listed via the ``azure.extensions`` server parameter
+        On Azure Postgres Flexible Server the extension must be allow-listed
+        via the ``azure.extensions`` server parameter
         (``infra/azure/modules/postgres.bicep``) before ``CREATE EXTENSION``
-        will succeed.
-
-        At this step the KB column is still JSONB, so a missing extension is
-        non-fatal: log an actionable warning and continue. The follow-up that
-        introduces the ``vector`` column makes this a hard requirement.
+        will succeed. We fail loudly rather than silently fall back to a
+        non-vector column.
         """
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         except asyncpg.PostgresError as exc:
-            logger.warning(
-                "could not create the pgvector extension (%s). KB vector search "
-                "needs it; on Azure Postgres add 'VECTOR' to the azure.extensions "
-                "server parameter (infra/azure/modules/postgres.bicep) and redeploy.",
-                exc,
-            )
+            raise RuntimeError(
+                "pgvector extension is required for KB storage but could not be "
+                f"created: {exc}. On Azure Postgres add 'VECTOR' to the "
+                "azure.extensions server parameter "
+                "(infra/azure/modules/postgres.bicep) and redeploy."
+            ) from exc
+
+    async def _run_migrations(self, conn: asyncpg.Connection) -> None:
+        """Apply ordered, idempotent schema migrations (ADR 009 D5).
+
+        The base ``_SCHEMA`` is all ``CREATE ... IF NOT EXISTS`` and cannot
+        express a column-type change, so structural upgrades live here. Each
+        migration runs at most once, tracked in ``schema_migrations``, inside
+        its own transaction (so a failure rolls back cleanly and leaves the
+        version unrecorded for a safe retry).
+        """
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "  version TEXT PRIMARY KEY,"
+            "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+            ")"
+        )
+        applied = {r["version"] for r in await conn.fetch("SELECT version FROM schema_migrations")}
+        for version, migrate in _MIGRATIONS:
+            if version in applied:
+                continue
+            async with conn.transaction():
+                await migrate(conn)
+                await conn.execute("INSERT INTO schema_migrations (version) VALUES ($1)", version)
 
     async def ping(self) -> None:
         """``SELECT 1`` against the pool — picks up DB-down /
@@ -1012,7 +1127,7 @@ class PostgresProvider:
             INSERT INTO kb_chunks (
                 chunk_id, tenant_id, agent, source, text, embedding,
                 embedding_model, content_hash, metadata, created_at, ocr
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ) VALUES ($1,$2,$3,$4,$5,$6::vector,$7,$8,$9,$10,$11)
             ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
                 SET embedding = EXCLUDED.embedding,
                     embedding_model = EXCLUDED.embedding_model,
@@ -1025,7 +1140,7 @@ class PostgresProvider:
             chunk.agent,
             chunk.source,
             chunk.text,
-            chunk.embedding,
+            _vec_literal(chunk.embedding),
             chunk.embedding_model,
             chunk.content_hash,
             chunk.metadata,
@@ -1041,25 +1156,32 @@ class PostgresProvider:
         query_embedding: list[float],
         limit: int = 5,
     ) -> list[KbChunkWithScore]:
-        # No pgvector yet — load matching chunks and rank in Python.
-        # The (agent, tenant_id) index scopes the scan to one KB; for
-        # KBs under ~10k chunks the Python cosine loop completes in
-        # <50ms. Future pgvector swap will compute the similarity in
-        # SQL and only return the top-K.
+        # pgvector ANN search: cosine distance `<=>` against the HNSW index,
+        # top-K computed in SQL (ADR 009 D2/D3). `<=>` is cosine *distance*;
+        # we return `1 - distance` to keep the existing 0-1 similarity score
+        # contract (RRF fusion + CLI thresholds depend on it).
+        dim = _embedding_dim()
+        if len(query_embedding) != dim:
+            raise ValueError(
+                f"query embedding has dimension {len(query_embedding)}, but the "
+                f"store is configured for vector({dim}) (MOVATE_EMBED_DIM)"
+            )
         rows = await self._db.fetch(
             """
             SELECT chunk_id, tenant_id, agent, source, text, embedding,
-                   embedding_model, content_hash, metadata, created_at, ocr
+                   embedding_model, content_hash, metadata, created_at, ocr,
+                   1 - (embedding <=> $3::vector) AS score
             FROM kb_chunks
             WHERE agent = $1 AND tenant_id = $2
+            ORDER BY embedding <=> $3::vector
+            LIMIT $4
             """,
             agent,
             tenant_id,
+            _vec_literal(query_embedding),
+            int(limit),
         )
-        chunks = [_row_to_kb_chunk(r) for r in rows]
-        from movate.storage._cosine import rank_chunks_by_cosine  # noqa: PLC0415
-
-        return rank_chunks_by_cosine(chunks, query_embedding, limit)
+        return [KbChunkWithScore(chunk=_row_to_kb_chunk(r), score=float(r["score"])) for r in rows]
 
     async def list_kb_chunks(
         self,
@@ -1386,6 +1508,18 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
     )
 
 
+def _parse_embedding(value: Any) -> list[float]:
+    """Coerce a stored embedding to ``list[float]``.
+
+    The ``vector`` column (no client-side codec) comes back as the text
+    ``[1,2,3]`` — JSON-parseable. Legacy/JSONB rows (pre-migration, or other
+    paths) arrive as a Python list. Handle both.
+    """
+    if isinstance(value, str):
+        value = json.loads(value)
+    return [float(x) for x in value]
+
+
 def _row_to_kb_chunk(row: asyncpg.Record) -> KbChunk:
     row_dict = dict(row)
     return KbChunk(
@@ -1394,7 +1528,7 @@ def _row_to_kb_chunk(row: asyncpg.Record) -> KbChunk:
         agent=row_dict["agent"],
         source=row_dict["source"],
         text=row_dict["text"],
-        embedding=list(row_dict["embedding"]),
+        embedding=_parse_embedding(row_dict["embedding"]),
         embedding_model=row_dict["embedding_model"],
         content_hash=row_dict["content_hash"],
         metadata=row_dict.get("metadata"),
