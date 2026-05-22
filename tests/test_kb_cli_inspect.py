@@ -408,9 +408,7 @@ def test_format_age_days_ago() -> None:
 
 
 @pytest.mark.unit
-def test_dry_run_shows_file_type_breakdown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dry_run_shows_file_type_breakdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``mdk kb ingest --dry-run`` shows file-type breakdown (e.g. PDF · MD)."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 

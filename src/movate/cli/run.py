@@ -326,10 +326,7 @@ def _run_hint(run_short: str, metrics: Any, output_format: Run) -> str:
     JSON / pipe mode: minimal hint (metadata already in the JSON body).
     """
     if output_format != Run.TEXT:
-        return (
-            f"[dim]→ run [bold]{run_short}[/bold] · "
-            f"[cyan]mdk explain {run_short}[/cyan][/dim]"
-        )
+        return f"[dim]→ run [bold]{run_short}[/bold] · [cyan]mdk explain {run_short}[/cyan][/dim]"
     parts: list[str] = [f"[bold]{run_short}[/bold]"]
     if metrics is not None:
         latency = getattr(metrics, "latency_ms", 0) or 0

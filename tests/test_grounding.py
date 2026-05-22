@@ -694,9 +694,7 @@ class TestMaxValidCitationIndexFromRecords:
         assert max_valid_citation_index_from_records(records) == 5
 
     def test_kb_output_missing_chunks_found(self) -> None:
-        rec = SkillCallRecord(
-            step=1, skill="kb-vector-lookup", input={}, output={"chunks": []}
-        )
+        rec = SkillCallRecord(step=1, skill="kb-vector-lookup", input={}, output={"chunks": []})
         assert max_valid_citation_index_from_records([rec]) == 0
 
     def test_kb_output_is_none(self) -> None:
@@ -705,7 +703,9 @@ class TestMaxValidCitationIndexFromRecords:
 
     def test_chunks_found_non_int_ignored(self) -> None:
         rec = SkillCallRecord(
-            step=1, skill="kb-vector-lookup", input={},
+            step=1,
+            skill="kb-vector-lookup",
+            input={},
             output={"chunks_found": "five"},
         )
         assert max_valid_citation_index_from_records([rec]) == 0
@@ -878,7 +878,9 @@ class TestOcrCitedIndicesFromRecords:
 
     def test_failed_kb_call_excluded(self) -> None:
         rec = SkillCallRecord(
-            step=1, skill="kb-vector-lookup", input={},
+            step=1,
+            skill="kb-vector-lookup",
+            input={},
             output={"chunks": [_chunk(ocr=True)], "chunks_found": 1},
             error="timeout",
         )
@@ -886,7 +888,9 @@ class TestOcrCitedIndicesFromRecords:
 
     def test_non_kb_skill_ignored(self) -> None:
         rec = SkillCallRecord(
-            step=1, skill="calculator", input={},
+            step=1,
+            skill="calculator",
+            input={},
             output={"chunks": [_chunk(ocr=True)]},
         )
         assert ocr_cited_indices_from_records([rec], [1]) == []

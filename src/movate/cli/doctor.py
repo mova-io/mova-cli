@@ -48,6 +48,7 @@ def _ocr_install_hint(extra: str) -> str:
         pass
     return f"uv add 'movate-cli[{extra}]'"
 
+
 console = Console()
 
 _REQUIRED_DEPS = ("typer", "rich", "pydantic", "yaml", "jinja2", "litellm", "aiosqlite")
@@ -129,7 +130,7 @@ _DEP_LICENSES: dict[str, str] = {
     "python-docx": "MIT",
     "beautifulsoup4": "MIT",
     # OCR deps ([ocr] extra — Pillow + pdf2image + pytesseract)
-    "pillow": "HPND",          # Historical Permission Notice and Disclaimer (permissive)
+    "pillow": "HPND",  # Historical Permission Notice and Disclaimer (permissive)
     "pdf2image": "MIT",
     "pytesseract": "Apache-2.0",
     "tesseract": "Apache-2.0",  # system binary

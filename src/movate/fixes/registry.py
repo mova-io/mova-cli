@@ -261,6 +261,7 @@ def _apply_agents_dir(root: Path, dry_run: bool) -> FixResult:
 # OCR optional-package fix helpers
 # ---------------------------------------------------------------------------
 
+
 def _uv_pip_install(packages: list[str], fix_id: str) -> FixResult:
     """Install ``packages`` into the current Python interpreter via uv pip.
 
@@ -280,9 +281,7 @@ def _uv_pip_install(packages: list[str], fix_id: str) -> FixResult:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            (result.stderr or result.stdout or "uv pip install failed").strip()
-        )
+        raise RuntimeError((result.stderr or result.stdout or "uv pip install failed").strip())
     return FixResult(
         fix_id=fix_id,
         status=FixStatus.APPLIED,

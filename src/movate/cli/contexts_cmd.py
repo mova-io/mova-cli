@@ -99,11 +99,7 @@ def _collect_project_contexts(project: Path) -> list[tuple[str, Path]]:
     cdir = _contexts_dir(project)
     if not cdir.is_dir():
         return []
-    return sorted(
-        (p.stem, p)
-        for p in cdir.iterdir()
-        if p.is_file() and p.suffix in _CONTEXT_EXTS
-    )
+    return sorted((p.stem, p) for p in cdir.iterdir() if p.is_file() and p.suffix in _CONTEXT_EXTS)
 
 
 def _collect_agent_local_contexts(agent_dir: Path) -> list[Path]:
@@ -111,9 +107,7 @@ def _collect_agent_local_contexts(agent_dir: Path) -> list[Path]:
     cdir = agent_dir / _AGENT_CONTEXTS_SUBDIR
     if not cdir.is_dir():
         return []
-    return sorted(
-        p for p in cdir.iterdir() if p.is_file() and p.suffix in _CONTEXT_EXTS
-    )
+    return sorted(p for p in cdir.iterdir() if p.is_file() and p.suffix in _CONTEXT_EXTS)
 
 
 def _load_agent_context_refs(agent_dir: Path) -> list[str]:
@@ -373,12 +367,10 @@ def _render_all_agent_local(
 def _warn_no_contexts(root: Path, contexts_dir: Path) -> None:
     """Print a hint when no context files exist in the project."""
     console.print(
-        f"[yellow]⚠[/yellow] no context files found under [bold]{root}[/bold]. "
-        "\nCreate one with:"
+        f"[yellow]⚠[/yellow] no context files found under [bold]{root}[/bold]. \nCreate one with:"
     )
     console.print(
-        f"  [dim]mkdir -p {contexts_dir} && "
-        f'echo "# My policy" > {contexts_dir}/policy.md[/dim]'
+        f'  [dim]mkdir -p {contexts_dir} && echo "# My policy" > {contexts_dir}/policy.md[/dim]'
     )
     console.print("Then reference it in [bold]agent.yaml[/bold]:")
     console.print("  [dim]contexts:\\n  - policy[/dim]")
@@ -453,9 +445,7 @@ def list_contexts(
     agent_dirs = _resolve_agent_dirs(agents_dir, agent)
 
     if agent is not None and not agent_dirs:
-        err_console.print(
-            f"[red]✗[/red] no agent [bold]{agent}[/bold] found under {agents_dir}"
-        )
+        err_console.print(f"[red]✗[/red] no agent [bold]{agent}[/bold] found under {agents_dir}")
         raise typer.Exit(code=2)
 
     project_contexts = _collect_project_contexts(project)
@@ -549,8 +539,7 @@ def show_context(
     console.print(body)
     console.print(Rule(style="dim"))
     console.print(
-        f"[dim]{len(body.splitlines())} lines  "
-        f"{_fmt_size(len(body.encode('utf-8')))}[/dim]"
+        f"[dim]{len(body.splitlines())} lines  {_fmt_size(len(body.encode('utf-8')))}[/dim]"
     )
 
 
@@ -630,10 +619,7 @@ def create_context(
         # Validate that the agent directory exists.
         agent_dir = _agents_dir(project) / agent
         if not agent_dir.is_dir():
-            err_console.print(
-                f"[red]✗[/red] agent [bold]{agent}[/bold] not found: "
-                f"{agent_dir}"
-            )
+            err_console.print(f"[red]✗[/red] agent [bold]{agent}[/bold] not found: {agent_dir}")
             raise typer.Exit(code=2)
         target_dir = agent_dir / _AGENT_CONTEXTS_SUBDIR
     else:
@@ -668,8 +654,7 @@ def create_context(
             added = attach_context_to_agent(agent_dir / "agent.yaml", name)
         except (OSError, yaml.YAMLError, ValueError) as exc:
             err_console.print(
-                f"[yellow]⚠[/yellow] created the file but couldn't update "
-                f"agent.yaml: {exc}"
+                f"[yellow]⚠[/yellow] created the file but couldn't update agent.yaml: {exc}"
             )
             err_console.print(
                 f"[dim]Wire it manually with "
@@ -735,8 +720,7 @@ def attach_context(
             f"(looked in contexts/ and agents/{agent}/contexts/)."
         )
         err_console.print(
-            f"[dim]Create it first: "
-            f"[bold]mdk contexts create {name} --agent {agent}[/bold].[/dim]"
+            f"[dim]Create it first: [bold]mdk contexts create {name} --agent {agent}[/bold].[/dim]"
         )
         raise typer.Exit(code=2)
     try:

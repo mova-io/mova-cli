@@ -71,9 +71,7 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_generate_inputs_only_returns_inputs_without_entries(project: Path) -> None:
     """Phase 1 returns a list of input dicts, not full {input, expected} entries."""
     bundle = load_agent(project / "agents" / "demo")
-    inputs = asyncio.run(
-        _generate_inputs_only(bundle, num=3, sample_input=None, mock=True)
-    )
+    inputs = asyncio.run(_generate_inputs_only(bundle, num=3, sample_input=None, mock=True))
     assert len(inputs) == 3
     for inp in inputs:
         assert isinstance(inp, dict)
@@ -91,9 +89,7 @@ def test_generate_inputs_only_on_progress_callback(project: Path) -> None:
     def _cb(cur: int, tot: int) -> None:
         calls.append((cur, tot))
 
-    asyncio.run(
-        _generate_inputs_only(bundle, num=4, sample_input=None, mock=True, on_progress=_cb)
-    )
+    asyncio.run(_generate_inputs_only(bundle, num=4, sample_input=None, mock=True, on_progress=_cb))
     assert len(calls) == 4
     # Progress should be monotonically increasing
     for i, (cur, _tot) in enumerate(calls):
@@ -109,12 +105,8 @@ def test_generate_inputs_only_on_progress_callback(project: Path) -> None:
 def test_execute_inputs_wraps_inputs_into_entries(project: Path) -> None:
     """Phase 2 augments each input with expected + generated flag."""
     bundle = load_agent(project / "agents" / "demo")
-    inputs = asyncio.run(
-        _generate_inputs_only(bundle, num=2, sample_input=None, mock=True)
-    )
-    entries = asyncio.run(
-        _execute_inputs(bundle, inputs, mock=True, with_dimensions=False)
-    )
+    inputs = asyncio.run(_generate_inputs_only(bundle, num=2, sample_input=None, mock=True))
+    entries = asyncio.run(_execute_inputs(bundle, inputs, mock=True, with_dimensions=False))
     assert len(entries) == 2
     for entry in entries:
         assert "input" in entry
@@ -126,17 +118,13 @@ def test_execute_inputs_wraps_inputs_into_entries(project: Path) -> None:
 def test_execute_inputs_on_progress_callback(project: Path) -> None:
     """on_progress fires once per agent call in Phase 2."""
     bundle = load_agent(project / "agents" / "demo")
-    inputs = asyncio.run(
-        _generate_inputs_only(bundle, num=3, sample_input=None, mock=True)
-    )
+    inputs = asyncio.run(_generate_inputs_only(bundle, num=3, sample_input=None, mock=True))
     calls: list[tuple[int, int]] = []
 
     def _cb(cur: int, tot: int) -> None:
         calls.append((cur, tot))
 
-    asyncio.run(
-        _execute_inputs(bundle, inputs, mock=True, with_dimensions=False, on_progress=_cb)
-    )
+    asyncio.run(_execute_inputs(bundle, inputs, mock=True, with_dimensions=False, on_progress=_cb))
     assert len(calls) == 3
     assert calls[-1] == (3, 3)
 

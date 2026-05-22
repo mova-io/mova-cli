@@ -80,7 +80,9 @@ def bench(
         False, "--mock", help="Use the deterministic MockProvider (no API keys)."
     ),
     output_format: Report = typer.Option(
-        Report.TABLE, "--output", "-o",
+        Report.TABLE,
+        "--output",
+        "-o",
         case_sensitive=False,
         help="Output format: table (default) | json | csv.",
     ),

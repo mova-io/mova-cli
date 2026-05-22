@@ -52,9 +52,7 @@ def _is_alive(entry: MemoryEntry) -> bool:
     if entry.ttl_seconds == 0:
         return True
     try:
-        created = datetime.fromisoformat(entry.created_at.removesuffix("Z")).replace(
-            tzinfo=UTC
-        )
+        created = datetime.fromisoformat(entry.created_at.removesuffix("Z")).replace(tzinfo=UTC)
     except (ValueError, AttributeError):
         return True  # malformed timestamp — don't silently evict
     return created + timedelta(seconds=entry.ttl_seconds) > datetime.now(UTC)
@@ -314,8 +312,7 @@ class SqliteStore:
         try:
             async with conn.execute(
                 "SELECT agent, key, value_json, created_at, ttl_seconds "
-                "FROM memory_entries WHERE agent = ? AND key = ? "
-                + self._TTL_ALIVE_CLAUSE,
+                "FROM memory_entries WHERE agent = ? AND key = ? " + self._TTL_ALIVE_CLAUSE,
                 (agent, key),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -478,8 +475,7 @@ class PostgresStore:
             await self._ensure_schema(conn)
             row = await conn.fetchrow(
                 "SELECT agent, key, value_json, created_at, ttl_seconds "
-                "FROM agent_memory WHERE agent = $1 AND key = $2 "
-                + _PG_TTL_ALIVE_CLAUSE,
+                "FROM agent_memory WHERE agent = $1 AND key = $2 " + _PG_TTL_ALIVE_CLAUSE,
                 agent,
                 key,
             )
@@ -600,9 +596,7 @@ def build_memory_store() -> MemoryStore:
     if backend == "postgres":
         dsn = os.environ.get("MOVATE_PG_URL", "")
         if not dsn:
-            raise RuntimeError(
-                "MOVATE_PG_URL must be set to use MOVATE_MEMORY_BACKEND=postgres"
-            )
+            raise RuntimeError("MOVATE_PG_URL must be set to use MOVATE_MEMORY_BACKEND=postgres")
         return PostgresStore(dsn=dsn)
     # Default = in-memory + JSON-file persistence so CLI invocations
     # see each other's writes. Honors MOVATE_MEMORY_FILE for tests +

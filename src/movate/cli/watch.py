@@ -222,9 +222,7 @@ def dispatch_once(agent_dir: Path, *, strict: bool) -> int:
     return 0
 
 
-def dispatch_run_once(
-    agent_dir: Path, test_input: str, *, mock: bool
-) -> tuple[int, str | None]:
+def dispatch_run_once(agent_dir: Path, test_input: str, *, mock: bool) -> tuple[int, str | None]:
     """Re-run the agent against ``test_input``, print its output, and
     return ``(exit_code, output_text)``.
 

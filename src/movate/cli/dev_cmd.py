@@ -470,9 +470,7 @@ def _test_deployed_action(
         f"[dim]running {agent_dir.name} on target '{target}' "
         f"— compare against the local output above[/dim]"
     )
-    _run_subcommand(
-        [mdk_bin_name(), "run", str(agent_dir), "--target", target, "-i", test_input]
-    )
+    _run_subcommand([mdk_bin_name(), "run", str(agent_dir), "--target", target, "-i", test_input])
     return target
 
 

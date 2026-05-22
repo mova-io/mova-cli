@@ -711,9 +711,7 @@ async def test_v1_list_agents_401_without_auth(storage: InMemoryStorage) -> None
 
 
 @pytest.mark.unit
-async def test_v1_get_agent_detail_happy_path(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_get_agent_detail_happy_path(storage: InMemoryStorage, tmp_path: Path) -> None:
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
     scaffold_agent(agents_path / "detail-bot", name="detail-bot")
@@ -751,9 +749,7 @@ async def test_v1_get_agent_detail_401_no_auth(storage: InMemoryStorage) -> None
 
 
 @pytest.mark.unit
-async def test_v1_agent_runs_queues_job(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_agent_runs_queues_job(storage: InMemoryStorage, tmp_path: Path) -> None:
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
     scaffold_agent(agents_path / "run-bot", name="run-bot")
@@ -784,9 +780,7 @@ async def test_v1_agent_runs_404_unknown_agent(storage: InMemoryStorage) -> None
 
 
 @pytest.mark.unit
-async def test_v1_agent_runs_inline_mock(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_agent_runs_inline_mock(storage: InMemoryStorage, tmp_path: Path) -> None:
     """?wait=true + mock=true executes synchronously and returns RunView (200)."""
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
@@ -818,9 +812,7 @@ async def test_v1_agent_runs_401_without_auth(storage: InMemoryStorage) -> None:
 
 
 @pytest.mark.unit
-async def test_v1_delete_agent_happy_path(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_delete_agent_happy_path(storage: InMemoryStorage, tmp_path: Path) -> None:
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
     scaffold_agent(agents_path / "bye-bot", name="bye-bot")
@@ -888,9 +880,7 @@ async def test_v1_create_agent_503_without_agents_path(storage: InMemoryStorage)
 
 
 @pytest.mark.unit
-async def test_v1_create_agent_400_no_files(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_create_agent_400_no_files(storage: InMemoryStorage, tmp_path: Path) -> None:
     """Posting neither bundle nor individual files → 400."""
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
@@ -900,9 +890,7 @@ async def test_v1_create_agent_400_no_files(
 
 
 @pytest.mark.unit
-async def test_v1_create_agent_422_invalid_bundle(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_create_agent_422_invalid_bundle(storage: InMemoryStorage, tmp_path: Path) -> None:
     """Bundle with a bad agent.yaml (invalid YAML) → 422."""
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
@@ -993,9 +981,7 @@ async def test_v1_list_jobs_empty(storage: InMemoryStorage) -> None:
 
 
 @pytest.mark.unit
-async def test_v1_list_jobs_after_run(
-    storage: InMemoryStorage, tmp_path: Path
-) -> None:
+async def test_v1_list_jobs_after_run(storage: InMemoryStorage, tmp_path: Path) -> None:
     agents_path = tmp_path / "agents"
     agents_path.mkdir()
     scaffold_agent(agents_path / "list-bot", name="list-bot")
