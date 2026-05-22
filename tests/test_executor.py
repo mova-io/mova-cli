@@ -23,6 +23,7 @@ from movate.core.models import (
     RunRequest,
     TokenUsage,
 )
+from movate.memory import InMemoryStore
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -31,7 +32,6 @@ from movate.providers.base import (
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import PricingTable, load_pricing
 from movate.providers.registry import ProviderRegistry
-from movate.memory import InMemoryStore
 from movate.testing import InMemoryStorage, NullTracer, scaffold_agent
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ async def test_executor_dispatches_via_registry_when_runtime_registered(
     """An agent declaring ``runtime: native_anthropic`` should be
     dispatched to the registered provider for that runtime — proves
     the registry seam works end-to-end when an adapter is wired."""
-    import yaml  # noqa: PLC0415
+    import yaml
 
     bundle_dir = _scaffold(tmp_path / "anthropic-demo")
     # Promote the agent to runtime: native_anthropic.
@@ -269,7 +269,7 @@ async def test_executor_uses_pricing_key_translation_for_native_runtimes(
     ``runtime: native_anthropic`` agent crashed on the first run with
     ``KeyError: 'claude-haiku-4-5-20251001'`` because pricing.yaml uses
     the ``anthropic/`` prefix."""
-    import yaml  # noqa: PLC0415
+    import yaml
 
     bundle_dir = _scaffold(tmp_path / "native-cost-demo")
     # Bare-id native_anthropic agent.
@@ -314,7 +314,7 @@ async def test_executor_records_zero_cost_when_pricing_key_is_none(
     """LangChain adapter returns ``pricing_key=None`` because the model
     is hidden inside the Runnable. The executor should record cost=0
     rather than crash with KeyError."""
-    import yaml  # noqa: PLC0415
+    import yaml
 
     bundle_dir = _scaffold(tmp_path / "langchain-demo")
     yaml_path = bundle_dir / "agent.yaml"
@@ -348,7 +348,7 @@ async def test_executor_rejects_unregistered_runtime_at_execute_time(
     langchain), the executor surfaces a schema_error — same exit shape
     as a bad input schema. Retries don't help here, so failing fast is
     the right call."""
-    import yaml  # noqa: PLC0415
+    import yaml
 
     bundle_dir = _scaffold(tmp_path / "unwired")
     yaml_path = bundle_dir / "agent.yaml"
@@ -416,9 +416,9 @@ async def test_executor_enforces_runtime_policy_at_execute_time(
     time with a policy_violation error — even if validate was skipped.
     Defense-in-depth: a worker that loaded an agent over HTTP can't
     bypass the project's 'A by default' stance."""
-    import yaml  # noqa: PLC0415
+    import yaml
 
-    from movate.core.config import RuntimePolicy  # noqa: PLC0415
+    from movate.core.config import RuntimePolicy
 
     bundle_dir = _scaffold(tmp_path / "demo")
     yaml_path = bundle_dir / "agent.yaml"
@@ -459,11 +459,11 @@ async def test_executor_prepends_history_to_provider_messages(
     prompt comes after history as the final user message.
 
     This is the seam ``movate chat`` uses for conversation memory."""
-    from movate.providers.base import (  # noqa: PLC0415
+    from movate.providers.base import (
         BaseLLMProvider,
         CompletionResponse,
     )
-    from movate.providers.base import Message as ProviderMessage  # noqa: PLC0415
+    from movate.providers.base import Message as ProviderMessage
 
     captured_messages: list[ProviderMessage] = []
 
@@ -525,7 +525,7 @@ async def test_executor_runtime_policy_permissive_by_default(
     """Without an explicit ``runtime_policy=``, the executor lets every
     registered runtime through — matches the v0.5 baseline behavior so
     existing tests / code paths aren't affected."""
-    import yaml  # noqa: PLC0415
+    import yaml
 
     bundle_dir = _scaffold(tmp_path / "demo")
     yaml_path = bundle_dir / "agent.yaml"

@@ -624,10 +624,7 @@ class Executor:
             self._tracer.log_generation(
                 span,
                 model=chosen_provider,
-                input_messages=[
-                    {"role": m.role, "content": m.content or ""}
-                    for m in conversation
-                ],
+                input_messages=[{"role": m.role, "content": m.content or ""} for m in conversation],
                 output_text=completion.text or "",
                 input_tokens=completion.tokens.input,
                 output_tokens=completion.tokens.output,

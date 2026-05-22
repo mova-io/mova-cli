@@ -578,7 +578,8 @@ async def _generate_question_for_chunks(
     system = (
         "You write evaluation questions for a retrieval-augmented QA agent. "
         "Given numbered context passages from a knowledge base, produce ONE "
-        "realistic user question answerable using ONLY those passages." + mode_hint
+        "realistic user question answerable using ONLY those passages."
+        + mode_hint
         + ' Reply with a single JSON object: {"question": "<the question>"}. '
         "No markdown."
     )
@@ -1544,11 +1545,7 @@ def _print_inputs_preview(
     title = (
         f"[bold]Phase 1 complete[/bold] — {total} input(s) generated"
         f" of {num_requested} requested"
-        + (
-            f" [dim](showing first {_INPUTS_PREVIEW_MAX})[/dim]"
-            if truncated
-            else ""
-        )
+        + (f" [dim](showing first {_INPUTS_PREVIEW_MAX})[/dim]" if truncated else "")
     )
 
     table = Table(
@@ -1566,7 +1563,7 @@ def _print_inputs_preview(
 
     for i, inp in enumerate(shown, start=1):
         lines = []
-        for k, v in (inp.items() if isinstance(inp, dict) else {}.items()):
+        for k, v in inp.items() if isinstance(inp, dict) else {}.items():
             vstr = str(v)
             vstr = vstr[:_PREVIEW_FIELD_MAX] + "…" if len(vstr) > _PREVIEW_FIELD_MAX else vstr
             lines.append(f"[dim]{k}:[/dim] {vstr}")
@@ -1912,8 +1909,7 @@ def eval_gen(  # noqa: PLR0912 — orchestrator; wizard + validation + dispatch 
 
     # ── Phase 2: run agent to capture expected outputs ────────────────────
     console.print(
-        f"[dim]Phase 2 — running [bold]{bundle.spec.name}[/bold] "
-        f"on {len(inputs)} input(s)…[/dim]"
+        f"[dim]Phase 2 — running [bold]{bundle.spec.name}[/bold] on {len(inputs)} input(s)…[/dim]"
     )
     with Progress(
         TextColumn("[progress.description]{task.description}"),

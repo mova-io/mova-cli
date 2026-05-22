@@ -603,10 +603,7 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     console.print(
         Panel(
             "\n".join(_detail_lines),
-            title=(
-                f"[green]✓[/green] {spec.name} "
-                f"[dim]v{spec.version}[/dim] [dim](agent)[/dim]"
-            ),
+            title=(f"[green]✓[/green] {spec.name} [dim]v{spec.version}[/dim] [dim](agent)[/dim]"),
             title_align="left",
             border_style="green",
         )
@@ -807,9 +804,7 @@ def _check_vector_kb_empty(bundle: AgentBundle, con: Console) -> None:
         s = build_storage()
         await s.init()
         try:
-            chunks = await s.list_kb_chunks(
-                agent=bundle.spec.name, tenant_id="local", limit=1
-            )
+            chunks = await s.list_kb_chunks(agent=bundle.spec.name, tenant_id="local", limit=1)
             return len(chunks) > 0
         finally:
             await s.close()
@@ -828,9 +823,7 @@ def _check_vector_kb_empty(bundle: AgentBundle, con: Console) -> None:
             f"    hint: run [bold]mdk kb ingest {bundle.spec.name} "
             f"./agents/{bundle.spec.name}/kb/[/bold]"
         )
-        con.print(
-            "          or   [bold]mdk kb ingest-all[/bold] to scan the whole project."
-        )
+        con.print("          or   [bold]mdk kb ingest-all[/bold] to scan the whole project.")
 
 
 # Names of input guardrails the executor currently recognises. Used by

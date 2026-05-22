@@ -630,9 +630,7 @@ def simulate(  # noqa: PLR0912
     if scenarios_file:
         try:
             _bar_total = sum(
-                1
-                for ln in Path(scenarios_file).read_text().splitlines()
-                if ln.strip()
+                1 for ln in Path(scenarios_file).read_text().splitlines() if ln.strip()
             )
         except OSError:
             _bar_total = num  # fallback

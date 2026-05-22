@@ -36,8 +36,10 @@ __all__ = ["AuthContext", "build_app"]
 def __getattr__(name: str) -> object:
     if name == "build_app":
         from movate.runtime.app import build_app  # noqa: PLC0415
+
         return build_app
     if name == "AuthContext":
         from movate.runtime.middleware import AuthContext  # noqa: PLC0415
+
         return AuthContext
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

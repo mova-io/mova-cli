@@ -27,10 +27,10 @@ from movate.providers.anthropic import (
     AnthropicProvider,
     _stream_chunk_from_event,
     _to_completion_response,
+    _tokens_from_usage,
     _translate_exception,
     _translate_messages,
     _translate_params,
-    _tokens_from_usage,
 )
 from movate.providers.base import CompletionRequest, Message
 
@@ -805,9 +805,7 @@ def test_translate_messages_multiple_system_parts_joined() -> None:
 @pytest.mark.unit
 def test_translate_messages_no_system_returns_empty_string() -> None:
     """When there is no system message the system string is empty."""
-    system_text, messages = _translate_messages(
-        [Message(role="user", content="hello")]
-    )
+    system_text, messages = _translate_messages([Message(role="user", content="hello")])
     assert system_text == ""
     assert messages == [{"role": "user", "content": "hello"}]
 
@@ -1020,9 +1018,7 @@ def test_to_completion_response_usage_cache_tokens_mapped() -> None:
 
     resp = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="ok")],
-        usage=SimpleNamespace(
-            input_tokens=100, output_tokens=20, cache_read_input_tokens=75
-        ),
+        usage=SimpleNamespace(input_tokens=100, output_tokens=20, cache_read_input_tokens=75),
         model="claude-sonnet",
         stop_reason="end_turn",
     )

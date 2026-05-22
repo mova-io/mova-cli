@@ -272,9 +272,7 @@ def test_eval_variant_comparison(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("movate.cli.eval._run_eval", _fake_run_eval)
     monkeypatch.setattr("movate.cli.eval._run_variant_comparison", _fake_run_variant)
     # Suppress the LLM-provider preflight check.
-    monkeypatch.setattr(
-        "movate.cli.eval._require_llm_provider_key_or_offer_setup", lambda: None
-    )
+    monkeypatch.setattr("movate.cli.eval._require_llm_provider_key_or_offer_setup", lambda: None)
 
     result = runner.invoke(
         app,

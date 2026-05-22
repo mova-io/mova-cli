@@ -16,14 +16,12 @@ Coverage:
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from movate.testing import InMemoryStorage
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -332,12 +330,12 @@ async def test_file_size_guard_uses_module_constant(tmp_path: Path) -> None:
 @pytest.mark.unit
 async def test_file_size_guard_default_is_50mb() -> None:
     """The default ``_MAX_FILE_MB`` constant is 50 (when env var is absent)."""
-    import movate.kb.ingest as ingest_mod  # noqa: PLC0415
-
     # We can't reload the module cleanly in a test, but we CAN assert the
     # default value that was baked in at import time (env var absent in CI).
     # If MOVATE_MAX_FILE_MB is unset, the value must be 50.
     import os  # noqa: PLC0415
+
+    import movate.kb.ingest as ingest_mod  # noqa: PLC0415
 
     if "MOVATE_MAX_FILE_MB" not in os.environ:
         assert ingest_mod._MAX_FILE_MB == 50.0, (

@@ -25,7 +25,6 @@ import pytest
 import movate.kb.lexical as lexical_mod
 from movate.core.models import KbChunk, KbChunkWithScore
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -64,27 +63,21 @@ def _make_scored(chunk: KbChunk, score: float) -> KbChunkWithScore:
 def test_bm25_k1_default_is_1_5() -> None:
     """_BM25_K1 defaults to 1.5 when MOVATE_BM25_K1 is not set."""
     if "MOVATE_BM25_K1" not in os.environ:
-        assert lexical_mod._BM25_K1 == 1.5, (
-            f"expected _BM25_K1=1.5, got {lexical_mod._BM25_K1}"
-        )
+        assert lexical_mod._BM25_K1 == 1.5, f"expected _BM25_K1=1.5, got {lexical_mod._BM25_K1}"
 
 
 @pytest.mark.unit
 def test_bm25_b_default_is_0_75() -> None:
     """_BM25_B defaults to 0.75 when MOVATE_BM25_B is not set."""
     if "MOVATE_BM25_B" not in os.environ:
-        assert lexical_mod._BM25_B == 0.75, (
-            f"expected _BM25_B=0.75, got {lexical_mod._BM25_B}"
-        )
+        assert lexical_mod._BM25_B == 0.75, f"expected _BM25_B=0.75, got {lexical_mod._BM25_B}"
 
 
 @pytest.mark.unit
 def test_rrf_k_default_is_60() -> None:
     """RRF_K defaults to 60 when MOVATE_RRF_K is not set."""
     if "MOVATE_RRF_K" not in os.environ:
-        assert lexical_mod.RRF_K == 60, (
-            f"expected RRF_K=60, got {lexical_mod.RRF_K}"
-        )
+        assert lexical_mod.RRF_K == 60, f"expected RRF_K=60, got {lexical_mod.RRF_K}"
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +164,7 @@ def test_rrf_fuse_uses_rrf_k_constant() -> None:
     scores_k1 = [r.score for r in result_k1]
     # The two configurations should not produce identical scores.
     # (They might produce the same ordering, but the magnitudes differ.)
-    assert scores_k60 != scores_k1, (
-        "RRF scores should differ between k=60 and k=1"
-    )
+    assert scores_k60 != scores_k1, "RRF scores should differ between k=60 and k=1"
 
 
 @pytest.mark.unit

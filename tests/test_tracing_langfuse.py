@@ -109,6 +109,7 @@ def test_build_tracer_langfuse_falls_back_when_package_missing(
     to SilentTracer with a one-time stderr warning. Never let tracing break
     a run, and never flood the terminal with JSON span lines."""
     import movate.tracing as _t
+
     _t._warned.discard("langfuse")  # reset per-process guard for test isolation
     monkeypatch.setenv("MOVATE_TRACER", "langfuse")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-set")
@@ -128,6 +129,7 @@ def test_build_tracer_langfuse_falls_back_without_keys(
 ) -> None:
     """MOVATE_TRACER=langfuse explicitly but keys missing → SilentTracer fallback."""
     import movate.tracing as _t
+
     _t._warned.discard("langfuse")  # reset per-process guard for test isolation
     monkeypatch.setenv("MOVATE_TRACER", "langfuse")
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)

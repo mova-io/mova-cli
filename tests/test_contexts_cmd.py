@@ -58,11 +58,7 @@ def _write_agent(
     ctx_block = ""
     if contexts:
         ctx_block = "  contexts:\n" + "".join(f"    - {c}\n" for c in contexts)
-    yaml_body = (
-        "spec:\n"
-        f"  name: {agent_name}\n"
-        f"{ctx_block}"
-    )
+    yaml_body = f"spec:\n  name: {agent_name}\n{ctx_block}"
     (agent_dir / "agent.yaml").write_text(yaml_body, encoding="utf-8")
     return agent_dir
 

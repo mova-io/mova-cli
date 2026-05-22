@@ -1483,9 +1483,7 @@ class EvalEngine:
                     _tracer = getattr(self._executor, "tracer", None)
                     _score_fn = getattr(_tracer, "score_trace", None) if _tracer else None
                     if callable(_score_fn):
-                        _acc_val = (
-                            dims.accuracy.value if dims.accuracy.value is not None else 0.0
-                        )
+                        _acc_val = dims.accuracy.value if dims.accuracy.value is not None else 0.0
                         with contextlib.suppress(Exception):
                             await _score_fn(
                                 trace_id=_eval_trace_id,

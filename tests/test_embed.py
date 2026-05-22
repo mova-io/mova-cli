@@ -77,14 +77,11 @@ class TestQualifiedModelName:
 
     def test_already_qualified_openai_unchanged(self) -> None:
         assert (
-            qualified_model_name("openai/text-embedding-3-small")
-            == "openai/text-embedding-3-small"
+            qualified_model_name("openai/text-embedding-3-small") == "openai/text-embedding-3-small"
         )
 
     def test_cohere_already_qualified_unchanged(self) -> None:
-        assert (
-            qualified_model_name("cohere/embed-english-v3.0") == "cohere/embed-english-v3.0"
-        )
+        assert qualified_model_name("cohere/embed-english-v3.0") == "cohere/embed-english-v3.0"
 
     def test_voyage_already_qualified_unchanged(self) -> None:
         assert qualified_model_name("voyage/voyage-3") == "voyage/voyage-3"
@@ -344,8 +341,9 @@ async def test_embed_texts_litellm_import_error_raises() -> None:
     # Setting sys.modules["litellm"] = None causes `import litellm` to
     # raise ImportError even when the package is installed — Python's
     # import machinery treats a None entry as a "blocked" module.
-    with patch.dict("sys.modules", {"litellm": None}), pytest.raises(
-        EmbeddingError, match="litellm is not installed"
+    with (
+        patch.dict("sys.modules", {"litellm": None}),
+        pytest.raises(EmbeddingError, match="litellm is not installed"),
     ):
         await embed_texts(
             ["text"],
@@ -357,12 +355,11 @@ async def test_embed_texts_litellm_import_error_raises() -> None:
 @pytest.mark.asyncio
 async def test_embed_texts_litellm_provider_exception_raises() -> None:
     mock_litellm = MagicMock()
-    mock_litellm.aembedding = AsyncMock(
-        side_effect=RuntimeError("cohere rate limit exceeded")
-    )
+    mock_litellm.aembedding = AsyncMock(side_effect=RuntimeError("cohere rate limit exceeded"))
 
-    with patch.dict("sys.modules", {"litellm": mock_litellm}), pytest.raises(
-        EmbeddingError, match="LiteLLM embedding failed"
+    with (
+        patch.dict("sys.modules", {"litellm": mock_litellm}),
+        pytest.raises(EmbeddingError, match="LiteLLM embedding failed"),
     ):
         await embed_texts(
             ["text"],
@@ -379,8 +376,9 @@ async def test_embed_texts_litellm_bad_shape_raises() -> None:
     mock_litellm = MagicMock()
     mock_litellm.aembedding = AsyncMock(return_value=fake_resp)
 
-    with patch.dict("sys.modules", {"litellm": mock_litellm}), pytest.raises(
-        EmbeddingError, match="unexpected LiteLLM embedding response"
+    with (
+        patch.dict("sys.modules", {"litellm": mock_litellm}),
+        pytest.raises(EmbeddingError, match="unexpected LiteLLM embedding response"),
     ):
         await embed_texts(
             ["text"],
@@ -398,8 +396,9 @@ async def test_embed_texts_litellm_count_mismatch_raises() -> None:
     mock_litellm = MagicMock()
     mock_litellm.aembedding = AsyncMock(return_value=fake_resp)
 
-    with patch.dict("sys.modules", {"litellm": mock_litellm}), pytest.raises(
-        EmbeddingError, match="2 embeddings for 3 inputs"
+    with (
+        patch.dict("sys.modules", {"litellm": mock_litellm}),
+        pytest.raises(EmbeddingError, match="2 embeddings for 3 inputs"),
     ):
         await embed_texts(
             ["a", "b", "c"],

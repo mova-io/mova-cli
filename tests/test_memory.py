@@ -192,9 +192,7 @@ class TestSqliteStore:
     def test_list_empty_agent(self, sqlite_store: SqliteStore) -> None:
         assert asyncio.run(sqlite_store.list("nobody")) == []
 
-    def test_list_returns_entries_sorted_by_created_at(
-        self, sqlite_store: SqliteStore
-    ) -> None:
+    def test_list_returns_entries_sorted_by_created_at(self, sqlite_store: SqliteStore) -> None:
         asyncio.run(sqlite_store.set("a", "k1", {"n": 1}))
         asyncio.run(sqlite_store.set("a", "k2", {"n": 2}))
         asyncio.run(sqlite_store.set("a", "k3", {"n": 3}))
@@ -337,14 +335,19 @@ class TestSqliteStore:
 # ---------------------------------------------------------------------------
 
 
-def _make_pg_conn(rows: list[dict] | None = None, fetchrow_result: dict | None = None,
-                  execute_tag: str = "DELETE 0") -> MagicMock:
+def _make_pg_conn(
+    rows: list[dict] | None = None,
+    fetchrow_result: dict | None = None,
+    execute_tag: str = "DELETE 0",
+) -> MagicMock:
     """Return a mock asyncpg connection with async fetch/fetchrow/execute/close."""
     conn = MagicMock()
     # _ensure_schema calls conn.execute (CREATE TABLE / INDEX)
     conn.execute = AsyncMock(return_value=execute_tag)
     conn.fetch = AsyncMock(return_value=[_make_record(r) for r in (rows or [])])
-    conn.fetchrow = AsyncMock(return_value=_make_record(fetchrow_result) if fetchrow_result else None)
+    conn.fetchrow = AsyncMock(
+        return_value=_make_record(fetchrow_result) if fetchrow_result else None
+    )
     conn.fetchval = AsyncMock(return_value=None)
     conn.close = AsyncMock()
     return conn
@@ -427,22 +430,24 @@ class TestPostgresStore:
     def test_postgres_list_returns_entries(self) -> None:
         """list() deserialises rows into MemoryEntry objects."""
         store = PostgresStore(dsn="postgresql://test/fake")
-        conn = _make_pg_conn(rows=[
-            {
-                "agent": "a",
-                "key": "k1",
-                "value_json": '{"n": 1}',
-                "created_at": "2024-01-01T00:00:00.000Z",
-                "ttl_seconds": 0,
-            },
-            {
-                "agent": "a",
-                "key": "k2",
-                "value_json": '{"n": 2}',
-                "created_at": "2024-01-02T00:00:00.000Z",
-                "ttl_seconds": 0,
-            },
-        ])
+        conn = _make_pg_conn(
+            rows=[
+                {
+                    "agent": "a",
+                    "key": "k1",
+                    "value_json": '{"n": 1}',
+                    "created_at": "2024-01-01T00:00:00.000Z",
+                    "ttl_seconds": 0,
+                },
+                {
+                    "agent": "a",
+                    "key": "k2",
+                    "value_json": '{"n": 2}',
+                    "created_at": "2024-01-02T00:00:00.000Z",
+                    "ttl_seconds": 0,
+                },
+            ]
+        )
 
         with patch("asyncpg.connect", return_value=conn):
             entries = asyncio.run(store.list("a"))
@@ -477,9 +482,7 @@ class TestPostgresStore:
         store = PostgresStore()
         assert store._dsn == "postgresql://env-host/db"
 
-    def test_postgres_dsn_arg_takes_precedence(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_postgres_dsn_arg_takes_precedence(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Explicit dsn= arg overrides MOVATE_PG_URL env var."""
         monkeypatch.setenv("MOVATE_PG_URL", "postgresql://env-host/db")
         store = PostgresStore(dsn="postgresql://explicit/db")

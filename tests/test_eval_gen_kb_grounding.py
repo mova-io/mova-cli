@@ -102,13 +102,19 @@ def patch_runtime(monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.unit
 def test_is_rag_context_schema() -> None:
     assert g._is_rag_context_schema(_bundle(_RAG_SCHEMA)) is True
-    assert g._is_rag_context_schema(
-        _bundle({"type": "object", "properties": {"text": {"type": "string"}}})
-    ) is False
+    assert (
+        g._is_rag_context_schema(
+            _bundle({"type": "object", "properties": {"text": {"type": "string"}}})
+        )
+        is False
+    )
     # question present but context not an array → not RAG-context shape.
-    assert g._is_rag_context_schema(
-        _bundle({"type": "object", "properties": {"question": {"type": "string"}}})
-    ) is False
+    assert (
+        g._is_rag_context_schema(
+            _bundle({"type": "object", "properties": {"question": {"type": "string"}}})
+        )
+        is False
+    )
 
 
 @pytest.mark.unit
@@ -210,9 +216,7 @@ async def test_non_rag_schema_skips_grounding(
 
     monkeypatch.setattr(g, "_generate_one_input", _fake_one)
     schema = {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
-    inputs = await g._generate_inputs_only(
-        _bundle(schema), num=1, sample_input=None, mock=False
-    )
+    inputs = await g._generate_inputs_only(_bundle(schema), num=1, sample_input=None, mock=False)
 
     assert inputs == [{"text": "hi"}]  # synthesized, not grounded
 

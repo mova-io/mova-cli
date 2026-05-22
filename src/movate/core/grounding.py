@@ -290,8 +290,7 @@ def kb_call_count_from_records(
     return sum(
         1
         for sc in skill_calls
-        if getattr(sc, "skill", None) == _KB_LOOKUP_SKILL
-        and not getattr(sc, "error", None)
+        if getattr(sc, "skill", None) == _KB_LOOKUP_SKILL and not getattr(sc, "error", None)
     )
 
 

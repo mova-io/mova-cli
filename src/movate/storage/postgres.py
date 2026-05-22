@@ -1030,6 +1030,7 @@ class PostgresProvider:
         )
         chunks = [_row_to_kb_chunk(r) for r in rows]
         from movate.storage._cosine import rank_chunks_by_cosine  # noqa: PLC0415
+
         return rank_chunks_by_cosine(chunks, query_embedding, limit)
 
     async def list_kb_chunks(
@@ -1372,7 +1373,6 @@ def _row_to_kb_chunk(row: asyncpg.Record) -> KbChunk:
         ocr=bool(row_dict.get("ocr", False)),
         created_at=row_dict["created_at"],
     )
-
 
 
 def _row_to_feedback(row: asyncpg.Record) -> FeedbackRecord:

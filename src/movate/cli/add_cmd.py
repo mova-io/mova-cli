@@ -1115,9 +1115,7 @@ def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None
     # Check whether any of the added agents created a kb/ dir. If so,
     # surface the ingest-all step before the validate step so the operator
     # sees the KB hint before running validation.
-    any_kb_dir = any(
-        (project_root / "agents" / name / "kb").is_dir() for name in added_names
-    )
+    any_kb_dir = any((project_root / "agents" / name / "kb").is_dir() for name in added_names)
     batch_steps: list[NextStep] = []
     if any_kb_dir:
         batch_steps.append(
