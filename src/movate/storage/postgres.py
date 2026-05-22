@@ -22,6 +22,7 @@ in :mod:`movate.storage`.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -48,6 +49,8 @@ from movate.core.models import (
     WorkflowStatus,
 )
 from movate.storage._cosine import rank_chunks_by_cosine as _rank_chunks_by_cosine  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -361,7 +364,32 @@ class PostgresProvider:
             kwargs["password"] = env_password
         self._pool = await asyncpg.create_pool(self._dsn, **kwargs)
         async with self._pool.acquire() as conn:
+            await self._ensure_pgvector(conn)
             await conn.execute(_SCHEMA)
+
+    @staticmethod
+    async def _ensure_pgvector(conn: asyncpg.Connection) -> None:
+        """Create the pgvector extension if it isn't already present.
+
+        KB embeddings move to a ``vector(N)`` column (ADR 009); the extension
+        must exist first. On Azure Postgres Flexible Server the extension also
+        has to be allow-listed via the ``azure.extensions`` server parameter
+        (``infra/azure/modules/postgres.bicep``) before ``CREATE EXTENSION``
+        will succeed.
+
+        At this step the KB column is still JSONB, so a missing extension is
+        non-fatal: log an actionable warning and continue. The follow-up that
+        introduces the ``vector`` column makes this a hard requirement.
+        """
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        except asyncpg.PostgresError as exc:
+            logger.warning(
+                "could not create the pgvector extension (%s). KB vector search "
+                "needs it; on Azure Postgres add 'VECTOR' to the azure.extensions "
+                "server parameter (infra/azure/modules/postgres.bicep) and redeploy.",
+                exc,
+            )
 
     async def ping(self) -> None:
         """``SELECT 1`` against the pool — picks up DB-down /
