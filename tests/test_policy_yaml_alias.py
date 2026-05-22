@@ -15,6 +15,7 @@ These tests cover three states:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -57,32 +58,32 @@ def test_neither_file_returns_defaults(in_empty_dir: Path) -> None:
 
 
 def test_only_movate_yaml_loads_with_deprecation_warning(
-    in_empty_dir: Path, capsys: pytest.CaptureFixture[str]
+    in_empty_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     (in_empty_dir / "movate.yaml").write_text("policy:\n  allowed_providers: [legacy]\n")
+    caplog.set_level(logging.WARNING)
     cfg = load_project_config()
     assert cfg.policy.allowed_providers == ["legacy"]
-    captured = capsys.readouterr()
-    assert "movate.yaml is deprecated" in captured.err
-    assert "project.yaml" in captured.err
+    assert "movate.yaml is deprecated" in caplog.text
+    assert "project.yaml" in caplog.text
 
 
 def test_only_policy_yaml_loads_without_warning(
-    in_empty_dir: Path, capsys: pytest.CaptureFixture[str]
+    in_empty_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Post-PR #85 (project.yaml canonical) policy.yaml is itself legacy
     # — it still loads, but with a deprecation warning pointing at
     # project.yaml as the new canonical name.
     (in_empty_dir / "policy.yaml").write_text("policy:\n  allowed_providers: [canonical]\n")
+    caplog.set_level(logging.WARNING)
     cfg = load_project_config()
     assert cfg.policy.allowed_providers == ["canonical"]
-    captured = capsys.readouterr()
-    assert "policy.yaml is deprecated" in captured.err
-    assert "project.yaml" in captured.err
+    assert "policy.yaml is deprecated" in caplog.text
+    assert "project.yaml" in caplog.text
 
 
 def test_both_files_present_policy_yaml_wins(
-    in_empty_dir: Path, capsys: pytest.CaptureFixture[str]
+    in_empty_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Mid-rename state: an operator dropped policy.yaml in but didn't
     delete movate.yaml yet. policy.yaml wins; we warn for policy.yaml
@@ -90,13 +91,13 @@ def test_both_files_present_policy_yaml_wins(
     silent because we never read that file."""
     (in_empty_dir / "movate.yaml").write_text("policy:\n  allowed_providers: [legacy]\n")
     (in_empty_dir / "policy.yaml").write_text("policy:\n  allowed_providers: [canonical]\n")
+    caplog.set_level(logging.WARNING)
     cfg = load_project_config()
     assert cfg.policy.allowed_providers == ["canonical"]
-    captured = capsys.readouterr()
     # policy.yaml warning fires (it's the loaded file).
-    assert "policy.yaml is deprecated" in captured.err
+    assert "policy.yaml is deprecated" in caplog.text
     # movate.yaml warning does NOT fire (we never opened that file).
-    assert "movate.yaml is deprecated" not in captured.err
+    assert "movate.yaml is deprecated" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -146,15 +147,15 @@ def test_explicit_path_to_movate_yaml_does_not_trigger_deprecation(
 
 
 def test_deprecation_warning_fires_once_per_process(
-    in_empty_dir: Path, capsys: pytest.CaptureFixture[str]
+    in_empty_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Single CLI invocation may load the config multiple times (validate
     + run + deploy all call load_project_config independently). We only
     want the operator to see one deprecation line, not three."""
     (in_empty_dir / "movate.yaml").write_text("policy:\n  allowed_providers: [a]\n")
+    caplog.set_level(logging.WARNING)
     load_project_config()
     load_project_config()
     load_project_config()
-    captured = capsys.readouterr()
-    # Count occurrences of the marker phrase in stderr.
-    assert captured.err.count("movate.yaml is deprecated") == 1
+    # Count occurrences of the marker phrase across log records.
+    assert caplog.text.count("movate.yaml is deprecated") == 1

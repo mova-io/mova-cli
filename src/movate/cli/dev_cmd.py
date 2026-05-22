@@ -83,7 +83,7 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         "--mock",
         help="Use the deterministic MockProvider for runs (no API keys needed).",
     ),
-    target: str = typer.Option(
+    target: str | None = typer.Option(
         None,
         "--target",
         help="Azure deploy target (from ~/.movate/config.yaml). Used by the deploy action.",
@@ -240,7 +240,10 @@ def _resolve_test_input(input_flag: str | None, agent_dir: Path) -> str | None:
         return input_flag
     try:
         bundle = load_agent(agent_dir)
-        ds_path = (bundle.agent_dir / bundle.spec.evals.dataset).resolve()
+        dataset = bundle.spec.evals.dataset
+        if not dataset:
+            return None
+        ds_path = (bundle.agent_dir / dataset).resolve()
         if ds_path.is_file():
             text = ds_path.read_text().strip()
             if text:

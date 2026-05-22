@@ -371,7 +371,9 @@ class InMemoryStorage:
         query_embedding: list[float],
         limit: int = 5,
     ) -> list[KbChunkWithScore]:
-        from movate.storage.postgres import _rank_chunks_by_cosine  # noqa: PLC0415
+        from movate.storage.postgres import (  # type: ignore[attr-defined]  # noqa: PLC0415
+            _rank_chunks_by_cosine,
+        )
 
         chunks = [c for c in self.kb_chunks if c.agent == agent and c.tenant_id == tenant_id]
         return _rank_chunks_by_cosine(chunks, query_embedding, limit)

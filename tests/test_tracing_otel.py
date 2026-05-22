@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from movate.tracing import CompositeTracer, StdoutTracer, build_tracer
+from movate.tracing import CompositeTracer, SilentTracer, StdoutTracer, build_tracer
 from movate.tracing.base import SpanCtx
 from movate.tracing.otel import (
     OtelTracer,
@@ -344,7 +344,9 @@ def test_build_tracer_explicit_otel_falls_back_when_endpoint_missing(
     _clear_tracer_env(monkeypatch)
     monkeypatch.setenv("MOVATE_TRACER", "otel")
     tracer = build_tracer()
-    assert isinstance(tracer, StdoutTracer)
+    # Explicit otel with no usable backend falls back to SILENT (the operator
+    # asked for otel, not a flood of JSON spans) — not StdoutTracer.
+    assert isinstance(tracer, SilentTracer)
     assert "OTel unavailable" in capsys.readouterr().err
 
 

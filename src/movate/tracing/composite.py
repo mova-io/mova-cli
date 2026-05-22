@@ -150,7 +150,7 @@ class CompositeTracer(Tracer):
             if not callable(fn):
                 continue
             try:
-                result = await fn(
+                result: str | None = await fn(
                     trace_id=trace_id,
                     name=name,
                     value=value,

@@ -822,7 +822,7 @@ def ingest(
                         # Check whether this file has changed since last ingest.
                         skip = False
                         try:
-                            existing = await storage.list_kb_chunks(  # type: ignore[attr-defined]
+                            existing = await storage.list_kb_chunks(
                                 agent=agent,
                                 tenant_id=tenant_id,
                                 source=source_uri,
@@ -846,7 +846,7 @@ def ingest(
                             console.print(f"  [dim]→ skipped (unchanged): {file_path.name}[/dim]")
                             continue
                         file_summaries, file_failed = await ingest_path(
-                            storage=storage,  # type: ignore[arg-type]
+                            storage=storage,
                             path=file_path,
                             agent=agent,
                             tenant_id=tenant_id,
@@ -869,7 +869,7 @@ def ingest(
                         advance(suffix=f" [cyan]{name}[/cyan]  [{current}/{total}]")
 
                     file_summaries, file_failed = await ingest_path(
-                        storage=storage,  # type: ignore[arg-type]
+                        storage=storage,
                         path=path,
                         agent=agent,
                         tenant_id=tenant_id,
@@ -885,7 +885,7 @@ def ingest(
                             f"embedding failed: {reason}"
                         )
         finally:
-            await storage.close()  # type: ignore[attr-defined]
+            await storage.close()
 
         if not summaries:
             if total_files == 0:
@@ -1358,7 +1358,7 @@ def search(
         storage = await _build_storage()
         try:
             results = await kb_search(
-                storage=storage,
+                storage=storage,  # type: ignore[arg-type]
                 question=question,
                 agent=agent,
                 tenant_id=tenant_id,

@@ -29,6 +29,7 @@ from movate.credentials import CredentialsStore, autoload_credentials
 from movate.credentials.loader import (
     ALL_AUTOLOADED_ENV_VARS,
     NOTIFICATION_KEY_ENV_VARS,
+    OBSERVABILITY_KEY_ENV_VARS,
     PROVIDER_KEY_ENV_VARS,
 )
 
@@ -59,10 +60,14 @@ class TestAutoloadedRegistry:
         assert "MOVATE_DEPLOY_WEBHOOK" in NOTIFICATION_KEY_ENV_VARS
 
     def test_all_autoloaded_is_union(self) -> None:
-        """ALL_AUTOLOADED_ENV_VARS should be the union of the provider
-        + notification groups. Catches accidental dropping when either
-        list is edited in isolation."""
-        expected = set(PROVIDER_KEY_ENV_VARS) | set(NOTIFICATION_KEY_ENV_VARS)
+        """ALL_AUTOLOADED_ENV_VARS should be the union of the provider,
+        notification, and observability groups. Catches accidental
+        dropping when any list is edited in isolation."""
+        expected = (
+            set(PROVIDER_KEY_ENV_VARS)
+            | set(NOTIFICATION_KEY_ENV_VARS)
+            | set(OBSERVABILITY_KEY_ENV_VARS)
+        )
         assert set(ALL_AUTOLOADED_ENV_VARS) == expected
 
 

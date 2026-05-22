@@ -522,9 +522,10 @@ async def _list_agent_kb_chunks(
 ) -> list[Any]:
     """Return the agent's ingested KB chunks (empty list when none / on error)."""
     try:
-        return await rt.storage.list_kb_chunks(
+        chunks: list[Any] = await rt.storage.list_kb_chunks(
             agent=bundle.spec.name, tenant_id=tenant_id, limit=1000
         )
+        return chunks
     except Exception as exc:  # storage may not support KB, or none ingested
         log.debug("KB chunk listing failed for %s: %s", bundle.spec.name, exc)
         return []
@@ -692,7 +693,7 @@ async def _generate_inputs_only(
             # Attach provenance AFTER validation so the reserved key never
             # trips additionalProperties; _execute_inputs pops it off.
             if source_sidecar is not None:
-                generated_input[_SOURCE_SIDECAR_KEY] = source_sidecar
+                generated_input[_SOURCE_SIDECAR_KEY] = source_sidecar  # type: ignore[assignment]
             inputs.append(generated_input)
             if on_progress is not None:
                 on_progress(len(inputs), num)

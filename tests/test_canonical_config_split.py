@@ -18,6 +18,7 @@ Coverage map:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -143,7 +144,7 @@ def test_all_three_split_files_no_policy_yaml(
 def test_dedicated_file_wins_over_policy_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When the same field appears in both policy.yaml AND its
     dedicated file, the dedicated file wins and the operator gets a
@@ -155,15 +156,15 @@ def test_dedicated_file_wins_over_policy_yaml(
     )
     # Dedicated file with a different value.
     (tmp_path / "runtime.yaml").write_text("runtime:\n  allowed: [litellm]\n")
+    caplog.set_level(logging.WARNING)
     cfg = load_project_config()
     # Dedicated wins — the litellm value, not native_anthropic.
     assert cfg.runtime.allowed is not None
     assert [r.value for r in cfg.runtime.allowed] == ["litellm"]
-    # Deprecation warning fires on stderr.
-    captured = capsys.readouterr()
-    assert "runtime.yaml" in captured.err
-    assert "runtime" in captured.err
-    assert "policy.yaml" in captured.err
+    # Deprecation warning fires (logged).
+    assert "runtime.yaml" in caplog.text
+    assert "runtime" in caplog.text
+    assert "policy.yaml" in caplog.text
 
 
 def test_deprecation_warning_fires_once_per_field(
@@ -188,7 +189,7 @@ def test_deprecation_warning_fires_once_per_field(
 def test_each_moved_field_warns_independently(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Migrating `runtime:` first but not `eval:` should warn only
     on the moved field, not on the legacy-but-not-yet-moved one."""
@@ -198,11 +199,11 @@ def test_each_moved_field_warns_independently(
         "eval:\n  gate: 0.5\n"  # still in policy.yaml, no eval.yaml yet
     )
     (tmp_path / "runtime.yaml").write_text("runtime:\n  allowed: [litellm]\n")
+    caplog.set_level(logging.WARNING)
     cfg = load_project_config()
-    captured = capsys.readouterr()
     # `runtime` warned (dedicated file present); `eval` did not.
-    assert "runtime" in captured.err
-    assert "eval" not in captured.err
+    assert "runtime" in caplog.text
+    assert "eval" not in caplog.text
     # Both values landed correctly.
     assert cfg.runtime.allowed is not None
     assert cfg.eval.gate == 0.5

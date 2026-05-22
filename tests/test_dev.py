@@ -16,6 +16,7 @@ tested in test_contexts_cmd.py.)
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -97,10 +98,18 @@ def test_watched_paths_includes_agent_local_contexts(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_cli_dev_help_renders() -> None:
+def test_cli_dev_help_renders(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin a wide terminal so rich doesn't ellipsize the option name.
+    # monkeypatch.setenv patches the real os.environ (which rich reads),
+    # which is more reliable across CI than CliRunner's env= param.
+    monkeypatch.setenv("COLUMNS", "200")
     r = runner.invoke(cli_app, ["dev", "--help"])
     assert r.exit_code == 0
-    assert "--template" in r.stdout.replace("\n", "")
+    # Strip ANSI + box-drawing + whitespace so the assertion is independent
+    # of rich's terminal-width wrapping (differs local vs CI).
+    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", r.stdout)
+    cleaned = re.sub(r"[\s│╭╮╰╯─├┤┌┐└┘|]+", "", cleaned)
+    assert "--template" in cleaned
 
 
 @pytest.mark.unit

@@ -27,7 +27,6 @@ from movate.cli.deploy import (
     DeployConfigError,
     DeployPlan,
     _build_plan,
-    _git_short_sha,
     _print_plan,
     _wait_for_healthz,
 )
@@ -37,6 +36,7 @@ from movate.core.user_config import (
     UserConfig,
     save_user_config,
 )
+from movate.utils.git import git_short_sha
 
 runner = CliRunner(mix_stderr=False)
 
@@ -245,27 +245,27 @@ def test_build_plan_error_lists_all_missing_fields_at_once() -> None:
 
 
 @pytest.mark.unit
-def test_git_short_sha_returns_none_when_git_missing(monkeypatch) -> None:
-    """No ``git`` on PATH → fall through to 'unknown' tag (not a crash)."""
+def test_git_short_sha_returns_empty_when_git_missing(monkeypatch) -> None:
+    """No ``git`` on PATH → "" (graceful), not a crash."""
     import shutil  # noqa: PLC0415
 
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    assert _git_short_sha() is None
+    assert git_short_sha() == ""
 
 
 @pytest.mark.unit
-def test_git_short_sha_returns_none_when_git_fails(monkeypatch) -> None:
-    """Non-zero git exit (not a git repo) → None, not a stack trace."""
+def test_git_short_sha_returns_empty_when_git_fails(monkeypatch) -> None:
+    """Non-zero git exit (not a git repo) → "", not a stack trace."""
 
     def fail_run(cmd, *args, **kwargs):
         return subprocess.CompletedProcess(args=cmd, returncode=128, stdout="", stderr="fatal")
 
-    monkeypatch.setattr("movate.cli.deploy.subprocess.run", fail_run)
+    monkeypatch.setattr("movate.utils.git.subprocess.run", fail_run)
     # shutil.which returning a path keeps us past the existence check.
     import shutil  # noqa: PLC0415
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
-    assert _git_short_sha() is None
+    assert git_short_sha() == ""
 
 
 @pytest.mark.unit
@@ -273,11 +273,11 @@ def test_git_short_sha_strips_whitespace(monkeypatch) -> None:
     def ok_run(cmd, *args, **kwargs):
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="abc1234\n", stderr="")
 
-    monkeypatch.setattr("movate.cli.deploy.subprocess.run", ok_run)
+    monkeypatch.setattr("movate.utils.git.subprocess.run", ok_run)
     import shutil  # noqa: PLC0415
 
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
-    assert _git_short_sha() == "abc1234"
+    assert git_short_sha() == "abc1234"
 
 
 # ---------------------------------------------------------------------------
