@@ -493,8 +493,7 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
         candidates = [
             p
             for p in sorted(path.rglob("*"))
-            if p.is_file()
-            and not any(part.startswith(".") for part in p.relative_to(path).parts)
+            if p.is_file() and not any(part.startswith(".") for part in p.relative_to(path).parts)
         ]
     uploadable = [p for p in candidates if is_supported_extension(p.name)]
     if not uploadable:
@@ -508,17 +507,13 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
     endpoint = f"{base_url}/api/v1/agents/{agent}/kb"
 
     if dry_run:
-        console.print(
-            f"[bold]Would upload {len(uploadable)} file(s)[/bold] to {endpoint}:"
-        )
+        console.print(f"[bold]Would upload {len(uploadable)} file(s)[/bold] to {endpoint}:")
         for p in uploadable:
             console.print(f"  • {p.name}")
         console.print("[dim](dry-run — nothing uploaded)[/dim]")
         return
 
-    files = [
-        ("files", (p.name, p.read_bytes(), "application/octet-stream")) for p in uploadable
-    ]
+    files = [("files", (p.name, p.read_bytes(), "application/octet-stream")) for p in uploadable]
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
         with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
@@ -547,9 +542,7 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
     body = resp.json() if resp.content else {}
     results = body.get("files", []) if isinstance(body, dict) else []
     total = body.get("total_chunks_saved", 0) if isinstance(body, dict) else 0
-    console.print(
-        f"[bold]Uploaded to {target_name}[/bold] [dim]({endpoint})[/dim]"
-    )
+    console.print(f"[bold]Uploaded to {target_name}[/bold] [dim]({endpoint})[/dim]")
     ingested = skipped = 0
     for r in results:
         src = r.get("source", "?")
