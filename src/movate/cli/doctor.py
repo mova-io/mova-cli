@@ -174,7 +174,7 @@ _DEP_PURPOSE: dict[str, str] = {
 # Map each AgentRuntime to (probe-module, extras-install-hint). Used by
 # the runtime section of ``movate doctor`` to report what's wired vs.
 # what's an `uv add 'movate-cli[...]'` away.
-_RUNTIME_PROBES = (
+_RUNTIME_PROBES: tuple[tuple[str, str, str | None], ...] = (
     # litellm is always wired (it's a required dep above).
     ("litellm", "litellm", None),
     ("native_anthropic", "anthropic", "anthropic"),
@@ -389,12 +389,12 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # actually resolve to an adapter on THIS install? litellm is always
     # available; the rest depend on whether the matching extra is
     # installed (`uv add 'movate-cli[anthropic]'` etc.).
-    for runtime_name, probe_module, extra_name in _RUNTIME_PROBES:
+    for runtime_name, probe_module, runtime_extra in _RUNTIME_PROBES:
         spec = importlib.util.find_spec(probe_module)
         if spec is not None:
             status = _ok("adapter available")
-        elif extra_name is not None:
-            status = _missing(f"install with: uv add 'movate-cli[{extra_name}]'")
+        elif runtime_extra is not None:
+            status = _missing(f"install with: uv add 'movate-cli[{runtime_extra}]'")
         else:
             # Should not happen — litellm is in _REQUIRED_DEPS — but the
             # branch keeps mypy happy.

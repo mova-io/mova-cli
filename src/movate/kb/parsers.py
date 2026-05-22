@@ -756,10 +756,11 @@ def parse_image(content: bytes) -> ParseResult | None:
         return None
 
     try:
-        image = _PILImage.open(io.BytesIO(content))
         # Convert to RGB: normalises palette, RGBA, and greyscale modes
         # so both Tesseract and EasyOCR receive a consistent input format.
-        image = image.convert("RGB")
+        # open() returns an ImageFile; convert() returns the base Image —
+        # chain them so the variable's type is Image, not the subclass.
+        image = _PILImage.open(io.BytesIO(content)).convert("RGB")
     except Exception as exc:
         logger.warning("Pillow failed to open image: %s", exc)
         return None

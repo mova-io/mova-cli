@@ -51,3 +51,7 @@ class Tracer(Protocol):
         Callers (executor) always call this; only LangfuseTracer produces
         observable output from it.
         """
+        # Concrete no-op default: keeps this a non-abstract Protocol member
+        # so the simple tracers (Stdout/Silent/Otel/Null) that don't override
+        # it stay instantiable. LangfuseTracer overrides with real behavior.
+        return None
