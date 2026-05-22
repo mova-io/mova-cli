@@ -120,9 +120,28 @@ async def test_postgres_provider_passes_pgpassword_as_kwarg_when_dsn_password_em
         # Return a stub pool whose acquire() context manager returns a
         # stub conn whose execute() coroutine is a no-op — enough to let
         # init() complete past the _SCHEMA execute.
+        class _Tx:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(self, *_a: Any) -> None:
+                return None
+
         class _Conn:
+            # init() now also runs schema migrations (ADR 009): a no-op
+            # fetch (no applied rows) lets migration 001 run as execute
+            # no-ops, fetchval(None) means "column not yet vector".
             async def execute(self, *_a: Any, **_kw: Any) -> None:
                 return None
+
+            async def fetch(self, *_a: Any, **_kw: Any) -> list[Any]:
+                return []
+
+            async def fetchval(self, *_a: Any, **_kw: Any) -> Any:
+                return None
+
+            def transaction(self) -> Any:
+                return _Tx()
 
         class _Acq:
             async def __aenter__(self) -> _Conn:
@@ -163,9 +182,28 @@ async def test_postgres_provider_omits_password_kwarg_when_pgpassword_unset(
     async def fake_create_pool(dsn: str, **kwargs: Any) -> Any:
         captured["kwargs"] = kwargs
 
+        class _Tx:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(self, *_a: Any) -> None:
+                return None
+
         class _Conn:
+            # init() now also runs schema migrations (ADR 009): a no-op
+            # fetch (no applied rows) lets migration 001 run as execute
+            # no-ops, fetchval(None) means "column not yet vector".
             async def execute(self, *_a: Any, **_kw: Any) -> None:
                 return None
+
+            async def fetch(self, *_a: Any, **_kw: Any) -> list[Any]:
+                return []
+
+            async def fetchval(self, *_a: Any, **_kw: Any) -> Any:
+                return None
+
+            def transaction(self) -> Any:
+                return _Tx()
 
         class _Acq:
             async def __aenter__(self) -> _Conn:

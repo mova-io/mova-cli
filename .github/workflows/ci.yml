@@ -24,11 +24,18 @@ jobs:
       # version (e.g. two PRs branched off the same base computing the same
       # next N — which is how 2026.5.22.19 once landed on two merges). Only
       # meaningful on PRs; skipped on push-to-main. Pure stdlib, no deps.
+      #
+      # Compare against the PR's FROZEN base commit (pull_request.base.sha),
+      # NOT live origin/main: with auto-merge enabled the PR can land on main
+      # before this step runs, so fetching live main would compare the PR
+      # against its own already-merged version and false-fail.
       - name: Version bump gate
         if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
-          python3 scripts/bump_version.py --gate-ahead-of FETCH_HEAD
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+          python3 scripts/bump_version.py --gate-ahead-of "${BASE_SHA}"
 
       # Catches pyproject.toml ↔ uv.lock drift. If you bump a dep in
       # pyproject.toml without re-running `uv lock`, the Docker build's
