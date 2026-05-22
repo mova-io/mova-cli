@@ -150,15 +150,33 @@ Without a separate ADR + Deva sign-off, **we do not introduce**:
 
 ## The CI gate
 
-`.github/workflows/ci.yml` will (in the next iteration of this work)
-include a `pip-licenses` step that:
+`.github/workflows/ci.yml` runs `scripts/check_licenses.py --strict`, which:
 
-1. Lists every transitive dep's SPDX license.
-2. Fails the CI run if any license is not in the allowlist above.
-3. Outputs a `license-report.csv` artifact for auditing.
+1. Reads each installed dep's SPDX license via `importlib.metadata`.
+2. Fails the CI run if any **shipped** dep's license is not in the
+   allowlist above.
 
-Until the gate is automated, every PR adding a new dep gets manual
-license review — call it out in the PR description.
+### Scope: shipped deps only
+
+The gate's mandate is *what reaches a customer deliverable*. It therefore
+scopes its scan to the transitive closure of the **shipped requirement
+roots** — the core `dependencies` plus the `runtime` and `langfuse`
+extras (`SHIPPED_EXTRAS` in the script).
+
+The heavy **opt-in** extras — `easyocr`, `cross-encoder`, `ocr` — are
+**out of scope**. They pull in a large ML/GPU stack (`torch`, the NVIDIA
+CUDA runtime libs under their proprietary redistributable terms, and
+`python-bidi` under LGPL) that an operator installs *deliberately and
+separately*; those licenses are the operator's informed choice for that
+opt-in path, not part of the default resale-clean deliverable. Bundling
+any of them into a default deliverable would still need the ADR + sign-off
+process below.
+
+If a dep is reachable from *both* a shipped root and an opt-in extra, it
+stays in scope (it ships, so it's policed).
+
+Run `python scripts/check_licenses.py` locally (no `--strict`) for the
+full inventory, including the out-of-scope opt-in deps.
 
 ## Process for adding a non-allowlist license
 

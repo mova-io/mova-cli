@@ -41,8 +41,10 @@ import argparse
 import json
 import re
 import sys
+import tomllib
 from collections.abc import Iterable
 from importlib import metadata
+from pathlib import Path
 
 # --- Allowlist ---------------------------------------------------------------
 # Mirror of docs/license-posture.md "approved licenses" table. Keep in sync.
@@ -57,6 +59,8 @@ ALLOWED_SPDX = frozenset(
         "BSD-3-Clause",
         "BSD",  # often unspecified variant; assume 3-clause (verify on suspicion)
         "ISC",
+        "0BSD",  # BSD Zero Clause — public-domain-equivalent, OSI-approved
+        "Zlib",  # zlib/libpng license — permissive, OSI-approved
         "PostgreSQL",
         "PSF-2.0",
         "Python Software Foundation License",
@@ -135,6 +139,14 @@ DEV_ONLY = frozenset(
 
 SELF_PACKAGES = frozenset({"movate-cli", "movate", "mdk"})
 
+# Extras that ship in customer deliverables. The gate scopes to the
+# transitive closure of the core deps PLUS these extras. The heavy opt-in
+# extras (easyocr / cross-encoder / ocr) pull in a large ML/GPU stack
+# (torch, the NVIDIA CUDA runtime libs, python-bidi, …) that an operator
+# explicitly chooses to install — those licenses are out of scope for the
+# default deliverable, so they are intentionally NOT shipped-scoped here.
+SHIPPED_EXTRAS = frozenset({"runtime", "langfuse"})
+
 # Heuristic: license metadata > this many chars almost always means the
 # package embedded its full LICENSE.txt in the metadata. Strip down to
 # just the first line to recover the SPDX id.
@@ -149,6 +161,7 @@ _ALIASES = {
     # Apache 2.0 and its many spellings
     "Apache 2.0": "Apache-2.0",
     "Apache 2": "Apache-2.0",
+    "Apache": "Apache-2.0",  # bare classifier (e.g. huggingface_hub)
     "Apache-2.0": "Apache-2.0",
     "Apache Software": "Apache-2.0",
     "Apache Software License": "Apache-2.0",
@@ -278,15 +291,101 @@ def _excluded_family(license_id: str) -> tuple[str, str] | None:
     return None
 
 
+def _canonical(name: str) -> str:
+    """PEP 503 canonical package name (lowercase; runs of -_. → single -)."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+_REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_REQ_EXTRAS_RE = re.compile(r"\[([^\]]+)\]")
+_REQ_EXTRA_MARKER_RE = re.compile(r"""extra\s*==\s*['"]([^'"]+)['"]""")
+
+
+def _parse_requirement(req: str) -> tuple[str, frozenset[str]]:
+    """``(canonical name, requested-extras)`` from a requirement string like
+    ``uvicorn[standard]>=0.29``."""
+    m = _REQ_NAME_RE.match(req)
+    name = _canonical(m.group(1)) if m else ""
+    # Extras live in the bracket BEFORE any version specifier / marker.
+    head = re.split(r"[;<>=!~ ]", req, maxsplit=1)[0]
+    em = _REQ_EXTRAS_RE.search(head)
+    extras = frozenset(_canonical(e) for e in em.group(1).split(",")) if em else frozenset()
+    return name, extras
+
+
+def _requires_extra(req: str) -> str | None:
+    """The extra that gates a ``Requires-Dist`` entry (``; extra == "x"``), if any."""
+    m = _REQ_EXTRA_MARKER_RE.search(req)
+    return _canonical(m.group(1)) if m else None
+
+
+def _read_shipped_roots() -> list[str] | None:
+    """Requirement strings that ship: core ``dependencies`` plus the
+    :data:`SHIPPED_EXTRAS` extras, read from ``pyproject.toml``. Returns
+    ``None`` if pyproject can't be located/parsed (caller scans everything)."""
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    project = data.get("project", {})
+    roots: list[str] = list(project.get("dependencies", []))
+    optional = project.get("optional-dependencies", {})
+    for extra in SHIPPED_EXTRAS:
+        roots.extend(optional.get(extra, []))
+    return roots or None
+
+
+def _shipped_closure() -> set[str] | None:
+    """Canonical names of every installed package reachable from the shipped
+    roots — following requested extras (e.g. ``uvicorn[standard]``) and
+    skipping extra-gated requirements we didn't ask for. ``None`` means
+    "couldn't scope; scan everything" (safe over-inclusive fallback)."""
+    roots = _read_shipped_roots()
+    if not roots:
+        return None
+    queue: list[tuple[str, frozenset[str]]] = [_parse_requirement(r) for r in roots]
+    closure: set[str] = set()
+    visited: set[tuple[str, frozenset[str]]] = set()
+    while queue:
+        name, extras = queue.pop()
+        if not name:
+            continue
+        state = (name, extras)
+        if state in visited:
+            continue
+        visited.add(state)
+        closure.add(name)
+        try:
+            dist = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
+        for req in dist.requires or []:
+            gate = _requires_extra(req)
+            if gate is not None and gate not in extras:
+                continue  # optional dep for an extra we didn't request
+            queue.append(_parse_requirement(req))
+    return closure
+
+
 def scan() -> list[dict[str, str]]:
-    """Return one row per installed dist with name, version, license, status."""
+    """Return one row per shipped dist with name, version, license, status.
+
+    Scopes to the transitive closure of the shipped requirement roots (see
+    :func:`_shipped_closure`) so opt-in extras a customer explicitly installs
+    (the easyocr / cross-encoder ML+GPU stack) aren't policed as if they were
+    part of the default deliverable.
+    """
     rows: list[dict[str, str]] = []
+    closure = _shipped_closure()
     for dist in metadata.distributions():
         name = dist.metadata.get("Name", "").lower()
         if not name:
             continue
         if name in DEV_ONLY or name in SELF_PACKAGES:
             continue
+        if closure is not None and _canonical(name) not in closure:
+            continue  # not part of the shipped dependency closure
         license_id = _read_license(dist)
         if _is_permissive_expression(license_id, ALLOWED_SPDX):
             status = "OK"
