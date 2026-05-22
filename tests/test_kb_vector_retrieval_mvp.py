@@ -226,7 +226,7 @@ async def test_ingest_pipeline_end_to_end(tmp_path: Path) -> None:
         return [[float(len(t) % 7), 1.0, 0.5, 0.0] for t in texts]
 
     with mock.patch("movate.kb.ingest.embed_texts", side_effect=fake_embed):
-        summaries = await ingest_path(
+        summaries, _ = await ingest_path(
             storage=storage,
             path=tmp_path,
             agent="rag-qa",

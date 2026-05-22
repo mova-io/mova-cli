@@ -407,6 +407,8 @@ def test_ocr_pdf_tesseract_raises_returns_none() -> None:
     mock_pdf2image = MagicMock()
     mock_pdf2image.convert_from_bytes.return_value = [img]
     mock_pytesseract = MagicMock()
+    # `except pytesseract.TesseractNotFoundError` needs a real exception class.
+    mock_pytesseract.TesseractNotFoundError = type("TesseractNotFoundError", (Exception,), {})
     mock_pytesseract.image_to_string.side_effect = RuntimeError("tesseract not found")
 
     with patch.dict("sys.modules", {"pdf2image": mock_pdf2image, "pytesseract": mock_pytesseract}):

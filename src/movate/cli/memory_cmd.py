@@ -85,7 +85,9 @@ def list_(
     store = _store()
     _backend = os.environ.get("MOVATE_MEMORY_BACKEND", "memory").lower()
     _backend_label = "sqlite" if _backend == "sqlite" else "json-file"
-    console.print(f"[dim]memory backend: {_backend_label}[/dim]")
+    # Diagnostic → stderr so it never corrupts the --json payload on stdout
+    # (json.loads of the whole stdout would otherwise choke on this line).
+    err_console.print(f"[dim]memory backend: {_backend_label}[/dim]")
     entries = asyncio.run(store.list(agent))
     if since_days > 0:
         entries = _filter_entries_by_age(entries, since_days)

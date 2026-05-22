@@ -98,7 +98,7 @@ def test_watched_paths_includes_agent_local_contexts(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_cli_dev_help_renders() -> None:
-    r = runner.invoke(cli_app, ["dev", "--help"])
+    r = runner.invoke(cli_app, ["dev", "--help"], env={"COLUMNS": "200"})
     assert r.exit_code == 0
     assert "--template" in r.stdout.replace("\n", "")
 

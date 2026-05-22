@@ -225,6 +225,9 @@ def test_parse_image_ocr_returns_none_gives_none() -> None:
     img = _fake_pil_image()
     mock_pil = _make_pil_module(img)
     mock_pytesseract = MagicMock()
+    # The parser's `except pytesseract.TesseractNotFoundError` needs a real
+    # exception class; a bare MagicMock attr would make `except` raise TypeError.
+    mock_pytesseract.TesseractNotFoundError = type("TesseractNotFoundError", (Exception,), {})
     mock_pytesseract.image_to_string.side_effect = RuntimeError("tesseract not found")
 
     with patch.dict(

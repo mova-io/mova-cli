@@ -104,7 +104,7 @@ async def test_clean_source_reports_chunks_removed(tmp_path: Path) -> None:
 
     # First ingest (no clean_source).
     with mock.patch("movate.kb.ingest.embed_texts", side_effect=_fake_embed):
-        summaries1 = await ingest_path(
+        summaries1, _ = await ingest_path(
             storage=storage,
             path=tmp_path,
             agent="test-agent",
@@ -115,7 +115,7 @@ async def test_clean_source_reports_chunks_removed(tmp_path: Path) -> None:
 
     # Second ingest with clean_source=True.
     with mock.patch("movate.kb.ingest.embed_texts", side_effect=_fake_embed):
-        summaries2 = await ingest_path(
+        summaries2, _ = await ingest_path(
             storage=storage,
             path=tmp_path,
             agent="test-agent",
