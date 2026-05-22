@@ -1,0 +1,71 @@
+# Full-lifecycle acceptance test — runs scripts/acceptance_e2e.sh.
+#
+# Distinct from:
+#   * ci.yml       — unit tests / lint / types, never touches an agent E2E.
+#   * mvp-smoke.yml — init→add→doctor→validate→eval on the bundled example.
+#   * e2e-smoke.yml — hits a deployed STAGING URL (submit/jobs/costs).
+#
+# This one is reproducible from a clean checkout: the script scaffolds a
+# throwaway project in a temp dir and walks the whole authoring journey —
+# blank agent → validate → run (mock + real) → wire a context → version
+# bump → deploy → remote inference → Langfuse tracing. The local structural
+# steps are hard assertions; the Azure / real-model / Langfuse steps SKIP
+# cleanly when their secrets aren't configured, so this is green by default
+# and exhaustive when secrets are present.
+#
+# Optional GitHub secrets (configure under Settings → Secrets); each only
+# unlocks the matching step — absence is a SKIP, not a failure:
+#   OPENAI_API_KEY        — real-model assertions (validation phrase + context)
+#   MOVATE_E2E_TARGET     — deploy-target name; unlocks the Azure deploy +
+#                           remote-inference steps (target must exist in the
+#                           runner's ~/.movate/config.yaml — wire via further
+#                           setup before enabling)
+#   LANGFUSE_SECRET_KEY   — (+ LANGFUSE_PUBLIC_KEY / LANGFUSE_HOST) tracing check
+
+name: acceptance
+
+on:
+  # Manual from the Actions tab — the primary trigger. Run it after a
+  # change to the authoring flow, or before a release, to confirm the
+  # golden path still holds end-to-end.
+  workflow_dispatch:
+  # Weekly @ 04:00 UTC Monday — catches lifecycle regressions that unit
+  # tests miss (scaffold drift, flag renames, validate/deploy contract
+  # changes) without running on every PR.
+  schedule:
+    - cron: "0 4 * * 1"
+
+jobs:
+  acceptance:
+    name: full-lifecycle acceptance
+    runs-on: ubuntu-latest
+    # The local structural path is fast (<2 min); the budget covers a
+    # real deploy + remote inference when secrets unlock those steps.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+
+      - name: Install mdk
+        run: uv sync --frozen
+
+      - name: Run acceptance lifecycle
+        env:
+          MDK: "uv run mdk"
+          # All optional — the script SKIPs the dependent steps when unset.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MOVATE_E2E_TARGET: ${{ secrets.MOVATE_E2E_TARGET }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+        run: bash scripts/acceptance_e2e.sh
