@@ -27,10 +27,10 @@ from movate.providers.anthropic import (
     AnthropicProvider,
     _stream_chunk_from_event,
     _to_completion_response,
+    _tokens_from_usage,
     _translate_exception,
     _translate_messages,
     _translate_params,
-    _tokens_from_usage,
 )
 from movate.providers.base import CompletionRequest, Message
 

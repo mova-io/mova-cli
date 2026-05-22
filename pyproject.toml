@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.22.8"
+version = "2026.5.22.9"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -260,6 +260,17 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # Each branch is a distinct concern; folding into helpers would scatter the
 # read order. PLR0912 is the wrong rule for this shape.
 "src/movate/core/executor.py" = ["PLR0912"]
+# Provider tests build dynamically-named exception classes
+# (`PermissionDeniedError = type("PermissionDeniedError", (Exception,), {})`)
+# to exercise the LiteLLM → movate error translation — N806 misfires on
+# those locals. The `pytest.raises(match=...)` strings are literal expected
+# error text, not regexes, so RUF043's "escape your metacharacters" is noise.
+"tests/test_anthropic_provider.py" = ["N806", "RUF043"]
+"tests/test_openai_native_provider.py" = ["N806", "RUF043"]
+# Local imports inside a test body are intentional — they scope a heavy or
+# optional dependency to the single test that needs it.
+"tests/test_executor.py" = ["PLC0415"]
+"tests/test_tracing_langfuse.py" = ["PLC0415"]
 # _validate_agent runs the full set of pre-flight checks in a linear pipeline:
 # runtime availability, project policy, prompt linter, cost forecast, then
 # success rendering. Same justification as executor.py — pipeline shape doesn't

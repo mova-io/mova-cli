@@ -15,6 +15,7 @@ worker in stage 4; here we only test the HTTP layer transitions.
 
 from __future__ import annotations
 
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -33,7 +34,7 @@ from movate.core.models import (
 )
 from movate.runtime import build_app
 from movate.runtime.registry import scan_agents
-from movate.testing import InMemoryStorage
+from movate.testing import InMemoryStorage, scaffold_agent
 
 cli_runner = CliRunner(mix_stderr=False)
 
@@ -633,13 +634,6 @@ async def test_agents_requires_auth(storage: InMemoryStorage) -> None:
 # ---------------------------------------------------------------------------
 
 
-import asyncio
-from pathlib import Path
-
-from movate.testing import scaffold_agent
-from movate.runtime.registry import scan_agents
-
-
 async def _make_authed_client(
     storage: InMemoryStorage,
     *,
@@ -919,8 +913,14 @@ async def test_v1_create_agent_422_invalid_bundle(
         files={
             "agent_yaml": ("agent.yaml", b": invalid: : yaml::"),
             "prompt": ("prompt.md", b"Hello"),
-            "input_schema": ("input.json", b'{"type":"object","properties":{"q":{"type":"string"}}}'),
-            "output_schema": ("output.json", b'{"type":"object","properties":{"a":{"type":"string"}}}'),
+            "input_schema": (
+                "input.json",
+                b'{"type":"object","properties":{"q":{"type":"string"}}}',
+            ),
+            "output_schema": (
+                "output.json",
+                b'{"type":"object","properties":{"a":{"type":"string"}}}',
+            ),
         },
     )
     assert r.status_code == 422

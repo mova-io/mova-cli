@@ -344,7 +344,9 @@ def _make_pg_conn(rows: list[dict] | None = None, fetchrow_result: dict | None =
     # _ensure_schema calls conn.execute (CREATE TABLE / INDEX)
     conn.execute = AsyncMock(return_value=execute_tag)
     conn.fetch = AsyncMock(return_value=[_make_record(r) for r in (rows or [])])
-    conn.fetchrow = AsyncMock(return_value=_make_record(fetchrow_result) if fetchrow_result else None)
+    conn.fetchrow = AsyncMock(
+        return_value=_make_record(fetchrow_result) if fetchrow_result else None
+    )
     conn.fetchval = AsyncMock(return_value=None)
     conn.close = AsyncMock()
     return conn

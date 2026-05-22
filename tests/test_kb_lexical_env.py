@@ -25,7 +25,6 @@ import pytest
 import movate.kb.lexical as lexical_mod
 from movate.core.models import KbChunk, KbChunkWithScore
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
