@@ -22,6 +22,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from movate import __version__
+from movate.core.paths import project_state_dir
 from movate.providers.pricing import load_pricing
 from movate.tracing import build_tracer
 
@@ -1284,8 +1285,8 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
 
     # Check 7: eval baseline
     baseline_candidates = [
-        agent_dir / ".movate" / "baseline.json",
-        agent_dir.parent.parent / ".movate" / bundle.spec.name / "baseline.json",
+        project_state_dir(agent_dir) / "baseline.json",
+        project_state_dir(agent_dir.parent.parent) / bundle.spec.name / "baseline.json",
     ]
     if any(c.is_file() for c in baseline_candidates):
         _row("eval baseline", "[green]✓ committed[/green]", "")
@@ -1293,7 +1294,7 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
         _row(
             "eval baseline",
             "[yellow]missing[/yellow]",
-            "run `mdk eval --output-baseline .movate/baseline.json`",
+            "run `mdk eval --output-baseline .mdk/baseline.json`",
         )
 
     # Check 8: last run from storage

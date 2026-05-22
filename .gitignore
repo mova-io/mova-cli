@@ -50,6 +50,13 @@ htmlcov/
 !.movate/*/
 .movate/*/*
 !.movate/*/baseline.json
+# .mdk/ is the canonical project-state dir name (ADR 011); same exception
+# dance so committed eval baselines stay tracked. .movate/ kept above for
+# projects not yet migrated.
+.mdk/*
+!.mdk/*/
+.mdk/*/*
+!.mdk/*/baseline.json
 *.db
 *.db-journal
 local.db

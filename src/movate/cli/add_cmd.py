@@ -31,6 +31,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from movate.cli._resolve import walk_up_for_project_root
+from movate.core.paths import project_state_dir
 from movate.templates import TEMPLATES, list_templates
 
 console = Console()
@@ -1861,8 +1862,8 @@ def _do_remove(args: list[str], *, apply: bool) -> None:
 
     # Eval baseline.
     baseline_candidates = [
-        agent_dir / ".movate" / "baseline.json",
-        project_root / ".movate" / agent_name / "baseline.json",
+        project_state_dir(agent_dir) / "baseline.json",
+        project_state_dir(project_root) / agent_name / "baseline.json",
     ]
     for baseline in baseline_candidates:
         if baseline.is_file():

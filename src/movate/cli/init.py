@@ -19,7 +19,7 @@ Three modes:
   validates by loading it back through :func:`load_agent`. On
   validation failure the error is fed back to the LLM for one retry;
   a second failure stashes the raw payload at
-  ``.movate/llm-init-failed-<name>.json`` and exits 1. Successful
+  ``.mdk/llm-init-failed-<name>.json`` and exits 1. Successful
   scaffolds emit a Rich Panel with the file list + cost + next-step
   commands, an ``_console.hint`` line pointing at ``prompt.md``, and a
   greppable ``mdk_init_summary:`` line for CI parity with
@@ -46,6 +46,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from movate.core.config import PROJECT_MARKER_FILES as _PROJECT_MARKERS
+from movate.core.paths import project_state_dir
 from movate.templates import get_template_path, list_templates
 
 console = Console()
@@ -225,13 +226,13 @@ defaults:
 
 
 # =============================================================================
-# About .movate/ — runtime state directory
+# About .mdk/ — runtime state directory
 # =============================================================================
 #
 # Created in the project root when you run any `mdk` command that
 # needs persistent state. Layout:
 #
-#   .movate/
+#   .mdk/
 #   ├── local.db           — SQLite for runs + failures (gitignored)
 #   ├── snapshots/         — content-addressed snapshots of project state
 #   │   └── <hash>/        — immutable: agent.yaml + prompt.md + schemas
@@ -251,7 +252,7 @@ defaults:
 # of the manifest), so re-snapshotting identical state produces the
 # same hash. They're small + git-friendly by default; `.gitignore`
 # tracks them so your repo carries a verifiable history of "what
-# shipped when". Drop `.movate/snapshots/` from `.gitignore` if you'd
+# shipped when". Drop `.mdk/snapshots/` from `.gitignore` if you'd
 # rather treat them as machine-local.
 """
 
@@ -397,7 +398,7 @@ The per-agent version wins for that one agent. `mdk doctor agent
 
 
 _MOVATE_STATE_README = """\
-# `.movate/` — Runtime State Directory
+# `.mdk/` — Runtime State Directory
 
 This directory is created and managed by `mdk`. It holds runtime state
 that is intentionally separate from your source-controlled agent
@@ -406,7 +407,7 @@ definitions.
 ## What lives here
 
 ```
-.movate/
+.mdk/
 ├── local.db           — SQLite: run history, eval results, failures
 ├── snapshots/         — content-addressed snapshots of project state
 │   └── <sha256>/      — immutable: agent.yaml + prompt.md + schemas
@@ -437,9 +438,9 @@ Key commands:
 The project `.gitignore` ships with these entries:
 
 ```
-.movate/local.db          # machine-local run history
-.movate/baselines/        # machine-local eval baselines
-# .movate/snapshots/      # UNCOMMENT to treat snapshots as machine-local
+.mdk/local.db          # machine-local run history
+.mdk/baselines/        # machine-local eval baselines
+# .mdk/snapshots/      # UNCOMMENT to treat snapshots as machine-local
 ```
 
 `local.db` is always gitignored — it contains run history and
@@ -491,12 +492,12 @@ real search service.
 
 _PROJECT_GITIGNORE = """\
 # movate runtime state — never commit
-.movate/local.db
-.movate/local.db-*
+.mdk/local.db
+.mdk/local.db-*
 
 # Snapshots are commit-friendly by default (content-addressed,
 # small) but operators can opt out of tracking them in git:
-# .movate/snapshots/
+# .mdk/snapshots/
 
 # Python
 __pycache__/
@@ -689,14 +690,14 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
     (project_root / "contexts" / "README.md").write_text(_CONTEXTS_README)
     (project_root / "skills" / "README.md").write_text(_SKILLS_README)
 
-    # Bootstrap the .movate/ runtime-state directory and land a README
-    # explaining it. Operators who poke into .movate/ wondering "what is
+    # Bootstrap the .mdk/ runtime-state directory and land a README
+    # explaining it. Operators who poke into .mdk/ wondering "what is
     # this?" find the answer in-place. The snapshot sub-command creates
     # the full tree; we create the top-level dir here so the README
     # exists even when --skip-snapshot is passed.
-    movate_state_dir = project_root / ".movate"
-    movate_state_dir.mkdir(exist_ok=True)
-    (movate_state_dir / "README.md").write_text(_MOVATE_STATE_README)
+    mdk_state_dir = project_state_dir(project_root)
+    mdk_state_dir.mkdir(exist_ok=True)
+    (mdk_state_dir / "README.md").write_text(_MOVATE_STATE_README)
 
     # Initial snapshot — operators get a baseline for diff / rollback.
     snapshot_short: str | None = None
@@ -1185,7 +1186,7 @@ _DEFAULT_LLM_MODEL = "openai/gpt-4o-mini-2024-07-18"
 # operator to inspect. Relative to the cwd at invocation time — the
 # project root in the normal flow. Operators are pointed at this path
 # in the error message so they don't have to grep stderr.
-_DEBUG_ARTIFACT_REL = ".movate/llm-init-failed-{name}.json"
+_DEBUG_ARTIFACT_REL = ".mdk/llm-init-failed-{name}.json"
 
 # Preview truncation cap for the prompt body in --dry-run mode. Long
 # enough that the operator sees the agent's intent; short enough that
@@ -1214,7 +1215,7 @@ def _init_agent_from_llm(
     3. Write to a tempdir; run :func:`load_agent` to validate end-to-end.
     4. On validation failure: re-prompt with the error context and retry
        ONCE. On second failure: stash raw JSON to
-       ``.movate/llm-init-failed-<name>.json`` and exit 2.
+       ``.mdk/llm-init-failed-<name>.json`` and exit 2.
     5. On success: either copy the tempdir contents to
        ``target / name`` (the normal flow) or render a Rich preview
        to stdout (``dry_run=True``).
@@ -1476,7 +1477,7 @@ def _try_validate(generated: Any, *, name: str) -> str | None:
 
 
 def _save_debug_artifact(name: str, *, payload: Any, raw_error: str) -> None:
-    """Stash the failed LLM output to ``.movate/llm-init-failed-<name>.json``."""
+    """Stash the failed LLM output to ``.mdk/llm-init-failed-<name>.json``."""
     artifact_path = Path(_DEBUG_ARTIFACT_REL.format(name=name))
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     body: dict[str, object] = {"error": raw_error, "name": name}

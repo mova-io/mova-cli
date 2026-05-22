@@ -80,9 +80,9 @@ def test_init_project_creates_initial_snapshot(tmp_path: Path) -> None:
     assert result.exit_code == 0
     proj = tmp_path / "my-proj"
     # Snapshot directory should exist
-    assert (proj / ".movate" / "snapshots").is_dir()
+    assert (proj / ".mdk" / "snapshots").is_dir()
     # At least one snapshot subdirectory (the initial one)
-    snaps = [p for p in (proj / ".movate" / "snapshots").iterdir() if p.is_dir()]
+    snaps = [p for p in (proj / ".mdk" / "snapshots").iterdir() if p.is_dir()]
     assert len(snaps) >= 1
     # The hint appears in the output
     assert "snapshot" in result.stdout.lower()
@@ -104,7 +104,7 @@ def test_init_project_skip_snapshot_flag(tmp_path: Path) -> None:
     assert result.exit_code == 0
     proj = tmp_path / "my-proj"
     # No snapshots dir created
-    assert not (proj / ".movate" / "snapshots").is_dir()
+    assert not (proj / ".mdk" / "snapshots").is_dir()
 
 
 # ---------------------------------------------------------------------------

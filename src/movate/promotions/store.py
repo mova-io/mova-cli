@@ -32,6 +32,8 @@ from pathlib import Path
 
 import yaml
 
+from movate.core.paths import project_state_dir
+
 
 class PromotionsStoreError(Exception):
     """Raised on malformed promotions.yaml or filesystem errors.
@@ -97,7 +99,7 @@ class PromotionsLog:
 
 def _log_path(project_root: Path) -> Path:
     """Resolve the on-disk path for a project's promotions log."""
-    return project_root / ".movate" / "promotions.yaml"
+    return project_state_dir(project_root) / "promotions.yaml"
 
 
 def _now_iso8601() -> str:
@@ -190,7 +192,7 @@ def save_log(log: PromotionsLog) -> None:
     tightening here (unlike secrets) — promotion data is not
     sensitive on its own, just an audit log.
     """
-    movate_dir = log.project_root / ".movate"
+    movate_dir = project_state_dir(log.project_root)
     movate_dir.mkdir(parents=True, exist_ok=True)
 
     path = _log_path(log.project_root)

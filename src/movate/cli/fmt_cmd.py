@@ -53,6 +53,7 @@ _SKIP_DIRS = frozenset(
         "venv",
         "__pycache__",
         "node_modules",
+        ".mdk",
         ".movate",
         ".pytest_cache",
         ".mypy_cache",

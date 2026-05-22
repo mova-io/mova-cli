@@ -225,7 +225,7 @@ class TestCreateSnapshot:
         second = create_snapshot(project_root=project, description="d")
         assert first.hash == second.hash
         # Only one directory on disk.
-        snapshot_dir = project / ".movate" / "snapshots"
+        snapshot_dir = project / ".mdk" / "snapshots"
         children = list(snapshot_dir.iterdir())
         assert len(children) == 1
 
@@ -233,7 +233,7 @@ class TestCreateSnapshot:
         project = _scaffold_project(tmp_path / "p", agents={"a": "specific content"})
         manifest = create_snapshot(project_root=project, description="")
         short = manifest.hash.removeprefix("sha256:")[:8]
-        files_dir = project / ".movate" / "snapshots" / short / "files"
+        files_dir = project / ".mdk" / "snapshots" / short / "files"
         assert files_dir.is_dir()
         assert (files_dir / "movate.yaml").is_file()
         # The captured prompt body matches the original
@@ -324,7 +324,7 @@ class TestDeleteSnapshot:
         project = _scaffold_project(tmp_path / "p", agents={"a": "x"})
         created = create_snapshot(project_root=project, description="goodbye")
         short = created.hash.removeprefix("sha256:")[:8]
-        target = project / ".movate" / "snapshots" / short
+        target = project / ".mdk" / "snapshots" / short
         assert target.is_dir()
 
         returned = delete_snapshot(project, short)
@@ -349,7 +349,7 @@ def project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_cli_create_writes_snapshot(project_root: Path) -> None:
     result = runner.invoke(app, ["snapshot", "create", "-d", "first"])
     assert result.exit_code == 0, result.stdout + result.stderr
-    snapshots = list((project_root / ".movate" / "snapshots").iterdir())
+    snapshots = list((project_root / ".mdk" / "snapshots").iterdir())
     assert len(snapshots) == 1
     # Header rendered
     assert "✓ Created" in result.stdout or "snapshot" in result.stdout.lower()
@@ -429,7 +429,7 @@ def test_cli_delete_without_force_is_dry_run(project_root: Path) -> None:
     result = runner.invoke(app, ["snapshot", "delete", short])
     assert result.exit_code == 1
     assert "dry-run" in result.stdout.lower() or "would delete" in result.stdout.lower()
-    assert (project_root / ".movate" / "snapshots" / short).is_dir()
+    assert (project_root / ".mdk" / "snapshots" / short).is_dir()
 
 
 @pytest.mark.unit
@@ -439,4 +439,4 @@ def test_cli_delete_with_force_removes_snapshot(project_root: Path) -> None:
 
     result = runner.invoke(app, ["snapshot", "delete", short, "--force"])
     assert result.exit_code == 0
-    assert not (project_root / ".movate" / "snapshots" / short).exists()
+    assert not (project_root / ".mdk" / "snapshots" / short).exists()
