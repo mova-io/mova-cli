@@ -112,9 +112,20 @@ def _eager_load_project_config() -> None:
     a YAML-read cost.
     """
     import contextlib  # noqa: PLC0415
+    import sys  # noqa: PLC0415
     from pathlib import Path  # noqa: PLC0415
 
     from movate.core.config import is_project_root, load_project_config  # noqa: PLC0415
+
+    # Config-free commands must not load project config (and so must not
+    # emit the legacy-yaml deprecation warning). `--version` / `--help`
+    # answer without touching the project, so eager-loading there is both
+    # wasted work and spurious noise — `mdk --version` from inside a
+    # project dir was printing "movate.yaml is deprecated" on every call.
+    # argv is inspected directly: this runs at import, before Typer parses.
+    _config_free_flags = {"--version", "-V", "--help", "-h"}
+    if _config_free_flags.intersection(sys.argv[1:]):
+        return
 
     if not is_project_root(Path.cwd()):
         return
