@@ -81,3 +81,9 @@ openai-feedback.md
 *.pptx
 deva-onboarding.md
 deva-onboarding.pptx
+
+# Chainlit playground runtime state (created by `mdk playground` / serve).
+.chainlit/
+
+# LibreOffice / OpenOffice lock files (e.g. when an .xlsx is open).
+.~lock.*#
