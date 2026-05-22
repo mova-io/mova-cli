@@ -130,7 +130,7 @@ def serve(
     except ImportError as exc:
         err.print(
             "[red]✗[/red] missing dependencies for the Teams bot. "
-            f"Install with: [bold]uv add 'movate-cli[teams]'[/bold]\n"
+            "Install with: [bold]uv add 'movate-cli\\[teams]'[/bold]\n"
             f"  ({exc})"
         )
         raise typer.Exit(code=2) from exc
