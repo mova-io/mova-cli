@@ -174,6 +174,19 @@ def test_single_md_file_ingests(client: TestClient, auth_header: dict[str, str])
 
 
 @pytest.mark.integration
+def test_upload_uses_configured_embedding_model(
+    client: TestClient, auth_header: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MOVATE_EMBED_MODEL flows into server-side ingest so the stored model
+    matches the deployment's vector(N) column (ADR 009 Task 5)."""
+    monkeypatch.setenv("MOVATE_EMBED_MODEL", "text-embedding-3-large")
+    r = _upload_files(client, auth_header, [("refund.md", _SAMPLE_MD, "text/markdown")])
+    assert r.status_code == 200, r.text
+    entry = r.json()["files"][0]
+    assert "large" in entry["embedding_model"], entry["embedding_model"]
+
+
+@pytest.mark.integration
 def test_multi_file_upload_aggregates_counts(
     client: TestClient, auth_header: dict[str, str]
 ) -> None:

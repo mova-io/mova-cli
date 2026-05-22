@@ -1666,6 +1666,7 @@ def build_app(
         * **404** — agent not found
         * **502** — embedding API unreachable
         """
+        from movate.kb.embed import embedding_model  # noqa: PLC0415
         from movate.kb.ingest import ingest_text  # noqa: PLC0415
 
         if not files:
@@ -1737,6 +1738,7 @@ def build_app(
                 source=basename,
                 agent=name,
                 tenant_id=ctx.tenant_id,
+                embedding_model=embedding_model(),
                 ocr=parse_result.ocr_used,
             )
             if summary is None:
