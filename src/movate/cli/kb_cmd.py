@@ -953,6 +953,17 @@ def ingest(
             "for that source path. Useful in CI to avoid re-embedding unchanged docs."
         ),
     ),
+    build_graph: bool = typer.Option(
+        False,
+        "--build-graph",
+        help=(
+            "Also extract a knowledge graph (entities + relations) from each "
+            "document for GraphRAG retrieval. Runs an extra LLM pass per chunk — "
+            "set the extraction provider's env var (default Anthropic → "
+            "ANTHROPIC_API_KEY). Combine with --clean-source to rebuild a "
+            "source's graph from scratch instead of merging into the existing one."
+        ),
+    ),
     ocr_lang: str = typer.Option(
         "",
         "--ocr-lang",
@@ -1168,6 +1179,7 @@ def ingest(
                             embedding_model=model,
                             api_key=api_key,
                             clean_source=clean_source,
+                            build_graph=build_graph,
                         )
                         summaries.extend(file_summaries)
                         for fname, reason in file_failed:
@@ -1191,6 +1203,7 @@ def ingest(
                         embedding_model=model,
                         api_key=api_key,
                         clean_source=clean_source,
+                        build_graph=build_graph,
                         on_file_start=_on_file,
                     )
                     summaries.extend(file_summaries)
@@ -1243,6 +1256,13 @@ def ingest(
         console.print(table)
         total = sum(getattr(s, "chunks_saved", 0) for s in summaries)
         console.print(f"[green]✓[/green] {total} chunks saved across {len(summaries)} file(s).")
+        if build_graph:
+            total_entities = sum(getattr(s, "entities_saved", 0) for s in summaries)
+            total_relations = sum(getattr(s, "relations_saved", 0) for s in summaries)
+            console.print(
+                f"[green]✓[/green] knowledge graph: {total_entities} entities, "
+                f"{total_relations} relations."
+            )
 
         # Surface any files that were found but silently skipped by the parser
         # (corrupt files, parse errors, or — most commonly — image files when

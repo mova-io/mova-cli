@@ -18,6 +18,8 @@ from movate.core.models import (
     ApiKeyEnv,
     ApiKeyRecord,
     ConversationThread,
+    Entity,
+    EntityWithScore,
     ErrorInfo,
     EvalRecord,
     FailureRecord,
@@ -29,7 +31,9 @@ from movate.core.models import (
     KbChunk,
     KbChunkWithScore,
     Metrics,
+    Relation,
     RunRecord,
+    Subgraph,
     TenantBudget,
     WorkflowRunRecord,
     WorkflowStatus,
@@ -307,6 +311,54 @@ _MIGRATIONS = [
     # idempotent on first-run (brand-new DB also has the column from
     # the CREATE TABLE below once the migration runs).
     "ALTER TABLE kb_chunks ADD COLUMN ocr INTEGER NOT NULL DEFAULT 0",
+    # GraphRAG: knowledge-graph entities + relations layered over the KB.
+    # Embeddings + source_chunk_ids + metadata stored as JSON-encoded TEXT
+    # (same strategy as kb_chunks). Dedup via UNIQUE(agent, tenant_id,
+    # content_hash) + ON CONFLICT in the upsert path. Bounded k-hop
+    # traversal rides a recursive CTE over kb_relations.
+    """
+    CREATE TABLE IF NOT EXISTS kb_entities (
+        entity_id        TEXT PRIMARY KEY,
+        tenant_id        TEXT NOT NULL,
+        agent            TEXT NOT NULL,
+        name             TEXT NOT NULL,
+        type             TEXT NOT NULL,
+        description      TEXT,
+        embedding        TEXT NOT NULL,
+        embedding_model  TEXT NOT NULL,
+        content_hash     TEXT NOT NULL,
+        source_chunk_ids TEXT,
+        metadata         TEXT,
+        created_at       TEXT NOT NULL,
+        UNIQUE(agent, tenant_id, content_hash)
+    )
+    """,
+    ("CREATE INDEX IF NOT EXISTS idx_kb_entities_agent_tenant ON kb_entities(agent, tenant_id)"),
+    """
+    CREATE TABLE IF NOT EXISTS kb_relations (
+        relation_id      TEXT PRIMARY KEY,
+        tenant_id        TEXT NOT NULL,
+        agent            TEXT NOT NULL,
+        src_entity_id    TEXT NOT NULL,
+        dst_entity_id    TEXT NOT NULL,
+        type             TEXT NOT NULL,
+        description      TEXT,
+        weight           REAL NOT NULL DEFAULT 1.0,
+        content_hash     TEXT NOT NULL,
+        source_chunk_ids TEXT,
+        metadata         TEXT,
+        created_at       TEXT NOT NULL,
+        UNIQUE(agent, tenant_id, content_hash)
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kb_relations_src "
+        "ON kb_relations(agent, tenant_id, src_entity_id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kb_relations_dst "
+        "ON kb_relations(agent, tenant_id, dst_entity_id)"
+    ),
 ]
 
 
@@ -327,6 +379,40 @@ def _fts5_escape(query: str) -> str:
 
     tokens = re.findall(r"[A-Za-z0-9_]+", query)
     return " ".join(tokens)
+
+
+def _row_to_entity(r: Any) -> Entity:
+    return Entity(
+        entity_id=r["entity_id"],
+        tenant_id=r["tenant_id"],
+        agent=r["agent"],
+        name=r["name"],
+        type=r["type"],
+        description=r["description"],
+        embedding=json.loads(r["embedding"]),
+        embedding_model=r["embedding_model"],
+        content_hash=r["content_hash"],
+        source_chunk_ids=json.loads(r["source_chunk_ids"]) if r["source_chunk_ids"] else [],
+        metadata=json.loads(r["metadata"]) if r["metadata"] else None,
+        created_at=datetime.fromisoformat(r["created_at"]),
+    )
+
+
+def _row_to_relation(r: Any) -> Relation:
+    return Relation(
+        relation_id=r["relation_id"],
+        tenant_id=r["tenant_id"],
+        agent=r["agent"],
+        src_entity_id=r["src_entity_id"],
+        dst_entity_id=r["dst_entity_id"],
+        type=r["type"],
+        description=r["description"],
+        weight=r["weight"],
+        content_hash=r["content_hash"],
+        source_chunk_ids=json.loads(r["source_chunk_ids"]) if r["source_chunk_ids"] else [],
+        metadata=json.loads(r["metadata"]) if r["metadata"] else None,
+        created_at=datetime.fromisoformat(r["created_at"]),
+    )
 
 
 class SqliteProvider:
@@ -1183,6 +1269,278 @@ class SqliteProvider:
                 count = cur.rowcount
         await self._db.commit()
         return int(count or 0)
+
+    # ------------------------------------------------------------------
+    # Knowledge graph (GraphRAG)
+    # ------------------------------------------------------------------
+
+    async def upsert_entity(self, entity: Entity) -> None:
+        # Merge provenance with any existing row (UNION source_chunk_ids)
+        # so re-ingesting from a new document adds to, rather than
+        # replaces, an entity's source citations.
+        async with self._db.execute(
+            "SELECT source_chunk_ids FROM kb_entities "
+            "WHERE agent = ? AND tenant_id = ? AND content_hash = ?",
+            (entity.agent, entity.tenant_id, entity.content_hash),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = json.loads(row[0]) if row and row[0] else []
+        merged = sorted(set(existing) | set(entity.source_chunk_ids))
+        await self._db.execute(
+            """
+            INSERT INTO kb_entities (
+                entity_id, tenant_id, agent, name, type, description,
+                embedding, embedding_model, content_hash, source_chunk_ids,
+                metadata, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(agent, tenant_id, content_hash) DO UPDATE SET
+                name = excluded.name,
+                type = excluded.type,
+                description = excluded.description,
+                embedding = excluded.embedding,
+                embedding_model = excluded.embedding_model,
+                source_chunk_ids = excluded.source_chunk_ids,
+                metadata = excluded.metadata
+            """,
+            (
+                entity.entity_id,
+                entity.tenant_id,
+                entity.agent,
+                entity.name,
+                entity.type,
+                entity.description,
+                json.dumps(entity.embedding),
+                entity.embedding_model,
+                entity.content_hash,
+                json.dumps(merged),
+                json.dumps(entity.metadata) if entity.metadata is not None else None,
+                entity.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def upsert_relation(self, relation: Relation) -> None:
+        async with self._db.execute(
+            "SELECT source_chunk_ids FROM kb_relations "
+            "WHERE agent = ? AND tenant_id = ? AND content_hash = ?",
+            (relation.agent, relation.tenant_id, relation.content_hash),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = json.loads(row[0]) if row and row[0] else []
+        merged = sorted(set(existing) | set(relation.source_chunk_ids))
+        await self._db.execute(
+            """
+            INSERT INTO kb_relations (
+                relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
+                type, description, weight, content_hash, source_chunk_ids,
+                metadata, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(agent, tenant_id, content_hash) DO UPDATE SET
+                src_entity_id = excluded.src_entity_id,
+                dst_entity_id = excluded.dst_entity_id,
+                type = excluded.type,
+                description = excluded.description,
+                weight = excluded.weight,
+                source_chunk_ids = excluded.source_chunk_ids,
+                metadata = excluded.metadata
+            """,
+            (
+                relation.relation_id,
+                relation.tenant_id,
+                relation.agent,
+                relation.src_entity_id,
+                relation.dst_entity_id,
+                relation.type,
+                relation.description,
+                relation.weight,
+                relation.content_hash,
+                json.dumps(merged),
+                json.dumps(relation.metadata) if relation.metadata is not None else None,
+                relation.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def search_entities(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 10,
+    ) -> list[EntityWithScore]:
+        from movate.storage._cosine import rank_entities_by_cosine  # noqa: PLC0415
+
+        entities = await self.list_entities(agent=agent, tenant_id=tenant_id, limit=100_000)
+        return rank_entities_by_cosine(entities, query_embedding, limit)
+
+    async def expand_neighbors(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        entity_ids: list[str],
+        hops: int = 1,
+        limit: int = 50,
+    ) -> Subgraph:
+        if not entity_ids:
+            return Subgraph(entities=[], relations=[])
+        # Recursive CTE: bounded k-hop reachability from the seed ids.
+        # Undirected for reachability (follow an edge from either endpoint);
+        # UNION dedups so cycles terminate, depth < hops bounds the walk.
+        async with self._db.execute(
+            """
+            WITH RECURSIVE reachable(eid, depth) AS (
+                SELECT value, 0 FROM json_each(?)
+              UNION
+                SELECT CASE WHEN r.src_entity_id = reachable.eid
+                            THEN r.dst_entity_id ELSE r.src_entity_id END,
+                       reachable.depth + 1
+                FROM kb_relations r
+                JOIN reachable
+                  ON (r.src_entity_id = reachable.eid OR r.dst_entity_id = reachable.eid)
+                WHERE reachable.depth < ? AND r.agent = ? AND r.tenant_id = ?
+            )
+            SELECT DISTINCT eid FROM reachable
+            """,
+            (json.dumps(entity_ids), int(hops), agent, tenant_id),
+        ) as cur:
+            reachable = [r[0] for r in await cur.fetchall()]
+        if not reachable:
+            return Subgraph(entities=[], relations=[])
+        # Edges with both endpoints reachable, strongest first, budget-capped.
+        ph = ",".join("?" * len(reachable))
+        async with self._db.execute(
+            f"""
+            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
+                   type, description, weight, content_hash, source_chunk_ids,
+                   metadata, created_at
+            FROM kb_relations
+            WHERE agent = ? AND tenant_id = ?
+              AND src_entity_id IN ({ph}) AND dst_entity_id IN ({ph})
+            ORDER BY weight DESC, relation_id LIMIT ?
+            """,
+            (agent, tenant_id, *reachable, *reachable, int(limit)),
+        ) as cur:
+            relations = [_row_to_relation(r) for r in await cur.fetchall()]
+        keep = set(entity_ids)
+        for rel in relations:
+            keep.add(rel.src_entity_id)
+            keep.add(rel.dst_entity_id)
+        keep_ph = ",".join("?" * len(keep))
+        async with self._db.execute(
+            f"""
+            SELECT entity_id, tenant_id, agent, name, type, description,
+                   embedding, embedding_model, content_hash, source_chunk_ids,
+                   metadata, created_at
+            FROM kb_entities
+            WHERE agent = ? AND tenant_id = ? AND entity_id IN ({keep_ph})
+            """,
+            (agent, tenant_id, *keep),
+        ) as cur:
+            entities = [_row_to_entity(r) for r in await cur.fetchall()]
+        return Subgraph(entities=entities, relations=relations)
+
+    async def get_entity(self, entity_id: str, *, tenant_id: str) -> Entity | None:
+        async with self._db.execute(
+            """
+            SELECT entity_id, tenant_id, agent, name, type, description,
+                   embedding, embedding_model, content_hash, source_chunk_ids,
+                   metadata, created_at
+            FROM kb_entities WHERE entity_id = ? AND tenant_id = ?
+            """,
+            (entity_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_entity(row) if row is not None else None
+
+    async def list_entities(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source_chunk_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[Entity]:
+        async with self._db.execute(
+            """
+            SELECT entity_id, tenant_id, agent, name, type, description,
+                   embedding, embedding_model, content_hash, source_chunk_ids,
+                   metadata, created_at
+            FROM kb_entities WHERE agent = ? AND tenant_id = ?
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (agent, tenant_id, int(limit)),
+        ) as cur:
+            entities = [_row_to_entity(r) for r in await cur.fetchall()]
+        if source_chunk_id is not None:
+            entities = [e for e in entities if source_chunk_id in e.source_chunk_ids]
+        return entities
+
+    async def list_relations(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[Relation]:
+        async with self._db.execute(
+            """
+            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
+                   type, description, weight, content_hash, source_chunk_ids,
+                   metadata, created_at
+            FROM kb_relations WHERE agent = ? AND tenant_id = ?
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (agent, tenant_id, int(limit)),
+        ) as cur:
+            return [_row_to_relation(r) for r in await cur.fetchall()]
+
+    async def delete_graph(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        if source is None:
+            async with self._db.execute(
+                "DELETE FROM kb_entities WHERE agent = ? AND tenant_id = ?",
+                (agent, tenant_id),
+            ) as cur:
+                count = int(cur.rowcount or 0)
+            async with self._db.execute(
+                "DELETE FROM kb_relations WHERE agent = ? AND tenant_id = ?",
+                (agent, tenant_id),
+            ) as cur:
+                count += int(cur.rowcount or 0)
+            await self._db.commit()
+            return count
+        # Per-source delete: drop rows whose provenance is SOLELY this
+        # source (source_chunk_ids ⊆ that source's chunks). Multi-source
+        # rows survive — load + filter in Python (same bounded-scale
+        # approach as the cosine path).
+        async with self._db.execute(
+            "SELECT chunk_id FROM kb_chunks WHERE agent = ? AND tenant_id = ? AND source = ?",
+            (agent, tenant_id, source),
+        ) as cur:
+            chunk_ids = {r[0] for r in await cur.fetchall()}
+
+        def _solely_from_source(ids: list[str]) -> bool:
+            return bool(ids) and set(ids) <= chunk_ids
+
+        entities = await self.list_entities(agent=agent, tenant_id=tenant_id, limit=10**9)
+        relations = await self.list_relations(agent=agent, tenant_id=tenant_id, limit=10**9)
+        doomed_entities = [e.entity_id for e in entities if _solely_from_source(e.source_chunk_ids)]
+        doomed_relations = [
+            r.relation_id for r in relations if _solely_from_source(r.source_chunk_ids)
+        ]
+        for entity_id in doomed_entities:
+            await self._db.execute("DELETE FROM kb_entities WHERE entity_id = ?", (entity_id,))
+        for relation_id in doomed_relations:
+            await self._db.execute("DELETE FROM kb_relations WHERE relation_id = ?", (relation_id,))
+        await self._db.commit()
+        return len(doomed_entities) + len(doomed_relations)
 
     async def search_kb_chunks_lexical(
         self,

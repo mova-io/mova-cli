@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 
-from movate.core.models import KbChunk, KbChunkWithScore
+from movate.core.models import Entity, EntityWithScore, KbChunk, KbChunkWithScore
 
 
 def rank_chunks_by_cosine(
@@ -51,3 +51,38 @@ def rank_chunks_by_cosine(
 # Legacy alias — postgres.py previously defined this as a private
 # function and sqlite.py imported it under the old name.
 _rank_chunks_by_cosine = rank_chunks_by_cosine
+
+
+def rank_entities_by_cosine(
+    entities: list[Entity], query: list[float], limit: int
+) -> list[EntityWithScore]:
+    """Score every entity against ``query`` by cosine similarity and
+    return the top ``limit`` descending — the GraphRAG vector-seed step.
+
+    Identical ranking semantics to :func:`rank_chunks_by_cosine` (shared
+    so the seed step and chunk retrieval can never diverge); only the
+    record type differs. A dim mismatch raises ``ValueError`` for the
+    same reason — a query embedded with a different model than the graph
+    would otherwise return garbage scores.
+    """
+    if not entities:
+        return []
+    q_norm = math.sqrt(sum(x * x for x in query))
+    if q_norm == 0.0:
+        return []
+    scored: list[EntityWithScore] = []
+    for e in entities:
+        if len(e.embedding) != len(query):
+            raise ValueError(
+                f"embedding dim mismatch: entity {e.entity_id} is "
+                f"{len(e.embedding)}-dim but query is {len(query)}-dim. "
+                f"Re-embed the query with {e.embedding_model!r} or "
+                f"re-ingest the graph with the query's model."
+            )
+        e_norm = math.sqrt(sum(x * x for x in e.embedding))
+        if e_norm == 0.0:
+            continue  # zero-vector entity (shouldn't happen) — skip
+        dot = sum(a * b for a, b in zip(e.embedding, query, strict=True))
+        scored.append(EntityWithScore(entity=e, score=dot / (q_norm * e_norm)))
+    scored.sort(key=lambda s: s.score, reverse=True)
+    return scored[: int(limit)]

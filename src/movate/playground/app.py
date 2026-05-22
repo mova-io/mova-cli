@@ -113,9 +113,9 @@ async def start() -> None:
     actions = [
         cl.Action(
             name="pick_agent",
-            value=a.get("name", ""),
+            payload={"value": a.get("name", "")},
             label=f"{a.get('name', '?')} · v{a.get('version', '?')}",
-            description=a.get("description", "")[:120],
+            tooltip=a.get("description", "")[:120],
         )
         for a in agents
     ]
@@ -139,7 +139,7 @@ async def on_pick_agent(action: cl.Action) -> None:
     a thread.
     """
     client: PlaygroundClient = cl.user_session.get("client")
-    agent_name = action.value
+    agent_name = action.payload.get("value")
     cl.user_session.set("agent_name", agent_name)
     # Clear any thread from a prior agent's session — a fresh pick
     # starts in single-shot mode until the operator explicitly picks
@@ -186,9 +186,9 @@ async def on_pick_agent(action: cl.Action) -> None:
         actions=[
             cl.Action(
                 name="upload_kb",
-                value=agent_name,
+                payload={"value": agent_name},
                 label="📎 Upload KB file",
-                description="Add a document to this agent's knowledge base",
+                tooltip="Add a document to this agent's knowledge base",
             ),
         ],
     ).send()
@@ -206,9 +206,9 @@ async def on_pick_agent(action: cl.Action) -> None:
     actions: list = [
         cl.Action(
             name="new_thread",
-            value=agent_name,
+            payload={"value": agent_name},
             label="+ New thread",
-            description="Start a fresh multi-turn conversation",
+            tooltip="Start a fresh multi-turn conversation",
         ),
     ]
     if threads:
@@ -219,9 +219,9 @@ async def on_pick_agent(action: cl.Action) -> None:
             actions.append(
                 cl.Action(
                     name="resume_thread",
-                    value=t["thread_id"],
+                    payload={"value": t["thread_id"]},
                     label=f"📜 {label}",
-                    description=f"Resume thread {t['thread_id'][:8]}…",
+                    tooltip=f"Resume thread {t['thread_id'][:8]}…",
                 )
             )
     await cl.Message(
@@ -240,7 +240,7 @@ async def on_new_thread(action: cl.Action) -> None:
     """Operator clicked "New thread" — open one + tell them subsequent
     messages will go via /api/v1/threads/{id}/messages."""
     client: PlaygroundClient = cl.user_session.get("client")
-    agent_name = action.value or cl.user_session.get("agent_name")
+    agent_name = action.payload.get("value") or cl.user_session.get("agent_name")
     if not agent_name or not client:
         await cl.Message(content="Pick an agent first from the buttons above.").send()
         return
@@ -265,7 +265,7 @@ async def on_resume_thread(action: cl.Action) -> None:
     """Operator picked an existing thread — bind it + show prior turns
     so they have visual continuity before sending the next message."""
     client: PlaygroundClient = cl.user_session.get("client")
-    thread_id = action.value
+    thread_id = action.payload.get("value")
     if not thread_id or not client:
         await cl.Message(content="Couldn't bind thread — pick an agent first.").send()
         return
@@ -308,7 +308,7 @@ async def on_upload_kb(action: cl.Action) -> None:
     """Operator clicked "Upload KB file" — prompt for a file picker,
     then POST it to the runtime's KB ingest endpoint."""
     client: PlaygroundClient = cl.user_session.get("client")
-    agent_name = action.value or cl.user_session.get("agent_name")
+    agent_name = action.payload.get("value") or cl.user_session.get("agent_name")
     if not agent_name or not client:
         await cl.Message(content="Pick an agent first from the buttons above.").send()
         return
@@ -460,8 +460,8 @@ async def on_message(message: cl.Message) -> None:
     await cl.Message(
         content=body,
         actions=[
-            cl.Action(name="feedback", value="up", label="👍 Helpful"),
-            cl.Action(name="feedback", value="down", label="👎 Not helpful"),
+            cl.Action(name="feedback", payload={"value": "up"}, label="👍 Helpful"),
+            cl.Action(name="feedback", payload={"value": "down"}, label="👎 Not helpful"),
         ],
     ).send()
 
@@ -476,7 +476,7 @@ async def on_feedback(action: cl.Action) -> None:
         await cl.Message(content="No run to attach feedback to. Run something first.").send()
         return
 
-    score = 1 if action.value == "up" else -1
+    score = 1 if action.payload.get("value") == "up" else -1
 
     # Ask for an optional comment before persisting. Cancel-friendly:
     # if the operator declines, we still save the thumbs.

@@ -29,6 +29,8 @@ from typing import Protocol
 from movate.core.models import (
     ApiKeyRecord,
     ConversationThread,
+    Entity,
+    EntityWithScore,
     EvalRecord,
     FailureRecord,
     FeedbackRecord,
@@ -36,7 +38,9 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    Relation,
     RunRecord,
+    Subgraph,
     TenantBudget,
     WorkflowRunRecord,
 )
@@ -466,5 +470,121 @@ class StorageProvider(Protocol):
         is fine — operators delete a thread when they don't want to
         see it anymore, not when they want to nuke the historical
         runs themselves)."""
+
+    # ------------------------------------------------------------------
+    # Knowledge graph (GraphRAG) — entities + relations layered over the
+    # KB chunks. Storage mirrors kb_chunks: embeddings as JSONB/TEXT float
+    # arrays, cosine in Python (pgvector swap stays behind this surface).
+    # The ONLY traversal primitive exposed is ``expand_neighbors`` (bounded
+    # k-hop) — no raw query language crosses the Protocol boundary, so a
+    # future Neo4jProvider implements the same contract without leaking
+    # Cypher to callers.
+    # ------------------------------------------------------------------
+
+    async def upsert_entity(self, entity: Entity) -> None:
+        """Persist an :class:`Entity`. Upsert on ``(agent, tenant_id,
+        content_hash)``: re-ingesting the same corpus refreshes
+        ``description`` / ``embedding`` / ``embedding_model`` / ``metadata``
+        and UNIONs ``source_chunk_ids`` in place rather than duplicating
+        the node. The dedup key is ``content_hash`` (SHA-256 of normalized
+        name+type), so two extractions of the same real-world entity
+        collapse to one row."""
+
+    async def upsert_relation(self, relation: Relation) -> None:
+        """Persist a :class:`Relation`. Upsert on ``(agent, tenant_id,
+        content_hash)``; UNIONs ``source_chunk_ids`` on conflict.
+
+        The caller MUST upsert both endpoint entities before the relation —
+        the storage layer does not auto-create dangling endpoints. It does
+        not enforce referential integrity either (no FK): an edge whose
+        endpoint was deleted simply never appears in an expansion because
+        the join drops it. Keeps the write path cheap and backend-portable."""
+
+    async def search_entities(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 10,
+    ) -> list[EntityWithScore]:
+        """Top-K most-similar entities for the agent's graph — the vector
+        SEED step of GraphRAG retrieval.
+
+        Same primitive as :meth:`search_kb_chunks`: load entities matching
+        ``(agent, tenant_id)``, compute cosine against ``query_embedding``
+        in Python, return the top ``limit``. Empty graph returns ``[]``.
+        Callers feed the resulting ``entity_id``s into
+        :meth:`expand_neighbors`."""
+
+    async def expand_neighbors(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        entity_ids: list[str],
+        hops: int = 1,
+        limit: int = 50,
+    ) -> Subgraph:
+        """Bounded k-hop expansion from ``entity_ids`` — the ONLY traversal
+        primitive. Returns the reached entities (including the seeds) plus
+        every relation traversed, as a flat :class:`Subgraph`.
+
+        ``hops`` caps traversal depth; ``limit`` caps the total number of
+        relations followed (the budget guard against a hub node exploding
+        the result). Edges are followed in descending ``weight`` order so a
+        truncated expansion keeps the strongest relationships. Traversal is
+        undirected for reachability (an edge connects its endpoints both
+        ways) — direction is preserved in the returned ``Relation`` rows for
+        the caller to interpret.
+
+        Implementations: recursive CTE over ``kb_relations`` on sqlite /
+        postgres; breadth-first walk in :class:`InMemoryStorage`. Unknown or
+        cross-tenant ``entity_ids`` contribute nothing rather than raising —
+        same no-leak contract as the single-record getters. Empty
+        ``entity_ids`` → empty :class:`Subgraph`."""
+
+    async def get_entity(self, entity_id: str, *, tenant_id: str) -> Entity | None:
+        """Exact lookup by entity_id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the entity belongs to a different
+        tenant — same 404-not-403 shape as every other single-record
+        getter, so a caller can't probe for other tenants' nodes."""
+
+    async def list_entities(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source_chunk_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[Entity]:
+        """List entities for inspection / debugging. When ``source_chunk_id``
+        is set, returns only entities extracted from that chunk (drives
+        provenance views — "what did this passage contribute to the
+        graph?"). Filters AND together. Empty graph → ``[]``."""
+
+    async def list_relations(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[Relation]:
+        """List relations for inspection / debugging, scoped to
+        ``(agent, tenant_id)``. Empty graph → ``[]``."""
+
+    async def delete_graph(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        """Delete an agent's graph, scoped to ``tenant_id``. When ``source``
+        is set, removes only entities/relations whose ``source_chunk_ids``
+        trace to chunks from that source URI (the per-source re-ingest
+        workflow, mirroring :meth:`delete_kb_chunks`). Returns the total
+        rows deleted (entities + relations)."""
 
     async def close(self) -> None: ...

@@ -2070,5 +2070,173 @@ class KbChunkWithScore(BaseModel):
     )
 
 
+class Entity(BaseModel):
+    """A node in an agent's knowledge graph (GraphRAG).
+
+    Extracted from KB chunks by ``mdk kb ingest --build-graph`` and used
+    as the seed for graph-augmented retrieval. Same per-agent + per-tenant
+    scoping as :class:`KbChunk`; the graph is an index layered over the
+    same corpus, not a separate store.
+
+    Storage strategy mirrors :class:`KbChunk`: ``embedding`` persisted as a
+    plain float array (JSONB on Postgres, JSON-encoded TEXT on sqlite),
+    cosine computed in Python at query time so the pgvector swap is the
+    only future diff. ``source_chunk_ids`` links each entity back to the
+    chunks it was extracted from so GraphRAG answers can cite source.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: str = Field(default_factory=lambda: uuid4().hex)
+    """Stable id; doubles as the table primary key and the edge endpoint
+    referenced by :class:`Relation`."""
+
+    tenant_id: str
+    """Tenant that owns the entity. Same scoping convention as KbChunk —
+    never list / search / expand across tenants."""
+
+    agent: str
+    """Which agent's KB graph this entity belongs to. One graph per agent,
+    matching the one-KB-per-agent model."""
+
+    name: str
+    """Canonical surface form of the entity (e.g. ``"SAML SSO"``). The
+    extraction pipeline normalizes aliases to one canonical name so the
+    same real-world entity dedups to a single node."""
+
+    type: str
+    """Free-form entity type from extraction (e.g. ``"Policy"``,
+    ``"Product"``, ``"Tier"``). Not an enum — the taxonomy is corpus-
+    dependent and the LLM picks it; callers treat it as an opaque label."""
+
+    description: str | None = None
+    """LLM-generated summary of the entity, aggregated across the chunks
+    it appears in. Surfaced in the assembled graph context at retrieval
+    time. Optional — a bare node (name+type) is valid."""
+
+    embedding: list[float]
+    """Vector representation of ``name`` (+ ``description`` when present),
+    same producer model as the chunk embeddings. The seed primitive:
+    ``search_entities`` ranks by cosine against this."""
+
+    embedding_model: str
+    """Model identifier that produced ``embedding``. Query embeddings MUST
+    use the same model — different models are incomparable vector spaces
+    (same contract as KbChunk)."""
+
+    content_hash: str
+    """SHA-256 of the normalized ``(name, type)``. Combined with
+    ``(agent, tenant_id)`` forms the dedup key — re-ingesting the same
+    corpus upserts entities in place rather than duplicating nodes."""
+
+    source_chunk_ids: list[str] = Field(default_factory=list)
+    """``KbChunk.chunk_id`` values this entity was extracted from. Drives
+    citation provenance: a GraphRAG answer can trace each node back to the
+    source passages. Not part of the dedup key — merged (union) across
+    re-ingests."""
+
+    metadata: dict[str, Any] | None = None
+    """Optional source-document attributes (e.g. salience, mention count).
+    Not part of the dedup key."""
+
+    created_at: datetime = Field(default_factory=_now)
+
+
+class Relation(BaseModel):
+    """A directed edge between two :class:`Entity` nodes in an agent's
+    knowledge graph.
+
+    The traversal substrate for ``expand_neighbors``. Endpoints reference
+    :class:`Entity.entity_id`; the caller upserts both endpoint entities
+    before the relation (the storage layer does not create dangling
+    endpoints). Same per-agent + per-tenant scoping as the rest of the KB.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    relation_id: str = Field(default_factory=lambda: uuid4().hex)
+    """Stable id; table primary key."""
+
+    tenant_id: str
+    """Tenant that owns the edge. Never traverse across tenants."""
+
+    agent: str
+    """Which agent's KB graph this edge belongs to."""
+
+    src_entity_id: str
+    """``Entity.entity_id`` of the edge's source (tail) node."""
+
+    dst_entity_id: str
+    """``Entity.entity_id`` of the edge's destination (head) node."""
+
+    type: str
+    """Free-form predicate from extraction (e.g. ``"REQUIRES"``,
+    ``"SUPERSEDES"``, ``"PART_OF"``). Opaque label like ``Entity.type``."""
+
+    description: str | None = None
+    """Evidence / rationale sentence the LLM extracted the edge from.
+    Surfaced in the assembled graph context for grounding."""
+
+    weight: float = 1.0
+    """Extraction confidence / co-occurrence strength in ``[0, 1]``-ish
+    range (not hard-bounded). ``expand_neighbors`` orders traversal by
+    descending weight so the budget spends on the strongest edges first."""
+
+    content_hash: str
+    """SHA-256 of the normalized ``(src_entity_id, dst_entity_id, type)``.
+    Combined with ``(agent, tenant_id)`` forms the dedup key — re-ingesting
+    upserts the edge in place."""
+
+    source_chunk_ids: list[str] = Field(default_factory=list)
+    """``KbChunk.chunk_id`` values this edge was extracted from. Citation
+    provenance, unioned across re-ingests. Not part of the dedup key."""
+
+    metadata: dict[str, Any] | None = None
+    """Optional edge attributes. Not part of the dedup key."""
+
+    created_at: datetime = Field(default_factory=_now)
+
+
+class EntityWithScore(BaseModel):
+    """A retrieved :class:`Entity` plus its similarity score.
+
+    Returned by ``search_entities`` — the vector-seed step of GraphRAG.
+    Mirrors :class:`KbChunkWithScore`: the score is cosine similarity
+    against the query embedding, used to threshold / rank seed nodes
+    before expansion.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity: Entity
+    score: float = Field(
+        ...,
+        ge=-1.0,
+        le=1.0,
+        description="Cosine similarity. Higher = closer match. 1.0 = identical.",
+    )
+
+
+class Subgraph(BaseModel):
+    """The result of ``expand_neighbors``: the entities reached and the
+    relations traversed during a bounded k-hop expansion.
+
+    Deliberately a flat pair of lists rather than an adjacency structure —
+    the retrieval layer assembles its own context string from these, and a
+    flat shape maps cleanly onto every backend (relational rows, in-memory
+    dicts, a future Neo4j result) without leaking traversal mechanics.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entities: list[Entity]
+    """All distinct entities in the expanded subgraph, including the seed
+    nodes the expansion started from."""
+
+    relations: list[Relation]
+    """All distinct edges traversed to reach ``entities``. Every edge's
+    ``src_entity_id`` / ``dst_entity_id`` is present in ``entities``."""
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

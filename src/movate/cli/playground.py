@@ -68,6 +68,32 @@ def _ensure_chainlit_installed() -> None:
         raise typer.Exit(code=2) from None
 
 
+def _warn_if_unstable_python() -> None:
+    """Soft-warn on Python 3.14, where the chat UI hits NoEventLoopError.
+
+    On CPython 3.14 chainlit's async stack (starlette FileResponse →
+    anyio.to_thread.run_sync → sniffio) fails because sniffio 1.3.1
+    can't detect the asyncio event loop, raising ``anyio.NoEventLoopError``
+    the first time a request hits the UI (e.g. serving static files).
+    Startup looks fine, so the failure is baffling without this hint.
+
+    ``uv tool install`` picks the newest interpreter by default, so
+    operators land on 3.14 without choosing it. We warn rather than
+    hard-exit: a future sniffio/anyio release may add 3.14 support, and
+    blocking launch outright would strand them once it does.
+    """
+    if sys.version_info < (3, 14):
+        return
+    err.print(
+        "[yellow]⚠[/yellow] The playground's chat UI is unstable on "
+        "Python 3.14 (chainlit/sniffio cannot detect the asyncio event "
+        "loop, causing anyio.NoEventLoopError when serving the UI). "
+        "Reinstall mdk on Python 3.13:\n  "
+        "[bold]uv tool install --reinstall --python 3.13 "
+        "'movate-cli\\[playground]'[/bold]"
+    )
+
+
 @playground_app.command("serve")
 def serve(
     runtime_url: str = typer.Option(
@@ -127,6 +153,7 @@ def serve(
     Postgres (and pushes to Langfuse if configured).
     """
     _ensure_chainlit_installed()
+    _warn_if_unstable_python()
 
     # Chainlit reads its config from env vars + CLI flags. We export
     # the runtime config under MDK_PLAYGROUND_* so the app module

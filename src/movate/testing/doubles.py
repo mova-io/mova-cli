@@ -14,6 +14,8 @@ from typing import Any
 from movate.core.models import (
     ApiKeyRecord,
     ConversationThread,
+    Entity,
+    EntityWithScore,
     EvalRecord,
     FailureRecord,
     FeedbackRecord,
@@ -21,7 +23,9 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    Relation,
     RunRecord,
+    Subgraph,
     TenantBudget,
     WorkflowRunRecord,
 )
@@ -53,6 +57,8 @@ class InMemoryStorage:
         self.tenant_budgets: dict[str, TenantBudget] = {}
         self.feedback: list[FeedbackRecord] = []
         self.kb_chunks: list[KbChunk] = []
+        self.entities: list[Entity] = []
+        self.relations: list[Relation] = []
         self.conversation_threads: list[ConversationThread] = []
 
     async def init(self) -> None:
@@ -424,6 +430,171 @@ class InMemoryStorage:
             )
         ]
         return before - len(self.kb_chunks)
+
+    # ------------------------------------------------------------------
+    # Knowledge graph (GraphRAG) — entities + relations. BFS expansion
+    # in Python; the SQL backends use a recursive CTE for the same result.
+    # ------------------------------------------------------------------
+
+    async def upsert_entity(self, entity: Entity) -> None:
+        key = (entity.agent, entity.tenant_id, entity.content_hash)
+        for i, existing in enumerate(self.entities):
+            if (existing.agent, existing.tenant_id, existing.content_hash) == key:
+                merged = sorted(set(existing.source_chunk_ids) | set(entity.source_chunk_ids))
+                self.entities[i] = entity.model_copy(
+                    update={"entity_id": existing.entity_id, "source_chunk_ids": merged}
+                )
+                return
+        self.entities.append(entity)
+
+    async def upsert_relation(self, relation: Relation) -> None:
+        key = (relation.agent, relation.tenant_id, relation.content_hash)
+        for i, existing in enumerate(self.relations):
+            if (existing.agent, existing.tenant_id, existing.content_hash) == key:
+                merged = sorted(set(existing.source_chunk_ids) | set(relation.source_chunk_ids))
+                self.relations[i] = relation.model_copy(
+                    update={"relation_id": existing.relation_id, "source_chunk_ids": merged}
+                )
+                return
+        self.relations.append(relation)
+
+    async def search_entities(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        query_embedding: list[float],
+        limit: int = 10,
+    ) -> list[EntityWithScore]:
+        from movate.storage._cosine import rank_entities_by_cosine  # noqa: PLC0415
+
+        ents = [e for e in self.entities if e.agent == agent and e.tenant_id == tenant_id]
+        return rank_entities_by_cosine(ents, query_embedding, limit)
+
+    async def expand_neighbors(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        entity_ids: list[str],
+        hops: int = 1,
+        limit: int = 50,
+    ) -> Subgraph:
+        if not entity_ids:
+            return Subgraph(entities=[], relations=[])
+        rels = [r for r in self.relations if r.agent == agent and r.tenant_id == tenant_id]
+        # Breadth-first reachability bounded by ``hops`` (undirected for
+        # reachability; edge direction preserved in the returned rows).
+        reachable: set[str] = set(entity_ids)
+        frontier: set[str] = set(entity_ids)
+        for _ in range(max(0, hops)):
+            nxt: set[str] = set()
+            for r in rels:
+                if r.src_entity_id in frontier and r.dst_entity_id not in reachable:
+                    nxt.add(r.dst_entity_id)
+                if r.dst_entity_id in frontier and r.src_entity_id not in reachable:
+                    nxt.add(r.src_entity_id)
+            if not nxt:
+                break
+            reachable |= nxt
+            frontier = nxt
+        # Edges with both endpoints reachable, strongest first, budget-capped.
+        internal = [
+            r for r in rels if r.src_entity_id in reachable and r.dst_entity_id in reachable
+        ]
+        internal.sort(key=lambda r: r.weight, reverse=True)
+        returned = internal[: int(limit)]
+        keep_ids = (
+            set(entity_ids)
+            | {r.src_entity_id for r in returned}
+            | {r.dst_entity_id for r in returned}
+        )
+        ents = [
+            e
+            for e in self.entities
+            if e.agent == agent and e.tenant_id == tenant_id and e.entity_id in keep_ids
+        ]
+        return Subgraph(entities=ents, relations=returned)
+
+    async def get_entity(self, entity_id: str, *, tenant_id: str) -> Entity | None:
+        return next(
+            (e for e in self.entities if e.entity_id == entity_id and e.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_entities(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source_chunk_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[Entity]:
+        rows = [e for e in self.entities if e.agent == agent and e.tenant_id == tenant_id]
+        if source_chunk_id is not None:
+            rows = [e for e in rows if source_chunk_id in e.source_chunk_ids]
+        rows = sorted(rows, key=lambda e: e.created_at, reverse=True)
+        return rows[: int(limit)]
+
+    async def list_relations(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[Relation]:
+        rows = [r for r in self.relations if r.agent == agent and r.tenant_id == tenant_id]
+        rows = sorted(rows, key=lambda r: r.created_at, reverse=True)
+        return rows[: int(limit)]
+
+    async def delete_graph(
+        self,
+        *,
+        agent: str,
+        tenant_id: str,
+        source: str | None = None,
+    ) -> int:
+        if source is None:
+            before = len(self.entities) + len(self.relations)
+            self.entities = [
+                e for e in self.entities if not (e.agent == agent and e.tenant_id == tenant_id)
+            ]
+            self.relations = [
+                r for r in self.relations if not (r.agent == agent and r.tenant_id == tenant_id)
+            ]
+            return before - len(self.entities) - len(self.relations)
+        # Per-source delete: drop graph rows whose provenance is SOLELY the
+        # given source (subset of that source's chunks). Multi-source rows
+        # survive — matches the SQL backends.
+        chunk_ids = {
+            c.chunk_id
+            for c in self.kb_chunks
+            if c.agent == agent and c.tenant_id == tenant_id and c.source == source
+        }
+
+        def solely_from_source(ids: list[str]) -> bool:
+            return bool(ids) and set(ids) <= chunk_ids
+
+        before = len(self.entities) + len(self.relations)
+        self.entities = [
+            e
+            for e in self.entities
+            if not (
+                e.agent == agent
+                and e.tenant_id == tenant_id
+                and solely_from_source(e.source_chunk_ids)
+            )
+        ]
+        self.relations = [
+            r
+            for r in self.relations
+            if not (
+                r.agent == agent
+                and r.tenant_id == tenant_id
+                and solely_from_source(r.source_chunk_ids)
+            )
+        ]
+        return before - len(self.entities) - len(self.relations)
 
     # ------------------------------------------------------------------
     # Conversation threads (PR-N) — multi-turn agent foundation.
