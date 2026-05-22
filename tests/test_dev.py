@@ -174,3 +174,72 @@ def test_test_deployed_action_skips_without_target(
 
     assert dc._test_deployed_action(agent_dir, "hello", None) is None
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Action: ingest knowledge base (the `k` key)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_ingest_kb_action_ingests_to_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`k` shells out to `kb ingest <agent> <path> --target <env>` and
+    remembers the target."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    kb_dir = agent_dir / "kb"
+    kb_dir.mkdir()
+    (kb_dir / "faq.md").write_text("# faq")
+    # Path defaults to agents/<name>/kb/ — accept the default by returning "".
+    monkeypatch.setattr(dc.Prompt, "ask", staticmethod(lambda *a, **k: str(kb_dir)))
+
+    out = dc._ingest_kb_action("demo", agent_dir, "prod")
+
+    assert out == "prod"  # target remembered
+    assert calls and calls[0][1:3] == ["kb", "ingest"]
+    assert "demo" in calls[0]
+    assert str(kb_dir) in calls[0]
+    assert "--target" in calls[0] and "prod" in calls[0]
+
+
+@pytest.mark.unit
+def test_ingest_kb_action_local_when_no_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No target → ingest into the local store (no --target flag)."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(dc, "_ensure_target", lambda target, *, purpose: None)
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    kb_dir = agent_dir / "kb"
+    kb_dir.mkdir()
+    (kb_dir / "faq.md").write_text("# faq")
+    monkeypatch.setattr(dc.Prompt, "ask", staticmethod(lambda *a, **k: str(kb_dir)))
+
+    out = dc._ingest_kb_action("demo", agent_dir, None)
+
+    assert out is None
+    assert calls and calls[0][1:3] == ["kb", "ingest"]
+    assert "--target" not in calls[0]
+
+
+@pytest.mark.unit
+def test_ingest_kb_action_skips_missing_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path that doesn't exist → no subprocess; target preserved."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    monkeypatch.setattr(dc.Prompt, "ask", staticmethod(lambda *a, **k: str(tmp_path / "nope")))
+
+    out = dc._ingest_kb_action("demo", agent_dir, "prod")
+
+    assert out == "prod"
+    assert calls == []

@@ -155,6 +155,18 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "key-storage issues directly."
         ),
     ),
+    with_kb: bool = typer.Option(
+        False,
+        "--with-kb",
+        help=(
+            "Agents-mode only. After a successful deploy, also ingest each "
+            "deployed agent's bundled [bold]agents/<name>/kb/[/bold] directory "
+            "to the target runtime — deploy ships the prompt + contexts, but "
+            "the knowledge base is otherwise a separate [bold]mdk kb ingest[/bold] "
+            "step. Agents without a non-empty kb/ dir are skipped. No effect "
+            "under --dry-run / --diff."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -200,6 +212,8 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         error(f"--mode must be 'auto', 'runtime', or 'agents'; got {mode!r}")
         raise typer.Exit(code=2)
     resolved_mode = _resolve_deploy_mode(mode=mode, cwd=Path.cwd())
+    if with_kb and resolved_mode != "agents":
+        hint("--with-kb only applies to agents-mode deploys; ignoring.")
     if resolved_mode == "agents":
         if status:
             _deploy_status(target=target)
@@ -209,6 +223,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             dry_run=dry_run,
             diff=diff,
             auto_recover=not no_auto_recover,
+            with_kb=with_kb,
         )
         return
 
@@ -589,6 +604,7 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     dry_run: bool,
     diff: bool = False,
     auto_recover: bool = True,
+    with_kb: bool = False,
 ) -> None:
     """Upload every agent under ``<project>/agents/*/`` to the deployed
     runtime via ``POST /api/v1/agents``.
@@ -919,6 +935,18 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             key_env=target_cfg.key_env,
         )
 
+    # --with-kb: sync each uploaded agent's bundled kb/ directory to the
+    # target. Deploy ships the prompt + contexts; the knowledge base is
+    # otherwise a separate `mdk kb ingest` step, so this closes that gap
+    # for the common "bundle docs alongside the agent" case. Only on a
+    # clean deploy, and only for agents that actually ship a non-empty kb/.
+    if with_kb and ok and uploaded and not dry_run:
+        _ingest_bundled_kb(
+            uploaded=uploaded,
+            project_root=project_root,
+            target_name=target_name,
+        )
+
     err.print(
         f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
         f"agents={len(agent_dirs)} uploaded={len(uploaded)} "
@@ -928,6 +956,44 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     )
     if not ok:
         raise typer.Exit(code=2)
+
+
+def _ingest_bundled_kb(
+    *,
+    uploaded: list[str],
+    project_root: Path,
+    target_name: str,
+) -> None:
+    """Ingest each uploaded agent's ``agents/<name>/kb/`` dir to the target.
+
+    Shells out to ``mdk kb ingest <name> <kb_dir> --target <target>`` — reuses
+    the standalone ingest path (chunk → embed → POST to the runtime) rather
+    than duplicating it. Agents with no kb/ dir, or an empty one, are skipped
+    silently. A failed ingest is non-fatal: the deploy already succeeded, so
+    we warn and move on rather than unwinding a live rollout.
+    """
+    from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
+    for name in uploaded:
+        kb_dir = project_root / "agents" / name / "kb"
+        if not kb_dir.is_dir() or not any(p.is_file() for p in kb_dir.rglob("*")):
+            continue
+        argv = [bin_name, "kb", "ingest", name, str(kb_dir), "--target", target_name]
+        err.print(f"\n[dim]$ {' '.join(argv)}[/dim]")
+        try:
+            result = subprocess.run(argv, check=False)
+        except FileNotFoundError:
+            err.print(
+                f"[yellow]⚠[/yellow] couldn't run [bold]{bin_name}[/bold] for KB "
+                f"ingest of [bold]{name}[/bold] — run it manually."
+            )
+            continue
+        if result.returncode != 0:
+            err.print(
+                f"[yellow]⚠[/yellow] KB ingest for [bold]{name}[/bold] exited "
+                f"{result.returncode} (deploy itself succeeded)."
+            )
 
 
 def _bearer_shell_expr(key_env: str) -> str:

@@ -11,6 +11,19 @@ The ``storage`` fixture yields a freshly-initialized
 
 Tests opt in via ``def test_x(storage): ...`` and get the test
 parametrized over all three backends automatically.
+
+Test-authoring conventions
+---------------------------
+* **Warnings / deprecations: assert via ``caplog``, not ``capsys``.**
+  movate emits deprecation and warning messages through the stdlib
+  ``logging`` module (e.g. ``movate.core.config``), which pytest captures
+  in ``caplog`` — they do NOT go to stdout/stderr. Use
+  ``caplog.set_level(logging.WARNING)`` then assert on ``caplog.text``.
+  Asserting on ``capsys`` for these is the most common stale-test trap.
+* **``--json`` output is stdout-only.** Diagnostic lines (e.g. "memory
+  backend: …") must go to stderr so machine-readable stdout stays valid
+  JSON. Assert structured output by ``json.loads`` of stdout; route the
+  human-readable chatter to ``err_console``.
 """
 
 from __future__ import annotations
