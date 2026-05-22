@@ -84,6 +84,9 @@ there. See the API module param of the same name for full docs.
 ''')
 param agentsStorageName string = ''
 
+@description('Langfuse host URL (self-hosted). Empty string = the Langfuse SDK default (Cloud). Set by main.bicep to the self-hosted Langfuse app URL when deployLangfuse=true.')
+param langfuseHost string = ''
+
 @description('Common tags.')
 param tags object = {}
 
@@ -166,7 +169,7 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json(cpu)
             memory: memory
           }
-          env: [
+          env: concat([
             {
               name: 'MOVATE_DB_URL'
               value: 'postgresql://${postgresAdminUsername}:@${postgresFqdn}:5432/${postgresDatabase}?sslmode=require'
@@ -204,7 +207,14 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'MOVATE_AGENTS_PATH'
               value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'
             }
-          ]
+          ], empty(langfuseHost) ? [] : [
+            {
+              // Point tracing at the self-hosted Langfuse (omitted when
+              // empty so the SDK keeps its Cloud default).
+              name: 'LANGFUSE_HOST'
+              value: langfuseHost
+            }
+          ])
           volumeMounts: empty(agentsStorageName) ? [] : [
             {
               volumeName: 'agents-vol'

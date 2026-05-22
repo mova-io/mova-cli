@@ -79,6 +79,9 @@ Set this to ``'agents-vol'`` when ``useAzureFiles=true`` in main.bicep.
 ''')
 param agentsStorageName string = ''
 
+@description('Langfuse host URL (self-hosted). Empty string = the Langfuse SDK default (Cloud). Set by main.bicep to the self-hosted Langfuse app URL when deployLangfuse=true.')
+param langfuseHost string = ''
+
 @description('Common tags.')
 param tags object = {}
 
@@ -178,7 +181,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json(cpu)
             memory: memory
           }
-          env: [
+          env: concat([
             {
               name: 'MOVATE_DB_URL'
               // Constructed from the secret + non-secret components.
@@ -237,7 +240,14 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'MDK_CORS_ALLOWED_ORIGINS'
               value: corsAllowedOrigins
             }
-          ]
+          ], empty(langfuseHost) ? [] : [
+            {
+              // Point tracing at the self-hosted Langfuse (omitted when
+              // empty so the SDK keeps its Cloud default).
+              name: 'LANGFUSE_HOST'
+              value: langfuseHost
+            }
+          ])
           volumeMounts: empty(agentsStorageName) ? [] : [
             {
               volumeName: 'agents-vol'
