@@ -876,6 +876,46 @@ def _clear_remote(*, agent: str, target: str, source: str | None) -> None:
         console.print(f"[green]✓[/green] deleted {n} chunk(s) on [bold]{target_name}[/bold].")
 
 
+def _reindex_remote(*, agent: str, target: str, reembed: bool) -> None:
+    """``mdk kb reindex --target`` — rebuild a deployed agent's KB index.
+
+    Calls ``POST /api/v1/agents/<agent>/kb/reindex`` with the ``reembed``
+    flag in the body and reports what the runtime did. The runtime owns
+    both the re-embedding (server-side, with ITS embedding key) and the
+    index rebuild, so this path needs no local embedding key — just the
+    target's URL + bearer. The ``--reembed`` confirmation guard already
+    fired in the command body before this helper is reached.
+    """
+    # reembed re-runs the embedding model over every chunk server-side,
+    # so allow a generous timeout for large KBs.
+    timeout_s = 600.0 if reembed else 120.0
+    target_name, body = _remote_request(
+        method="POST",
+        target=target,
+        path=f"/api/v1/agents/{agent}/kb/reindex",
+        agent=agent,
+        json={"reembed": reembed},
+        timeout_s=timeout_s,
+    )
+    reembedded = int(body.get("chunks_reembedded", 0)) if isinstance(body, dict) else 0
+    index_rebuilt = bool(body.get("index_rebuilt", False)) if isinstance(body, dict) else False
+    backend = str(body.get("backend", "?")) if isinstance(body, dict) else "?"
+    if reembed:
+        console.print(
+            f"[green]✓[/green] re-embedded {reembedded} chunk(s) on [bold]{target_name}[/bold]."
+        )
+    if index_rebuilt:
+        console.print(
+            f"[green]✓[/green] rebuilt the vector index on [bold]{target_name}[/bold] "
+            f"[dim]({backend})[/dim]."
+        )
+    else:
+        console.print(
+            f"[dim]→ {backend} backend has no vector index to rebuild "
+            f"(brute-force search) — nothing to do.[/dim]"
+        )
+
+
 @kb_app.command("ingest")
 def ingest(
     agent: str | None = typer.Argument(
@@ -2600,5 +2640,169 @@ def clear(
             err_console.print("[yellow]⚠[/yellow] no chunks matched; nothing deleted.")
         else:
             console.print(f"[green]✓[/green] deleted {n} chunk(s).")
+
+    asyncio.run(_run())
+
+
+@kb_app.command("reindex")
+def reindex(
+    agent: str | None = typer.Argument(
+        None, help="Agent whose KB index to rebuild. Omit for picker."
+    ),
+    reembed: bool = typer.Option(
+        False,
+        "--reembed",
+        help=(
+            "Re-run the embedding model over EVERY stored chunk's text, "
+            "overwrite each vector, then rebuild the index. Expensive — "
+            "needs an embedding API key. Required when the embedding "
+            "model / dimension changes. Without this flag, reindex rebuilds "
+            "the index from the EXISTING stored vectors (no LLM calls, no key)."
+        ),
+    ),
+    model: str = typer.Option(
+        DEFAULT_EMBEDDING_MODEL,
+        "--model",
+        help=(
+            "Embedding model for the --reembed path (ignored without --reembed). "
+            "Must match the dimension of the deployment's vector column."
+        ),
+    ),
+    api_key_env: str = typer.Option(
+        "OPENAI_API_KEY",
+        "--api-key-env",
+        help="Env var holding the embedding API key for --reembed. Defaults to OPENAI_API_KEY.",
+    ),
+    tenant_id: str = typer.Option(
+        _DEFAULT_TENANT,
+        "--tenant-id",
+        help="Tenant scope (matches the value used at ingest).",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the --reembed confirmation prompt (CI / scripting).",
+    ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Reindex a DEPLOYED runtime's KB instead of the local store. "
+            "Resolves URL + bearer from ~/.movate/config.yaml and calls "
+            "POST /api/v1/agents/<agent>/kb/reindex. The runtime owns the "
+            "re-embedding (with ITS key) + index rebuild, so local --model "
+            "/ --api-key-env / --tenant-id don't apply on the remote path."
+        ),
+    ),
+) -> None:
+    """Rebuild ``agent``'s KB vector index.
+
+    Default (no flag): rebuild the index from the EXISTING stored vectors
+    — no embedding calls, no API key. Use after changing index params or
+    when the index is degraded.
+
+    ``--reembed``: re-run the embedding model over every stored chunk's
+    text, overwrite each vector, THEN rebuild the index. Expensive (costs
+    money) and needs an embedding key. Required when the embedding
+    model / dimension changes. Confirmation required unless ``--yes``.
+
+    Omit ``agent`` for an interactive picker. Pass ``--target`` to
+    reindex a deployed agent's KB instead of the local store.
+    """
+    import os  # noqa: PLC0415
+
+    # ── Interactive guided helper ──────────────────────────────────────────
+    if agent is None:
+        agent = _prompt_agent_picker(verb="rebuild the KB index for")
+        if agent is None:
+            raise typer.Exit(code=1)
+    # ── End guided helper ──────────────────────────────────────────────────
+
+    # --reembed costs money (re-runs the embedding model over the whole
+    # KB), so confirm before proceeding unless --yes is set.
+    if reembed and not yes:
+        from rich.prompt import Confirm  # noqa: PLC0415
+
+        scope = f"agent [bold]{agent}[/bold]"
+        if target is not None:
+            scope += f" on [bold]{target}[/bold]"
+        if not Confirm.ask(
+            f"Re-embed ALL chunks for {scope}? This calls the embedding API and costs money.",
+            default=False,
+        ):
+            err_console.print("[dim]→ aborted.[/dim]")
+            raise typer.Exit(code=0)
+
+    if target is not None:
+        _reindex_remote(agent=agent, target=target, reembed=reembed)
+        return
+
+    # Local --reembed needs an embedding key up front (fail fast before
+    # touching storage). The default index-only path needs no key.
+    api_key = os.environ.get(api_key_env, "").strip()
+    if reembed and not api_key:
+        err_console.print(
+            f"[red]✗[/red] --reembed needs an embedding API key in [bold]${api_key_env}[/bold]. "
+            "Set the env var or pass [bold]--api-key-env[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    async def _run() -> None:
+        from movate.kb.embed import embed_texts, qualified_model_name  # noqa: PLC0415
+
+        storage = await _build_storage()
+        chunks_reembedded = 0
+        try:
+            if reembed:
+                # Re-embed every chunk's text and overwrite its vector.
+                # save_kb_chunk upserts on (agent, tenant_id, content_hash),
+                # so persisting the same chunk with a new embedding
+                # overwrites in place. The embedder lives at THIS layer,
+                # never in storage (boundary: storage must not import it).
+                chunks = await storage.list_kb_chunks(
+                    agent=agent, tenant_id=tenant_id, limit=100_000
+                )
+                if chunks:
+                    console.print(
+                        f"[bold cyan]Re-embedding[/bold cyan] {len(chunks)} chunk(s) "
+                        f"for agent [bold]{agent}[/bold] with [bold]{model}[/bold]…"
+                    )
+                    vectors = await embed_texts(
+                        [c.text for c in chunks], model=model, api_key=api_key
+                    )
+                    qualified = qualified_model_name(model)
+                    for chunk, vector in zip(chunks, vectors, strict=True):
+                        await storage.save_kb_chunk(
+                            chunk.model_copy(
+                                update={"embedding": vector, "embedding_model": qualified}
+                            )
+                        )
+                    chunks_reembedded = len(chunks)
+                else:
+                    err_console.print(
+                        f"[yellow]⚠[/yellow] no chunks for agent [bold]{agent}[/bold] "
+                        "— nothing to re-embed."
+                    )
+
+            indexed = await storage.reindex_kb(agent=agent, tenant_id=tenant_id)
+            backend = getattr(storage, "name", "unknown")
+        finally:
+            await storage.close()
+
+        if chunks_reembedded:
+            console.print(f"[green]✓[/green] re-embedded {chunks_reembedded} chunk(s).")
+        # Only the postgres backend maintains a real vector index; the
+        # brute-force backends report the count as a no-op.
+        if backend == "postgres":
+            console.print(
+                f"[green]✓[/green] rebuilt the vector index "
+                f"[dim]({indexed} chunk(s) indexed)[/dim]."
+            )
+        else:
+            console.print(
+                f"[dim]→ {backend} backend has no vector index to rebuild "
+                f"(brute-force search over {indexed} chunk(s)) — nothing to do.[/dim]"
+            )
 
     asyncio.run(_run())

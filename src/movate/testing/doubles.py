@@ -431,6 +431,12 @@ class InMemoryStorage:
         ]
         return before - len(self.kb_chunks)
 
+    async def reindex_kb(self, *, agent: str, tenant_id: str) -> int:
+        # In-memory search is brute-force cosine — no vector index to
+        # rebuild. Graceful no-op returning the chunk count, mirroring
+        # the sqlite backend. NEVER raises.
+        return sum(1 for c in self.kb_chunks if c.agent == agent and c.tenant_id == tenant_id)
+
     # ------------------------------------------------------------------
     # Knowledge graph (GraphRAG) — entities + relations. BFS expansion
     # in Python; the SQL backends use a recursive CTE for the same result.

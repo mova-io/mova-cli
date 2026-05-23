@@ -1270,6 +1270,18 @@ class SqliteProvider:
         await self._db.commit()
         return int(count or 0)
 
+    async def reindex_kb(self, *, agent: str, tenant_id: str) -> int:
+        # SQLite brute-forces cosine search in Python (no HNSW index to
+        # rebuild), so reindex is a graceful no-op that just reports how
+        # many chunks the (agent, tenant_id) scope holds. NEVER raises —
+        # same contract the other backends honour.
+        async with self._db.execute(
+            "SELECT count(*) FROM kb_chunks WHERE agent = ? AND tenant_id = ?",
+            (agent, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------------
     # Knowledge graph (GraphRAG)
     # ------------------------------------------------------------------

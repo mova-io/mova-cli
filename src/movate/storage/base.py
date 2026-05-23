@@ -402,6 +402,27 @@ class StorageProvider(Protocol):
         only chunks from that source URI are removed (re-ingest with
         --replace workflow). Returns the count deleted."""
 
+    async def reindex_kb(self, *, agent: str, tenant_id: str) -> int:
+        """Rebuild the backend's vector index from the stored chunk
+        vectors and return the number of chunks indexed for ``(agent,
+        tenant_id)``.
+
+        Used by ``mdk kb reindex`` (and the runtime's ``POST
+        .../kb/reindex``) to recover from a degraded index or to pick up
+        new index parameters WITHOUT re-embedding — the stored vectors
+        are reused as-is. Re-embedding (when the model/dim changes) is
+        orchestrated one layer up in ``kb``/cli, which re-embeds each
+        chunk's text and persists via :meth:`save_kb_chunk` before
+        calling this; the storage layer never imports the embedder.
+
+        Backends with a real vector index (Postgres / pgvector) drop and
+        re-create it here. Backends that brute-force search (sqlite,
+        in-memory) have no index to rebuild and return the chunk count as
+        a graceful no-op — NEVER raise. The HNSW index on Postgres is
+        global to the ``kb_chunks`` table, not per-agent, so rebuilding
+        it serves every agent; the returned count is still scoped to
+        ``(agent, tenant_id)`` so callers can report what they touched."""
+
     # ------------------------------------------------------------------
     # Conversation threads (Tier 10.5, added 0.8.2.27 / PR-N) — group
     # runs together so multi-turn agents can fetch prior context when
