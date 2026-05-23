@@ -31,11 +31,13 @@ from fastapi.responses import JSONResponse
 import movate
 from movate.core.auth import ALL_SCOPES, LEGACY_DEFAULT_SCOPES, mint_api_key
 from movate.core.cache import build_cache
+from movate.core.canary import aggregate_side, choose_version
 from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
     BenchRecord,
+    CanaryConfig,
     EvalRecord,
     EvalSchedule,
     JobKind,
@@ -108,6 +110,12 @@ from movate.runtime.schemas import (
     BenchModelView,
     BenchResultView,
     BenchSubmission,
+    CanaryCompareView,
+    CanaryPromotedView,
+    CanaryPromoteRequest,
+    CanarySetRequest,
+    CanarySideView,
+    CanaryView,
     EvalAcceptedView,
     EvalListView,
     EvalScheduleListView,
@@ -2999,11 +3007,24 @@ def build_app(
         """
         store: StorageProvider = request.app.state.storage
 
+        # Canary routing (ADR 016 D3) — additive + default-off. Look up the
+        # per-(tenant, agent) canary ONCE; choose_version returns None when
+        # there's no config / it's disabled / the kill switch (weight 0) is
+        # on — so the NO-CANARY path below is byte-for-byte the pre-canary
+        # call (resolve_agent_bundle(version=None) → latest; JobRecord with
+        # target_version=None → worker resolves latest). The version is the
+        # champion-vs-challenger slice key; we never add a field to the run.
+        canary = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        chosen_version = choose_version(canary, thread_id=body.thread_id)
+
         # Resolve registry-first (so an agent published on another pod is
         # runnable here), filesystem-fallback (local `mdk serve --agents`
         # + the empty-registry tests). Tenant-scoped via the auth context.
+        # ``version=chosen_version`` is None for the no-canary path.
         agents: list[AgentBundle] = request.app.state.agents
-        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=chosen_version, fallback=agents
+        )
         if bundle is None:
             raise not_found("agent", name)
 
@@ -3070,7 +3091,13 @@ def build_app(
                 created_at=_datetime.now(UTC),
             )
 
-        # Default async path — same as before.
+        # Default async path — same as before, plus the canary-chosen
+        # version (ADR 016 D3) stamped onto the job so the worker resolves
+        # the SAME version this request's routing decision picked (it must
+        # not re-roll a weighted/sticky draw at claim time). ``target_version``
+        # is None for the no-canary path → the JobRecord is identical to a
+        # pre-canary one. ``thread_id`` rides along so a threaded run still
+        # joins its thread (and matches the version chosen for that thread).
         job = JobRecord(
             job_id=str(uuid4()),
             tenant_id=ctx.tenant_id,
@@ -3080,6 +3107,8 @@ def build_app(
             input=body.input,
             api_key_id=ctx.api_key_id,
             notify_email=body.notify_email,
+            thread_id=body.thread_id,
+            target_version=chosen_version,
         )
         await store.save_job(job)
         response.status_code = 202
@@ -3856,6 +3885,379 @@ def build_app(
         await store.touch_trigger(trigger.trigger_id, last_fired_at=datetime.now(UTC))
         response.status_code = 202
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    # ------------------------------------------------------------------
+    # Canary / champion-challenger rollout (ADR 016 D3). Additive +
+    # default-off. Two surfaces:
+    #   * set / status / compare — manage + observe the canary. set gates on
+    #     `admin` (it changes which version prod traffic hits); status +
+    #     compare gate on `read`.
+    #   * promote / rollback — move the champion pointer. Both gate on
+    #     `admin` (ADR 013). Assisted by default; auto-promote is opt-in +
+    #     eval-gated.
+    # All tenant-scoped via the AuthContext. The version is the slice key —
+    # NO RunRecord field is added; champion vs challenger is sliced by
+    # `agent_version`.
+    # ------------------------------------------------------------------
+    def _canary_to_view(c: CanaryConfig) -> CanaryView:
+        return CanaryView(
+            agent=c.agent,
+            challenger_version=c.challenger_version,
+            champion_version=c.champion_version,
+            weight=c.weight,
+            sticky=c.sticky,
+            enabled=c.enabled,
+            auto_promote=c.auto_promote,
+            eval_gate=c.eval_gate,
+            created_at=c.created_at.isoformat(),
+            updated_at=c.updated_at.isoformat(),
+        )
+
+    async def _aggregate_side(
+        store: StorageProvider,
+        *,
+        agent: str,
+        tenant_id: str,
+        version: str | None,
+    ) -> CanarySideView:
+        """Aggregate live quality for one agent_version slice → wire view.
+
+        Delegates the actual run/feedback aggregation to the pure
+        :func:`movate.core.canary.aggregate_side` (reused by the CLI) and
+        maps the resulting :class:`SideStats` to the wire shape.
+        """
+        stats = await aggregate_side(store, agent=agent, tenant_id=tenant_id, version=version)
+        return CanarySideView(
+            version=stats.version,
+            run_count=stats.run_count,
+            success_count=stats.success_count,
+            error_count=stats.error_count,
+            thumbs_up=stats.thumbs_up,
+            thumbs_down=stats.thumbs_down,
+            feedback_count=stats.feedback_count,
+            success_rate=stats.success_rate,
+            thumbs_up_rate=stats.thumbs_up_rate,
+        )
+
+    async def _confirm_version_exists(
+        store: StorageProvider, agent: str, *, tenant_id: str, version: str
+    ) -> bool:
+        """Whether ``version`` is a published version of ``agent`` (ADR 014).
+
+        Used before honoring a challenger / promoting a target so we never
+        point traffic at a version the registry doesn't have. Falls back to
+        the filesystem-scanned bundles (local serve / tests carry no registry
+        row) so the same check works in every deployment.
+        """
+        record = await store.get_agent_bundle(agent, tenant_id=tenant_id, version=version)
+        if record is not None:
+            return True
+        # Late read of app.state.agents (annotated for the type checker) so we
+        # see the current filesystem-scanned bundles, not a stale snapshot.
+        fs_agents: list[AgentBundle] = app.state.agents
+        return any(b.spec.name == agent and b.spec.version == version for b in fs_agents)
+
+    @v1.post(
+        "/agents/{name}/canary",
+        response_model=CanaryView,
+        tags=["canary-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_set_canary(
+        name: str,
+        body: CanarySetRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CanaryView:
+        """Set (or update) an agent's canary rollout (ADR 016 D3).
+
+        Routes ``weight``% of prod traffic to ``challenger_version`` (0 =
+        kill switch). Gated on ``admin`` (it changes which version prod
+        traffic hits). Additive + default-off — until this is called, the
+        agent has no canary and routes 100% to its champion.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **404** — ``challenger_version`` is not a published version
+        * **422** — ``auto_promote`` requested without an ``eval_gate``
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        if body.auto_promote and body.eval_gate is None:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message="auto_promote requires an eval_gate (the bar a challenger must clear)",
+            )
+        if not await _confirm_version_exists(
+            store, name, tenant_id=ctx.tenant_id, version=body.challenger_version
+        ):
+            raise not_found("agent version", f"{name}@{body.challenger_version}")
+        now = datetime.now(UTC)
+        existing = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        config = CanaryConfig(
+            tenant_id=ctx.tenant_id,
+            agent=name,
+            challenger_version=body.challenger_version,
+            champion_version=body.champion_version,
+            weight=body.weight,
+            sticky=body.sticky,
+            enabled=body.enabled,
+            auto_promote=body.auto_promote,
+            eval_gate=body.eval_gate,
+            created_by=ctx.api_key_id,
+            created_at=existing.created_at if existing else now,
+            updated_at=now,
+        )
+        await store.save_canary_config(config)
+        return _canary_to_view(config)
+
+    @v1.get(
+        "/agents/{name}/canary",
+        response_model=CanaryView,
+        tags=["canary-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_canary(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CanaryView:
+        """Fetch an agent's canary config (status).
+
+        Tenant-scoped: a canary under another tenant 404s. 404 also when the
+        agent simply has no canary (the default-off state).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no canary for this agent/tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        config = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        if config is None:
+            raise not_found("canary", name)
+        return _canary_to_view(config)
+
+    @v1.delete(
+        "/agents/{name}/canary",
+        status_code=204,
+        tags=["canary-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_canary(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove an agent's canary (the kill switch's hard variant).
+
+        Idempotent: deleting a non-existent canary still returns 204. After
+        this the agent routes 100% to its champion. Gated on ``admin``.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        await store.delete_canary_config(name, tenant_id=ctx.tenant_id)
+        return Response(status_code=204)
+
+    @v1.get(
+        "/agents/{name}/canary/compare",
+        response_model=CanaryCompareView,
+        tags=["canary-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_compare_canary(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        challenger: str | None = None,
+        champion: str | None = None,
+    ) -> CanaryCompareView:
+        """Compare live quality champion-vs-challenger (ADR 016 D3).
+
+        Aggregates the agent's runs + feedback, sliced by ``agent_version``
+        (the canary slice key): run/success/error counts and 👍/👎 counts +
+        rate for each side, plus the delta (challenger - champion). The
+        versions come from the agent's canary config; ``?challenger=`` /
+        ``?champion=`` override them (e.g. to compare two arbitrary versions
+        without a config).
+
+        The champion side, when not pinned, slices by "the latest published
+        version" so a registry-latest champion is still measured.
+
+        Live feedback + error slicing is the must-have here; an eval-based
+        slice (running the eval suite per version) is a documented follow-up.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **422** — no challenger version (neither config nor ``?challenger=``)
+        """
+        store: StorageProvider = request.app.state.storage
+        config = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        challenger_version = challenger or (config.challenger_version if config else None)
+        if challenger_version is None:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=(
+                    "no challenger version to compare — set a canary or pass ?challenger=<version>"
+                ),
+            )
+        # Champion side: explicit override → config pin → registry latest.
+        champion_version = champion or (config.champion_version if config else None)
+        if champion_version is None:
+            latest = await store.get_agent_bundle(name, tenant_id=ctx.tenant_id)
+            champion_version = latest.version if latest is not None else None
+        champion_side = await _aggregate_side(
+            store, agent=name, tenant_id=ctx.tenant_id, version=champion_version
+        )
+        challenger_side = await _aggregate_side(
+            store, agent=name, tenant_id=ctx.tenant_id, version=challenger_version
+        )
+        return CanaryCompareView(
+            agent=name,
+            champion=champion_side,
+            challenger=challenger_side,
+            success_rate_delta=challenger_side.success_rate - champion_side.success_rate,
+            thumbs_up_rate_delta=challenger_side.thumbs_up_rate - champion_side.thumbs_up_rate,
+            canary=_canary_to_view(config) if config else None,
+        )
+
+    @v1.post(
+        "/agents/{name}/canary/promote",
+        response_model=CanaryPromotedView,
+        tags=["canary-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_promote_canary(
+        name: str,
+        body: CanaryPromoteRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CanaryPromotedView:
+        """Promote a version to champion (ADR 016 D3).
+
+        **Assisted by default** — a human calls this and the human is the
+        gate. When ``auto_promote`` is requested (or enabled on the config),
+        the target's measured ``thumbs_up_rate`` must clear the config's
+        ``eval_gate`` or this 409s with a clear reason (fail-safe: never
+        auto-ship a regression).
+
+        Promotion updates the canary config: the promoted version becomes
+        ``champion_version`` (the new served version pointer), ``weight`` →
+        0 (the canary has concluded), and the prior champion is returned for
+        rollback/audit. Agent versions stay immutable (ADR 014) — this moves
+        a pointer in the storage-backed canary, not the registry's history.
+        Gated on ``admin`` (ADR 013).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **404** — no canary for this agent, or the target version is not
+          published
+        * **409** — auto-promote requested but the eval-gate is unmet
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        config = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        if config is None:
+            raise not_found("canary", name)
+        target = body.to_version or config.challenger_version
+        if not await _confirm_version_exists(store, name, tenant_id=ctx.tenant_id, version=target):
+            raise not_found("agent version", f"{name}@{target}")
+
+        auto = body.auto_promote or config.auto_promote
+        mode = "auto" if auto else "assisted"
+        if auto:
+            # Eval-gate guard: the challenger's measured live quality must
+            # clear the bar. A None gate is unsatisfiable (fail-safe).
+            if config.eval_gate is None:
+                raise conflict(
+                    "auto-promote refused: no eval_gate is configured (nothing to clear)"
+                )
+            side = await _aggregate_side(store, agent=name, tenant_id=ctx.tenant_id, version=target)
+            if side.thumbs_up_rate < config.eval_gate:
+                raise conflict(
+                    f"auto-promote refused: challenger thumbs-up rate "
+                    f"{side.thumbs_up_rate:.3f} < eval_gate {config.eval_gate:.3f}"
+                )
+
+        previous_champion = config.champion_version
+        updated = config.model_copy(
+            update={
+                "champion_version": target,
+                "weight": 0,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        await store.save_canary_config(updated)
+        return CanaryPromotedView(
+            agent=name,
+            promoted_version=target,
+            previous_champion=previous_champion,
+            mode=mode,
+            canary=_canary_to_view(updated),
+        )
+
+    @v1.post(
+        "/agents/{name}/canary/rollback",
+        response_model=CanaryPromotedView,
+        tags=["canary-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_rollback_canary(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CanaryPromotedView:
+        """Roll back the champion to the prior recorded champion (instant).
+
+        The inverse of promote: it sets ``champion_version`` back to the
+        canary's currently-recorded champion pin and zeroes the weight, so
+        traffic returns to the prior version immediately. Use it when a
+        just-promoted challenger turns out bad. Gated on ``admin``.
+
+        If the canary has no recorded champion pin (champion was
+        registry-latest), rollback clears the pin (→ latest) and zeroes the
+        weight — still an instant return to champion-by-default.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **404** — no canary for this agent/tenant
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        config = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        if config is None:
+            raise not_found("canary", name)
+        # Revert: champion pin stays the recorded champion; weight → 0 routes
+        # 100% to it instantly. (Promote set champion_version = the promoted
+        # version, so this re-asserts that as the served champion at 0%.)
+        target = config.champion_version
+        updated = config.model_copy(update={"weight": 0, "updated_at": datetime.now(UTC)})
+        await store.save_canary_config(updated)
+        return CanaryPromotedView(
+            agent=name,
+            promoted_version=target if target is not None else "<latest>",
+            previous_champion=config.champion_version,
+            mode="rollback",
+            canary=_canary_to_view(updated),
+        )
 
     # ------------------------------------------------------------------
     # Bench endpoints (BACKLOG #64) — multi-model comparison persistence.

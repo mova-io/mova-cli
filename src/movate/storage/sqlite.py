@@ -20,6 +20,7 @@ from movate.core.models import (
     ApiKeyRecord,
     BenchModelResult,
     BenchRecord,
+    CanaryConfig,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -483,6 +484,35 @@ _MIGRATIONS = [
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id)",
+    # ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
+    # agent): a challenger version + a traffic weight (0 = kill switch), with
+    # optional champion pin + auto-promote eval gate. The run/enqueue path
+    # reads this to choose champion vs challenger; NO row → champion-by-latest
+    # → byte-for-byte the pre-canary behavior. Additive + idempotent (CREATE
+    # TABLE IF NOT EXISTS) — default-off, no backfill.
+    """
+    CREATE TABLE IF NOT EXISTS canary_configs (
+        tenant_id          TEXT NOT NULL,
+        agent              TEXT NOT NULL,
+        challenger_version TEXT NOT NULL,
+        champion_version   TEXT,
+        weight             INTEGER NOT NULL,
+        sticky             INTEGER NOT NULL,
+        enabled            INTEGER NOT NULL,
+        auto_promote       INTEGER NOT NULL,
+        eval_gate          REAL,
+        created_by         TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, agent)
+    )
+    """,
+    # ADR 016 D3: carry the canary-chosen agent version to the async worker.
+    # The enqueue path stamps the concrete champion/challenger version it
+    # picked; the worker resolves THAT version. Nullable — pre-canary rows
+    # (and every job with no canary in play) read back as NULL → None → the
+    # worker resolves latest, unchanged.
+    "ALTER TABLE jobs ADD COLUMN target_version TEXT",
 ]
 
 
@@ -1061,6 +1091,77 @@ class SqliteProvider:
         await self._db.commit()
 
     # ------------------------------------------------------------------
+    # Canary configs (ADR 016 D3 — champion/challenger rollout)
+    # ------------------------------------------------------------------
+
+    async def save_canary_config(self, config: CanaryConfig) -> None:
+        # Upsert on the (tenant_id, agent) primary key.
+        await self._db.execute(
+            """
+            INSERT INTO canary_configs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, agent) DO UPDATE SET
+                challenger_version = excluded.challenger_version,
+                champion_version = excluded.champion_version,
+                weight = excluded.weight,
+                sticky = excluded.sticky,
+                enabled = excluded.enabled,
+                auto_promote = excluded.auto_promote,
+                eval_gate = excluded.eval_gate,
+                created_by = excluded.created_by,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                config.tenant_id,
+                config.agent,
+                config.challenger_version,
+                config.champion_version,
+                config.weight,
+                int(config.sticky),
+                int(config.enabled),
+                int(config.auto_promote),
+                config.eval_gate,
+                config.created_by,
+                config.created_at.isoformat(),
+                config.updated_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_canary_config(self, agent: str, *, tenant_id: str) -> CanaryConfig | None:
+        async with self._db.execute(
+            "SELECT * FROM canary_configs WHERE agent = ? AND tenant_id = ? LIMIT 1",
+            (agent, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_canary_config(row) if row else None
+
+    async def list_canary_configs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[CanaryConfig]:
+        sql = "SELECT * FROM canary_configs"
+        params: list[object] = []
+        if tenant_id is not None:
+            sql += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_canary_config(r) for r in rows]
+
+    async def delete_canary_config(self, agent: str, *, tenant_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM canary_configs WHERE agent = ? AND tenant_id = ?",
+            (agent, tenant_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1)
     # ------------------------------------------------------------------
 
@@ -1216,8 +1317,9 @@ class SqliteProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email, attempt_count, next_retry_at, thread_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                notify_email, attempt_count, next_retry_at, thread_id,
+                target_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -1236,6 +1338,7 @@ class SqliteProvider:
                 job.attempt_count,
                 job.next_retry_at.isoformat() if job.next_retry_at else None,
                 job.thread_id,
+                job.target_version,
             ),
         )
         await self._db.commit()
@@ -2386,6 +2489,23 @@ def _row_to_job_schedule(row: aiosqlite.Row) -> JobSchedule:
     )
 
 
+def _row_to_canary_config(row: aiosqlite.Row) -> CanaryConfig:
+    return CanaryConfig(
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        challenger_version=row["challenger_version"],
+        champion_version=row["champion_version"],
+        weight=row["weight"],
+        sticky=bool(row["sticky"]),
+        enabled=bool(row["enabled"]),
+        auto_promote=bool(row["auto_promote"]),
+        eval_gate=row["eval_gate"],
+        created_by=row["created_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
 def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
     return Trigger(
         tenant_id=row["tenant_id"],
@@ -2470,6 +2590,11 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # PR-Q thread linkage. init() has run the migration by the
         # time we read here, so the column is guaranteed to exist.
         thread_id=row["thread_id"],
+        # ADR 016 D3 canary-chosen version. init() has run the ALTER by
+        # the time we read here; .get() stays defensive against a row
+        # read on a connection that somehow predates the migration —
+        # such a row is a pre-canary job, which is exactly None.
+        target_version=dict(row).get("target_version"),
     )
 
 

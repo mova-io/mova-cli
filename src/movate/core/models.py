@@ -2031,6 +2031,18 @@ class JobRecord(BaseModel):
     propagates this onto the spawned :class:`RunRecord.thread_id` so
     the run joins back to its thread. ``None`` (the common case) for
     standalone non-threaded jobs."""
+    target_version: str | None = None
+    """Pinned agent version the worker must resolve for this job (ADR 016
+    D3 — canary rollout). The enqueue path (API) decides champion vs
+    challenger via :func:`movate.core.canary.choose_version` and stamps the
+    chosen concrete version here so the worker runs the SAME version the
+    routing decision picked — async runs can't re-decide at claim time
+    (the canary config may have changed, or the weighted/sticky draw must
+    not be re-rolled). The worker passes this to ``resolve_agent_bundle(
+    version=...)``. ``None`` (the overwhelming common case — no canary
+    config, or champion-by-latest) means "resolve latest", so a job with no
+    canary in play is byte-for-byte identical to a pre-canary job. Additive
+    + nullable: pre-canary rows read back as ``None``."""
 
 
 class JobSchedule(BaseModel):
@@ -2228,6 +2240,101 @@ class Trigger(BaseModel):
                 "trigger target."
             )
         return v
+
+
+class CanaryConfig(BaseModel):
+    """Per-(tenant, agent) canary / champion-challenger rollout (ADR 016 D3).
+
+    With versioned agents (ADR 014 registry), this enables a *safe,
+    progressive rollout*: publish a challenger version, route a configurable
+    slice of prod traffic to it, compare live quality champion-vs-challenger,
+    then promote the winner. The whole thing is **additive + default-off** —
+    an agent with no :class:`CanaryConfig` row routes 100% to its
+    champion-by-default (registry latest), and the run/enqueue/dispatch path
+    is byte-for-byte identical to today.
+
+    **Version is the slice key (not a new run field).** Every run is already
+    tagged with ``RunRecord.agent_version`` (ADR 014). Canary doesn't add a
+    column to a run — it *chooses which version a run executes* (champion vs
+    challenger) and then slices feedback/runs by ``agent_version`` to compare
+    them. The config knows which version is which.
+
+    **The kill switch is ``weight == 0``.** Setting the weight to 0 routes
+    100% of traffic back to the champion *instantly* — no version delete, no
+    redeploy. It's the panic button when a challenger misbehaves.
+
+    **Routing** (pure, in :func:`movate.core.canary.choose_version`):
+
+    * No config / ``enabled is False`` / ``weight == 0`` → champion
+      (``champion_version`` if pinned, else ``None`` → registry latest).
+    * ``sticky`` (default) + a ``thread_id`` → a *deterministic* hash of the
+      thread decides, so every turn of one conversation stays on the same
+      side (a session never flips champion↔challenger mid-thread).
+    * Otherwise a weighted random draw at ``weight``%.
+
+    **Promotion** is *assisted by default* (a human calls
+    ``POST .../canary/promote``). ``auto_promote`` is opt-in and gated: the
+    challenger's measured quality must clear ``eval_gate`` before an
+    auto-promote proceeds, and the endpoint requires the ``admin`` scope
+    (ADR 013) either way. Promotion sets ``champion_version`` to the promoted
+    version and zeroes ``weight`` (the canary has concluded); the prior
+    champion is recorded so rollback is instant.
+
+    ``(tenant_id, agent)`` is unique — one canary per agent per tenant.
+    Re-running ``set`` upserts the row. Agent versions stay immutable (ADR
+    014); promotion moves a *pointer*, never rewrites history.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    agent: str
+    """Agent name this canary applies to. Paired with ``tenant_id`` as the
+    unique key — one active canary per agent per tenant."""
+    challenger_version: str
+    """The version receiving canary traffic. Must be a published version in
+    the registry (the API confirms it exists before honoring the config /
+    promoting it). Runs that land on the challenger are tagged with this
+    ``agent_version`` so they can be sliced out for comparison."""
+    champion_version: str | None = None
+    """Optional pin for the champion side. ``None`` (the common case) means
+    "champion is whatever the registry resolves as latest" — so a freshly
+    published patch becomes the champion without touching this config. Pin it
+    only when you need the champion held at a specific version while the
+    challenger is evaluated."""
+    weight: int = Field(default=0, ge=0, le=100)
+    """Percent of traffic (0-100) routed to the challenger. **0 is the kill
+    switch** — 100% to the champion, instantly. Defaults to 0 so a
+    just-created config is dormant until an operator dials traffic up."""
+    sticky: bool = True
+    """When true (default), routing is *consistent per* ``thread_id`` — a
+    deterministic hash decides the side so a multi-turn conversation never
+    flips champion↔challenger mid-thread. False = an independent weighted
+    draw per run. With no ``thread_id`` available, routing falls back to the
+    weighted draw regardless."""
+    enabled: bool = True
+    """Soft on/off. A disabled canary is retained (history + quick re-enable)
+    but routes 100% to the champion, exactly like ``weight == 0``. ``mdk
+    canary off`` can disable or delete it."""
+    auto_promote: bool = False
+    """Opt-in: when true, the promote endpoint MAY promote the challenger
+    automatically once its measured quality clears ``eval_gate``. Default
+    false = **assisted** promotion (a human approves every promote). A bad
+    auto-promote ships a regression to all users — the exact failure canary
+    exists to prevent — so it stays off by default and gated."""
+    eval_gate: float | None = None
+    """Minimum challenger quality (a pass-rate / score in ``[0, 1]``, or a
+    feedback-derived rate) required before an ``auto_promote`` proceeds. Only
+    meaningful when ``auto_promote`` is true. ``None`` + ``auto_promote`` →
+    the gate is unsatisfiable, so auto-promote is refused (fail-safe: never
+    auto-ship without a measurable bar)."""
+    created_by: str | None = None
+    """Auth identity that created/updated the canary (ADR 013), or ``None``
+    for a local/CLI write."""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    """Refreshed on every upsert (set / promote / rollback) so operators can
+    see when the canary last changed."""
 
 
 # ---------------------------------------------------------------------------

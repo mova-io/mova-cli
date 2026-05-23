@@ -119,11 +119,21 @@ class WorkerDispatch:
         tests, which carry no durable registry row). The job's
         ``tenant_id`` scopes the registry read so the worker reads the
         same tenant the API published under.
+
+        Canary (ADR 016 D3): the API decided champion-vs-challenger at
+        enqueue and stamped the chosen concrete version on
+        ``job.target_version``. We resolve THAT version so the worker
+        runs the same version the routing decision picked (an async job
+        must not re-roll a weighted/sticky draw at claim time). When
+        ``target_version is None`` — the overwhelming common case (no
+        canary, or champion-by-latest) — this is byte-for-byte the
+        pre-canary call (``version=None`` → latest).
         """
         return await resolve_agent_bundle(
             self._storage,
             job.target,
             tenant_id=job.tenant_id,
+            version=job.target_version,
             fallback=self._agents_fallback,
         )
 
