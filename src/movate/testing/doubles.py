@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from movate.core.models import (
+    AgentBundleRecord,
     ApiKeyRecord,
     BenchRecord,
     ConversationThread,
@@ -53,6 +54,7 @@ class InMemoryStorage:
         self.failures: list[FailureRecord] = []
         self.evals: list[EvalRecord] = []
         self.bench: list[BenchRecord] = []
+        self.agent_bundles: list[AgentBundleRecord] = []
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
         self.api_keys: list[ApiKeyRecord] = []
@@ -165,6 +167,70 @@ class InMemoryStorage:
             rows = [b for b in rows if b.agent == agent]
         # Newest-first to match the SQL backends' ORDER BY.
         return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
+
+    # ------------------------------------------------------------------
+    # Agent registry (ADR 014 D1)
+    # ------------------------------------------------------------------
+
+    async def save_agent_bundle(self, bundle: AgentBundleRecord) -> None:
+        self.agent_bundles.append(bundle)
+
+    async def get_agent_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> AgentBundleRecord | None:
+        matches = [b for b in self.agent_bundles if b.name == name and b.tenant_id == tenant_id]
+        if version is not None:
+            matches = [b for b in matches if b.version == version]
+        if not matches:
+            return None
+        # version=None → latest by created_at (matches the SQL backends).
+        return max(matches, key=lambda b: b.created_at)
+
+    async def list_agents(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[AgentBundleRecord]:
+        rows = [b for b in self.agent_bundles if b.tenant_id == tenant_id]
+        # Latest version per name.
+        latest: dict[str, AgentBundleRecord] = {}
+        for b in rows:
+            current = latest.get(b.name)
+            if current is None or b.created_at > current.created_at:
+                latest[b.name] = b
+        ordered = sorted(latest.values(), key=lambda b: b.created_at, reverse=True)
+        return ordered[:limit]
+
+    async def list_agent_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[AgentBundleRecord]:
+        rows = [b for b in self.agent_bundles if b.name == name and b.tenant_id == tenant_id]
+        return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
+
+    async def delete_agent_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        def _matches(b: AgentBundleRecord) -> bool:
+            if b.name != name or b.tenant_id != tenant_id:
+                return False
+            return version is None or b.version == version
+
+        to_delete = [b for b in self.agent_bundles if _matches(b)]
+        self.agent_bundles = [b for b in self.agent_bundles if not _matches(b)]
+        return len(to_delete)
 
     async def list_workflow_runs(
         self,

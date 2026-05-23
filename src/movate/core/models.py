@@ -1811,6 +1811,53 @@ class BenchRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Durable agent registry (ADR 014 D1) — a published agent bundle persisted
+# as one immutable (name, version) row behind the StorageProvider Protocol.
+#
+# The bundle is the small text files that make up an agent on disk
+# (``agent.yaml``, ``prompt.md``, schemas, dataset, skills, contexts),
+# carried in the JSON-serializable ``files`` map keyed by relative path. KB
+# is NOT part of the bundle — it already lives durably in pgvector storage
+# (ADR 009); the registry records which agent expects a KB, not the chunks.
+# ---------------------------------------------------------------------------
+
+
+class AgentBundleRecord(BaseModel):
+    """One published, versioned agent bundle (the bundle analogue of
+    :class:`BenchRecord`).
+
+    A row is **immutable**: each publish of an agent writes a new
+    ``(name, version)`` row, so the table doubles as the version history.
+    Tenant-scoped like every other durable record. The bundle's files are
+    small text (yaml / md / json / jsonl / skill files) carried in
+    ``files`` and serialized to a single JSON column on every backend.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """The agent name (``agent.yaml`` ``name``) — the registry key paired
+    with ``version``."""
+    tenant_id: str
+    version: str
+    """The bundle's ``agent.yaml`` version. ``(name, tenant_id, version)``
+    is unique; a new publish bumps this and writes a new row."""
+    created_by: str | None = None
+    """Auth identity that published this version (ADR 013), or ``None`` for
+    a system/seed import. Drives the "who published what when" audit."""
+    content_hash: str
+    """Content-addressed hash of the bundle (over ``files``), so an
+    unchanged re-publish is detectable and a version can be verified."""
+    files: dict[str, str]
+    """The bundle's text files keyed by relative path, e.g.
+    ``agent.yaml``, ``prompt.md``, ``schema/input.json``,
+    ``schema/output.json``, ``evals/dataset.jsonl``, ``skills/*.py``,
+    ``contexts/*.md``. JSON-serializable (path -> file contents). KB is
+    excluded — it lives in pgvector (ADR 009)."""
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
 # Job queue (v0.5+)
 #
 # A ``JobRecord`` is a queue entry — created on ``POST /run``, claimed by a

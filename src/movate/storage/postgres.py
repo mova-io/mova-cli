@@ -29,6 +29,7 @@ from typing import Any
 import asyncpg
 
 from movate.core.models import (
+    AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
     BenchModelResult,
@@ -397,6 +398,28 @@ CREATE INDEX IF NOT EXISTS idx_kb_relations_src
     ON kb_relations(agent, tenant_id, src_entity_id);
 CREATE INDEX IF NOT EXISTS idx_kb_relations_dst
     ON kb_relations(agent, tenant_id, dst_entity_id);
+
+-- ADR 014 D1: durable agent registry. One immutable row per published
+-- (name, version) bundle, tenant-scoped; the ``files`` map is JSONB (same
+-- strategy as bench.models / workflow_runs.initial_state). Additive new
+-- table (CREATE TABLE IF NOT EXISTS, re-run idempotently on every init) —
+-- no ALTER, no backfill. A new publish = a new row; rows are never mutated.
+CREATE TABLE IF NOT EXISTS agent_bundles (
+    name          TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    created_by    TEXT,
+    content_hash  TEXT NOT NULL,
+    files         JSONB NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, name, version)
+);
+-- Per-tenant + per-name registry lookup (latest / version history).
+CREATE INDEX IF NOT EXISTS idx_agent_bundles_name
+    ON agent_bundles(tenant_id, name);
+-- Latest-version-per-name + history ordering scan.
+CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created
+    ON agent_bundles(tenant_id, name, created_at DESC);
 """
 
 
@@ -813,6 +836,116 @@ class PostgresProvider:
         sql = f"SELECT * FROM bench {where} ORDER BY created_at DESC LIMIT ${len(params)}"
         rows = await self._db.fetch(sql, *params)
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Agent registry (ADR 014 D1)
+    # ------------------------------------------------------------------
+
+    async def save_agent_bundle(self, bundle: AgentBundleRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO agent_bundles (
+                name, tenant_id, version, created_by, content_hash,
+                files, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7
+            )
+            """,
+            bundle.name,
+            bundle.tenant_id,
+            bundle.version,
+            bundle.created_by,
+            bundle.content_hash,
+            bundle.files,
+            bundle.created_at,
+        )
+
+    async def get_agent_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> AgentBundleRecord | None:
+        if version is not None:
+            row = await self._db.fetchrow(
+                "SELECT * FROM agent_bundles WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            # version=None → latest by created_at.
+            row = await self._db.fetchrow(
+                "SELECT * FROM agent_bundles WHERE name = $1 AND tenant_id = $2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                name,
+                tenant_id,
+            )
+        return _row_to_agent_bundle(row) if row else None
+
+    async def list_agents(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[AgentBundleRecord]:
+        # Latest version per name, newest-first: DISTINCT ON the name picks
+        # each name's most-recent row, then the outer sort orders names by
+        # that row's created_at DESC.
+        rows = await self._db.fetch(
+            """
+            SELECT * FROM (
+                SELECT DISTINCT ON (name) * FROM agent_bundles
+                WHERE tenant_id = $1
+                ORDER BY name, created_at DESC
+            ) latest
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_agent_bundle(r) for r in rows]
+
+    async def list_agent_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[AgentBundleRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM agent_bundles WHERE name = $1 AND tenant_id = $2 "
+            "ORDER BY created_at DESC LIMIT $3",
+            name,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_agent_bundle(r) for r in rows]
+
+    async def delete_agent_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            status = await self._db.execute(
+                "DELETE FROM agent_bundles WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            status = await self._db.execute(
+                "DELETE FROM agent_bundles WHERE name = $1 AND tenant_id = $2",
+                name,
+                tenant_id,
+            )
+        # asyncpg returns a command tag like "DELETE <n>".
+        return int(status.split()[-1])
 
     # ------------------------------------------------------------------
     # Workflow runs
@@ -1918,6 +2051,18 @@ def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
         runs_per_model=row["runs_per_model"],
         gate_mode=row["gate_mode"],
         models=[BenchModelResult.model_validate(m) for m in row["models"]],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
+    return AgentBundleRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        files=dict(row["files"]),
         created_at=row["created_at"],
     )
 
