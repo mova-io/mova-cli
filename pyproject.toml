@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.22.43"
+version = "2026.5.23.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -94,6 +94,19 @@ runtime = [
     "python-multipart>=0.0.9",
 ]
 langfuse = ["langfuse>=2.30,<3"]
+keychain = [
+    # Optional OS-keychain credential backend (ADR 012 D2). Lets
+    # operators keep machine-global runtime/provider keys out of the
+    # plaintext ~/.movate/credentials file by storing them in the OS
+    # keychain (macOS Keychain / Windows Credential Manager / Linux
+    # Secret Service). Opt-in via MOVATE_CRED_BACKEND=keychain or
+    # `mdk auth use-keychain`; the file backend stays the default + the
+    # fallback, so this extra is purely additive. keyring is MIT-licensed,
+    # pure-Python, and only imported when the keychain backend is selected
+    # — the core install (headless CI / containers with no keychain) is
+    # unaffected.
+    "keyring>=24,<26",
+]
 cross-encoder = [
     # Local cross-encoder reranker (PR-BB). sentence-transformers pulls
     # in torch-cpu (~300MB) + huggingface-hub + tokenizers. The model

@@ -2212,7 +2212,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.5.22.43"
+version = "2026.5.23.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -2257,6 +2257,9 @@ easyocr = [
 ]
 github = [
     { name = "cryptography" },
+]
+keychain = [
+    { name = "keyring" },
 ]
 langchain = [
     { name = "langchain-core" },
@@ -2324,6 +2327,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'playground'", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "jsonschema", specifier = ">=4.21" },
+    { name = "keyring", marker = "extra == 'keychain'", specifier = ">=24,<26" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=0.3,<1" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = ">=2.30,<3" },
     { name = "litellm", specifier = ">=1.50,<2" },
@@ -2357,7 +2361,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'runtime'", specifier = ">=0.29" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'teams'", specifier = ">=0.29" },
 ]
-provides-extras = ["runtime", "langfuse", "cross-encoder", "ocr", "easyocr", "otel", "dev", "anthropic", "openai", "langchain", "teams", "github", "playground"]
+provides-extras = ["runtime", "langfuse", "keychain", "cross-encoder", "ocr", "easyocr", "otel", "dev", "anthropic", "openai", "langchain", "teams", "github", "playground"]
 
 [package.metadata.requires-dev]
 dev = [

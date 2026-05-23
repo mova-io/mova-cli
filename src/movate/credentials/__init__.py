@@ -22,7 +22,8 @@ CI can still override. But on a developer's laptop where they just
 
 Public surface:
 
-* :class:`CredentialsStore` — read/write the file
+* :class:`CredentialsStore` — read/write credentials via the active backend
+* :class:`CredentialBackend` — the file/keychain backend seam (ADR 012 D2)
 * :func:`autoload_credentials` — called at every CLI startup
 * :func:`verify_provider_key` — cheap test call to confirm a key works
 * :data:`PROVIDER_KEY_ENV_VARS` — canonical list of provider env vars
@@ -35,7 +36,15 @@ from movate.credentials.loader import (
     autoload_credentials,
     key_source,
 )
-from movate.credentials.store import CREDENTIALS_PATH, CredentialsStore
+from movate.credentials.store import (
+    CREDENTIALS_PATH,
+    CredentialBackend,
+    CredentialBackendUnavailableError,
+    CredentialsStore,
+    FileCredentialBackend,
+    KeychainCredentialBackend,
+    build_backend,
+)
 from movate.credentials.verify import (
     VerifyResult,
     verify_provider_key,
@@ -44,9 +53,14 @@ from movate.credentials.verify import (
 __all__ = [
     "CREDENTIALS_PATH",
     "PROVIDER_KEY_ENV_VARS",
+    "CredentialBackend",
+    "CredentialBackendUnavailableError",
     "CredentialsStore",
+    "FileCredentialBackend",
+    "KeychainCredentialBackend",
     "VerifyResult",
     "autoload_credentials",
+    "build_backend",
     "key_source",
     "verify_provider_key",
 ]

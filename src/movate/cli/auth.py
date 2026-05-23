@@ -653,6 +653,142 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         raise typer.Exit(code=2)
 
 
+@auth_app.command("use-keychain")
+def use_keychain(
+    remove_source: bool = typer.Option(
+        False,
+        "--remove-source",
+        help=(
+            "After copying, delete the credentials from the file backend. "
+            "Off by default so a botched migration never strands your keys."
+        ),
+    ),
+) -> None:
+    """Migrate machine-global credentials from the file into the OS keychain.
+
+    Copies every entry from the plaintext ``~/.movate/credentials`` file
+    into the OS keychain (macOS Keychain / Windows Credential Manager /
+    Linux Secret Service via the optional ``keyring`` package). The
+    migration is [bold]opt-in and reversible[/bold] — the source file is
+    left untouched unless you pass [bold]--remove-source[/bold], so a
+    botched migration can never strand your keys.
+
+    Afterwards, set [bold]MOVATE_CRED_BACKEND=keychain[/bold] in your
+    shell profile so every ``mdk`` invocation reads from the keychain.
+
+    Needs the optional ``keyring`` dependency: install with
+    [bold]pip install 'mdk[keychain]'[/bold].
+
+    [bold]Examples:[/bold]
+
+      [dim]# Copy keys into the keychain, keep the file as a backup:[/dim]
+      $ mdk auth use-keychain
+
+      [dim]# Copy then remove the plaintext file (DLP-clean):[/dim]
+      $ mdk auth use-keychain --remove-source
+    """
+    _migrate_backend(src_name="file", dst_name="keychain", remove_source=remove_source)
+
+
+@auth_app.command("use-file")
+def use_file(
+    remove_source: bool = typer.Option(
+        False,
+        "--remove-source",
+        help=(
+            "After copying, delete the credentials from the keychain backend. "
+            "Off by default so a botched migration never strands your keys."
+        ),
+    ),
+) -> None:
+    """Migrate machine-global credentials from the OS keychain back to the file.
+
+    The reverse of [bold]mdk auth use-keychain[/bold]. Copies every entry
+    out of the OS keychain into the plaintext ``~/.movate/credentials``
+    file (mode 0600). [bold]Opt-in and reversible[/bold] — the keychain
+    entry is left intact unless you pass [bold]--remove-source[/bold].
+
+    Afterwards, unset [bold]MOVATE_CRED_BACKEND[/bold] (or set it to
+    ``file``) so ``mdk`` reads from the file again.
+
+    [bold]Example:[/bold]
+
+      [dim]$ mdk auth use-file[/dim]
+    """
+    _migrate_backend(src_name="keychain", dst_name="file", remove_source=remove_source)
+
+
+def _migrate_backend(*, src_name: str, dst_name: str, remove_source: bool) -> None:
+    """Copy every credential entry from one backend to the other.
+
+    Order of operations is safety-first: read the full source set, WRITE
+    all of it to the destination, and only THEN (and only if asked)
+    delete from the source. Never delete-before-confirm-write — a failed
+    destination write must never strand the operator's keys.
+    """
+    from movate.credentials.store import (  # noqa: PLC0415
+        CredentialBackendUnavailableError,
+        CredentialsStore,
+        build_backend,
+    )
+
+    try:
+        src_backend = build_backend(src_name)
+        dst_backend = build_backend(dst_name)
+    except CredentialBackendUnavailableError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    src = CredentialsStore(backend=src_backend)
+    dst = CredentialsStore(backend=dst_backend)
+
+    try:
+        entries = src.read()
+    except CredentialBackendUnavailableError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    if not entries:
+        hint(f"[dim]nothing to migrate — {src.location()} has no credentials.[/dim]")
+        return
+
+    # Write everything to the destination FIRST. Each set() is a
+    # read-blob → line-edit → write-blob round trip, so existing
+    # destination entries / comments are preserved (we only add/update).
+    try:
+        for key, value in entries.items():
+            dst.set(key, value)
+    except CredentialBackendUnavailableError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    success(
+        f"copied {len(entries)} credential(s) from [cyan]{src.location()}[/cyan] "
+        f"to [cyan]{dst.location()}[/cyan]."
+    )
+    # Never log secret values — only the key names moved.
+    hint(f"[dim]keys: {', '.join(sorted(entries))}[/dim]")
+
+    if remove_source:
+        # Source removal happens ONLY after every destination write
+        # succeeded above, so a partial migration can't strand keys.
+        removed = 0
+        for key in entries:
+            if src.delete(key):
+                removed += 1
+        success(f"removed {removed} credential(s) from [cyan]{src.location()}[/cyan].")
+    else:
+        hint(
+            f"[dim]source left intact at {src.location()} (pass "
+            f"[bold]--remove-source[/bold] to delete it after verifying).[/dim]"
+        )
+
+    hint(
+        f"[dim]Set [bold]MOVATE_CRED_BACKEND={dst_name}[/bold] in your shell "
+        f"profile so every mdk invocation uses the {dst_name} backend.[/dim]"
+    )
+
+
 @auth_app.command("status")
 def status() -> None:
     """Show which provider keys are configured and where they came from.
@@ -773,7 +909,12 @@ def status() -> None:
     _render_runtime_targets_section(counts)
 
     stdout.print()
-    stdout.print(f"[dim]credentials file: [cyan]{CredentialsStore().path}[/cyan][/dim]")
+    # Backend-aware: shows the file path for the default file backend, or
+    # "OS keychain (...)" when MOVATE_CRED_BACKEND=keychain is selected.
+    # `.location()` is a pure string and never touches `keyring`, so this
+    # is safe even when the keychain backend is selected without the
+    # optional dependency installed.
+    stdout.print(f"[dim]credentials: [cyan]{CredentialsStore().location()}[/cyan][/dim]")
     # Summary line tail keeps the ``set=`` and ``unset=`` keys for
     # backwards-compat with downstream scrapers; adds ``rejected=``
     # when any keys came back 401 so CI scripts can gate on it
