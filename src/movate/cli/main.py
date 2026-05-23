@@ -194,6 +194,7 @@ from movate.cli.costs_cmd import costs_app  # noqa: E402
 from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.doctor import doctor_app  # noqa: E402
 from movate.cli.export_oci_cmd import export_app  # noqa: E402
+from movate.cli.fleet_cmd import fleet_app  # noqa: E402
 from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.infra_cmd import infra_app  # noqa: E402
@@ -499,6 +500,7 @@ app.add_typer(playground_app, name="playground", rich_help_panel=PANEL_DEPLOY)
 
 app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
+app.add_typer(fleet_app, name="fleet", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(profiles_app, name="profiles", rich_help_panel=PANEL_MANAGE)
 app.add_typer(secrets_app, name="secrets", rich_help_panel=PANEL_MANAGE)
