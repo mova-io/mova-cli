@@ -28,17 +28,22 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 9 | Response cache — `CacheProvider` adapter (exact + optional semantic), Redis/Postgres-backed | feature | M (~35m) | — | ⬜ | | `____` |
 | 10 | Continuous eval + drift alerting — scheduler enqueues eval-job on cadence/publish; baseline-diff; alerts | 016.D2 | L (~1–1.5h, ~2 PRs) | #2, scheduler | ⬜ | | `____` |
 
-## After the next 10 (rough order)
+## Items 11+ (sequenced; orchestration ADR 017 woven in by leverage/dependency)
 
-| Item | ADR / ref | LOE (Claude) |
-|------|-----------|--------------|
-| Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) |
-| Langfuse self-host Bicep module (`enableLangfuse`: ClickHouse/Redis/Blob, KV, private ingress) | 015.3 | L (~45m) 🔒 |
-| Canary / champion–challenger (version-tagged runs, weighted routing, assisted-promote) | 016.D3 | L (~1–1.5h) |
-| Workload identity for service-to-service (removes shared fleet key + KV bootstrap secret) | 013.D6 | M (~35m) 🔒 |
-| Edge gateway (APIM / Envoy — custom domain, dev portal, edge throttle/WAF) | 013.L3 | L (~1h) 🔒 |
-| Batch inference API (bulk async run over a dataset) | feature | M (~25m) |
-| Streaming responses (SSE) | #75 | S (~20m) |
+| # | Item | ADR / ref | LOE (Claude) | Depends on |
+|---|------|-----------|--------------|------------|
+| 11 | **Generalize the scheduler** — cron→enqueue arbitrary agent/workflow jobs (ACA Jobs substrate); extends item 10's eval scheduler | 017.D2 / 016 | L (~1h) 🔒 | #10 |
+| 12 | Canary / champion–challenger (version-tagged runs, weighted routing, assisted-promote) — completes the improvement loop | 016.D3 | L (~1–1.5h) | registry, obs, scopes |
+| 13 | Event / webhook triggers — run an agent/workflow on an inbound event | 017.D2 | M (~35m) | #11 |
+| 14 | Durable + HITL — `HUMAN` node pause/persist/resume-on-signal (long, human-gated pipelines) | 017.D5 / #28 | L (~1.5–2h, ~2 PRs) | #11, #13 |
+| 15 | External-orchestrator adapter pack — `mdk[prefect]` task + `mdk[airflow]` `MovateAgentOperator` + webhook contract (movate as a *callable*, no core dep) | 017.D3 | M–L (~45m) 🔒 | — |
+| 16 | Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) | scopes |
+| 17 | Batch inference API (bulk async run over a dataset) | feature | M (~25m) | — |
+| 18 | Streaming responses (SSE) | #75 | S (~20m) | — |
+| 19 | Workload identity for service-to-service (removes shared fleet key + KV bootstrap secret) | 013.D6 | M (~35m) 🔒 | — |
+| 20 | Langfuse self-host Bicep module (`enableLangfuse`: ClickHouse/Redis/Blob, KV, private ingress) | 015.3 | L (~45m) 🔒 | langfuse-v3 |
+| 21 | Edge gateway (APIM / Envoy — custom domain, dev portal, edge throttle/WAF) | 013.L3 | L (~1h) 🔒 | scopes |
+| — | _(Temporal/Prefect durable backend — only if a single external engine is required; Deva sign-off, ADR 001)_ | 017.D4 | — | — |
 
 ## How this is maintained
 As each PR merges, its row flips to ✅ and the **Merged** column is stamped with

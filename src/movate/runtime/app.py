@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 
 import movate
 from movate.core.auth import ALL_SCOPES, LEGACY_DEFAULT_SCOPES, mint_api_key
+from movate.core.cache import build_cache
 from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
@@ -857,6 +858,13 @@ def build_app(
     else:
         limiter = InProcessRateLimiter(limit_per_minute=rate_limit_per_minute)
     app.state.rate_limiter = limiter
+
+    # Build the LLM response cache once at app construction so entries
+    # persist across requests within this replica (mirrors the rate
+    # limiter's lifecycle). NoOp / OFF unless MOVATE_LLM_CACHE selects
+    # a backend — unset → zero behavior change. In-process per-replica
+    # in v1.x; shared backends slot in behind the CacheProvider later.
+    app.state.llm_cache = build_cache()
 
     auth_dep = make_auth_dependency(storage, rate_limiter=limiter)
 
@@ -3002,6 +3010,11 @@ def build_app(
                 storage=store,
                 tracer=build_tracer(),
                 tenant_id=ctx.tenant_id,
+                # Shared per-replica LLM response cache (NoOp/OFF unless
+                # MOVATE_LLM_CACHE is set). Lives on app.state so entries
+                # persist across requests; the per-request executor just
+                # borrows it.
+                cache=request.app.state.llm_cache,
             )
             run_request = _RunRequest(agent=name, input=body.input)
             run_response = await executor.execute(bundle, run_request)
