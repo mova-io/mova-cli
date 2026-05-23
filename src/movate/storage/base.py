@@ -28,6 +28,7 @@ from typing import Protocol
 
 from movate.core.models import (
     ApiKeyRecord,
+    BenchRecord,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -70,6 +71,8 @@ class StorageProvider(Protocol):
 
     async def save_eval(self, e: EvalRecord) -> None: ...
 
+    async def save_bench(self, b: BenchRecord) -> None: ...
+
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None: ...
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
@@ -96,6 +99,13 @@ class StorageProvider(Protocol):
         different tenant.
         """
 
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        """Exact lookup by bench_id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the bench belongs to a
+        different tenant — same no-leak contract as ``get_eval``.
+        """
+
     async def list_runs(
         self,
         *,
@@ -116,6 +126,20 @@ class StorageProvider(Protocol):
         """List evals newest-first, optionally filtered.
 
         ``tenant_id=None`` returns evals across all tenants — operator
+        tooling only; never exposed on the HTTP API.
+        """
+
+    async def list_bench(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        """List bench runs newest-first, optionally filtered.
+
+        Same tenant-scoping + signature as :meth:`list_evals`:
+        ``tenant_id=None`` returns benches across all tenants — operator
         tooling only; never exposed on the HTTP API.
         """
 

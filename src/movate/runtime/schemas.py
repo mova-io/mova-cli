@@ -496,6 +496,119 @@ class EvalListView(BaseModel):
     count: int
 
 
+# ---------------------------------------------------------------------------
+# Bench (BACKLOG #64) — multi-model comparison. Mirrors the eval wire types:
+# a submission kicks off a JobKind.BENCH job; the result + list endpoints
+# render the persisted BenchRecord.
+# ---------------------------------------------------------------------------
+
+
+class BenchSubmission(BaseModel):
+    """``POST /api/v1/bench/{agent}`` request body.
+
+    Bench kickoff config. Mirrors the ``mdk bench`` CLI's flag set:
+    compare one ``input`` across N ``models`` and report cost / latency
+    / (optional) quality per model.
+
+    Execution is async: the endpoint creates a ``JobRecord(kind=BENCH)``
+    and returns immediately with ``{job_id, bench_id, status: "queued"}``.
+    The worker picks it up and persists the ``BenchRecord``; poll
+    ``GET /api/v1/jobs/{job_id}`` for completion and
+    ``GET /api/v1/bench/{result_run_id}`` for the comparison.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[str] = Field(..., min_length=1)
+    """Providers to compare. At least one required."""
+    input: dict[str, Any] = Field(...)
+    """The single input payload run through every model (same shape as
+    the agent's input schema)."""
+    judge: str | None = Field(None)
+    """Optional judge provider for quality scoring. Scoring is enabled
+    only when both ``judge`` and ``rubric`` are supplied."""
+    rubric: str | None = Field(None)
+    """Optional inline scoring rubric (required to enable LLM-as-judge)."""
+    runs: int = Field(1, ge=1, le=10)
+    """Runs per model. Use 3+ to smooth latency/cost variance."""
+    gate_mode: str = Field("mean")
+    """Score aggregation across N runs per model: ``mean`` | ``min`` | ``p10``."""
+    mock: bool = Field(False)
+    """Use the deterministic MockProvider (no API keys, fast)."""
+
+
+class BenchAcceptedView(BaseModel):
+    """``POST /api/v1/bench/{agent}`` response.
+
+    Returns immediately with ``status="queued"``, the queue ``job_id``,
+    and the ``bench_id`` that the produced :class:`BenchRecord` will
+    carry. Poll ``GET /api/v1/jobs/{job_id}`` until terminal, then fetch
+    the comparison from ``GET /api/v1/bench/{bench_id}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bench_id: str = ""
+    """The id the produced BenchRecord will carry (pre-generated so the
+    caller can fetch it once the job completes)."""
+    job_id: str = ""
+    """The queue entry's id; poll ``GET /api/v1/jobs/{job_id}``."""
+    status: str = "queued"
+
+
+class BenchModelView(BaseModel):
+    """One per-model row in a bench result. Matches the shape
+    ``mdk bench --output json`` emits per model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    score: float | None = None
+    """Aggregated quality score (0.0-1.0), or ``None`` if unscored."""
+    judge_skipped: bool = False
+    cost_mean_usd: float
+    cost_total_usd: float
+    latency_p50_ms: int
+    latency_p95_ms: int
+    error_count: int
+    sample_output: dict[str, Any] | None = None
+
+
+class BenchResultView(BaseModel):
+    """``GET /api/v1/bench/{bench_id}`` response.
+
+    The complete BenchRecord rendered as JSON + per-model rows. Mirrors
+    what ``mdk bench`` prints to terminal but as structured JSON for the
+    Angular UI to render the comparison table.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bench_id: str
+    agent: str
+    agent_version: str
+    input: dict[str, Any]
+    judge_method: str | None
+    judge_provider: str | None
+    runs_per_model: int
+    gate_mode: str
+    models: list[BenchModelView]
+    created_at: str
+    """ISO-8601 timestamp."""
+
+
+class BenchListView(BaseModel):
+    """``GET /api/v1/bench?agent={name}`` response.
+
+    Paginated history of past bench runs for an agent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bench: list[BenchResultView]
+    count: int
+
+
 class WizardAgentSubmission(BaseModel):
     """``POST /api/v1/agents/from-wizard`` request body.
 
@@ -1447,6 +1560,11 @@ __all__ = [
     "AgentValidationIssue",
     "AgentValidationView",
     "AgentView",
+    "BenchAcceptedView",
+    "BenchListView",
+    "BenchModelView",
+    "BenchResultView",
+    "BenchSubmission",
     "EvalAcceptedView",
     "EvalCaseView",
     "EvalListView",

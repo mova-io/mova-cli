@@ -31,6 +31,8 @@ import asyncpg
 from movate.core.models import (
     ApiKeyEnv,
     ApiKeyRecord,
+    BenchModelResult,
+    BenchRecord,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -148,6 +150,22 @@ CREATE TABLE IF NOT EXISTS evals (
 );
 CREATE INDEX IF NOT EXISTS idx_evals_agent_created
     ON evals(agent, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS bench (
+    bench_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    agent_version   TEXT NOT NULL,
+    input           JSONB NOT NULL,
+    judge_method    TEXT,
+    judge_provider  TEXT,
+    runs_per_model  INTEGER NOT NULL,
+    gate_mode       TEXT NOT NULL,
+    models          JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_agent_created
+    ON bench(agent, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_run_id   TEXT PRIMARY KEY,
@@ -738,6 +756,63 @@ class PostgresProvider:
         sql = f"SELECT * FROM evals {where} ORDER BY created_at DESC LIMIT ${len(params)}"
         rows = await self._db.fetch(sql, *params)
         return [_row_to_eval(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Bench (BACKLOG #64)
+    # ------------------------------------------------------------------
+
+    async def save_bench(self, b: BenchRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO bench (
+                bench_id, tenant_id, agent, agent_version, input,
+                judge_method, judge_provider, runs_per_model, gate_mode,
+                models, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            )
+            """,
+            b.bench_id,
+            b.tenant_id,
+            b.agent,
+            b.agent_version,
+            b.input,
+            b.judge_method.value if b.judge_method else None,
+            b.judge_provider,
+            b.runs_per_model,
+            b.gate_mode,
+            [m.model_dump() for m in b.models],
+            b.created_at,
+        )
+
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM bench WHERE bench_id = $1 AND tenant_id = $2",
+            bench_id,
+            tenant_id,
+        )
+        return _row_to_bench(row) if row else None
+
+    async def list_bench(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
+        if agent is not None:
+            params.append(agent)
+            clauses.append(f"agent = ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        sql = f"SELECT * FROM bench {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_bench(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Workflow runs
@@ -1828,6 +1903,22 @@ def _row_to_thread(row: asyncpg.Record) -> ConversationThread:
         title=row["title"] or "",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
+    return BenchRecord(
+        bench_id=row["bench_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        agent_version=row["agent_version"],
+        input=dict(row["input"]),
+        judge_method=JudgeMethod(row["judge_method"]) if row["judge_method"] else None,
+        judge_provider=row["judge_provider"],
+        runs_per_model=row["runs_per_model"],
+        gate_mode=row["gate_mode"],
+        models=[BenchModelResult.model_validate(m) for m in row["models"]],
+        created_at=row["created_at"],
     )
 
 

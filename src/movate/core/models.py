@@ -1751,6 +1751,65 @@ class EvalRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class BenchModelResult(BaseModel):
+    """Per-model row inside a :class:`BenchRecord`.
+
+    One per provider compared in the bench, mirroring the shape
+    ``mdk bench --output json`` emits (see ``cli.bench._model_to_json``)
+    so the persisted record and the CLI's JSON output stay aligned.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    score: float | None = None
+    """Aggregated quality score (0.0-1.0) across the model's runs, or
+    ``None`` when no judge scored it (no rubric, or judge skipped for a
+    same-family conflict — see ``judge_skipped``)."""
+    judge_skipped: bool = False
+    """True when the judge was skipped for this model because it shared
+    a family with the configured judge (cross-family enforcement)."""
+    cost_mean_usd: float
+    cost_total_usd: float
+    latency_p50_ms: int
+    latency_p95_ms: int
+    error_count: int
+    sample_output: dict[str, Any] | None = None
+    """First successful run's output payload (or ``None`` if every run
+    errored). Kept for a quick eyeball of what the model produced."""
+
+
+class BenchRecord(BaseModel):
+    """Persisted summary of one bench run (one agent version, N models compared).
+
+    The bench analogue of :class:`EvalRecord`: where an eval scores one
+    agent against a dataset, a bench compares one input across several
+    models and reports cost / latency / (optional) quality per model.
+    Per-model rows live in ``models`` as a JSON-serializable list, the
+    same way ``EvalRecord`` flattens per-case data.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bench_id: str
+    tenant_id: str
+    agent: str
+    agent_version: str
+    input: dict[str, Any]
+    """The single input payload run through every model."""
+    judge_method: JudgeMethod | None = None
+    """Judge method when quality was scored (``llm_judge``); ``None`` for
+    cost+latency-only benches."""
+    judge_provider: str | None = None
+    """Judge provider when scoring was enabled; ``None`` otherwise."""
+    runs_per_model: int
+    gate_mode: str
+    """Score aggregation across the N runs per model: ``mean`` | ``min`` | ``p10``."""
+    models: list[BenchModelResult]
+    """Per-model comparison rows, in the order they were benched."""
+    created_at: datetime = Field(default_factory=_now)
+
+
 # ---------------------------------------------------------------------------
 # Job queue (v0.5+)
 #
@@ -1777,6 +1836,13 @@ class JobKind(StrEnum):
     output payload carries ``{eval_id}`` so the caller can fetch the
     completed EvalRecord via GET /api/v1/evals/{eval_id} (item 84).
     See BACKLOG Group H item 83."""
+    BENCH = "bench"
+    """Async multi-model bench. JobRecord.input carries the bench config
+    (models, judge, rubric, mock, runs, gate_mode, input). Worker loads
+    the agent bundle, runs BenchEngine, persists a BenchRecord. As with
+    EVAL, ``result_run_id`` carries the produced ``bench_id`` so the
+    caller can fetch the completed BenchRecord via
+    GET /api/v1/bench/{bench_id}. See BACKLOG item 64."""
 
 
 class JobRecord(BaseModel):
