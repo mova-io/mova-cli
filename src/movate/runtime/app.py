@@ -79,8 +79,16 @@ from movate.runtime.schemas import (
     HealthView,
     JobListView,
     JobView,
+    KbChunkView,
+    KbDeletedView,
     KbIngestFileResult,
     KbIngestView,
+    KbListView,
+    KbSearchResultView,
+    KbSearchSubmission,
+    KbSearchView,
+    KbStatsSourceView,
+    KbStatsView,
     ReadyView,
     RunAccepted,
     RunSubmission,
@@ -1764,6 +1772,246 @@ def build_app(
             agent_name=name,
             files=per_file,
             total_chunks_saved=total_saved,
+        )
+
+    @v1.get(
+        "/agents/{name}/kb",
+        response_model=KbListView,
+        tags=["agents-v1", "kb"],
+    )
+    async def v1_list_agent_kb(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        source: str | None = None,
+        limit: int = 1000,
+    ) -> KbListView:
+        """List the chunks in an agent's knowledge base (Task 4).
+
+        The remote twin of ``mdk kb list`` — lets an operator inspect a
+        DEPLOYED agent's KB ("is my content actually in there?") without
+        SSH-ing to the host or running SQL by hand. Tenant-scoped at the
+        storage layer (``list_kb_chunks(..., tenant_id=...)``), so a
+        caller only ever sees their own tenant's chunks.
+
+        Query params:
+
+        * ``?source=`` — filter to chunks from one source URI (file path
+          / URL recorded at ingest time).
+        * ``?limit=`` — cap the rows returned. Hard-capped at 10000 to
+          keep the response bounded.
+
+        The ``embedding`` vector is omitted from each chunk — list
+        payloads are for inspection, not retrieval, and 1536 floats per
+        chunk would bloat the response for no consumer benefit.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        if name not in {b.spec.name for b in agents}:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        # Hard cap mirrors the bounded-response convention on the other
+        # list endpoints (jobs caps at 100; KB lists can legitimately be
+        # larger, so 10k — same order as the CLI's local default ceiling).
+        capped_limit = max(1, min(int(limit), 10_000))
+        chunks = await store.list_kb_chunks(
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            source=source,
+            limit=capped_limit,
+        )
+        views = [
+            KbChunkView(
+                chunk_id=c.chunk_id,
+                source=c.source,
+                text=c.text,
+                embedding_model=c.embedding_model,
+                content_hash=c.content_hash,
+                ocr=c.ocr,
+                metadata=c.metadata,
+                created_at=c.created_at.isoformat(),
+            )
+            for c in chunks
+        ]
+        return KbListView(agent_name=name, chunks=views, count=len(views))
+
+    @v1.get(
+        "/agents/{name}/kb/stats",
+        response_model=KbStatsView,
+        tags=["agents-v1", "kb"],
+    )
+    async def v1_agent_kb_stats(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> KbStatsView:
+        """Aggregate stats for an agent's KB (Task 4).
+
+        The remote twin of ``mdk kb stats``. Aggregation happens
+        SERVER-SIDE — the runtime walks its own chunks and ships only the
+        rolled-up counts, never the corpus. Returns total chunk count,
+        total char count, OCR-derived chunk count, a per-source
+        breakdown (chunk + char counts), and every distinct
+        ``embedding_model`` present (more than one = a mixed-model KB
+        that needs a re-embed before search is reliable).
+
+        Tenant-scoped via ``list_kb_chunks(..., tenant_id=...)``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        if name not in {b.spec.name for b in agents}:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        # Pull all chunks for accurate aggregation. The high limit matches
+        # the local ``mdk kb stats`` path (which uses 100k); a KB larger
+        # than that is a re-architecture problem, not a pagination one.
+        chunks = await store.list_kb_chunks(
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            limit=100_000,
+        )
+
+        per_source: dict[str, list[int]] = {}
+        models: set[str] = set()
+        total_chars = 0
+        ocr_chunks = 0
+        for c in chunks:
+            per_source.setdefault(c.source, []).append(len(c.text))
+            models.add(c.embedding_model)
+            total_chars += len(c.text)
+            if c.ocr:
+                ocr_chunks += 1
+
+        # Sort per-source rows by chunk count DESC (the distribution view
+        # operators care about — "which doc dominates retrieval?"), ties
+        # broken alphabetically for stable output.
+        sources = [
+            KbStatsSourceView(source=src, chunks=len(sizes), chars=sum(sizes))
+            for src, sizes in sorted(per_source.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        ]
+        return KbStatsView(
+            agent_name=name,
+            total_chunks=len(chunks),
+            total_chars=total_chars,
+            ocr_chunks=ocr_chunks,
+            sources=sources,
+            models=sorted(models),
+        )
+
+    @v1.delete(
+        "/agents/{name}/kb",
+        response_model=KbDeletedView,
+        tags=["agents-v1", "kb"],
+    )
+    async def v1_delete_agent_kb(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        source: str | None = None,
+    ) -> KbDeletedView:
+        """Delete chunks from an agent's KB (Task 4).
+
+        The remote twin of ``mdk kb clear``. With ``?source=`` set, only
+        chunks from that source URI are removed (the re-ingest-with-
+        --replace workflow); omit it for a full-KB wipe. Returns the
+        count deleted.
+
+        Tenant-scoped via ``delete_kb_chunks(..., tenant_id=...)`` — a
+        caller can never wipe another tenant's KB by guessing the agent
+        name.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        if name not in {b.spec.name for b in agents}:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        deleted = await store.delete_kb_chunks(
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            source=source,
+        )
+        return KbDeletedView(agent_name=name, deleted=deleted, source=source)
+
+    @v1.post(
+        "/agents/{name}/kb/search",
+        response_model=KbSearchView,
+        tags=["agents-v1", "kb"],
+    )
+    async def v1_search_agent_kb(
+        name: str,
+        body: KbSearchSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> KbSearchView:
+        """Semantic search over an agent's KB (Task 4).
+
+        The remote twin of ``mdk kb search``. The runtime embeds the
+        question SERVER-SIDE with the deployment's configured embedding
+        model (so the query vector lands in the same space as the stored
+        chunks — different models produce incomparable vectors) and runs
+        the same :func:`movate.kb.search.search` pipeline the local CLI
+        uses. ``hybrid=true`` adds a parallel BM25 lexical pass + RRF
+        fusion. The embedding vector is omitted from each result for the
+        usual payload-size reason.
+
+        Tenant-scoped — the search runs against ``ctx.tenant_id``'s
+        chunks only.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent not in the registry
+        * **502** — embedding API unreachable
+        """
+        from movate.kb.embed import embedding_model  # noqa: PLC0415
+        from movate.kb.search import search as kb_search  # noqa: PLC0415
+
+        agents: list[AgentBundle] = request.app.state.agents
+        if name not in {b.spec.name for b in agents}:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        results = await kb_search(
+            storage=store,
+            question=body.question,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            limit=body.k,
+            embedding_model=embedding_model(),
+            hybrid=body.hybrid,
+        )
+        views = [
+            KbSearchResultView(
+                chunk_id=r.chunk.chunk_id,
+                source=r.chunk.source,
+                text=r.chunk.text,
+                embedding_model=r.chunk.embedding_model,
+                score=r.score,
+                ocr=r.chunk.ocr,
+                metadata=r.chunk.metadata,
+            )
+            for r in results
+        ]
+        return KbSearchView(
+            agent_name=name,
+            question=body.question,
+            results=views,
+            count=len(views),
         )
 
     @v1.post(
