@@ -26,7 +26,12 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 7 | `mdk login` — OIDC device-code SSO + token cache/refresh + `TargetConfig auth:oidc` + login/logout/whoami | 013.L1 | L (~50m) 🔒 | — | ✅ | #374 | `2026.5.23.21` |
 | 8 | Langfuse v3 SDK bump — `tracing/langfuse.py` v2→v3; `langfuse>=3` extra | 015.2 | S–M (~25m) | — | ✅ | #376 | `2026.5.23.23` |
 | 9 | Response cache — `CacheProvider` adapter (exact + optional semantic), Redis/Postgres-backed | feature | M (~35m) | — | ✅ | #378 | `2026.5.23.25` |
-| 10 | Continuous eval + drift alerting — scheduler enqueues eval-job on cadence/publish; baseline-diff; alerts | 016.D2 | L (~1–1.5h, ~2 PRs) | #2, scheduler | ⬜ | | `____` |
+| 10 | Continuous eval + drift alerting — scheduler enqueues eval-job on cadence/publish; baseline-diff; alerts | 016.D2 | L (~1–1.5h, 1 PR) | #2, scheduler | ✅ | #380 | `2026.5.23.27` |
+
+> ✅ **Next-10 arc complete** (`2026.5.23.13` → `.27`). The continuous-eval
+> scheduler (item 10) ships the portable cron-tick + enqueue primitive
+> (`core/scheduler.py`) that item 11 generalizes into the orchestration
+> substrate — so item 11 is now the front of the queue.
 
 ## Items 11+ (sequenced; orchestration ADR 017 woven in by leverage/dependency)
 
