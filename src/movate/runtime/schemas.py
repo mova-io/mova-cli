@@ -961,6 +961,44 @@ class KbSearchView(BaseModel):
     count: int
 
 
+class KbReindexSubmission(BaseModel):
+    """``POST /api/v1/agents/{name}/kb/reindex`` request body.
+
+    ``reembed=false`` (the default) rebuilds the vector index from the
+    chunks already in storage — no embedding calls, no API key. Set
+    ``reembed=true`` to first re-run the embedding model over every
+    stored chunk's text (overwriting each vector) and THEN rebuild the
+    index — the expensive path, required only when the embedding
+    model / dimension changes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reembed: bool = False
+    """When true, re-embed every stored chunk before rebuilding the
+    index (costs money + needs an embedding key on the runtime)."""
+
+
+class KbReindexView(BaseModel):
+    """``POST /api/v1/agents/{name}/kb/reindex`` response — what was done."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    reembed: bool
+    chunks_reembedded: int
+    """How many chunks had their vector re-computed (0 unless
+    ``reembed`` was set)."""
+
+    index_rebuilt: bool
+    """True when the backend rebuilt a real vector index; False for
+    brute-force backends (sqlite / in-memory) that have none."""
+
+    backend: str
+    """The storage backend name (``postgres`` / ``sqlite`` /
+    ``memory``) — clarifies whether a real index rebuild happened."""
+
+
 # ---------------------------------------------------------------------------
 # Auth key management wire types
 # ---------------------------------------------------------------------------

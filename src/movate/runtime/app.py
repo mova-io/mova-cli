@@ -84,6 +84,8 @@ from movate.runtime.schemas import (
     KbIngestFileResult,
     KbIngestView,
     KbListView,
+    KbReindexSubmission,
+    KbReindexView,
     KbSearchResultView,
     KbSearchSubmission,
     KbSearchView,
@@ -2012,6 +2014,85 @@ def build_app(
             question=body.question,
             results=views,
             count=len(views),
+        )
+
+    @v1.post(
+        "/agents/{name}/kb/reindex",
+        response_model=KbReindexView,
+        tags=["agents-v1", "kb"],
+    )
+    async def v1_reindex_agent_kb(
+        name: str,
+        body: KbReindexSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> KbReindexView:
+        """Rebuild an agent's KB vector index (Task 5).
+
+        The remote twin of ``mdk kb reindex``. With ``reembed=false``
+        (the default) the runtime rebuilds the vector index from the
+        chunks already in storage — no embedding calls, for recovering a
+        degraded index or applying new index parameters. With
+        ``reembed=true`` it first re-runs the deployment's configured
+        embedding model over every stored chunk's text (overwriting each
+        vector via :func:`save_kb_chunk`'s upsert) and THEN rebuilds the
+        index — the expensive path, required when the embedding
+        model / dimension changes.
+
+        Re-embedding is orchestrated HERE in the runtime layer (which may
+        import the embedder), not in storage — same boundary the local
+        ``mdk kb reindex`` honours. Tenant-scoped via ``ctx.tenant_id``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent not in the registry
+        * **502** — embedding API unreachable (reembed path only)
+        """
+        from movate.kb.embed import embed_texts, qualified_model_name  # noqa: PLC0415
+        from movate.kb.embed import embedding_model as _embedding_model  # noqa: PLC0415
+
+        agents: list[AgentBundle] = request.app.state.agents
+        if name not in {b.spec.name for b in agents}:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+
+        chunks_reembedded = 0
+        if body.reembed:
+            # Re-embed every stored chunk's text with the deployment's
+            # configured model and overwrite its vector. save_kb_chunk
+            # upserts on (agent, tenant_id, content_hash), so persisting
+            # the same chunk with a fresh embedding overwrites in place.
+            model = _embedding_model()
+            chunks = await store.list_kb_chunks(
+                agent=name,
+                tenant_id=ctx.tenant_id,
+                limit=100_000,
+            )
+            if chunks:
+                vectors = await embed_texts([c.text for c in chunks], model=model)
+                qualified = qualified_model_name(model)
+                for chunk, vector in zip(chunks, vectors, strict=True):
+                    await store.save_kb_chunk(
+                        chunk.model_copy(update={"embedding": vector, "embedding_model": qualified})
+                    )
+                chunks_reembedded = len(chunks)
+
+        # Rebuild the index (no-op count on brute-force backends). The
+        # KbReindexView reports rebuilt-or-not by backend, not the count,
+        # so the return value is intentionally discarded here.
+        await store.reindex_kb(agent=name, tenant_id=ctx.tenant_id)
+        backend = getattr(store, "name", "unknown")
+        # Only Postgres has a real vector index to rebuild; the
+        # brute-force backends return the count as a no-op.
+        index_rebuilt = backend == "postgres"
+        return KbReindexView(
+            agent=name,
+            reembed=body.reembed,
+            chunks_reembedded=chunks_reembedded,
+            index_rebuilt=index_rebuilt,
+            backend=backend,
         )
 
     @v1.post(

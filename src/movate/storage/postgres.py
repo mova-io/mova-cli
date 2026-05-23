@@ -1288,6 +1288,29 @@ class PostgresProvider:
         except (ValueError, IndexError):
             return 0
 
+    async def reindex_kb(self, *, agent: str, tenant_id: str) -> int:
+        # The HNSW index is GLOBAL to the kb_chunks table, not per-agent
+        # (it indexes the embedding column for the whole table), so a
+        # rebuild serves every agent at once — the (agent, tenant_id)
+        # scope only narrows the returned count, not what gets rebuilt.
+        # Drop + re-create with the exact DDL the migration uses (ADR
+        # 009 D3) so a degraded index or a changed index parameter is
+        # picked up. No embedding happens here — re-embedding is the
+        # caller's job (kb/cli), preserving the storage-layer boundary
+        # that storage never imports the embedder.
+        async with self._db.acquire() as conn:
+            await conn.execute("DROP INDEX IF EXISTS idx_kb_chunks_embedding_hnsw")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_kb_chunks_embedding_hnsw "
+                "ON kb_chunks USING hnsw (embedding vector_cosine_ops)"
+            )
+            count = await conn.fetchval(
+                "SELECT count(*) FROM kb_chunks WHERE agent = $1 AND tenant_id = $2",
+                agent,
+                tenant_id,
+            )
+        return int(count or 0)
+
     # ------------------------------------------------------------------
     # Knowledge graph (GraphRAG)
     # ------------------------------------------------------------------
