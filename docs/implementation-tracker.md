@@ -24,8 +24,8 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 5 | Harvest — prod runs + feedback → *proposed* eval cases (`mdk eval harvest` + API) | 016.D1 | M (~30m) | (#2 helps) | ✅ | #372 | `2026.5.23.19` |
 | 6 | Versioning UX — optimistic concurrency (If-Match/409), `GET …/versions`, `revert` (#80), `mdk agent history\|revert` | 014.3 | M (~30m) | #1, #2 | ✅ | #373 | `2026.5.23.20` |
 | 7 | `mdk login` — OIDC device-code SSO + token cache/refresh + `TargetConfig auth:oidc` + login/logout/whoami | 013.L1 | L (~50m) 🔒 | — | ✅ | #374 | `2026.5.23.21` |
-| 8 | Langfuse v3 SDK bump — `tracing/langfuse.py` v2→v3; `langfuse>=3` extra | 015.2 | S–M (~25m) | — | ⬜ | | `____` |
-| 9 | Response cache — `CacheProvider` adapter (exact + optional semantic), Redis/Postgres-backed | feature | M (~35m) | — | ⬜ | | `____` |
+| 8 | Langfuse v3 SDK bump — `tracing/langfuse.py` v2→v3; `langfuse>=3` extra | 015.2 | S–M (~25m) | — | ✅ | #376 | `2026.5.23.23` |
+| 9 | Response cache — `CacheProvider` adapter (exact + optional semantic), Redis/Postgres-backed | feature | M (~35m) | — | ✅ | #378 | `2026.5.23.25` |
 | 10 | Continuous eval + drift alerting — scheduler enqueues eval-job on cadence/publish; baseline-diff; alerts | 016.D2 | L (~1–1.5h, ~2 PRs) | #2, scheduler | ⬜ | | `____` |
 
 ## Items 11+ (sequenced; orchestration ADR 017 woven in by leverage/dependency)
