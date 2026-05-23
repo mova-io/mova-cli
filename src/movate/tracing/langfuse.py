@@ -4,6 +4,12 @@ Langfuse is an optional dependency. Install with::
 
     uv sync --extra langfuse
 
+This adapter targets the **Langfuse v3 SDK** (the OpenTelemetry-based SDK
+shipped with self-hosted Langfuse v3). It replaced the v2 SDK, whose
+``Langfuse().trace(...)`` / ``trace.span(...)`` / ``span.generation(...)``
+object model was a significant API change. The mapping is documented inline
+at each method (see ADR 015, implementation-plan step 2).
+
 Activation precedence (see :func:`movate.tracing.build_tracer`):
 
 1. ``MOVATE_TRACER=langfuse`` — explicit opt-in.
@@ -13,15 +19,21 @@ Either path will gracefully fall back to the stdout tracer (with a stderr
 warning) if the langfuse package isn't importable or if the SDK rejects
 our keys at construction time. We never let tracing break a run.
 
-Span model:
+Span model (v3):
 
 * The first ``start_span`` on a fresh tracer instance creates a Langfuse
-  *trace*. Nested spans (those passed a ``parent``) become Langfuse spans
-  under that trace.
-* ``log_event`` maps to ``span.event(name="event", metadata=event)``.
+  *root span* via ``client.start_span(...)``. In v3 the root span IS the
+  trace anchor (there is no separate ``trace`` object) — trace-level fields
+  (``session_id`` / ``user_id`` / ``tags``) are set on it via
+  ``span.update_trace(...)``. Nested spans (those passed a ``parent``)
+  become child spans via ``parent.start_span(...)``.
+* ``log_event`` maps to ``span.create_event(name="event", metadata=event)``.
 * ``set_attribute`` mirrors the value into the span's metadata via
   ``span.update(metadata={key: value})``.
-* ``end_span`` closes the underlying Langfuse object with ``status_message``.
+* ``end_span`` closes the underlying Langfuse object with ``span.end()``.
+  In v3 *every* observation (root included) exposes ``.end()`` — the v2
+  "trace root has no ``.end()``" quirk is gone — so we record terminal
+  status via ``update(status_message=...)`` then ``end()``.
 
 The local ``SpanCtx`` stays a pure dataclass — Langfuse handles are kept
 in a private dict keyed by ``span_id`` so callers never see SDK objects.
@@ -42,23 +54,27 @@ class LangfuseUnavailableError(Exception):
 
 
 class LangfuseTracer(Tracer):
-    """Forwards :class:`Tracer` Protocol calls to Langfuse v2 SDK objects."""
+    """Forwards :class:`Tracer` Protocol calls to Langfuse v3 SDK objects."""
 
     name = "langfuse"
 
     def __init__(self, *, client: Any | None = None) -> None:
         """Construct from an existing client, or build one from env vars.
 
-        ``client=`` is the test seam: pass a stub that exposes
-        ``trace(...)`` returning an object with ``span(...)``, ``event(...)``,
-        ``update(...)``, ``end(...)``, plus a top-level ``flush()``.
+        ``client=`` is the test seam: pass a stub that mirrors the v3 SDK
+        surface we use — a top-level ``start_span(name=, metadata=)``
+        returning an observation object with ``start_span(...)``,
+        ``start_observation(as_type="generation", ...)``, ``create_event(...)``,
+        ``update(...)``, ``update_trace(...)``, ``end()``, a ``trace_id``
+        attribute, plus a top-level ``create_score(...)`` /
+        ``flush()`` / ``shutdown()``.
         """
         if client is None:
             client = _build_client_from_env()
         self._client = client
-        # span_id → langfuse handle (trace or span). Lookups are O(1) and
-        # unbounded growth is bounded by the lifetime of the run since
-        # ``end_span`` pops.
+        # span_id → langfuse observation handle (root or child span). Lookups
+        # are O(1); unbounded growth is bounded by the lifetime of the run
+        # since ``end_span`` pops.
         self._handles: dict[str, Any] = {}
 
     # ----- start ------------------------------------------------------------
@@ -78,17 +94,13 @@ class LangfuseTracer(Tracer):
         user_id: str | None = attributes.pop("_user_id", None) or None
         tags: list[str] = attributes.pop("_tags", None) or []
         if parent is None:
-            # Build kwargs for client.trace() selectively so we don't pass
-            # None for optional fields the SDK might reject.
-            trace_kwargs: dict[str, Any] = {"name": name, "metadata": attributes}
-            if session_id:
-                trace_kwargs["session_id"] = session_id
-            if user_id:
-                trace_kwargs["user_id"] = user_id
-            if tags:
-                trace_kwargs["tags"] = tags
-            handle = self._client.trace(**trace_kwargs)
-            trace_id = getattr(handle, "id", None) or str(uuid4())
+            # v3: the root span anchors the trace. Create it, then push
+            # trace-level fields onto it via update_trace (v2 set these as
+            # client.trace(session_id=..., user_id=..., tags=...) kwargs —
+            # in v3 there's no separate trace object).
+            handle = self._client.start_span(name=name, metadata=attributes)
+            self._update_trace_fields(handle, session_id=session_id, user_id=user_id, tags=tags)
+            trace_id = getattr(handle, "trace_id", None) or str(uuid4())
             ctx = SpanCtx(
                 trace_id=trace_id,
                 parent_id=None,
@@ -98,12 +110,12 @@ class LangfuseTracer(Tracer):
         else:
             parent_handle = self._handles.get(parent.span_id)
             if parent_handle is None:
-                # Parent's already ended — fall back to a top-level trace
+                # Parent's already ended — fall back to a top-level root span
                 # rather than dropping the span on the floor.
-                handle = self._client.trace(name=name, metadata=attributes)
-                trace_id = getattr(handle, "id", None) or parent.trace_id
+                handle = self._client.start_span(name=name, metadata=attributes)
+                trace_id = getattr(handle, "trace_id", None) or parent.trace_id
             else:
-                handle = parent_handle.span(name=name, metadata=attributes)
+                handle = parent_handle.start_span(name=name, metadata=attributes)
                 trace_id = parent.trace_id
             ctx = SpanCtx(
                 trace_id=trace_id,
@@ -114,28 +126,51 @@ class LangfuseTracer(Tracer):
         self._handles[ctx.span_id] = handle
         return ctx
 
+    @staticmethod
+    def _update_trace_fields(
+        handle: Any,
+        *,
+        session_id: str | None,
+        user_id: str | None,
+        tags: list[str],
+    ) -> None:
+        """Set v3 trace-level fields on the root span via ``update_trace``.
+
+        Build kwargs selectively so we don't pass ``None`` for fields the
+        SDK might reject, and skip the call entirely when nothing is set.
+        Fail-soft: tracing must never break a run.
+        """
+        trace_kwargs: dict[str, Any] = {}
+        if session_id:
+            trace_kwargs["session_id"] = session_id
+        if user_id:
+            trace_kwargs["user_id"] = user_id
+        if tags:
+            trace_kwargs["tags"] = tags
+        if not trace_kwargs:
+            return
+        update_trace = getattr(handle, "update_trace", None)
+        if callable(update_trace):
+            with contextlib.suppress(Exception):
+                update_trace(**trace_kwargs)
+
     # ----- end --------------------------------------------------------------
 
     def end_span(self, span: SpanCtx, status: str = "ok") -> None:
         handle = self._handles.pop(span.span_id, None)
         if handle is None:
             return
-        # Langfuse v2 capability split: child spans (StatefulSpanClient)
-        # expose ``.end()``; the trace ROOT (StatefulTraceClient) does NOT —
-        # it has no ``.end()`` at all and is finalized via ``.update()`` +
-        # flushed at shutdown. Route by which method the handle actually
-        # has so a trace root doesn't raise AttributeError (which used to
-        # abort the whole run). Wrapped fail-soft: tracing must never break
-        # a run.
+        # v3 unifies the observation API: EVERY observation (root span and
+        # child spans alike) exposes ``.end()`` — the v2 split where the
+        # trace ROOT lacked ``.end()`` and had to be finalized via
+        # ``.update()`` is gone. Record terminal status on the span's
+        # metadata (v3 has no first-class status enum on spans we map to),
+        # then close it. Wrapped fail-soft: tracing must never break a run.
         with contextlib.suppress(Exception):
-            end = getattr(handle, "end", None)
-            if callable(end):
-                try:
-                    end(metadata={"status": status})
-                except TypeError:  # SDK quirk: some .end() take no kwargs
-                    end()
-            else:
-                handle.update(metadata={"status": status})
+            update = getattr(handle, "update", None)
+            if callable(update):
+                update(metadata={"status": status})
+            handle.end()
 
     # ----- events / attributes ---------------------------------------------
 
@@ -143,7 +178,8 @@ class LangfuseTracer(Tracer):
         handle = self._handles.get(span.span_id)
         if handle is None:
             return
-        handle.event(name="event", metadata=event)
+        with contextlib.suppress(Exception):
+            handle.create_event(name="event", metadata=event)
 
     def set_attribute(self, span: SpanCtx, key: str, value: Any) -> None:
         # Mutate the local ctx so callers reading ``span.attributes`` see it.
@@ -151,7 +187,8 @@ class LangfuseTracer(Tracer):
         handle = self._handles.get(span.span_id)
         if handle is None:
             return
-        handle.update(metadata={key: value})
+        with contextlib.suppress(Exception):
+            handle.update(metadata={key: value})
 
     # ----- generation -------------------------------------------------------
 
@@ -166,39 +203,71 @@ class LangfuseTracer(Tracer):
         output_tokens: int,
         cost_usd: float = 0.0,
     ) -> None:
-        """Emit a Langfuse Generation object for the LLM completion.
+        """Emit a Langfuse Generation observation for the LLM completion.
 
         This populates the Generations tab in Langfuse UI and feeds the
         model-level token-usage + cost dashboards. Called once per
         ``executor.execute()`` call after the final response is received.
-        Fail-soft: any SDK exception is swallowed so tracing never breaks
-        a run.
+
+        v3 mapping: the v2 ``span.generation(name=, model=, input=, output=,
+        usage={"input": .., "output": .., "total": .., "unit": "TOKENS"})``
+        one-shot call becomes ``span.start_observation(as_type="generation",
+        ...)`` returning a child generation that we immediately ``.end()``.
+        Token usage moves from the v2 ``usage=`` blob to v3 ``usage_details=``
+        (a plain ``{input, output, total}`` int dict — v3 dropped the ``unit``
+        field), and cost moves from a metadata bag to the first-class v3
+        ``cost_details={"total": ...}`` so it lands on the cost dashboards.
+        Fail-soft: any SDK exception is swallowed so tracing never breaks a run.
         """
         handle = self._handles.get(span.span_id)
         if handle is None:
             return
         with contextlib.suppress(Exception):  # never let tracing break a run
-            handle.generation(
+            generation = handle.start_observation(
+                as_type="generation",
                 name="llm-completion",
                 model=model,
                 input=input_messages,
                 output=output_text,
-                usage={
+                usage_details={
                     "input": input_tokens,
                     "output": output_tokens,
                     "total": input_tokens + output_tokens,
-                    "unit": "TOKENS",
                 },
-                metadata={"cost_usd": cost_usd} if cost_usd else None,
+                cost_details={"total": cost_usd} if cost_usd else None,
             )
+            # The generation is a point-in-time record of an already-complete
+            # call, so close it immediately (v3 requires an explicit .end()).
+            generation.end()
 
     # ----- lifecycle --------------------------------------------------------
 
     def flush(self) -> None:
-        """Flush queued events. Called by ``shutdown_runtime`` at CLI exit."""
+        """Flush queued events. Called by ``shutdown_runtime`` at CLI exit.
+
+        v3 keeps both ``flush()`` (force-send buffered spans/scores) and
+        ``shutdown()`` (flush + tear down the exporter threads). We call
+        ``flush()`` here to match the v2 semantics ``shutdown_runtime``
+        relied on; ``shutdown()`` is exposed separately for a full teardown.
+        """
         flush = getattr(self._client, "flush", None)
         if callable(flush):
             flush()
+
+    def shutdown(self) -> None:
+        """Flush and tear down the v3 SDK's background exporter.
+
+        v3 is OpenTelemetry-based and runs a background span processor;
+        ``shutdown()`` flushes pending data and joins those threads. Safe to
+        call on a client that only has ``flush()`` (e.g. older stubs) — we
+        fall back to ``flush()`` in that case. Fail-soft.
+        """
+        with contextlib.suppress(Exception):
+            shutdown = getattr(self._client, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+                return
+            self.flush()
 
     async def push_run_feedback_score(self, run_record: Any, feedback: Any) -> str | None:
         """Mirror :class:`FeedbackRecord` to Langfuse as a trace-level score.
@@ -209,25 +278,36 @@ class LangfuseTracer(Tracer):
         Langfuse client doesn't surface as an opaque error in the
         endpoint logs.
 
-        Langfuse v2 SDK shape::
+        Langfuse v3 SDK shape::
 
-            client.score(
+            client.create_score(
                 trace_id=<run's trace id>,
                 name="user_feedback",
                 value=<numeric>,
+                data_type="NUMERIC",
                 comment=<optional str>,
-            ) -> Score object with .id
+            ) -> None   # v3 create_score returns None (no Score object)
+
+        Semantic difference vs. v2: v2's ``client.score(...)`` returned a
+        ``Score`` object with an ``.id`` we surfaced as
+        ``feedback.langfuse_score_id``. v3's ``create_score`` returns
+        ``None`` (the score id is generated client-side and not handed
+        back), so this method returns ``None`` on success — the
+        cross-link id is no longer available from the SDK. The score is
+        still pushed; only the returned id is gone. Callers (``app.py``)
+        only set the cross-link when a truthy id comes back, so a ``None``
+        return is handled correctly (the Postgres row stays the source of
+        truth).
 
         Mapping:
 
         * trace id: ``run_record.metrics.langfuse_trace_id`` if the
-          executor wrote it there, else None → we skip the push
+          executor wrote it there, else ``trace_id`` → we skip the push
           (no trace = nothing to attach to).
         * score value: ``feedback.score`` (raw -1/+1 or 1-5).
         * name: ``user_feedback`` (operators can filter on this in
           Langfuse UI; ``mdk_*`` namespace is reserved for system scores).
-        * comment: ``feedback.comment`` (truncated to Langfuse's
-          configured limit; the SDK accepts None).
+        * comment: ``feedback.comment`` (the SDK accepts None).
         """
         # Pull trace id from the run's metrics. Different code paths
         # write it under slightly different keys (legacy vs current);
@@ -239,31 +319,24 @@ class LangfuseTracer(Tracer):
         if not trace_id:
             return None
 
-        # The Langfuse client's score() is synchronous in v2 SDK. We
-        # don't want to block the feedback endpoint's event loop on
-        # a network call to Langfuse, so dispatch via ``asyncio.to_thread``.
+        # The Langfuse client's create_score() is synchronous. We don't
+        # want to block the feedback endpoint's event loop on a network
+        # call to Langfuse, so dispatch via ``asyncio.to_thread``.
         import asyncio  # noqa: PLC0415
 
-        def _do_score() -> str | None:
-            try:
-                score_obj = self._client.score(
-                    trace_id=trace_id,
-                    name="user_feedback",
-                    value=float(feedback.score),
-                    comment=feedback.comment,
-                )
-            except Exception:
-                return None
-            return getattr(score_obj, "id", None)
-
         try:
-            score_id = await asyncio.to_thread(_do_score)
+            return await asyncio.to_thread(
+                self._create_score,
+                trace_id=trace_id,
+                name="user_feedback",
+                value=float(feedback.score),
+                comment=feedback.comment,
+            )
         except Exception:
             # Last-resort guard: even ``to_thread`` shouldn't fail in
             # normal operation, but if it does, swallow and proceed.
             # The feedback row in Postgres is the source of truth.
             return None
-        return score_id
 
     async def score_trace(
         self,
@@ -278,8 +351,14 @@ class LangfuseTracer(Tracer):
         Used by the eval engine to record the accuracy dimension score so
         it appears on the Langfuse Generations / Traces view alongside the
         per-run token usage. Dispatched via ``asyncio.to_thread`` so the
-        synchronous Langfuse v2 ``score()`` call doesn't block the eval
-        event loop. Fail-soft: returns ``None`` on any error.
+        synchronous Langfuse v3 ``create_score()`` call doesn't block the
+        eval event loop. Fail-soft: returns ``None`` on any error.
+
+        Semantic difference vs. v2: as with :meth:`push_run_feedback_score`,
+        v3's ``create_score`` returns ``None`` rather than a ``Score`` with
+        an ``.id``, so this returns ``None`` on success (the score is still
+        recorded; the SDK simply doesn't hand back an id). Callers use it
+        best-effort and don't depend on the return value.
 
         This method is NOT part of the :class:`Tracer` Protocol — it's a
         Langfuse-specific extension. Callers access it via ``getattr``
@@ -291,22 +370,44 @@ class LangfuseTracer(Tracer):
 
         import asyncio  # noqa: PLC0415
 
-        def _do_score() -> str | None:
-            try:
-                score_obj = self._client.score(
-                    trace_id=trace_id,
-                    name=name,
-                    value=value,
-                    comment=comment,
-                )
-            except Exception:
-                return None
-            return getattr(score_obj, "id", None)
-
         try:
-            return await asyncio.to_thread(_do_score)
+            return await asyncio.to_thread(
+                self._create_score,
+                trace_id=trace_id,
+                name=name,
+                value=value,
+                comment=comment,
+            )
         except Exception:
             return None
+
+    def _create_score(
+        self,
+        *,
+        trace_id: str,
+        name: str,
+        value: float,
+        comment: str | None,
+    ) -> str | None:
+        """Synchronous v3 ``create_score`` push; fail-soft.
+
+        v3's ``create_score`` returns ``None`` (no Score object), so we
+        return ``None`` on success. We still return the id when a stub /
+        future SDK happens to hand one back, so callers that look for a
+        cross-link id keep working if the SDK ever restores it.
+        """
+        try:
+            result = self._client.create_score(
+                trace_id=trace_id,
+                name=name,
+                value=value,
+                data_type="NUMERIC",
+                comment=comment,
+            )
+        except Exception:
+            return None
+        # v3 returns None; tolerate a stub/future SDK that returns an object.
+        return getattr(result, "id", None)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +438,9 @@ def _build_client_from_env() -> Any:
         ) from exc
     # Accept LANGFUSE_HOST (canonical) or LANGFUSE_BASE_URL (Langfuse SDK
     # alias) so both spellings work when stored in ~/.movate/credentials.
+    # v3 renamed the constructor kwarg ``host`` → ``base_url`` but still
+    # accepts ``host=`` as a deprecated alias, so the existing call shape
+    # keeps working against a self-hosted v3 instance.
     host = (
         os.environ.get("LANGFUSE_HOST")
         or os.environ.get("LANGFUSE_BASE_URL")
