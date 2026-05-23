@@ -2033,6 +2033,102 @@ class JobRecord(BaseModel):
     standalone non-threaded jobs."""
 
 
+class JobSchedule(BaseModel):
+    """A per-(tenant, name) cadence for cron-driven agent/workflow runs (ADR 017 D2).
+
+    This generalizes the continuous-eval scheduler (ADR 016 D2 /
+    :class:`EvalSchedule`) from the eval-only case to enqueuing arbitrary
+    ``JobKind.AGENT`` and ``JobKind.WORKFLOW`` jobs on a cadence. It reuses
+    the exact same enqueue-on-cron primitive: an operator records a
+    schedule (``mdk schedule set``), and an external cron (a Container Apps
+    **Job** on Azure; any cron locally) periodically invokes the **tick**
+    (``mdk scheduler-tick``), which finds schedules whose cadence has
+    elapsed and enqueues a job for each — reusing the existing
+    ``mdk submit`` / ``POST /run`` job path so the worker executes them
+    with no new dispatch branch. There is **no in-process timer daemon**;
+    the tick is a stateless one-shot driven by an external scheduler.
+
+    Additive + default-off: nothing is created unless an operator sets a
+    schedule, and existing agent/workflow/job behaviour is unchanged for
+    everything without one.
+
+    The cadence is an **interval in seconds** (``cadence_seconds``) — a
+    portable primitive any cron can satisfy (run the tick every N minutes;
+    the tick only enqueues schedules that are actually due). A richer
+    cron-expression cadence is a documented follow-up; the interval covers
+    the D2 "run on a cadence" requirement without a new dependency.
+
+    **Idempotency.** The tick stamps ``last_enqueued_at`` and a schedule is
+    "due" only once ``now - last_enqueued_at >= cadence_seconds``, so
+    running the tick more often than the cadence never double-enqueues
+    inside a window.
+
+    ``(tenant_id, name)`` is unique — one active schedule per handle per
+    tenant. Re-running ``set`` upserts (overwrites) the row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    name: str
+    """The schedule's handle — a stable name the operator picks (defaults
+    to the target). Paired with ``tenant_id`` as the unique schedule key,
+    so one target can have multiple schedules (e.g. different cadences /
+    inputs) under distinct names."""
+    kind: JobKind
+    """Which job kind the tick enqueues — only ``AGENT`` or ``WORKFLOW``.
+    ``EVAL`` has its own richer scheduler (:class:`EvalSchedule`) and
+    ``BENCH`` is not a scheduling target; both are rejected at construction
+    (see the validator below)."""
+    target: str
+    """Agent name or workflow name to run — pairs with ``kind`` exactly as
+    ``JobRecord.target`` does."""
+    cadence_seconds: int = Field(ge=1)
+    """How often, in seconds, to enqueue a job for this schedule. The tick
+    enqueues when ``now - last_enqueued_at >= cadence_seconds`` (or when
+    ``last_enqueued_at`` is null — first tick). An interval (not a cron
+    expression) keeps the tick trivially portable and idempotent."""
+    enabled: bool = True
+    """Soft on/off. A disabled schedule is retained (history + quick
+    re-enable) but never enqueues. ``mdk schedule clear`` deletes the
+    row entirely."""
+    input: dict[str, Any] = Field(default_factory=dict)
+    """The job payload enqueued each tick. For an ``AGENT`` schedule this
+    is the ``RunRequest.input`` dict; for a ``WORKFLOW`` schedule it is the
+    initial-state dict — the same shapes ``mdk submit`` / ``POST /run``
+    set, so the enqueued job runs through the existing dispatch path
+    unchanged."""
+    notify_email: str | None = None
+    """Optional email the worker notifies when an enqueued job reaches a
+    terminal status. Rides onto each enqueued :class:`JobRecord`."""
+    created_by: str | None = None
+    """Auth identity that created the schedule (ADR 013), or ``None`` for
+    a local/CLI write."""
+    created_at: datetime = Field(default_factory=_now)
+    last_enqueued_at: datetime | None = None
+    """When the tick last enqueued a job for this schedule. Drives the
+    due-check + idempotency (no double-enqueue inside one cadence window).
+    Null until the first enqueue."""
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_is_schedulable(cls, v: JobKind) -> JobKind:
+        """Only ``AGENT``/``WORKFLOW`` jobs are schedulable here.
+
+        ``EVAL`` has its own richer scheduler (:class:`EvalSchedule` —
+        cadence + drift knobs), and ``BENCH`` is not a scheduling target.
+        Rejecting them at parse time keeps the generic scheduler focused
+        and avoids a second, weaker eval-scheduling path.
+        """
+        if v not in (JobKind.AGENT, JobKind.WORKFLOW):
+            raise ValueError(
+                f"JobSchedule.kind must be 'agent' or 'workflow', got {v.value!r}; "
+                "EVAL has its own scheduler (EvalSchedule) and BENCH is not a "
+                "scheduling target."
+            )
+        return v
+
+
 # ---------------------------------------------------------------------------
 # API keys (v0.5+)
 # ---------------------------------------------------------------------------

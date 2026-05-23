@@ -30,6 +30,7 @@ from movate.core.models import (
     FeedbackRecord,
     JobKind,
     JobRecord,
+    JobSchedule,
     JobStatus,
     JudgeMethod,
     KbChunk,
@@ -433,6 +434,27 @@ _MIGRATIONS = [
         created_at           TEXT NOT NULL,
         last_enqueued_at     TEXT,
         PRIMARY KEY (tenant_id, agent)
+    )
+    """,
+    # ADR 017 D2: generic agent/workflow cron schedules. One row per
+    # (tenant, name) with a cadence + a job payload; the scheduler tick
+    # enqueues a JobKind.AGENT/WORKFLOW job for due rows. Additive +
+    # idempotent (CREATE TABLE IF NOT EXISTS) — default-off, no backfill.
+    # ``input`` holds json.dumps(payload), mirroring the jobs table.
+    """
+    CREATE TABLE IF NOT EXISTS job_schedules (
+        tenant_id        TEXT NOT NULL,
+        name             TEXT NOT NULL,
+        kind             TEXT NOT NULL,
+        target           TEXT NOT NULL,
+        cadence_seconds  INTEGER NOT NULL,
+        enabled          INTEGER NOT NULL,
+        input            TEXT NOT NULL,
+        notify_email     TEXT,
+        created_by       TEXT,
+        created_at       TEXT NOT NULL,
+        last_enqueued_at TEXT,
+        PRIMARY KEY (tenant_id, name)
     )
     """,
 ]
@@ -841,6 +863,88 @@ class SqliteProvider:
         await self._db.execute(
             "UPDATE eval_schedules SET last_enqueued_at = ? WHERE agent = ? AND tenant_id = ?",
             (last_enqueued_at.isoformat(), agent, tenant_id),
+        )
+        await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Job schedules (ADR 017 D2)
+    # ------------------------------------------------------------------
+
+    async def save_job_schedule(self, schedule: JobSchedule) -> None:
+        # Upsert on the (tenant_id, name) primary key.
+        await self._db.execute(
+            """
+            INSERT INTO job_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, name) DO UPDATE SET
+                kind = excluded.kind,
+                target = excluded.target,
+                cadence_seconds = excluded.cadence_seconds,
+                enabled = excluded.enabled,
+                input = excluded.input,
+                notify_email = excluded.notify_email,
+                created_by = excluded.created_by,
+                created_at = excluded.created_at,
+                last_enqueued_at = excluded.last_enqueued_at
+            """,
+            (
+                schedule.tenant_id,
+                schedule.name,
+                schedule.kind.value,
+                schedule.target,
+                schedule.cadence_seconds,
+                int(schedule.enabled),
+                json.dumps(schedule.input),
+                schedule.notify_email,
+                schedule.created_by,
+                schedule.created_at.isoformat(),
+                schedule.last_enqueued_at.isoformat() if schedule.last_enqueued_at else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_job_schedule(self, name: str, *, tenant_id: str) -> JobSchedule | None:
+        async with self._db.execute(
+            "SELECT * FROM job_schedules WHERE name = ? AND tenant_id = ? LIMIT 1",
+            (name, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_job_schedule(row) if row else None
+
+    async def list_job_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[JobSchedule]:
+        sql = "SELECT * FROM job_schedules"
+        params: list[object] = []
+        if tenant_id is not None:
+            sql += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_job_schedule(r) for r in rows]
+
+    async def delete_job_schedule(self, name: str, *, tenant_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM job_schedules WHERE name = ? AND tenant_id = ?",
+            (name, tenant_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def touch_job_schedule(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        await self._db.execute(
+            "UPDATE job_schedules SET last_enqueued_at = ? WHERE name = ? AND tenant_id = ?",
+            (last_enqueued_at.isoformat(), name, tenant_id),
         )
         await self._db.commit()
 
@@ -2143,6 +2247,24 @@ def _row_to_eval_schedule(row: aiosqlite.Row) -> EvalSchedule:
         objective=row["objective"],
         regression_tolerance=row["regression_tolerance"],
         baseline_id=row["baseline_id"],
+        notify_email=row["notify_email"],
+        created_by=row["created_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        last_enqueued_at=(
+            datetime.fromisoformat(row["last_enqueued_at"]) if row["last_enqueued_at"] else None
+        ),
+    )
+
+
+def _row_to_job_schedule(row: aiosqlite.Row) -> JobSchedule:
+    return JobSchedule(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        kind=JobKind(row["kind"]),
+        target=row["target"],
+        cadence_seconds=row["cadence_seconds"],
+        enabled=bool(row["enabled"]),
+        input=json.loads(row["input"]),
         notify_email=row["notify_email"],
         created_by=row["created_by"],
         created_at=datetime.fromisoformat(row["created_at"]),

@@ -62,6 +62,23 @@ operator populates KV secrets, second pass flips the flag to
 param enableApiWorker bool = true
 
 @description('''
+Deploy the scheduler Container Apps **Job** (ADR 017 D2) — a cron-triggered
+one-shot that runs ``mdk scheduler-tick``, draining eval + generic
+agent/workflow schedules into the existing job queue for the worker to
+execute. Default-off (purely additive); flip to ``true`` once schedules are
+in use. Requires ``enableApiWorker = true`` (it shares the worker's image +
+identity and enqueues into the queue the worker drains).
+''')
+param enableScheduler bool = false
+
+@description('''
+Cron expression (5-field, UTC) for the scheduler Job. The tick is
+idempotent + only enqueues schedules whose cadence has elapsed, so running
+it more often than the finest cadence is safe. Default: every 5 minutes.
+''')
+param schedulerCron string = '*/5 * * * *'
+
+@description('''
 Short suffix appended to globally-unique resource names (Key Vault,
 ACR, Postgres) to avoid collisions with other Azure tenants that
 picked the same "movate" branding. KV names live in a global Azure
@@ -199,6 +216,7 @@ var pgName = 'movate-${env}-pg${sfx}'
 var caeName = 'movate-${env}-cae'
 var apiName = 'movate-${env}-api'
 var workerName = 'movate-${env}-worker'
+var schedulerName = 'movate-${env}-scheduler'
 // Storage account names: globally unique, 3-24 chars, lowercase alphanumeric.
 // Max expansion: 'movate' (6) + 'staging' (7) + 'sa' (2) + sfxNoHyphen (≤6) = 21 ✓
 var saName = 'movate${env}sa${sfxNoHyphen}'
@@ -431,6 +449,33 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: workerUai.id
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler Container Apps Job (ADR 017 D2) — cron → enqueue. Gated on
+// ``enableScheduler`` (default off) AND ``enableApiWorker`` (it shares the
+// worker UAI + image and enqueues into the queue the worker drains). Runs
+// ``mdk scheduler-tick`` on ``schedulerCron``; the tick is idempotent.
+// ---------------------------------------------------------------------------
+module scheduler 'modules/containerapp-scheduler.bicep' = if (enableScheduler && enableApiWorker) {
+  name: 'scheduler-${env}'
+  params: {
+    name: schedulerName
+    location: location
+    environmentId: cae.outputs.envId
+    acrLoginServer: acr.outputs.loginServer
+    acrResourceId: acr.outputs.registryId
+    image: image
+    keyVaultUri: kv.outputs.vaultUri
+    postgresFqdn: pg.outputs.serverFqdn
+    postgresDatabase: pg.outputs.databaseName
+    postgresAdminUsername: pg.outputs.adminUsername
+    cronExpression: schedulerCron
+    // Reuse the worker UAI — its AcrPull + KV Secrets User roles already
+    // cover the same image + secrets the scheduler needs.
+    userAssignedIdentityId: workerUai.id
     tags: tags
   }
 }

@@ -594,6 +594,74 @@ class EvalScheduleListView(BaseModel):
     count: int
 
 
+class JobScheduleSubmission(BaseModel):
+    """``PUT /api/v1/schedules/{name}`` request body (ADR 017 D2).
+
+    Upserts a generic cron schedule that enqueues a ``JobKind.AGENT`` /
+    ``JobKind.WORKFLOW`` job on a cadence. Mirrors the ``mdk schedule set``
+    flags + the ``mdk submit`` payload shape. Additive + default-off: no
+    schedule means nothing runs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: JobKind = Field(JobKind.AGENT)
+    """Only ``agent`` / ``workflow`` are accepted — ``eval``/``bench`` are
+    rejected by the JobSchedule model validator (eval has its own scheduler)."""
+    target: str
+    """Agent or workflow name to run on the cadence."""
+    cadence_seconds: int = Field(ge=1)
+    """How often (seconds) to enqueue a job. The scheduler tick enqueues
+    when this interval has elapsed since the last enqueue."""
+    enabled: bool = Field(True)
+    input: dict[str, Any] = Field(default_factory=dict)
+    """Job payload — the ``RunRequest.input`` dict for agents, the initial
+    state dict for workflows (same shape as ``mdk submit``)."""
+    notify_email: str | None = Field(None)
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_is_schedulable(cls, v: JobKind) -> JobKind:
+        """Reject ``eval``/``bench`` at request-parse time (→ 422).
+
+        Mirrors :meth:`movate.core.models.JobSchedule._kind_is_schedulable`
+        so the API returns a 422 (validation error) rather than letting the
+        downstream model raise a 500. EVAL has its own scheduler; BENCH is
+        not a scheduling target.
+        """
+        if v not in (JobKind.AGENT, JobKind.WORKFLOW):
+            raise ValueError(
+                f"kind must be 'agent' or 'workflow', got {v.value!r}; "
+                "eval has its own scheduler and bench is not a scheduling target."
+            )
+        return v
+
+
+class JobScheduleView(BaseModel):
+    """One generic cron schedule (response shape for the schedule endpoints)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    kind: JobKind
+    target: str
+    cadence_seconds: int
+    enabled: bool
+    input: dict[str, Any]
+    notify_email: str | None = None
+    last_enqueued_at: str | None = None
+    created_at: str
+
+
+class JobScheduleListView(BaseModel):
+    """``GET /api/v1/schedules`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedules: list[JobScheduleView]
+    count: int
+
+
 class EvalCaseView(BaseModel):
     """One row in the eval scorecard. Matches the shape produced by
     ``mdk eval --output json`` for per-case data."""
@@ -1803,6 +1871,9 @@ __all__ = [
     "FeedbackView",
     "HealthView",
     "JobListView",
+    "JobScheduleListView",
+    "JobScheduleSubmission",
+    "JobScheduleView",
     "JobView",
     "ModelCatalogView",
     "ModelInfoView",

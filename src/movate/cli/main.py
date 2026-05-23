@@ -162,6 +162,7 @@ from movate.cli import (  # noqa: E402
     promote_cmd,
     replay_cmd,
     rollback_cmd,
+    schedule_cmd,
     simulate_cmd,
     tune_cmd,
 )
@@ -471,6 +472,12 @@ app.command("eval-scorecard", rich_help_panel=PANEL_RUN)(eval_scorecard_cmd.eval
 # Job); there is no in-process timer daemon.
 app.add_typer(eval_schedule_cmd.eval_schedule_app, name="eval-schedule", rich_help_panel=PANEL_RUN)
 app.command("eval-scheduler-tick", rich_help_panel=PANEL_RUN)(eval_schedule_cmd.scheduler_tick)
+# `schedule` (CRUD) + `scheduler-tick` (unified cron entrypoint) generalize the
+# eval scheduler to arbitrary agent/workflow jobs (ADR 017 D2). The unified tick
+# drains BOTH eval and generic schedules; eval-scheduler-tick stays eval-only
+# for back-compat. Driven by an external cron (Azure: a Container Apps Job).
+app.add_typer(schedule_cmd.schedule_app, name="schedule", rich_help_panel=PANEL_RUN)
+app.command("scheduler-tick", rich_help_panel=PANEL_RUN)(schedule_cmd.scheduler_tick)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /

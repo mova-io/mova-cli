@@ -23,6 +23,7 @@ from movate.core.models import (
     FailureRecord,
     FeedbackRecord,
     JobRecord,
+    JobSchedule,
     JobStatus,
     KbChunk,
     KbChunkWithScore,
@@ -66,6 +67,7 @@ class InMemoryStorage:
         self.relations: list[Relation] = []
         self.conversation_threads: list[ConversationThread] = []
         self.eval_schedules: list[EvalSchedule] = []
+        self.job_schedules: list[JobSchedule] = []
 
     async def init(self) -> None:
         return None
@@ -217,6 +219,55 @@ class InMemoryStorage:
         for i, s in enumerate(self.eval_schedules):
             if s.agent == agent and s.tenant_id == tenant_id:
                 self.eval_schedules[i] = s.model_copy(update={"last_enqueued_at": last_enqueued_at})
+                return
+
+    # ------------------------------------------------------------------
+    # Job schedules (ADR 017 D2)
+    # ------------------------------------------------------------------
+
+    async def save_job_schedule(self, schedule: JobSchedule) -> None:
+        # Upsert keyed by (tenant_id, name) — last write wins.
+        self.job_schedules = [
+            s
+            for s in self.job_schedules
+            if not (s.name == schedule.name and s.tenant_id == schedule.tenant_id)
+        ]
+        self.job_schedules.append(schedule)
+
+    async def get_job_schedule(self, name: str, *, tenant_id: str) -> JobSchedule | None:
+        return next(
+            (s for s in self.job_schedules if s.name == name and s.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_job_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[JobSchedule]:
+        rows = self.job_schedules
+        if tenant_id is not None:
+            rows = [s for s in rows if s.tenant_id == tenant_id]
+        return sorted(rows, key=lambda s: s.created_at, reverse=True)[:limit]
+
+    async def delete_job_schedule(self, name: str, *, tenant_id: str) -> bool:
+        before = len(self.job_schedules)
+        self.job_schedules = [
+            s for s in self.job_schedules if not (s.name == name and s.tenant_id == tenant_id)
+        ]
+        return len(self.job_schedules) < before
+
+    async def touch_job_schedule(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        for i, s in enumerate(self.job_schedules):
+            if s.name == name and s.tenant_id == tenant_id:
+                self.job_schedules[i] = s.model_copy(update={"last_enqueued_at": last_enqueued_at})
                 return
 
     # ------------------------------------------------------------------
