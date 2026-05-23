@@ -40,6 +40,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    Trigger,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -457,6 +458,31 @@ _MIGRATIONS = [
         PRIMARY KEY (tenant_id, name)
     )
     """,
+    # ADR 017 D2: inbound event/webhook triggers. One row per (tenant, name)
+    # with a public trigger_id (in the webhook URL), a hashed-at-rest
+    # per-trigger secret, and default-input merged under the event body. The
+    # fire endpoint resolves by trigger_id and enqueues a JobKind.AGENT/
+    # WORKFLOW job. Additive new table (CREATE TABLE IF NOT EXISTS, idempotent)
+    # — default-off, no ALTER, no backfill. ``input_defaults`` is JSON-encoded
+    # like jobs.input; trigger_id is uniquely indexed for the fire-path lookup.
+    """
+    CREATE TABLE IF NOT EXISTS triggers (
+        tenant_id      TEXT NOT NULL,
+        name           TEXT NOT NULL,
+        trigger_id     TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        target         TEXT NOT NULL,
+        secret_hash    TEXT NOT NULL,
+        salt           TEXT NOT NULL,
+        input_defaults TEXT NOT NULL,
+        enabled        INTEGER NOT NULL,
+        created_by     TEXT,
+        created_at     TEXT NOT NULL,
+        last_fired_at  TEXT,
+        PRIMARY KEY (tenant_id, name)
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id)",
 ]
 
 
@@ -945,6 +971,92 @@ class SqliteProvider:
         await self._db.execute(
             "UPDATE job_schedules SET last_enqueued_at = ? WHERE name = ? AND tenant_id = ?",
             (last_enqueued_at.isoformat(), name, tenant_id),
+        )
+        await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Triggers (ADR 017 D2 — inbound event/webhook → enqueue a job)
+    # ------------------------------------------------------------------
+
+    async def save_trigger(self, trigger: Trigger) -> None:
+        # Upsert on the (tenant_id, name) management key.
+        await self._db.execute(
+            """
+            INSERT INTO triggers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, name) DO UPDATE SET
+                trigger_id = excluded.trigger_id,
+                kind = excluded.kind,
+                target = excluded.target,
+                secret_hash = excluded.secret_hash,
+                salt = excluded.salt,
+                input_defaults = excluded.input_defaults,
+                enabled = excluded.enabled,
+                created_by = excluded.created_by,
+                created_at = excluded.created_at,
+                last_fired_at = excluded.last_fired_at
+            """,
+            (
+                trigger.tenant_id,
+                trigger.name,
+                trigger.trigger_id,
+                trigger.kind.value,
+                trigger.target,
+                trigger.secret_hash,
+                trigger.salt,
+                json.dumps(trigger.input_defaults),
+                int(trigger.enabled),
+                trigger.created_by,
+                trigger.created_at.isoformat(),
+                trigger.last_fired_at.isoformat() if trigger.last_fired_at else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_trigger(self, name: str, *, tenant_id: str) -> Trigger | None:
+        async with self._db.execute(
+            "SELECT * FROM triggers WHERE name = ? AND tenant_id = ? LIMIT 1",
+            (name, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_trigger(row) if row else None
+
+    async def get_trigger_by_id(self, trigger_id: str) -> Trigger | None:
+        async with self._db.execute(
+            "SELECT * FROM triggers WHERE trigger_id = ? LIMIT 1",
+            (trigger_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_trigger(row) if row else None
+
+    async def list_triggers(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Trigger]:
+        sql = "SELECT * FROM triggers"
+        params: list[object] = []
+        if tenant_id is not None:
+            sql += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_trigger(r) for r in rows]
+
+    async def delete_trigger(self, name: str, *, tenant_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM triggers WHERE name = ? AND tenant_id = ?",
+            (name, tenant_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def touch_trigger(self, trigger_id: str, *, last_fired_at: datetime) -> None:
+        await self._db.execute(
+            "UPDATE triggers SET last_fired_at = ? WHERE trigger_id = ?",
+            (last_fired_at.isoformat(), trigger_id),
         )
         await self._db.commit()
 
@@ -2270,6 +2382,25 @@ def _row_to_job_schedule(row: aiosqlite.Row) -> JobSchedule:
         created_at=datetime.fromisoformat(row["created_at"]),
         last_enqueued_at=(
             datetime.fromisoformat(row["last_enqueued_at"]) if row["last_enqueued_at"] else None
+        ),
+    )
+
+
+def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
+    return Trigger(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        trigger_id=row["trigger_id"],
+        kind=JobKind(row["kind"]),
+        target=row["target"],
+        secret_hash=row["secret_hash"],
+        salt=row["salt"],
+        input_defaults=json.loads(row["input_defaults"]),
+        enabled=bool(row["enabled"]),
+        created_by=row["created_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        last_fired_at=(
+            datetime.fromisoformat(row["last_fired_at"]) if row["last_fired_at"] else None
         ),
     )
 

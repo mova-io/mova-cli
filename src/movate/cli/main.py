@@ -164,6 +164,7 @@ from movate.cli import (  # noqa: E402
     rollback_cmd,
     schedule_cmd,
     simulate_cmd,
+    trigger_cmd,
     tune_cmd,
 )
 from movate.cli import bench as bench_cmd  # noqa: E402
@@ -478,6 +479,10 @@ app.command("eval-scheduler-tick", rich_help_panel=PANEL_RUN)(eval_schedule_cmd.
 # for back-compat. Driven by an external cron (Azure: a Container Apps Job).
 app.add_typer(schedule_cmd.schedule_app, name="schedule", rich_help_panel=PANEL_RUN)
 app.command("scheduler-tick", rich_help_panel=PANEL_RUN)(schedule_cmd.scheduler_tick)
+# `trigger` (CRUD) is the inbound-event sibling of `schedule` (ADR 017 D2): a
+# schedule fires on cron, a trigger fires on an external webhook POST. Same
+# panel since both register a standing way to enqueue agent/workflow jobs.
+app.add_typer(trigger_cmd.trigger_app, name="trigger", rich_help_panel=PANEL_RUN)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /
