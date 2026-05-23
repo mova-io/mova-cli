@@ -149,6 +149,7 @@ from movate.cli import (  # noqa: E402
     dev_cmd,
     diff_cmd,
     eval_gen_cmd,
+    eval_harvest_cmd,
     eval_scorecard_cmd,
     fix_cmd,
     fmt_cmd,
@@ -432,7 +433,28 @@ app.command("simulate", rich_help_panel=PANEL_RUN)(simulate_cmd.simulate)
 app.add_typer(benchmark_app, name="benchmark", rich_help_panel=PANEL_RUN)
 app.command("chat", rich_help_panel=PANEL_RUN)(chat_cmd.chat)
 app.command("bench", rich_help_panel=PANEL_RUN)(bench_cmd.bench)
-app.command("eval", rich_help_panel=PANEL_RUN)(eval_cmd.eval_)
+# `eval` is the scoring orchestrator. ``mdk eval harvest <agent>`` (ADR 016
+# D1) is reachable as a sub-action: a Typer group whose
+# ``invoke_without_command=True`` callback runs the orchestrator can't ALSO
+# carry the orchestrator's positional ``path`` without that positional eating
+# the ``harvest`` subcommand token (a Click group limitation). So we keep
+# ``eval`` a plain command and route the ``harvest`` sub-action inside
+# ``eval_`` (when the first positional is literally ``harvest``). Existing
+# ``mdk eval …`` callsites are unchanged; ``mdk eval-harvest`` is also wired
+# as a discoverable sibling (matches eval-gen / eval-scorecard).
+# ``allow_extra_args`` + ``ignore_unknown_options`` let ``mdk eval harvest
+# <agent> [harvest-flags]`` flow its trailing tokens into ``ctx.args`` so
+# ``eval_`` can forward them to the harvest sub-action (the ``harvest`` token
+# can't be a real Typer subcommand without its callback's ``path`` positional
+# swallowing it — a Click group limitation). ``eval_`` re-asserts strict
+# parsing for the NORMAL path: any leftover token when the first positional
+# isn't ``harvest`` is rejected, so flag typos on ``mdk eval`` still error.
+app.command(
+    "eval",
+    rich_help_panel=PANEL_RUN,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)(eval_cmd.eval_)
+app.command("eval-harvest", rich_help_panel=PANEL_RUN)(eval_harvest_cmd.harvest)
 # `eval-gen` is the sibling that creates a dataset; `eval` runs it.
 # Sibling (not subcommand) because restructuring `eval` to a Typer
 # sub-app would break ~30 test callsites. See eval_gen_cmd docstring.

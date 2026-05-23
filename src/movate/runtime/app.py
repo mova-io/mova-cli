@@ -101,6 +101,8 @@ from movate.runtime.schemas import (
     FeedbackListView,
     FeedbackSubmission,
     FeedbackView,
+    HarvestedCaseView,
+    HarvestView,
     HealthView,
     JobListView,
     JobView,
@@ -1887,6 +1889,110 @@ def build_app(
             row_count=len(rows),
             sha256_prefix=sha256_prefix,
             preview=preview,
+        )
+
+    @v1.post(
+        "/agents/{name}/dataset/harvest",
+        response_model=HarvestView,
+        status_code=200,
+        tags=["agents-v1", "eval"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_harvest_agent_dataset(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        source: str = "thumbs-down",
+        limit: int = 20,
+        since: str | None = None,
+    ) -> HarvestView:
+        """Harvest prod runs into *proposed* eval cases (ADR 016 D1).
+
+        Selects this tenant's runs for ``name`` by feedback/sample signal and
+        returns them transformed into **proposed** eval-dataset cases. This is
+        a **read-only proposal**: it NEVER modifies the stored
+        ``evals/dataset.jsonl``. Acceptance is a deliberate follow-up call to
+        ``POST /api/v1/agents/{name}/dataset`` with the reviewed subset — the
+        human-review gate is the core anti-poisoning safety property (D5).
+
+        Scope: ``eval`` — harvesting reads run/feedback data (preview); the
+        *accept* step (writing the dataset) keeps its ``admin`` scope.
+
+        Tenant-scoped: only the authenticated tenant's runs/feedback are
+        considered; another tenant's runs are never harvested.
+
+        Query params:
+
+        * ``source`` — ``thumbs-down`` (default) | ``thumbs-up`` |
+          ``low-score`` | ``sample``.
+        * ``limit`` — max proposed cases to return (default 20).
+        * ``since`` — ISO-8601 timestamp; only runs/feedback at or after this
+          instant are considered. Omit for no cutoff.
+
+        Errors:
+
+        * **400** — unknown ``source`` or unparseable ``since``.
+        * **401** — missing / bad bearer token.
+        * **403** — caller lacks the ``eval`` scope.
+        * **404** — agent not found in the runtime's agents_path.
+        * **503** — runtime built without an agents_path.
+        """
+        from datetime import datetime  # noqa: PLC0415
+
+        from movate.core.harvest import harvest_runs, resolve_source  # noqa: PLC0415
+
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/agents/{name}/dataset/harvest is unavailable",
+                status_code=503,
+            )
+        if not (agents_path / name).is_dir():
+            raise not_found("agent", name)
+
+        try:
+            harvest_source = resolve_source(source)
+        except ValueError as exc:
+            raise AgentCreationError(str(exc), status_code=400) from exc
+
+        since_dt: datetime | None = None
+        if since:
+            try:
+                since_dt = datetime.fromisoformat(since)
+            except ValueError as exc:
+                raise AgentCreationError(
+                    f"invalid 'since' timestamp {since!r}; expected ISO-8601 "
+                    f"(e.g. 2026-05-01T00:00:00Z)",
+                    status_code=400,
+                ) from exc
+
+        store: StorageProvider = request.app.state.storage
+        result = await harvest_runs(
+            store,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            source=harvest_source,
+            limit=int(limit),
+            since=since_dt,
+        )
+
+        return HarvestView(
+            agent_name=name,
+            source=result.source.value,
+            proposed_count=result.proposed_count,
+            needs_review_count=result.needs_review_count,
+            runs_considered=result.runs_considered,
+            applied=False,
+            cases=[
+                HarvestedCaseView(
+                    input=c.input,
+                    expected=c.expected,
+                    needs_review=c.needs_review,
+                    provenance=c.provenance,
+                )
+                for c in result.cases
+            ],
         )
 
     @v1.post(

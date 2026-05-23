@@ -51,6 +51,7 @@ err_console = Console(stderr=True)
 
 
 def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatch + wizard
+    ctx: typer.Context = None,  # type: ignore[assignment]
     path: str | None = typer.Argument(
         None,
         help=(
@@ -355,6 +356,37 @@ def eval_(  # noqa: PLR0912 — orchestrator; branch count reflects flag dispatc
       $ mdk eval ./rag-qa --scorecard
       $ mdk eval ./rag-qa --scorecard --scorecard-count 25 --scorecard-mix domain
     """
+    # ``mdk eval harvest <agent> [flags]`` — sub-action dispatch (ADR 016 D1).
+    # ``eval`` is a plain command (not a Typer group) because its ``path``
+    # positional would otherwise swallow a real ``harvest`` subcommand token
+    # (a Click group limitation). When the first positional is literally
+    # ``harvest`` we re-dispatch to the harvest command with the remaining
+    # tokens (carried in ``ctx.args`` thanks to the command's
+    # ``allow_extra_args``). ``mdk eval-harvest`` is the equivalent sibling.
+    extra_args = list(getattr(ctx, "args", []) or []) if ctx is not None else []
+    if path == "harvest":
+        import typer as _typer  # noqa: PLC0415
+
+        from movate.cli.eval_harvest_cmd import harvest as _harvest_cmd  # noqa: PLC0415
+
+        _harvest_app = _typer.Typer(add_completion=False)
+        _harvest_app.command()(_harvest_cmd)
+        # Run as a standalone Click command over the trailing args; let its
+        # own ``typer.Exit`` / SystemExit propagate so the code is preserved.
+        _typer.main.get_command(_harvest_app).main(
+            args=extra_args, prog_name="mdk eval harvest", standalone_mode=True
+        )
+        return
+
+    # Normal eval path: ``allow_extra_args`` / ``ignore_unknown_options`` are
+    # only there to forward the ``harvest`` sub-action's tokens. For every
+    # other invocation, re-assert strict parsing — an unconsumed token (a
+    # stray positional or a mistyped ``--flag``) is a user error, same as a
+    # plain Typer command would report.
+    if extra_args:
+        err_console.print(f"[red]✗[/red] unexpected argument(s): {' '.join(extra_args)}")
+        raise typer.Exit(code=2)
+
     # --scorecard short-circuits everything else. Route directly to the
     # new scorecard flow (Phase 1 + Phase 2). Other flags (--gate,
     # --baseline, --runs, etc.) are not meaningful in the scorecard
