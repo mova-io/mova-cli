@@ -27,6 +27,7 @@ class ErrorCode(StrEnum):
     FORBIDDEN = "forbidden"
     NOT_FOUND = "not_found"
     BAD_REQUEST = "bad_request"
+    CONFLICT = "conflict"
     INTERNAL = "internal"
     RATE_LIMITED = "rate_limited"
 
@@ -101,6 +102,26 @@ def not_found(resource: str, identifier: str) -> HTTPException:
     )
 
 
+def conflict(message: str = "version conflict") -> HTTPException:
+    """409 for an optimistic-concurrency mismatch (ADR 014 D3).
+
+    Raised by ``PUT /api/v1/agents/{name}`` when the caller sends an
+    ``If-Match`` precondition (the version or content_hash it believes
+    is current) that no longer matches the registry's latest version —
+    someone else published in between. The message is safe to be
+    specific: the caller is authenticated and already knows the agent
+    name, so naming the stale-vs-current versions helps the client
+    re-fetch and retry rather than silently clobbering a teammate's
+    write. Absent ``If-Match`` this is never raised (last-write-wins
+    back-compat).
+    """
+    return http_error(
+        ErrorCode.CONFLICT,
+        status_code=status.HTTP_409_CONFLICT,
+        message=message,
+    )
+
+
 def rate_limited(
     *,
     retry_after_seconds: int,
@@ -137,6 +158,7 @@ __all__ = [
     "ErrorCode",
     "ErrorResponse",
     "auth_required",
+    "conflict",
     "forbidden",
     "http_error",
     "not_found",
