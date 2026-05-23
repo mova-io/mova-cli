@@ -104,8 +104,8 @@ the portable default or the existing security properties.
             │                                   └─ AzureCliCredential / DefaultAzure… (adapter, optional dep)
             │                                                                             │
             │ _remote_request(...)  ── 401 ──▶ recover_once(target):                       │  ◀── (a)
-            │        │                          refresh-capable + durable backend?         │
-            │        │                            yes → refresh_runtime_key_inline; retry 1│
+            │        │                          refresh-capable? (az exec)                  │
+            │        │                            yes → refresh; retry 1; 2nd 401 → fatal   │
             │        ▼                            no  → today's manual hint, Exit(2)        │
             └────────┼────────────────────────────────────────────────────────────────────┘
                      ▼  Authorization: Bearer <token>
@@ -135,10 +135,16 @@ path) into **one** client helper. On 401 it attempts recovery **exactly once**:
   Container App we can `az containerapp exec` against (the same precondition
   `refresh_runtime_key_inline` already enforces). Non-Azure / unknown targets
   skip straight to the manual hint.
-- **Guard 2 — durable backend.** Auto-refresh is pointless against an ephemeral
-  SQLite runtime (a freshly minted key dies on the next pod recycle). Recovery
-  only engages when the target is known to use durable Postgres; otherwise the
-  manual hint (today's behavior) is the honest answer.
+- **Guard 2 — single retry is the durability backstop.** Auto-refresh is
+  pointless against an ephemeral-SQLite runtime (a freshly minted key dies on the
+  next pod recycle). There is **no durability/backend signal in `TargetConfig`**
+  to pre-check, and adding a server probe/endpoint to discover one is out of
+  scope — so rather than probe, we let the **one-shot rule** handle it: a
+  refreshed key that *still* 401s on the single retry is fatal. The ephemeral
+  case therefore costs one wasted refresh, not a wrong outcome, and needs no
+  a-priori backend check. This is exactly what `mdk deploy`'s 401 handler already
+  does. *(Implemented this way in PR #352; this wording supersedes an earlier
+  draft that described Guard 2 as a "probe for durable Postgres" pre-check.)*
 - **One shot only.** A second 401 after a refresh is fatal (`Exit(2)`) — no
   loops, no thundering-herd of `az exec` calls.
 
@@ -244,7 +250,10 @@ small and the upgrade a no-op for anyone who doesn't opt in.
 
 1. **(a) 401 auto-recovery.** Extract the shared client helper; wire one guarded
    refresh+retry (D1). Pure client-side; no new deps. Tests: 401→refresh→200,
-   401→refresh→401 fatal, non-durable/non-Azure target skips to manual hint.
+   401→refresh→401 fatal, non-Azure target skips to manual hint.
+   **Status: shipped (PR #352)** for the kb `_remote_request` path (all
+   `mdk kb … --target` ops). Extending the same helper to auth.py's
+   `_list_keys_remote`/`whoami` and the `run --target` path is a small follow-up.
 2. **(b) Keychain backend.** `CredentialBackend` seam + `keyring` adapter behind
    `mdk[keychain]`; `mdk auth use-keychain` migration (opt-in, reversible). File
    stays default. Tests: backend round-trip, file fallback when keychain absent,
