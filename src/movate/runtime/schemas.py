@@ -538,6 +538,62 @@ class EvalAcceptedView(BaseModel):
     """Failure message when ``status == "failed"``; empty otherwise."""
 
 
+class EvalScheduleSubmission(BaseModel):
+    """``PUT /api/v1/agents/{name}/eval-schedule`` request body (ADR 016 D2).
+
+    Upserts a continuous-eval cadence for the agent. Mirrors the
+    ``mdk eval-schedule set`` flags. Additive + default-off: no schedule
+    means nothing runs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cadence_seconds: int = Field(ge=1)
+    """How often (seconds) to enqueue an eval. The scheduler tick enqueues
+    when this interval has elapsed since the last enqueue."""
+    enabled: bool = Field(True)
+    mock: bool = Field(False)
+    """Cheap smoke cadence — MockProvider, no tokens."""
+    runs: int = Field(1, ge=1, le=10)
+    gate_mode: str = Field("mean")
+    gate: float = Field(0.7, ge=0.0, le=1.0)
+    objective: str | None = Field(None)
+    regression_tolerance: float = Field(0.05, ge=0.0, le=1.0)
+    """Mean_score / pass_rate drop vs baseline before drift fires."""
+    baseline_id: str | None = Field(None)
+    """Pinned baseline eval_id; default diffs against the prior eval."""
+    notify_email: str | None = Field(None)
+
+
+class EvalScheduleView(BaseModel):
+    """One continuous-eval schedule (response shape for the schedule endpoints)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    cadence_seconds: int
+    enabled: bool
+    mock: bool
+    runs: int
+    gate_mode: str
+    gate: float
+    objective: str | None = None
+    regression_tolerance: float
+    baseline_id: str | None = None
+    notify_email: str | None = None
+    last_enqueued_at: str | None = None
+    created_at: str
+
+
+class EvalScheduleListView(BaseModel):
+    """``GET /api/v1/eval-schedules`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedules: list[EvalScheduleView]
+    count: int
+
+
 class EvalCaseView(BaseModel):
     """One row in the eval scorecard. Matches the shape produced by
     ``mdk eval --output json`` for per-case data."""
@@ -1737,6 +1793,9 @@ __all__ = [
     "EvalAcceptedView",
     "EvalCaseView",
     "EvalListView",
+    "EvalScheduleListView",
+    "EvalScheduleSubmission",
+    "EvalScheduleView",
     "EvalScorecardView",
     "EvalSubmission",
     "FeedbackListView",

@@ -37,6 +37,7 @@ from movate.core.models import (
     ApiKeyEnv,
     BenchRecord,
     EvalRecord,
+    EvalSchedule,
     JobKind,
     JobRecord,
     JobStatus,
@@ -101,6 +102,9 @@ from movate.runtime.schemas import (
     BenchSubmission,
     EvalAcceptedView,
     EvalListView,
+    EvalScheduleListView,
+    EvalScheduleSubmission,
+    EvalScheduleView,
     EvalScorecardView,
     EvalSubmission,
     FeedbackListView,
@@ -3344,6 +3348,123 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Continuous-eval schedules (ADR 016 D2). Additive + default-off.
+    # Writes gate on the `eval` scope (same as kicking off an eval);
+    # reads gate on `read`. The cadence is driven by an external cron
+    # calling the scheduler tick — these endpoints only manage the rows.
+    # ------------------------------------------------------------------
+    def _schedule_to_view(s: EvalSchedule) -> EvalScheduleView:
+        return EvalScheduleView(
+            agent=s.agent,
+            cadence_seconds=s.cadence_seconds,
+            enabled=s.enabled,
+            mock=s.mock,
+            runs=s.runs,
+            gate_mode=s.gate_mode,
+            gate=s.gate,
+            objective=s.objective,
+            regression_tolerance=s.regression_tolerance,
+            baseline_id=s.baseline_id,
+            notify_email=s.notify_email,
+            last_enqueued_at=s.last_enqueued_at.isoformat() if s.last_enqueued_at else None,
+            created_at=s.created_at.isoformat(),
+        )
+
+    @v1.put(
+        "/agents/{name}/eval-schedule",
+        response_model=EvalScheduleView,
+        tags=["evals-v1"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_set_eval_schedule(
+        name: str,
+        body: EvalScheduleSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> EvalScheduleView:
+        """Upsert an agent's continuous-eval cadence (ADR 016 D2).
+
+        Idempotent: re-PUTting overwrites the agent's schedule. The schedule
+        is enqueued by an external cron calling the scheduler tick — this
+        endpoint only persists the cadence + drift knobs.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``eval`` scope
+        * **404** — agent not registered for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        agents: list[AgentBundle] = request.app.state.agents
+        registered = await store.get_agent_bundle(name, tenant_id=ctx.tenant_id)
+        if registered is None and not any(b.spec.name == name for b in agents):
+            raise not_found("agent", name)
+        schedule = EvalSchedule(
+            tenant_id=ctx.tenant_id,
+            agent=name,
+            cadence_seconds=body.cadence_seconds,
+            enabled=body.enabled,
+            mock=body.mock,
+            runs=body.runs,
+            gate_mode=body.gate_mode,
+            gate=body.gate,
+            objective=body.objective,
+            regression_tolerance=body.regression_tolerance,
+            baseline_id=body.baseline_id,
+            notify_email=body.notify_email,
+            created_by=ctx.api_key_id,
+        )
+        await store.save_eval_schedule(schedule)
+        return _schedule_to_view(schedule)
+
+    @v1.get(
+        "/eval-schedules",
+        response_model=EvalScheduleListView,
+        tags=["evals-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_eval_schedules(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 100,
+    ) -> EvalScheduleListView:
+        """List this tenant's continuous-eval schedules.
+
+        Errors:
+
+        * **401** — bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_eval_schedules(tenant_id=ctx.tenant_id, limit=capped_limit)
+        views = [_schedule_to_view(r) for r in rows]
+        return EvalScheduleListView(schedules=views, count=len(views))
+
+    @v1.delete(
+        "/agents/{name}/eval-schedule",
+        status_code=204,
+        tags=["evals-v1"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_clear_eval_schedule(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove an agent's continuous-eval schedule.
+
+        Idempotent: clearing a non-existent schedule still returns 204.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``eval`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        await store.delete_eval_schedule(name, tenant_id=ctx.tenant_id)
+        return Response(status_code=204)
 
     # ------------------------------------------------------------------
     # Bench endpoints (BACKLOG #64) — multi-model comparison persistence.

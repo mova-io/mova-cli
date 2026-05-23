@@ -150,6 +150,7 @@ from movate.cli import (  # noqa: E402
     diff_cmd,
     eval_gen_cmd,
     eval_harvest_cmd,
+    eval_schedule_cmd,
     eval_scorecard_cmd,
     fix_cmd,
     fmt_cmd,
@@ -464,6 +465,12 @@ app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
 # test cases + 10-category scorecard. Sibling pattern like eval-gen.
 # Phase 3 will swap bare `mdk eval` to use this flow as the default.
 app.command("eval-scorecard", rich_help_panel=PANEL_RUN)(eval_scorecard_cmd.eval_scorecard)
+# `eval-schedule` (CRUD) + `eval-scheduler-tick` (cron entrypoint) wire the
+# continuous-eval loop (ADR 016 D2). Sibling pattern like eval-gen/eval-scorecard.
+# The tick is meant to be driven by an external cron (Azure: a Container Apps
+# Job); there is no in-process timer daemon.
+app.add_typer(eval_schedule_cmd.eval_schedule_app, name="eval-schedule", rich_help_panel=PANEL_RUN)
+app.command("eval-scheduler-tick", rich_help_panel=PANEL_RUN)(eval_schedule_cmd.scheduler_tick)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /

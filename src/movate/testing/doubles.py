@@ -19,6 +19,7 @@ from movate.core.models import (
     Entity,
     EntityWithScore,
     EvalRecord,
+    EvalSchedule,
     FailureRecord,
     FeedbackRecord,
     JobRecord,
@@ -64,6 +65,7 @@ class InMemoryStorage:
         self.entities: list[Entity] = []
         self.relations: list[Relation] = []
         self.conversation_threads: list[ConversationThread] = []
+        self.eval_schedules: list[EvalSchedule] = []
 
     async def init(self) -> None:
         return None
@@ -167,6 +169,55 @@ class InMemoryStorage:
             rows = [b for b in rows if b.agent == agent]
         # Newest-first to match the SQL backends' ORDER BY.
         return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
+
+    # ------------------------------------------------------------------
+    # Eval schedules (ADR 016 D2)
+    # ------------------------------------------------------------------
+
+    async def save_eval_schedule(self, schedule: EvalSchedule) -> None:
+        # Upsert keyed by (tenant_id, agent) — last write wins.
+        self.eval_schedules = [
+            s
+            for s in self.eval_schedules
+            if not (s.agent == schedule.agent and s.tenant_id == schedule.tenant_id)
+        ]
+        self.eval_schedules.append(schedule)
+
+    async def get_eval_schedule(self, agent: str, *, tenant_id: str) -> EvalSchedule | None:
+        return next(
+            (s for s in self.eval_schedules if s.agent == agent and s.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_eval_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EvalSchedule]:
+        rows = self.eval_schedules
+        if tenant_id is not None:
+            rows = [s for s in rows if s.tenant_id == tenant_id]
+        return sorted(rows, key=lambda s: s.created_at, reverse=True)[:limit]
+
+    async def delete_eval_schedule(self, agent: str, *, tenant_id: str) -> bool:
+        before = len(self.eval_schedules)
+        self.eval_schedules = [
+            s for s in self.eval_schedules if not (s.agent == agent and s.tenant_id == tenant_id)
+        ]
+        return len(self.eval_schedules) < before
+
+    async def touch_eval_schedule(
+        self,
+        agent: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        for i, s in enumerate(self.eval_schedules):
+            if s.agent == agent and s.tenant_id == tenant_id:
+                self.eval_schedules[i] = s.model_copy(update={"last_enqueued_at": last_enqueued_at})
+                return
 
     # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1)

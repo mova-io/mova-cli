@@ -34,6 +34,7 @@ from movate.core.models import (
     Entity,
     EntityWithScore,
     EvalRecord,
+    EvalSchedule,
     FailureRecord,
     FeedbackRecord,
     JobRecord,
@@ -155,6 +156,64 @@ class StorageProvider(Protocol):
 
         ``tenant_id=None`` returns runs across all tenants — operator
         tooling only; never exposed on the HTTP API.
+        """
+
+    # ------------------------------------------------------------------
+    # Eval schedules (ADR 016 D2 — continuous eval cadence)
+    #
+    # Additive, default-off: a row exists only when an operator sets a
+    # cadence for an agent. ``(tenant_id, agent)`` is the unique key;
+    # ``save_eval_schedule`` upserts. The portable scheduler tick
+    # (movate.core.scheduler) reads ``list_eval_schedules`` and enqueues
+    # EVAL jobs for due rows.
+    # ------------------------------------------------------------------
+
+    async def save_eval_schedule(self, schedule: EvalSchedule) -> None:
+        """Upsert one schedule keyed by ``(tenant_id, agent)``.
+
+        Re-setting an agent's cadence overwrites the prior row (last write
+        wins) rather than creating a duplicate — one active schedule per
+        agent per tenant.
+        """
+
+    async def get_eval_schedule(self, agent: str, *, tenant_id: str) -> EvalSchedule | None:
+        """Exact lookup by ``(agent, tenant_id)``.
+
+        Returns ``None`` if no schedule OR if it belongs to a different
+        tenant — same no-leak contract as the other ``get_*`` methods.
+        """
+
+    async def list_eval_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EvalSchedule]:
+        """List schedules, optionally tenant-scoped.
+
+        ``tenant_id=None`` returns schedules across all tenants — used by
+        the scheduler tick's cron drain mode (and operator tooling); never
+        exposed on the HTTP API.
+        """
+
+    async def delete_eval_schedule(self, agent: str, *, tenant_id: str) -> bool:
+        """Delete the schedule for ``(agent, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none existed.
+        Tenant-scoped: a wrong-tenant delete is a no-op (returns ``False``).
+        """
+
+    async def touch_eval_schedule(
+        self,
+        agent: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        """Stamp ``last_enqueued_at`` after the tick enqueues a job.
+
+        Drives the cadence due-check + idempotency. No-op if the schedule
+        doesn't exist (it may have been cleared mid-tick).
         """
 
     # ------------------------------------------------------------------

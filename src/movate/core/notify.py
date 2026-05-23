@@ -62,6 +62,15 @@ class NotificationDispatcher(Protocol):
         """Called once per job that reaches a terminal state with
         ``notify_email`` set. No-op for jobs without an email target."""
 
+    async def notify_alert(self, *, subject: str, body: str, email: str | None) -> None:
+        """Send an ad-hoc operational alert not tied to a :class:`JobRecord`.
+
+        Used by the continuous-eval loop (ADR 016 D2) to fire a drift
+        alert when a scheduled eval regresses vs. its baseline. Same
+        never-raise contract as :meth:`notify_terminal`: log + return on
+        any operational failure. ``email=None`` means "no delivery target"
+        — the console backend still logs the intent so operators see it."""
+
 
 # ---------------------------------------------------------------------------
 # ConsoleBackend — logs only (dev default, test-friendly)
@@ -88,6 +97,14 @@ class ConsoleBackend:
             job.status.value,
             job.notify_email,
             _subject_for(job),
+        )
+
+    async def notify_alert(self, *, subject: str, body: str, email: str | None) -> None:
+        logger.info(
+            "notify_console_alert would_email=%s subject=%s body=%s",
+            email,
+            subject,
+            body,
         )
 
 
@@ -129,7 +146,17 @@ class SmtpEmailBackend:
         if not job.notify_email:
             return
         try:
-            self._send_sync(job)
+            self._send_message(
+                to_addr=job.notify_email,
+                subject=_subject_for(job),
+                body=_body_for(job),
+            )
+            logger.info(
+                "notify_smtp_sent job_id=%s to=%s status=%s",
+                job.job_id,
+                job.notify_email,
+                job.status.value,
+            )
         except Exception:
             # Never sink the worker. Operators see the warning in
             # logs and can diagnose SMTP separately from job execution.
@@ -142,16 +169,35 @@ class SmtpEmailBackend:
                 exc_info=True,
             )
 
-    def _send_sync(self, job: JobRecord) -> None:
+    async def notify_alert(self, *, subject: str, body: str, email: str | None) -> None:
+        if not email:
+            # No target — log the intent (so the alert isn't silently lost)
+            # and let the structured log event at the call site carry it.
+            logger.info("notify_smtp_alert_no_target subject=%s", subject)
+            return
+        try:
+            self._send_message(to_addr=email, subject=subject, body=body)
+            logger.info("notify_smtp_alert_sent to=%s subject=%s", email, subject)
+        except Exception:
+            logger.warning(
+                "notify_smtp_alert_failed to=%s host=%s subject=%s — alert "
+                "delivery only; the underlying event is unchanged",
+                email,
+                self._host,
+                subject,
+                exc_info=True,
+            )
+
+    def _send_message(self, *, to_addr: str, subject: str, body: str) -> None:
         """Synchronous SMTP. The worker calls this from an async
         method; ``smtplib`` is blocking, but the call is short (<1s
         typical) and runs inside the worker's per-job slot so other
         jobs aren't blocked. If SMTP latency becomes a problem, swap
         to ``aiosmtplib`` — same envelope, async API."""
-        msg = MIMEText(_body_for(job), "plain", "utf-8")
-        msg["Subject"] = _subject_for(job)
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
         msg["From"] = self._from_addr
-        msg["To"] = job.notify_email or ""
+        msg["To"] = to_addr
 
         smtp_cls = smtplib.SMTP_SSL if self._use_ssl else smtplib.SMTP
         with smtp_cls(self._host, self._port, timeout=self._timeout) as smtp:
@@ -163,12 +209,6 @@ class SmtpEmailBackend:
             if self._username and self._password:
                 smtp.login(self._username, self._password)
             smtp.send_message(msg)
-        logger.info(
-            "notify_smtp_sent job_id=%s to=%s status=%s",
-            job.job_id,
-            job.notify_email,
-            job.status.value,
-        )
 
 
 # ---------------------------------------------------------------------------

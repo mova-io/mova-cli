@@ -39,6 +39,7 @@ from movate.core.models import (
     EntityWithScore,
     ErrorInfo,
     EvalRecord,
+    EvalSchedule,
     FailureRecord,
     FeedbackRecord,
     JobKind,
@@ -426,6 +427,29 @@ CREATE INDEX IF NOT EXISTS idx_agent_bundles_name
 -- Latest-version-per-name + history ordering scan.
 CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created
     ON agent_bundles(tenant_id, name, created_at DESC);
+
+-- ADR 016 D2: continuous-eval schedules. One row per (tenant, agent) with a
+-- cadence; the scheduler tick enqueues EVAL jobs for due rows. Additive new
+-- table (CREATE TABLE IF NOT EXISTS, idempotent on every init) — default-off,
+-- no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS eval_schedules (
+    tenant_id            TEXT NOT NULL,
+    agent                TEXT NOT NULL,
+    cadence_seconds      INTEGER NOT NULL,
+    enabled              BOOLEAN NOT NULL,
+    mock                 BOOLEAN NOT NULL,
+    runs                 INTEGER NOT NULL,
+    gate_mode            TEXT NOT NULL,
+    gate                 DOUBLE PRECISION NOT NULL,
+    objective            TEXT,
+    regression_tolerance DOUBLE PRECISION NOT NULL,
+    baseline_id          TEXT,
+    notify_email         TEXT,
+    created_by           TEXT,
+    created_at           TIMESTAMPTZ NOT NULL,
+    last_enqueued_at     TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, agent)
+);
 """
 
 
@@ -842,6 +866,99 @@ class PostgresProvider:
         sql = f"SELECT * FROM bench {where} ORDER BY created_at DESC LIMIT ${len(params)}"
         rows = await self._db.fetch(sql, *params)
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Eval schedules (ADR 016 D2)
+    # ------------------------------------------------------------------
+
+    async def save_eval_schedule(self, schedule: EvalSchedule) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO eval_schedules (
+                tenant_id, agent, cadence_seconds, enabled, mock, runs,
+                gate_mode, gate, objective, regression_tolerance, baseline_id,
+                notify_email, created_by, created_at, last_enqueued_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            )
+            ON CONFLICT (tenant_id, agent) DO UPDATE SET
+                cadence_seconds = EXCLUDED.cadence_seconds,
+                enabled = EXCLUDED.enabled,
+                mock = EXCLUDED.mock,
+                runs = EXCLUDED.runs,
+                gate_mode = EXCLUDED.gate_mode,
+                gate = EXCLUDED.gate,
+                objective = EXCLUDED.objective,
+                regression_tolerance = EXCLUDED.regression_tolerance,
+                baseline_id = EXCLUDED.baseline_id,
+                notify_email = EXCLUDED.notify_email,
+                created_by = EXCLUDED.created_by,
+                created_at = EXCLUDED.created_at,
+                last_enqueued_at = EXCLUDED.last_enqueued_at
+            """,
+            schedule.tenant_id,
+            schedule.agent,
+            schedule.cadence_seconds,
+            schedule.enabled,
+            schedule.mock,
+            schedule.runs,
+            schedule.gate_mode,
+            schedule.gate,
+            schedule.objective,
+            schedule.regression_tolerance,
+            schedule.baseline_id,
+            schedule.notify_email,
+            schedule.created_by,
+            schedule.created_at,
+            schedule.last_enqueued_at,
+        )
+
+    async def get_eval_schedule(self, agent: str, *, tenant_id: str) -> EvalSchedule | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM eval_schedules WHERE agent = $1 AND tenant_id = $2",
+            agent,
+            tenant_id,
+        )
+        return _row_to_eval_schedule(row) if row else None
+
+    async def list_eval_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EvalSchedule]:
+        params: list[Any] = []
+        where = ""
+        if tenant_id is not None:
+            params.append(tenant_id)
+            where = f"WHERE tenant_id = ${len(params)}"
+        params.append(limit)
+        sql = f"SELECT * FROM eval_schedules {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_eval_schedule(r) for r in rows]
+
+    async def delete_eval_schedule(self, agent: str, *, tenant_id: str) -> bool:
+        status: str = await self._db.execute(
+            "DELETE FROM eval_schedules WHERE agent = $1 AND tenant_id = $2",
+            agent,
+            tenant_id,
+        )
+        # asyncpg returns a status string like "DELETE 1" / "DELETE 0".
+        return status.startswith("DELETE ") and not status.endswith(" 0")
+
+    async def touch_eval_schedule(
+        self,
+        agent: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        await self._db.execute(
+            "UPDATE eval_schedules SET last_enqueued_at = $1 WHERE agent = $2 AND tenant_id = $3",
+            last_enqueued_at,
+            agent,
+            tenant_id,
+        )
 
     # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1)
@@ -2062,6 +2179,26 @@ def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
         gate_mode=row["gate_mode"],
         models=[BenchModelResult.model_validate(m) for m in row["models"]],
         created_at=row["created_at"],
+    )
+
+
+def _row_to_eval_schedule(row: asyncpg.Record) -> EvalSchedule:
+    return EvalSchedule(
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        cadence_seconds=row["cadence_seconds"],
+        enabled=row["enabled"],
+        mock=row["mock"],
+        runs=row["runs"],
+        gate_mode=row["gate_mode"],
+        gate=row["gate"],
+        objective=row["objective"],
+        regression_tolerance=row["regression_tolerance"],
+        baseline_id=row["baseline_id"],
+        notify_email=row["notify_email"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        last_enqueued_at=row["last_enqueued_at"],
     )
 
 

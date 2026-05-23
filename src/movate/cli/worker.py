@@ -116,12 +116,18 @@ async def _run_worker(
             for name in sorted(workflows):
                 err.print(f"  - {name}")
 
+    # Build the notifier first so it can be shared between the dispatch
+    # (drift alerts on completed evals — ADR 016 D2) and the worker's
+    # terminal-job notification hook.
+    notifier = build_dispatcher()
+
     dispatch = WorkerDispatch(
         storage=rt.storage,
         executor=rt.executor,
         agents=agents,
         workflows=workflows,
         use_mock_for_eval=mock,
+        notifier=notifier,
     )
     config = WorkerConfig(
         poll_interval_seconds=poll_interval,
@@ -146,7 +152,6 @@ async def _run_worker(
             f"[dim]({duration_ms}ms · {job.job_id[:8]})[/dim]"
         )
 
-    notifier = build_dispatcher()
     hint(f"[dim]notifications: {notifier.name} backend[/dim]")
 
     worker_obj = Worker(
