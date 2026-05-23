@@ -1999,8 +1999,19 @@ class ApiKeyRecord(BaseModel):
     """UTC expiry. None = no expiry (legacy keys minted before v0.7.1).
     New keys default to 90 days from mint time via :func:`movate.core.auth.mint_api_key`."""
     scope: str | None = None
-    """Permission scope. ``"fleet-admin"`` grants access to admin-only endpoints
-    (POST/GET/DELETE /api/v1/auth/keys). ``None`` = standard tenant key."""
+    """**Legacy** single permission scope (pre-ADR-013). ``"fleet-admin"``
+    was the only meaningful value — an all-powerful admin grant.
+    Superseded by :attr:`scopes`; retained for back-compat reads. A row
+    whose ``scopes`` is empty but ``scope == "fleet-admin"`` is expanded to
+    the full scope set by :func:`movate.core.auth.effective_scopes`."""
+    scopes: list[str] = Field(default_factory=list)
+    """Least-privilege scope grant (ADR 013 L2). A flat set drawn from
+    :data:`movate.core.auth.ALL_SCOPES` (``read``, ``run``, ``eval``,
+    ``kb:write``, ``admin``, ``fleet-admin``). **Empty = no explicit
+    grant**: :func:`movate.core.auth.effective_scopes` resolves an empty
+    list to the legacy default ``{read, run, eval}`` at check time, so
+    existing keys keep working on read/run/eval but 403 on admin. New keys
+    + OIDC tokens carry explicit scopes."""
 
 
 class FeedbackRecord(BaseModel):

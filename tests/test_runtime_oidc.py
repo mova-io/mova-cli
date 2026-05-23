@@ -319,3 +319,110 @@ class TestOpaquePathStillWorks:
         token = _make_jwt(rsa_key)
         resp = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 401
+
+
+@pytest.mark.unit
+class TestRuntimeOidcScopes:
+    """OIDC scope mapping from ``MOVATE_OIDC_SCOPE_CLAIM`` (ADR 013 L2).
+
+    The token's scopes drive ``require_scope`` exactly like an opaque
+    key's; ``GET /api/v1/auth/me`` echoes the resolved set so we can
+    assert it directly.
+    """
+
+    def test_no_scope_claim_configured_defaults_to_legacy(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        rsa_key: rsa.RSAPrivateKey,
+        patch_jwks: None,
+    ) -> None:
+        # MOVATE_OIDC_SCOPE_CLAIM unset → legacy default {read,run,eval},
+        # same back-compat rule as a scopeless opaque key.
+        _configure_oidc(monkeypatch)
+        token = _make_jwt(rsa_key, extra={"scp": "read run admin"})
+        resp = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, resp.text
+        assert sorted(resp.json()["scopes"]) == ["eval", "read", "run"]
+
+    def test_absent_claim_defaults_to_legacy(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        rsa_key: rsa.RSAPrivateKey,
+        patch_jwks: None,
+    ) -> None:
+        # Claim CONFIGURED but ABSENT on the token → legacy default.
+        _configure_oidc(monkeypatch)
+        monkeypatch.setenv("MOVATE_OIDC_SCOPE_CLAIM", "scp")
+        token = _make_jwt(rsa_key)  # no `scp` claim
+        resp = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, resp.text
+        assert sorted(resp.json()["scopes"]) == ["eval", "read", "run"]
+
+    def test_space_delimited_scope_claim(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        rsa_key: rsa.RSAPrivateKey,
+        patch_jwks: None,
+    ) -> None:
+        # OAuth `scope`/`scp` convention: space-delimited string.
+        _configure_oidc(monkeypatch)
+        monkeypatch.setenv("MOVATE_OIDC_SCOPE_CLAIM", "scp")
+        token = _make_jwt(rsa_key, extra={"scp": "read run admin"})
+        resp = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, resp.text
+        assert sorted(resp.json()["scopes"]) == ["admin", "read", "run"]
+
+    def test_list_valued_scope_claim(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        rsa_key: rsa.RSAPrivateKey,
+        patch_jwks: None,
+    ) -> None:
+        # Entra app `roles`: JSON list.
+        _configure_oidc(monkeypatch)
+        monkeypatch.setenv("MOVATE_OIDC_SCOPE_CLAIM", "roles")
+        token = _make_jwt(rsa_key, extra={"roles": ["read", "kb:write"]})
+        resp = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, resp.text
+        assert sorted(resp.json()["scopes"]) == ["kb:write", "read"]
+
+    def test_admin_scope_from_claim_allows_admin_endpoint(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        rsa_key: rsa.RSAPrivateKey,
+        patch_jwks: None,
+    ) -> None:
+        # An OIDC identity carrying `admin` passes require_scope("admin")
+        # on POST /api/v1/auth/keys (it 422s on the missing body, NOT 403).
+        _configure_oidc(monkeypatch)
+        monkeypatch.setenv("MOVATE_OIDC_SCOPE_CLAIM", "scp")
+        token = _make_jwt(rsa_key, extra={"scp": "admin"})
+        resp = client.post(
+            "/api/v1/auth/keys",
+            json={"label": "from-oidc"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 201, resp.text
+
+    def test_missing_admin_scope_from_claim_403s_admin_endpoint(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        rsa_key: rsa.RSAPrivateKey,
+        patch_jwks: None,
+    ) -> None:
+        # An OIDC identity WITHOUT `admin` → 403 on the admin endpoint.
+        _configure_oidc(monkeypatch)
+        monkeypatch.setenv("MOVATE_OIDC_SCOPE_CLAIM", "scp")
+        token = _make_jwt(rsa_key, extra={"scp": "read run"})
+        resp = client.post(
+            "/api/v1/auth/keys",
+            json={"label": "from-oidc"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 403, resp.text

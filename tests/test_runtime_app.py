@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from movate.cli.main import app as cli_app
-from movate.core.auth import mint_api_key
+from movate.core.auth import ALL_SCOPES, mint_api_key
 from movate.core.models import (
     ApiKeyEnv,
     JobKind,
@@ -61,7 +61,9 @@ def client(storage: InMemoryStorage) -> TestClient:
 async def minted_key(storage: InMemoryStorage):
     """A persisted API key + the bearer-formatted token to present."""
     tenant_id = uuid4().hex
-    minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="test-suite")
+    minted = mint_api_key(
+        tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="test-suite", scopes=list(ALL_SCOPES)
+    )
     await storage.save_api_key(minted.record)
     return minted, f"Bearer {minted.full_key}"
 
@@ -198,7 +200,7 @@ async def test_run_with_unknown_key_id_returns_401(
     """Token shape is valid but no matching record → 401, indistinguishable
     from a parse failure (timing-oracle defense)."""
     # Mint a key but DON'T persist it — server has no idea who this is.
-    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
     r = client.post(
         "/run",
         json={"kind": "agent", "target": "demo", "input": {}},
@@ -211,7 +213,7 @@ async def test_run_with_unknown_key_id_returns_401(
 async def test_run_with_revoked_key_returns_401(
     client: TestClient, storage: InMemoryStorage
 ) -> None:
-    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
     await storage.save_api_key(minted.record)
     await storage.revoke_api_key(minted.record.key_id, tenant_id=minted.record.tenant_id)
 
@@ -346,7 +348,7 @@ async def test_get_job_404_when_cross_tenant(
     job_id = submit.json()["job_id"]
 
     # Now mint a SECOND key for a DIFFERENT tenant.
-    other_minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    other_minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
     await storage.save_api_key(other_minted.record)
 
     # That tenant's key must NOT be able to see the first tenant's job.
@@ -443,7 +445,7 @@ async def test_list_jobs_is_tenant_scoped(
     )
 
     # Mint a second key for a different tenant.
-    other = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    other = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
     await storage.save_api_key(other.record)
 
     r = client.get(
@@ -534,7 +536,7 @@ async def test_get_run_404_when_cross_tenant(
     await storage.save_run(run)
 
     # Mint a second key for a different tenant.
-    other = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    other = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
     await storage.save_api_key(other.record)
 
     r = client.get(
@@ -642,7 +644,9 @@ async def _make_authed_client(
 ) -> tuple[TestClient, dict[str, str]]:
     """Build an app + TestClient with a fresh auth key and return both the
     client and a pre-built Authorization header dict."""
-    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="v1-tests")
+    minted = mint_api_key(
+        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="v1-tests", scopes=list(ALL_SCOPES)
+    )
     await storage.save_api_key(minted.record)
     app = build_app(storage, agents=agents or [], agents_path=agents_path)
     client = TestClient(app)

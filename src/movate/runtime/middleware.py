@@ -24,11 +24,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Header, Response
+from fastapi import Depends, Header, Response
 
-from movate.core.auth import ApiKeyParseError, check_record, parse_api_key
+from movate.core.auth import (
+    ApiKeyParseError,
+    check_record,
+    effective_scopes,
+    parse_api_key,
+)
 from movate.core.rate_limit import NoOpRateLimiter, RateLimiter
-from movate.runtime.errors import auth_required, rate_limited
+from movate.runtime.errors import auth_required, forbidden, rate_limited
 from movate.runtime.oidc import (
     OidcValidationError,
     looks_like_jwt,
@@ -45,17 +50,32 @@ class AuthContext:
     """What handlers receive after a successful auth.
 
     Carries only what handlers legitimately need — the tenant for
-    scoping queries, the key id for audit attribution. Handlers MUST
-    NOT reach back to the underlying ``ApiKeyRecord`` (no plaintext
-    secret on the wire ever).
+    scoping queries, the key id for audit attribution, and the resolved
+    authorization scopes. Handlers MUST NOT reach back to the underlying
+    ``ApiKeyRecord`` (no plaintext secret on the wire ever).
     """
 
     tenant_id: str
     api_key_id: str
     env: str
-    scope: str | None = None
-    """Permission scope from the ApiKeyRecord. ``"fleet-admin"`` grants
-    access to admin-only endpoints. ``None`` = standard tenant key."""
+    scopes: frozenset[str] = frozenset()
+    """Resolved least-privilege scopes (ADR 013 L2). On the opaque-key
+    path this is :func:`movate.core.auth.effective_scopes` of the stored
+    record (so a scopeless key resolves to the legacy ``{read, run,
+    eval}`` default; a legacy ``fleet-admin`` key resolves to the full
+    set). On the OIDC path it's mapped from ``MOVATE_OIDC_SCOPE_CLAIM``,
+    falling back to the same legacy default when the claim is absent.
+    Enforced per endpoint by :func:`require_scope`."""
+
+    @property
+    def scope(self) -> str | None:
+        """Back-compat shim for the pre-ADR-013 single-scope field.
+
+        Returns ``"fleet-admin"`` when that scope is present (preserving
+        the historical boolean-ish check ``ctx.scope == "fleet-admin"``),
+        else ``None``. New code should test membership in
+        :attr:`scopes` / use :func:`require_scope` instead."""
+        return "fleet-admin" if "fleet-admin" in self.scopes else None
 
 
 # ----------------------------------------------------------------------
@@ -175,10 +195,62 @@ def make_auth_dependency(
             tenant_id=record.tenant_id,
             api_key_id=record.key_id,
             env=record.env.value,
-            scope=record.scope,
+            scopes=frozenset(effective_scopes(record)),
         )
 
     return auth_dependency
+
+
+def require_scope(
+    auth_dependency: Callable[..., Awaitable[AuthContext]],
+    *needed: str,
+) -> Callable[..., Awaitable[AuthContext]]:
+    """Build a FastAPI dependency that 403s unless the caller has every
+    scope in ``needed`` (ADR 013 L2).
+
+    ``auth_dependency`` is **the app's own** ``make_auth_dependency``
+    closure (built once in ``build_app``). The returned scope-checker
+    depends on *that exact callable*, so FastAPI's per-request dependency
+    cache resolves the bearer parse + storage lookup + rate-limit charge
+    **once** — shared with the handler's own ``ctx = Depends(auth_dep)``.
+    (Passing the same object is what makes the cache hit; an indirection
+    through ``app.dependency_overrides`` would create a second cache key
+    and double-charge the limiter.)
+
+    Layer it per endpoint group::
+
+        @app.post(
+            "/agents",
+            dependencies=[Depends(require_scope(auth_dep, "admin"))],
+        )
+
+    All ``needed`` scopes must be present (AND semantics). The flat scope
+    model has no hierarchy, so e.g. an ``admin`` key does **not** implicitly
+    satisfy ``read`` — endpoints declare exactly the scope they need.
+
+    A missing scope returns the standard ``403 FORBIDDEN`` envelope with a
+    clear, non-sensitive message naming the required scope. (It is safe to
+    name the scope: the caller is already authenticated, and the scope set
+    is public contract.)
+    """
+
+    async def scope_dependency(
+        ctx: AuthContext = Depends(auth_dependency),
+    ) -> AuthContext:
+        missing = [s for s in needed if s not in ctx.scopes]
+        if missing:
+            logger.info(
+                "scope_denied key_id=%s needed=%s have=%s",
+                ctx.api_key_id,
+                sorted(needed),
+                sorted(ctx.scopes),
+            )
+            raise forbidden(
+                f"missing required scope(s): {', '.join(sorted(missing))}",
+            )
+        return ctx
+
+    return scope_dependency
 
 
 async def _safe_touch(storage: StorageProvider, key_id: str, tenant_id: str) -> None:
@@ -196,4 +268,8 @@ async def _safe_touch(storage: StorageProvider, key_id: str, tenant_id: str) -> 
         logger.warning("touch_api_key failed for %s", key_id, exc_info=True)
 
 
-__all__ = ["AuthContext", "make_auth_dependency"]
+__all__ = [
+    "AuthContext",
+    "make_auth_dependency",
+    "require_scope",
+]

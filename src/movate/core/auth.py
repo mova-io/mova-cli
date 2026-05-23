@@ -36,6 +36,7 @@ import hashlib
 import hmac
 import re
 import secrets
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -49,6 +50,81 @@ KEY_ID_BYTES = 8  # 8 raw bytes → 13 base32 chars after stripping padding
 SECRET_BYTES = 32  # 256 bits of entropy
 SALT_BYTES = 16
 KEY_DEFAULT_TTL_DAYS = 90
+
+# --- Scopes (ADR 013 L2 / D3) ----------------------------------------------
+#
+# A small, FLAT, least-privilege scope set carried on both opaque keys
+# (``ApiKeyRecord.scopes``) and OIDC tokens (mapped from a configured
+# claim). No hierarchy — each scope is checked independently by
+# :func:`movate.runtime.middleware.require_scope`. Adding a scope here is
+# additive; never repurpose an existing string (it's an authorization
+# contract).
+
+SCOPE_READ = "read"
+"""GET list/detail endpoints (catalog, runs, evals, models, pricing, …)."""
+SCOPE_RUN = "run"
+"""Submit an agent run (``POST /run``, ``POST /agents/{name}/runs``)."""
+SCOPE_EVAL = "eval"
+"""Kick off evals / benchmarks."""
+SCOPE_KB_WRITE = "kb:write"
+"""KB write ops — ingest / clear / reindex an agent corpus."""
+SCOPE_ADMIN = "admin"
+"""Tenant administration — create/update/delete agents, manage the
+tenant's API keys, upload datasets."""
+SCOPE_FLEET_ADMIN = "fleet-admin"
+"""Cross-tenant / fleet-scoped administration. Historically the *only*
+scope value; preserved verbatim so existing fleet keys keep working."""
+
+ALL_SCOPES: frozenset[str] = frozenset(
+    {SCOPE_READ, SCOPE_RUN, SCOPE_EVAL, SCOPE_KB_WRITE, SCOPE_ADMIN, SCOPE_FLEET_ADMIN}
+)
+"""The complete, valid scope set. Used to validate ``--scope`` input."""
+
+# The back-compat grant for a key/record carrying NO explicit scopes
+# (null/empty). Decided in ADR 013 D3: existing keys keep working on
+# read/run/eval but get 403 on admin endpoints (deliberate least
+# privilege — no legacy key silently gains admin). Applied as a
+# READ-TIME default by :func:`effective_scopes`; never backfilled.
+LEGACY_DEFAULT_SCOPES: frozenset[str] = frozenset({SCOPE_READ, SCOPE_RUN, SCOPE_EVAL})
+
+
+def normalize_scopes(scopes: Iterable[str] | None) -> list[str]:
+    """De-dupe + sort an iterable of scope strings into a stable list.
+
+    Unknown scope strings are *not* rejected here — minting tooling
+    validates against :data:`ALL_SCOPES` at the CLI/API edge, but the
+    persistence + check path tolerates forward-compatible values so a
+    newer key written by a newer minter doesn't break an older runtime.
+    Empty / ``None`` → ``[]`` (the legacy-default sentinel).
+    """
+    if not scopes:
+        return []
+    return sorted({s.strip() for s in scopes if s and s.strip()})
+
+
+def effective_scopes(record: ApiKeyRecord) -> set[str]:
+    """Resolve the authorization scopes a stored key actually grants.
+
+    The read-time back-compat rule (ADR 013 D3), in order:
+
+    1. **Explicit ``scopes``** set on the record → use them verbatim.
+    2. Else, **legacy single ``scope == "fleet-admin"``** (the only scope
+       value that existed before this ADR — an all-powerful admin grant)
+       → expand to the full :data:`ALL_SCOPES` set so existing fleet keys
+       keep their admin reach.
+    3. Else (both null/empty) → :data:`LEGACY_DEFAULT_SCOPES`
+       (``{read, run, eval}``). Existing tenant keys keep working on
+       read/run/eval but get 403 on admin endpoints.
+
+    Pure function — no I/O. The middleware calls it once per request on
+    the opaque-key path.
+    """
+    if record.scopes:
+        return set(record.scopes)
+    if record.scope == SCOPE_FLEET_ADMIN:
+        return set(ALL_SCOPES)
+    return set(LEGACY_DEFAULT_SCOPES)
+
 
 # Token shape: mvt_<env>_<8 alnum>_<10-15 alnum>_<40-50 url-safe-b64>
 # Hard prefix `mvt`, then four underscore-separated segments.
@@ -114,6 +190,7 @@ def mint_api_key(
     env: ApiKeyEnv,
     label: str | None = None,
     ttl_days: int = KEY_DEFAULT_TTL_DAYS,
+    scopes: Iterable[str] | None = None,
 ) -> MintedApiKey:
     """Generate a new API key for ``tenant_id``.
 
@@ -126,6 +203,14 @@ def mint_api_key(
     ``ttl_days=0`` to create a non-expiring key (legacy / service-account
     use — requires an explicit opt-in so expiry is never accidentally
     omitted).
+
+    ``scopes`` (ADR 013 L2) is the least-privilege scope grant carried on
+    the key. ``None``/empty mints a key with **no explicit scopes** — at
+    check time :func:`effective_scopes` resolves that to the legacy
+    default ``{read, run, eval}``. Callers that want admin reach must pass
+    it explicitly (``scopes=["admin"]`` etc.). The scope list is
+    normalized (de-duped + sorted) but not validated against
+    :data:`ALL_SCOPES` here — the CLI/API edge does that.
     """
     if len(tenant_id) < TENANT_PREFIX_LEN:
         raise ValueError(f"tenant_id must be ≥ {TENANT_PREFIX_LEN} chars; got {len(tenant_id)!r}")
@@ -148,6 +233,7 @@ def mint_api_key(
         label=label,
         created_at=now,
         expires_at=expires_at,
+        scopes=normalize_scopes(scopes),
     )
     return MintedApiKey(full_key=full_key, record=record)
 
@@ -249,13 +335,23 @@ def check_record(parsed: ParsedApiKey, record: ApiKeyRecord | None) -> Verificat
 
 
 __all__ = [
+    "ALL_SCOPES",
+    "LEGACY_DEFAULT_SCOPES",
+    "SCOPE_ADMIN",
+    "SCOPE_EVAL",
+    "SCOPE_FLEET_ADMIN",
+    "SCOPE_KB_WRITE",
+    "SCOPE_READ",
+    "SCOPE_RUN",
     "ApiKeyParseError",
     "MintedApiKey",
     "ParsedApiKey",
     "VerificationFailure",
     "check_record",
+    "effective_scopes",
     "hash_secret",
     "mint_api_key",
+    "normalize_scopes",
     "parse_api_key",
     "verify_secret",
 ]

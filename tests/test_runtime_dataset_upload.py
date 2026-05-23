@@ -28,7 +28,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from movate.core.auth import ApiKeyEnv, mint_api_key
+from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
@@ -67,6 +67,7 @@ async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
         tenant_id=uuid4().hex,
         env=ApiKeyEnv.LIVE,
         label="dataset-upload-tests",
+        scopes=list(ALL_SCOPES),
     )
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}
@@ -260,7 +261,9 @@ class TestDatasetUploadErrors:
         self, client_no_agents_path: TestClient, storage: InMemoryStorage
     ) -> None:
         async def _get_header() -> dict[str, str]:
-            minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-path")
+            minted = mint_api_key(
+                tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-path", scopes=list(ALL_SCOPES)
+            )
             await storage.save_api_key(minted.record)
             return {"Authorization": f"Bearer {minted.full_key}"}
 

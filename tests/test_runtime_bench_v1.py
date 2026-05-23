@@ -30,7 +30,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from movate.core.auth import ApiKeyEnv, mint_api_key
+from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.core.models import BenchModelResult, BenchRecord, JobKind
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
@@ -58,7 +58,9 @@ def client(storage: InMemoryStorage, agents_path: Path) -> TestClient:
 @pytest.fixture
 async def auth_setup(storage: InMemoryStorage):
     tenant_id = uuid4().hex
-    minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="bench-v1-tests")
+    minted = mint_api_key(
+        tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="bench-v1-tests", scopes=list(ALL_SCOPES)
+    )
     await storage.save_api_key(minted.record)
     header = {"Authorization": f"Bearer {minted.full_key}"}
     return header, tenant_id

@@ -1126,6 +1126,11 @@ class ApiKeyMintRequest(BaseModel):
     """Optional human-readable note (e.g. ``"ci-bot"``)."""
     ttl_days: int = 90
     """Validity in days. 0 = no expiry (service-account use)."""
+    scopes: list[str] | None = None
+    """Least-privilege scope grant (ADR 013 L2). Drawn from the flat set
+    ``read``, ``run``, ``eval``, ``kb:write``, ``admin``, ``fleet-admin``.
+    ``None``/omitted mints a key with the legacy default
+    ``{read, run, eval}``. An unknown scope string is rejected with 400."""
 
 
 class ApiKeyMintedView(BaseModel):
@@ -1188,6 +1193,12 @@ class AuthWhoamiView(BaseModel):
     tenant_id: str
     env: str
     scope: str | None
+    """**Legacy** single-scope field: ``"fleet-admin"`` when that scope is
+    present, else ``None``. Kept for back-compat; prefer :attr:`scopes`."""
+    scopes: list[str] = Field(default_factory=list)
+    """Resolved least-privilege scopes for the calling identity (ADR 013
+    L2), sorted. A scopeless legacy key reports the default
+    ``["eval", "read", "run"]``."""
     label: str | None
     expires_at: datetime | None
 
