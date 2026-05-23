@@ -38,6 +38,7 @@ from movate.core.models import (
     FailureRecord,
     FeedbackRecord,
     JobRecord,
+    JobSchedule,
     JobStatus,
     KbChunk,
     KbChunkWithScore,
@@ -206,6 +207,65 @@ class StorageProvider(Protocol):
     async def touch_eval_schedule(
         self,
         agent: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        """Stamp ``last_enqueued_at`` after the tick enqueues a job.
+
+        Drives the cadence due-check + idempotency. No-op if the schedule
+        doesn't exist (it may have been cleared mid-tick).
+        """
+
+    # ------------------------------------------------------------------
+    # Job schedules (ADR 017 D2 — generic agent/workflow cron cadence)
+    #
+    # Additive, default-off: a row exists only when an operator sets a
+    # cadence for an agent/workflow. ``(tenant_id, name)`` is the unique
+    # key; ``save_job_schedule`` upserts. The portable scheduler tick
+    # (movate.core.scheduler) reads ``list_job_schedules`` and enqueues a
+    # JobKind.AGENT/WORKFLOW job for due rows — the same enqueue-on-cron
+    # primitive the eval scheduler uses, with a different job builder.
+    # ------------------------------------------------------------------
+
+    async def save_job_schedule(self, schedule: JobSchedule) -> None:
+        """Upsert one schedule keyed by ``(tenant_id, name)``.
+
+        Re-setting a schedule's cadence/input overwrites the prior row
+        (last write wins) rather than creating a duplicate — one active
+        schedule per name per tenant.
+        """
+
+    async def get_job_schedule(self, name: str, *, tenant_id: str) -> JobSchedule | None:
+        """Exact lookup by ``(name, tenant_id)``.
+
+        Returns ``None`` if no schedule OR if it belongs to a different
+        tenant — same no-leak contract as the other ``get_*`` methods.
+        """
+
+    async def list_job_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[JobSchedule]:
+        """List schedules, optionally tenant-scoped.
+
+        ``tenant_id=None`` returns schedules across all tenants — used by
+        the scheduler tick's cron drain mode (and operator tooling); never
+        exposed on the HTTP API.
+        """
+
+    async def delete_job_schedule(self, name: str, *, tenant_id: str) -> bool:
+        """Delete the schedule for ``(name, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none existed.
+        Tenant-scoped: a wrong-tenant delete is a no-op (returns ``False``).
+        """
+
+    async def touch_job_schedule(
+        self,
+        name: str,
         *,
         tenant_id: str,
         last_enqueued_at: datetime,

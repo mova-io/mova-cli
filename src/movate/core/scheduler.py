@@ -1,32 +1,48 @@
-"""Portable, cron-driven eval scheduler (ADR 016 D2).
+"""Portable, cron-driven scheduler (ADR 016 D2 + ADR 017 D2).
 
-The continuous-eval loop needs the eval suite to run *on a cadence* against
-the live agent. This module is the portable scheduler primitive: a stateless
-**tick** that, when invoked, finds the schedules that are **due** and
-**enqueues a ``JobKind.EVAL`` job** for each — reusing the existing
-eval-as-job path (``WorkerDispatch._execute_eval``). The existing Postgres
-job queue + KEDA worker then execute them with their existing retry /
-dead-letter behavior.
-
-**There is no in-process timer daemon.** The tick is meant to be driven by
-an *external* cron:
+The scheduler is a stateless **tick** that, when invoked, finds the
+schedules that are **due** and **enqueues a job** for each — reusing the
+existing job queue + KEDA worker, which then execute them with their
+existing retry / dead-letter behavior. There is no in-process timer
+daemon; the tick is driven by an *external* cron:
 
 * On Azure: a Container Apps **Job** with a cron trigger that runs
-  ``mdk eval-scheduler-tick`` (or calls :func:`run_scheduler_tick`).
+  ``mdk scheduler-tick`` (or ``mdk eval-scheduler-tick`` for the
+  eval-only variant).
 * Locally / anywhere: any cron, a CI schedule, or a manual invocation.
 
 This keeps the scheduler vendor-neutral (ADR 001) — ACA Jobs is just the
 cron that calls the tick; nothing here imports a cloud SDK.
+
+Two scheduling surfaces share the same primitive:
+
+* **Continuous eval (ADR 016 D2)** — :func:`run_scheduler_tick` reads
+  :meth:`StorageProvider.list_eval_schedules` and enqueues a
+  ``JobKind.EVAL`` job per due :class:`EvalSchedule` (via
+  :func:`build_eval_job`), reusing the eval-as-job path
+  (``WorkerDispatch._execute_eval``).
+* **Generic agent/workflow schedules (ADR 017 D2)** —
+  :func:`run_job_scheduler_tick` reads
+  :meth:`StorageProvider.list_job_schedules` and enqueues a
+  ``JobKind.AGENT``/``WORKFLOW`` job per due :class:`JobSchedule` (via
+  :func:`build_scheduled_job`), reusing the exact ``mdk submit`` /
+  ``POST /run`` job shape so the worker runs them with no new branch.
+
+:func:`run_all_scheduler_ticks` drains both — the unified cron entrypoint
+behind ``mdk scheduler-tick``.
 
 **Idempotency.** The tick stamps ``last_enqueued_at`` on each schedule it
 fires, and a schedule is "due" only when ``now - last_enqueued_at >=
 cadence_seconds``. Running the tick more often than the cadence is safe —
 it simply doesn't double-enqueue inside a cadence window.
 
-**Factored for reuse (ADR 017).** The job-construction step is split out as
-:func:`build_eval_job` and the generic enqueue loop as :func:`enqueue_due`,
-so a future agent/workflow scheduler can reuse the due-check + enqueue
-machinery with a different job builder.
+**Factored for reuse (ADR 017).** The due-check (:func:`is_due`, typed
+against the structural :class:`_Schedulable` protocol so both schedule
+models satisfy it), the job-construction step (:func:`build_eval_job` /
+:func:`build_scheduled_job`), and the generic enqueue loop
+(:func:`enqueue_due`) are split out so a future trigger surface (item 13:
+webhooks/events) can reuse the same enqueue path with a different job
+builder.
 """
 
 from __future__ import annotations
@@ -35,20 +51,43 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Protocol, TypeVar
 from uuid import uuid4
 
-from movate.core.models import EvalSchedule, JobKind, JobRecord, _now
+from movate.core.models import EvalSchedule, JobKind, JobRecord, JobSchedule, _now
 from movate.storage.base import StorageProvider
 
 logger = logging.getLogger(__name__)
 
 
-def is_due(schedule: EvalSchedule, *, now: datetime) -> bool:
+class _Schedulable(Protocol):
+    """The minimal due-check shape both schedule models satisfy.
+
+    A structural :class:`typing.Protocol` so :func:`is_due` works for both
+    :class:`EvalSchedule` and :class:`JobSchedule` (and any future schedule
+    model) without a shared base class — each just needs these three
+    fields. Keeps the cadence/idempotency logic in one place.
+    """
+
+    enabled: bool
+    last_enqueued_at: datetime | None
+    cadence_seconds: int
+
+
+# Bound to the schedule type so ``enqueue_due``'s ``build_job`` / ``touch``
+# / ``label`` callbacks stay type-coherent for a given schedule model.
+_S = TypeVar("_S", bound=_Schedulable)
+
+
+def is_due(schedule: _Schedulable, *, now: datetime) -> bool:
     """Return whether ``schedule`` should enqueue at ``now``.
 
     Due when enabled AND (never enqueued before OR the cadence interval
     has fully elapsed since the last enqueue). Disabled schedules are
     never due — they're retained but dormant.
+
+    Typed against the structural :class:`_Schedulable` protocol so both
+    :class:`EvalSchedule` and :class:`JobSchedule` are accepted.
     """
     if not schedule.enabled:
         return False
@@ -89,6 +128,30 @@ def build_eval_job(schedule: EvalSchedule) -> JobRecord:
     )
 
 
+def build_scheduled_job(schedule: JobSchedule) -> JobRecord:
+    """Construct the ``JobKind.AGENT``/``WORKFLOW`` :class:`JobRecord` (ADR 017 D2).
+
+    Mirrors how ``mdk submit`` (``cli.submit``) and ``POST /run``
+    (``runtime.app.submit_run``) build an agent/workflow job: ``kind`` +
+    ``target`` are copied straight through, and ``input`` is the schedule's
+    stored payload (the ``RunRequest.input`` dict for agents, the initial
+    state dict for workflows). Because the shape is identical, the worker's
+    existing ``_execute_agent`` / ``_execute_workflow`` dispatch runs it
+    with no new branch. ``notify_email`` rides along like the manual path.
+
+    Kept deliberately generic so item 13 (webhook/event triggers) can reuse
+    it to enqueue the same job kinds from a non-cron trigger.
+    """
+    return JobRecord(
+        job_id=str(uuid4()),
+        tenant_id=schedule.tenant_id,
+        kind=schedule.kind,
+        target=schedule.target,
+        input=schedule.input,
+        notify_email=schedule.notify_email,
+    )
+
+
 @dataclass
 class TickResult:
     """Summary of one scheduler tick — what was enqueued and what was skipped."""
@@ -97,11 +160,22 @@ class TickResult:
     enqueued: list[str] = field(default_factory=list)
     """``job_id``s enqueued this tick (one per due schedule)."""
     skipped: list[str] = field(default_factory=list)
-    """Agent names skipped because they weren't due (cadence not elapsed)."""
+    """Schedule labels skipped because they weren't due (cadence not elapsed)."""
 
     @property
     def enqueued_count(self) -> int:
         return len(self.enqueued)
+
+    def merge(self, other: TickResult) -> TickResult:
+        """Combine two ticks' results (e.g. eval + job schedules).
+
+        Keeps this tick's ``now`` and concatenates the enqueued / skipped
+        lists, so :func:`run_all_scheduler_ticks` can report a single
+        combined :class:`TickResult` across both scheduling surfaces.
+        """
+        self.enqueued.extend(other.enqueued)
+        self.skipped.extend(other.skipped)
+        return self
 
     def summary(self) -> str:
         return (
@@ -112,26 +186,29 @@ class TickResult:
 
 async def enqueue_due(
     storage: StorageProvider,
-    schedules: list[EvalSchedule],
+    schedules: list[_S],
     *,
     now: datetime,
-    build_job: Callable[[EvalSchedule], JobRecord] = build_eval_job,
-    touch: Callable[[EvalSchedule, datetime], Awaitable[None]] | None = None,
+    build_job: Callable[[_S], JobRecord] = build_eval_job,  # type: ignore[assignment]
+    touch: Callable[[_S, datetime], Awaitable[None]] | None = None,
+    label: Callable[[_S], str] = lambda s: s.agent,  # type: ignore[attr-defined]
 ) -> TickResult:
     """Enqueue one job per due schedule; stamp ``last_enqueued_at``.
 
-    Generic over the job builder + the touch callback so ADR-017 can reuse
-    this enqueue loop for agent/workflow schedules with a different
-    ``build_job`` and persistence model. ``touch`` defaults to
-    :meth:`StorageProvider.touch_eval_schedule` when omitted.
+    Generic over the job builder, the touch callback, and a ``label``
+    extractor so ADR-017's agent/workflow scheduler (and item 13's trigger
+    surface) can reuse this enqueue loop with a different ``build_job`` and
+    persistence model. ``build_job`` / ``touch`` / ``label`` default to the
+    eval scheduler's (``build_eval_job`` / :meth:`touch_eval_schedule` /
+    ``schedule.agent``) when omitted.
 
-    Per-schedule failures are logged and skipped — one bad agent never
+    Per-schedule failures are logged and skipped — one bad schedule never
     blocks the rest of the tick.
     """
     result = TickResult(now=now)
     for schedule in schedules:
         if not is_due(schedule, now=now):
-            result.skipped.append(schedule.agent)
+            result.skipped.append(label(schedule))
             continue
         try:
             job = build_job(schedule)
@@ -140,27 +217,27 @@ async def enqueue_due(
                 await touch(schedule, now)
             else:
                 await storage.touch_eval_schedule(
-                    schedule.agent,
-                    tenant_id=schedule.tenant_id,
+                    schedule.agent,  # type: ignore[attr-defined]
+                    tenant_id=schedule.tenant_id,  # type: ignore[attr-defined]
                     last_enqueued_at=now,
                 )
             result.enqueued.append(job.job_id)
             logger.info(
-                "scheduler_enqueued_eval agent=%s tenant=%s job_id=%s cadence_s=%d",
-                schedule.agent,
-                schedule.tenant_id,
+                "scheduler_enqueued target=%s tenant=%s kind=%s job_id=%s cadence_s=%d",
+                job.target,
+                job.tenant_id,
+                job.kind.value,
                 job.job_id,
                 schedule.cadence_seconds,
             )
         except Exception:
             logger.warning(
-                "scheduler_enqueue_failed agent=%s tenant=%s — skipping this "
+                "scheduler_enqueue_failed schedule=%s — skipping this "
                 "schedule; other schedules continue",
-                schedule.agent,
-                schedule.tenant_id,
+                label(schedule),
                 exc_info=True,
             )
-            result.skipped.append(schedule.agent)
+            result.skipped.append(label(schedule))
     return result
 
 
@@ -192,10 +269,73 @@ async def run_scheduler_tick(
     return result
 
 
+async def run_job_scheduler_tick(
+    storage: StorageProvider,
+    *,
+    tenant_id: str | None = None,
+    now: datetime | None = None,
+) -> TickResult:
+    """One tick over the generic agent/workflow schedules (ADR 017 D2).
+
+    Reuses :func:`enqueue_due` — the same due-check + idempotency machinery
+    as the eval tick — with :func:`build_scheduled_job` and a ``touch`` that
+    stamps :meth:`StorageProvider.touch_job_schedule`. ``tenant_id=None``
+    drains every tenant (cron drain mode); a specific id scopes to one.
+    """
+    effective_now = now or _now()
+    schedules = await storage.list_job_schedules(tenant_id=tenant_id)
+
+    async def _touch(schedule: JobSchedule, when: datetime) -> None:
+        await storage.touch_job_schedule(
+            schedule.name,
+            tenant_id=schedule.tenant_id,
+            last_enqueued_at=when,
+        )
+
+    result = await enqueue_due(
+        storage,
+        schedules,
+        now=effective_now,
+        build_job=build_scheduled_job,
+        touch=_touch,
+        label=lambda s: s.name,
+    )
+    logger.info(
+        "job_scheduler_tick_done tenant=%s enqueued=%d skipped=%d",
+        tenant_id or "<all>",
+        result.enqueued_count,
+        len(result.skipped),
+    )
+    return result
+
+
+async def run_all_scheduler_ticks(
+    storage: StorageProvider,
+    *,
+    tenant_id: str | None = None,
+    now: datetime | None = None,
+) -> TickResult:
+    """Drain BOTH eval and generic agent/workflow schedules in one tick.
+
+    Backs the unified ``mdk scheduler-tick`` cron entrypoint: runs
+    :func:`run_scheduler_tick` (eval) then :func:`run_job_scheduler_tick`
+    (agent/workflow) against the same ``now`` and merges their
+    :class:`TickResult`\\ s. Either surface being empty is a no-op — the
+    tick stays additive + default-off.
+    """
+    effective_now = now or _now()
+    eval_result = await run_scheduler_tick(storage, tenant_id=tenant_id, now=effective_now)
+    job_result = await run_job_scheduler_tick(storage, tenant_id=tenant_id, now=effective_now)
+    return eval_result.merge(job_result)
+
+
 __all__ = [
     "TickResult",
     "build_eval_job",
+    "build_scheduled_job",
     "enqueue_due",
     "is_due",
+    "run_all_scheduler_ticks",
+    "run_job_scheduler_tick",
     "run_scheduler_tick",
 ]

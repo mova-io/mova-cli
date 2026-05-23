@@ -44,6 +44,7 @@ from movate.core.models import (
     FeedbackRecord,
     JobKind,
     JobRecord,
+    JobSchedule,
     JobStatus,
     JudgeMethod,
     KbChunk,
@@ -449,6 +450,26 @@ CREATE TABLE IF NOT EXISTS eval_schedules (
     created_at           TIMESTAMPTZ NOT NULL,
     last_enqueued_at     TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, agent)
+);
+
+-- ADR 017 D2: generic agent/workflow cron schedules. One row per
+-- (tenant, name) with a cadence + a job payload; the scheduler tick
+-- enqueues a JobKind.AGENT/WORKFLOW job for due rows. Additive new table
+-- (CREATE TABLE IF NOT EXISTS, idempotent on every init) — default-off,
+-- no ALTER, no backfill. ``input`` is JSONB (same codec as jobs.input).
+CREATE TABLE IF NOT EXISTS job_schedules (
+    tenant_id        TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    target           TEXT NOT NULL,
+    cadence_seconds  INTEGER NOT NULL,
+    enabled          BOOLEAN NOT NULL,
+    input            JSONB NOT NULL,
+    notify_email     TEXT,
+    created_by       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL,
+    last_enqueued_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, name)
 );
 """
 
@@ -957,6 +978,90 @@ class PostgresProvider:
             "UPDATE eval_schedules SET last_enqueued_at = $1 WHERE agent = $2 AND tenant_id = $3",
             last_enqueued_at,
             agent,
+            tenant_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Job schedules (ADR 017 D2)
+    # ------------------------------------------------------------------
+
+    async def save_job_schedule(self, schedule: JobSchedule) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO job_schedules (
+                tenant_id, name, kind, target, cadence_seconds, enabled,
+                input, notify_email, created_by, created_at, last_enqueued_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            )
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+                kind = EXCLUDED.kind,
+                target = EXCLUDED.target,
+                cadence_seconds = EXCLUDED.cadence_seconds,
+                enabled = EXCLUDED.enabled,
+                input = EXCLUDED.input,
+                notify_email = EXCLUDED.notify_email,
+                created_by = EXCLUDED.created_by,
+                created_at = EXCLUDED.created_at,
+                last_enqueued_at = EXCLUDED.last_enqueued_at
+            """,
+            schedule.tenant_id,
+            schedule.name,
+            schedule.kind.value,
+            schedule.target,
+            schedule.cadence_seconds,
+            schedule.enabled,
+            schedule.input,
+            schedule.notify_email,
+            schedule.created_by,
+            schedule.created_at,
+            schedule.last_enqueued_at,
+        )
+
+    async def get_job_schedule(self, name: str, *, tenant_id: str) -> JobSchedule | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM job_schedules WHERE name = $1 AND tenant_id = $2",
+            name,
+            tenant_id,
+        )
+        return _row_to_job_schedule(row) if row else None
+
+    async def list_job_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[JobSchedule]:
+        params: list[Any] = []
+        where = ""
+        if tenant_id is not None:
+            params.append(tenant_id)
+            where = f"WHERE tenant_id = ${len(params)}"
+        params.append(limit)
+        sql = f"SELECT * FROM job_schedules {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_job_schedule(r) for r in rows]
+
+    async def delete_job_schedule(self, name: str, *, tenant_id: str) -> bool:
+        status: str = await self._db.execute(
+            "DELETE FROM job_schedules WHERE name = $1 AND tenant_id = $2",
+            name,
+            tenant_id,
+        )
+        # asyncpg returns a status string like "DELETE 1" / "DELETE 0".
+        return status.startswith("DELETE ") and not status.endswith(" 0")
+
+    async def touch_job_schedule(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        await self._db.execute(
+            "UPDATE job_schedules SET last_enqueued_at = $1 WHERE name = $2 AND tenant_id = $3",
+            last_enqueued_at,
+            name,
             tenant_id,
         )
 
@@ -2195,6 +2300,22 @@ def _row_to_eval_schedule(row: asyncpg.Record) -> EvalSchedule:
         objective=row["objective"],
         regression_tolerance=row["regression_tolerance"],
         baseline_id=row["baseline_id"],
+        notify_email=row["notify_email"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        last_enqueued_at=row["last_enqueued_at"],
+    )
+
+
+def _row_to_job_schedule(row: asyncpg.Record) -> JobSchedule:
+    return JobSchedule(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        kind=JobKind(row["kind"]),
+        target=row["target"],
+        cadence_seconds=row["cadence_seconds"],
+        enabled=row["enabled"],
+        input=dict(row["input"]),
         notify_email=row["notify_email"],
         created_by=row["created_by"],
         created_at=row["created_at"],

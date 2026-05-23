@@ -40,6 +40,7 @@ from movate.core.models import (
     EvalSchedule,
     JobKind,
     JobRecord,
+    JobSchedule,
     JobStatus,
 )
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
@@ -114,6 +115,9 @@ from movate.runtime.schemas import (
     HarvestView,
     HealthView,
     JobListView,
+    JobScheduleListView,
+    JobScheduleSubmission,
+    JobScheduleView,
     JobView,
     KbChunkView,
     KbDeletedView,
@@ -3464,6 +3468,140 @@ def build_app(
         """
         store: StorageProvider = request.app.state.storage
         await store.delete_eval_schedule(name, tenant_id=ctx.tenant_id)
+        return Response(status_code=204)
+
+    # ------------------------------------------------------------------
+    # Generic agent/workflow cron schedules (ADR 017 D2). Additive +
+    # default-off. These schedule *execution* (agent/workflow runs), so
+    # writes gate on the `run` scope (same as POST /run); reads gate on
+    # `read`. The cadence is driven by an external cron calling the
+    # scheduler tick — these endpoints only manage the rows. Target
+    # existence is NOT validated here (mirrors POST /run): the worker
+    # surfaces an unknown agent/workflow when it claims the job.
+    # ------------------------------------------------------------------
+    def _job_schedule_to_view(s: JobSchedule) -> JobScheduleView:
+        return JobScheduleView(
+            name=s.name,
+            kind=s.kind,
+            target=s.target,
+            cadence_seconds=s.cadence_seconds,
+            enabled=s.enabled,
+            input=s.input,
+            notify_email=s.notify_email,
+            last_enqueued_at=s.last_enqueued_at.isoformat() if s.last_enqueued_at else None,
+            created_at=s.created_at.isoformat(),
+        )
+
+    @v1.put(
+        "/schedules/{name}",
+        response_model=JobScheduleView,
+        tags=["jobs"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_set_job_schedule(
+        name: str,
+        body: JobScheduleSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobScheduleView:
+        """Upsert a cron schedule that enqueues an agent/workflow job (ADR 017 D2).
+
+        Idempotent: re-PUTting the same ``name`` overwrites the schedule. The
+        schedule is enqueued by an external cron calling the scheduler tick —
+        this endpoint only persists the cadence + job payload.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``run`` scope
+        * **422** — ``kind`` is not ``agent``/``workflow``
+        """
+        store: StorageProvider = request.app.state.storage
+        schedule = JobSchedule(
+            tenant_id=ctx.tenant_id,
+            name=name,
+            kind=body.kind,
+            target=body.target,
+            cadence_seconds=body.cadence_seconds,
+            enabled=body.enabled,
+            input=body.input,
+            notify_email=body.notify_email,
+            created_by=ctx.api_key_id,
+        )
+        await store.save_job_schedule(schedule)
+        return _job_schedule_to_view(schedule)
+
+    @v1.get(
+        "/schedules",
+        response_model=JobScheduleListView,
+        tags=["jobs"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_job_schedules(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 100,
+    ) -> JobScheduleListView:
+        """List this tenant's cron schedules.
+
+        Errors:
+
+        * **401** — bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_job_schedules(tenant_id=ctx.tenant_id, limit=capped_limit)
+        views = [_job_schedule_to_view(r) for r in rows]
+        return JobScheduleListView(schedules=views, count=len(views))
+
+    @v1.get(
+        "/schedules/{name}",
+        response_model=JobScheduleView,
+        tags=["jobs"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_job_schedule(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobScheduleView:
+        """Fetch one cron schedule by its handle.
+
+        Tenant-scoped: a schedule under another tenant 404s (no existence leak).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — no schedule with this name for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        row = await store.get_job_schedule(name, tenant_id=ctx.tenant_id)
+        if row is None:
+            raise not_found("schedule", name)
+        return _job_schedule_to_view(row)
+
+    @v1.delete(
+        "/schedules/{name}",
+        status_code=204,
+        tags=["jobs"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_clear_job_schedule(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove a cron schedule by its handle.
+
+        Idempotent: clearing a non-existent schedule still returns 204.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``run`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        await store.delete_job_schedule(name, tenant_id=ctx.tenant_id)
         return Response(status_code=204)
 
     # ------------------------------------------------------------------
