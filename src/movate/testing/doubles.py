@@ -13,6 +13,7 @@ from typing import Any
 
 from movate.core.models import (
     ApiKeyRecord,
+    BenchRecord,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -51,6 +52,7 @@ class InMemoryStorage:
         self.runs: list[RunRecord] = []
         self.failures: list[FailureRecord] = []
         self.evals: list[EvalRecord] = []
+        self.bench: list[BenchRecord] = []
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
         self.api_keys: list[ApiKeyRecord] = []
@@ -79,6 +81,9 @@ class InMemoryStorage:
     async def save_eval(self, e: EvalRecord) -> None:
         self.evals.append(e)
 
+    async def save_bench(self, b: BenchRecord) -> None:
+        self.bench.append(b)
+
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         self.workflow_runs.append(w)
 
@@ -103,6 +108,12 @@ class InMemoryStorage:
     async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
         return next(
             (e for e in self.evals if e.eval_id == eval_id and e.tenant_id == tenant_id),
+            None,
+        )
+
+    async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
+        return next(
+            (b for b in self.bench if b.bench_id == bench_id and b.tenant_id == tenant_id),
             None,
         )
 
@@ -139,6 +150,21 @@ class InMemoryStorage:
         if agent:
             rows = [e for e in rows if e.agent == agent]
         return list(rows)[:limit]
+
+    async def list_bench(
+        self,
+        *,
+        tenant_id: str | None = None,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> list[BenchRecord]:
+        rows = self.bench
+        if tenant_id is not None:
+            rows = [b for b in rows if b.tenant_id == tenant_id]
+        if agent:
+            rows = [b for b in rows if b.agent == agent]
+        # Newest-first to match the SQL backends' ORDER BY.
+        return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
 
     async def list_workflow_runs(
         self,

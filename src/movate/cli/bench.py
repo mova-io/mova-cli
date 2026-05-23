@@ -267,6 +267,11 @@ async def _run_bench(
         except EvalConfigError as exc:
             err_console.print(f"[red]✗ bench config error:[/red] {exc}")
             raise typer.Exit(code=2) from None
+
+        # Persist the comparison so it shows up in the runtime's bench
+        # history (GET /api/v1/bench) — mirrors how ``mdk eval`` saves an
+        # EvalRecord. Local-only side effect; output + flags unchanged.
+        await rt.storage.save_bench(summary.to_record())
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 

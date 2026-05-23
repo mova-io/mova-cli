@@ -87,6 +87,8 @@ class WorkerDispatch:
             return await self._execute_workflow(job)
         if job.kind == JobKind.EVAL:
             return await self._execute_eval(job)
+        if job.kind == JobKind.BENCH:
+            return await self._execute_bench(job)
         return _error(
             "unknown_kind",
             f"unsupported JobKind {job.kind!r}",
@@ -234,6 +236,109 @@ class WorkerDispatch:
         return DispatchOutcome(
             status=JobStatus.SUCCESS,
             result_run_id=record.eval_id,
+            error=None,
+        )
+
+    async def _execute_bench(self, job: JobRecord) -> DispatchOutcome:
+        """Run an async multi-model bench job (BACKLOG #64).
+
+        ``job.input`` carries the bench config (the same fields as
+        :class:`movate.runtime.schemas.BenchSubmission`): ``models``,
+        ``judge``, ``rubric``, ``mock``, ``runs``, ``gate_mode``,
+        ``input``. The completed :class:`BenchRecord` is persisted via
+        storage; ``result_run_id`` is set to the ``bench_id`` so callers
+        can retrieve it via ``GET /api/v1/bench/{bench_id}`` — mirrors
+        the EVAL job's eval_id mapping.
+        """
+        from movate.core.bench import BenchEngine  # noqa: PLC0415
+        from movate.core.eval import EvalConfigError  # noqa: PLC0415
+        from movate.core.models import JudgeConfig, JudgeMethod, ModelConfig  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        bundle = self._agents.get(job.target)
+        if bundle is None:
+            return _error(
+                "unknown_agent",
+                f"agent {job.target!r} not registered on this worker",
+                retryable=False,
+            )
+
+        cfg = job.input
+        models = [str(m) for m in (cfg.get("models") or [])]
+        if not models:
+            return _error("bench_config", "bench requires at least one model", retryable=False)
+
+        # Reuse the EVAL job's mock policy: the server-level
+        # use_mock_for_eval flag forces mock for both eval + bench jobs in
+        # test environments; otherwise the per-job ``mock`` flag decides.
+        use_mock: bool = self._use_mock_for_eval or bool(cfg.get("mock", False))
+        if use_mock:
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=self._storage,
+            tracer=build_tracer(),
+            tenant_id=job.tenant_id,
+        )
+
+        # Quality scoring is opt-in: only when the submission carried both
+        # a judge provider and an inline rubric (matches the CLI's
+        # resolution). Otherwise the bench reports cost + latency only.
+        judge_provider = cfg.get("judge")
+        rubric = cfg.get("rubric")
+        judge: JudgeConfig | None = None
+        if judge_provider and rubric:
+            judge = JudgeConfig(
+                method=JudgeMethod.LLM_JUDGE,
+                model=ModelConfig(provider=str(judge_provider)),
+                rubric=str(rubric),
+            )
+
+        input_payload = cfg.get("input")
+        if not isinstance(input_payload, dict):
+            return _error("bench_config", "bench requires an 'input' object", retryable=False)
+
+        try:
+            engine = BenchEngine(
+                executor=executor,
+                provider=provider,
+                runs_per_model=int(cfg.get("runs", 1)),
+                gate_mode=str(cfg.get("gate_mode", "mean")),
+                judge=judge,
+                rubric=str(rubric) if rubric else None,
+            )
+            summary = await engine.run(bundle, input_payload=input_payload, providers=models)
+        except EvalConfigError as exc:
+            return _error("bench_config", str(exc), retryable=False)
+        except Exception as exc:
+            logger.exception("bench_execute_unhandled job_id=%s", job.job_id)
+            return _error("internal", str(exc), retryable=True)
+
+        # Honor the API-pre-generated bench_id when present (so the
+        # caller's GET /bench/{bench_id} hits the persisted row); fall
+        # back to a fresh uuid for direct/local callers.
+        pregenerated = cfg.get("bench_id")
+        record = summary.to_record(
+            tenant_id=job.tenant_id,
+            bench_id=str(pregenerated) if pregenerated else None,
+        )
+        await self._storage.save_bench(record)
+
+        # bench_id rides result_run_id (generic "result identifier"); the
+        # API contract documents this mapping for BENCH jobs.
+        return DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id=record.bench_id,
             error=None,
         )
 

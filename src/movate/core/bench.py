@@ -23,6 +23,7 @@ import statistics
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from movate.core.eval import (
     EvalConfigError,
@@ -31,6 +32,8 @@ from movate.core.eval import (
     assert_cross_family,
 )
 from movate.core.models import (
+    BenchModelResult,
+    BenchRecord,
     JudgeConfig,
     JudgeMethod,
     ModelConfig,
@@ -137,6 +140,46 @@ class BenchSummary:
     runs_per_model: int
     gate_mode: str
     models: list[ModelBenchResult] = field(default_factory=list)
+    judge_method: JudgeMethod | None = None
+    """The judge method used for quality scoring (``llm_judge``), or
+    ``None`` for cost+latency-only benches. Populated by the engine
+    from the configured :class:`JudgeConfig`."""
+
+    def to_record(self, *, tenant_id: str = "local", bench_id: str | None = None) -> BenchRecord:
+        """Flatten this summary into a persistable :class:`BenchRecord`.
+
+        Mirrors :meth:`movate.core.eval.EvalSummary.to_record`: a fresh
+        ``uuid4`` id (unless ``bench_id`` is supplied — the API
+        pre-generates it so the caller can fetch the result the moment
+        the job completes), the tenant scope, and the per-model rows
+        rendered with the configured ``gate_mode`` for score aggregation
+        (the same shape the CLI's ``--output json`` emits)."""
+        return BenchRecord(
+            bench_id=bench_id or str(uuid4()),
+            tenant_id=tenant_id,
+            agent=self.agent,
+            agent_version=self.agent_version,
+            input=self.input,
+            judge_method=self.judge_method,
+            judge_provider=self.judge_provider,
+            runs_per_model=self.runs_per_model,
+            gate_mode=self.gate_mode,
+            models=[self._model_to_result(m) for m in self.models],
+        )
+
+    def _model_to_result(self, m: ModelBenchResult) -> BenchModelResult:
+        score = m.aggregated_score(self.gate_mode)
+        return BenchModelResult(
+            provider=m.provider,
+            score=round(score, 6) if score is not None else None,
+            judge_skipped=m.skipped_score,
+            cost_mean_usd=m.cost_mean_usd,
+            cost_total_usd=m.cost_total_usd,
+            latency_p50_ms=m.latency_p50_ms,
+            latency_p95_ms=m.latency_p95_ms,
+            error_count=m.error_count,
+            sample_output=m.sample_output,
+        )
 
 
 class BenchEngine:
@@ -230,10 +273,13 @@ class BenchEngine:
                 with contextlib.suppress(Exception):
                     self._on_model_complete(len(results), len(providers), result)
 
+        scoring = (
+            self._judge is not None
+            and self._judge.method == JudgeMethod.LLM_JUDGE
+            and self._judge.model is not None
+        )
         judge_provider = (
-            self._judge.model.provider
-            if self._judge and self._judge.method == JudgeMethod.LLM_JUDGE and self._judge.model
-            else None
+            self._judge.model.provider if scoring and self._judge and self._judge.model else None
         )
         return BenchSummary(
             agent=bundle.spec.name,
@@ -244,6 +290,7 @@ class BenchEngine:
             runs_per_model=self._runs_per_model,
             gate_mode=self._gate_mode,
             models=results,
+            judge_method=JudgeMethod.LLM_JUDGE if scoring else None,
         )
 
     async def _score_freeform(

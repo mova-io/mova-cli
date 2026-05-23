@@ -31,7 +31,14 @@ from fastapi.responses import JSONResponse
 import movate
 from movate.core.auth import mint_api_key
 from movate.core.loader import AgentBundle
-from movate.core.models import ApiKeyEnv, EvalRecord, JobKind, JobRecord, JobStatus
+from movate.core.models import (
+    ApiKeyEnv,
+    BenchRecord,
+    EvalRecord,
+    JobKind,
+    JobRecord,
+    JobStatus,
+)
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.runtime.agent_creation import (
     AgentCreationError,
@@ -69,6 +76,11 @@ from movate.runtime.schemas import (
     ApiKeyRevokedView,
     ApiKeyView,
     AuthWhoamiView,
+    BenchAcceptedView,
+    BenchListView,
+    BenchModelView,
+    BenchResultView,
+    BenchSubmission,
     EvalAcceptedView,
     EvalListView,
     EvalScorecardView,
@@ -348,6 +360,38 @@ def _eval_record_to_view(record: EvalRecord) -> EvalScorecardView:
         pass_rate=record.pass_rate,
         sample_count=record.sample_count,
         total_cost_usd=record.total_cost_usd,
+        created_at=record.created_at.isoformat(),
+    )
+
+
+def _bench_record_to_view(record: BenchRecord) -> BenchResultView:
+    """Map a :class:`BenchRecord` to the wire view. Shared by the
+    retrieval + list endpoints so both map fields identically (mirrors
+    ``_eval_record_to_view``).
+    """
+    return BenchResultView(
+        bench_id=record.bench_id,
+        agent=record.agent,
+        agent_version=record.agent_version,
+        input=record.input,
+        judge_method=record.judge_method.value if record.judge_method else None,
+        judge_provider=record.judge_provider,
+        runs_per_model=record.runs_per_model,
+        gate_mode=record.gate_mode,
+        models=[
+            BenchModelView(
+                provider=m.provider,
+                score=m.score,
+                judge_skipped=m.judge_skipped,
+                cost_mean_usd=m.cost_mean_usd,
+                cost_total_usd=m.cost_total_usd,
+                latency_p50_ms=m.latency_p50_ms,
+                latency_p95_ms=m.latency_p95_ms,
+                error_count=m.error_count,
+                sample_output=m.sample_output,
+            )
+            for m in record.models
+        ],
         created_at=record.created_at.isoformat(),
     )
 
@@ -2730,6 +2774,131 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Bench endpoints (BACKLOG #64) — multi-model comparison persistence.
+    # Mirror the eval endpoints beat-for-beat: kickoff enqueues a
+    # JobKind.BENCH job; the worker runs BenchEngine + persists a
+    # BenchRecord; the result + list endpoints render it.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/bench/{agent}",
+        response_model=BenchAcceptedView,
+        status_code=202,
+        tags=["bench-v1"],
+    )
+    async def v1_kick_off_bench(
+        agent: str,
+        body: BenchSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> BenchAcceptedView:
+        """Kick off a multi-model bench against an agent and persist the
+        BenchRecord.
+
+        Creates a ``JobRecord(kind=BENCH)`` and returns 202 immediately
+        with ``{job_id, bench_id, status: "queued"}``. The worker process
+        claims and executes the job; poll ``GET /api/v1/jobs/{job_id}``
+        until terminal, then fetch the comparison from
+        ``GET /api/v1/bench/{bench_id}``.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == agent), None)
+        if bundle is None:
+            raise not_found("agent", agent)
+
+        store: StorageProvider = request.app.state.storage
+
+        # Pre-generate the bench_id so the caller can fetch the result
+        # the moment the job completes. The worker derives the same id by
+        # passing it through the job input; if absent (older worker), the
+        # worker generates its own and the caller reads it off the job's
+        # result_run_id instead.
+        bench_id = str(uuid4())
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.BENCH,
+            target=agent,
+            input={
+                "bench_id": bench_id,
+                "models": body.models,
+                "input": body.input,
+                "judge": body.judge,
+                "rubric": body.rubric,
+                "runs": body.runs,
+                "gate_mode": body.gate_mode,
+                "mock": body.mock,
+            },
+            api_key_id=ctx.api_key_id,
+        )
+        await store.save_job(job)
+        return BenchAcceptedView(
+            bench_id=bench_id,
+            job_id=job.job_id,
+            status="queued",
+        )
+
+    @v1.get(
+        "/bench/{bench_id}",
+        response_model=BenchResultView,
+        tags=["bench-v1"],
+    )
+    async def v1_get_bench(
+        bench_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> BenchResultView:
+        """Retrieve a completed bench's comparison.
+
+        Tenant-scoped at the storage layer (a cross-tenant id probe
+        returns 404, never 403, to avoid leaking that the id exists).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — no bench record matches the id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_bench(bench_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("bench", bench_id)
+        return _bench_record_to_view(record)
+
+    @v1.get(
+        "/bench",
+        response_model=BenchListView,
+        tags=["bench-v1"],
+    )
+    async def v1_list_bench(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> BenchListView:
+        """Paginated history of bench runs. Filter by ``agent=<name>``.
+
+        Same tenant scoping as every other endpoint; limit hard-capped
+        at 100.
+
+        Errors:
+
+        * **401** — bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_bench(
+            tenant_id=ctx.tenant_id,
+            agent=agent,
+            limit=capped_limit,
+        )
+        views = [_bench_record_to_view(r) for r in records]
+        return BenchListView(bench=views, count=len(views))
 
     # ------------------------------------------------------------------
     # Model catalog + pricing (BACKLOG #67 / #68) — read-only mirrors of
