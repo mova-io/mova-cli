@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 
+from movate.core.cache import build_cache
 from movate.core.config import load_project_config
 from movate.core.executor import Executor
 from movate.core.models import AgentRuntime
@@ -129,6 +130,9 @@ async def build_local_runtime(*, mock: bool) -> LocalRuntime:
         skill_policy=project_cfg.skills,
         guardrails=project_cfg.guardrails,
         memory_store=build_memory_store(),
+        # Opt-in LLM response cache (default NoOp / OFF). Selected by
+        # MOVATE_LLM_CACHE=memory; unset → zero behavior change.
+        cache=build_cache(),
     )
     return LocalRuntime(executor=executor, provider=provider, storage=storage, tracer=tracer)
 

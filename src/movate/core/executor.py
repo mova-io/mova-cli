@@ -26,6 +26,14 @@ if TYPE_CHECKING:
 
 from jsonschema import ValidationError as JsonSchemaError
 
+from movate.core.cache import (
+    CachedResponse,
+    CacheProvider,
+    NoOpCache,
+    cache_ttl_s,
+    compute_cache_key,
+    is_cacheable,
+)
 from movate.core.config import GuardrailsConfig, ModelPolicy, RuntimePolicy, SkillPolicy
 from movate.core.failures import (
     DEFAULT_RETRY,
@@ -96,6 +104,7 @@ class Executor:
         skill_policy: SkillPolicy | None = None,
         guardrails: GuardrailsConfig | None = None,
         memory_store: MemoryStore | None = None,
+        cache: CacheProvider | None = None,
     ) -> None:
         """One of ``provider`` (legacy single-runtime) OR ``registry``
         (multi-runtime, v0.6+) must be set. Passing ``provider`` is
@@ -141,6 +150,16 @@ class Executor:
         # entry (input) and exit (output). See GuardrailsConfig for the
         # full schema and ``movate.guardrails`` for the engine.
         self._guardrails = guardrails or GuardrailsConfig()
+        # LLM response cache (ADR-free, mirrors RateLimiter). Default
+        # NoOpCache → always-miss, never-store → byte-for-byte
+        # unchanged behavior. Only deterministic (temperature==0) calls
+        # are ever cached; a hit returns the stored completion at $0
+        # cost / ~0 latency. In-process now; shared backends
+        # (Redis/Postgres) slot in behind the CacheProvider Protocol
+        # later. Wired at the executor↔provider boundary in
+        # _run_with_tool_use.
+        self._cache: CacheProvider = cache or NoOpCache()
+        self._cache_ttl_s = cache_ttl_s()
 
     @property
     def tracer(self) -> Tracer:
@@ -450,6 +469,19 @@ class Executor:
                 assert last_error is not None
                 raise last_error
 
+            # Cache-hit short-circuit: a response served from the LLM
+            # cache cost us no provider call, so the run pays $0 for it
+            # (the whole point of the cache). The ``llm_cache_hit`` flag
+            # is stamped on ``raw`` by ``_complete_cached`` and survives
+            # into the accumulated raw of the final completion. Skipping
+            # the pricing lookup keeps the win honest and observable.
+            llm_cache_hit = bool(completion.raw.get("llm_cache_hit"))
+            if llm_cache_hit:
+                cost = 0.0
+                self._tracer.log_event(
+                    span,
+                    {"cost_skipped": True, "reason": "llm cache hit ($0)"},
+                )
             # Pricing-key dance: each adapter knows the canonical key for
             # its provider strings (LiteLLM passes the agent's
             # ``model.provider`` through unchanged; native_anthropic /
@@ -457,8 +489,7 @@ class Executor:
             # None because the model is opaque). When None or the lookup
             # misses we record cost=0 with an event — better than
             # crashing on a runtime where pricing isn't applicable.
-            pricing_key = provider_for_run.pricing_key(chosen_provider)
-            if pricing_key is None:
+            elif (pricing_key := provider_for_run.pricing_key(chosen_provider)) is None:
                 cost = 0.0
                 self._tracer.log_event(
                     span,
@@ -793,7 +824,13 @@ class Executor:
 
             async def _invoke(req: CompletionRequest = req) -> CompletionResponse:
                 if on_token is None:
-                    return await provider_for_run.complete(req)
+                    return await self._complete_cached(
+                        provider_for_run, req, span=span, tenant_id=tenant_id
+                    )
+                # Streaming bypasses the cache: a hit can't be replayed
+                # as a live token stream without synthesizing chunks,
+                # and streaming is a UX concern (live render) rather
+                # than a cost-of-repeat one. Always calls the provider.
                 return await self._invoke_streaming(provider_for_run, req, on_token)
 
             completion = await run_with_retries(_invoke)
@@ -972,6 +1009,86 @@ class Executor:
                 for _cid, _res, _cost, _rec in dispatch_results
             ]
             messages.extend([assistant_turn, *tool_turns])
+
+    async def _complete_cached(
+        self,
+        provider: BaseLLMProvider,
+        req: CompletionRequest,
+        *,
+        span: SpanCtx,
+        tenant_id: str,
+    ) -> CompletionResponse:
+        """Thin read-through cache wrapper around ``provider.complete``.
+
+        Only deterministic calls (``temperature == 0``, per
+        :func:`movate.core.cache.is_cacheable`) are eligible — a
+        sampled (``temperature > 0``) response is one draw from a
+        distribution and replaying it would be wrong, so those calls
+        skip the cache entirely and always hit the provider.
+
+        Cache key = sha256 of the request signature (provider +
+        rendered messages + params + tools) folded with ``tenant_id``
+        so there's no cross-tenant leakage. On a HIT we rebuild a
+        :class:`CompletionResponse` from the stored value, log a
+        ``llm_cache.hit`` tracer event (so the hit is observable), and
+        return without calling the provider — the downstream cost
+        calc reads the stored token usage but the run pays nothing for
+        this call (no provider round-trip). On a MISS we call the
+        provider and store the result under the same key.
+
+        With the default :class:`NoOpCache` this collapses to a plain
+        ``provider.complete`` call (get is always-miss, set is a
+        no-op) — byte-for-byte unchanged behavior.
+        """
+        if not is_cacheable(req.params) or req.tools:
+            # Non-deterministic (sampled) call — never cached. Tool-use
+            # requests (``req.tools`` set) also bypass: a cached entry
+            # is a flat text/tokens value, so replaying it would lose
+            # the tool_use kind/call fields and corrupt the loop. The
+            # single-shot final-answer path — by far the common, most
+            # repeated call — is what we cache.
+            return await provider.complete(req)
+
+        key = compute_cache_key(
+            provider=req.provider,
+            messages=req.messages,
+            params=req.params,
+            tools=req.tools,
+            tenant_id=tenant_id,
+        )
+        cached = self._cache.get(key)
+        if cached is not None:
+            # HIT — replay the stored completion. Mark it on the raw
+            # payload so the cost path (and traces) can see this call
+            # was free, and log an observable tracer event.
+            self._tracer.log_event(
+                span,
+                {
+                    "llm_cache.hit": True,
+                    "llm_cache.backend": getattr(self._cache, "name", "unknown"),
+                    "llm_cache.provider": req.provider,
+                },
+            )
+            raw = dict(cached.raw)
+            raw["llm_cache_hit"] = True
+            return CompletionResponse(text=cached.text, tokens=cached.tokens, raw=raw)
+
+        # MISS — call the provider, then store the result for next time.
+        completion = await provider.complete(req)
+        self._cache.set(
+            key,
+            CachedResponse(text=completion.text, tokens=completion.tokens, raw=completion.raw),
+            ttl_s=self._cache_ttl_s,
+        )
+        self._tracer.log_event(
+            span,
+            {
+                "llm_cache.miss": True,
+                "llm_cache.backend": getattr(self._cache, "name", "unknown"),
+                "llm_cache.provider": req.provider,
+            },
+        )
+        return completion
 
     async def _invoke_streaming(
         self,
