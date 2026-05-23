@@ -132,13 +132,36 @@ class AzureCliTokenProvider:
 
 
 def default_oidc_provider() -> OidcTokenProvider:
-    """The provider used when a target sets ``auth: oidc`` with no override.
+    """The Azure-CLI provider — the original ADR 012 D4 default.
 
-    Today this is always the Azure CLI provider (no new dependency). The
-    indirection is the seam where a future ``azure-identity`` provider
-    (DEFERRED, Deva sign-off pending) would be selected.
+    Kept for back-compat with call sites/tests that want the ``az`` provider
+    directly. New call sites should prefer :func:`select_oidc_provider`, which
+    honors the target's ``oidc_provider`` field (device-code is the general
+    human default per ADR 013 L1).
     """
     return AzureCliTokenProvider()
+
+
+def select_oidc_provider(target: TargetConfig) -> OidcTokenProvider:
+    """Pick the OIDC provider for ``target`` from its ``oidc_provider`` field.
+
+    * ``device-code`` (default, ADR 013 L1) — the cached device-code provider:
+      returns the token cached by ``mdk auth login``, silently refreshing it.
+      The general, no-cloud-SDK human path.
+    * ``azure-cli`` — the original :class:`AzureCliTokenProvider`
+      (``az account get-access-token``), for operators already authenticated
+      via the Azure CLI / managed identity.
+    """
+    choice = getattr(target, "oidc_provider", "device-code")
+    if choice == "azure-cli":
+        return AzureCliTokenProvider()
+    # Imported lazily so the device-code module (httpx + credentials) isn't
+    # pulled in for the az path or for the default key path.
+    from movate.core.oidc_device import (  # noqa: PLC0415
+        CachedDeviceCodeTokenProvider,
+    )
+
+    return CachedDeviceCodeTokenProvider()
 
 
 __all__ = [
@@ -146,4 +169,5 @@ __all__ = [
     "OidcTokenError",
     "OidcTokenProvider",
     "default_oidc_provider",
+    "select_oidc_provider",
 ]

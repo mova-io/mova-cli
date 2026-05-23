@@ -302,7 +302,7 @@ def _list_keys_remote(*, target: str, include_revoked: bool) -> None:
 
 
 @auth_app.command("whoami")
-def whoami(
+def whoami(  # noqa: PLR0912 — branch count inherent to the key/oidc/env multi-mode flow
     target: str = typer.Option(
         None,
         "--target",
@@ -336,14 +336,36 @@ def whoami(
         except UserConfigError as exc:
             error(str(exc))
             raise typer.Exit(code=2) from None
-        api_key = os.environ.get(target_cfg.key_env, "").strip()
         base_url = target_cfg.url.rstrip("/")
-        if not api_key:
-            error(
-                f"env var ${target_cfg.key_env} is empty. "
-                f"Run mdk auth refresh-runtime-key {target}."
+        # OIDC target (ADR 013 L1): resolve the bearer from the cached SSO
+        # token (refreshing if needed) rather than a static key env var, and
+        # also show the locally-decoded identity claims so `whoami` works even
+        # if the runtime is unreachable.
+        if getattr(target_cfg, "auth", "key") == "oidc":
+            from movate.core.oidc_provider import (  # noqa: PLC0415
+                OidcTokenError,
+                select_oidc_provider,
             )
-            raise typer.Exit(code=2)
+
+            try:
+                api_key = select_oidc_provider(target_cfg).get_token(target, target_cfg)
+            except OidcTokenError as exc:
+                error(str(exc))
+                raise typer.Exit(code=2) from None
+            # Local claims first — informative even when /auth/me 5xxs.
+            identity = _decode_token_identity(api_key)
+            if identity:
+                stdout.print("[dim]from token claims:[/dim]")
+                for label, value in identity:
+                    stdout.print(f"[bold]{label}:[/bold] {value}")
+        else:
+            api_key = os.environ.get(target_cfg.key_env, "").strip()
+            if not api_key:
+                error(
+                    f"env var ${target_cfg.key_env} is empty. "
+                    f"Run mdk auth refresh-runtime-key {target}."
+                )
+                raise typer.Exit(code=2)
     else:
         api_key = os.environ.get("MDK_API_KEY", os.environ.get("MOVATE_API_KEY", "")).strip()
         base_url = os.environ.get("MDK_RUNTIME_URL", "").rstrip("/")
@@ -594,8 +616,25 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]project[/bold] ([bold]./.env[/bold], project-only)."
         ),
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help=(
+            "Run SSO device-code login for an [bold]auth='oidc'[/bold] "
+            "deployment target (ADR 013). Mutually exclusive with the "
+            "[bold]provider[/bold] argument — when set, the provider-key flow "
+            "is skipped and the IdP device-authorization flow runs instead."
+        ),
+    ),
 ) -> None:
     """Set a provider API key, verify it, persist it for every project.
+
+    With [bold]--target[/bold], runs the OIDC [bold]device-code SSO[/bold]
+    flow for an ``auth='oidc'`` deployment target instead: prints a
+    verification URL + user code, waits for browser approval, then caches the
+    short-lived token (auto-refreshed on later calls). Humans use this in
+    place of long-lived ``mvt_*`` keys.
 
     [bold]Examples:[/bold]
 
@@ -607,7 +646,21 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
 
       [dim]# CI-style: pass key non-interactively, skip verify[/dim]
       $ mdk auth login openai --key "$OPENAI_API_KEY" --no-verify
+
+      [dim]# SSO device-code login for an oidc target[/dim]
+      $ mdk auth login --target prod
     """
+    # Normalize the --target sentinel for direct Python callers (same defense
+    # as the provider/key args below).
+    if not isinstance(target, (str, type(None))):
+        target = None
+    # ADR 013 L1: SSO device-code login for an oidc target. Fully separate
+    # from the provider-key flow below — dispatched here so that path stays
+    # byte-for-byte unchanged.
+    if target is not None and str(target).strip():
+        _login_oidc_target(str(target).strip())
+        return
+
     from movate.credentials import (  # noqa: PLC0415
         CredentialsStore,
         verify_provider_key,
@@ -713,6 +766,169 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
         raise typer.Exit(code=2)
+
+
+# ---------------------------------------------------------------------------
+# OIDC device-code SSO (ADR 013 L1)
+#
+# `mdk auth login --target <t>` / `mdk auth logout --target <t>` manage the
+# short-lived human-SSO token cached per oidc target. Distinct from both the
+# tenant API keys (top of file) and the provider keys above — same `auth`
+# surface because all three are credential flows.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_oidc_target(target: str) -> object:
+    """Resolve a target name and require it to be ``auth='oidc'``.
+
+    Returns the :class:`TargetConfig`. Exits 2 (actionable) when the target is
+    unknown or is a plain ``auth='key'`` target (device-code login is only
+    meaningful for oidc targets).
+    """
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        resolve_target,
+    )
+
+    try:
+        _name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+    if getattr(target_cfg, "auth", "key") != "oidc":
+        error(
+            f"target {target!r} is not an OIDC target (auth='key'). "
+            "SSO login only applies to targets with auth='oidc'. Set it with "
+            f"`mdk config add-target {target} --url ... --auth oidc ...` or "
+            "use the static key flow."
+        )
+        raise typer.Exit(code=2)
+    return target_cfg
+
+
+def _login_oidc_target(target: str) -> None:
+    """Run the OIDC device-code flow for an oidc target + cache the token.
+
+    Prints the verification URL + user code (never the token), polls the IdP
+    until approval, then writes the access/refresh/expiry triple to the
+    credentials store via :class:`DeviceCodeTokenCache`. Surfaces the resolved
+    identity on success.
+    """
+    from movate.core.oidc_device import (  # noqa: PLC0415
+        DeviceCodeStart,
+        DeviceCodeTokenCache,
+        run_device_code_login,
+    )
+    from movate.core.oidc_provider import OidcTokenError  # noqa: PLC0415
+
+    target_cfg = _resolve_oidc_target(target)
+
+    def _prompt(start: DeviceCodeStart) -> None:
+        stdout.print(
+            f"\n[bold]To sign in, open[/bold] [cyan]{start.verification_uri}[/cyan] "
+            f"and enter the code:\n\n    [bold yellow]{start.user_code}[/bold yellow]\n"
+        )
+        if start.verification_uri_complete:
+            stdout.print(f"[dim]Or open this direct link: {start.verification_uri_complete}[/dim]")
+        stdout.print("[dim]Waiting for you to approve in the browser…[/dim]")
+
+    try:
+        result = run_device_code_login(target, target_cfg, on_prompt=_prompt)
+    except OidcTokenError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    cache = DeviceCodeTokenCache()
+    cache.save(target, result)
+
+    success(f"signed in to [bold]{target}[/bold] via SSO.")
+    # Surface the resolved identity from the token's claims (no signature
+    # validation needed here — the runtime re-validates; this is display only).
+    identity = _decode_token_identity(result.access_token)
+    if identity:
+        for label, value in identity:
+            stdout.print(f"[bold]{label}:[/bold] {value}")
+    hint(
+        "[dim]Token cached (short-lived; auto-refreshed). Run "
+        f"[bold]mdk auth whoami --target {target}[/bold] to confirm, or "
+        f"[bold]mdk auth logout --target {target}[/bold] to clear it.[/dim]"
+    )
+
+
+def _decode_token_identity(access_token: str) -> list[tuple[str, str]]:
+    """Best-effort, signature-free decode of a JWT's identity claims for display.
+
+    Returns ``[(label, value), …]`` (sub / tenant / scopes) or ``[]`` when the
+    token isn't a decodable JWT (e.g. an opaque access token). NEVER includes
+    the token itself. Signature is intentionally NOT verified — this is a
+    local display convenience; the runtime is the authority.
+
+    Decoded with plain base64 (no PyJWT dependency — PyJWT lives in the
+    optional ``runtime`` extra, but this display path must work in a core-only
+    CLI install).
+    """
+    import base64  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    try:
+        payload_b64 = access_token.split(".")[1]
+        # Re-pad for urlsafe_b64decode (JWS strips ``=`` padding).
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        if not isinstance(claims, dict):
+            return []
+    except Exception:
+        return []
+    rows: list[tuple[str, str]] = []
+    sub = claims.get("sub")
+    if isinstance(sub, str) and sub:
+        rows.append(("sub", sub))
+    # Tenant claim varies by IdP; show the common Entra `tid` if present.
+    tid = claims.get("tid")
+    if isinstance(tid, str) and tid:
+        rows.append(("tenant", tid))
+    # Scopes may be a space-delimited string (`scp`) or a list (`roles`).
+    for claim in ("scp", "roles"):
+        raw = claims.get(claim)
+        if isinstance(raw, str) and raw:
+            rows.append(("scopes", raw))
+            break
+        if isinstance(raw, (list, tuple)) and raw:
+            rows.append(("scopes", " ".join(str(p) for p in raw)))
+            break
+    return rows
+
+
+@auth_app.command("logout")
+def logout(
+    target: str = typer.Option(
+        ...,
+        "--target",
+        "-t",
+        help="OIDC deployment target whose cached SSO token to clear.",
+    ),
+) -> None:
+    """Clear the cached SSO token for an OIDC target (ADR 013 L1).
+
+    Removes the access token, refresh token, and expiry cached by
+    [bold]mdk auth login --target <t>[/bold] from the credentials store. The
+    next authenticated call to that target will require a fresh
+    [bold]mdk auth login[/bold]. Idempotent — clearing an already-empty cache
+    is a no-op.
+
+    [bold]Example:[/bold]
+
+      [dim]$ mdk auth logout --target prod[/dim]
+    """
+    from movate.core.oidc_device import DeviceCodeTokenCache  # noqa: PLC0415
+
+    # Resolve to validate the target exists + is oidc, giving a clean error.
+    _resolve_oidc_target(target)
+    cache = DeviceCodeTokenCache()
+    if cache.clear(target):
+        success(f"cleared the cached SSO token for [bold]{target}[/bold].")
+    else:
+        hint(f"[dim]no cached SSO token for {target!r} — nothing to clear.[/dim]")
 
 
 @auth_app.command("use-keychain")

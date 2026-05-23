@@ -139,7 +139,13 @@ class TestResolveTargetBearer:
     ) -> None:
         from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
 
-        _write_user_config(tmp_path, auth="oidc", extra="    oidc_resource: api://movate\n")
+        # The default oidc provider is now 'device-code' (ADR 013 L1); opt
+        # into the Azure CLI provider explicitly to exercise the az shell-out.
+        _write_user_config(
+            tmp_path,
+            auth="oidc",
+            extra="    oidc_provider: azure-cli\n    oidc_resource: api://movate\n",
+        )
         monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
         # Deliberately leave MDK_DEV_KEY UNSET — the oidc path must not read it.
         monkeypatch.delenv("MDK_DEV_KEY", raising=False)
@@ -188,7 +194,11 @@ class TestResolveTargetBearer:
     def test_oidc_missing_az_exits_2(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
 
-        _write_user_config(tmp_path, auth="oidc", extra="    oidc_resource: api://movate\n")
+        _write_user_config(
+            tmp_path,
+            auth="oidc",
+            extra="    oidc_provider: azure-cli\n    oidc_resource: api://movate\n",
+        )
         monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
         monkeypatch.setattr("shutil.which", lambda name: None)
         with pytest.raises(typer.Exit) as exc:

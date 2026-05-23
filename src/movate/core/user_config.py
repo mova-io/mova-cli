@@ -88,8 +88,41 @@ class TargetConfig(BaseModel):
         default=None,
         description=(
             "OAuth2 scope for OIDC auth (passed to `az account get-access-token "
-            "--scope`). Alternative to oidc_resource for IdPs/flows that scope by "
-            "scope rather than resource."
+            "--scope`, and appended to the device-code login's requested scopes). "
+            "Alternative to oidc_resource for IdPs/flows that scope by scope "
+            "rather than resource."
+        ),
+    )
+    # --- Device-code login config (ADR 013 L1) ----------------------------
+    # The interactive `mdk auth login --target <t>` device-code flow (RFC 8628)
+    # is plain OIDC HTTP — it needs the IdP issuer (for discovery) + the app
+    # registration's client id. Both default None; only consulted when a target
+    # opts into auth='oidc' AND uses the device-code provider (no `az` needed).
+    oidc_issuer: str | None = Field(
+        default=None,
+        description=(
+            "OIDC issuer URL for the device-code login flow (used for "
+            "`{issuer}/.well-known/openid-configuration` discovery). Falls back "
+            "to the MOVATE_OIDC_ISSUER env var when unset, so one value can "
+            "drive both the runtime's acceptance and the CLI's login."
+        ),
+    )
+    oidc_client_id: str | None = Field(
+        default=None,
+        description=(
+            "IdP app-registration client id for the device-code login flow "
+            "(RFC 8628). Required when using `mdk auth login` for an "
+            "auth='oidc' target via the device-code provider."
+        ),
+    )
+    oidc_provider: Literal["device-code", "azure-cli"] = Field(
+        default="device-code",
+        description=(
+            "Which OIDC token provider to use for auth='oidc'. "
+            "'device-code' (default) is the general, no-cloud-SDK human path: "
+            "`mdk auth login` runs the device-authorization flow and caches a "
+            "short-lived token. 'azure-cli' shells out to "
+            "`az account get-access-token` instead (no `mdk auth login` step)."
         ),
     )
 
