@@ -29,8 +29,10 @@ from movate.kb.embed import (
     embed_texts,
     qualified_model_name,
 )
+from movate.kb.graph_extract import DEFAULT_EXTRACTION_MODEL, extract_graph
 
 if TYPE_CHECKING:
+    from movate.kb.graph_extract import CompleteFn
     from movate.storage.base import StorageProvider
 
 log = logging.getLogger(__name__)
@@ -64,6 +66,14 @@ class IngestSummary:
     chunks_removed: int = field(default=0)
     """Old chunks deleted before re-ingest when ``clean_source=True``.
     Zero unless the caller passed ``--clean-source``."""
+
+    entities_saved: int = field(default=0)
+    """Knowledge-graph entities upserted for this source. Zero unless the
+    caller passed ``--build-graph``."""
+
+    relations_saved: int = field(default=0)
+    """Knowledge-graph relations upserted for this source. Zero unless the
+    caller passed ``--build-graph``."""
 
 
 # File-size guard — default 50 MB. Operators with large scanned PDFs
@@ -109,6 +119,9 @@ async def ingest_path(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
     clean_source: bool = False,
+    build_graph: bool = False,
+    extraction_model: str = DEFAULT_EXTRACTION_MODEL,
+    complete_fn: CompleteFn | None = None,
     on_file_start: Callable[[str, int, int], None] | None = None,
 ) -> tuple[list[IngestSummary], list[tuple[str, str]]]:
     """Ingest a file or directory tree. Returns one summary per file.
@@ -148,6 +161,9 @@ async def ingest_path(
                 embedding_model=embedding_model,
                 api_key=api_key,
                 clean_source=clean_source,
+                build_graph=build_graph,
+                extraction_model=extraction_model,
+                complete_fn=complete_fn,
             )
         except EmbeddingError as exc:
             # Transient network or rate-limit failure — continue with
@@ -169,6 +185,9 @@ async def _ingest_one_file(
     embedding_model: str,
     api_key: str | None,
     clean_source: bool = False,
+    build_graph: bool = False,
+    extraction_model: str = DEFAULT_EXTRACTION_MODEL,
+    complete_fn: CompleteFn | None = None,
 ) -> IngestSummary | None:
     """Read + parse + ingest a single file.
 
@@ -208,6 +227,10 @@ async def _ingest_one_file(
             tenant_id=tenant_id,
             source=source,
         )
+        # Drop the source's graph rows too so a clean re-ingest rebuilds
+        # them from scratch rather than accumulating stale provenance.
+        if build_graph:
+            await storage.delete_graph(agent=agent, tenant_id=tenant_id, source=source)
 
     result = parse_document(file_path.name, content)
     if result is None:
@@ -222,6 +245,9 @@ async def _ingest_one_file(
         api_key=api_key,
         ocr=result.ocr_used,
         page_texts=result.page_texts,
+        build_graph=build_graph,
+        extraction_model=extraction_model,
+        complete_fn=complete_fn,
     )
     if summary is not None:
         summary.chunks_removed = chunks_removed
@@ -239,6 +265,9 @@ async def ingest_text(
     api_key: str | None = None,
     ocr: bool = False,
     page_texts: tuple[str, ...] | None = None,
+    build_graph: bool = False,
+    extraction_model: str = DEFAULT_EXTRACTION_MODEL,
+    complete_fn: CompleteFn | None = None,
 ) -> IngestSummary | None:
     """Chunk + embed + persist ``text`` as KB content for ``agent``.
 
@@ -287,6 +316,7 @@ async def ingest_text(
 
     full_model_name = qualified_model_name(embedding_model)
     saved = 0
+    saved_chunks: list[KbChunk] = []
     # Batch the embedding calls. ``save_kb_chunk`` is async-but-fast
     # so we save sequentially; embedding HTTP calls are the bottleneck
     # and are already batched into 64-per-call.
@@ -313,12 +343,60 @@ async def ingest_text(
             # ``save_kb_chunk`` works (Postgres / sqlite / in-memory).
             await storage.save_kb_chunk(kb_chunk)
             saved += 1
+            saved_chunks.append(kb_chunk)
+
+    entities_saved = 0
+    relations_saved = 0
+    if build_graph:
+        entities_saved, relations_saved = await _build_graph_for_chunks(
+            storage=storage,
+            chunks=saved_chunks,
+            agent=agent,
+            tenant_id=tenant_id,
+            embedding_model=embedding_model,
+            extraction_model=extraction_model,
+            api_key=api_key,
+            complete_fn=complete_fn,
+        )
+
     return IngestSummary(
         source=label,
         chunks_total=len(chunks),
         chunks_saved=saved,
         embedding_model=full_model_name,
+        entities_saved=entities_saved,
+        relations_saved=relations_saved,
     )
+
+
+async def _build_graph_for_chunks(
+    *,
+    storage: StorageProvider,
+    chunks: list[KbChunk],
+    agent: str,
+    tenant_id: str,
+    embedding_model: str,
+    extraction_model: str,
+    api_key: str | None,
+    complete_fn: CompleteFn | None,
+) -> tuple[int, int]:
+    """Extract a knowledge graph from ``chunks`` and upsert it. Returns
+    ``(entities_saved, relations_saved)``. The chunks must already be
+    persisted — their ``chunk_id``s become the graph's source provenance."""
+    entities, relations = await extract_graph(
+        chunks,
+        agent=agent,
+        tenant_id=tenant_id,
+        embedding_model=embedding_model,
+        model=extraction_model,
+        api_key=api_key,
+        complete_fn=complete_fn,
+    )
+    for entity in entities:
+        await storage.upsert_entity(entity)
+    for relation in relations:
+        await storage.upsert_relation(relation)
+    return len(entities), len(relations)
 
 
 def _batched(items: list[Chunk], n: int) -> list[list[Chunk]]:

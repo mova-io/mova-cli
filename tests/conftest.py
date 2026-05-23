@@ -47,6 +47,9 @@ _PG_TABLES = (
     "workflow_runs",
     "jobs",
     "api_keys",
+    "kb_chunks",
+    "kb_entities",
+    "kb_relations",
 )
 
 
