@@ -18,9 +18,9 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | # | Item | ADR / ref | LOE (Claude) | Depends on | Status | PR | Merged |
 |---|------|-----------|--------------|------------|--------|----|--------|
 | 1 | Registry storage layer (`AgentBundleRecord` + storage methods + `agent_bundles` table) | 014.1 | M (~25m) | — | ✅ | #366 | `2026.5.23.13` |
-| 2 | Resolve-from-registry — runtime loads agents from storage; version-keyed cache; FS→registry import (**closes #109 async gap**) | 014.2 | M (~35m) 🔒 | #1 | ⬜ | | `____` |
-| 3 | Scopes / least-privilege — scope set + `require_scope` + `ApiKeyRecord.scopes` (+ back-compat migration) + OIDC claim map + `create-key --scope` | 013.L2 | M (~35m) | — | ⬜ | | `____` |
-| 4 | OTLP → Azure Monitor — wire `OtelTracer` to App Insights; `MOVATE_TRACE_SINK=otlp` | 015.1 | S (~20m) 🔒 | — | ⬜ | | `____` |
+| 2 | Resolve-from-registry — runtime loads agents from storage; version-keyed cache; FS→registry import (**closes #109 async gap**) | 014.2 | M (~35m) 🔒 | #1 | ✅ | #368 | `2026.5.23.15` |
+| 3 | Scopes / least-privilege — scope set + `require_scope` + `ApiKeyRecord.scopes` (+ back-compat migration) + OIDC claim map + `create-key --scope` | 013.L2 | M (~35m) | — | ✅ | #369 | `2026.5.23.16` |
+| 4 | OTLP → Azure Monitor — wire `OtelTracer` to App Insights; `MOVATE_TRACE_SINK=otlp` | 015.1 | S (~20m) 🔒 | — | ✅ | #370 | `2026.5.23.17` |
 | 5 | Harvest — prod runs + feedback → *proposed* eval cases (`mdk eval harvest` + API) | 016.D1 | M (~30m) | (#2 helps) | ⬜ | | `____` |
 | 6 | Versioning UX — optimistic concurrency (If-Match/409), `GET …/versions`, `revert` (#80), `mdk agent history\|revert` | 014.3 | M (~30m) | #1, #2 | ⬜ | | `____` |
 | 7 | `mdk login` — OIDC device-code SSO + token cache/refresh + `TargetConfig auth:oidc` + login/logout/whoami | 013.L1 | L (~50m) 🔒 | — | ⬜ | | `____` |
