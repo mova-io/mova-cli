@@ -308,15 +308,15 @@ clarity; **no MDK backlog items**:
 
 #### G-NEXT — Follow-up endpoints (next sprint)
 
-64. [ ] **`POST /api/v1/bench/{agent}` + `GET /api/v1/bench/{bench_id}`** `[HIGH] [v0.8] [~1d]` — Multi-model comparison kickoff + retrieval. Mirrors `mdk bench`.
+64. [ ] **`POST /api/v1/bench/{agent}` + `GET /api/v1/bench/{bench_id}`** `[HIGH] [v0.8] [~3-4d — re-estimated 2026-05-23]` — Multi-model comparison kickoff + retrieval. **Not a cheap mirror:** `JobKind` has no `BENCH` and bench results aren't persisted today (no `BenchRecord`/storage — `mdk bench` just prints a table). Needs a `BenchRecord` model + storage methods + migration + a `JobKind.BENCH` worker dispatch path before the endpoints can enqueue/retrieve. Treat as its own feature.
 
 65. [x] **`GET /api/v1/runs/{run_id}/trace` — replay info** `[HIGH] [v0.8] [≤1d]` — Mirrors `mdk trace replay`. Returns timeline JSON (spans, costs, decisions) for Angular's trace-viewer component.
 
-66. [ ] **`GET /api/v1/runs/{run_id}/explain` — decision chain** `[MED] [v0.8] [≤1d, depends on item 35]` — Mirrors `mdk explain` (item 35). Skill calls, tool results, branch decisions in human-readable form. **Pairs with item 35 from Group F.**
+66. [x] **`GET /api/v1/runs/{run_id}/explain` — decision chain** `[MED] [v0.8] [done 2026-05-23]` — Mirrors `mdk explain` (item 35). Skill calls, tool results, branch decisions in human-readable form; tenant-scoped via `AuthContext`, `?steps=true` for full skill calls. Decision-chain serialization factored into shared `core/explain.py`. **Pairs with item 35 from Group F.**
 
-67. [ ] **`GET /api/v1/models` + `GET /api/v1/models/{id}` — model catalog** `[MED] [v0.8] [≤1d, depends on item 30]` — Pricing, context window, capabilities, region availability. **Pairs with item 30 from Group F.**
+67. [x] **`GET /api/v1/models` + `GET /api/v1/models/{id}` — model catalog** `[MED] [v0.8] [done 2026-05-23]` — Pricing, context window, capabilities, region availability. `{id:path}` converter handles embedded `/` in model ids; catalog logic factored into shared `providers/model_catalog.py`. **Pairs with item 30 from Group F.**
 
-68. [ ] **`GET /api/v1/pricing` — pricing table** `[MED] [v0.8] [≤2h]` — Read-only mirror of `pricing.yaml`. Lets Angular render cost-forecast UI client-side without round-tripping.
+68. [x] **`GET /api/v1/pricing` — pricing table** `[MED] [v0.8] [done 2026-05-23]` — Read-only mirror of `pricing.yaml`. Lets Angular render cost-forecast UI client-side without round-tripping.
 
 69. [ ] **Skills CRUD: `GET/POST/PUT/DELETE /api/v1/skills` + `POST /api/v1/skills/{name}/invoke`** `[MED] [v0.8] [~2d]` — Wraps `mdk skills *` commands. Skill registry browsing + direct invocation from the Angular skill-authoring UI. **(partial 2026-05-23: only `POST /api/v1/skills` shipped; `GET`/`PUT`/`DELETE` + `/skills/{name}/invoke` still missing.)**
 
