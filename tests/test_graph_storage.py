@@ -87,7 +87,7 @@ def _chunk(chunk_id: str, source: str, *, agent: str = "a1", tenant_id: str = "t
         agent=agent,
         source=source,
         text=f"text for {chunk_id}",
-        embedding=[1.0, 0.0, 0.0],
+        embedding=_pad([1.0, 0.0, 0.0]),
         embedding_model="test-embed",
         content_hash=_hash(chunk_id),
     )
