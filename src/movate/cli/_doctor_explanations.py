@@ -188,6 +188,17 @@ _PROVIDER_KEY_EXPLANATIONS: dict[str, CheckExplanation] = {
 # Tracing env vars.
 
 _TRACING_EXPLANATIONS: dict[str, CheckExplanation] = {
+    "MOVATE_TRACE_SINK": CheckExplanation(
+        what="Deployment sink selector (ADR 015): `none` | `langfuse` | `otlp` | `both`.",
+        why=(
+            "The per-deployment choice of where traces go. When set it wins over "
+            "MOVATE_TRACER and is treated as explicit — a missing extra is a hard "
+            "error, not a silent fallback. `otlp` sends generic OTLP to any "
+            "OTLP backend (Azure Monitor / App Insights, Tempo, SigNoz)."
+        ),
+        failure_impact="Unset = unchanged legacy MOVATE_TRACER + auto-detect behavior.",
+        fix="export MOVATE_TRACE_SINK=otlp   # then set OTEL_EXPORTER_OTLP_ENDPOINT",
+    ),
     "MOVATE_TRACER": CheckExplanation(
         what="Explicit tracer selection: `stdout` | `langfuse` | `otel` | `composite`.",
         why="Override of the auto-detect rule. Default is stdout when no other tracer is configured.",
@@ -214,14 +225,39 @@ _TRACING_EXPLANATIONS: dict[str, CheckExplanation] = {
     ),
     "OTEL_EXPORTER_OTLP_ENDPOINT": CheckExplanation(
         what="OTLP receiver URL — where spans get sent.",
-        why="Required when `MDK_TRACER=otel`. Could be Jaeger, Honeycomb, Datadog, etc.",
-        failure_impact="MDK_TRACER=otel without this falls back to stdout.",
+        why=(
+            "Required for the OTLP sink (`MOVATE_TRACE_SINK=otlp`, or legacy "
+            "`MDK_TRACER=otel`). Point at Azure Monitor / App Insights OTLP "
+            "ingestion, or Tempo / SigNoz / Jaeger / Honeycomb."
+        ),
+        failure_impact=(
+            "MOVATE_TRACE_SINK=otlp without this is a hard error; "
+            "legacy MDK_TRACER=otel without this falls back to stdout."
+        ),
         fix="export OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io",
+    ),
+    "OTEL_EXPORTER_OTLP_HEADERS": CheckExplanation(
+        what="Auth/metadata headers for the OTLP exporter (comma-separated key=value).",
+        why=(
+            "Carries the backend auth header — e.g. an Azure Monitor / App "
+            "Insights ingestion key. Read natively by the OTel SDK."
+        ),
+        failure_impact="Unset = no auth header; backends that require auth reject spans.",
+        fix="export OTEL_EXPORTER_OTLP_HEADERS='x-api-key=...'   # from Key Vault in prod",
+    ),
+    "OTEL_EXPORTER_OTLP_PROTOCOL": CheckExplanation(
+        what="OTLP transport: `http/protobuf` (default) or `grpc`.",
+        why="Selects which OTLP exporter the runtime builds.",
+        failure_impact="Unset = http/protobuf (fewer transitive deps, easier to debug).",
+        fix="export OTEL_EXPORTER_OTLP_PROTOCOL=grpc   # only if your collector needs gRPC",
     ),
     "OTEL_SERVICE_NAME": CheckExplanation(
         what="Logical service name attached to every emitted span.",
         why="Lets your observability backend group spans by service.",
-        failure_impact="OTel spans get a default service.name (`unknown_service`). Hard to find in dashboards.",
+        failure_impact=(
+            "OTel spans default to `service.name=movate-runtime`. "
+            "Set to disambiguate multiple deployments in dashboards."
+        ),
         fix="export OTEL_SERVICE_NAME=mdk-prod",
     ),
 }

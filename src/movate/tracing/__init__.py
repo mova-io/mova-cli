@@ -1,25 +1,44 @@
 """Tracing layer: pluggable Tracer interface, env-driven selection.
 
-Selection precedence (lazy — optional deps only import when actually
-needed; tracing must never break a run):
+Two selectors, in precedence order:
 
-* ``MOVATE_TRACER=stdout`` → :class:`StdoutTracer` (debug / CI override).
-* ``MOVATE_TRACER=langfuse`` → :class:`LangfuseTracer` (or silent if
-  package/keys unusable).
-* ``MOVATE_TRACER=otel`` → :class:`OtelTracer` (or silent if
-  package/endpoint unusable).
-* ``MOVATE_TRACER=composite`` → fan out to every configured backend; if
-  none usable, silent.
-* Auto (env unset):
-  - both ``LANGFUSE_SECRET_KEY`` AND ``OTEL_EXPORTER_OTLP_ENDPOINT`` set →
-    :class:`CompositeTracer` over both.
-  - only ``LANGFUSE_SECRET_KEY`` set → :class:`LangfuseTracer`.
-  - only ``OTEL_EXPORTER_OTLP_ENDPOINT`` set → :class:`OtelTracer`.
-  - neither → :class:`SilentTracer` (no output; set ``MOVATE_TRACER=stdout``
-    to see JSON spans on stderr).
+1. ``MOVATE_TRACE_SINK`` (ADR 015) — the **deployment** sink selector. When
+   set, it wins and the sink is treated as *explicitly requested* (a missing
+   SDK is a hard, actionable error, not a silent fallback — the operator chose
+   this sink, so a misconfig should be loud). Values:
 
-Every backend fallback emits a single line on stderr explaining why so a
-production misconfig is debuggable from the logs.
+   * ``none``     → :class:`SilentTracer` (off; trace data goes nowhere).
+   * ``langfuse`` → :class:`LangfuseTracer` (rich LLM UI; self-hosted or Cloud).
+   * ``otlp``     → :class:`OtelTracer` over a generic OTLP exporter — points
+     at any OTLP backend: **Azure Monitor / Application Insights** (in-tenant,
+     ADR 015 D3), Grafana Tempo, SigNoz, Honeycomb, etc. Configured by the
+     standard OTel env vars (``OTEL_EXPORTER_OTLP_ENDPOINT`` /
+     ``OTEL_EXPORTER_OTLP_HEADERS`` / ``OTEL_EXPORTER_OTLP_PROTOCOL``).
+   * ``both``     → :class:`CompositeTracer` fanning out to Langfuse **and**
+     OTLP (LLM UI + ops APM at once).
+
+2. ``MOVATE_TRACER`` + auto-detect (legacy, **byte-for-byte unchanged**) —
+   used only when ``MOVATE_TRACE_SINK`` is **unset**:
+
+   * ``MOVATE_TRACER=stdout`` → :class:`StdoutTracer` (debug / CI override).
+   * ``MOVATE_TRACER=langfuse`` → :class:`LangfuseTracer` (or silent if
+     package/keys unusable).
+   * ``MOVATE_TRACER=otel`` → :class:`OtelTracer` (or silent if
+     package/endpoint unusable).
+   * ``MOVATE_TRACER=composite`` → fan out to every configured backend; if
+     none usable, silent.
+   * Auto (``MOVATE_TRACER`` also unset):
+     - both ``LANGFUSE_SECRET_KEY`` AND ``OTEL_EXPORTER_OTLP_ENDPOINT`` set →
+       :class:`CompositeTracer` over both.
+     - only ``LANGFUSE_SECRET_KEY`` set → :class:`LangfuseTracer`.
+     - only ``OTEL_EXPORTER_OTLP_ENDPOINT`` set → :class:`OtelTracer`.
+     - neither → :class:`SilentTracer` (no output; set ``MOVATE_TRACER=stdout``
+       to see JSON spans on stderr).
+
+Every backend fallback in the legacy path emits a single line on stderr
+explaining why so a production misconfig is debuggable from the logs. In the
+``MOVATE_TRACE_SINK`` path, a missing optional dependency raises
+:class:`TraceSinkError` so the deployment fails fast with an install hint.
 """
 
 from __future__ import annotations
@@ -42,13 +61,120 @@ __all__ = [
     "SilentTracer",
     "SpanCtx",
     "StdoutTracer",
+    "TraceSinkError",
     "Tracer",
     "build_tracer",
 ]
 
+# Valid values for the ADR-015 deployment sink selector.
+_VALID_SINKS = ("none", "langfuse", "otlp", "both")
+
+
+class TraceSinkError(Exception):
+    """An explicitly-requested ``MOVATE_TRACE_SINK`` could not be built.
+
+    Raised (not swallowed) when the operator selects a sink via
+    ``MOVATE_TRACE_SINK`` but its optional dependency is missing or its
+    config is unusable. Unlike the legacy ``MOVATE_TRACER`` auto-detect path
+    (which fails soft to silent/stdout so tracing never breaks a run), an
+    *explicit deployment choice* should fail loudly with an actionable hint.
+    """
+
 
 def build_tracer() -> Tracer:
-    """Auto-select a Tracer based on env vars."""
+    """Select a Tracer from the environment.
+
+    ``MOVATE_TRACE_SINK`` (ADR 015) wins when set; otherwise the legacy
+    ``MOVATE_TRACER`` + auto-detect path runs, byte-for-byte unchanged.
+    """
+    sink = os.environ.get("MOVATE_TRACE_SINK", "").strip().lower()
+    if sink:
+        return _build_from_sink(sink)
+
+    return _build_legacy()
+
+
+# ---------------------------------------------------------------------------
+# MOVATE_TRACE_SINK — deployment sink selector (ADR 015). Explicit choice →
+# fail loud on a missing dep so a misconfigured deploy is obvious.
+# ---------------------------------------------------------------------------
+
+
+def _build_from_sink(sink: str) -> Tracer:
+    if sink not in _VALID_SINKS:
+        raise TraceSinkError(
+            f"MOVATE_TRACE_SINK={sink!r} is not recognized; valid values: {', '.join(_VALID_SINKS)}"
+        )
+
+    if sink == "none":
+        return SilentTracer()
+
+    if sink == "langfuse":
+        return _require_langfuse()
+
+    if sink == "otlp":
+        return _require_otel()
+
+    # sink == "both": fan out to Langfuse + OTLP. Both are required — a
+    # half-configured dual sink should fail loud rather than silently drop one.
+    return CompositeTracer([_require_langfuse(), _require_otel()])
+
+
+def _require_langfuse() -> Tracer:
+    """Build the Langfuse tracer or raise an actionable :class:`TraceSinkError`."""
+    try:
+        from movate.tracing.langfuse import (  # noqa: PLC0415 - lazy by design
+            LangfuseTracer,
+            LangfuseUnavailableError,
+        )
+    except ImportError as exc:  # pragma: no cover - tracer module has no deps
+        raise TraceSinkError(f"langfuse tracer module failed to import: {exc}") from exc
+    try:
+        return LangfuseTracer()
+    except LangfuseUnavailableError as exc:
+        raise TraceSinkError(
+            "MOVATE_TRACE_SINK=langfuse but Langfuse is unavailable: "
+            f"{exc}. Install with `uv tool install --reinstall movate-cli "
+            "--extra langfuse` and set LANGFUSE_SECRET_KEY / LANGFUSE_PUBLIC_KEY."
+        ) from exc
+
+
+def _require_otel() -> Tracer:
+    """Build the OTLP tracer or raise an actionable :class:`TraceSinkError`.
+
+    The generic OTLP exporter is configured via the standard OTel env vars
+    (``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``OTEL_EXPORTER_OTLP_HEADERS`` /
+    ``OTEL_EXPORTER_OTLP_PROTOCOL``). For Azure Monitor / Application Insights,
+    point ``OTEL_EXPORTER_OTLP_ENDPOINT`` at the App Insights OTLP ingestion
+    endpoint and supply the auth header via ``OTEL_EXPORTER_OTLP_HEADERS`` —
+    no Azure-specific SDK required (ADR 001 portability).
+    """
+    try:
+        from movate.tracing.otel import (  # noqa: PLC0415 - lazy by design
+            OtelTracer,
+            OtelUnavailableError,
+        )
+    except ImportError as exc:  # pragma: no cover - tracer module has no deps
+        raise TraceSinkError(f"otel tracer module failed to import: {exc}") from exc
+    try:
+        return OtelTracer()
+    except OtelUnavailableError as exc:
+        raise TraceSinkError(
+            "MOVATE_TRACE_SINK=otlp but the OTLP exporter is unavailable: "
+            f"{exc}. Install the OTel extra (`uv sync --extra otel` / "
+            "`pip install 'mdk[otel]'`) and set OTEL_EXPORTER_OTLP_ENDPOINT "
+            "(e.g. your Azure Monitor / App Insights OTLP ingestion endpoint)."
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Legacy MOVATE_TRACER + auto-detect path — preserved byte-for-byte for
+# backward compatibility (unchanged when MOVATE_TRACE_SINK is unset).
+# ---------------------------------------------------------------------------
+
+
+def _build_legacy() -> Tracer:
+    """Auto-select a Tracer based on env vars (legacy ``MOVATE_TRACER`` path)."""
     explicit = os.environ.get("MOVATE_TRACER", "").strip().lower()
 
     if explicit == "stdout":
