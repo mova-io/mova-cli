@@ -25,6 +25,7 @@ from movate.core.models import (
     EntityWithScore,
     ErrorInfo,
     EvalRecord,
+    EvalSchedule,
     FailureRecord,
     FeedbackRecord,
     JobKind,
@@ -411,6 +412,29 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name ON agent_bundles(tenant_id, name)",
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created "
     "ON agent_bundles(tenant_id, name, created_at DESC)",
+    # ADR 016 D2: continuous-eval schedules. One row per (tenant, agent) with
+    # a cadence; the scheduler tick enqueues EVAL jobs for due rows. Additive
+    # + idempotent (CREATE TABLE IF NOT EXISTS) — default-off, no backfill.
+    """
+    CREATE TABLE IF NOT EXISTS eval_schedules (
+        tenant_id            TEXT NOT NULL,
+        agent                TEXT NOT NULL,
+        cadence_seconds      INTEGER NOT NULL,
+        enabled              INTEGER NOT NULL,
+        mock                 INTEGER NOT NULL,
+        runs                 INTEGER NOT NULL,
+        gate_mode            TEXT NOT NULL,
+        gate                 REAL NOT NULL,
+        objective            TEXT,
+        regression_tolerance REAL NOT NULL,
+        baseline_id          TEXT,
+        notify_email         TEXT,
+        created_by           TEXT,
+        created_at           TEXT NOT NULL,
+        last_enqueued_at     TEXT,
+        PRIMARY KEY (tenant_id, agent)
+    )
+    """,
 ]
 
 
@@ -729,6 +753,96 @@ class SqliteProvider:
         async with self._db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Eval schedules (ADR 016 D2)
+    # ------------------------------------------------------------------
+
+    async def save_eval_schedule(self, schedule: EvalSchedule) -> None:
+        # Upsert on the (tenant_id, agent) primary key.
+        await self._db.execute(
+            """
+            INSERT INTO eval_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, agent) DO UPDATE SET
+                cadence_seconds = excluded.cadence_seconds,
+                enabled = excluded.enabled,
+                mock = excluded.mock,
+                runs = excluded.runs,
+                gate_mode = excluded.gate_mode,
+                gate = excluded.gate,
+                objective = excluded.objective,
+                regression_tolerance = excluded.regression_tolerance,
+                baseline_id = excluded.baseline_id,
+                notify_email = excluded.notify_email,
+                created_by = excluded.created_by,
+                created_at = excluded.created_at,
+                last_enqueued_at = excluded.last_enqueued_at
+            """,
+            (
+                schedule.tenant_id,
+                schedule.agent,
+                schedule.cadence_seconds,
+                int(schedule.enabled),
+                int(schedule.mock),
+                schedule.runs,
+                schedule.gate_mode,
+                schedule.gate,
+                schedule.objective,
+                schedule.regression_tolerance,
+                schedule.baseline_id,
+                schedule.notify_email,
+                schedule.created_by,
+                schedule.created_at.isoformat(),
+                schedule.last_enqueued_at.isoformat() if schedule.last_enqueued_at else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_eval_schedule(self, agent: str, *, tenant_id: str) -> EvalSchedule | None:
+        async with self._db.execute(
+            "SELECT * FROM eval_schedules WHERE agent = ? AND tenant_id = ? LIMIT 1",
+            (agent, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_eval_schedule(row) if row else None
+
+    async def list_eval_schedules(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[EvalSchedule]:
+        sql = "SELECT * FROM eval_schedules"
+        params: list[object] = []
+        if tenant_id is not None:
+            sql += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_eval_schedule(r) for r in rows]
+
+    async def delete_eval_schedule(self, agent: str, *, tenant_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM eval_schedules WHERE agent = ? AND tenant_id = ?",
+            (agent, tenant_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def touch_eval_schedule(
+        self,
+        agent: str,
+        *,
+        tenant_id: str,
+        last_enqueued_at: datetime,
+    ) -> None:
+        await self._db.execute(
+            "UPDATE eval_schedules SET last_enqueued_at = ? WHERE agent = ? AND tenant_id = ?",
+            (last_enqueued_at.isoformat(), agent, tenant_id),
+        )
+        await self._db.commit()
 
     # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1)
@@ -2013,6 +2127,28 @@ def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
         sample_count=row["sample_count"],
         total_cost_usd=row["total_cost_usd"],
         created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_eval_schedule(row: aiosqlite.Row) -> EvalSchedule:
+    return EvalSchedule(
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        cadence_seconds=row["cadence_seconds"],
+        enabled=bool(row["enabled"]),
+        mock=bool(row["mock"]),
+        runs=row["runs"],
+        gate_mode=row["gate_mode"],
+        gate=row["gate"],
+        objective=row["objective"],
+        regression_tolerance=row["regression_tolerance"],
+        baseline_id=row["baseline_id"],
+        notify_email=row["notify_email"],
+        created_by=row["created_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        last_enqueued_at=(
+            datetime.fromisoformat(row["last_enqueued_at"]) if row["last_enqueued_at"] else None
+        ),
     )
 
 

@@ -1751,6 +1751,82 @@ class EvalRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class EvalSchedule(BaseModel):
+    """A per-(tenant, agent) cadence for continuous, scheduled eval (ADR 016 D2).
+
+    Additive + default-off: nothing is created unless an operator runs
+    ``mdk eval-schedule set``. When a schedule exists, an external cron
+    (a Container Apps Job on Azure; any cron locally) periodically invokes
+    the **tick** entrypoint (``mdk eval-scheduler-tick``), which finds
+    schedules whose cadence has elapsed and enqueues a ``JobKind.EVAL``
+    job for each — reusing the existing eval-as-job path. There is **no
+    in-process timer daemon**; the tick is a stateless one-shot driven by
+    an external scheduler.
+
+    The cadence is an **interval in seconds** (``cadence_seconds``) — a
+    portable primitive that any cron can satisfy (run the tick every N
+    minutes; the tick only enqueues schedules that are actually due).
+    A richer cron-expression cadence is a documented follow-up; the
+    interval covers the D2 "run on a cadence" requirement without a new
+    dependency.
+
+    ``(tenant_id, agent)`` is unique — one active schedule per agent per
+    tenant. Re-running ``set`` upserts (overwrites) the row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    agent: str
+    """Agent name (``agent.yaml`` ``name``). Paired with ``tenant_id`` as
+    the unique schedule key."""
+    cadence_seconds: int = Field(ge=1)
+    """How often, in seconds, an eval should be enqueued for this agent.
+    The tick enqueues a job when ``now - last_enqueued_at >= cadence_seconds``
+    (or when ``last_enqueued_at`` is null — first tick). Keeping it an
+    interval (not a cron expression) makes the tick trivially portable and
+    idempotent."""
+    enabled: bool = True
+    """Soft on/off. A disabled schedule is retained (history + quick
+    re-enable) but never enqueues. ``mdk eval-schedule clear`` deletes
+    the row entirely."""
+    # ---- eval kickoff config (mirrors EvalSubmission / the EVAL job input) ----
+    mock: bool = False
+    """Use the deterministic MockProvider for the scheduled eval — a cheap
+    smoke cadence that spends no tokens. Cost-aware default-off; flip on
+    for high-frequency canaries."""
+    runs: int = Field(default=1, ge=1, le=10)
+    """Runs per case for the scheduled eval (3+ defeats LLM-judge variance)."""
+    gate_mode: str = "mean"
+    """N-run aggregation: ``mean`` | ``min`` | ``p10``."""
+    gate: float = Field(default=0.7, ge=0.0, le=1.0)
+    """Per-case score required to pass — carried onto the enqueued job."""
+    objective: str | None = None
+    """Optional objective id to filter cases by (sampling a subset of the
+    dataset between full runs — cost-aware)."""
+    # ---- drift detection knobs ----
+    regression_tolerance: float = Field(default=0.05, ge=0.0, le=1.0)
+    """Allowable mean_score / pass_rate drop vs. the baseline before the
+    result is flagged as drift. Slightly loose by default (0.05) to absorb
+    LLM-judge noise on the scheduled path; tighten for critical agents."""
+    baseline_id: str | None = None
+    """Optional pinned baseline ``eval_id`` to diff scheduled runs against.
+    When null, drift compares against the *prior* eval for this agent
+    (the most recent ``EvalRecord`` before the new one)."""
+    notify_email: str | None = None
+    """Where to send a drift alert when a scheduled eval regresses. When
+    null, the alert is still emitted as a structured log + the console
+    backend; SMTP delivery needs an address."""
+    created_by: str | None = None
+    """Auth identity that created the schedule (ADR 013), or ``None`` for
+    a local/CLI write."""
+    created_at: datetime = Field(default_factory=_now)
+    last_enqueued_at: datetime | None = None
+    """When the tick last enqueued a job for this schedule. Drives the
+    due-check + idempotency (no double-enqueue inside one cadence window).
+    Null until the first enqueue."""
+
+
 class BenchModelResult(BaseModel):
     """Per-model row inside a :class:`BenchRecord`.
 

@@ -26,6 +26,7 @@ from movate.core.models import (
     RunRequest,
     WorkflowStatus,
 )
+from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.storage.base import StorageProvider
@@ -67,6 +68,7 @@ class WorkerDispatch:
         agents: list[AgentBundle] | None = None,
         workflows: dict[str, WorkflowGraph] | None = None,
         use_mock_for_eval: bool = False,
+        notifier: NotificationDispatcher | None = None,
     ) -> None:
         self._storage = storage
         self._executor = executor
@@ -77,6 +79,14 @@ class WorkerDispatch:
         self._agents_fallback: list[AgentBundle] = list(agents or [])
         self._workflows: dict[str, WorkflowGraph] = workflows or {}
         self._use_mock_for_eval = use_mock_for_eval
+        self._notifier = notifier
+        """Optional :class:`NotificationDispatcher` for drift alerts (ADR
+        016 D2). When an eval job completes, the dispatch compares the new
+        EvalRecord to a baseline; on regression it logs ``eval_drift_detected``
+        and (if a notifier is wired) dispatches an alert. ``None`` → the
+        structured log still fires, no email/console alert. Backwards
+        compatible: existing callers that don't pass a notifier are
+        unaffected, and non-scheduled evals without a baseline never drift."""
         """When True, eval jobs always use MockProvider regardless of the
         job's ``mock`` flag. Useful in test environments where real LLM
         calls would be expensive. The app sets this from the server's
@@ -251,6 +261,14 @@ class WorkerDispatch:
         record = summary.to_record(tenant_id=job.tenant_id)
         await self._storage.save_eval(record)
 
+        # ADR 016 D2 — continuous-eval drift check. Runs when the eval job
+        # asks for it: either a scheduled eval (``scheduled=True``, set by
+        # the scheduler tick) or any eval that pinned a ``baseline_id``.
+        # Ad-hoc evals with neither carry no baseline intent → no drift
+        # check, byte-for-byte the old behaviour. Best-effort: a drift /
+        # alert failure never changes the job's SUCCESS outcome.
+        await self._maybe_check_drift(job, record)
+
         # Store eval_id in result_run_id — field is a generic "result
         # identifier"; the API contract documents this mapping for EVAL jobs.
         return DispatchOutcome(
@@ -258,6 +276,51 @@ class WorkerDispatch:
             result_run_id=record.eval_id,
             error=None,
         )
+
+    async def _maybe_check_drift(self, job: JobRecord, record: Any) -> None:
+        """Compare a fresh EvalRecord to a baseline and alert on regression.
+
+        Wrapped in a broad try/except: drift detection + alerting are a
+        courtesy layer over a SUCCESS eval; nothing here may flip the job's
+        outcome or raise into the worker loop.
+        """
+        from movate.core.drift import alert_on_drift, detect_drift, select_baseline  # noqa: PLC0415
+
+        cfg = job.input
+        scheduled = bool(cfg.get("scheduled", False))
+        baseline_id = cfg.get("baseline_id") or None
+        if not scheduled and baseline_id is None:
+            return  # ad-hoc eval, no baseline intent — nothing to diff
+
+        try:
+            tolerance = float(cfg.get("regression_tolerance", 0.05))
+            # The agent's eval history (newest-first); includes the row we
+            # just saved, which select_baseline excludes by eval_id.
+            history = await self._storage.list_evals(
+                tenant_id=job.tenant_id,
+                agent=record.agent,
+                limit=50,
+            )
+            baseline = select_baseline(
+                current=record,
+                candidates=history,
+                baseline_id=baseline_id,
+            )
+            result = detect_drift(record, baseline, tolerance=tolerance)
+            logger.info("eval_drift_check %s", result.summary())
+            await alert_on_drift(
+                result,
+                notifier=self._notifier,
+                notify_email=cfg.get("notify_email") or job.notify_email,
+            )
+        except Exception:
+            logger.warning(
+                "eval_drift_check_failed job_id=%s agent=%s — eval result is "
+                "unchanged; this is the drift/alert path only",
+                job.job_id,
+                record.agent,
+                exc_info=True,
+            )
 
     async def _execute_bench(self, job: JobRecord) -> DispatchOutcome:
         """Run an async multi-model bench job (BACKLOG #64).
