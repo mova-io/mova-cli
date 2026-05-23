@@ -32,6 +32,7 @@ import movate
 from movate.core.auth import mint_api_key
 from movate.core.loader import AgentBundle
 from movate.core.models import (
+    AgentBundleRecord,
     ApiKeyEnv,
     BenchRecord,
     EvalRecord,
@@ -47,6 +48,14 @@ from movate.runtime.agent_creation import (
     split_skills_from_bundle,
     unzip_bundle,
     wizard_to_bundle_files,
+)
+from movate.runtime.agent_resolver import (
+    bundle_files_from_dir,
+    import_filesystem_agents,
+    resolve_agent_bundle,
+)
+from movate.runtime.agent_resolver import (
+    content_hash as _bundle_content_hash,
 )
 from movate.runtime.errors import auth_required, forbidden, not_found
 from movate.runtime.middleware import AuthContext, make_auth_dependency
@@ -255,6 +264,52 @@ async def _collect_bundle_files(
         files[canonical] = await kb_upload.read()
 
     return files
+
+
+async def _dual_write_agent_to_registry(
+    storage: StorageProvider,
+    agent_dir: Path,
+    *,
+    tenant_id: str,
+    version: str,
+    created_by: str | None,
+) -> None:
+    """Dual-write a freshly-persisted agent dir into the durable registry.
+
+    ADR 014 D2/D5: ``POST/PUT /api/v1/agents`` keep writing to the
+    filesystem (``persist_bundle`` — the local-serve path + back-compat),
+    AND now also publish the bundle as a versioned, tenant-scoped row so
+    every pod (the async worker, other replicas) resolves it. The two
+    writes are additive; the FS write is the source of truth for local
+    ``mdk serve``, the registry row for the deployed multi-pod runtime.
+
+    Reads the bundle files back off disk (the files ``persist_bundle``
+    just wrote) into the ``files`` dict the registry stores. Best-effort:
+    a registry write failure must NOT fail the publish (the FS copy is
+    still live and the worker's filesystem-fallback / a later import
+    seed will pick it up) — so it's logged, not raised.
+    """
+    try:
+        files = bundle_files_from_dir(agent_dir)
+        record = AgentBundleRecord(
+            name=agent_dir.name,
+            tenant_id=tenant_id,
+            version=version,
+            created_by=created_by,
+            content_hash=_bundle_content_hash(files),
+            files=files,
+        )
+        await storage.save_agent_bundle(record)
+    except Exception:
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning(
+            "agent_registry_dual_write_failed name=%s tenant_id=%s version=%s",
+            agent_dir.name,
+            tenant_id,
+            version,
+            exc_info=True,
+        )
 
 
 def _agent_creation_error_code(status_code: int) -> str:
@@ -564,6 +619,7 @@ def build_app(
     rate_limit_per_minute: int | None = 60,
     cors_allowed_origins: list[str] | None = None,
     github_client: object | None = None,
+    import_tenant_id: str | None = None,
 ) -> FastAPI:
     """Build the FastAPI app bound to ``storage`` + ``agents``.
 
@@ -583,13 +639,60 @@ def build_app(
     ``state.agents`` / ``state.rate_limiter`` to swap mid-test if
     you really need to).
     """
+    # One-time filesystem → registry import (ADR 014 D5), wired as a
+    # lifespan startup step. On boot, if an import tenant is configured,
+    # seed any filesystem-scanned agents not yet in the durable registry
+    # so a deployed runtime's pre-baked agents become registry-resolvable
+    # by every pod (incl. the worker). Idempotent — already-present
+    # (name, version) rows are skipped — so it's safe on every boot.
+    # Guarded: skipped entirely when no import tenant is set (local
+    # ``mdk serve`` without durable storage), and never raises (a seed
+    # failure must not block the runtime from coming up — the FS fallback
+    # still serves those agents).
+    from collections.abc import AsyncIterator  # noqa: PLC0415
+    from contextlib import asynccontextmanager  # noqa: PLC0415
+
+    @asynccontextmanager
+    async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        import_tenant: str | None = app_.state.import_tenant_id
+        fs_agents: list[AgentBundle] = app_.state.agents
+        if import_tenant and fs_agents:
+            try:
+                count = await import_filesystem_agents(storage, fs_agents, tenant_id=import_tenant)
+                if count:
+                    import logging  # noqa: PLC0415
+
+                    logging.getLogger(__name__).info(
+                        "agent_registry_seeded count=%d tenant_id=%s",
+                        count,
+                        import_tenant,
+                    )
+            except Exception:
+                import logging  # noqa: PLC0415
+
+                logging.getLogger(__name__).warning(
+                    "agent_registry_seed_failed tenant_id=%s",
+                    import_tenant,
+                    exc_info=True,
+                )
+        yield
+
     app = FastAPI(
         title="movate",
         version=movate.__version__,
         description="Declarative platform for building and running AI agents.",
+        lifespan=_lifespan,
     )
     app.state.storage = storage
     app.state.agents = agents or []
+    # Tenant to seed the durable registry with filesystem agents on first
+    # boot (ADR 014 D5 one-time import). ``None`` (the default + local
+    # ``mdk serve``) skips the import entirely — the resolver's
+    # filesystem-fallback already serves those agents, so seeding is a
+    # convenience for deployed multi-pod runtimes that want FS agents to
+    # become registry-resolvable. Env fallback lets a deploy set it
+    # without a code change.
+    app.state.import_tenant_id = import_tenant_id or os.environ.get("MDK_AGENTS_IMPORT_TENANT_ID")
     # Where new agents (POST /api/v1/agents, item 76) land on disk.
     # None means the endpoint returns 503 — the runtime was built
     # without an agents_path and can't persist. mdk serve always
@@ -1219,11 +1322,18 @@ def build_app(
         # one-level scan.
         request.app.state.agents = scan_agents(agents_path)
 
-        # Tenant attribution is logged for the audit trail. Future
-        # per-tenant filesystem isolation (v0.8) reads this back.
-        # Reference ctx so the param isn't unused — and we record it
-        # for the future audit log.
-        _ = ctx.tenant_id
+        # Dual-write into the durable registry (ADR 014 D2): the FS write
+        # above keeps local `mdk serve` working; the registry row makes
+        # the agent resolvable by the async worker + other replicas
+        # (closes #109). Tenant-scoped from the auth context.
+        store: StorageProvider = request.app.state.storage
+        await _dual_write_agent_to_registry(
+            store,
+            result.agent_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.bundle.spec.version,
+            created_by=ctx.api_key_id,
+        )
 
         spec = result.bundle.spec
         return AgentCreatedView(
@@ -1293,7 +1403,16 @@ def build_app(
         # see the new bundle immediately.
         request.app.state.agents = scan_agents(agents_path)
 
-        _ = ctx.tenant_id  # future per-tenant audit log entry
+        # Dual-write into the durable registry (ADR 014 D2) — same as the
+        # multipart POST so wizard-created agents are worker-resolvable.
+        store: StorageProvider = request.app.state.storage
+        await _dual_write_agent_to_registry(
+            store,
+            result.agent_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.bundle.spec.version,
+            created_by=ctx.api_key_id,
+        )
 
         spec = result.bundle.spec
         return AgentCreatedView(
@@ -1599,6 +1718,22 @@ def build_app(
 
         result = persist_bundle(agent_files, agents_path=agents_path, on_conflict="replace")
         request.app.state.agents = scan_agents(agents_path)
+
+        # Dual-write the updated bundle into the durable registry (ADR
+        # 014 D2). Each publish writes a new immutable (name, version)
+        # row; if the version was bumped this is a fresh row that the
+        # worker resolves as the new latest, if not it's a no-op
+        # (save_agent_bundle is idempotent-ish via content_hash and the
+        # backends tolerate the re-publish). Best-effort — never fails
+        # the update.
+        store: StorageProvider = request.app.state.storage
+        await _dual_write_agent_to_registry(
+            store,
+            result.agent_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.bundle.spec.version,
+            created_by=ctx.api_key_id,
+        )
 
         spec = result.bundle.spec
         return AgentUpdatedView(
@@ -2421,12 +2556,15 @@ def build_app(
         * **500** — (inline mode only) execution failure surfaces
           here; the RunView's ``error`` field carries the typed info
         """
+        store: StorageProvider = request.app.state.storage
+
+        # Resolve registry-first (so an agent published on another pod is
+        # runnable here), filesystem-fallback (local `mdk serve --agents`
+        # + the empty-registry tests). Tenant-scoped via the auth context.
         agents: list[AgentBundle] = request.app.state.agents
-        bundle = next((b for b in agents if b.spec.name == name), None)
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
         if bundle is None:
             raise not_found("agent", name)
-
-        store: StorageProvider = request.app.state.storage
 
         if wait:
             # Inline mode — same Executor stack the worker uses.

@@ -132,11 +132,13 @@ async def test_dispatch_unknown_agent_is_terminal_error() -> None:
     assert outcome.error is not None
     assert outcome.error["type"] == "unknown_agent"
     assert "ghost" in outcome.error["message"]
-    # Item 118: hint should point callers at the cross-pod gap (item 109)
-    # and the ?wait=true workaround (item 110) so they stop debugging
-    # "did my agent actually get created?" — it did, just not here.
+    # ADR 014 D2 closed the old cross-pod sync gap (#109): the worker now
+    # resolves agents from the durable registry, so a miss means the agent
+    # genuinely isn't published for this tenant — NOT a sync lag. The hint
+    # is still present and now points at "publish it / check the tenant"
+    # rather than the obsolete ?wait=true workaround.
     assert outcome.error["hint"] is not None
-    assert "?wait=true" in outcome.error["hint"]
+    assert "registry" in outcome.error["hint"]
 
 
 @pytest.mark.unit

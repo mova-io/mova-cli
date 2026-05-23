@@ -27,6 +27,7 @@ from movate.core.models import (
     WorkflowStatus,
 )
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
+from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.storage.base import StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,10 @@ class WorkerDispatch:
         self._storage = storage
         self._executor = executor
         self._agents: dict[str, AgentBundle] = {b.spec.name: b for b in (agents or [])}
+        # The filesystem-scanned bundles double as the resolver's fallback
+        # list — kept as a plain list so resolve_agent_bundle can scan it
+        # when the durable registry has no row for the job's tenant.
+        self._agents_fallback: list[AgentBundle] = list(agents or [])
         self._workflows: dict[str, WorkflowGraph] = workflows or {}
         self._use_mock_for_eval = use_mock_for_eval
         """When True, eval jobs always use MockProvider regardless of the
@@ -95,29 +100,44 @@ class WorkerDispatch:
             retryable=False,
         )
 
+    async def _resolve_bundle(self, job: JobRecord) -> AgentBundle | None:
+        """Resolve ``job.target`` to a runnable bundle for ``job.tenant_id``.
+
+        Registry-first (so the worker sees what the API published —
+        the #109 fix), with the filesystem-scanned bundles as the
+        fallback (local ``mdk worker --agents ./dir`` + the existing
+        tests, which carry no durable registry row). The job's
+        ``tenant_id`` scopes the registry read so the worker reads the
+        same tenant the API published under.
+        """
+        return await resolve_agent_bundle(
+            self._storage,
+            job.target,
+            tenant_id=job.tenant_id,
+            fallback=self._agents_fallback,
+        )
+
     async def _execute_agent(self, job: JobRecord) -> DispatchOutcome:
-        bundle = self._agents.get(job.target)
+        bundle = await self._resolve_bundle(job)
         if bundle is None:
-            # Known recurring failure: in multi-pod ACA deploys the
-            # worker pod's filesystem doesn't see agents created via
-            # `POST /api/v1/agents` on the API pod (cross-pod sync gap,
-            # tracked as BACKLOG item 109). The runbook workaround is
-            # `?wait=true` on the run endpoint (item 110), which
-            # sidesteps the worker entirely. Surface that pointer in
-            # the error so callers stop debugging "did my agent
-            # actually get created?" — the agent IS there, just not on
-            # this pod.
+            # The agent resolved in neither the durable registry (for
+            # this job's tenant) nor the worker's local filesystem
+            # fallback — so it genuinely isn't published. ADR 014 D2
+            # closed the old cross-pod sync gap (BACKLOG #109): an agent
+            # created via POST /api/v1/agents now lands in the shared
+            # registry and the worker resolves it directly. A miss here
+            # means the name/tenant is wrong or the agent was never
+            # published, not a sync lag.
             return _error(
                 "unknown_agent",
-                f"agent {job.target!r} not registered on this worker",
+                f"agent {job.target!r} not registered for tenant {job.tenant_id!r}",
                 retryable=False,
                 hint=(
-                    "this worker pod has no bundle for the requested agent. "
-                    "if you just created it via POST /api/v1/agents, the "
-                    "bundle is on the API pod's filesystem but not yet "
-                    "synced to workers (cross-pod sync gap — see BACKLOG "
-                    "item 109). until that lands, retry the run with "
-                    "`?wait=true` to execute inline on the API pod (item 110)."
+                    "no bundle for this agent in the durable registry "
+                    "(scoped to the job's tenant) nor on the worker's "
+                    "filesystem. confirm the agent was published via "
+                    "POST /api/v1/agents under the same tenant, and that "
+                    "the name matches."
                 ),
             )
         request = RunRequest(agent=job.target, input=job.input)
@@ -182,11 +202,11 @@ class WorkerDispatch:
         from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
 
-        bundle = self._agents.get(job.target)
+        bundle = await self._resolve_bundle(job)
         if bundle is None:
             return _error(
                 "unknown_agent",
-                f"agent {job.target!r} not registered on this worker",
+                f"agent {job.target!r} not registered for tenant {job.tenant_id!r}",
                 retryable=False,
             )
 
@@ -255,11 +275,11 @@ class WorkerDispatch:
         from movate.core.models import JudgeConfig, JudgeMethod, ModelConfig  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
 
-        bundle = self._agents.get(job.target)
+        bundle = await self._resolve_bundle(job)
         if bundle is None:
             return _error(
                 "unknown_agent",
-                f"agent {job.target!r} not registered on this worker",
+                f"agent {job.target!r} not registered for tenant {job.tenant_id!r}",
                 retryable=False,
             )
 
