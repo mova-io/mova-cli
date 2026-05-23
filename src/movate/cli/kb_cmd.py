@@ -469,6 +469,82 @@ def _resolve_target_bearer(target: str) -> tuple[str, object, str, str]:
     return target_name, target_cfg, base_url, api_key
 
 
+def _send_remote(
+    *,
+    method: str,
+    endpoint: str,
+    api_key: str,
+    base_url: str,
+    clean_params: dict[str, Any] | None,
+    json: dict[str, Any] | None,
+    files: list[tuple[str, tuple[str, bytes, str]]] | None,
+    timeout_s: float,
+) -> Any:
+    """Issue one authenticated httpx request, returning the raw response.
+
+    Builds a fresh request from the supplied ``api_key`` on every call so
+    the 401 auto-recovery retry (which re-resolves a refreshed bearer) is
+    a clean second attempt — the body/params are re-serialised, never
+    re-used from a half-consumed first request.
+
+    A network-layer failure prints the unreachable-target message and
+    exits 2, exactly as the original inline ``httpx`` block did. Returns
+    the ``httpx.Response`` so the caller owns status-code handling.
+    """
+    import httpx  # noqa: PLC0415
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(timeout_s)) as client:
+            return client.request(
+                method.upper(),
+                endpoint,
+                params=clean_params or None,
+                json=json,
+                files=files,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        err_console.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+
+def _attempt_kb_auto_recovery(target_name: str) -> bool:
+    """Best-effort, one-shot programmatic key refresh for a ``--target``.
+
+    Reuses :func:`movate.cli.auth.refresh_runtime_key_inline` (the same
+    primitive ``mdk deploy``'s 401 handler uses) to mint + persist a fresh
+    bearer inside the target's Azure Container App. ``refresh_runtime_key_inline``
+    writes the new key to the on-disk credential store but does NOT touch
+    the running process's env, while :func:`_resolve_target_bearer` reads
+    the bearer from ``os.environ[key_env]``. So we mirror the freshly-minted
+    key into that env var here, in-process, so the immediate re-resolve on
+    the retry path picks up the new bearer rather than the rejected one.
+
+    Returns ``True`` when a fresh key was minted + saved, ``False`` on any
+    :class:`RefreshRuntimeKeyError` (non-Azure / unknown target, ``az``
+    absent, exec failed). Never raises and never logs the minted key —
+    recovery is silent and best-effort, so a failed refresh falls straight
+    through to today's manual hint.
+    """
+    import os  # noqa: PLC0415
+
+    from movate.cli.auth import (  # noqa: PLC0415
+        RefreshRuntimeKeyError,
+        refresh_runtime_key_inline,
+    )
+
+    try:
+        minted_key, env_var = refresh_runtime_key_inline(target_name)
+    except RefreshRuntimeKeyError:
+        return False
+    # Propagate the fresh key into the process env so the retry's
+    # _resolve_target_bearer re-read sees it (the store write alone
+    # wouldn't — the autoloader only runs at startup). Never logged.
+    os.environ[env_var] = minted_key
+    return True
+
+
 def _remote_request(
     *,
     method: str,
@@ -491,7 +567,11 @@ def _remote_request(
     Translates the standard runtime failure surface into actionable CLI
     errors, exiting with code 2:
 
-    * **401** — bearer rejected → hint to refresh the runtime key.
+    * **401** — attempt **one** guarded auto-recovery (ADR 012a): refresh
+      the runtime key via :func:`_attempt_kb_auto_recovery` and retry the
+      request exactly once with the fresh bearer. A second 401, or a
+      refresh that couldn't run, falls back to today's behavior — the
+      manual hint + exit 2. Never loops, never refreshes more than once.
     * **404** — agent not on the target → hint to deploy it first.
     * any other non-2xx → raw status + truncated body.
     * network error → unreachable-target message.
@@ -501,37 +581,51 @@ def _remote_request(
     ``json`` is sent as the request body; ``files`` is a multipart
     upload list (only one of ``json`` / ``files`` should be set).
     """
-    import httpx  # noqa: PLC0415
-
     target_name, target_cfg, base_url, api_key = _resolve_target_bearer(target)
     endpoint = f"{base_url}{path}"
-    headers = {"Authorization": f"Bearer {api_key}"}
 
     # Drop None-valued query params so an unset ``--source`` doesn't
     # serialise as ``?source=`` (which the runtime would treat as the
     # empty-string source filter rather than "no filter").
     clean_params = {k: v for k, v in (params or {}).items() if v is not None}
 
-    try:
-        with httpx.Client(timeout=httpx.Timeout(timeout_s)) as client:
-            resp = client.request(
-                method.upper(),
-                endpoint,
-                params=clean_params or None,
-                json=json,
-                files=files,
-                headers=headers,
-            )
-    except httpx.HTTPError as exc:
-        err_console.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
-        raise typer.Exit(code=2) from None
+    resp = _send_remote(
+        method=method,
+        endpoint=endpoint,
+        api_key=api_key,
+        base_url=base_url,
+        clean_params=clean_params,
+        json=json,
+        files=files,
+        timeout_s=timeout_s,
+    )
 
     if resp.status_code == _HTTP_UNAUTHORIZED:
-        err_console.print(
-            f"[red]✗[/red] runtime rejected the bearer (${target_cfg.key_env}). "  # type: ignore[attr-defined]
-            f"Refresh it: [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
-        )
-        raise typer.Exit(code=2)
+        # ADR 012a / D1: one guarded auto-refresh + retry. If the target is
+        # refresh-capable (Azure Container App we can `az exec` against) the
+        # refresh mints + persists a fresh key; we re-resolve the bearer and
+        # retry exactly once. A non-Azure / unknown target raises inside
+        # refresh and we skip straight to the manual hint. The single-retry
+        # rule is the durability guard: a refreshed key against an ephemeral
+        # SQLite backend immediately 401s again → fatal, no probe needed.
+        if _attempt_kb_auto_recovery(target_name):
+            _target_name, _target_cfg, _base_url, new_api_key = _resolve_target_bearer(target)
+            resp = _send_remote(
+                method=method,
+                endpoint=endpoint,
+                api_key=new_api_key,
+                base_url=base_url,
+                clean_params=clean_params,
+                json=json,
+                files=files,
+                timeout_s=timeout_s,
+            )
+        if resp.status_code == _HTTP_UNAUTHORIZED:
+            err_console.print(
+                f"[red]✗[/red] runtime rejected the bearer (${target_cfg.key_env}). "  # type: ignore[attr-defined]
+                f"Refresh it: [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
+            )
+            raise typer.Exit(code=2)
     if resp.status_code == _HTTP_NOT_FOUND:
         err_console.print(
             f"[red]✗[/red] agent [bold]{agent}[/bold] not found on "
