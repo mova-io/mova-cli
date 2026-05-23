@@ -2129,6 +2129,107 @@ class JobSchedule(BaseModel):
         return v
 
 
+class Trigger(BaseModel):
+    """A registered inbound event/webhook trigger (ADR 017 D2).
+
+    The trigger sibling of :class:`JobSchedule`: both register a *standing*
+    way to enqueue an agent/workflow job into the existing queue, so the run
+    is observable + retryable for free (it becomes a normal job). The
+    scheduler fires on a cron cadence; a trigger fires on an **inbound
+    event** — an external system (a ticketing tool, a CI webhook, a queue
+    consumer) POSTs an event to a stable movate URL and movate enqueues a
+    run ("process this incoming ticket").
+
+    Crucially the external caller has **no** ``mvt_*`` API key. It
+    authenticates with a **per-trigger secret** instead: the fire endpoint
+    (``POST /api/v1/triggers/{trigger_id}/events``) verifies an HMAC-SHA256
+    signature of the raw request body keyed by that secret. The secret is
+    minted + hashed-at-rest exactly like an API key
+    (:func:`movate.core.auth.hash_secret`) — the plaintext is shown once at
+    creation and **never stored**; only ``secret_hash`` + ``salt`` persist,
+    and verification is a constant-time compare. Hashing at rest means a
+    storage compromise never yields a usable trigger secret.
+
+    Additive + default-off: nothing is created unless an operator registers
+    a trigger, and every existing endpoint is unchanged for everything
+    without one.
+
+    ``(tenant_id, name)`` is the unique management key (an operator's stable
+    handle). ``trigger_id`` is the separate **public** id embedded in the
+    webhook URL — the fire endpoint looks the trigger up by ``trigger_id``
+    *without* a tenant context (an unauthenticated external caller has no
+    tenant), and the enqueued job inherits the trigger's own ``tenant_id``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    name: str
+    """The trigger's handle — a stable name the operator picks (defaults to
+    the target). Paired with ``tenant_id`` as the unique management key, so
+    one target can have multiple triggers (e.g. different default inputs)
+    under distinct names."""
+    trigger_id: str = Field(default_factory=lambda: uuid4().hex)
+    """Stable **public** id embedded in the webhook URL
+    (``/api/v1/triggers/{trigger_id}/events``). Distinct from ``name`` so
+    the fire endpoint can resolve the trigger (and its tenant) from the URL
+    alone, with no tenant context — the external caller is unauthenticated
+    in the ``mvt_*`` sense. A uuid hex (unguessable, but the secret — not
+    obscurity — is the actual auth)."""
+    kind: JobKind
+    """Which job kind the trigger enqueues — only ``AGENT`` or ``WORKFLOW``.
+    ``EVAL`` has its own scheduler (:class:`EvalSchedule`) and ``BENCH`` is
+    not a trigger target; both are rejected at construction (see the
+    validator below), exactly as :class:`JobSchedule` does."""
+    target: str
+    """Agent name or workflow name to run — pairs with ``kind`` exactly as
+    ``JobRecord.target`` does."""
+    secret_hash: str
+    """SHA-256 hex digest of ``salt || secret`` (the per-trigger secret).
+    The plaintext secret is never stored — shown once at creation, then
+    irrecoverable, like an API key."""
+    salt: str
+    """Per-trigger salt (URL-safe base64). Prevents rainbow tables across
+    the table; the high-entropy secret makes brute force pointless."""
+    input_defaults: dict[str, Any] = Field(default_factory=dict)
+    """Baseline job payload, merged **UNDER** the inbound event body to form
+    the enqueued job's ``input`` (the event body wins on key collisions).
+    Lets an operator pin fixed fields (e.g. ``{"source": "zendesk"}``) while
+    the event supplies the per-event payload."""
+    enabled: bool = True
+    """Soft on/off. A disabled trigger is retained (history + quick
+    re-enable) but the fire endpoint treats it as absent (404, no existence
+    leak to an unauthenticated caller). ``mdk trigger delete`` removes the
+    row entirely."""
+    created_by: str | None = None
+    """Auth identity that created the trigger (ADR 013), or ``None`` for a
+    local/CLI write."""
+    created_at: datetime = Field(default_factory=_now)
+    last_fired_at: datetime | None = None
+    """When the fire endpoint last enqueued a job for this trigger. Stamped
+    by :meth:`StorageProvider.touch_trigger`; observational (unlike the
+    scheduler's ``last_enqueued_at``, it does not gate firing — every valid
+    event fires). Null until the first fire."""
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_is_triggerable(cls, v: JobKind) -> JobKind:
+        """Only ``AGENT``/``WORKFLOW`` jobs are triggerable here.
+
+        ``EVAL`` has its own richer scheduler (:class:`EvalSchedule`), and
+        ``BENCH`` is not a trigger target. Rejecting them at parse time keeps
+        the trigger surface focused — mirrors
+        :meth:`JobSchedule._kind_is_schedulable`.
+        """
+        if v not in (JobKind.AGENT, JobKind.WORKFLOW):
+            raise ValueError(
+                f"Trigger.kind must be 'agent' or 'workflow', got {v.value!r}; "
+                "EVAL has its own scheduler (EvalSchedule) and BENCH is not a "
+                "trigger target."
+            )
+        return v
+
+
 # ---------------------------------------------------------------------------
 # API keys (v0.5+)
 # ---------------------------------------------------------------------------

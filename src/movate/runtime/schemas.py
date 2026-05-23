@@ -662,6 +662,98 @@ class JobScheduleListView(BaseModel):
     count: int
 
 
+# ---------------------------------------------------------------------------
+# Event/webhook triggers (ADR 017 D2)
+# ---------------------------------------------------------------------------
+
+
+class TriggerCreateRequest(BaseModel):
+    """``POST /api/v1/triggers`` request body (ADR 017 D2).
+
+    Registers an inbound event/webhook trigger that enqueues a
+    ``JobKind.AGENT`` / ``JobKind.WORKFLOW`` job when an external system
+    POSTs an event. Mirrors the ``mdk trigger create`` flags. Additive +
+    default-off: no trigger means nothing fires.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: JobKind = Field(JobKind.AGENT)
+    """Only ``agent`` / ``workflow`` are accepted — ``eval``/``bench`` are
+    rejected by the Trigger model validator (eval has its own scheduler)."""
+    target: str
+    """Agent or workflow name to run when the trigger fires."""
+    name: str | None = Field(None)
+    """Trigger handle (unique per tenant). Defaults to the target name."""
+    input_defaults: dict[str, Any] = Field(default_factory=dict)
+    """Baseline job payload, merged UNDER the inbound event body (the event
+    body wins on key collisions)."""
+    enabled: bool = Field(True)
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_is_triggerable(cls, v: JobKind) -> JobKind:
+        """Reject ``eval``/``bench`` at request-parse time (→ 422).
+
+        Mirrors :meth:`movate.core.models.Trigger._kind_is_triggerable` so the
+        API returns a 422 rather than letting the model raise a 500.
+        """
+        if v not in (JobKind.AGENT, JobKind.WORKFLOW):
+            raise ValueError(
+                f"kind must be 'agent' or 'workflow', got {v.value!r}; "
+                "eval has its own scheduler and bench is not a trigger target."
+            )
+        return v
+
+
+class TriggerView(BaseModel):
+    """One trigger (response shape for the management endpoints).
+
+    Never carries the secret — only the metadata. The plaintext secret is
+    returned exactly once, by :class:`TriggerCreatedView` at creation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    trigger_id: str
+    name: str
+    kind: JobKind
+    target: str
+    input_defaults: dict[str, Any]
+    enabled: bool
+    last_fired_at: str | None = None
+    created_at: str
+
+
+class TriggerCreatedView(TriggerView):
+    """``POST /api/v1/triggers`` response — includes the secret ONCE.
+
+    ``secret`` is the plaintext per-trigger secret, shown **once** and
+    irrecoverable afterward (only the hash + salt persist). With ``salt`` the
+    caller derives the HMAC signing key
+    (``hash_secret(secret, salt)``) it signs each event body with.
+    ``webhook_path`` is the relative URL the external caller POSTs events to.
+    """
+
+    secret: str
+    salt: str
+    """The (non-sensitive) per-trigger salt. The caller derives the HMAC
+    signing key as ``sha256(salt || secret)`` to sign each event body."""
+    webhook_path: str
+    """Relative path of the fire endpoint, e.g.
+    ``/api/v1/triggers/<trigger_id>/events``. The caller prepends its
+    runtime base URL."""
+
+
+class TriggerListView(BaseModel):
+    """``GET /api/v1/triggers`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    triggers: list[TriggerView]
+    count: int
+
+
 class EvalCaseView(BaseModel):
     """One row in the eval scorecard. Matches the shape produced by
     ``mdk eval --output json`` for per-case data."""
@@ -1887,6 +1979,10 @@ __all__ = [
     "RunTraceView",
     "RunView",
     "SkillCreatedView",
+    "TriggerCreateRequest",
+    "TriggerCreatedView",
+    "TriggerListView",
+    "TriggerView",
     "WizardAgentSubmission",
 ]
 

@@ -31,6 +31,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    Trigger,
     WorkflowRunRecord,
 )
 from movate.providers.base import (
@@ -68,6 +69,7 @@ class InMemoryStorage:
         self.conversation_threads: list[ConversationThread] = []
         self.eval_schedules: list[EvalSchedule] = []
         self.job_schedules: list[JobSchedule] = []
+        self.triggers: list[Trigger] = []
 
     async def init(self) -> None:
         return None
@@ -268,6 +270,52 @@ class InMemoryStorage:
         for i, s in enumerate(self.job_schedules):
             if s.name == name and s.tenant_id == tenant_id:
                 self.job_schedules[i] = s.model_copy(update={"last_enqueued_at": last_enqueued_at})
+                return
+
+    # ------------------------------------------------------------------
+    # Triggers (ADR 017 D2 — inbound event/webhook → enqueue a job)
+    # ------------------------------------------------------------------
+
+    async def save_trigger(self, trigger: Trigger) -> None:
+        # Upsert keyed by (tenant_id, name) — last write wins.
+        self.triggers = [
+            t
+            for t in self.triggers
+            if not (t.name == trigger.name and t.tenant_id == trigger.tenant_id)
+        ]
+        self.triggers.append(trigger)
+
+    async def get_trigger(self, name: str, *, tenant_id: str) -> Trigger | None:
+        return next(
+            (t for t in self.triggers if t.name == name and t.tenant_id == tenant_id),
+            None,
+        )
+
+    async def get_trigger_by_id(self, trigger_id: str) -> Trigger | None:
+        return next((t for t in self.triggers if t.trigger_id == trigger_id), None)
+
+    async def list_triggers(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Trigger]:
+        rows = self.triggers
+        if tenant_id is not None:
+            rows = [t for t in rows if t.tenant_id == tenant_id]
+        return sorted(rows, key=lambda t: t.created_at, reverse=True)[:limit]
+
+    async def delete_trigger(self, name: str, *, tenant_id: str) -> bool:
+        before = len(self.triggers)
+        self.triggers = [
+            t for t in self.triggers if not (t.name == name and t.tenant_id == tenant_id)
+        ]
+        return len(self.triggers) < before
+
+    async def touch_trigger(self, trigger_id: str, *, last_fired_at: datetime) -> None:
+        for i, t in enumerate(self.triggers):
+            if t.trigger_id == trigger_id:
+                self.triggers[i] = t.model_copy(update={"last_fired_at": last_fired_at})
                 return
 
     # ------------------------------------------------------------------

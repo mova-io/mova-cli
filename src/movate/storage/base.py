@@ -46,6 +46,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    Trigger,
     WorkflowRunRecord,
 )
 
@@ -274,6 +275,69 @@ class StorageProvider(Protocol):
 
         Drives the cadence due-check + idempotency. No-op if the schedule
         doesn't exist (it may have been cleared mid-tick).
+        """
+
+    # ------------------------------------------------------------------
+    # Triggers (ADR 017 D2 — inbound event/webhook → enqueue a job)
+    #
+    # Additive, default-off: a row exists only when an operator registers a
+    # trigger. ``(tenant_id, name)`` is the unique management key;
+    # ``save_trigger`` upserts. ``trigger_id`` is the separate public id in
+    # the webhook URL — the fire endpoint resolves a trigger by it
+    # (``get_trigger_by_id``) WITHOUT a tenant context (the external caller
+    # is unauthenticated), and the trigger carries its own tenant. The
+    # secret is hashed at rest (never the plaintext), like an API key.
+    # ------------------------------------------------------------------
+
+    async def save_trigger(self, trigger: Trigger) -> None:
+        """Upsert one trigger keyed by ``(tenant_id, name)``.
+
+        Re-registering a trigger of the same name overwrites the prior row
+        (last write wins) — one active trigger per name per tenant.
+        """
+
+    async def get_trigger(self, name: str, *, tenant_id: str) -> Trigger | None:
+        """Exact lookup by ``(name, tenant_id)`` — the management path.
+
+        Returns ``None`` if no trigger OR if it belongs to a different
+        tenant — same no-leak contract as the other ``get_*`` methods.
+        """
+
+    async def get_trigger_by_id(self, trigger_id: str) -> Trigger | None:
+        """Lookup by the public ``trigger_id`` — the fire path.
+
+        Deliberately **not** tenant-scoped: the fire endpoint is hit by an
+        unauthenticated external caller who only knows the URL's
+        ``trigger_id``. The returned :class:`Trigger` carries its own
+        ``tenant_id``, which scopes the enqueued job. Returns ``None`` when
+        no trigger matches.
+        """
+
+    async def list_triggers(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Trigger]:
+        """List triggers, optionally tenant-scoped.
+
+        ``tenant_id=None`` returns triggers across all tenants — reserved for
+        operator tooling; never exposed on the HTTP API.
+        """
+
+    async def delete_trigger(self, name: str, *, tenant_id: str) -> bool:
+        """Delete the trigger for ``(name, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none existed.
+        Tenant-scoped: a wrong-tenant delete is a no-op (returns ``False``).
+        """
+
+    async def touch_trigger(self, trigger_id: str, *, last_fired_at: datetime) -> None:
+        """Stamp ``last_fired_at`` after the fire endpoint enqueues a job.
+
+        Keyed by the public ``trigger_id`` (the fire path has no tenant
+        context). Observational only — does not gate firing. No-op if the
+        trigger doesn't exist (it may have been deleted mid-request).
         """
 
     # ------------------------------------------------------------------

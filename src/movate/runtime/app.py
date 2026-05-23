@@ -42,8 +42,15 @@ from movate.core.models import (
     JobRecord,
     JobSchedule,
     JobStatus,
+    Trigger,
 )
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
+from movate.core.triggers import (
+    SIGNATURE_HEADER,
+    build_triggered_job,
+    mint_trigger,
+    verify_signature,
+)
 from movate.runtime.agent_creation import (
     AgentCreationError,
     persist_bundle,
@@ -147,6 +154,10 @@ from movate.runtime.schemas import (
     ThreadListView,
     ThreadMessageSubmission,
     ThreadView,
+    TriggerCreatedView,
+    TriggerCreateRequest,
+    TriggerListView,
+    TriggerView,
     WizardAgentSubmission,
 )
 from movate.runtime.skill_creation import (
@@ -3603,6 +3614,248 @@ def build_app(
         store: StorageProvider = request.app.state.storage
         await store.delete_job_schedule(name, tenant_id=ctx.tenant_id)
         return Response(status_code=204)
+
+    # ------------------------------------------------------------------
+    # Event/webhook triggers (ADR 017 D2). Additive + default-off.
+    #
+    # Two surfaces with DIFFERENT auth models:
+    #
+    #  * Management CRUD (POST/GET/DELETE /triggers[/{name}]) — the normal
+    #    mvt_* key + AuthContext, tenant-scoped. Create/delete gate on
+    #    ``admin`` (creating a trigger mints a long-lived secret credential,
+    #    like minting an API key); list/get gate on ``read``.
+    #  * The FIRE endpoint (POST /triggers/{trigger_id}/events) — hit by an
+    #    EXTERNAL system that has NO mvt_* key. It is deliberately NOT behind
+    #    the api-key auth dependency; instead it authenticates with the
+    #    per-trigger secret via an HMAC-SHA256 signature over the raw body
+    #    (X-Movate-Signature). On success it builds the SAME JobRecord shape
+    #    POST /run + the scheduler produce (via build_triggered_job) so the
+    #    run flows through the existing dispatch with no new branch.
+    #
+    # Replay/idempotency (a nonce/delivery-id store to drop duplicate events)
+    # is a documented follow-up — not built here.
+    # ------------------------------------------------------------------
+    def _trigger_to_view(t: Trigger) -> TriggerView:
+        return TriggerView(
+            trigger_id=t.trigger_id,
+            name=t.name,
+            kind=t.kind,
+            target=t.target,
+            input_defaults=t.input_defaults,
+            enabled=t.enabled,
+            last_fired_at=t.last_fired_at.isoformat() if t.last_fired_at else None,
+            created_at=t.created_at.isoformat(),
+        )
+
+    @v1.post(
+        "/triggers",
+        response_model=TriggerCreatedView,
+        status_code=201,
+        tags=["triggers"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_trigger(
+        body: TriggerCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> TriggerCreatedView:
+        """Register an inbound event/webhook trigger (ADR 017 D2).
+
+        Mints a per-trigger secret + a stable public ``trigger_id``, persists
+        the trigger (secret hashed at rest), and returns the trigger metadata
+        plus the plaintext ``secret`` **once** — it is irrecoverable
+        afterward, exactly like a minted API key.
+
+        The external system then POSTs events to
+        ``POST /api/v1/triggers/{trigger_id}/events`` with an
+        ``X-Movate-Signature: sha256=<hex>`` header = HMAC-SHA256 of the raw
+        body keyed by the secret.
+
+        Gated on ``admin`` (it mints a long-lived secret credential).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **422** — ``kind`` is not ``agent``/``workflow``
+        """
+        store: StorageProvider = request.app.state.storage
+        name = body.name or body.target
+        minted = mint_trigger(
+            tenant_id=ctx.tenant_id,
+            name=name,
+            kind=body.kind,
+            target=body.target,
+            input_defaults=body.input_defaults,
+            enabled=body.enabled,
+            created_by=ctx.api_key_id,
+        )
+        await store.save_trigger(minted.record)
+        view = _trigger_to_view(minted.record)
+        return TriggerCreatedView(
+            **view.model_dump(),
+            secret=minted.secret,
+            salt=minted.salt,
+            webhook_path=f"/api/v1/triggers/{minted.record.trigger_id}/events",
+        )
+
+    @v1.get(
+        "/triggers",
+        response_model=TriggerListView,
+        tags=["triggers"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_triggers(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 100,
+    ) -> TriggerListView:
+        """List this tenant's registered triggers (no secrets).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_triggers(tenant_id=ctx.tenant_id, limit=capped_limit)
+        views = [_trigger_to_view(r) for r in rows]
+        return TriggerListView(triggers=views, count=len(views))
+
+    @v1.get(
+        "/triggers/{name}",
+        response_model=TriggerView,
+        tags=["triggers"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_trigger(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> TriggerView:
+        """Fetch one trigger by its handle (no secret).
+
+        Tenant-scoped: a trigger under another tenant 404s (no existence leak).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no trigger with this name for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        row = await store.get_trigger(name, tenant_id=ctx.tenant_id)
+        if row is None:
+            raise not_found("trigger", name)
+        return _trigger_to_view(row)
+
+    @v1.delete(
+        "/triggers/{name}",
+        status_code=204,
+        tags=["triggers"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_trigger(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove a trigger by its handle.
+
+        Idempotent: deleting a non-existent trigger still returns 204. Gated
+        on ``admin`` (it revokes a long-lived secret credential).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        await store.delete_trigger(name, tenant_id=ctx.tenant_id)
+        return Response(status_code=204)
+
+    @v1.post(
+        "/triggers/{trigger_id}/events",
+        response_model=RunAccepted,
+        status_code=202,
+        tags=["triggers"],
+    )
+    async def v1_fire_trigger(
+        trigger_id: str,
+        request: Request,
+        response: Response,
+    ) -> RunAccepted:
+        """Fire a trigger — the endpoint the EXTERNAL system calls (ADR 017 D2).
+
+        Authenticated by the **per-trigger secret**, NOT a normal API key:
+        send ``X-Movate-Signature: sha256=<hex>`` = HMAC-SHA256 of the raw
+        request body keyed by the trigger's signing key
+        (``hash_secret(secret, salt)``). This is intentionally outside the
+        api-key auth dependency — the external caller has no ``mvt_*`` key,
+        and the secret never travels on the wire (only a body-bound HMAC).
+        The raw body is the event payload (a JSON object); it is merged OVER
+        the trigger's ``input_defaults`` to form the job input, and a
+        ``JobKind.AGENT``/``WORKFLOW`` job is enqueued scoped to the
+        **trigger's** tenant. The enqueued job is the same shape ``POST /run``
+        produces, so it runs through the existing dispatch with no new branch,
+        and is observable + retryable as a normal job.
+
+        Returns **202** ``{job_id, status}`` (mirrors ``RunAccepted``).
+
+        Errors:
+
+        * **404** — unknown OR disabled trigger (we do NOT leak existence to
+          an unauthenticated caller)
+        * **401** — missing or invalid ``X-Movate-Signature``
+        * **400** — body is present but not a JSON object
+        """
+        import json  # noqa: PLC0415
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        raw_body = await request.body()
+
+        # Resolve the trigger by its PUBLIC id (no tenant context — the caller
+        # is unauthenticated). Unknown OR disabled → 404, indistinguishable,
+        # so we never leak a trigger's existence to an unauthenticated caller.
+        trigger = await store.get_trigger_by_id(trigger_id)
+        if trigger is None or not trigger.enabled:
+            raise not_found("trigger", trigger_id)
+
+        # Per-trigger-secret auth: recompute the body-bound HMAC from the
+        # stored secret_hash and constant-time compare against the presented
+        # X-Movate-Signature. No normal API key is accepted here.
+        presented = request.headers.get(SIGNATURE_HEADER)
+        if not verify_signature(trigger, raw_body, presented):
+            raise auth_required()
+
+        # The event body becomes the job input (merged over input_defaults).
+        # An empty body is allowed (→ {}); a non-object JSON body is a 400.
+        if not raw_body.strip():
+            event_body: dict[str, Any] = {}
+        else:
+            try:
+                parsed = json.loads(raw_body)
+            except json.JSONDecodeError:
+                raise http_error(
+                    ErrorCode.BAD_REQUEST,
+                    status_code=400,
+                    message="event body must be a JSON object",
+                ) from None
+            if not isinstance(parsed, dict):
+                raise http_error(
+                    ErrorCode.BAD_REQUEST,
+                    status_code=400,
+                    message="event body must be a JSON object",
+                )
+            event_body = parsed
+
+        job = build_triggered_job(trigger, event_body)
+        await store.save_job(job)
+        await store.touch_trigger(trigger.trigger_id, last_fired_at=datetime.now(UTC))
+        response.status_code = 202
+        return RunAccepted(job_id=job.job_id, status=job.status)
 
     # ------------------------------------------------------------------
     # Bench endpoints (BACKLOG #64) — multi-model comparison persistence.

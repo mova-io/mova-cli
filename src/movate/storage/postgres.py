@@ -54,6 +54,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    Trigger,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -471,6 +472,31 @@ CREATE TABLE IF NOT EXISTS job_schedules (
     last_enqueued_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, name)
 );
+
+-- ADR 017 D2: inbound event/webhook triggers. One row per (tenant, name)
+-- with a public trigger_id (in the webhook URL), a hashed-at-rest per-trigger
+-- secret, and default-input merged under the inbound event body. The fire
+-- endpoint resolves by trigger_id (no tenant context) and enqueues a
+-- JobKind.AGENT/WORKFLOW job. Additive new table (CREATE TABLE IF NOT EXISTS,
+-- idempotent) — default-off, no ALTER, no backfill. ``input_defaults`` is
+-- JSONB (same codec as jobs.input); trigger_id is uniquely indexed for the
+-- fire-path lookup.
+CREATE TABLE IF NOT EXISTS triggers (
+    tenant_id      TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    trigger_id     TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    target         TEXT NOT NULL,
+    secret_hash    TEXT NOT NULL,
+    salt           TEXT NOT NULL,
+    input_defaults JSONB NOT NULL,
+    enabled        BOOLEAN NOT NULL,
+    created_by     TEXT,
+    created_at     TIMESTAMPTZ NOT NULL,
+    last_fired_at  TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, name)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id);
 """
 
 
@@ -1063,6 +1089,92 @@ class PostgresProvider:
             last_enqueued_at,
             name,
             tenant_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Triggers (ADR 017 D2 — inbound event/webhook → enqueue a job)
+    # ------------------------------------------------------------------
+
+    async def save_trigger(self, trigger: Trigger) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO triggers (
+                tenant_id, name, trigger_id, kind, target, secret_hash, salt,
+                input_defaults, enabled, created_by, created_at, last_fired_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            )
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+                trigger_id = EXCLUDED.trigger_id,
+                kind = EXCLUDED.kind,
+                target = EXCLUDED.target,
+                secret_hash = EXCLUDED.secret_hash,
+                salt = EXCLUDED.salt,
+                input_defaults = EXCLUDED.input_defaults,
+                enabled = EXCLUDED.enabled,
+                created_by = EXCLUDED.created_by,
+                created_at = EXCLUDED.created_at,
+                last_fired_at = EXCLUDED.last_fired_at
+            """,
+            trigger.tenant_id,
+            trigger.name,
+            trigger.trigger_id,
+            trigger.kind.value,
+            trigger.target,
+            trigger.secret_hash,
+            trigger.salt,
+            trigger.input_defaults,
+            trigger.enabled,
+            trigger.created_by,
+            trigger.created_at,
+            trigger.last_fired_at,
+        )
+
+    async def get_trigger(self, name: str, *, tenant_id: str) -> Trigger | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM triggers WHERE name = $1 AND tenant_id = $2",
+            name,
+            tenant_id,
+        )
+        return _row_to_trigger(row) if row else None
+
+    async def get_trigger_by_id(self, trigger_id: str) -> Trigger | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM triggers WHERE trigger_id = $1",
+            trigger_id,
+        )
+        return _row_to_trigger(row) if row else None
+
+    async def list_triggers(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[Trigger]:
+        params: list[Any] = []
+        where = ""
+        if tenant_id is not None:
+            params.append(tenant_id)
+            where = f"WHERE tenant_id = ${len(params)}"
+        params.append(limit)
+        sql = f"SELECT * FROM triggers {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_trigger(r) for r in rows]
+
+    async def delete_trigger(self, name: str, *, tenant_id: str) -> bool:
+        status: str = await self._db.execute(
+            "DELETE FROM triggers WHERE name = $1 AND tenant_id = $2",
+            name,
+            tenant_id,
+        )
+        # asyncpg returns a status string like "DELETE 1" / "DELETE 0".
+        return status.startswith("DELETE ") and not status.endswith(" 0")
+
+    async def touch_trigger(self, trigger_id: str, *, last_fired_at: datetime) -> None:
+        await self._db.execute(
+            "UPDATE triggers SET last_fired_at = $1 WHERE trigger_id = $2",
+            last_fired_at,
+            trigger_id,
         )
 
     # ------------------------------------------------------------------
@@ -2320,6 +2432,23 @@ def _row_to_job_schedule(row: asyncpg.Record) -> JobSchedule:
         created_by=row["created_by"],
         created_at=row["created_at"],
         last_enqueued_at=row["last_enqueued_at"],
+    )
+
+
+def _row_to_trigger(row: asyncpg.Record) -> Trigger:
+    return Trigger(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        trigger_id=row["trigger_id"],
+        kind=JobKind(row["kind"]),
+        target=row["target"],
+        secret_hash=row["secret_hash"],
+        salt=row["salt"],
+        input_defaults=dict(row["input_defaults"]),
+        enabled=row["enabled"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        last_fired_at=row["last_fired_at"],
     )
 
 
