@@ -38,6 +38,8 @@ A ranked, checkable list of features for movate. Each item is sized to "thing a 
 
 ### Session 2026-05-23 — KB-on-Azure (pgvector + GraphRAG) + auth resilience + fleet
 
+**Backlog re-triage (2026-05-23).** Audited Groups E–H against the code: ticked 16 items that shipped but were never checked off (incl. the eval/agent-mgmt `/api/v1` surface #57/#60/#61/#62/#63/#71/#73, `mdk models` #30, `mdk explain` #35, agent-as-tool #32, intent-router #33, marketplace metadata #29, prompt-injection #37 + PII #38 guardrails, parallel tool-use #23, skill templates #20). Four items marked partial (#17/#36/#42/#69). The genuinely-open, no-dependency highlights that remain: Helm chart (#22), Teams JWT validation (#26), `mdk bench` native runtimes (#24), Prompt Library (#34), Slack adapter (#44), plus the now-unblocked API mirrors `/models` (#67), `/bench` (#64), `/runs/{id}/explain` (#66).
+
 **Knowledge layer landed on Postgres + pgvector.** Shipped **ADR 009 (pgvector KB storage)** — KB chunk embeddings moved from brute-force Python cosine over JSONB to a durable `vector(N)` column with an HNSW index + `<=>` cosine search, an idempotent JSONB→vector migration (`schema_migrations` table), and embedding model/dim config (`MOVATE_EMBED_MODEL`/`MOVATE_EMBED_DIM`) with doctor checks. CLI gained `mdk kb reindex` (rebuild the HNSW index; `--reembed` to re-embed) and remote `--target` management for `kb list/stats/search/clear` (mirrors the runtime `/api/v1/agents/{name}/kb*` endpoints). The CI `postgres` job runs the parametrized storage conformance suite against `pgvector/pgvector:pg16`.
 
 **GraphRAG shipped — ADR 010.** Entity/relation extraction + bounded k-hop expansion behind the `StorageProvider` Protocol, multi-backend (SQLite + Postgres), so GraphRAG runs the same on local dev and Azure. *(This supersedes the original "graph store" framing in item 49 — implemented via StorageProvider tables rather than Apache AGE; AGE stays an optional future backend.)*
@@ -146,7 +148,7 @@ out so you can prioritize the code + business work independently.
 ### Group D — Polish + nice-to-haves
 
 16. [ ] **Workflow replay** `[LOW] [post-v1.0]` — `mdk run --replay <workflow-run-id>`. Single-agent replay already covers 80% of debug cases; defer until a customer asks.
-17. [ ] **More templates as customer engagements demand** `[MED] [post-v1.0]` — extractor, RAG, function-caller; trivial to add now that the registry exists.
+17. [ ] **More templates as customer engagements demand** `[MED] [post-v1.0]` — extractor, RAG, function-caller; trivial to add now that the registry exists. **(partial 2026-05-23: extractor + RAG templates shipped; function-caller template still missing.)**
 18. [ ] **HTTP streaming for `POST /run?wait=true`** `[LOW] [post-v1.0]` — server-sent events for long jobs so the client streams instead of polling. Useful for interactive UIs; not needed for the current batch / dev-team workflows.
 
 ### Group E — Next up after 2026-05-13 re-rank
@@ -164,13 +166,13 @@ shippable; nothing here is gated by anything still open.
 
 29. [x] **Teams Slice 3.1.e — Teams app manifest + Azure Bot Service** `[HIGH] [v0.7] [done 2026-05-13]` — Teams app manifest, appPackage zipper, two new Bicep modules + main.bicep wiring, end-to-end deploy runbook. Bicep build + lint clean; CI's bicep job catches template errors. 15 new tests. Unblocked from the Azure-migration gate because the same artifacts work against any subscription. PR [#87](https://github.com/mova-io/mova-cli/pull/87). Closes [#69](https://github.com/mova-io/mova-cli/issues/69). **Demo loop complete.**
 
-20. [ ] **Skill-using default templates** `[HIGH] [v0.8] [≤1d]` — every `mdk init` today scaffolds a skill-less agent, so the entire Skills feature (now fully cross-runtime after ADR 002 closeout) is invisible until docs are read. Two new templates: `calc-agent` (Python skill) + `lookup-agent` (HTTP skill against a fake CRM). One of them becomes the new default. Big "first 5 minutes" demo lift for ~half a day of work. **Issue [#71](https://github.com/mova-io/mova-cli/issues/71).**
+20. [x] **Skill-using default templates** `[HIGH] [v0.8] [≤1d] [done 2026-05-23]` — every `mdk init` today scaffolds a skill-less agent, so the entire Skills feature (now fully cross-runtime after ADR 002 closeout) is invisible until docs are read. Two new templates: `calc-agent` (Python skill) + `lookup-agent` (HTTP skill against a fake CRM). One of them becomes the new default. Big "first 5 minutes" demo lift for ~half a day of work. **Issue [#71](https://github.com/mova-io/mova-cli/issues/71).**
 
 21. [ ] **v0.6 release tag + GitHub Release** `[MED] [v0.6] [≤2h]` — everything from #51 onwards (Skills + Contexts + canonical config split + native tool-use + 4-dim eval + side_effects policy) is a logical v0.6 boundary. Cut the tag, write release notes pointing at ADR 002 + the 4-dim eval section, set the README capability matrix's v0.6 row to ✓. Clarifies the v0.7 alpha boundary for what comes next. **No GH issue — just do it.**
 
 22. [ ] **Helm chart for the runtime** `[HIGH] [v0.8] [~2d]` — `infra/helm/movate-runtime/` with Deployment + Service + Ingress + worker Deployment + HPA + KEDA Postgres scaler (mirrors what we do on ACA via Bicep). Unblocks non-Azure customers — important for partners + the Helm-deploy paths a chunk of Movate's customer base prefers. CI gains `helm lint` + `kubeval` on every PR. **Issue [#73](https://github.com/mova-io/mova-cli/issues/73).**
 
-23. [ ] **Parallel tool-use across all three runtimes** `[MED] [v0.8] [~2d]` — modern models (Claude Sonnet 4.6+, GPT-4o) emit parallel tool calls in a single turn; today all three adapters take only the first. Executor's tool-use loop gains a multi-dispatch path via `asyncio.gather`. Cap parallel count to bound runaway models. **~3x latency improvement on multi-tool turns. Issue [#74](https://github.com/mova-io/mova-cli/issues/74).**
+23. [x] **Parallel tool-use across all three runtimes** `[MED] [v0.8] [~2d] [done 2026-05-23]` — modern models (Claude Sonnet 4.6+, GPT-4o) emit parallel tool calls in a single turn; today all three adapters take only the first. Executor's tool-use loop gains a multi-dispatch path via `asyncio.gather`. Cap parallel count to bound runaway models. **~3x latency improvement on multi-tool turns. Issue [#74](https://github.com/mova-io/mova-cli/issues/74).**
 
 24. [ ] **`mdk bench` support for native_anthropic / native_openai** `[MED] [v0.8] [≤1d]` — closes a gap from ADR 002 closeout. Bench today assumes LiteLLM-style provider strings; native runtimes use bare model ids. Wire the registry/pricing-key bridge through bench; add a `--runtime litellm,native_anthropic` flag for side-by-side LiteLLM-overhead comparisons. **Issue [#75](https://github.com/mova-io/mova-cli/issues/75).**
 
@@ -194,27 +196,27 @@ shippable; nothing here is gated by anything still open.
 
 #### F-A — Tier A: ≤1d each (quick wins)
 
-29. [ ] **Agent metadata extension for the marketplace** `[HIGH] [v0.8] [≤1d]` — Extend `agent.yaml` schema with `persona`, `role`, `capabilities[]`, `tags[]`, `examples[]`, `owner` — all optional, backward-compatible. Marketplace UI (separate product) reads these as the source of truth for Agent Catalog / Profiles / Search / Reviews. `mdk show` renders the new fields; `mdk validate` checks them. **Unlocks the entire Agent Marketplace row of the slide. No GH issue yet — direct PR.**
+29. [x] **Agent metadata extension for the marketplace** `[HIGH] [v0.8] [≤1d] [done 2026-05-23]` — Extend `agent.yaml` schema with `persona`, `role`, `capabilities[]`, `tags[]`, `examples[]`, `owner` — all optional, backward-compatible. Marketplace UI (separate product) reads these as the source of truth for Agent Catalog / Profiles / Search / Reviews. `mdk show` renders the new fields; `mdk validate` checks them. **Unlocks the entire Agent Marketplace row of the slide. No GH issue yet — direct PR.**
 
-30. [ ] **`mdk models` — model catalog command** `[MED] [v0.8] [≤1d]` — `mdk models list` + `mdk models show <id>`. Surfaces pricing, context window, capabilities (tools / vision), region availability, license from the existing pricing.yaml + provider registry. Closes the slide's Model Library block at the runtime layer.
+30. [x] **`mdk models` — model catalog command** `[MED] [v0.8] [≤1d] [done 2026-05-23]` — `mdk models list` + `mdk models show <id>`. Surfaces pricing, context window, capabilities (tools / vision), region availability, license from the existing pricing.yaml + provider registry. Closes the slide's Model Library block at the runtime layer.
 
 31. [ ] **Open LLM + SLM templates** `[MED] [v0.8] [≤1d]` — Two new `mdk init -t` templates: `ollama-agent` (local LLM via Ollama) and `vllm-agent` (self-hosted via vLLM). Smoke test against an Ollama container in CI behind a marker. Documents the "yes we support open models / SLMs" answer with a runnable example. Closes the Open LLMs + SLMs blocks of the Model Layer.
 
-32. [ ] **Cross-agent skill — "agent-as-tool"** `[HIGH] [v0.8] [≤1d]` — New skill kind: `agent` — declare another deployed MDK agent as a tool target. Wraps `MovateClient.submit_job` + `wait_for_terminal`. Cheapest path to the slide's Agent–Agent Integrators block. Gives multi-agent orchestration without waiting on v1.1 LangGraph + conditional edges.
+32. [x] **Cross-agent skill — "agent-as-tool"** `[HIGH] [v0.8] [≤1d] [done 2026-05-23]` — New skill kind: `agent` — declare another deployed MDK agent as a tool target. Wraps `MovateClient.submit_job` + `wait_for_terminal`. Cheapest path to the slide's Agent–Agent Integrators block. Gives multi-agent orchestration without waiting on v1.1 LangGraph + conditional edges.
 
 #### F-B — Tier B: 2-3d each (foundational)
 
-33. [ ] **Intent Recognition primitive** `[HIGH] [v0.8] [~2d]` — New workflow node type: `intent-router` with a declarative `routes:` map (intent → next node). Reuses classifier-agent under the hood but elevates intent routing to a first-class IR concept. Workflows can branch on intent without conditional-edge machinery (v1.1). Closes the slide's Intent Recognition block.
+33. [x] **Intent Recognition primitive** `[HIGH] [v0.8] [~2d] [done 2026-05-23]` — New workflow node type: `intent-router` with a declarative `routes:` map (intent → next node). Reuses classifier-agent under the hood but elevates intent routing to a first-class IR concept. Workflows can branch on intent without conditional-edge machinery (v1.1). Closes the slide's Intent Recognition block.
 
 34. [ ] **Prompt Library** `[MED] [v0.8] [~2d]` — New `prompts/` registry dir (sibling to `skills/`) — versioned, named, importable into `agent.yaml` prompts via Jinja `{% include "kb_grounding/v3" %}`. Cross-project share via a shared-prompts package. Enables "use the company's standard customer-service tone" without copy-paste. Closes the Prompt Library block.
 
-35. [ ] **Explainability surface — `mdk explain <run-id>`** `[HIGH] [v0.8] [~2d]` — Builds on the existing replay engine: render the decision chain (which skill called when, which tool result fed which next step, why this branch). Shipped both as CLI output and as an Adaptive Card field on the Teams bot. Closes the Explainability block — turns a checkbox into a real command.
+35. [x] **Explainability surface — `mdk explain <run-id>`** `[HIGH] [v0.8] [~2d] [done 2026-05-23]` — Builds on the existing replay engine: render the decision chain (which skill called when, which tool result fed which next step, why this branch). Shipped both as CLI output and as an Adaptive Card field on the Teams bot. Closes the Explainability block — turns a checkbox into a real command.
 
-36. [ ] **Reflection / self-critique workflow pattern** `[MED] [v0.8] [~2d]` — Reference workflow showing: agent A produces, agent B critiques, agent A revises (max N iterations). New eval dim: `reflection_score` measures whether the critique improved the output. Ships as a `reflective-agent` template + docs. Closes the Reflection block.
+36. [ ] **Reflection / self-critique workflow pattern** `[MED] [v0.8] [~2d]` — Reference workflow showing: agent A produces, agent B critiques, agent A revises (max N iterations). New eval dim: `reflection_score` measures whether the critique improved the output. Ships as a `reflective-agent` template + docs. Closes the Reflection block. **(partial 2026-05-23: reflection engine + executor loop shipped; the `reflection_score` eval dim and `reflective-agent` template are still missing.)**
 
-37. [ ] **Prompt-injection detector** `[HIGH] [v0.8] [~2d]` — New executor-entry guardrail: heuristic regex + small-LLM judge catches prompt-injection patterns in user input. Configurable in `movate.yaml: policy.input_guardrails: [prompt_injection]`. Closes the highest-stakes Safe-AI-layer gap. **Highest customer-trust impact in this tier.**
+37. [x] **Prompt-injection detector** `[HIGH] [v0.8] [~2d] [done 2026-05-23]` — New executor-entry guardrail: heuristic regex + small-LLM judge catches prompt-injection patterns in user input. Configurable in `movate.yaml: policy.input_guardrails: [prompt_injection]`. Closes the highest-stakes Safe-AI-layer gap. **Highest customer-trust impact in this tier.**
 
-38. [ ] **Input/output PII guardrail** `[HIGH] [v0.9] [~3d]` — Filter at executor entry + exit. PII detection (emails / phones / SSNs / addresses via regex + spaCy NER). Modes: `block | redact | log-only`. `policy.io_guardrails: pii_redact`. Enterprise-table-stakes for customer-VPC deployments — pairs with the stack-defense doc.
+38. [x] **Input/output PII guardrail** `[HIGH] [v0.9] [~3d] [done 2026-05-23]` — Filter at executor entry + exit. PII detection (emails / phones / SSNs / addresses via regex + spaCy NER). Modes: `block | redact | log-only`. `policy.io_guardrails: pii_redact`. Enterprise-table-stakes for customer-VPC deployments — pairs with the stack-defense doc.
 
 39. [ ] **Document loaders + chunking** `[HIGH] [v0.9] [~5d, gated on ADR 004]` — `mdk knowledge ingest <path>` — PDF, MD, HTML, plain text. Pluggable chunkers (fixed, semantic, by-heading). Persists chunks + metadata to the vector store declared in `knowledge.yaml`. Closes Unstructured-data + Chunking blocks. **Depends on ADR 004 landing first.**
 
@@ -224,7 +226,7 @@ shippable; nothing here is gated by anything still open.
 
 41. [ ] **Bias / fairness eval dims** `[MED] [v0.9] [~3d]` — Two new dim scorers: `disparate_impact` (per-group accuracy gap when dataset has a `group` field) and `consistency` (semantically-equivalent input → equivalent output). Reuses the 4-dim eval machinery from v0.6. Closes the Ethical & Responsible AI block at the eval layer.
 
-42. [ ] **Knowledge Asset Catalog (knowledge.yaml expansion)** `[HIGH] [v0.9] [~3d]` — Declare datasets / indexes / sources in `knowledge.yaml` with versioning + lineage. `mdk knowledge list | show | diff` commands. Pairs with ADR 004 and item 39. Closes the Knowledge Asset Catalog block.
+42. [ ] **Knowledge Asset Catalog (knowledge.yaml expansion)** `[HIGH] [v0.9] [~3d]` — Declare datasets / indexes / sources in `knowledge.yaml` with versioning + lineage. `mdk knowledge list | show | diff` commands. Pairs with ADR 004 and item 39. Closes the Knowledge Asset Catalog block. **(partial 2026-05-23: `mdk knowledge list` shipped; `show`/`diff` + versioning/lineage still missing.)**
 
 43. [ ] **Dataset quality checks** `[MED] [v0.9] [~2d]` — `mdk eval --quality` runs deduplication, near-duplicate flagging (embedding-similarity), label-distribution drift vs baseline. Surfaces "your test set has 12 near-duplicates and a class imbalance" before scoring. Closes the Data Quality block.
 
@@ -290,19 +292,19 @@ clarity; **no MDK backlog items**:
 
 56. [x] **`GET /api/v1/agents/{name}` — full agent spec + bundle metadata** `[HIGH] [v0.7] [≤2h]` — Extends today's `/agents` (which is list-only) with per-agent detail: spec JSON + prompt body + I/O schemas + dataset stats + marketplace metadata + last-known eval scores. Mirrors `mdk show` output. **The Angular agent-profile view reads this single endpoint.**
 
-57. [ ] **`PUT /api/v1/agents/{name}` — update agent bundle** `[HIGH] [v0.7] [≤1d]` — Same multipart shape as POST but updates in-place. Bumps `version` on every update (semver minor by default; major if breaking schema change detected). Returns the new resolved spec.
+57. [x] **`PUT /api/v1/agents/{name}` — update agent bundle** `[HIGH] [v0.7] [≤1d] [done 2026-05-23]` — Same multipart shape as POST but updates in-place. Bumps `version` on every update (semver minor by default; major if breaking schema change detected). Returns the new resolved spec.
 
 58. [x] **`POST /api/v1/agents/{name}/validate` — schema + prompt-linter** `[HIGH] [v0.7] [≤2h]` — Wraps `mdk validate` programmatically. Returns `{errors: [], warnings: [], cost_forecast: {...}}`. Errors block save; warnings let the UI render a yellow chip but don't block. **Drives the "is this agent shippable?" UI gate.**
 
 59. [x] **`POST /api/v1/agents/{name}/runs` — agent-scoped run** `[HIGH] [v0.7] [≤2h]` — Equivalent to today's `POST /run` but URL-anchored on the agent (REST-clean for Angular's resource-oriented mental model). Body: `{input: {...}}`. Sync (`?wait=true`, returns `RunView`) or async (default, returns `{job_id}` + 202).
 
-60. [ ] **`POST /api/v1/agents/{name}/evals` — kick off an eval run** `[HIGH] [v0.7] [≤1d]` — Wraps `mdk eval`. Body: `{gate: 0.7, runs: 3, mock: false, baseline_id?: "...", regression_tolerance?: 0.05}`. Returns `{eval_id, status: queued}` immediately; eval runs as a background job (reuses worker infra). Poll via `GET /api/v1/evals/{eval_id}`. **Closes the eval kickoff path from Angular.**
+60. [x] **`POST /api/v1/agents/{name}/evals` — kick off an eval run** `[HIGH] [v0.7] [≤1d] [done 2026-05-23]` — Wraps `mdk eval`. Body: `{gate: 0.7, runs: 3, mock: false, baseline_id?: "...", regression_tolerance?: 0.05}`. Returns `{eval_id, status: queued}` immediately; eval runs as a background job (reuses worker infra). Poll via `GET /api/v1/evals/{eval_id}`. **Closes the eval kickoff path from Angular.**
 
-61. [ ] **`GET /api/v1/evals/{eval_id}` — eval record + 4-dim scorecard** `[HIGH] [v0.7] [≤2h]` — Full `EvalRecord` JSON: per-case rows, dimensional means (accuracy / faithfulness / coverage / latency), baseline diff if applicable. Mirrors the `mdk eval` Rich table but as structured data for Angular's chart rendering.
+61. [x] **`GET /api/v1/evals/{eval_id}` — eval record + 4-dim scorecard** `[HIGH] [v0.7] [≤2h] [done 2026-05-23]` — Full `EvalRecord` JSON: per-case rows, dimensional means (accuracy / faithfulness / coverage / latency), baseline diff if applicable. Mirrors the `mdk eval` Rich table but as structured data for Angular's chart rendering.
 
-62. [ ] **`GET /api/v1/evals?agent={name}` — eval history list** `[HIGH] [v0.7] [≤2h]` — Paginated. Each row: eval_id, agent_name, gate, gate_mode, mean_score, pass_rate, created_at, status. Drives the "evals over time" chart Angular will render.
+62. [x] **`GET /api/v1/evals?agent={name}` — eval history list** `[HIGH] [v0.7] [≤2h] [done 2026-05-23]` — Paginated. Each row: eval_id, agent_name, gate, gate_mode, mean_score, pass_rate, created_at, status. Drives the "evals over time" chart Angular will render.
 
-63. [ ] **`GET /api/v1/agents` enhancement — marketplace facets + filters** `[HIGH] [v0.7] [≤2h]` — Extends today's `/agents` (basic name+version list) with marketplace metadata (role / persona / capabilities / tags / examples from item 29), filterable by `?role=...&capabilities=...&tags=...`. **Drives the Mova iO Agent Catalog page directly.**
+63. [x] **`GET /api/v1/agents` enhancement — marketplace facets + filters** `[HIGH] [v0.7] [≤2h] [done 2026-05-23]` — Extends today's `/agents` (basic name+version list) with marketplace metadata (role / persona / capabilities / tags / examples from item 29), filterable by `?role=...&capabilities=...&tags=...`. **Drives the Mova iO Agent Catalog page directly.**
 
 #### G-NEXT — Follow-up endpoints (next sprint)
 
@@ -316,15 +318,15 @@ clarity; **no MDK backlog items**:
 
 68. [ ] **`GET /api/v1/pricing` — pricing table** `[MED] [v0.8] [≤2h]` — Read-only mirror of `pricing.yaml`. Lets Angular render cost-forecast UI client-side without round-tripping.
 
-69. [ ] **Skills CRUD: `GET/POST/PUT/DELETE /api/v1/skills` + `POST /api/v1/skills/{name}/invoke`** `[MED] [v0.8] [~2d]` — Wraps `mdk skills *` commands. Skill registry browsing + direct invocation from the Angular skill-authoring UI.
+69. [ ] **Skills CRUD: `GET/POST/PUT/DELETE /api/v1/skills` + `POST /api/v1/skills/{name}/invoke`** `[MED] [v0.8] [~2d]` — Wraps `mdk skills *` commands. Skill registry browsing + direct invocation from the Angular skill-authoring UI. **(partial 2026-05-23: only `POST /api/v1/skills` shipped; `GET`/`PUT`/`DELETE` + `/skills/{name}/invoke` still missing.)**
 
 70. [ ] **Workflows CRUD: `/api/v1/workflows` + `POST /api/v1/workflows/{name}/runs`** `[MED] [v0.8] [~2d]` — Mirrors `mdk` workflow surface. Topology JSON for Angular's flowchart renderer.
 
-71. [ ] **Datasets endpoint: `POST /api/v1/agents/{name}/dataset`** `[MED] [v0.8] [≤1d]` — Upload / replace `evals/dataset.jsonl`. Mirrors the Teams bot's file-attachment validation (slice 3.1.d). Returns row count + preview.
+71. [x] **Datasets endpoint: `POST /api/v1/agents/{name}/dataset`** `[MED] [v0.8] [≤1d] [done 2026-05-23]` — Upload / replace `evals/dataset.jsonl`. Mirrors the Teams bot's file-attachment validation (slice 3.1.d). Returns row count + preview.
 
 72. [ ] **Tenant admin: `GET/POST /api/v1/tenants/{id}/budget`, `GET /api/v1/tenants/{id}/usage`** `[MED] [v0.8] [≤1d]` — Wraps `mdk tenants *`. Admin-only (RBAC needed before public exposure).
 
-73. [ ] **API keys CRUD: `GET/POST/DELETE /api/v1/auth/keys`** `[MED] [v0.8] [≤1d]` — Wraps `mdk auth create-key | list-keys | revoke-key`. Admin-only.
+73. [x] **API keys CRUD: `GET/POST/DELETE /api/v1/auth/keys`** `[MED] [v0.8] [≤1d] [done 2026-05-23]` — Wraps `mdk auth create-key | list-keys | revoke-key`. Admin-only.
 
 74. [x] **`GET /api/v1/jobs?agent={}&status={}&tenant={}` — filterable job history** `[MED] [v0.8] [≤2h]` — Extends today's `/jobs` with filtering + cursor pagination. Drives Angular's run-history table.
 
