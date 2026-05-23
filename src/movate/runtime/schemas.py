@@ -1293,6 +1293,142 @@ class AgentDetailView(BaseModel):
     agent" + "View on GitHub" links per file."""
 
 
+# ---------------------------------------------------------------------------
+# Model catalog + pricing wire types (BACKLOG #67 / #68)
+#
+# Read-only mirrors of the ``mdk models`` / ``mdk pricing`` CLI surfaces over
+# HTTP. The underlying catalogue (pricing + capabilities) is the shared
+# :mod:`movate.providers.model_catalog` module — same source of truth the CLI
+# uses, so the API and the CLI never drift. These views are static (no storage
+# / tenant scoping) but the endpoints still require auth for consistency.
+# ---------------------------------------------------------------------------
+
+
+class ModelInfoView(BaseModel):
+    """One model in ``GET /api/v1/models`` / ``GET /api/v1/models/{id}``.
+
+    Combined pricing (per-1M tokens) + capability metadata. Mirrors the
+    shape ``mdk models show -o json`` emits, field-for-field, so a client
+    can switch between the CLI and the API without reshaping.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str
+    provider: str
+    context_window: int
+    """Maximum context window in tokens. ``0`` when unknown (model not in
+    the capability catalogue and no provider default applies)."""
+    input_per_1m: float
+    """Input price in USD per 1,000,000 tokens."""
+    output_per_1m: float
+    """Output price in USD per 1,000,000 tokens."""
+    cached_input_per_1m: float | None = None
+    """Cached-input price per 1M tokens, when the model supports prompt
+    caching; ``None`` otherwise."""
+    supports_tools: bool
+    supports_vision: bool
+    notes: str = ""
+    in_pricing_table: bool = True
+    """Always ``True`` for catalog entries — every model in the catalog is
+    sourced from the pricing table. Kept for parity with the CLI JSON shape."""
+
+
+class ModelCatalogView(BaseModel):
+    """``GET /api/v1/models`` response — the full model catalog.
+
+    Sorted by ``(provider, model_id)`` ascending, matching ``mdk models
+    list``. ``count`` echoes the number of entries for a quick sanity
+    check without re-counting client-side.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[ModelInfoView]
+    count: int
+
+
+class PricingEntryView(BaseModel):
+    """One model's raw pricing row in ``GET /api/v1/pricing``.
+
+    Direct serialisation of :class:`movate.providers.pricing.ModelPrice`
+    (per-1K-token units, as stored in the packaged ``pricing.yaml``). Use
+    ``GET /api/v1/models`` for the per-1M-token + capability view.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str
+    input_per_1k: float
+    output_per_1k: float
+    cached_input_per_1k: float | None = None
+
+
+class PricingView(BaseModel):
+    """``GET /api/v1/pricing`` response — the versioned pricing table.
+
+    Mirrors :class:`movate.providers.pricing.PricingTable` over the wire:
+    the table ``version`` + ``last_verified`` date plus one entry per model.
+    Entries are sorted by ``model_id`` for stable output.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    last_verified: str
+    entries: list[PricingEntryView]
+    count: int
+
+
+# ---------------------------------------------------------------------------
+# Run explain wire type (BACKLOG #66)
+#
+# Read-only mirror of ``mdk explain --json``: the decision chain for a
+# stored run. The record→dict logic is the shared
+# :func:`movate.core.explain.explain_run` seam (reused by the CLI), so the
+# API and CLI emit byte-identical chains. Tenant-scoped at the storage layer.
+# ---------------------------------------------------------------------------
+
+
+class RunExplainLlmCallView(BaseModel):
+    """The single LLM-call summary inside a run's decision chain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    tokens_in: int
+    tokens_out: int
+    tokens_cached: int
+    latency_ms: int
+    cost_usd: float
+
+
+class RunExplainView(BaseModel):
+    """``GET /api/v1/runs/{run_id}/explain`` response — the decision chain.
+
+    Mirrors ``mdk explain <run_id> --json``: identity + status, the input,
+    the LLM-call summary, the output (or error), and the per-step
+    ``skill_calls``. With ``?steps=true`` the full skill-call breakdown is
+    included; otherwise ``skill_calls_hint`` summarises the count.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    agent: str
+    agent_version: str
+    status: str
+    input: dict[str, Any]
+    llm_call: RunExplainLlmCallView
+    output: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    skill_calls: list[dict[str, Any]] | None = None
+    """Full per-step breakdown — populated only when ``?steps=true``."""
+    skill_calls_hint: str | None = None
+    """One-line summary of the skill-call count — populated when
+    ``?steps`` is omitted/false (mutually exclusive with ``skill_calls``)."""
+
+
 __all__ = [
     "AgentCatalogItemView",
     "AgentCatalogView",
@@ -1322,8 +1458,14 @@ __all__ = [
     "HealthView",
     "JobListView",
     "JobView",
+    "ModelCatalogView",
+    "ModelInfoView",
+    "PricingEntryView",
+    "PricingView",
     "ReadyView",
     "RunAccepted",
+    "RunExplainLlmCallView",
+    "RunExplainView",
     "RunSubmission",
     "RunTraceView",
     "RunView",

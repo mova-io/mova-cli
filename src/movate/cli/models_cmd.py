@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, field
 
 import typer
 from rich.console import Console
@@ -30,7 +29,8 @@ from rich.table import Table
 from rich.text import Text
 
 from movate.cli._output import TableJson
-from movate.providers.pricing import ModelPrice, PricingTable, load_pricing
+from movate.providers.model_catalog import ModelInfo, caps_for, model_catalog, model_info
+from movate.providers.pricing import ModelPrice, load_pricing
 
 console = Console()
 err_console = Console(stderr=True)
@@ -44,85 +44,13 @@ models_app = typer.Typer(
 
 
 # ---------------------------------------------------------------------------
-# Capability catalogue
+# Capability + pricing data
 #
-# The pricing table (pricing.yaml) tracks cost data only. Capability metadata
-# — context window, tool-use support, vision support — is maintained here.
-# Keys match the LiteLLM provider strings in pricing.yaml exactly.
+# The catalogue (pricing + context window / tool-use / vision capability) is
+# maintained in the shared :mod:`movate.providers.model_catalog` module so the
+# runtime's read-only ``GET /api/v1/models`` endpoint and this CLI command
+# share one source of truth (the runtime never imports from ``cli``).
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class _ModelCaps:
-    """Static capability metadata for one model."""
-
-    context_window: int
-    supports_tools: bool = True
-    supports_vision: bool = False
-    notes: str = ""
-
-
-# Default capabilities by provider prefix (used as fallback if a model ID
-# isn't listed explicitly below).
-_PROVIDER_DEFAULTS: dict[str, _ModelCaps] = {
-    "openai": _ModelCaps(context_window=128_000, supports_tools=True, supports_vision=False),
-    "azure": _ModelCaps(context_window=128_000, supports_tools=True, supports_vision=False),
-    "anthropic": _ModelCaps(context_window=200_000, supports_tools=True, supports_vision=False),
-}
-
-_CAPABILITY_CATALOGUE: dict[str, _ModelCaps] = {
-    # OpenAI
-    "openai/gpt-4o-2024-08-06": _ModelCaps(
-        context_window=128_000,
-        supports_tools=True,
-        supports_vision=True,
-    ),
-    "openai/gpt-4o-mini-2024-07-18": _ModelCaps(
-        context_window=128_000,
-        supports_tools=True,
-        supports_vision=True,
-    ),
-    "openai/o1-2024-12-17": _ModelCaps(
-        context_window=200_000,
-        supports_tools=True,
-        supports_vision=True,
-        notes="Reasoning model; extended thinking built in.",
-    ),
-    # Azure OpenAI
-    "azure/gpt-4o-2024-08-06": _ModelCaps(
-        context_window=128_000,
-        supports_tools=True,
-        supports_vision=True,
-        notes="Azure-hosted GPT-4o; slight markup vs first-party.",
-    ),
-    # Anthropic
-    "anthropic/claude-opus-4-6": _ModelCaps(
-        context_window=200_000,
-        supports_tools=True,
-        supports_vision=True,
-    ),
-    "anthropic/claude-sonnet-4-6": _ModelCaps(
-        context_window=200_000,
-        supports_tools=True,
-        supports_vision=True,
-    ),
-    "anthropic/claude-haiku-4-5-20251001": _ModelCaps(
-        context_window=200_000,
-        supports_tools=True,
-        supports_vision=True,
-    ),
-}
-
-
-def _caps_for(model_id: str) -> _ModelCaps:
-    """Return capability metadata for *model_id*, falling back to provider defaults."""
-    if model_id in _CAPABILITY_CATALOGUE:
-        return _CAPABILITY_CATALOGUE[model_id]
-    provider = model_id.split("/", maxsplit=1)[0] if "/" in model_id else ""
-    return _PROVIDER_DEFAULTS.get(
-        provider,
-        _ModelCaps(context_window=0, supports_tools=False, supports_vision=False),
-    )
 
 
 _ONE_MILLION = 1_000_000
@@ -150,78 +78,32 @@ def _check(value: bool) -> str:
 
 # ---------------------------------------------------------------------------
 # Build the rows list (shared between list and JSON output)
+#
+# The catalogue itself (pricing + caps, sorted by provider then model_id)
+# comes from the shared ``model_catalog()``; the filter flags here are a
+# pure CLI presentation concern, so they stay in the control plane.
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _ModelRow:
-    model_id: str
-    provider: str
-    context_window: int
-    input_per_1m: float
-    output_per_1m: float
-    cached_input_per_1m: float | None
-    supports_tools: bool
-    supports_vision: bool
-    notes: str = field(default="")
-    in_pricing_table: bool = field(default=True)
-
-    def to_dict(self) -> dict:
-        return {
-            "model_id": self.model_id,
-            "provider": self.provider,
-            "context_window": self.context_window,
-            "input_per_1m": self.input_per_1m,
-            "output_per_1m": self.output_per_1m,
-            "cached_input_per_1m": self.cached_input_per_1m,
-            "supports_tools": self.supports_tools,
-            "supports_vision": self.supports_vision,
-            "notes": self.notes,
-            "in_pricing_table": self.in_pricing_table,
-        }
-
-
 def _build_rows(
-    table_data: PricingTable,
     *,
     provider_filter: str | None = None,
     has_tools: bool = False,
     has_vision: bool = False,
     search_filter: str | None = None,
-) -> list[_ModelRow]:
+) -> list[ModelInfo]:
     needle = search_filter.lower() if search_filter else None
-    rows: list[_ModelRow] = []
-    for model_id, price in sorted(table_data.models.items()):
-        provider = model_id.split("/")[0] if "/" in model_id else model_id
-        if provider_filter and provider != provider_filter:
+    rows: list[ModelInfo] = []
+    for info in model_catalog():
+        if provider_filter and info.provider != provider_filter:
             continue
-        if needle and needle not in model_id.lower():
+        if needle and needle not in info.model_id.lower():
             continue
-        caps = _caps_for(model_id)
-        if has_tools and not caps.supports_tools:
+        if has_tools and not info.supports_tools:
             continue
-        if has_vision and not caps.supports_vision:
+        if has_vision and not info.supports_vision:
             continue
-        rows.append(
-            _ModelRow(
-                model_id=model_id,
-                provider=provider,
-                context_window=caps.context_window,
-                input_per_1m=price.input_per_1k * 1000,
-                output_per_1m=price.output_per_1k * 1000,
-                cached_input_per_1m=(
-                    price.cached_input_per_1k * 1000
-                    if price.cached_input_per_1k is not None
-                    else None
-                ),
-                supports_tools=caps.supports_tools,
-                supports_vision=caps.supports_vision,
-                notes=caps.notes,
-                in_pricing_table=True,
-            )
-        )
-    # Sort: provider ascending, then model_id ascending.
-    rows.sort(key=lambda r: (r.provider, r.model_id))
+        rows.append(info)
     return rows
 
 
@@ -288,7 +170,6 @@ def models_list(
         raise typer.Exit(code=2) from None
 
     rows = _build_rows(
-        table_data,
         provider_filter=provider,
         search_filter=search,
         has_tools=has_tools,
@@ -369,34 +250,19 @@ def models_show(
         err_console.print(f"[red]✗ failed to load pricing table:[/red] {exc}")
         raise typer.Exit(code=2) from None
 
-    price: ModelPrice | None = table_data.models.get(model_id)
-    in_pricing = price is not None
-    caps = _caps_for(model_id)
-
-    if not in_pricing:
+    row = model_info(model_id, table_data)
+    if row is None:
         err_console.print(f"[red]✗ model not found:[/red] {model_id!r}")
         err_console.print(
             "[dim]hint: run [bold]mdk models list[/bold] to see all models in the catalog.[/dim]"
         )
         raise typer.Exit(code=1)
 
-    provider = model_id.split("/", maxsplit=1)[0] if "/" in model_id else model_id
+    in_pricing = row.in_pricing_table
+    price: ModelPrice = table_data.models[model_id]
+    caps = caps_for(model_id)
+    provider = row.provider
     model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
-
-    row = _ModelRow(
-        model_id=model_id,
-        provider=provider,
-        context_window=caps.context_window,
-        input_per_1m=price.input_per_1k * 1000,
-        output_per_1m=price.output_per_1k * 1000,
-        cached_input_per_1m=(
-            price.cached_input_per_1k * 1000 if price.cached_input_per_1k is not None else None
-        ),
-        supports_tools=caps.supports_tools,
-        supports_vision=caps.supports_vision,
-        notes=caps.notes,
-        in_pricing_table=in_pricing,
-    )
 
     if output_format == TableJson.JSON:
         sys.stdout.write(json.dumps(row.to_dict(), indent=2) + "\n")
