@@ -28,12 +28,14 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 9 | Response cache — `CacheProvider` adapter (exact + optional semantic), Redis/Postgres-backed | feature | M (~35m) | — | ✅ | #378 | `2026.5.23.25` |
 | 10 | Continuous eval + drift alerting — scheduler enqueues eval-job on cadence/publish; baseline-diff; alerts | 016.D2 | L (~1–1.5h, 1 PR) | #2, scheduler | ✅ | #380 | `2026.5.23.27` |
 
-> ✅ **Next-10 arc complete** (`2026.5.23.13` → `.27`). The continuous-eval
-> scheduler (item 10) shipped the portable cron-tick + enqueue primitive
-> (`core/scheduler.py`); item 11 (#382, `.29`) generalized it into the
-> orchestration substrate — `JobSchedule` + `mdk schedule`/`scheduler-tick`
-> enqueuing arbitrary agent/workflow jobs. **Item 13 (event/webhook triggers)
-> is next** — it reuses item 11's `build_scheduled_job`/`enqueue_due` path.
+> ✅ **Next-10 arc complete** (`2026.5.23.13` → `.27`). Orchestration substrate
+> (ADR 017 D2) now landed: item 11 (#382, `.29`) generalized item 10's cron-tick
+> into `JobSchedule` + `mdk schedule`/`scheduler-tick`; item 13 (#384, `.31`)
+> added inbound event/webhook triggers (HMAC-signed fire endpoint) that enqueue
+> the same `JobRecord` shape. **Item 12 (canary / champion–challenger) is next**
+> — independent (registry + obs + scopes all merged), it closes the ADR 016
+> improvement loop (harvest → continuous-eval/drift → safe progressive promote).
+> Item 14 (durable + HITL) is the remaining orchestration capstone (depends on 11+13).
 
 ## Items 11+ (sequenced; orchestration ADR 017 woven in by leverage/dependency)
 
@@ -41,7 +43,7 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 |---|------|-----------|--------------|------------|--------|----|--------|
 | 11 | **Generalize the scheduler** — cron→enqueue arbitrary agent/workflow jobs (ACA Jobs substrate); extends item 10's eval scheduler | 017.D2 / 016 | L (~1h) 🔒 | #10 | ✅ | #382 | `2026.5.23.29` |
 | 12 | Canary / champion–challenger (version-tagged runs, weighted routing, assisted-promote) — completes the improvement loop | 016.D3 | L (~1–1.5h) | registry, obs, scopes | ⬜ | | `____` |
-| 13 | Event / webhook triggers — run an agent/workflow on an inbound event | 017.D2 | M (~35m) | #11 | ⬜ | | `____` |
+| 13 | Event / webhook triggers — run an agent/workflow on an inbound event | 017.D2 | M (~35m) | #11 | ✅ | #384 | `2026.5.23.31` |
 | 14 | Durable + HITL — `HUMAN` node pause/persist/resume-on-signal (long, human-gated pipelines) | 017.D5 / #28 | L (~1.5–2h, ~2 PRs) | #11, #13 | ⬜ | | `____` |
 | 15 | External-orchestrator adapter pack — `mdk[prefect]` task + `mdk[airflow]` `MovateAgentOperator` + webhook contract (movate as a *callable*, no core dep) | 017.D3 | M–L (~45m) 🔒 | — | ⬜ | | `____` |
 | 16 | Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) | scopes | ⬜ | | `____` |
