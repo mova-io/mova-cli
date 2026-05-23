@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, File, Request, Response, UploadFile
@@ -91,8 +91,14 @@ from movate.runtime.schemas import (
     KbSearchView,
     KbStatsSourceView,
     KbStatsView,
+    ModelCatalogView,
+    ModelInfoView,
+    PricingEntryView,
+    PricingView,
     ReadyView,
     RunAccepted,
+    RunExplainLlmCallView,
+    RunExplainView,
     RunSubmission,
     RunTraceView,
     RunView,
@@ -108,6 +114,9 @@ from movate.runtime.skill_creation import (
     persist_skill_bundle,
 )
 from movate.storage.base import StorageProvider
+
+if TYPE_CHECKING:
+    from movate.providers.model_catalog import ModelInfo
 
 
 def _github_is_enabled() -> bool:
@@ -340,6 +349,25 @@ def _eval_record_to_view(record: EvalRecord) -> EvalScorecardView:
         sample_count=record.sample_count,
         total_cost_usd=record.total_cost_usd,
         created_at=record.created_at.isoformat(),
+    )
+
+
+def _model_info_to_view(info: ModelInfo) -> ModelInfoView:
+    """Map a :class:`movate.providers.model_catalog.ModelInfo` to the wire
+    view. Shared by the catalog-list and single-model endpoints so both
+    map fields identically.
+    """
+    return ModelInfoView(
+        model_id=info.model_id,
+        provider=info.provider,
+        context_window=info.context_window,
+        input_per_1m=info.input_per_1m,
+        output_per_1m=info.output_per_1m,
+        cached_input_per_1m=info.cached_input_per_1m,
+        supports_tools=info.supports_tools,
+        supports_vision=info.supports_vision,
+        notes=info.notes,
+        in_pricing_table=info.in_pricing_table,
     )
 
 
@@ -2702,6 +2730,156 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Model catalog + pricing (BACKLOG #67 / #68) — read-only mirrors of
+    # the ``mdk models`` / ``mdk pricing`` CLI surfaces. Static data
+    # (no storage / tenant scoping) but auth-gated for consistency. The
+    # catalogue is the shared movate.providers.model_catalog module — the
+    # same source of truth the CLI uses (runtime never imports cli).
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/pricing",
+        response_model=PricingView,
+        tags=["catalog-v1"],
+    )
+    async def v1_get_pricing(
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> PricingView:
+        """Return the packaged model pricing table.
+
+        Serialises :func:`movate.providers.pricing.load_pricing` — the
+        versioned ``pricing.yaml`` MDK uses to cost every run. Per-1K-token
+        units, one entry per model (sorted by model id). For per-1M-token
+        prices + capability metadata use ``GET /api/v1/models`` instead.
+
+        Errors:
+
+        * **401** — bad / missing bearer token
+        """
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        table = load_pricing()
+        entries = [
+            PricingEntryView(
+                model_id=model_id,
+                input_per_1k=price.input_per_1k,
+                output_per_1k=price.output_per_1k,
+                cached_input_per_1k=price.cached_input_per_1k,
+            )
+            for model_id, price in sorted(table.models.items())
+        ]
+        return PricingView(
+            version=table.version,
+            last_verified=table.last_verified,
+            entries=entries,
+            count=len(entries),
+        )
+
+    @v1.get(
+        "/models",
+        response_model=ModelCatalogView,
+        tags=["catalog-v1"],
+    )
+    async def v1_list_models(
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ModelCatalogView:
+        """List every model in the catalog: pricing + capabilities.
+
+        Combines the pricing table with capability metadata (context
+        window, tool-use, vision) — the same view ``mdk models list``
+        renders. Sorted by ``(provider, model_id)``.
+
+        Errors:
+
+        * **401** — bad / missing bearer token
+        """
+        from movate.providers.model_catalog import model_catalog  # noqa: PLC0415
+
+        views = [_model_info_to_view(info) for info in model_catalog()]
+        return ModelCatalogView(models=views, count=len(views))
+
+    @v1.get(
+        "/models/{model_id:path}",
+        response_model=ModelInfoView,
+        tags=["catalog-v1"],
+    )
+    async def v1_get_model(
+        model_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ModelInfoView:
+        """Pricing + capabilities for one model.
+
+        Mirrors ``mdk models show <model_id>``. ``model_id`` is the full
+        LiteLLM provider string (e.g. ``anthropic/claude-sonnet-4-6``);
+        the ``:path`` converter lets the embedded slash through.
+
+        Errors:
+
+        * **401** — bad / missing bearer token
+        * **404** — model not in the catalog
+        """
+        from movate.providers.model_catalog import model_info  # noqa: PLC0415
+
+        info = model_info(model_id)
+        if info is None:
+            raise not_found("model", model_id)
+        return _model_info_to_view(info)
+
+    # ------------------------------------------------------------------
+    # Run explain (BACKLOG #66) — read-only mirror of ``mdk explain``.
+    # The decision chain for a stored run, tenant-scoped at the storage
+    # layer (a cross-tenant id returns 404, never 403). The record→dict
+    # logic is the shared movate.core.explain.explain_run seam.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/runs/{run_id}/explain",
+        response_model=RunExplainView,
+        tags=["runs-v1"],
+    )
+    async def v1_explain_run(
+        run_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        steps: bool = False,
+    ) -> RunExplainView:
+        """Return the decision chain for a stored run.
+
+        Mirrors ``mdk explain <run_id> --json``: identity + status, input,
+        the LLM-call summary, output (or error), and the per-step
+        ``skill_calls``. Pass ``?steps=true`` to embed the full skill-call
+        breakdown; otherwise a one-line ``skill_calls_hint`` summarises the
+        count.
+
+        Tenant-scoped at the storage layer — a cross-tenant id returns 404
+        (never 403), so the existence of another tenant's run never leaks.
+
+        Errors:
+
+        * **401** — bad / missing bearer token
+        * **404** — no run matches the id for this tenant
+        """
+        from movate.core.explain import explain_run  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_run(run_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("run", run_id)
+        chain = explain_run(record, steps=steps)
+        return RunExplainView(
+            run_id=chain["run_id"],
+            agent=chain["agent"],
+            agent_version=chain["agent_version"],
+            status=chain["status"],
+            input=chain["input"],
+            llm_call=RunExplainLlmCallView(**chain["llm_call"]),
+            output=chain["output"],
+            error=chain["error"],
+            skill_calls=chain.get("skill_calls"),
+            skill_calls_hint=chain.get("skill_calls_hint"),
+        )
 
     # ------------------------------------------------------------------
     # Auth key management — admin-only (scope="fleet-admin" required).

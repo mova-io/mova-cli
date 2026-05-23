@@ -25,6 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from movate.cli._runtime import build_storage
+from movate.core.explain import explain_run
 from movate.core.models import JobStatus, RunRecord, SkillCallRecord
 
 console = Console()
@@ -123,34 +124,14 @@ async def _resolve(storage: Any, *, run_id: str | None, last: bool) -> RunRecord
 
 
 def _to_json(record: RunRecord, *, steps: bool = False) -> str:
-    """Machine-readable representation of the decision chain."""
-    m = record.metrics
-    chain: dict[str, Any] = {
-        "run_id": record.run_id,
-        "agent": record.agent,
-        "agent_version": record.agent_version,
-        "status": record.status,
-        "input": record.input,
-        "llm_call": {
-            "model": m.provider,
-            "tokens_in": m.tokens.input,
-            "tokens_out": m.tokens.output,
-            "tokens_cached": m.tokens.cached_input,
-            "latency_ms": m.latency_ms,
-            "cost_usd": m.cost_usd,
-        },
-        "output": record.output,
-        "error": record.error.model_dump() if record.error else None,
-    }
-    if steps:
-        chain["skill_calls"] = [s.model_dump() for s in (record.skill_calls or [])]
-    else:
-        chain["skill_calls_hint"] = (
-            f"{len(record.skill_calls)} skill call(s) — add --steps to include details"
-            if record.skill_calls
-            else "no skill calls (single-shot agent)"
-        )
-    return json.dumps(chain, indent=2, default=str)
+    """Machine-readable representation of the decision chain.
+
+    Thin wrapper over :func:`movate.core.explain.explain_run` (the shared
+    record→dict seam reused by the runtime's ``/runs/{id}/explain`` endpoint)
+    that serialises the resulting dict to the pretty JSON string
+    ``console.print_json`` expects.
+    """
+    return json.dumps(explain_run(record, steps=steps), indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
