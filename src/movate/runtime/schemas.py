@@ -898,6 +898,58 @@ class AgentDatasetUploadView(BaseModel):
     """First up to 3 rows, for a quick sanity-check in the UI."""
 
 
+class HarvestedCaseView(BaseModel):
+    """One *proposed* eval case in a harvest response (ADR 016 D1).
+
+    A superset of an ``evals/dataset.jsonl`` row: ``input`` + optional
+    ``expected`` are the eval-case fields; ``needs_review`` + ``provenance``
+    are the harvest audit fields a human reads before accepting. This view is
+    a *proposal* — the harvest endpoint never writes it to the stored dataset.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: dict[str, Any]
+    """The source run's input — becomes the eval case input verbatim."""
+    expected: dict[str, Any] | None = None
+    """Suggested reference output. Set ONLY for thumbs-up golden cases (the
+    prod output); ``None`` for needs-review cases so a human supplies it."""
+    needs_review: bool
+    """``True`` when a human must supply / confirm ``expected`` before the
+    case is trustworthy — always ``True`` except thumbs-up golden cases."""
+    provenance: dict[str, Any]
+    """Audit block: ``source_run_id``, the ``source`` signal, the feedback
+    score/comment (when any), and the known prod output."""
+
+
+class HarvestView(BaseModel):
+    """``POST /api/v1/agents/{name}/dataset/harvest`` response (ADR 016 D1).
+
+    Returns the proposed cases as JSON. **Does NOT modify the stored
+    dataset** — acceptance is a deliberate follow-up call to the existing
+    dataset-upload endpoint (``POST /api/v1/agents/{name}/dataset``). The
+    human-review gate is the core anti-poisoning safety property.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    source: str
+    """The selection signal used: thumbs-down | thumbs-up | low-score | sample."""
+    proposed_count: int
+    """Number of proposed cases returned (== ``len(cases)``)."""
+    needs_review_count: int
+    """How many proposed cases need a human to supply / confirm ``expected``."""
+    runs_considered: int
+    """How many candidate runs the selection looked at."""
+    applied: bool = False
+    """Always ``False`` — a harvest proposes, it never applies. Present so the
+    contract makes the proposed-not-applied guarantee explicit to clients."""
+    cases: list[HarvestedCaseView]
+    """The proposed cases. Review, then POST the accepted subset to the
+    dataset-upload endpoint to land them in ``evals/dataset.jsonl``."""
+
+
 # ---------------------------------------------------------------------------
 # KB upload wire types
 # ---------------------------------------------------------------------------
