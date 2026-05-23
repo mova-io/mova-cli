@@ -26,6 +26,7 @@ import asyncio
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -404,8 +405,9 @@ def kb_root(ctx: typer.Context) -> None:
 # is reachable by `mdk run` later without per-call tenant juggling.
 _DEFAULT_TENANT = "local"
 
-# HTTP status codes used by the --target remote-upload path.
+# HTTP status codes used by the --target remote paths.
 _HTTP_OK = 200
+_HTTP_REDIRECT = 300  # first non-2xx status — 2xx success is [200, 300).
 _HTTP_UNAUTHORIZED = 401
 _HTTP_NOT_FOUND = 404
 
@@ -432,6 +434,117 @@ async def _build_storage() -> object:
     s = build_storage()
     await s.init()
     return s
+
+
+def _resolve_target_bearer(target: str) -> tuple[str, object, str, str]:
+    """Resolve a ``--target`` name into ``(target_name, target_cfg, base_url, bearer)``.
+
+    Shared by every ``mdk kb <cmd> --target`` path. Reads the target's
+    URL + ``key_env`` from ``~/.movate/config.yaml`` and the bearer
+    token from the env var named by ``key_env``. Exits with code 2 (and
+    an actionable hint) when the target is unknown or the bearer env var
+    is empty — the same failure surface the original ``_ingest_remote``
+    presented.
+    """
+    import os  # noqa: PLC0415
+
+    from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
+
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        err_console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    if not api_key:
+        err_console.print(
+            f"[red]✗[/red] env var [bold]${target_cfg.key_env}[/bold] is empty — "
+            f"needed to authenticate to [bold]{target_name}[/bold]. "
+            f"Run [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    base_url = target_cfg.url.rstrip("/")
+    return target_name, target_cfg, base_url, api_key
+
+
+def _remote_request(
+    *,
+    method: str,
+    target: str,
+    path: str,
+    agent: str,
+    params: dict[str, Any] | None = None,
+    json: dict[str, Any] | None = None,
+    files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+    timeout_s: float = 60.0,
+) -> tuple[str, dict[str, Any]]:
+    """Make an authenticated request to a deployed runtime's KB endpoint.
+
+    Factored out of :func:`_ingest_remote` so every ``--target`` path
+    (ingest / list / stats / search / clear) shares one resolve-target
+    → bearer → httpx → error-handling pipeline. Returns
+    ``(target_name, body)`` where ``body`` is the parsed JSON response
+    (``{}`` when the runtime returns an empty body).
+
+    Translates the standard runtime failure surface into actionable CLI
+    errors, exiting with code 2:
+
+    * **401** — bearer rejected → hint to refresh the runtime key.
+    * **404** — agent not on the target → hint to deploy it first.
+    * any other non-2xx → raw status + truncated body.
+    * network error → unreachable-target message.
+
+    ``path`` is the URL path AFTER the base URL (e.g.
+    ``/api/v1/agents/<agent>/kb``). ``params`` become the query string;
+    ``json`` is sent as the request body; ``files`` is a multipart
+    upload list (only one of ``json`` / ``files`` should be set).
+    """
+    import httpx  # noqa: PLC0415
+
+    target_name, target_cfg, base_url, api_key = _resolve_target_bearer(target)
+    endpoint = f"{base_url}{path}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Drop None-valued query params so an unset ``--source`` doesn't
+    # serialise as ``?source=`` (which the runtime would treat as the
+    # empty-string source filter rather than "no filter").
+    clean_params = {k: v for k, v in (params or {}).items() if v is not None}
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(timeout_s)) as client:
+            resp = client.request(
+                method.upper(),
+                endpoint,
+                params=clean_params or None,
+                json=json,
+                files=files,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        err_console.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code == _HTTP_UNAUTHORIZED:
+        err_console.print(
+            f"[red]✗[/red] runtime rejected the bearer (${target_cfg.key_env}). "  # type: ignore[attr-defined]
+            f"Refresh it: [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
+        )
+        raise typer.Exit(code=2)
+    if resp.status_code == _HTTP_NOT_FOUND:
+        err_console.print(
+            f"[red]✗[/red] agent [bold]{agent}[/bold] not found on "
+            f"[bold]{target_name}[/bold]. Deploy it first: "
+            f"[bold]mdk deploy --target {target_name}[/bold]."
+        )
+        raise typer.Exit(code=2)
+    if not (_HTTP_OK <= resp.status_code < _HTTP_REDIRECT):
+        err_console.print(f"[red]✗[/red] HTTP {resp.status_code}: {resp.text[:200]}")
+        raise typer.Exit(code=2)
+
+    body = resp.json() if resp.content else {}
+    return target_name, body if isinstance(body, dict) else {}
 
 
 def _estimate_embedding_cost(files: list[Path]) -> float:
@@ -462,28 +575,14 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
     (Azure Postgres in prod), so this needs no local embedding key or DB
     connection — just the target's URL + bearer. We only filter the files
     by supported extension client-side; the runtime does the parsing.
+
+    Resolve-target / bearer / httpx / 401-404 handling is delegated to
+    the shared :func:`_remote_request` helper (which the other
+    ``--target`` paths also use); this function owns only the
+    KB-upload-specific bits: file discovery, the dry-run preview, and the
+    per-file summary rendering.
     """
-    import os  # noqa: PLC0415
-
-    import httpx  # noqa: PLC0415
-
-    from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
     from movate.kb.parsers import is_supported_extension  # noqa: PLC0415
-
-    try:
-        target_name, target_cfg = resolve_target(target)
-    except UserConfigError as exc:
-        err_console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(code=2) from None
-
-    api_key = os.environ.get(target_cfg.key_env, "").strip()
-    if not api_key:
-        err_console.print(
-            f"[red]✗[/red] env var [bold]${target_cfg.key_env}[/bold] is empty — "
-            f"needed to authenticate to [bold]{target_name}[/bold]. "
-            f"Run [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
-        )
-        raise typer.Exit(code=2)
 
     # Discover supported files under `path` (the runtime parses them; we
     # only filter by extension so we don't upload junk). Hidden dirs skipped.
@@ -503,43 +602,30 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
         )
         raise typer.Exit(code=2)
 
-    base_url = target_cfg.url.rstrip("/")
-    endpoint = f"{base_url}/api/v1/agents/{agent}/kb"
+    endpoint_path = f"/api/v1/agents/{agent}/kb"
 
     if dry_run:
-        console.print(f"[bold]Would upload {len(uploadable)} file(s)[/bold] to {endpoint}:")
+        # Resolve the target for the endpoint URL in the preview message,
+        # but don't upload anything.
+        _name, _cfg, base_url, _key = _resolve_target_bearer(target)
+        console.print(
+            f"[bold]Would upload {len(uploadable)} file(s)[/bold] to {base_url}{endpoint_path}:"
+        )
         for p in uploadable:
             console.print(f"  • {p.name}")
         console.print("[dim](dry-run — nothing uploaded)[/dim]")
         return
 
     files = [("files", (p.name, p.read_bytes(), "application/octet-stream")) for p in uploadable]
-    headers = {"Authorization": f"Bearer {api_key}"}
-    try:
-        with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
-            resp = client.post(endpoint, files=files, headers=headers)
-    except httpx.HTTPError as exc:
-        err_console.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
-        raise typer.Exit(code=2) from None
-
-    if resp.status_code == _HTTP_UNAUTHORIZED:
-        err_console.print(
-            f"[red]✗[/red] runtime rejected the bearer (${target_cfg.key_env}). "
-            f"Refresh it: [bold]mdk auth refresh-runtime-key {target_name}[/bold]."
-        )
-        raise typer.Exit(code=2)
-    if resp.status_code == _HTTP_NOT_FOUND:
-        err_console.print(
-            f"[red]✗[/red] agent [bold]{agent}[/bold] not found on "
-            f"[bold]{target_name}[/bold]. Deploy it first: "
-            f"[bold]mdk deploy --target {target_name}[/bold]."
-        )
-        raise typer.Exit(code=2)
-    if resp.status_code != _HTTP_OK:
-        err_console.print(f"[red]✗[/red] HTTP {resp.status_code}: {resp.text[:200]}")
-        raise typer.Exit(code=2)
-
-    body = resp.json() if resp.content else {}
+    target_name, body = _remote_request(
+        method="POST",
+        target=target,
+        path=endpoint_path,
+        agent=agent,
+        files=files,
+        timeout_s=180.0,
+    )
+    endpoint = endpoint_path
     results = body.get("files", []) if isinstance(body, dict) else []
     total = body.get("total_chunks_saved", 0) if isinstance(body, dict) else 0
     console.print(f"[bold]Uploaded to {target_name}[/bold] [dim]({endpoint})[/dim]")
@@ -559,6 +645,235 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
         f"files={len(results)} ingested={ingested} skipped={skipped} "
         f"chunks_saved={total} ok=true[/dim]"
     )
+
+
+def _list_remote(*, agent: str, target: str, source: str | None, limit: int) -> None:
+    """``mdk kb list --target`` — list a deployed agent's KB chunks.
+
+    Calls ``GET /api/v1/agents/<agent>/kb`` and renders the same table
+    shape as the local path. The runtime omits embedding vectors, so the
+    response is small even for large KBs. Tenant scoping is the runtime's
+    auth tenant, not the local ``--tenant-id``.
+    """
+    target_name, body = _remote_request(
+        method="GET",
+        target=target,
+        path=f"/api/v1/agents/{agent}/kb",
+        agent=agent,
+        params={"source": source, "limit": limit},
+    )
+    chunks = body.get("chunks", []) if isinstance(body, dict) else []
+    if not chunks:
+        err_console.print(
+            f"[yellow]⚠[/yellow] no chunks for agent [bold]{agent}[/bold] "
+            f"on [bold]{target_name}[/bold]. Run [bold]mdk kb ingest {agent} "
+            f"<path> --target {target_name}[/bold] first."
+        )
+        return
+
+    table = Table(
+        title=(
+            f"[bold]KB chunks[/bold] — agent [bold]{agent}[/bold] "
+            f"[dim](on {target_name}, {len(chunks)} shown)[/dim]"
+        ),
+        show_lines=True,
+    )
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("source", overflow="fold", max_width=40)
+    table.add_column("len", justify="right", style="dim", no_wrap=True)
+    table.add_column("ocr", justify="center", style="dim", no_wrap=True)
+    table.add_column("preview", overflow="fold")
+    for i, c in enumerate(chunks, start=1):
+        text = c.get("text", "") if isinstance(c, dict) else ""
+        short = Path(c.get("source", "")).name if isinstance(c, dict) and c.get("source") else "?"
+        preview = (
+            text
+            if len(text) <= _CHUNK_PREVIEW_CHARS
+            else text[:_CHUNK_PREVIEW_CHARS].rstrip() + "…"
+        )
+        ocr_flag = "✓" if isinstance(c, dict) and c.get("ocr") else ""
+        table.add_row(str(i), short, str(len(text)), ocr_flag, preview)
+    console.print(table)
+
+
+def _stats_remote(*, agent: str, target: str, by_source: bool, top: int) -> None:
+    """``mdk kb stats --target`` — summarize a deployed agent's KB.
+
+    Calls ``GET /api/v1/agents/<agent>/kb/stats`` (aggregated
+    server-side) and renders the summary + per-source table. The remote
+    stats payload doesn't carry a "last ingested" timestamp (the runtime
+    aggregates counts, not max(created_at)), so that line is omitted here
+    — everything else mirrors the local view.
+    """
+    target_name, body = _remote_request(
+        method="GET",
+        target=target,
+        path=f"/api/v1/agents/{agent}/kb/stats",
+        agent=agent,
+    )
+    total_chunks = int(body.get("total_chunks", 0)) if isinstance(body, dict) else 0
+    if total_chunks == 0:
+        err_console.print(
+            f"[yellow]⚠[/yellow] no chunks for agent [bold]{agent}[/bold] "
+            f"on [bold]{target_name}[/bold]."
+        )
+        return
+
+    total_chars = int(body.get("total_chars", 0))
+    ocr_chunks = int(body.get("ocr_chunks", 0))
+    models = body.get("models", []) or []
+    sources = body.get("sources", []) or []
+
+    console.print(
+        f"\n[bold]KB summary[/bold] — agent [bold]{agent}[/bold] [dim](on {target_name})[/dim]"
+    )
+    console.print(f"  total chunks: [bold]{total_chunks}[/bold]")
+    console.print(f"  total chars:  [bold]{total_chars:,}[/bold]")
+    console.print(f"  sources:      [bold]{len(sources)}[/bold]")
+    console.print(f"  models:       [bold]{', '.join(models)}[/bold]")
+    ocr_pct = f"{ocr_chunks / total_chunks * 100:.0f}%" if ocr_chunks else "0%"
+    console.print(
+        f"  ocr chunks:   [bold]{ocr_chunks}[/bold] [dim]({ocr_pct} — "
+        "Tesseract-extracted from scanned-image PDFs)[/dim]"
+    )
+
+    title = (
+        "[bold]Per-source distribution[/bold] (top sources first)"
+        if by_source
+        else "[bold]Per-source breakdown[/bold]"
+    )
+    table = Table(title=title, show_lines=False)
+    table.add_column("source", overflow="fold")
+    table.add_column("chunks", justify="right", no_wrap=True)
+    if by_source:
+        table.add_column("% of total", justify="right", no_wrap=True)
+    table.add_column("chars", justify="right", no_wrap=True)
+    table.add_column("avg chunk len", justify="right", no_wrap=True)
+
+    # The runtime already returns sources sorted by chunk count DESC.
+    # Re-sort alphabetically for the default (non --by-source) breakdown
+    # to match the local command's ordering.
+    rows = list(sources)
+    if not by_source:
+        rows = sorted(rows, key=lambda r: r.get("source", ""))
+    if top > 0:
+        rows = rows[:top]
+
+    for row_data in rows:
+        src = row_data.get("source", "")
+        short = Path(src).name if src else "?"
+        count = int(row_data.get("chunks", 0))
+        chars = int(row_data.get("chars", 0))
+        avg = chars / count if count else 0
+        cells = [short, str(count)]
+        if by_source:
+            pct = (count / total_chunks * 100.0) if total_chunks else 0.0
+            cells.append(f"{pct:.1f}%")
+        cells.extend([f"{chars:,}", f"{avg:.0f}"])
+        table.add_row(*cells)
+
+    if top > 0 and len(sources) > top:
+        remainder = len(sources) - top
+        cells = [f"[dim]…and {remainder} more sources[/dim]", ""]
+        if by_source:
+            cells.append("")
+        cells.extend(["", ""])
+        table.add_row(*cells)
+
+    console.print(table)
+
+
+def _search_remote(
+    *, agent: str, target: str, question: str, k: int, hybrid: bool, show_full: bool
+) -> None:
+    """``mdk kb search --target`` — search a deployed agent's KB.
+
+    Calls ``POST /api/v1/agents/<agent>/kb/search``; the runtime embeds
+    the question server-side with ITS configured model (so no local
+    embedding key is required) and returns scored chunks. Renders the
+    same result table as the local path. Advanced local-only stages
+    (rewrite / rerank / multi-hop / trace) don't apply — the remote API
+    exposes only ``k`` + ``hybrid``.
+    """
+    target_name, body = _remote_request(
+        method="POST",
+        target=target,
+        path=f"/api/v1/agents/{agent}/kb/search",
+        agent=agent,
+        json={"question": question, "k": k, "hybrid": hybrid},
+    )
+    results = body.get("results", []) if isinstance(body, dict) else []
+    if not results:
+        err_console.print(
+            f"[yellow]⚠[/yellow] no chunks in [bold]{agent}[/bold]'s KB on "
+            f"[bold]{target_name}[/bold]. Did you run "
+            f"[bold]mdk kb ingest {agent} <path> --target {target_name}[/bold]?"
+        )
+        return
+
+    mode_label = "[bold magenta]" + ("hybrid" if hybrid else "vector") + "[/bold magenta]"
+    table = Table(
+        title=(
+            f'[bold]Top {len(results)} chunks[/bold] for "[italic]{question}[/italic]"'
+            f" — agent [bold]{agent}[/bold] [dim](on {target_name})[/dim] ({mode_label})"
+        ),
+        show_lines=True,
+    )
+    table.add_column("rank", justify="right", style="dim", no_wrap=True)
+    table.add_column("score", justify="right", style="bold")
+    table.add_column("source", overflow="fold", max_width=40)
+    table.add_column("text", overflow="fold")
+    for i, r in enumerate(results, start=1):
+        text = r.get("text", "") if isinstance(r, dict) else ""
+        score = float(r.get("score", 0.0)) if isinstance(r, dict) else 0.0
+        text_preview = (
+            text
+            if show_full or len(text) <= _CHUNK_PREVIEW_CHARS
+            else text[:_CHUNK_PREVIEW_CHARS].rstrip() + "…"
+        )
+        src = r.get("source", "") if isinstance(r, dict) else ""
+        short_source = Path(src).name if src else "?"
+        page = (r.get("metadata") or {}).get("page") if isinstance(r, dict) else None
+        if page is not None:
+            short_source = f"{short_source} p.{page}"
+        score_color = (
+            "green"
+            if score >= _SCORE_GREEN_THRESHOLD
+            else "yellow"
+            if score >= _SCORE_YELLOW_THRESHOLD
+            else "red"
+        )
+        table.add_row(
+            str(i),
+            f"[{score_color}]{score:.3f}[/{score_color}]",
+            short_source,
+            text_preview,
+        )
+    console.print(table)
+
+
+def _clear_remote(*, agent: str, target: str, source: str | None) -> None:
+    """``mdk kb clear --target`` — delete a deployed agent's KB chunks.
+
+    Calls ``DELETE /api/v1/agents/<agent>/kb`` (with ``?source=`` when a
+    source filter is supplied) and reports the count removed. The
+    confirmation prompt already fired in the command body before this
+    helper is reached.
+    """
+    target_name, body = _remote_request(
+        method="DELETE",
+        target=target,
+        path=f"/api/v1/agents/{agent}/kb",
+        agent=agent,
+        params={"source": source},
+    )
+    n = int(body.get("deleted", 0)) if isinstance(body, dict) else 0
+    if n == 0:
+        err_console.print(
+            f"[yellow]⚠[/yellow] no chunks matched on [bold]{target_name}[/bold]; nothing deleted."
+        )
+    else:
+        console.print(f"[green]✓[/green] deleted {n} chunk(s) on [bold]{target_name}[/bold].")
 
 
 @kb_app.command("ingest")
@@ -1298,6 +1613,19 @@ def search(
             "stage (negligible)."
         ),
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Search a DEPLOYED runtime's KB instead of the local store. "
+            "Resolves URL + bearer from ~/.movate/config.yaml and calls "
+            "POST /api/v1/agents/<agent>/kb/search; the runtime embeds the "
+            "question server-side with ITS configured model. Only --k and "
+            "--hybrid apply remotely — the runtime owns --model / "
+            "--api-key-env / --tenant-id and the advanced "
+            "rewrite/rerank/multi-hop/trace stages."
+        ),
+    ),
 ) -> None:
     """Semantic search over ``agent``'s KB. Prints top-K with scores.
 
@@ -1314,6 +1642,10 @@ def search(
     product names, error codes, or other rare terms. ``--rewrite N``
     fans out across N+1 LLM-generated paraphrases — best on vague
     or under-specified questions.
+
+    Pass ``--target`` to search a deployed agent's KB instead of the
+    local store — the runtime embeds the query server-side, so no local
+    embedding key is needed.
     """
     import os  # noqa: PLC0415
 
@@ -1340,6 +1672,19 @@ def search(
             raise typer.Exit(code=2)
     # ── End guided helpers ─────────────────────────────────────────────────
 
+    if target is not None:
+        # Remote search: the runtime embeds server-side, so no local
+        # embedding key is required. Only --k / --hybrid carry over.
+        _search_remote(
+            agent=agent,
+            target=target,
+            question=question,
+            k=k,
+            hybrid=hybrid,
+            show_full=show_full,
+        )
+        return
+
     api_key = os.environ.get(api_key_env, "").strip()
     if not api_key:
         err_console.print(
@@ -1358,7 +1703,7 @@ def search(
         storage = await _build_storage()
         try:
             results = await kb_search(
-                storage=storage,  # type: ignore[arg-type]
+                storage=storage,
                 question=question,
                 agent=agent,
                 tenant_id=tenant_id,
@@ -1373,7 +1718,7 @@ def search(
                 trace=trace,
             )
         finally:
-            await storage.close()  # type: ignore[attr-defined]
+            await storage.close()
 
         # Render the trace before the results table so the operator
         # sees timing context above the chunks (which can be long).
@@ -1460,11 +1805,22 @@ def list_chunks(
         "--tenant-id",
         help="Tenant scope (matches the value used at ingest).",
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Inspect a DEPLOYED runtime's KB instead of the local store. "
+            "Resolves URL + bearer from ~/.movate/config.yaml and calls "
+            "GET /api/v1/agents/<agent>/kb. The runtime scopes by its own "
+            "auth tenant, so --tenant-id is ignored on the remote path."
+        ),
+    ),
 ) -> None:
     """List chunks in ``agent``'s KB. Useful for debugging
     "is my content actually in there?" without dropping into SQL.
 
-    Omit ``agent`` for an interactive picker.
+    Omit ``agent`` for an interactive picker. Pass ``--target`` to list a
+    deployed agent's KB instead of the local store.
     """
     # ── Interactive guided helper ──────────────────────────────────────────
     if agent is None:
@@ -1473,17 +1829,21 @@ def list_chunks(
             raise typer.Exit(code=1)
     # ── End guided helper ──────────────────────────────────────────────────
 
+    if target is not None:
+        _list_remote(agent=agent, target=target, source=source, limit=limit)
+        return
+
     async def _run() -> None:
         storage = await _build_storage()
         try:
-            chunks = await storage.list_kb_chunks(  # type: ignore[attr-defined]
+            chunks = await storage.list_kb_chunks(
                 agent=agent,
                 tenant_id=tenant_id,
                 source=source,
                 limit=limit,
             )
         finally:
-            await storage.close()  # type: ignore[attr-defined]
+            await storage.close()
 
         if not chunks:
             err_console.print(
@@ -1548,6 +1908,17 @@ def stats(
             "Useful when an agent's KB has hundreds of source files."
         ),
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Summarize a DEPLOYED runtime's KB instead of the local store. "
+            "Resolves URL + bearer from ~/.movate/config.yaml and calls "
+            "GET /api/v1/agents/<agent>/kb/stats (aggregated server-side). "
+            "The runtime scopes by its own auth tenant, so --tenant-id is "
+            "ignored on the remote path."
+        ),
+    ),
 ) -> None:
     """Summary stats for ``agent``'s KB: chunk count, source
     breakdown, embedding model(s) in use, total + per-source character
@@ -1557,7 +1928,8 @@ def stats(
     distribution view (sorted by chunk count DESC with a %-of-total
     column) — quick triage for 'is one document dominating?'.
 
-    Omit ``agent`` for an interactive picker.
+    Omit ``agent`` for an interactive picker. Pass ``--target`` to
+    summarize a deployed agent's KB instead of the local store.
     """
     # ── Interactive guided helper ──────────────────────────────────────────
     if agent is None:
@@ -1566,17 +1938,21 @@ def stats(
             raise typer.Exit(code=1)
     # ── End guided helper ──────────────────────────────────────────────────
 
+    if target is not None:
+        _stats_remote(agent=agent, target=target, by_source=by_source, top=top)
+        return
+
     async def _run() -> None:
         storage = await _build_storage()
         try:
             # Pull ALL chunks (limit 100k) for accurate aggregation.
-            chunks = await storage.list_kb_chunks(  # type: ignore[attr-defined]
+            chunks = await storage.list_kb_chunks(
                 agent=agent,
                 tenant_id=tenant_id,
                 limit=100_000,
             )
         finally:
-            await storage.close()  # type: ignore[attr-defined]
+            await storage.close()
 
         if not chunks:
             err_console.print(f"[yellow]⚠[/yellow] no chunks for agent [bold]{agent}[/bold].")
@@ -2146,12 +2522,24 @@ def clear(
         "-y",
         help="Skip the confirmation prompt (CI / scripting).",
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Clear a DEPLOYED runtime's KB instead of the local store. "
+            "Resolves URL + bearer from ~/.movate/config.yaml and calls "
+            "DELETE /api/v1/agents/<agent>/kb (with ?source= when --source "
+            "is set). The runtime scopes by its own auth tenant, so "
+            "--tenant-id is ignored on the remote path."
+        ),
+    ),
 ) -> None:
     """Delete chunks from ``agent``'s KB. Use ``--source`` to remove
     just one document; omit for a full wipe. Confirmation required
     unless ``--yes`` is set.
 
-    Omit ``agent`` for an interactive picker.
+    Omit ``agent`` for an interactive picker. Pass ``--target`` to clear
+    a deployed agent's KB instead of the local store.
     """
     # ── Interactive guided helper ──────────────────────────────────────────
     if agent is None:
@@ -2160,28 +2548,34 @@ def clear(
             raise typer.Exit(code=1)
     # ── End guided helper ──────────────────────────────────────────────────
 
-    target = (
+    scope_label = (
         f"all chunks for agent [bold]{agent}[/bold]"
         if source is None
         else f"chunks from [bold]{source}[/bold] (agent [bold]{agent}[/bold])"
     )
+    if target is not None:
+        scope_label += f" on [bold]{target}[/bold]"
     if not yes:
         from rich.prompt import Confirm  # noqa: PLC0415
 
-        if not Confirm.ask(f"Delete {target}?", default=False):
+        if not Confirm.ask(f"Delete {scope_label}?", default=False):
             err_console.print("[dim]→ aborted.[/dim]")
             raise typer.Exit(code=0)
+
+    if target is not None:
+        _clear_remote(agent=agent, target=target, source=source)
+        return
 
     async def _run() -> None:
         storage = await _build_storage()
         try:
-            n = await storage.delete_kb_chunks(  # type: ignore[attr-defined]
+            n = await storage.delete_kb_chunks(
                 agent=agent,
                 tenant_id=tenant_id,
                 source=source,
             )
         finally:
-            await storage.close()  # type: ignore[attr-defined]
+            await storage.close()
         if n == 0:
             err_console.print("[yellow]⚠[/yellow] no chunks matched; nothing deleted.")
         else:

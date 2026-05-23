@@ -838,6 +838,130 @@ class KbIngestView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# KB remote-management wire types (Task 4) — list / stats / delete / search.
+# These power the ``--target`` paths on ``mdk kb list/stats/search/clear`` so
+# operators can manage a deployed agent's KB without SSH-ing to the host.
+# The embedding vectors are deliberately omitted from the wire shapes — they
+# bloat payloads (1536 floats/chunk) and no remote consumer needs them.
+# ---------------------------------------------------------------------------
+
+
+class KbChunkView(BaseModel):
+    """A single KB chunk's metadata for ``GET /api/v1/agents/{name}/kb``.
+
+    Mirrors the load-bearing fields of :class:`movate.core.models.KbChunk`
+    MINUS the ``embedding`` vector — list payloads are for inspection
+    ("is my content actually in there?"), not retrieval, so shipping
+    1536 floats per chunk is pure waste. Callers needing vectors run a
+    search instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str
+    source: str
+    text: str
+    embedding_model: str
+    content_hash: str
+    ocr: bool = False
+    metadata: dict[str, Any] | None = None
+    created_at: str
+    """ISO-8601 timestamp, serialised on the wire as a string."""
+
+
+class KbListView(BaseModel):
+    """``GET /api/v1/agents/{name}/kb`` response — chunk metadata list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    chunks: list[KbChunkView]
+    count: int
+    """Number of chunks returned (post ``?limit=`` / ``?source=`` filter)."""
+
+
+class KbStatsSourceView(BaseModel):
+    """Per-source aggregate row for ``GET /api/v1/agents/{name}/kb/stats``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    chunks: int
+    chars: int
+
+
+class KbStatsView(BaseModel):
+    """``GET /api/v1/agents/{name}/kb/stats`` response.
+
+    Aggregated SERVER-SIDE so the runtime never ships the whole corpus
+    over the wire just to count it — the CLI / Angular console render
+    this directly. ``models`` carries every distinct ``embedding_model``
+    present (usually one; more than one means a mixed-model KB that
+    needs a re-embed).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    total_chunks: int
+    total_chars: int
+    ocr_chunks: int
+    sources: list[KbStatsSourceView]
+    models: list[str]
+
+
+class KbDeletedView(BaseModel):
+    """``DELETE /api/v1/agents/{name}/kb`` response — count removed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    deleted: int
+    source: str | None = None
+    """Echoes the ``?source=`` filter when one was supplied; ``None``
+    means a full-KB wipe."""
+
+
+class KbSearchSubmission(BaseModel):
+    """``POST /api/v1/agents/{name}/kb/search`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+    k: int = Field(default=5, ge=1, le=50)
+    hybrid: bool = False
+    """Combine vector + BM25 lexical search via reciprocal rank fusion —
+    same flag as ``mdk kb search --hybrid``."""
+
+
+class KbSearchResultView(BaseModel):
+    """One scored chunk in a ``kb/search`` response. Like
+    :class:`KbChunkView` plus the similarity ``score``; the embedding
+    vector is omitted for the same payload-size reason."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str
+    source: str
+    text: str
+    embedding_model: str
+    score: float
+    ocr: bool = False
+    metadata: dict[str, Any] | None = None
+
+
+class KbSearchView(BaseModel):
+    """``POST /api/v1/agents/{name}/kb/search`` response — scored hits."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    question: str
+    results: list[KbSearchResultView]
+    count: int
+
+
+# ---------------------------------------------------------------------------
 # Auth key management wire types
 # ---------------------------------------------------------------------------
 
