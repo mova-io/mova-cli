@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Protocol
 
 from movate.core.models import (
+    AgentBundleRecord,
     ApiKeyRecord,
     BenchRecord,
     ConversationThread,
@@ -515,6 +516,88 @@ class StorageProvider(Protocol):
         is fine — operators delete a thread when they don't want to
         see it anymore, not when they want to nuke the historical
         runs themselves)."""
+
+    # ------------------------------------------------------------------
+    # Agent registry (ADR 014 D1) — durable, versioned agent bundles.
+    # A bundle is the small text files of a published agent stored as one
+    # immutable (name, version) row, tenant-scoped, on every backend. KB
+    # stays out of the bundle (it lives in pgvector, ADR 009). This is the
+    # storage layer only — runtime resolve-from-registry is a later step.
+    # ------------------------------------------------------------------
+
+    async def save_agent_bundle(self, bundle: AgentBundleRecord) -> None:
+        """Persist one published agent bundle as an immutable
+        ``(name, tenant_id, version)`` row.
+
+        Each publish writes a new row, so the table is also the version
+        history. Errors on a duplicate ``(name, tenant_id, version)`` —
+        a given version is written exactly once and never mutated.
+        """
+
+    async def get_agent_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> AgentBundleRecord | None:
+        """Fetch one agent bundle by ``name``, scoped to ``tenant_id``.
+
+        ``version=None`` returns the **latest** version (newest
+        ``created_at``); an explicit ``version`` returns that exact
+        version. Returns ``None`` if no match OR if the agent belongs to a
+        different tenant — same 404-not-403 contract as every other
+        single-record getter, so a caller can't probe for another
+        tenant's agents.
+        """
+
+    async def list_agents(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[AgentBundleRecord]:
+        """List the **latest version per agent name**, newest-first,
+        scoped to ``tenant_id``.
+
+        One row per distinct ``name`` (the most recently published
+        version of each), ordered by that version's ``created_at`` DESC.
+        Drives a registry listing — "what agents are published in this
+        tenant." ``limit`` caps the number of distinct agents returned.
+        """
+
+    async def list_agent_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[AgentBundleRecord]:
+        """List the version history for one agent ``name``, newest-first,
+        scoped to ``tenant_id``.
+
+        Returns every published version of ``name`` ordered by
+        ``created_at`` DESC (drives ``mdk agent history`` / rollback in a
+        later step). A cross-tenant or unknown ``name`` returns ``[]``
+        rather than raising — same no-leak contract as the getters.
+        """
+
+    async def delete_agent_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        """Delete agent bundle rows scoped to ``tenant_id``; return the
+        count deleted.
+
+        ``version=None`` removes **all** versions of ``name`` (deregister
+        the agent); an explicit ``version`` removes just that one version.
+        Tenant-scoped in WHERE so a caller can't delete another tenant's
+        agents by guessing names — a cross-tenant or unknown name deletes
+        nothing and returns ``0``.
+        """
 
     # ------------------------------------------------------------------
     # Knowledge graph (GraphRAG) — entities + relations layered over the

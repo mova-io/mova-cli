@@ -45,6 +45,7 @@ _PG_TABLES = (
     "failures",
     "evals",
     "bench",
+    "agent_bundles",
     "workflow_runs",
     "jobs",
     "api_keys",
