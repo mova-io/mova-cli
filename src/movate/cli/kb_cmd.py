@@ -456,6 +456,24 @@ def _resolve_target_bearer(target: str) -> tuple[str, object, str, str]:
         err_console.print(f"[red]✗[/red] {exc}")
         raise typer.Exit(code=2) from None
 
+    # OIDC targets (ADR 012 D4): obtain a short-lived JWT from a token
+    # provider (default: the Azure CLI) instead of reading the static
+    # ``key_env`` bearer. The default ``auth == "key"`` path below is
+    # byte-for-byte unchanged.
+    if getattr(target_cfg, "auth", "key") == "oidc":
+        from movate.core.oidc_provider import (  # noqa: PLC0415
+            OidcTokenError,
+            default_oidc_provider,
+        )
+
+        try:
+            bearer = default_oidc_provider().get_token(target_name, target_cfg)
+        except OidcTokenError as exc:
+            err_console.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=2) from None
+        base_url = target_cfg.url.rstrip("/")
+        return target_name, target_cfg, base_url, bearer
+
     api_key = os.environ.get(target_cfg.key_env, "").strip()
     if not api_key:
         err_console.print(

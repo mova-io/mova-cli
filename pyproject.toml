@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.23.1"
+version = "2026.5.23.2"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -92,6 +92,15 @@ runtime = [
     # (item 76) for the canonical-bundle creation flow. FastAPI
     # doesn't pull it in transitively — it's an explicit extra.
     "python-multipart>=0.0.9",
+    # Optional OIDC JWT acceptance (ADR 012 D3). The runtime can be
+    # configured (MOVATE_OIDC_ISSUER) to ALSO accept a federated OIDC
+    # JWT bearer alongside opaque mvt_* keys: validate the signature
+    # against the issuer's JWKS, check aud/iss/exp, map claims → tenant.
+    # PyJWT is MIT-licensed; the [crypto] extra pulls `cryptography`
+    # (already a core dep) for RS*/ES*/PS* asymmetric verification. Lives
+    # in the runtime extra (next to fastapi/uvicorn) and is only imported
+    # by the auth middleware — off entirely unless MOVATE_OIDC_ISSUER is set.
+    "PyJWT[crypto]>=2.8,<3",
 ]
 langfuse = ["langfuse>=2.30,<3"]
 keychain = [

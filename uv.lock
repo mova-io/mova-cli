@@ -2212,7 +2212,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.5.23.1"
+version = "2026.5.23.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -2287,6 +2287,7 @@ runtime = [
     { name = "bcrypt" },
     { name = "fastapi" },
     { name = "pgvector" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -2341,6 +2342,7 @@ requires-dist = [
     { name = "pgvector", marker = "extra == 'runtime'", specifier = ">=0.3" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pydantic", specifier = ">=2.6,<3" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'runtime'", specifier = ">=2.8,<3" },
     { name = "pypdf", specifier = ">=4.0,<6" },
     { name = "pytesseract", specifier = ">=0.3,<1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

@@ -29,6 +29,12 @@ from fastapi import Header, Response
 from movate.core.auth import ApiKeyParseError, check_record, parse_api_key
 from movate.core.rate_limit import NoOpRateLimiter, RateLimiter
 from movate.runtime.errors import auth_required, rate_limited
+from movate.runtime.oidc import (
+    OidcValidationError,
+    looks_like_jwt,
+    oidc_config,
+    validate_oidc_token,
+)
 from movate.storage.base import StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -94,6 +100,23 @@ def make_auth_dependency(
         if scheme.lower() != "bearer" or not token:
             logger.info("auth_failure reason=bad_scheme")
             raise auth_required()
+
+        # Token-shape branch (ADR 012 D3). The portable opaque ``mvt_*``
+        # path below is the default and is byte-for-byte unchanged. A JWT
+        # (``eyJ…``) is only *attempted* as OIDC when an issuer is
+        # configured (``MOVATE_OIDC_ISSUER``); a JWT presented with OIDC
+        # off — or anything that isn't a JWT — falls through to the opaque
+        # path, which fails parse and returns today's identical 401. The
+        # OIDC path returns early with an AuthContext built from the JWT's
+        # claims (no api_keys row, no touch, no rate-limit bucket — those
+        # are tied to the opaque-key model).
+        oidc_cfg = oidc_config()
+        if oidc_cfg is not None and looks_like_jwt(token):
+            try:
+                return validate_oidc_token(token, oidc_cfg)
+            except OidcValidationError as exc:
+                logger.info("auth_failure reason=%s", exc.reason)
+                raise auth_required() from None
 
         try:
             parsed = parse_api_key(token)

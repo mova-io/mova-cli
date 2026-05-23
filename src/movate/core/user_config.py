@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -61,6 +62,35 @@ class TargetConfig(BaseModel):
     key_env: str = Field(
         ...,
         description="Name of the env var that holds the bearer token (e.g. MOVATE_PROD_KEY).",
+    )
+
+    # --- Optional OIDC auth (ADR 012 D4) ----------------------------------
+    # Default ``"key"`` keeps the opaque-key path byte-for-byte unchanged for
+    # every existing target. ``"oidc"`` opts a target into federated auth: the
+    # CLI obtains a short-lived OIDC JWT from an OidcTokenProvider (default:
+    # `az account get-access-token`) instead of reading ``key_env``.
+    auth: Literal["key", "oidc"] = Field(
+        default="key",
+        description=(
+            "Bearer source: 'key' (default) reads key_env; 'oidc' obtains an "
+            "OIDC JWT via a token provider (default: the Azure CLI)."
+        ),
+    )
+    oidc_resource: str | None = Field(
+        default=None,
+        description=(
+            "Token audience/resource for OIDC auth (passed to "
+            "`az account get-access-token --resource`). Required when auth='oidc' "
+            "unless oidc_scope is set. Must match the runtime's MOVATE_OIDC_AUDIENCE."
+        ),
+    )
+    oidc_scope: str | None = Field(
+        default=None,
+        description=(
+            "OAuth2 scope for OIDC auth (passed to `az account get-access-token "
+            "--scope`). Alternative to oidc_resource for IdPs/flows that scope by "
+            "scope rather than resource."
+        ),
     )
 
     # --- Optional deploy config (used by `movate deploy`) -----------------
