@@ -109,6 +109,14 @@ class OidcConfig:
     tenant_claim: str
     env_claim: str | None
     default_env: str
+    scope_claim: str | None
+    """Claim carrying the token's least-privilege scopes (ADR 013 L2). Read
+    from ``MOVATE_OIDC_SCOPE_CLAIM`` (e.g. ``scp`` for Azure AD delegated
+    scopes, or ``roles`` for app roles). The claim value may be a
+    space-delimited string (the OAuth ``scope`` convention) or a JSON
+    list. When unset, or the claim is absent on the token, the OIDC
+    identity falls back to the legacy default ``{read, run, eval}`` — same
+    rule as a scopeless opaque key."""
 
 
 def oidc_config() -> OidcConfig | None:
@@ -134,6 +142,10 @@ def oidc_config() -> OidcConfig | None:
       ``MOVATE_OIDC_DEFAULT_ENV`` is used.
     * ``MOVATE_OIDC_DEFAULT_ENV`` — env value when no env claim resolves
       (default ``live``).
+    * ``MOVATE_OIDC_SCOPE_CLAIM`` — optional claim carrying the token's
+      authorization scopes (ADR 013 L2). Space-delimited string or JSON
+      list. When unset or absent on the token, the identity falls back to
+      the legacy default ``{read, run, eval}``.
     """
     issuer = os.environ.get("MOVATE_OIDC_ISSUER", "").strip()
     if not issuer:
@@ -142,12 +154,14 @@ def oidc_config() -> OidcConfig | None:
     tenant_claim = os.environ.get("MOVATE_OIDC_TENANT_CLAIM", "").strip() or "tid"
     env_claim = os.environ.get("MOVATE_OIDC_ENV_CLAIM", "").strip() or None
     default_env = os.environ.get("MOVATE_OIDC_DEFAULT_ENV", "").strip() or "live"
+    scope_claim = os.environ.get("MOVATE_OIDC_SCOPE_CLAIM", "").strip() or None
     return OidcConfig(
         issuer=issuer,
         audience=audience,
         tenant_claim=tenant_claim,
         env_claim=env_claim,
         default_env=default_env,
+        scope_claim=scope_claim,
     )
 
 
@@ -283,6 +297,8 @@ def validate_oidc_token(token: str, config: OidcConfig) -> AuthContext:
         if isinstance(env_value, str) and env_value:
             env = env_value
 
+    scopes = _map_scopes_from_claims(claims, config.scope_claim)
+
     # ``api_key_id`` is a stable, audit-friendly identity derived from the
     # subject; it deliberately is NOT a real ``mvt_*`` key id (OIDC tokens
     # have no row in the api_keys table).
@@ -290,8 +306,43 @@ def validate_oidc_token(token: str, config: OidcConfig) -> AuthContext:
         tenant_id=tenant_id,
         api_key_id=f"oidc:{sub}",
         env=env,
-        scope=None,
+        scopes=frozenset(scopes),
     )
+
+
+def _map_scopes_from_claims(claims: dict[str, object], scope_claim: str | None) -> set[str]:
+    """Resolve an OIDC token's authorization scopes (ADR 013 L2).
+
+    Mirrors the opaque-key back-compat rule
+    (:func:`movate.core.auth.effective_scopes`): when no scope claim is
+    configured, or the claim is absent / empty on the token, fall back to
+    the legacy default ``{read, run, eval}``. Otherwise read the claim,
+    which may be a **space-delimited string** (the OAuth ``scope``
+    convention, e.g. Azure AD's ``scp``) or a **JSON list** (e.g. Entra
+    app ``roles``).
+    """
+    # Imported lazily to keep this module importable without core.auth at
+    # module load (and to avoid any import-order surprises).
+    from movate.core.auth import (  # noqa: PLC0415
+        LEGACY_DEFAULT_SCOPES,
+        normalize_scopes,
+    )
+
+    if not scope_claim:
+        return set(LEGACY_DEFAULT_SCOPES)
+    raw = claims.get(scope_claim)
+    if isinstance(raw, str):
+        parts = raw.split()
+    elif isinstance(raw, (list, tuple)):
+        parts = [str(p) for p in raw]
+    else:
+        parts = []
+    normalized = normalize_scopes(parts)
+    if not normalized:
+        # Claim absent / empty / wrong type → legacy default, same as a
+        # scopeless key. (Fail-open to read/run/eval, never to admin.)
+        return set(LEGACY_DEFAULT_SCOPES)
+    return set(normalized)
 
 
 __all__ = [

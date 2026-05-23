@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import movate
-from movate.core.auth import mint_api_key
+from movate.core.auth import ALL_SCOPES, LEGACY_DEFAULT_SCOPES, mint_api_key
 from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
@@ -57,8 +57,12 @@ from movate.runtime.agent_resolver import (
 from movate.runtime.agent_resolver import (
     content_hash as _bundle_content_hash,
 )
-from movate.runtime.errors import auth_required, forbidden, not_found
-from movate.runtime.middleware import AuthContext, make_auth_dependency
+from movate.runtime.errors import ErrorCode, auth_required, http_error, not_found
+from movate.runtime.middleware import (
+    AuthContext,
+    make_auth_dependency,
+    require_scope,
+)
 from movate.runtime.registry import scan_agents
 from movate.runtime.schemas import (
     AgentCatalogItemView,
@@ -774,6 +778,16 @@ def build_app(
 
     auth_dep = make_auth_dependency(storage, rate_limiter=limiter)
 
+    # ``require_scope(auth_dep, ...)`` (ADR 013 L2) layers a per-endpoint
+    # scope check on top of ``auth_dep``. Passing the SAME ``auth_dep``
+    # object means the scope checker and the handler's own
+    # ``Depends(auth_dep)`` share FastAPI's per-request dependency cache —
+    # the bearer is parsed, the key looked up, and the rate limiter charged
+    # exactly once per request. Bind it once here so the call sites stay
+    # terse.
+    def _scope(*needed: str) -> Any:
+        return Depends(require_scope(auth_dep, *needed))
+
     # ------------------------------------------------------------------
     # /healthz — unauthed liveness probe
     # ------------------------------------------------------------------
@@ -869,7 +883,12 @@ def build_app(
     # ------------------------------------------------------------------
     # GET /agents — registry discovery
     # ------------------------------------------------------------------
-    @app.get("/agents", response_model=AgentListView, tags=["meta"])
+    @app.get(
+        "/agents",
+        response_model=AgentListView,
+        tags=["meta"],
+        dependencies=[_scope("read")],
+    )
     async def list_agents(
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
@@ -901,7 +920,13 @@ def build_app(
     # ------------------------------------------------------------------
     # POST /run — queue a job
     # ------------------------------------------------------------------
-    @app.post("/run", response_model=RunAccepted, tags=["jobs"], status_code=202)
+    @app.post(
+        "/run",
+        response_model=RunAccepted,
+        tags=["jobs"],
+        status_code=202,
+        dependencies=[_scope("run")],
+    )
     async def submit_run(
         body: RunSubmission,
         request: Request,
@@ -931,7 +956,12 @@ def build_app(
     # ------------------------------------------------------------------
     # GET /jobs/{id} — poll
     # ------------------------------------------------------------------
-    @app.get("/jobs", response_model=JobListView, tags=["jobs"])
+    @app.get(
+        "/jobs",
+        response_model=JobListView,
+        tags=["jobs"],
+        dependencies=[_scope("read")],
+    )
     async def list_jobs(
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
@@ -955,7 +985,12 @@ def build_app(
         views = [JobView.from_record(r) for r in records]
         return JobListView(jobs=views, count=len(views))
 
-    @app.get("/jobs/{job_id}", response_model=JobView, tags=["jobs"])
+    @app.get(
+        "/jobs/{job_id}",
+        response_model=JobView,
+        tags=["jobs"],
+        dependencies=[_scope("read")],
+    )
     async def get_job(
         job_id: str,
         request: Request,
@@ -971,7 +1006,12 @@ def build_app(
             raise not_found("job", job_id)
         return JobView.from_record(record)
 
-    @app.get("/runs/{run_id}", response_model=RunView, tags=["runs"])
+    @app.get(
+        "/runs/{run_id}",
+        response_model=RunView,
+        tags=["runs"],
+        dependencies=[_scope("read")],
+    )
     async def get_run(
         run_id: str,
         request: Request,
@@ -1006,6 +1046,7 @@ def build_app(
         response_model=FeedbackView,
         status_code=201,
         tags=["runs", "feedback"],
+        dependencies=[_scope("run")],
     )
     async def post_run_feedback(
         run_id: str,
@@ -1090,6 +1131,7 @@ def build_app(
         "/runs/{run_id}/feedback",
         response_model=FeedbackListView,
         tags=["runs", "feedback"],
+        dependencies=[_scope("read")],
     )
     async def list_run_feedback(
         run_id: str,
@@ -1138,6 +1180,7 @@ def build_app(
         "/agents",
         response_model=AgentCatalogView,
         tags=["agents-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_agents(
         request: Request,
@@ -1212,6 +1255,7 @@ def build_app(
         response_model=AgentCreatedView,
         status_code=201,
         tags=["agents-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_create_agent(
         request: Request,
@@ -1349,6 +1393,7 @@ def build_app(
         response_model=AgentCreatedView,
         status_code=201,
         tags=["agents-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_create_agent_from_wizard(
         body: WizardAgentSubmission,
@@ -1428,6 +1473,7 @@ def build_app(
         response_model=SkillCreatedView,
         status_code=201,
         tags=["skills-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_create_skill(
         request: Request,
@@ -1498,6 +1544,7 @@ def build_app(
         "/agents/{name}",
         response_model=AgentDetailView,
         tags=["agents-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_get_agent(
         name: str,
@@ -1542,6 +1589,9 @@ def build_app(
         "/agents/{name}/validate",
         response_model=AgentValidationView,
         tags=["agents-v1"],
+        # Read-only inspection (prompt lint + cost forecast; no mutation),
+        # so it gates on ``read`` despite being a POST.
+        dependencies=[_scope("read")],
     )
     async def v1_validate_agent(
         name: str,
@@ -1581,6 +1631,7 @@ def build_app(
         "/agents/{name}",
         response_model=AgentDeletedView,
         tags=["agents-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_delete_agent(
         name: str,
@@ -1633,6 +1684,7 @@ def build_app(
         "/agents/{name}",
         response_model=AgentUpdatedView,
         tags=["agents-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_update_agent(
         name: str,
@@ -1750,6 +1802,7 @@ def build_app(
         response_model=AgentDatasetUploadView,
         status_code=200,
         tags=["agents-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_upload_agent_dataset(
         name: str,
@@ -1841,6 +1894,7 @@ def build_app(
         response_model=KbIngestView,
         status_code=200,
         tags=["agents-v1", "kb"],
+        dependencies=[_scope("kb:write")],
     )
     async def v1_upload_agent_kb(
         name: str,
@@ -1987,6 +2041,7 @@ def build_app(
         "/agents/{name}/kb",
         response_model=KbListView,
         tags=["agents-v1", "kb"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_agent_kb(
         name: str,
@@ -2053,6 +2108,7 @@ def build_app(
         "/agents/{name}/kb/stats",
         response_model=KbStatsView,
         tags=["agents-v1", "kb"],
+        dependencies=[_scope("read")],
     )
     async def v1_agent_kb_stats(
         name: str,
@@ -2121,6 +2177,7 @@ def build_app(
         "/agents/{name}/kb",
         response_model=KbDeletedView,
         tags=["agents-v1", "kb"],
+        dependencies=[_scope("kb:write")],
     )
     async def v1_delete_agent_kb(
         name: str,
@@ -2160,6 +2217,9 @@ def build_app(
         "/agents/{name}/kb/search",
         response_model=KbSearchView,
         tags=["agents-v1", "kb"],
+        # Read-only retrieval over the corpus (no mutation), so it gates
+        # on ``read`` despite being a POST.
+        dependencies=[_scope("read")],
     )
     async def v1_search_agent_kb(
         name: str,
@@ -2227,6 +2287,7 @@ def build_app(
         "/agents/{name}/kb/reindex",
         response_model=KbReindexView,
         tags=["agents-v1", "kb"],
+        dependencies=[_scope("kb:write")],
     )
     async def v1_reindex_agent_kb(
         name: str,
@@ -2306,6 +2367,7 @@ def build_app(
         "/agents/{name}/publish",
         response_model=AgentPublishedView,
         tags=["agents-v1"],
+        dependencies=[_scope("admin")],
     )
     async def v1_publish_agent(
         name: str,
@@ -2407,6 +2469,7 @@ def build_app(
         "/agents/{name}/history",
         response_model=AgentHistoryView,
         tags=["agents-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_agent_history(
         name: str,
@@ -2515,6 +2578,7 @@ def build_app(
         # oneOf in OpenAPI so the Angular client can branch.
         response_model=RunAccepted | RunView,
         tags=["agents-v1"],
+        dependencies=[_scope("run")],
     )
     async def v1_agent_run(
         name: str,
@@ -2643,6 +2707,7 @@ def build_app(
         "/jobs",
         response_model=JobListView,
         tags=["jobs-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_jobs(
         request: Request,
@@ -2684,6 +2749,7 @@ def build_app(
         "/runs/{run_id}/trace",
         response_model=RunTraceView,
         tags=["runs-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_run_trace(
         run_id: str,
@@ -2756,6 +2822,7 @@ def build_app(
         response_model=EvalAcceptedView,
         status_code=202,
         tags=["evals-v1"],
+        dependencies=[_scope("eval")],
     )
     async def v1_kick_off_eval(
         name: str,
@@ -2860,6 +2927,7 @@ def build_app(
         "/evals/{eval_id}",
         response_model=EvalScorecardView,
         tags=["evals-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_get_eval(
         eval_id: str,
@@ -2886,6 +2954,7 @@ def build_app(
         "/evals",
         response_model=EvalListView,
         tags=["evals-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_evals(
         request: Request,
@@ -2924,6 +2993,7 @@ def build_app(
         response_model=BenchAcceptedView,
         status_code=202,
         tags=["bench-v1"],
+        dependencies=[_scope("eval")],
     )
     async def v1_kick_off_bench(
         agent: str,
@@ -2986,6 +3056,7 @@ def build_app(
         "/bench/{bench_id}",
         response_model=BenchResultView,
         tags=["bench-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_get_bench(
         bench_id: str,
@@ -3012,6 +3083,7 @@ def build_app(
         "/bench",
         response_model=BenchListView,
         tags=["bench-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_bench(
         request: Request,
@@ -3050,6 +3122,7 @@ def build_app(
         "/pricing",
         response_model=PricingView,
         tags=["catalog-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_get_pricing(
         ctx: AuthContext = Depends(auth_dep),
@@ -3088,6 +3161,7 @@ def build_app(
         "/models",
         response_model=ModelCatalogView,
         tags=["catalog-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_models(
         ctx: AuthContext = Depends(auth_dep),
@@ -3111,6 +3185,7 @@ def build_app(
         "/models/{model_id:path}",
         response_model=ModelInfoView,
         tags=["catalog-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_get_model(
         model_id: str,
@@ -3145,6 +3220,7 @@ def build_app(
         "/runs/{run_id}/explain",
         response_model=RunExplainView,
         tags=["runs-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_explain_run(
         run_id: str,
@@ -3189,20 +3265,23 @@ def build_app(
         )
 
     # ------------------------------------------------------------------
-    # Auth key management — admin-only (scope="fleet-admin" required).
+    # Auth key management — requires the ``admin`` scope (ADR 013 L2).
     #
-    # The calling key must carry scope="fleet-admin". Regular keys
-    # without that scope receive 403. Tenant isolation is still enforced:
-    # admin keys only see/manage keys for their own tenant.
+    # Pre-ADR-013 these gated on the single ``scope == "fleet-admin"``
+    # value. They now gate on the ``admin`` scope via ``require_scope``.
+    # Back-compat: a legacy key carrying only ``fleet-admin`` resolves
+    # (via ``effective_scopes``) to the full scope set — which INCLUDES
+    # ``admin`` — so existing fleet keys keep managing keys unchanged.
+    # Tenant isolation is still enforced: admin keys only see/manage
+    # keys for their own tenant.
     # ------------------------------------------------------------------
-
-    _ADMIN_SCOPE = "fleet-admin"  # noqa: N806 — local constant inside register-routes
 
     @v1.post(
         "/auth/keys",
         response_model=ApiKeyMintedView,
         status_code=201,
         summary="Mint a new API key for the calling tenant (admin only).",
+        dependencies=[_scope("admin")],
     )
     async def v1_mint_key(
         request: Request,
@@ -3214,15 +3293,29 @@ def build_app(
         The ``full_key`` in the response is shown **once** — it cannot
         be recovered. Store it immediately in your secrets vault.
 
-        The calling key must have ``scope="fleet-admin"``.
+        The calling key must carry the ``admin`` scope. ``body.scopes``
+        sets the new key's least-privilege grant; omit it to mint a key
+        with the legacy default ``{read, run, eval}``.
 
         Errors:
 
         * **401** — bad or missing bearer token
-        * **403** — authenticated but key lacks ``fleet-admin`` scope
+        * **403** — authenticated but key lacks the ``admin`` scope
+        * **422** — ``body.scopes`` contains an unknown scope string
         """
-        if ctx.scope != _ADMIN_SCOPE:
-            raise forbidden()
+        # Validate requested scopes against the known set (fail-closed on
+        # typos). Empty/omitted → legacy default at mint time.
+        requested = body.scopes if body.scopes is not None else list(LEGACY_DEFAULT_SCOPES)
+        unknown = [s for s in requested if s not in ALL_SCOPES]
+        if unknown:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    f"unknown scope(s): {', '.join(sorted(unknown))}. "
+                    f"Valid scopes: {', '.join(sorted(ALL_SCOPES))}."
+                ),
+            )
         store: StorageProvider = request.app.state.storage
         try:
             env = ApiKeyEnv(ctx.env)
@@ -3233,6 +3326,7 @@ def build_app(
             env=env,
             label=body.label,
             ttl_days=body.ttl_days,
+            scopes=requested,
         )
         await store.save_api_key(minted.record)
         return ApiKeyMintedView(
@@ -3248,6 +3342,7 @@ def build_app(
         "/auth/keys",
         response_model=ApiKeyListView,
         summary="List active API keys for the calling tenant (admin only).",
+        dependencies=[_scope("admin")],
     )
     async def v1_list_keys(
         request: Request,
@@ -3258,16 +3353,13 @@ def build_app(
 
         Pass ``include_revoked=true`` to show revoked keys too.
 
-        The calling key must have ``scope="fleet-admin"``.
+        The calling key must carry the ``admin`` scope.
 
         Errors:
 
         * **401** — bad or missing bearer token
-        * **403** — authenticated but key lacks ``fleet-admin`` scope
+        * **403** — authenticated but key lacks the ``admin`` scope
         """
-        if ctx.scope != _ADMIN_SCOPE:
-            raise forbidden()
-
         from datetime import UTC, datetime  # noqa: PLC0415
 
         store: StorageProvider = request.app.state.storage
@@ -3301,6 +3393,7 @@ def build_app(
         "/auth/keys/{key_id}",
         response_model=ApiKeyRevokedView,
         summary="Revoke an API key (admin only).",
+        dependencies=[_scope("admin")],
     )
     async def v1_revoke_key(
         request: Request,
@@ -3312,16 +3405,14 @@ def build_app(
         Idempotent — revoking an already-revoked key returns 200.
         Tenant-scoped: you can only revoke keys belonging to your tenant.
 
-        The calling key must have ``scope="fleet-admin"``.
+        The calling key must carry the ``admin`` scope.
 
         Errors:
 
         * **401** — bad or missing bearer token
-        * **403** — authenticated but key lacks ``fleet-admin`` scope
+        * **403** — authenticated but key lacks the ``admin`` scope
         * **404** — key not found or belongs to a different tenant
         """
-        if ctx.scope != _ADMIN_SCOPE:
-            raise forbidden()
         store: StorageProvider = request.app.state.storage
         record = await store.get_api_key(key_id)
         if record is None or record.tenant_id != ctx.tenant_id:
@@ -3353,7 +3444,8 @@ def build_app(
             key_id=ctx.api_key_id,
             tenant_id=ctx.tenant_id,
             env=ctx.env,
-            scope=None,
+            scope=ctx.scope,
+            scopes=sorted(ctx.scopes),
             label=record.label if record is not None else None,
             expires_at=record.expires_at if record is not None else None,
         )
@@ -3371,6 +3463,7 @@ def build_app(
         response_model=ThreadView,
         status_code=201,
         tags=["threads-v1"],
+        dependencies=[_scope("run")],
     )
     async def v1_create_thread(
         body: ThreadCreateSubmission,
@@ -3409,6 +3502,7 @@ def build_app(
         "/threads",
         response_model=ThreadListView,
         tags=["threads-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_list_threads(
         request: Request,
@@ -3440,6 +3534,7 @@ def build_app(
         "/threads/{thread_id}",
         response_model=ThreadView,
         tags=["threads-v1"],
+        dependencies=[_scope("read")],
     )
     async def v1_get_thread(
         thread_id: str,
@@ -3480,6 +3575,7 @@ def build_app(
         "/threads/{thread_id}",
         status_code=204,
         tags=["threads-v1"],
+        dependencies=[_scope("run")],
     )
     async def v1_delete_thread(
         thread_id: str,
@@ -3520,6 +3616,7 @@ def build_app(
         response_model=RunAccepted,
         status_code=202,
         tags=["threads-v1"],
+        dependencies=[_scope("run")],
     )
     async def v1_thread_submit_message(
         thread_id: str,

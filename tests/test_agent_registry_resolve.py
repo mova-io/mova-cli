@@ -24,7 +24,7 @@ pytest.importorskip("fastapi")  # skip whole module if runtime extras absent
 
 from fastapi.testclient import TestClient
 
-from movate.core.auth import ApiKeyEnv, mint_api_key
+from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.core.executor import Executor
 from movate.core.loader import load_agent
 from movate.core.models import AgentBundleRecord, JobKind, JobRecord, JobStatus
@@ -86,7 +86,9 @@ async def storage() -> InMemoryStorage:
 @pytest.fixture
 async def auth_setup(storage: InMemoryStorage):
     tenant_id = uuid4().hex
-    minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="resolve-tests")
+    minted = mint_api_key(
+        tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="resolve-tests", scopes=list(ALL_SCOPES)
+    )
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}, tenant_id
 

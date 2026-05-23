@@ -224,6 +224,13 @@ _MIGRATIONS = [
     # v0.8: permission scope. NULL = standard tenant key;
     # "fleet-admin" = admin-only endpoint access.
     "ALTER TABLE api_keys ADD COLUMN scope TEXT",
+    # ADR 013 L2: least-privilege scope SET (supersedes the single
+    # `scope` above). JSON-encoded list of scope strings; NULL/empty on a
+    # legacy row resolves to the default {read,run,eval} at read time via
+    # `effective_scopes` (no destructive backfill). sqlite has no native
+    # JSON column type, so TEXT holds `json.dumps(scopes)` — same pattern
+    # as runs.metrics / run_feedback.dimensions.
+    "ALTER TABLE api_keys ADD COLUMN scopes TEXT",
     # 0.8.2.11: operator feedback on runs. Chainlit playground writes
     # here; the analytics dashboard reads. Sqlite uses TEXT for the
     # JSONB-equivalent dimensions column (we serialize via json.dumps
@@ -1092,8 +1099,8 @@ class SqliteProvider:
             """
             INSERT INTO api_keys (
                 key_id, tenant_id, env, secret_hash, salt, label,
-                created_at, last_used_at, revoked_at, expires_at, scope
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, last_used_at, revoked_at, expires_at, scope, scopes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 key.key_id,
@@ -1107,6 +1114,10 @@ class SqliteProvider:
                 key.revoked_at.isoformat() if key.revoked_at else None,
                 key.expires_at.isoformat() if key.expires_at else None,
                 key.scope,
+                # Persist as a JSON array; empty list → NULL so a legacy
+                # read (and round-trip) is indistinguishable from a never-
+                # scoped row → resolves to the default at check time.
+                json.dumps(key.scopes) if key.scopes else None,
             ),
         )
         await self._db.commit()
@@ -2074,9 +2085,9 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
 
 
 def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
-    # expires_at and scope may be absent on rows from pre-migration schemas
-    # (before the ALTER TABLE migrations ran). dict() access raises KeyError
-    # for missing columns; use .get() via the keys() approach instead.
+    # expires_at, scope, and scopes may be absent on rows from pre-migration
+    # schemas (before the ALTER TABLE migrations ran). dict() access raises
+    # KeyError for missing columns; use .get() via the keys() approach instead.
     row_dict = dict(row)
     return ApiKeyRecord(
         key_id=row_dict["key_id"],
@@ -2096,7 +2107,27 @@ def _row_to_api_key(row: aiosqlite.Row) -> ApiKeyRecord:
             datetime.fromisoformat(row_dict["expires_at"]) if row_dict.get("expires_at") else None
         ),
         scope=row_dict.get("scope"),
+        # NULL / missing column → empty list (legacy default applies at
+        # check time via effective_scopes). Stored as a JSON array.
+        scopes=_decode_scopes(row_dict.get("scopes")),
     )
+
+
+def _decode_scopes(raw: object) -> list[str]:
+    """Decode the JSON-encoded ``scopes`` column → list of scope strings.
+
+    Tolerant of NULL/empty (legacy rows → ``[]``) and of a bare-string
+    legacy value (defensive — should always be a JSON array)."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if isinstance(decoded, list):
+            return [str(s) for s in decoded]
+    return []
 
 
 def _first_of_month_utc() -> datetime:

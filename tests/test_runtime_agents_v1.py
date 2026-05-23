@@ -36,7 +36,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from movate.core.auth import ApiKeyEnv, mint_api_key
+from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
@@ -74,6 +74,7 @@ async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
         tenant_id=uuid4().hex,
         env=ApiKeyEnv.LIVE,
         label="agents-v1-tests",
+        scopes=list(ALL_SCOPES),
     )
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}
@@ -469,7 +470,9 @@ async def test_create_without_agents_path_returns_503() -> None:
     await storage.init()
     # No agents_path kwarg — simulates a misconfigured deployment.
     client = TestClient(build_app(storage))
-    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-agents-path")
+    minted = mint_api_key(
+        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-agents-path", scopes=list(ALL_SCOPES)
+    )
     await storage.save_api_key(minted.record)
 
     r = client.post(

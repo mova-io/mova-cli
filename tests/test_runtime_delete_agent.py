@@ -26,7 +26,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from movate.core.auth import ApiKeyEnv, mint_api_key
+from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
@@ -52,7 +52,12 @@ def client(storage: InMemoryStorage, agents_path: Path) -> TestClient:
 
 @pytest.fixture
 async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
-    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="delete-agent-tests")
+    minted = mint_api_key(
+        tenant_id=uuid4().hex,
+        env=ApiKeyEnv.LIVE,
+        label="delete-agent-tests",
+        scopes=list(ALL_SCOPES),
+    )
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}
 
@@ -194,7 +199,12 @@ async def test_delete_without_agents_path_returns_503() -> None:
     a clear error_code, same as the create endpoint."""
     storage = InMemoryStorage()
     await storage.init()
-    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="no-agents-path-test")
+    minted = mint_api_key(
+        tenant_id=uuid4().hex,
+        env=ApiKeyEnv.LIVE,
+        label="no-agents-path-test",
+        scopes=list(ALL_SCOPES),
+    )
     await storage.save_api_key(minted.record)
     # Build app without agents_path (deliberate test misconfiguration)
     client = TestClient(build_app(storage))

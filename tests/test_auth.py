@@ -209,6 +209,31 @@ async def test_save_and_get_api_key(storage) -> None:
 
 
 @pytest.mark.unit
+async def test_save_and_get_api_key_round_trips_scopes(storage) -> None:
+    """ADR 013 L2: the ``scopes`` column round-trips on every backend
+    (memory + sqlite + postgres-when-available)."""
+    minted = mint_api_key(
+        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=["admin", "read", "kb:write"]
+    )
+    await storage.save_api_key(minted.record)
+    got = await storage.get_api_key(minted.record.key_id)
+    assert got is not None
+    assert sorted(got.scopes) == ["admin", "kb:write", "read"]
+
+
+@pytest.mark.unit
+async def test_legacy_null_scopes_round_trips_as_empty(storage) -> None:
+    """A scopeless key stores no scopes and reads back as an empty list —
+    indistinguishable from a pre-ADR-013 row, so ``effective_scopes`` can
+    apply the legacy default at check time (no destructive backfill)."""
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE)
+    await storage.save_api_key(minted.record)
+    got = await storage.get_api_key(minted.record.key_id)
+    assert got is not None
+    assert got.scopes == []
+
+
+@pytest.mark.unit
 async def test_get_api_key_returns_none_for_missing(storage) -> None:
     assert await storage.get_api_key("ghost") is None
 

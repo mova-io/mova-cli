@@ -26,7 +26,12 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._console import confirm_destructive, error, hint, success
-from movate.core.auth import mint_api_key
+from movate.core.auth import (
+    ALL_SCOPES,
+    LEGACY_DEFAULT_SCOPES,
+    mint_api_key,
+    normalize_scopes,
+)
 from movate.core.models import ApiKeyEnv, ApiKeyRecord
 from movate.storage import build_storage
 
@@ -41,11 +46,47 @@ auth_app = typer.Typer(
 )
 
 
+def _parse_scope_options(raw: list[str] | None) -> list[str]:
+    """Parse ``--scope`` input into a validated, normalized scope list.
+
+    Accepts the option repeated (``--scope read --scope run``) AND/OR
+    comma-lists (``--scope read,run``) — both forms compose. ``None`` /
+    empty (the option omitted) → the legacy default ``{read, run, eval}``,
+    documented as the sensible least-privilege starting grant that matches
+    how scopeless keys already behave. An unknown scope string is a hard
+    error (fail-closed on typos).
+    """
+    if not raw:
+        return sorted(LEGACY_DEFAULT_SCOPES)
+    parts: list[str] = []
+    for item in raw:
+        parts.extend(p for p in item.split(",") if p.strip())
+    scopes = normalize_scopes(parts)
+    unknown = [s for s in scopes if s not in ALL_SCOPES]
+    if unknown:
+        error(
+            f"unknown scope(s): {', '.join(unknown)}. "
+            f"Valid scopes: {', '.join(sorted(ALL_SCOPES))}."
+        )
+        raise typer.Exit(code=2)
+    return scopes
+
+
 @auth_app.command("create-key")
 def create_key(
     tenant_id: str = typer.Option(..., "--tenant-id", help="Tenant id (≥8 chars)."),
     env: str = typer.Option("live", "--env", help="`live` or `test`."),
     label: str = typer.Option(None, "--label", help="Optional human-readable note."),
+    scope: list[str] = typer.Option(
+        None,
+        "--scope",
+        help=(
+            "Least-privilege scope(s) (ADR 013). Repeatable and/or "
+            "comma-listed: `--scope read,run` or `--scope read --scope run`. "
+            "Valid: read, run, eval, kb:write, admin, fleet-admin. "
+            "Omit to default to read,run,eval (matches legacy keys)."
+        ),
+    ),
     quiet: bool = typer.Option(
         False,
         "--quiet",
@@ -59,10 +100,18 @@ def create_key(
     that. The CLI prints a "save this now" warning to **stderr** so
     the warning doesn't pollute scripted ``> /vault.txt`` redirection.
 
+    Scopes (ADR 013 L2) follow least privilege: when ``--scope`` is
+    omitted the key gets ``read,run,eval`` (the same grant a scopeless
+    legacy key resolves to) — NOT admin. Pass ``--scope admin`` (and/or
+    ``fleet-admin``) explicitly for a management key.
+
     [bold]Examples:[/bold]
 
       [dim]# Interactive use; copy the key into your password manager.[/dim]
       $ movate auth create-key --tenant-id <uuid> --env live --label ci-bot
+
+      [dim]# An admin key that can manage other keys + create agents.[/dim]
+      $ movate auth create-key --tenant-id <uuid> --scope admin,read
 
       [dim]# Scripting: the bare key on stdout, warnings on stderr.[/dim]
       $ KEY=$(movate auth create-key --tenant-id <uuid> --env live --quiet)
@@ -73,8 +122,10 @@ def create_key(
         error(f"env must be 'live' or 'test'; got {env!r}")
         raise typer.Exit(code=2) from exc
 
+    scopes = _parse_scope_options(scope)
+
     try:
-        minted = mint_api_key(tenant_id=tenant_id, env=env_enum, label=label)
+        minted = mint_api_key(tenant_id=tenant_id, env=env_enum, label=label, scopes=scopes)
     except ValueError as exc:
         error(str(exc))
         raise typer.Exit(code=2) from exc
@@ -96,7 +147,8 @@ def create_key(
             f"[bold yellow]save this now — never shown again[/bold yellow]\n"
             f"  key_id:    {minted.record.key_id}\n"
             f"  tenant_id: {minted.record.tenant_id}\n"
-            f"  env:       {minted.record.env.value}" + (f"\n  label:     {label}" if label else "")
+            f"  env:       {minted.record.env.value}\n"
+            f"  scopes:    {', '.join(scopes)}" + (f"\n  label:     {label}" if label else "")
         )
 
 
@@ -325,6 +377,11 @@ def whoami(
     stdout.print(f"[bold]env:[/bold]       {data.get('env', '?')}")
     if data.get("label"):
         stdout.print(f"[bold]label:[/bold]     {data['label']}")
+    # Resolved least-privilege scopes (ADR 013 L2). A scopeless legacy key
+    # reports the default read/run/eval grant here.
+    scopes = data.get("scopes")
+    if scopes:
+        stdout.print(f"[bold]scopes:[/bold]    {', '.join(scopes)}")
     if data.get("scope"):
         stdout.print(f"[bold]scope:[/bold]     {data['scope']}")
     expires = data.get("expires_at")
@@ -440,11 +497,16 @@ def rotate_key(
             if old_record.revoked_at is not None:
                 error(f"key {old_key_id!r} is already revoked")
                 raise typer.Exit(code=2)
+            # Preserve the rotated key's scope grant verbatim (ADR 013 L2):
+            # an explicit set carries over; an empty set stays empty (→
+            # legacy default at check time), so rotation never silently
+            # narrows or widens access.
             minted = mint_api_key(
                 tenant_id=old_record.tenant_id,
                 env=old_record.env,
                 label=old_record.label,
                 ttl_days=ttl_days,
+                scopes=old_record.scopes,
             )
             await storage.save_api_key(minted.record)
             await storage.revoke_api_key(old_key_id, tenant_id=old_record.tenant_id)

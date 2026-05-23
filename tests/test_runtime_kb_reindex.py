@@ -19,7 +19,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from movate.core.auth import ApiKeyEnv, mint_api_key
+from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.kb import embed as embed_mod
 from movate.kb import ingest as ingest_mod
 from movate.runtime import build_app
@@ -103,6 +103,7 @@ async def _mint(storage: InMemoryStorage, *, tenant_id: str | None = None) -> di
         tenant_id=tenant_id or uuid4().hex,
         env=ApiKeyEnv.LIVE,
         label="kb-reindex-tests",
+        scopes=list(ALL_SCOPES),
     )
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}

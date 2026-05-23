@@ -242,7 +242,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at  TIMESTAMPTZ,
     revoked_at    TIMESTAMPTZ,
     expires_at    TIMESTAMPTZ,
-    scope         TEXT
+    scope         TEXT,
+    scopes        JSONB
 );
 -- Idempotent self-healing migrations for tables that pre-date a
 -- column. `CREATE TABLE IF NOT EXISTS` is a no-op when the table is
@@ -254,6 +255,11 @@ CREATE TABLE IF NOT EXISTS api_keys (
 -- `api_keys` without `expires_at` or `scope`).
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scope TEXT;
+-- ADR 013 L2: least-privilege scope SET (supersedes the single `scope`
+-- above). JSONB array of scope strings; NULL on a legacy row resolves to
+-- the default {read,run,eval} at read time via `effective_scopes` — no
+-- destructive backfill.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scopes JSONB;
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_active
     ON api_keys(tenant_id) WHERE revoked_at IS NULL;
 
@@ -1196,8 +1202,8 @@ class PostgresProvider:
             """
             INSERT INTO api_keys (
                 key_id, tenant_id, env, secret_hash, salt, label,
-                created_at, last_used_at, revoked_at, expires_at, scope
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                created_at, last_used_at, revoked_at, expires_at, scope, scopes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             """,
             key.key_id,
             key.tenant_id,
@@ -1210,6 +1216,10 @@ class PostgresProvider:
             key.revoked_at,
             key.expires_at,
             key.scope,
+            # JSONB via the pool's json codec (encoder=json.dumps). Empty
+            # list → NULL so a round-trip matches a never-scoped legacy row
+            # → resolves to the default at check time via effective_scopes.
+            list(key.scopes) if key.scopes else None,
         )
 
     async def get_api_key(self, key_id: str) -> ApiKeyRecord | None:
@@ -2206,6 +2216,10 @@ def _row_to_feedback(row: asyncpg.Record) -> FeedbackRecord:
 
 def _row_to_api_key(row: asyncpg.Record) -> ApiKeyRecord:
     row_dict = dict(row)
+    # JSONB ``scopes`` round-trips through the pool's json codec as a list
+    # (or None on a legacy row). NULL → [] → legacy default at check time.
+    raw_scopes = row_dict.get("scopes")
+    scopes = [str(s) for s in raw_scopes] if isinstance(raw_scopes, list) else []
     return ApiKeyRecord(
         key_id=row_dict["key_id"],
         tenant_id=row_dict["tenant_id"],
@@ -2218,6 +2232,7 @@ def _row_to_api_key(row: asyncpg.Record) -> ApiKeyRecord:
         revoked_at=row_dict["revoked_at"],
         expires_at=row_dict.get("expires_at"),
         scope=row_dict.get("scope"),
+        scopes=scopes,
     )
 
 

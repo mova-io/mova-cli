@@ -269,6 +269,15 @@ async def _seed_bootstrap_key(storage: StorageProvider) -> None:
         salt=salt,
         label="seed",
         created_at=datetime.now(UTC),
+        # The bootstrap key is the first-admin that breaks the
+        # chicken-and-egg: with no other keys yet, it must be able to mint
+        # scoped keys + manage the fleet. Grant it ``fleet-admin`` (ADR 013
+        # L2 → resolves to the full scope set incl. ``admin`` via
+        # effective_scopes). Operators rotate to narrowly-scoped keys ASAP.
+        scopes=["fleet-admin"],
     )
     await storage.save_api_key(record)
-    err.print(f"[dim]seeded bootstrap key {parsed.key_id} from MOVATE_SEED_API_KEY[/dim]")
+    err.print(
+        f"[dim]seeded bootstrap key {parsed.key_id} (scope: fleet-admin) "
+        f"from MOVATE_SEED_API_KEY[/dim]"
+    )
