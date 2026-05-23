@@ -186,6 +186,7 @@ from movate.cli import submit as submit_cmd  # noqa: E402
 from movate.cli import validate as validate_cmd  # noqa: E402
 from movate.cli import watch as watch_cmd  # noqa: E402
 from movate.cli import worker as worker_cmd  # noqa: E402
+from movate.cli.agent_cmd import agent_app  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
@@ -535,6 +536,10 @@ app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
+# `agent` surfaces the durable agent registry's version history + rollback
+# (ADR 014 D3). Lives in MANAGE next to `rollback` / `promote` / `tenants`
+# since it's a registry-lifecycle operation, not authoring (that's `dev`).
+app.add_typer(agent_app, name="agent", rich_help_panel=PANEL_MANAGE)
 # `memory` exposes the Sprint T MVP — list/get/set/evict/summarise/
 # query against the operator-facing memory store. Lives in MANAGE
 # alongside other state-managing commands (secrets, profiles, etc.).

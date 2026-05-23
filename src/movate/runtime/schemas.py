@@ -320,6 +320,108 @@ class AgentCreatedView(BaseModel):
     "schema/input.json", "schema/output.json"]``."""
 
 
+class AgentVersionView(BaseModel):
+    """One row in the durable agent-registry version history (ADR 014 D3).
+
+    Distinct from :class:`AgentCommitView` (the GitHub commit history,
+    ADR 007): this is the **registry**'s immutable ``(name, version)``
+    rows — one per publish — surfaced by ``GET /api/v1/agents/{name}/
+    versions`` and ``mdk agent history``. Carries the audit fields a
+    team needs ("who published which version when") without the bundle
+    payload itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    """The bundle's ``agent.yaml`` version. ``(name, version)`` is unique
+    within a tenant; this is what a client passes back as ``If-Match``
+    on a concurrency-safe PUT or as ``to_version`` on a revert."""
+
+    created_by: str | None = None
+    """Auth identity (ADR 013 — the API key id / OIDC subject) that
+    published this version, or ``None`` for a system/seed import. Drives
+    the "who published what" audit column."""
+
+    created_at: datetime
+    """When this version was published (UTC)."""
+
+    content_hash: str
+    """Content-addressed hash of the bundle's files — lets a client
+    detect an unchanged re-publish and is an alternate ``If-Match``
+    precondition value alongside ``version``."""
+
+    is_current: bool = False
+    """True for the newest version (the one a versionless resolve / run
+    would pick up). Exactly one row in a non-empty history is current."""
+
+
+class AgentVersionsView(BaseModel):
+    """``GET /api/v1/agents/{name}/versions`` response (ADR 014 D3).
+
+    The durable registry's version history for one agent, newest-first.
+    Mirrors the listing style of :class:`AgentCatalogView` (items +
+    count) so the Angular console renders it the same way."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Echoes the URL path parameter so callers can correlate the
+    response without re-parsing the path."""
+
+    versions: list[AgentVersionView]
+    """Sorted newest-first (most recent publish at index 0). Empty when
+    the agent has no registry rows for this tenant (never published, or
+    a different tenant's agent — same no-leak contract as a 404)."""
+
+    count: int
+    """Number of versions returned (== ``len(versions)``)."""
+
+
+class AgentRevertSubmission(BaseModel):
+    """``POST /api/v1/agents/{name}/revert`` request body (ADR 014 D3 / #80).
+
+    Names the prior version to roll back to. The revert re-publishes
+    that version's bundle **forward** as a new latest version — it never
+    deletes or rewrites history. ``to_version`` may also be supplied as
+    a ``?to_version=`` query param for curl ergonomics; the body takes
+    precedence when both are present."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_version: str
+    """The existing version to roll back to. 404 if no such version
+    exists for this agent in this tenant."""
+
+
+class AgentRevertedView(BaseModel):
+    """``POST /api/v1/agents/{name}/revert`` response (ADR 014 D3 / #80).
+
+    Confirms the non-destructive rollback: the bundle from
+    ``reverted_from`` was re-published as the new latest version
+    (``version``), leaving every prior version intact in the history."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Echoes the URL path parameter."""
+
+    version: str
+    """The new latest version after the revert. Same value as
+    ``reverted_from`` because the revert re-publishes that exact bundle
+    forward (a new row with the same ``version`` string + a fresh
+    ``created_at`` / ``created_by``) — so a subsequent versionless
+    resolve serves the reverted bundle."""
+
+    reverted_from: str
+    """The prior version whose bundle was re-published. Equal to the
+    request's ``to_version``."""
+
+    previous_version: str
+    """The version that was the latest immediately BEFORE this revert —
+    handy for an "undo the undo" affordance in the UI. Empty string when
+    the only existing version was the revert target itself."""
+
+
 class RunTraceView(BaseModel):
     """``GET /api/v1/runs/{run_id}/trace`` response.
 
@@ -1617,11 +1719,15 @@ __all__ = [
     "AgentListView",
     "AgentPublishSubmission",
     "AgentPublishedView",
+    "AgentRevertSubmission",
+    "AgentRevertedView",
     "AgentRunSubmission",
     "AgentUpdatedView",
     "AgentValidationCostForecast",
     "AgentValidationIssue",
     "AgentValidationView",
+    "AgentVersionView",
+    "AgentVersionsView",
     "AgentView",
     "BenchAcceptedView",
     "BenchListView",

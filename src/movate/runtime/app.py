@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, File, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -57,7 +57,7 @@ from movate.runtime.agent_resolver import (
 from movate.runtime.agent_resolver import (
     content_hash as _bundle_content_hash,
 )
-from movate.runtime.errors import ErrorCode, auth_required, http_error, not_found
+from movate.runtime.errors import ErrorCode, auth_required, conflict, http_error, not_found
 from movate.runtime.middleware import (
     AuthContext,
     make_auth_dependency,
@@ -77,11 +77,15 @@ from movate.runtime.schemas import (
     AgentListView,
     AgentPublishedView,
     AgentPublishSubmission,
+    AgentRevertedView,
+    AgentRevertSubmission,
     AgentRunSubmission,
     AgentUpdatedView,
     AgentValidationCostForecast,
     AgentValidationIssue,
     AgentValidationView,
+    AgentVersionsView,
+    AgentVersionView,
     AgentView,
     ApiKeyListView,
     ApiKeyMintedView,
@@ -316,6 +320,82 @@ async def _dual_write_agent_to_registry(
             version,
             exc_info=True,
         )
+
+
+def _normalize_if_match(raw: str) -> str:
+    """Strip RFC 7232 ETag decoration from an ``If-Match`` value.
+
+    Tolerates the wire forms clients/proxies emit: a leading weak
+    validator ``W/`` and surrounding double quotes (``W/"0.2.0"`` →
+    ``0.2.0``). We don't honor the wildcard ``*`` specially — for this
+    registry an explicit version/hash is the useful precondition, and a
+    literal ``*`` simply won't match a real version (so it 409s, which
+    is the safe direction). Returns the bare value to compare against
+    the current version or content_hash.
+    """
+    value = raw.strip()
+    if value[:2] in ("W/", "w/"):
+        value = value[2:].strip()
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return value
+
+
+async def _check_agent_if_match(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+    if_match: str,
+) -> None:
+    """Enforce the ``If-Match`` optimistic-concurrency precondition (ADR 014 D3).
+
+    Looks up the registry's CURRENT latest bundle for ``(name,
+    tenant_id)`` and 409s unless the caller's ``If-Match`` matches that
+    version's ``version`` OR its ``content_hash`` (either is an accepted
+    precondition token). A missing registry row is treated as a match —
+    the durable registry may be empty for a local ``mdk serve`` whose
+    agent only lives on the filesystem, and a precondition can't be stale
+    against a history that doesn't exist; the FS 404-guard already ran.
+
+    Only called when the client opted in by sending the header — absent
+    ``If-Match`` this is never invoked, preserving last-write-wins.
+    """
+    current = await storage.get_agent_bundle(name, tenant_id=tenant_id)
+    if current is None:
+        return
+    expected = _normalize_if_match(if_match)
+    if expected in (current.version, current.content_hash):
+        return
+    raise conflict(
+        f"agent {name!r} was updated concurrently: If-Match {expected!r} no longer "
+        f"matches the current version {current.version!r} — re-fetch and retry",
+    )
+
+
+def _mint_revert_version(to_version: str, existing: set[str]) -> str:
+    """Derive a new, collision-free registry version for a revert (ADR 014 D3).
+
+    The registry's ``(tenant_id, name, version)`` row is a primary key,
+    so a revert can't re-use ``to_version``'s string verbatim — it must
+    publish a *new* row. We keep the new version human-traceable by
+    suffixing the target with SemVer build metadata (``+revert.N``,
+    RFC-style ``+`` build tag), bumping ``N`` until it doesn't collide
+    with any version already in the history. The registry resolves
+    "latest" by ``created_at`` (not by parsing the version), so the
+    suffix only needs to be unique + legible — it carries the provenance
+    "this is a re-publish of ``to_version``" without pretending to be a
+    semantic bump the operator didn't author.
+    """
+    # Strip any prior ``+revert.*`` so reverting a reverted version stays
+    # ``<base>+revert.N`` rather than nesting (``...+revert.1+revert.1``).
+    base = to_version.split("+revert.", 1)[0]
+    n = 1
+    candidate = f"{base}+revert.{n}"
+    while candidate in existing:
+        n += 1
+        candidate = f"{base}+revert.{n}"
+    return candidate
 
 
 def _agent_creation_error_code(status_code: int) -> str:
@@ -1699,6 +1779,7 @@ def build_app(
         contexts: list[UploadFile] = File(default=[]),
         kb: list[UploadFile] = File(default=[]),
         bundle: UploadFile | None = File(default=None),
+        if_match: str | None = Header(default=None, alias="If-Match"),
         ctx: AuthContext = Depends(auth_dep),
     ) -> AgentUpdatedView:
         """Replace an existing agent bundle in-place (item 57 / BACKLOG G).
@@ -1716,6 +1797,18 @@ def build_app(
         * ``previous_version`` in the response lets the caller detect the
           diff without a round-trip.
 
+        **Optimistic concurrency (ADR 014 D3) — opt-in via ``If-Match``.**
+        Send ``If-Match: <version>`` (or the bundle's ``content_hash``) with
+        the version you believe is current; if the registry's latest version
+        for this tenant no longer matches, the write is rejected with
+        **409 Conflict** ("someone else updated this; re-fetch") so two
+        teammates can't silently clobber each other. The header is parsed
+        leniently (surrounding quotes + a leading weak-validator ``W/`` are
+        stripped, RFC 7232) and matched against either the current
+        ``version`` or its ``content_hash``. **Omitting ``If-Match``
+        preserves today's last-write-wins behavior** — concurrency safety is
+        purely opt-in, so existing clients are unaffected.
+
         Skills bundled inside the upload are persisted to the global
         registry with PUT semantics (idempotent re-deploy).
 
@@ -1723,6 +1816,7 @@ def build_app(
 
         * **400** — neither mode supplied OR both modes supplied
         * **404** — agent ``{name}`` is not registered (never created)
+        * **409** — ``If-Match`` precondition is stale (concurrent publish)
         * **422** — bundle failed validation OR agent_yaml name ≠ path param
         * **503** — runtime built without an ``agents_path``
         """
@@ -1741,7 +1835,14 @@ def build_app(
             raise not_found("agent", name)
         previous_version = existing.spec.version
 
-        _ = ctx.tenant_id  # future per-tenant audit log
+        # Optimistic concurrency (ADR 014 D3): only when the caller opts in
+        # by sending ``If-Match``. Compare against the DURABLE registry's
+        # current latest (the multi-pod source of truth), not the local FS
+        # mirror — a stale precondition means another publisher won the race.
+        # Absent ``If-Match`` → fall through to last-write-wins (back-compat).
+        store: StorageProvider = request.app.state.storage
+        if if_match is not None:
+            await _check_agent_if_match(store, name, tenant_id=ctx.tenant_id, if_match=if_match)
 
         files = await _collect_bundle_files(
             agent_yaml=agent_yaml,
@@ -1779,8 +1880,7 @@ def build_app(
         # worker resolves as the new latest, if not it's a no-op
         # (save_agent_bundle is idempotent-ish via content_hash and the
         # backends tolerate the re-publish). Best-effort — never fails
-        # the update.
-        store: StorageProvider = request.app.state.storage
+        # the update. ``store`` was bound above for the If-Match check.
         await _dual_write_agent_to_registry(
             store,
             result.agent_dir,
@@ -1796,6 +1896,150 @@ def build_app(
             description=spec.description,
             agent_dir=result.agent_dir.name,
             files_persisted=result.files_persisted,
+            previous_version=previous_version,
+        )
+
+    @v1.get(
+        "/agents/{name}/versions",
+        response_model=AgentVersionsView,
+        tags=["agents-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_agent_versions(
+        name: str,
+        request: Request,
+        limit: int = 50,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AgentVersionsView:
+        """List the durable-registry version history for one agent (ADR 014 D3).
+
+        Returns every published version of ``name`` for the caller's
+        tenant, **newest-first**, with the audit fields a team needs:
+        ``version``, ``created_by`` (who published it — ADR 013),
+        ``created_at`` (when), and ``content_hash``. The newest row is
+        flagged ``is_current`` — it's the version a versionless run/resolve
+        serves and the value to send back as ``If-Match`` on a
+        concurrency-safe PUT.
+
+        Source of truth is the durable registry (``list_agent_versions``),
+        not the local filesystem mirror — so the history is the same on
+        every pod and survives recycles. Tenant-scoped: another tenant's
+        agent (or an unknown name) returns an empty history rather than
+        leaking existence (same no-leak contract as a 404).
+
+        Drives ``mdk agent history`` + the Angular console's version panel.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — authenticated but key lacks the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_agent_versions(name, tenant_id=ctx.tenant_id, limit=limit)
+        items = [
+            AgentVersionView(
+                version=r.version,
+                created_by=r.created_by,
+                created_at=r.created_at,
+                content_hash=r.content_hash,
+                # list_agent_versions is newest-first, so index 0 is the
+                # current latest. Mark exactly that row.
+                is_current=(i == 0),
+            )
+            for i, r in enumerate(records)
+        ]
+        return AgentVersionsView(name=name, versions=items, count=len(items))
+
+    @v1.post(
+        "/agents/{name}/revert",
+        response_model=AgentRevertedView,
+        tags=["agents-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_revert_agent(
+        name: str,
+        request: Request,
+        body: AgentRevertSubmission | None = None,
+        to_version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AgentRevertedView:
+        """Revert an agent to a prior version (ADR 014 D3 / BACKLOG #80).
+
+        Fetches the bundle for ``to_version`` and **re-publishes it forward
+        as a NEW latest version** — a fresh ``save_agent_bundle`` row with a
+        new ``created_at`` / ``created_by`` and the same ``files``. This is
+        **non-destructive**: no version is ever deleted or rewritten, so the
+        full history (including the version you reverted away from) stays
+        intact and you can revert again — even back to the version you just
+        left.
+
+        ``to_version`` may be supplied in the JSON body
+        (``{"to_version": "0.2.0"}``) OR as a ``?to_version=`` query param
+        for curl ergonomics; the body wins when both are present.
+
+        Operates on the durable registry so the revert is visible to every
+        pod (API + async worker) immediately. Tenant-scoped: you can only
+        revert your own tenant's agents, and a cross-tenant ``to_version``
+        is indistinguishable from a missing one (404).
+
+        Drives ``mdk agent revert``.
+
+        Errors:
+
+        * **400** — no ``to_version`` supplied (neither body nor query)
+        * **401** — missing / bad bearer token
+        * **403** — authenticated but key lacks the ``admin`` scope
+        * **404** — no such ``to_version`` for this agent in this tenant
+        """
+        target_version = body.to_version if body is not None else to_version
+        if not target_version:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    'revert requires a target version: send {"to_version": "..."} '
+                    "in the body or ?to_version=..."
+                ),
+            )
+
+        store: StorageProvider = request.app.state.storage
+
+        # The version we're rolling back to — must exist for this tenant.
+        target = await store.get_agent_bundle(name, tenant_id=ctx.tenant_id, version=target_version)
+        if target is None:
+            raise not_found("agent version", f"{name}@{target_version}")
+
+        # The full history (newest-first) — needed both for the response's
+        # ``previous_version`` ("undo the undo") and to mint a NEW version
+        # string that won't collide with the (tenant, name, version) primary
+        # key. The registry resolves "latest" by created_at, so the new row's
+        # exact version string only needs to be unique + human-traceable.
+        history = await store.list_agent_versions(name, tenant_id=ctx.tenant_id, limit=1000)
+        previous_version = history[0].version if history else target_version
+        existing_versions = {r.version for r in history}
+        new_version = _mint_revert_version(target_version, existing_versions)
+
+        # Re-publish the target's bundle FORWARD as a new immutable row
+        # (a fresh created_at via the model default + the reverting identity
+        # as created_by). Same ``files`` + ``content_hash`` so the served
+        # bundle is byte-identical to what ``to_version`` published; only the
+        # registry-row ``version`` differs so it appends to history rather
+        # than rewriting the immutable ``to_version`` row. History is only
+        # ever appended to — the revert NEVER deletes or mutates a prior row.
+        reverted = AgentBundleRecord(
+            name=target.name,
+            tenant_id=target.tenant_id,
+            version=new_version,
+            created_by=ctx.api_key_id,
+            content_hash=target.content_hash,
+            files=target.files,
+        )
+        await store.save_agent_bundle(reverted)
+
+        return AgentRevertedView(
+            name=name,
+            version=new_version,
+            reverted_from=target_version,
             previous_version=previous_version,
         )
 
