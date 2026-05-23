@@ -194,11 +194,14 @@ _PROVIDER_KEYS = (
     ("LYZR_API_KEY", "Lyzr Studio"),
 )
 _TRACING_KEYS = (
+    ("MOVATE_TRACE_SINK", "sink selector"),
     ("MOVATE_TRACER", "explicit override"),
     ("LANGFUSE_SECRET_KEY", "Langfuse secret"),
     ("LANGFUSE_PUBLIC_KEY", "Langfuse public"),
     ("LANGFUSE_HOST", "Langfuse host"),
     ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTel endpoint"),
+    ("OTEL_EXPORTER_OTLP_HEADERS", "OTel headers"),
+    ("OTEL_EXPORTER_OTLP_PROTOCOL", "OTel protocol"),
     ("OTEL_SERVICE_NAME", "OTel service.name"),
 )
 

@@ -6,12 +6,24 @@ Install with::
 
 Activation precedence (see :func:`movate.tracing.build_tracer`):
 
-1. ``MOVATE_TRACER=otel`` — explicit opt-in.
-2. ``OTEL_EXPORTER_OTLP_ENDPOINT`` set — implicit opt-in.
+1. ``MOVATE_TRACE_SINK=otlp`` (or ``both``) — explicit *deployment* sink
+   (ADR 015). A missing OTel extra here is a hard, actionable error.
+2. ``MOVATE_TRACER=otel`` — explicit opt-in (legacy; fails soft to stdout).
+3. ``OTEL_EXPORTER_OTLP_ENDPOINT`` set — implicit opt-in (legacy; fails soft).
 
-Either path falls back to stdout (with a stderr warning) when the OTel
+The legacy paths fall back to stdout (with a stderr warning) when the OTel
 packages aren't installed or the SDK rejects construction. Tracing must
 never break a run.
+
+The exporter is the **generic** OpenTelemetry OTLP exporter, configured by the
+standard OTel env vars — no cloud-specific dependency (ADR 001):
+
+* ``OTEL_EXPORTER_OTLP_ENDPOINT`` — the OTLP receiver URL. Point this at Azure
+  Monitor / Application Insights' OTLP ingestion endpoint, or at Grafana
+  Tempo / SigNoz / Honeycomb / a local collector (``http://localhost:4318``).
+* ``OTEL_EXPORTER_OTLP_HEADERS`` — auth/metadata headers (e.g. the App Insights
+  ingestion key header). Read natively by the SDK.
+* ``OTEL_EXPORTER_OTLP_PROTOCOL`` — ``http/protobuf`` (default) or ``grpc``.
 
 Span hierarchy mirrors the runtime: workflow → agent.execute → provider
 call. Inside the executor, ``span.set_attribute`` mirrors metadata
@@ -217,9 +229,15 @@ def _otel_value(value: Any) -> Any:
 def _build_provider_from_env() -> Any:
     """Construct a real OTel :class:`TracerProvider` from env vars.
 
-    Reads ``OTEL_EXPORTER_OTLP_ENDPOINT`` (required) and
-    ``OTEL_SERVICE_NAME`` (default ``"movate"``). Uses the HTTP exporter
-    — fewer transitive deps than gRPC and easier to debug locally.
+    Reads ``OTEL_EXPORTER_OTLP_ENDPOINT`` (required) and ``OTEL_SERVICE_NAME``
+    (default ``"movate-runtime"``). The generic OTLP exporter also honors the
+    standard transport env vars natively — ``OTEL_EXPORTER_OTLP_HEADERS`` (e.g.
+    an Azure Monitor / App Insights auth header) and
+    ``OTEL_EXPORTER_OTLP_PROTOCOL`` (``http/protobuf`` vs ``grpc``). We pick the
+    HTTP vs gRPC exporter from ``OTEL_EXPORTER_OTLP_PROTOCOL`` (default HTTP —
+    fewer transitive deps, easier to debug locally) and let the SDK read the
+    endpoint + headers from the environment so no cloud-specific code is needed
+    (ADR 001: Azure Monitor is just an OTLP endpoint).
     """
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
     if not endpoint:
@@ -228,9 +246,6 @@ def _build_provider_from_env() -> Any:
         )
     try:
         # Lazy imports — only needed when actually building from env.
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (  # noqa: PLC0415
-            OTLPSpanExporter,
-        )
         from opentelemetry.sdk.resources import Resource  # noqa: PLC0415
         from opentelemetry.sdk.trace import TracerProvider  # noqa: PLC0415
         from opentelemetry.sdk.trace.export import (  # noqa: PLC0415
@@ -241,12 +256,72 @@ def _build_provider_from_env() -> Any:
             "opentelemetry packages not installed; `uv sync --extra otel`"
         ) from exc
 
-    service_name = os.environ.get("OTEL_SERVICE_NAME", "movate").strip() or "movate"
-    resource = Resource.create({"service.name": service_name})
+    exporter_cls = _otlp_exporter_class()
+    resource = Resource.create(_resource_attributes())
     provider = TracerProvider(resource=resource)
     try:
-        exporter = OTLPSpanExporter(endpoint=endpoint)
+        # No explicit endpoint/headers kwargs — the SDK reads
+        # OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_HEADERS from the
+        # environment. This keeps Azure Monitor / App Insights config purely
+        # env-driven (portable; no azure-specific dependency).
+        exporter = exporter_cls()
     except Exception as exc:
         raise OtelUnavailableError(f"OTLP exporter init failed: {exc}") from exc
     provider.add_span_processor(BatchSpanProcessor(exporter))
     return provider
+
+
+def _otlp_exporter_class() -> Any:
+    """Return the generic OTLP span-exporter class for the configured transport.
+
+    ``OTEL_EXPORTER_OTLP_PROTOCOL`` selects HTTP (``http/protobuf``, the default
+    — fewer transitive deps, easier to debug) or gRPC. Either way it is the
+    *generic* ``opentelemetry-exporter-otlp`` (already in the ``otel`` extra) —
+    no cloud-specific exporter (ADR 001).
+    """
+    protocol = os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").strip().lower()
+    try:
+        if protocol in ("grpc", "grpc/protobuf"):
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (  # noqa: PLC0415
+                OTLPSpanExporter as _GrpcExporter,
+            )
+
+            return _GrpcExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (  # noqa: PLC0415
+            OTLPSpanExporter as _HttpExporter,
+        )
+
+        return _HttpExporter
+    except ImportError as exc:
+        raise OtelUnavailableError(
+            "opentelemetry-exporter-otlp not installed; `uv sync --extra otel`"
+        ) from exc
+
+
+def _resource_attributes() -> dict[str, str]:
+    """OTel resource attributes for the runtime's tracer provider.
+
+    ``service.name`` defaults to ``movate-runtime`` (overridable via
+    ``OTEL_SERVICE_NAME``); ``service.version`` carries ``movate.__version__``;
+    ``deployment.environment`` is read from ``MOVATE_ENV`` /
+    ``OTEL_DEPLOYMENT_ENVIRONMENT`` when set so dashboards can split prod from
+    dev.
+    """
+    service_name = os.environ.get("OTEL_SERVICE_NAME", "movate-runtime").strip() or "movate-runtime"
+    attrs: dict[str, str] = {"service.name": service_name}
+
+    try:
+        from movate import __version__  # noqa: PLC0415
+
+        attrs["service.version"] = __version__
+    except Exception:  # pragma: no cover - __version__ always present
+        pass
+
+    environment = (
+        os.environ.get("MOVATE_ENV", "").strip()
+        or os.environ.get("OTEL_DEPLOYMENT_ENVIRONMENT", "").strip()
+    )
+    if environment:
+        attrs["deployment.environment"] = environment
+
+    return attrs

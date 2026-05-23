@@ -224,3 +224,90 @@ regulated deploys choose per their constraints. Documented in the deploy runbook
 - **Cost** — self-host infra (ClickHouse/Redis/compute) vs. Langfuse Cloud
   subscription; model it before committing to D2 over D3.
 - **Historical data** — whether to migrate existing Cloud traces or start fresh.
+
+---
+
+## Addendum 015.1 — OTLP sink shipped (implementation-plan step 1)
+
+*Status: implemented (branch `feat/otlp-sink`). Code-only; live Azure Monitor
+validation is gated on a subscription and is out of scope for this step.*
+
+This delivers step 1 of the plan: the runtime can emit traces over **generic
+OTLP** to a self-hosted-in-tenant backend, selected per deployment, **default-off
+and backward compatible**. No execution-plane code changed — only
+`build_tracer()` and the OTLP provider builder in `tracing/`.
+
+### The sink selector: `MOVATE_TRACE_SINK`
+
+`build_tracer()` now reads `MOVATE_TRACE_SINK` first. When it is set it wins and
+the sink is treated as an **explicit deployment choice** — a missing optional
+dependency raises a loud, actionable `TraceSinkError` (with an install hint)
+rather than silently falling back, so a misconfigured deploy is obvious.
+
+| `MOVATE_TRACE_SINK` | Result |
+|---|---|
+| *(unset)* | **Unchanged** — legacy `MOVATE_TRACER` + auto-detect path, byte-for-byte. |
+| `none` | `SilentTracer` (off; trace data goes nowhere). |
+| `langfuse` | `LangfuseTracer` (self-hosted or Cloud — D2). |
+| `otlp` | `OtelTracer` over the generic OTLP exporter (D3). |
+| `both` | `CompositeTracer([langfuse, otlp])` — LLM UI + ops APM at once (D4). |
+
+Default-off / backward-compat: with `MOVATE_TRACE_SINK` unset, behavior is
+identical to before this change — the existing `MOVATE_TRACER` override and the
+`LANGFUSE_SECRET_KEY` / `OTEL_EXPORTER_OTLP_ENDPOINT` auto-detect rules are
+preserved exactly (and still fail *soft* to silent/stdout, since they are not an
+explicit deployment choice).
+
+### OTLP exporter config (portable — ADR 001, no Azure-specific SDK)
+
+The `otlp` sink uses the **generic** `opentelemetry-exporter-otlp` (already in
+the `otel` extra — no new dependency). It is configured entirely via the
+standard OpenTelemetry env vars, which the SDK reads natively:
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — the OTLP receiver URL (required).
+- `OTEL_EXPORTER_OTLP_HEADERS` — auth/metadata headers.
+- `OTEL_EXPORTER_OTLP_PROTOCOL` — `http/protobuf` (default) or `grpc`.
+
+Resource attributes set on the tracer provider: `service.name=movate-runtime`
+(override via `OTEL_SERVICE_NAME`), `service.version` (from `movate.__version__`),
+and `deployment.environment` (from `MOVATE_ENV` / `OTEL_DEPLOYMENT_ENVIRONMENT`,
+when set).
+
+#### Azure Monitor / Application Insights (in-tenant, recommended on Azure)
+
+App Insights ingests OTLP natively — point the generic exporter at its OTLP
+ingestion endpoint and pass the ingestion key as a header. **No
+`azure-monitor-opentelemetry` or any azure-specific package is added** — Azure
+Monitor is just an OTLP endpoint (the portable path).
+
+```bash
+export MOVATE_TRACE_SINK=otlp
+export OTEL_EXPORTER_OTLP_ENDPOINT="https://<region>.in.applicationinsights.azure.com/v2.1/track"
+export OTEL_EXPORTER_OTLP_HEADERS="x-api-key=<app-insights-ingestion-key>"
+# optional:
+export OTEL_SERVICE_NAME=mdk-prod
+export MOVATE_ENV=production
+```
+
+> Exact App Insights OTLP endpoint/header shape depends on the tenant's
+> ingestion config; the operator points the standard OTel vars at it. Secrets
+> (the ingestion key/header) come from Key Vault via managed identity per D5 —
+> never static in env in deployed config.
+
+#### OSS alternative (fully portable — Grafana Tempo / SigNoz / collector)
+
+Same selector, different endpoint — e.g. a local/in-cluster OTLP collector:
+
+```bash
+export MOVATE_TRACE_SINK=otlp
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4318"
+```
+
+### Caveat (🔒)
+
+The code and tests are entirely local: tests assert span emission via OTel's
+`InMemorySpanExporter` (no network). **Live validation against a real Azure
+Monitor / App Insights endpoint is gated on an Azure subscription and is
+external to this change.** Steps 2–5 of the plan (Langfuse v3 bump, the
+`enableLangfuse` Bicep module, redaction hook, Cloud decommission) remain
+follow-ups.
