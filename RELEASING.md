@@ -51,35 +51,48 @@ Every release:
    Actions from opening PRs — and the SemVer scheme it bumped was
    replaced by CalVer.)
 7. Move `[Unreleased]` content in `CHANGELOG.md` under a new
-   `[X.Y.Z] — YYYY-MM-DD` heading; update the link refs at the bottom
-   of the file.
-8. Commit the bump (e.g. `chore: bump version to X.Y.Z`), open a PR,
-   merge to main.
-9. `git tag -a vX.Y.Z -m "vX.Y.Z: <one-line summary>"` (annotated, not
-   lightweight — annotated tags carry author, date, and message and
-   show up in GitHub Releases) on the merge commit, then `git push
-   origin vX.Y.Z`.
+   `[YYYY.M.D.N] — YYYY-MM-DD` heading (the CalVer version from
+   `pyproject.toml`); update the link refs at the bottom of the file.
+8. Commit the release prep (e.g. `chore: release 2026.5.23.4`), open a
+   PR, merge to main. Day-to-day commits already bump the version via
+   the hook, so a release usually just **tags an existing main commit** —
+   no extra version bump needed.
+9. Tag the merge commit with the CalVer version, **`v`-prefixed**, so the
+   tag matches `mdk --version` and the wheel `uv build` emits:
+   ```bash
+   VERSION=$(python -c 'import movate; print(movate.__version__)')
+   git tag -a "v$VERSION" -m "v$VERSION: <one-line summary>"   # annotated
+   git push origin "v$VERSION"
+   ```
+   Annotated tags (not lightweight) carry author/date/message and surface
+   in GitHub Releases. **Releases are CalVer now** — the old `v0.x` SemVer
+   tags remain only as history.
 
 ## Distribution targets (pick one)
 
-### Option A — GitHub Release artifacts (recommended for v0.4)
+### Option A — GitHub Release artifacts (recommended)
 
 Lowest friction. Build wheel + sdist, attach to a GitHub Release on the
-private repo. Consumers `pip install` the wheel URL directly:
+private repo. Consumers `pip install` the wheel URL directly. Note the
+wheel filename is the **bare PEP 440 CalVer** (no `v` prefix), while the
+git tag / release is **`v`-prefixed**:
 
 ```bash
-# build
-uv build  # writes dist/movate_cli-X.Y.Z-py3-none-any.whl + .tar.gz
+VERSION=$(python -c 'import movate; print(movate.__version__)')
 
-# create the release (auto-generates release notes from PRs since the
-# previous tag; --notes-file CHANGELOG.md works too)
-gh release create vX.Y.Z dist/movate_cli-X.Y.Z-py3-none-any.whl \
-  dist/movate_cli-X.Y.Z.tar.gz \
-  --title "vX.Y.Z" \
+# build — writes dist/movate_cli-$VERSION-py3-none-any.whl + .tar.gz
+uv build
+
+# create the release (auto-generates notes from PRs since the previous
+# tag; --notes-file CHANGELOG.md works too)
+gh release create "v$VERSION" \
+  "dist/movate_cli-$VERSION-py3-none-any.whl" \
+  "dist/movate_cli-$VERSION.tar.gz" \
+  --title "v$VERSION" \
   --notes-from-tag
 
 # consumers install with:
-#   pip install https://github.com/mova-io/mova-cli/releases/download/vX.Y.Z/movate_cli-X.Y.Z-py3-none-any.whl
+#   pip install https://github.com/mova-io/mova-cli/releases/download/v$VERSION/movate_cli-$VERSION-py3-none-any.whl
 ```
 
 GitHub serves these to anyone with read access to the private repo. No
@@ -141,12 +154,10 @@ covers the developer-installs-from-laptop case.
   of truth (e.g. `hatch-vcs` or reading `__version__` from
   `importlib.metadata`).
 
-## Current state (v0.4.0, 2026-05-09)
+## Versioning scheme note (CalVer since 2026-05)
 
-- ✓ Tagged: `v0.4.0` (local; pushed to `origin` once remote exists)
-- ✗ Built: no `dist/` artifacts produced yet
-- ✗ Published: nowhere — pick Option A/B/C above before next release
-
-The first push of this repo creates the GitHub remote at
-<https://github.com/mova-io/mova-cli>. After that, switch to
-Option A for the v0.4.0 artifact.
+Releases are tagged in **CalVer** (`vYYYY.M.D.N`, e.g. `v2026.5.23.4`) to
+match the package version, `mdk --version`, and the wheel `uv build`
+produces — so an operator who pulls a tag gets a `mdk --version` that
+equals it. The earlier **SemVer** tags (`v0.2.0` … `v0.8.0`) predate the
+CalVer switch and remain only as history; do not cut new `v0.x` tags.

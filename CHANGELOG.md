@@ -1,7 +1,8 @@
 # Changelog
 
 All notable changes to movate. Format follows [Keep a Changelog](https://keepachangelog.com/);
-versioning follows [SemVer](https://semver.org/).
+versioning is [CalVer](https://calver.org/) `YYYY.M.D.N` (date-based, auto-bumped
+per commit). Releases prior to 2026-05 used SemVer (`v0.x`); those tags remain as history.
 
 ## [Unreleased]
 
