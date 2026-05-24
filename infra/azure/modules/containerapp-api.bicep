@@ -129,7 +129,13 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
       // being in the image or deployment outputs. Format:
       //   keyVaultUrl: <vault uri> + secrets/<secret name>
       //   identity: 'system' (managed identity reads KV)
-      secrets: [
+      // The langfuse-* secrets are gated on `empty(langfuseHost)` (the
+      // same flag that drives LANGFUSE_HOST below): when Langfuse is off
+      // those Key Vault secrets don't exist, and referencing them here
+      // would hard-fail revision provisioning ("unable to fetch secret
+      // 'langfuse-secret-key'…"). The pg/provider/bootstrap secrets are
+      // always required, so they stay unconditional.
+      secrets: concat([
         {
           name: 'pg-password'
           keyVaultUrl: '${keyVaultUri}secrets/pg-admin-password'
@@ -145,16 +151,6 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: '${keyVaultUri}secrets/anthropic-api-key'
           identity: userAssignedIdentityId
         }
-        {
-          name: 'langfuse-secret-key'
-          keyVaultUrl: '${keyVaultUri}secrets/langfuse-secret-key'
-          identity: userAssignedIdentityId
-        }
-        {
-          name: 'langfuse-public-key'
-          keyVaultUrl: '${keyVaultUri}secrets/langfuse-public-key'
-          identity: userAssignedIdentityId
-        }
         // The runtime's bootstrap key — populated by
         // `mdk auth bootstrap-seed <target> --keyvault <name>` BEFORE
         // the first runtime deploy. On every pod start,
@@ -168,7 +164,18 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: '${keyVaultUri}secrets/bootstrap-api-key'
           identity: userAssignedIdentityId
         }
-      ]
+      ], empty(langfuseHost) ? [] : [
+        {
+          name: 'langfuse-secret-key'
+          keyVaultUrl: '${keyVaultUri}secrets/langfuse-secret-key'
+          identity: userAssignedIdentityId
+        }
+        {
+          name: 'langfuse-public-key'
+          keyVaultUrl: '${keyVaultUri}secrets/langfuse-public-key'
+          identity: userAssignedIdentityId
+        }
+      ])
     }
     template: {
       containers: [
@@ -205,14 +212,6 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'ANTHROPIC_API_KEY'
               secretRef: 'anthropic-api-key'
             }
-            {
-              name: 'LANGFUSE_SECRET_KEY'
-              secretRef: 'langfuse-secret-key'
-            }
-            {
-              name: 'LANGFUSE_PUBLIC_KEY'
-              secretRef: 'langfuse-public-key'
-            }
             // Bootstrap API key (see secrets[] above). The runtime's
             // _seed_bootstrap_key() reads this on startup and inserts
             // the matching ApiKeyRecord into Postgres if it isn't
@@ -241,6 +240,18 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
               value: corsAllowedOrigins
             }
           ], empty(langfuseHost) ? [] : [
+            // Langfuse tracing creds + host — gated together with the
+            // langfuse-* KV secret refs above. When Langfuse is off the
+            // secrets don't exist, so neither the secretRef env vars nor
+            // the host are emitted (the SDK keeps its Cloud default).
+            {
+              name: 'LANGFUSE_SECRET_KEY'
+              secretRef: 'langfuse-secret-key'
+            }
+            {
+              name: 'LANGFUSE_PUBLIC_KEY'
+              secretRef: 'langfuse-public-key'
+            }
             {
               // Point tracing at the self-hosted Langfuse (omitted when
               // empty so the SDK keeps its Cloud default).
