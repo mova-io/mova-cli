@@ -14,6 +14,7 @@ from typing import Any
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
+    BatchRecord,
     BenchRecord,
     CanaryConfig,
     ConversationThread,
@@ -62,6 +63,7 @@ class InMemoryStorage:
         self.agent_bundles: list[AgentBundleRecord] = []
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
+        self.batches: list[BatchRecord] = []
         self.api_keys: list[ApiKeyRecord] = []
         self.tenant_budgets: dict[str, TenantBudget] = {}
         self.feedback: list[FeedbackRecord] = []
@@ -450,6 +452,32 @@ class InMemoryStorage:
         return list(rows)[:limit]
 
     # ------------------------------------------------------------------
+    # Batches (item 17 — batch inference)
+    # ------------------------------------------------------------------
+
+    async def save_batch(self, batch: BatchRecord) -> None:
+        if any(b.batch_id == batch.batch_id for b in self.batches):
+            raise ValueError(f"duplicate batch_id {batch.batch_id!r}")
+        self.batches.append(batch)
+
+    async def get_batch(self, batch_id: str, *, tenant_id: str) -> BatchRecord | None:
+        return next(
+            (b for b in self.batches if b.batch_id == batch_id and b.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_batches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 20,
+    ) -> list[BatchRecord]:
+        rows = self.batches
+        if tenant_id is not None:
+            rows = [b for b in rows if b.tenant_id == tenant_id]
+        return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
+
+    # ------------------------------------------------------------------
     # Jobs (v0.5)
     # ------------------------------------------------------------------
 
@@ -470,6 +498,7 @@ class InMemoryStorage:
         tenant_id: str | None = None,
         status: JobStatus | None = None,
         target: str | None = None,
+        batch_id: str | None = None,
         limit: int = 20,
     ) -> list[JobRecord]:
         rows = self.jobs
@@ -479,6 +508,8 @@ class InMemoryStorage:
             rows = [j for j in rows if j.status == status]
         if target:
             rows = [j for j in rows if j.target == target]
+        if batch_id:
+            rows = [j for j in rows if j.batch_id == batch_id]
         # Newest-first to match SqliteProvider's ORDER BY.
         return sorted(rows, key=lambda j: j.created_at, reverse=True)[:limit]
 

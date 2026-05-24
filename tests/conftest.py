@@ -48,6 +48,7 @@ _PG_TABLES = (
     "agent_bundles",
     "workflow_runs",
     "jobs",
+    "batches",
     "api_keys",
     "kb_chunks",
     "kb_entities",

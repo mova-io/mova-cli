@@ -39,6 +39,7 @@ from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
+    BatchRecord,
     BenchRecord,
     CanaryConfig,
     EvalRecord,
@@ -109,6 +110,12 @@ from movate.runtime.schemas import (
     ApiKeyRevokedView,
     ApiKeyView,
     AuthWhoamiView,
+    BatchAcceptedView,
+    BatchInlineSubmission,
+    BatchListItemView,
+    BatchListView,
+    BatchStatusCounts,
+    BatchStatusView,
     BenchAcceptedView,
     BenchListView,
     BenchModelView,
@@ -821,6 +828,121 @@ _THREAD_HISTORY_TURNS = 20
 # rather than relying on raw truncation. The cap just stops the
 # pathological case (single 50KB turn) from breaking everyone else.
 _THREAD_HISTORY_CHAR_BUDGET = 40000
+
+
+def _batch_max_rows() -> int:
+    """Cap on rows per ``POST /api/v1/agents/{name}/batch`` (item 17).
+
+    A single batch submission enqueues ONE job per dataset row; without a
+    ceiling a single request could flood the shared queue (and starve other
+    tenants' single runs). Default 10000 — generous for realistic eval / bulk
+    datasets while bounding the blast radius of one request. Operators tune it
+    per-deployment via ``MDK_BATCH_MAX_ROWS`` (a non-positive / unparseable
+    value falls back to the default). Read per-request so a deploy can change
+    it without a code change; the cost is one ``os.environ`` lookup per submit.
+    """
+    raw = os.environ.get("MDK_BATCH_MAX_ROWS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return _BATCH_MAX_ROWS_DEFAULT
+        if parsed > 0:
+            return parsed
+    return _BATCH_MAX_ROWS_DEFAULT
+
+
+_BATCH_MAX_ROWS_DEFAULT = 10_000
+
+
+def _parse_jsonl_rows(raw: bytes) -> list[dict[str, Any]]:
+    """Parse a JSONL byte payload into a list of input-row dicts.
+
+    Every non-empty line must be a JSON object — same contract as the
+    dataset-upload endpoint. A malformed line or a non-object value raises
+    ``HTTPException`` (422) naming the line so the caller can fix it. Blank
+    lines are skipped so trailing newlines are harmless.
+    """
+    rows: list[dict[str, Any]] = []
+    for lineno, raw_line in enumerate(raw.decode().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=f"batch dataset line {lineno} is not valid JSON: {exc}",
+            ) from exc
+        if not isinstance(obj, dict):
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=(
+                    f"batch dataset line {lineno} must be a JSON object, got {type(obj).__name__}"
+                ),
+            )
+        rows.append(obj)
+    return rows
+
+
+async def _parse_batch_dataset(request: Request) -> tuple[list[dict[str, Any]], str | None]:
+    """Extract the batch dataset rows + optional notify_email from a request.
+
+    Dispatches on ``Content-Type`` so one endpoint serves both shapes:
+
+    * ``multipart/form-data`` → a ``file`` field carrying a **JSONL** dataset
+      (one JSON object per line). The form may also carry ``notify_email``.
+    * otherwise (JSON body) → ``{"inputs": [ {...}, ... ], "notify_email"?: ...}``
+      validated against :class:`BatchInlineSubmission`.
+
+    Returns ``(rows, notify_email)``. Raises ``HTTPException`` (422) on a
+    malformed dataset / missing file / unparseable body — never silently
+    coerces, so a typo fails the submit loud rather than enqueuing garbage.
+    """
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data"):
+        # ``request.form()`` returns Starlette's UploadFile (FastAPI's
+        # ``UploadFile`` is a *subclass*, so an isinstance against the FastAPI
+        # re-export would miss it). Check the Starlette base instead.
+        from starlette.datastructures import UploadFile as _StarletteUploadFile  # noqa: PLC0415
+
+        form = await request.form()
+        upload = form.get("file")
+        if not isinstance(upload, _StarletteUploadFile):
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message="multipart batch upload requires a 'file' field holding a JSONL dataset",
+            )
+        raw = await upload.read()
+        rows = _parse_jsonl_rows(raw)
+        notify_field = form.get("notify_email")
+        notify_email = notify_field if isinstance(notify_field, str) and notify_field else None
+        return rows, notify_email
+
+    # JSON body path — {"inputs": [...], "notify_email"?: ...}.
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=f"batch body is not valid JSON: {exc}",
+        ) from exc
+    try:
+        submission = BatchInlineSubmission.model_validate(body)
+    except ValidationError as exc:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=f"batch body must be {{'inputs': [ {{...}}, ... ]}}: {exc.errors()}",
+        ) from exc
+    return submission.inputs, submission.notify_email
 
 
 def _apply_history_char_budget(
@@ -3253,6 +3375,216 @@ def build_app(
         await store.save_job(job)
         response.status_code = 202
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    # ------------------------------------------------------------------
+    # Batch inference (item 17) — submit a whole dataset, one AGENT job
+    # per row, sharing a batch_id. Reuses the existing queue: each row is
+    # an ordinary JobKind.AGENT job, so it inherits retry / dead-letter /
+    # canary / observability with no new execution path. Submit gates on
+    # ``run`` (it executes the agent); read/status gate on ``read``.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/agents/{name}/batch",
+        response_model=BatchAcceptedView,
+        status_code=202,
+        tags=["agents-v1", "jobs"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_agent_batch(
+        name: str,
+        request: Request,
+        response: Response,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> BatchAcceptedView:
+        """Submit a dataset of inputs for ``name`` as a batch of async jobs.
+
+        Accepts EITHER:
+
+        * a ``multipart/form-data`` upload with a ``file`` field holding a
+          **JSONL** dataset (one JSON object per line = one run's input); OR
+        * an inline JSON body ``{"inputs": [ {...}, ... ], "notify_email"?: ...}``
+          for programmatic callers that already have the rows in memory.
+
+        Each row becomes ONE ordinary ``JobKind.AGENT`` job — the exact same
+        shape the single-run path produces — stamped with a shared
+        ``batch_id``. The worker runs them with no new dispatch branch, so
+        every row is observable, retryable, dead-letter-handled, and
+        canary-aware for free. A :class:`BatchRecord` (``total`` = row count)
+        is persisted so ``GET /api/v1/batches/{batch_id}`` can aggregate.
+
+        Returns ``202`` + ``{batch_id, total, status: "queued"}``. Poll the
+        status endpoint for per-row progress.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — key lacks the ``run`` scope
+        * **404** — agent not in the registry (same resolution as single-run)
+        * **413** — dataset exceeds the per-request row cap
+          (``MDK_BATCH_MAX_ROWS``, default 10000)
+        * **422** — empty dataset, malformed JSONL, or a non-object row
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # Resolve the agent registry-first, filesystem-fallback — identical
+        # to the single-run path so an unknown agent 404s the same way. We
+        # do NOT apply canary version pinning here: a batch is a bulk eval /
+        # backfill, so every row resolves "latest" (target_version=None),
+        # byte-for-byte a pre-canary agent job. (A future PR could thread a
+        # per-batch version pin; out of scope for item 17.)
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=None, fallback=agents
+        )
+        if bundle is None:
+            raise not_found("agent", name)
+
+        rows, notify_email = await _parse_batch_dataset(request)
+
+        if not rows:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message="batch dataset is empty — provide at least one input row",
+            )
+        max_rows = _batch_max_rows()
+        if len(rows) > max_rows:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=413,
+                message=(
+                    f"batch dataset has {len(rows)} rows, exceeding the per-request "
+                    f"cap of {max_rows} (set MDK_BATCH_MAX_ROWS to adjust)"
+                ),
+            )
+
+        # Mint the parent + enqueue one ordinary AGENT job per row, all
+        # sharing the batch_id. Persist the BatchRecord FIRST so a crash
+        # mid-enqueue still leaves a discoverable parent (its children that
+        # made it onto the queue still run; the status endpoint reports the
+        # partial count honestly against ``total``).
+        batch_id = str(uuid4())
+        batch = BatchRecord(
+            batch_id=batch_id,
+            tenant_id=ctx.tenant_id,
+            agent=name,
+            total=len(rows),
+            created_by=ctx.api_key_id,
+        )
+        await store.save_batch(batch)
+
+        for row in rows:
+            job = JobRecord(
+                job_id=str(uuid4()),
+                tenant_id=ctx.tenant_id,
+                kind=JobKind.AGENT,
+                target=name,
+                status=JobStatus.QUEUED,
+                input=row,
+                api_key_id=ctx.api_key_id,
+                notify_email=notify_email,
+                batch_id=batch_id,
+            )
+            await store.save_job(job)
+
+        response.status_code = 202
+        return BatchAcceptedView(batch_id=batch_id, total=len(rows), status="queued")
+
+    @v1.get(
+        "/batches",
+        response_model=BatchListView,
+        tags=["agents-v1", "jobs"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_batches(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 20,
+    ) -> BatchListView:
+        """List this tenant's recent batches, newest-first.
+
+        Always tenant-scoped. Returns parent metadata only (no per-status
+        aggregate — that requires fetching every child, so it lives on
+        ``GET /api/v1/batches/{id}``). ``limit`` is hard-capped at 100.
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_batches(tenant_id=ctx.tenant_id, limit=capped_limit)
+        items = [
+            BatchListItemView(
+                batch_id=b.batch_id,
+                agent=b.agent,
+                total=b.total,
+                created_at=b.created_at,
+            )
+            for b in records
+        ]
+        return BatchListView(batches=items, count=len(items))
+
+    @v1.get(
+        "/batches/{batch_id}",
+        response_model=BatchStatusView,
+        tags=["agents-v1", "jobs"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_batch(
+        batch_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> BatchStatusView:
+        """Aggregate status of one batch's child jobs.
+
+        Loads the :class:`BatchRecord` (tenant-scoped — a cross-tenant or
+        missing id 404s identically, never leaking existence), fetches the
+        child jobs via ``list_jobs(batch_id=...)``, and returns per-status
+        counts + a derived overall ``state``: ``running`` while ANY child is
+        still non-terminal (QUEUED / RUNNING), else ``complete``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — key lacks the ``read`` scope
+        * **404** — no such batch for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_batch(batch_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("batch", batch_id)
+
+        # A batch's child count is bounded by the submit-time row cap, so a
+        # single list call with that ceiling fetches them all. Pass the
+        # recorded ``total`` (min 1) as the limit so we never silently
+        # truncate the aggregate.
+        children = await store.list_jobs(
+            tenant_id=ctx.tenant_id,
+            batch_id=batch_id,
+            limit=max(record.total, 1),
+        )
+
+        counts = BatchStatusCounts()
+        non_terminal = {JobStatus.QUEUED, JobStatus.RUNNING}
+        any_pending = False
+        for child in children:
+            # Field names mirror the JobStatus values 1:1.
+            setattr(counts, child.status.value, getattr(counts, child.status.value) + 1)
+            if child.status in non_terminal:
+                any_pending = True
+
+        # "running" while any child is still QUEUED/RUNNING; "complete" once
+        # every child has reached a terminal status. An empty batch (total=0,
+        # no children) reads "complete" — there's nothing left to run.
+        state = "running" if any_pending else "complete"
+
+        return BatchStatusView(
+            batch_id=record.batch_id,
+            agent=record.agent,
+            total=record.total,
+            counts=counts,
+            state=state,
+            created_at=record.created_at,
+            job_ids=[c.job_id for c in children],
+        )
 
     @v1.post(
         "/agents/{name}/runs/stream",

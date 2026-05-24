@@ -29,6 +29,7 @@ from typing import Protocol
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
+    BatchRecord,
     BenchRecord,
     CanaryConfig,
     ConversationThread,
@@ -394,6 +395,41 @@ class StorageProvider(Protocol):
         """
 
     # ------------------------------------------------------------------
+    # Batches (item 17 — batch inference)
+    #
+    # A batch is parent metadata over N child jobs. The submit endpoint
+    # mints a batch_id, persists one BatchRecord(total=N), and enqueues N
+    # ordinary JobKind.AGENT jobs each carrying jobs.batch_id = batch_id.
+    # The status endpoint loads the BatchRecord then aggregates over the
+    # children via list_jobs(batch_id=...). Additive new table — no row
+    # exists unless a batch was submitted, so non-batch behavior is
+    # byte-for-byte unchanged.
+    # ------------------------------------------------------------------
+
+    async def save_batch(self, batch: BatchRecord) -> None:
+        """Insert a brand-new batch parent row. Errors on duplicate ``batch_id``."""
+
+    async def get_batch(self, batch_id: str, *, tenant_id: str) -> BatchRecord | None:
+        """Exact lookup by ``batch_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the batch belongs to a different
+        tenant — same no-leak contract as ``get_job`` (a cross-tenant lookup
+        is indistinguishable from a missing one, so callers 404 either way).
+        """
+
+    async def list_batches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 20,
+    ) -> list[BatchRecord]:
+        """List batches newest-first, optionally tenant-scoped.
+
+        ``tenant_id=None`` returns batches across all tenants — reserved for
+        operator tooling; never exposed on the HTTP API.
+        """
+
+    # ------------------------------------------------------------------
     # Job queue (v0.5)
     # ------------------------------------------------------------------
 
@@ -414,6 +450,7 @@ class StorageProvider(Protocol):
         tenant_id: str | None = None,
         status: JobStatus | None = None,
         target: str | None = None,
+        batch_id: str | None = None,
         limit: int = 20,
     ) -> list[JobRecord]:
         """List jobs newest-first, optionally filtered.
@@ -426,6 +463,12 @@ class StorageProvider(Protocol):
         ``target`` filters to one agent (or workflow) name — drives the
         Angular agent-profile page's "recent runs" tab via
         ``GET /api/v1/jobs?agent=<name>`` (item 74).
+
+        ``batch_id`` filters to the child jobs of one batch (item 17). The
+        batch-status endpoint pairs this with a high ``limit`` so it can
+        aggregate per-status counts over every row of a batch. ``None`` (the
+        common case) doesn't constrain on batch membership, so the pre-batch
+        listing behavior is unchanged.
         """
 
     async def claim_next_job(self, *, tenant_id: str | None = None) -> JobRecord | None:

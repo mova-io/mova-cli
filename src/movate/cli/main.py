@@ -191,6 +191,7 @@ from movate.cli import watch as watch_cmd  # noqa: E402
 from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.agent_cmd import agent_app  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
+from movate.cli.batch_cmd import batch_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.canary_cmd import canary_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
@@ -500,6 +501,7 @@ app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 # ----- Remote (talk to a deployed runtime) ----------------------------------
 
 app.command("submit", rich_help_panel=PANEL_RUN)(submit_cmd.submit)
+app.add_typer(batch_app, name="batch", rich_help_panel=PANEL_RUN)
 app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 app.add_typer(workflow_app, name="workflow", rich_help_panel=PANEL_RUN)
 
