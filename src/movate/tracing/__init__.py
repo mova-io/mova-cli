@@ -46,6 +46,7 @@ from __future__ import annotations
 import os
 import sys
 
+from movate.tracing.audit import record_audit_event
 from movate.tracing.base import SpanCtx, Tracer
 from movate.tracing.composite import CompositeTracer
 from movate.tracing.metrics import (
@@ -84,6 +85,7 @@ __all__ = [
     "inc_in_flight",
     "init_metrics",
     "inject_current_trace_context",
+    "record_audit_event",
     "record_job_completed",
     "record_run_usage",
 ]

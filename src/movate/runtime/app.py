@@ -208,7 +208,7 @@ from movate.runtime.skill_creation import (
     persist_skill_bundle,
 )
 from movate.storage.base import StorageProvider
-from movate.tracing import inject_current_trace_context
+from movate.tracing import inject_current_trace_context, record_audit_event
 
 if TYPE_CHECKING:
     from movate.providers.model_catalog import ModelInfo
@@ -5111,6 +5111,16 @@ def build_app(
             }
         )
         await store.save_canary_config(updated)
+        # Audit the successful promotion (item 35): target is the agent +
+        # promoted version; mode records assisted vs auto.
+        record_audit_event(
+            "canary.promote",
+            actor=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            target=f"{name}@{target}",
+            mode=mode,
+            previous_champion=previous_champion,
+        )
         return CanaryPromotedView(
             agent=name,
             promoted_version=target,
@@ -5159,6 +5169,13 @@ def build_app(
         target = config.champion_version
         updated = config.model_copy(update={"weight": 0, "updated_at": datetime.now(UTC)})
         await store.save_canary_config(updated)
+        # Audit the successful rollback (item 35).
+        record_audit_event(
+            "canary.rollback",
+            actor=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            target=f"{name}@{target if target is not None else '<latest>'}",
+        )
         return CanaryPromotedView(
             agent=name,
             promoted_version=target if target is not None else "<latest>",
@@ -5679,6 +5696,14 @@ def build_app(
             scopes=requested,
         )
         await store.save_api_key(minted.record)
+        # Audit the successful mint (item 35). Never logs the key value —
+        # only the new key's id as the target.
+        record_audit_event(
+            "api_key.mint",
+            actor=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            target=minted.record.key_id,
+        )
         return ApiKeyMintedView(
             key_id=minted.record.key_id,
             full_key=minted.full_key,
@@ -5768,6 +5793,13 @@ def build_app(
         if record is None or record.tenant_id != ctx.tenant_id:
             raise not_found("api_key", key_id)
         await store.revoke_api_key(key_id, tenant_id=ctx.tenant_id)
+        # Audit the successful revoke (item 35).
+        record_audit_event(
+            "api_key.revoke",
+            actor=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            target=key_id,
+        )
         return ApiKeyRevokedView(key_id=key_id)
 
     @v1.post(
@@ -5826,6 +5858,14 @@ def build_app(
         await store.save_api_key(rotated.minted.record)
         await store.set_api_key_expiry(
             old.key_id, tenant_id=ctx.tenant_id, expires_at=rotated.old_expires_at
+        )
+        # Audit the successful rotation (item 35): old key id → its successor.
+        record_audit_event(
+            "api_key.rotate",
+            actor=ctx.api_key_id,
+            tenant_id=ctx.tenant_id,
+            target=old.key_id,
+            successor_key_id=rotated.minted.record.key_id,
         )
         return ApiKeyRotatedView(
             key_id=rotated.minted.record.key_id,

@@ -205,6 +205,16 @@ mdk auth revoke-key <key_id>             # revoke a single key
 mdk auth whoami --target dev             # resolve the calling identity + scopes
 ```
 
+> **Audit trail (item 35).** Security-relevant control-plane mutations — API key
+> mint / revoke / rotate and canary promote / rollback — emit a structured
+> `audit` record on the `movate.audit` logger at INFO (→ Azure Log Analytics)
+> carrying `action`, `actor` (the calling key id), `tenant_id`, and `target`
+> (the affected key id, or `agent@version`). The same fields ride as a
+> best-effort event on the active OpenTelemetry span (→ App Insights trace
+> correlation) when tracing is on. The audited record NEVER contains the key
+> value or any secret — only identifiers. Filter Log Analytics on the
+> `movate.audit` logger for the "who did what, when" trail.
+
 > **Fresh-deploy bootstrap key (gotcha).** On a fresh Azure deploy the runtime
 > auto-seeds a bootstrap key from the `bootstrap-api-key` secret, populated by
 > `mdk auth bootstrap-seed <target>` (a `fleet-admin` key) — *not* hand-set. See
