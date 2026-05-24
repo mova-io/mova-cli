@@ -46,6 +46,7 @@ from movate.core.models import (
 from movate.core.notify import NotificationDispatcher
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.storage.base import StorageProvider
+from movate.tracing import dec_in_flight, inc_in_flight, record_job_completed
 
 logger = logging.getLogger(__name__)
 
@@ -129,21 +130,29 @@ class Worker:
             return None
 
         started = time.monotonic()
+        # Bracket dispatch with the in-flight gauge (mdk.jobs.in_flight, R3 /
+        # item 33). try/finally so the decrement always runs — even if dispatch
+        # raises below — otherwise the gauge would leak upward. No-op when
+        # metrics are off (OTel extra absent or sink not OTLP).
+        inc_in_flight(tenant_id=job.tenant_id)
         try:
-            outcome = await self._dispatch.execute_job(job)
-        except Exception as exc:
-            # Programming bug in dispatch (or in the executor it
-            # wraps). Record as INTERNAL so operators can triage.
-            logger.exception("worker_dispatch_crashed job_id=%s", job.job_id)
-            outcome = DispatchOutcome(
-                status=JobStatus.ERROR,
-                result_run_id=None,
-                error=ErrorInfo(
-                    type="internal",
-                    message=f"worker dispatch crashed: {exc}",
-                    retryable=True,
-                ).model_dump(),
-            )
+            try:
+                outcome = await self._dispatch.execute_job(job)
+            except Exception as exc:
+                # Programming bug in dispatch (or in the executor it
+                # wraps). Record as INTERNAL so operators can triage.
+                logger.exception("worker_dispatch_crashed job_id=%s", job.job_id)
+                outcome = DispatchOutcome(
+                    status=JobStatus.ERROR,
+                    result_run_id=None,
+                    error=ErrorInfo(
+                        type="internal",
+                        message=f"worker dispatch crashed: {exc}",
+                        retryable=True,
+                    ).model_dump(),
+                )
+        finally:
+            dec_in_flight(tenant_id=job.tenant_id)
 
         # Decide retry vs terminal BEFORE writing back to storage.
         # The decision is a pure function of the outcome's retryable
@@ -204,6 +213,18 @@ class Worker:
             final_status.value,
             duration_ms,
         )
+        # Job-queue golden signals (mdk.jobs.completed + mdk.job.duration_ms,
+        # R3 / item 33). Record the *final* persisted status — a retryable error
+        # that exhausted its budget surfaces here as dead_letter, not error.
+        # A "retry" action is NOT terminal (the job re-queues), so we only record
+        # on a true terminal status. No-op when metrics are off.
+        if final_action == "terminal":
+            record_job_completed(
+                kind=job.kind.value,
+                status=final_status.value,
+                duration_ms=duration_ms,
+                tenant_id=job.tenant_id,
+            )
         if self._on_job_complete is not None:
             # Decorative; never sink the worker on a buggy callback.
             # We pass an outcome reflecting the FINAL status (which

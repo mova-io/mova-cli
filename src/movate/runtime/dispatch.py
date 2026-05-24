@@ -30,7 +30,7 @@ from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.storage.base import StorageProvider
-from movate.tracing import continue_trace_context
+from movate.tracing import continue_trace_context, record_run_usage
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,19 @@ class WorkerDispatch:
             # operators can decide whether to requeue.
             logger.exception("agent_execute_unhandled job_id=%s", job.job_id)
             return _error("internal", str(exc), retryable=True)
+
+        # Per-run token + cost volume (mdk.run.tokens + mdk.run.cost_usd, R3 /
+        # item 33). Recorded at the runtime edge from the RunResponse already in
+        # hand — NOT inside the executor/core (boundary rule: core must not import
+        # tracing metrics). ``response.metrics`` carries the aggregate token usage
+        # (input + output) and cost the executor computed; we record the total.
+        # No-op when metrics are off.
+        _metrics = response.metrics
+        record_run_usage(
+            tenant_id=job.tenant_id,
+            tokens=_metrics.tokens.input + _metrics.tokens.output,
+            cost_usd=_metrics.cost_usd,
+        )
 
         if response.status == "success":
             return DispatchOutcome(

@@ -139,6 +139,13 @@ async def _run_serve(
 
     from movate.runtime.app import build_app  # noqa: PLC0415
     from movate.runtime.registry import scan_agents  # noqa: PLC0415
+    from movate.tracing import init_metrics  # noqa: PLC0415
+
+    # Initialize OTel metrics once at process startup (R3 / item 33), after
+    # dotenv + MDK_*→MOVATE_* alias sync (both run at CLI import in main.py).
+    # Mirrors the tracer wiring; a complete no-op when the otel extra is absent
+    # or the OTLP sink/endpoint isn't configured. Never raises.
+    init_metrics()
 
     storage = build_storage()
     await storage.init()

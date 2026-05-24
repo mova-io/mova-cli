@@ -562,6 +562,80 @@ async def test_worker_run_one_cycle_drains_one_job(
 
 
 @pytest.mark.unit
+async def test_worker_run_one_cycle_records_job_metric(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3 / item 33: a completed cycle records the job-completed metric with the
+    job's kind, the final status, the measured duration, and the tenant — and
+    brackets dispatch with the in-flight inc/dec. Metrics are recorded by
+    monkeypatched recorders so the assertion needs no OTel SDK."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+
+    completed: list[dict] = []
+    in_flight: list[str] = []
+    monkeypatch.setattr(
+        "movate.runtime.worker.record_job_completed",
+        lambda **kw: completed.append(kw),
+    )
+    monkeypatch.setattr(
+        "movate.runtime.worker.inc_in_flight",
+        lambda *, tenant_id: in_flight.append(f"+{tenant_id}"),
+    )
+    monkeypatch.setattr(
+        "movate.runtime.worker.dec_in_flight",
+        lambda *, tenant_id: in_flight.append(f"-{tenant_id}"),
+    )
+
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = _make_executor(storage)
+    agents = scan_agents(scaffolded_agent)
+
+    job = _make_job(target="alpha", tenant_id="tenant-a")
+    await storage.save_job(job)
+
+    dispatch = WorkerDispatch(storage=storage, executor=executor, agents=agents)
+    worker = Worker(storage=storage, dispatch=dispatch)
+    await worker.run_one_cycle()
+
+    assert len(completed) == 1
+    rec = completed[0]
+    assert rec["kind"] == JobKind.AGENT.value
+    assert rec["status"] == JobStatus.SUCCESS.value
+    assert rec["tenant_id"] == "tenant-a"
+    assert isinstance(rec["duration_ms"], int) and rec["duration_ms"] >= 0
+    # In-flight bracketed: inc before dispatch, dec after (try/finally).
+    assert in_flight == ["+tenant-a", "-tenant-a"]
+
+
+@pytest.mark.unit
+async def test_worker_run_one_cycle_unchanged_when_metrics_off(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior is unchanged when metrics are off: the default (uninitialized)
+    recorders are no-ops, so the job still drains to SUCCESS exactly as before.
+    No init_metrics call here → the real helpers run as no-ops."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = _make_executor(storage)
+    agents = scan_agents(scaffolded_agent)
+
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    dispatch = WorkerDispatch(storage=storage, executor=executor, agents=agents)
+    worker = Worker(storage=storage, dispatch=dispatch)
+    handled = await worker.run_one_cycle()
+
+    assert handled is not None
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.SUCCESS
+
+
+@pytest.mark.unit
 async def test_worker_records_error_on_unknown_target() -> None:
     """A job whose target isn't in the registry should still transition
     to a terminal state — ERROR, with a structured error info."""
