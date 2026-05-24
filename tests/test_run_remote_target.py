@@ -50,6 +50,19 @@ def _make_client_factory(transport: httpx.MockTransport, monkeypatch: pytest.Mon
     monkeypatch.setattr("httpx.Client", factory)
 
 
+def _async_client_factory(transport: httpx.MockTransport):
+    """Return a drop-in ``httpx.AsyncClient`` factory that forces calls
+    through a MockTransport — the streaming remote path uses
+    ``httpx.AsyncClient.stream`` rather than the sync ``httpx.Client``."""
+    real_async = httpx.AsyncClient
+
+    def factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        kwargs["transport"] = transport  # type: ignore[assignment]
+        return real_async(*args, **kwargs)  # type: ignore[arg-type]
+
+    return factory
+
+
 def _write_user_config(home: Path, target_name: str = "dev") -> None:
     """Stash a minimal ``~/.movate/config.yaml`` pointing at a fake URL.
 
@@ -318,18 +331,41 @@ def test_target_mutex_with_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.unit
-def test_target_mutex_with_stream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``--target`` + ``--stream`` is unsupported in v0.7 — the
-    runtime returns the final RunView once execution completes; no
-    per-token callback path."""
+def test_target_stream_is_now_supported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--target`` + ``--stream`` is no longer a mutex error (BACKLOG
+    #75): it POSTs to the runtime's SSE endpoint and renders tokens.
+
+    Regression guard against the old v0.7 guard creeping back. Full SSE
+    consumption is covered in test_run_remote_stream.py — here we just
+    confirm the CLI accepts the combination and hits the stream URL."""
     _bootstrap_project(tmp_path, monkeypatch)
     monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
     _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_t1_k1_secret")
+
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        sse = (
+            'event: token\ndata: {"text": "{\\"answer\\": \\"hi\\"}"}\n\n'
+            'event: done\ndata: {"run_id": "r1", "status": "success", '
+            '"metrics": {"cost_usd": 0.0, "latency_ms": 5}, "output": {"answer": "hi"}}\n\n'
+        )
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse.encode()
+        )
+
+    monkeypatch.setattr(
+        "httpx.AsyncClient",
+        _async_client_factory(httpx.MockTransport(handler)),
+    )
+
     result = runner.invoke(
         app, ["run", "faq", "hi", "--target", "dev", "--stream"], env={"COLUMNS": "200"}
     )
-    assert result.exit_code == 2
-    assert "--stream" in result.stderr
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "/api/v1/agents/faq/runs/stream" in str(captured["url"])
 
 
 # ---------------------------------------------------------------------------

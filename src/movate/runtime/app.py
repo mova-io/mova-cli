@@ -19,6 +19,9 @@ and ``movate serve`` CLI binding (uvicorn integration).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,7 +29,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, File, Header, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import movate
 from movate.core.auth import ALL_SCOPES, LEGACY_DEFAULT_SCOPES, mint_api_key
@@ -180,6 +183,139 @@ from movate.storage.base import StorageProvider
 
 if TYPE_CHECKING:
     from movate.providers.model_catalog import ModelInfo
+
+
+def _sse_frame(event: str, data: dict[str, Any]) -> str:
+    """Format one Server-Sent Events frame.
+
+    Single source of truth for the wire shape so the endpoint and any
+    future caller stay byte-identical: an ``event:`` line, a ``data:``
+    line carrying compact JSON, terminated by the mandatory blank line
+    (``\\n\\n``). Compact separators keep token frames small — most
+    carry a one- or two-token ``text`` delta.
+    """
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'), default=str)}\n\n"
+
+
+async def _sse_run_stream(
+    *,
+    executor: Any,
+    bundle: AgentBundle,
+    run_request: Any,
+    store: StorageProvider,
+    tenant_id: str,
+) -> Any:
+    """Bridge the Executor's *sync* ``on_token`` callback to an *async*
+    SSE generator and yield SSE frames.
+
+    The tricky bit: ``Executor.execute`` invokes ``on_token`` inline
+    from inside its own coroutine, but an SSE response must be driven by
+    an async generator that the server pulls from. We decouple the two
+    with an :class:`asyncio.Queue`:
+
+    * A background task runs ``execute(..., on_token=...)``. The callback
+      is a sync lambda that ``put_nowait``-s each token delta onto the
+      queue (the queue is unbounded, so the callback never blocks the
+      executor coroutine). When ``execute`` returns (or raises), the task
+      pushes a terminal marker.
+    * This generator ``await queue.get()``-loops, translating each
+      marker into an SSE frame: ``token`` per delta, then a single
+      ``done`` (success / safety) or ``error`` (executor error status
+      or raised exception) frame.
+
+    No orphaned tasks / leaks: the ``finally`` cancels the executor task
+    if it's still running (e.g. the client disconnected mid-stream and
+    the server threw ``GeneratorExit`` into us) and awaits it so the
+    coroutine is fully unwound. On the normal path the task has already
+    completed before we exit the loop.
+
+    Persistence is unchanged: ``execute`` writes the ``RunRecord`` (or a
+    ``FailureRecord`` on error) exactly as a non-streamed run, so a
+    follow-up ``GET /runs/{run_id}`` returns the run after the stream
+    closes.
+    """
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    async def _drive() -> None:
+        try:
+            response = await executor.execute(
+                bundle,
+                run_request,
+                on_token=lambda delta: queue.put_nowait(("token", delta)),
+                tenant_id_override=tenant_id,
+            )
+            await queue.put(("result", response))
+        except Exception as exc:  # surface ANY failure as an SSE error frame
+            await queue.put(("exc", exc))
+
+    task = asyncio.create_task(_drive())
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "token":
+                # Only emit non-empty deltas — the provider's final
+                # usage-only chunk carries an empty string.
+                if payload:
+                    yield _sse_frame("token", {"text": payload})
+                continue
+            if kind == "result":
+                response = payload
+                if response.status == "error":
+                    err = response.error
+                    yield _sse_frame(
+                        "error",
+                        {
+                            "message": err.message if err is not None else "run failed",
+                            "code": err.type if err is not None else "error",
+                        },
+                    )
+                    return
+                # Success / safety_blocked → fetch the persisted record so
+                # the terminal frame carries the canonical RunView shape.
+                record = await store.get_run(response.run_id, tenant_id=tenant_id)
+                if record is not None:
+                    view = RunView.from_record(record)
+                    yield _sse_frame(
+                        "done",
+                        {
+                            "run_id": view.run_id,
+                            "status": view.status.value,
+                            "metrics": view.metrics.model_dump(mode="json"),
+                            "output": view.output,
+                        },
+                    )
+                else:
+                    # No RunRecord (only happens if the status was
+                    # non-error but persistence was skipped) — fall back
+                    # to the RunResponse so the client still gets a
+                    # terminal frame with the run_id + output.
+                    yield _sse_frame(
+                        "done",
+                        {
+                            "run_id": response.run_id,
+                            "status": response.status,
+                            "metrics": response.metrics.model_dump(mode="json"),
+                            "output": response.data or None,
+                        },
+                    )
+                return
+            if kind == "exc":
+                exc = payload
+                yield _sse_frame(
+                    "error",
+                    {"message": str(exc) or exc.__class__.__name__, "code": "internal_error"},
+                )
+                return
+    finally:
+        # Cancel + reap the executor task so nothing is orphaned. On the
+        # happy path it's already done; on client disconnect (GeneratorExit
+        # thrown into this generator) it may still be running. Suppress both
+        # CancelledError (from our cancel) and any straggler exception —
+        # cleanup must never raise out of the generator's finally.
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 def _github_is_enabled() -> bool:
@@ -3117,6 +3253,115 @@ def build_app(
         await store.save_job(job)
         response.status_code = 202
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    @v1.post(
+        "/agents/{name}/runs/stream",
+        tags=["agents-v1"],
+        dependencies=[_scope("run")],
+        # No response_model — this returns a raw SSE byte stream
+        # (text/event-stream), not a JSON body. OpenAPI documents the
+        # event shapes in the docstring instead.
+    )
+    async def v1_agent_run_stream(
+        name: str,
+        body: AgentRunSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> StreamingResponse:
+        """Run an agent and stream model tokens live over **SSE**.
+
+        Companion to the inline ``POST /agents/{name}/runs?wait=true``
+        path — same Executor stack, same bundle resolution (incl.
+        canary routing, ADR 016 D3), same persistence (the streamed run
+        writes its ``RunRecord`` exactly as a non-streamed run, so
+        ``GET /runs/{run_id}`` works after the stream closes). The ONLY
+        difference is the transport: instead of blocking for the full
+        run and returning one ``RunView``, we emit
+        `Server-Sent Events <https://html.spec.whatwg.org/multipage/server-sent-events.html>`_
+        so a client (``mdk run --target <t> --stream``) renders tokens
+        as they arrive.
+
+        Event shapes (``\\n\\n``-terminated SSE frames):
+
+        * **per token** — ``event: token`` /
+          ``data: {"text": "<delta>"}``. Zero or more; concatenating
+          every ``text`` reconstructs the model's raw output.
+        * **terminal success** — ``event: done`` /
+          ``data: {"run_id", "status", "metrics", "output"}``.
+        * **failure** — ``event: error`` /
+          ``data: {"message", "code"}``. Emitted instead of ``done``
+          when the executor returns an error status or raises.
+
+        Streaming is purely *additive observation* (the Executor's
+        ``on_token`` hook): cost accounting, schema validation, and
+        persistence are byte-for-byte the same as a one-shot run.
+
+        Gated on the ``run`` scope (least privilege) and tenant-scoped:
+        the persisted ``RunRecord`` carries the caller's tenant, so a
+        cross-tenant ``GET /runs/{id}`` 404s exactly like the sync path.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``run`` scope
+        * **404** — agent not in the registry
+        * **422** — body shape failure
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # Canary routing (ADR 016 D3) — resolve EXACTLY like the sync run
+        # path so a streamed run picks the same champion/challenger
+        # version a non-streamed run would. choose_version returns None
+        # (→ latest) when there's no config / it's disabled.
+        canary = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        chosen_version = choose_version(canary, thread_id=body.thread_id)
+
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=chosen_version, fallback=agents
+        )
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Lazy imports keep cold-start light for the non-streaming paths.
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.core.models import RunRequest as _RunRequest  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        provider: BaseLLMProvider = MockProvider() if body.mock else LiteLLMProvider()
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=ctx.tenant_id,
+            cache=request.app.state.llm_cache,
+        )
+        run_request = _RunRequest(agent=name, input=body.input)
+        tenant_id = ctx.tenant_id
+
+        generator = _sse_run_stream(
+            executor=executor,
+            bundle=bundle,
+            run_request=run_request,
+            store=store,
+            tenant_id=tenant_id,
+        )
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers={
+                # Defeat any intermediary buffering so tokens reach the
+                # client as they're produced (matters behind nginx /
+                # Azure Front Door).
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @v1.get(
         "/jobs",
