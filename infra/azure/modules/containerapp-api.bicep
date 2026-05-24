@@ -70,7 +70,7 @@ param corsAllowedOrigins string = ''
 @description('''
 Name of the Container Apps Environment storage config that backs the
 Azure Files agents volume. When non-empty, a volume named ``agents-vol``
-is mounted at ``/home/movate/agents`` and ``MOVATE_AGENTS_PATH`` points
+is mounted at ``/home/movate/agents`` and ``MDK_AGENTS_PATH`` points
 there instead of the image-baked ``/app/agents``. Empty string (default)
 disables the mount — dev/staging with a single replica works fine on
 pod-local storage.
@@ -190,7 +190,7 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat([
             {
-              name: 'MOVATE_DB_URL'
+              name: 'MDK_DB_URL'
               // Constructed from the secret + non-secret components.
               // asyncpg understands the libpq URL format directly.
               value: 'postgresql://${postgresAdminUsername}:@${postgresFqdn}:5432/${postgresDatabase}?sslmode=require'
@@ -219,11 +219,11 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             // <target>` once per environment to mint + upload this
             // secret value.
             {
-              name: 'MOVATE_SEED_API_KEY'
+              name: 'MDK_SEED_API_KEY'
               secretRef: 'bootstrap-api-key'
             }
             {
-              name: 'MOVATE_AGENTS_PATH'
+              name: 'MDK_AGENTS_PATH'
               // Pod-local when Azure Files is off (single-replica dev);
               // shared mount when agentsStorageName is set (multi-pod).
               value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'

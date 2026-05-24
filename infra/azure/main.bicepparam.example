@@ -84,3 +84,16 @@ param tags = {
 // Example for the Friday Mova iO demo:
 //   param corsAllowedOrigins = 'http://localhost:4200,https://mova-io.movate.com'
 param corsAllowedOrigins = ''
+
+// OPTIONAL — cold-start knobs. Override the API / worker
+// `scale.minReplicas`. Leave at the -1 sentinel (the param default) to
+// keep the per-env defaults (dev/staging = 1, prod = 2) — i.e. no change
+// to today's scaling. Set to 0 to allow scale-to-zero (cheapest; the
+// first request / queued job after idle pays a cold start, which can
+// time out a tight `GET /healthz` probe). Set to 1+ to keep a replica
+// always-warm for QA/prod so no request ever pays the cold start.
+//
+//   param apiMinReplicas = 1      // always-warm API (no /healthz cold-start)
+//   param workerMinReplicas = 1   // always-warm worker
+// param apiMinReplicas = -1
+// param workerMinReplicas = -1

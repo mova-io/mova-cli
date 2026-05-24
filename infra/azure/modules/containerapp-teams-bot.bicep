@@ -8,9 +8,9 @@
 // ----------
 // The bot reads three secrets from Key Vault at startup:
 //
-//   1. ``MOVATE_TEAMS_FLEET_API_KEY`` — bot's fleet Movate API key for
+//   1. ``MDK_TEAMS_FLEET_API_KEY`` — bot's fleet Movate API key for
 //      admin ops + the fallback path when a user hasn't run /movate connect.
-//   2. ``MOVATE_TEAMS_ENCRYPTION_KEY`` — Fernet key for the per-user
+//   2. ``MDK_TEAMS_ENCRYPTION_KEY`` — Fernet key for the per-user
 //      identity-binding store (3.1.c). 32-byte url-safe-base64.
 //   3. ``MICROSOFT_APP_PASSWORD`` — Bot Service AAD app secret. Used
 //      for JWT validation of inbound webhooks (slot ready for the
@@ -152,15 +152,15 @@ resource bot 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: [
             {
-              name: 'MOVATE_RUNTIME_URL'
+              name: 'MDK_RUNTIME_URL'
               value: runtimeUrl
             }
             {
-              name: 'MOVATE_TEAMS_FLEET_API_KEY'
+              name: 'MDK_TEAMS_FLEET_API_KEY'
               secretRef: 'fleet-api-key'
             }
             {
-              name: 'MOVATE_TEAMS_ENCRYPTION_KEY'
+              name: 'MDK_TEAMS_ENCRYPTION_KEY'
               secretRef: 'encryption-key'
             }
             // Bot Service AAD credentials. Used by the JWT-validation
@@ -175,11 +175,11 @@ resource bot 'Microsoft.App/containerApps@2024-03-01' = {
               secretRef: 'app-password'
             }
             {
-              name: 'MOVATE_TEAMS_LANGFUSE_PUBLIC_HOST'
+              name: 'MDK_TEAMS_LANGFUSE_PUBLIC_HOST'
               value: langfusePublicHost
             }
             {
-              name: 'MOVATE_TEAMS_REQUIRE_BINDING'
+              name: 'MDK_TEAMS_REQUIRE_BINDING'
               value: requireBinding ? '1' : '0'
             }
             // The bot's own sqlite teams_users db. ACA gives us
@@ -188,7 +188,7 @@ resource bot 'Microsoft.App/containerApps@2024-03-01' = {
             // is friction-light. Production-grade durability would
             // move teams_users to Postgres — tracked as a follow-up.
             {
-              name: 'MOVATE_TEAMS_DB'
+              name: 'MDK_TEAMS_DB'
               value: '/tmp/teams.db'
             }
           ]
