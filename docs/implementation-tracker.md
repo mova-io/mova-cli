@@ -72,9 +72,9 @@ smoke pass is the gate to calling the platform production-ready.**
 
 | # | Item | Class | ADR / ref | LOE (Claude) | Depends on | Status | PR | Merged |
 |---|------|-------|-----------|--------------|------------|--------|----|--------|
-| 22 | **Auto-rollback on drift** — when a scheduled eval flags a challenger regression, opt-in auto-revert to champion (weight→0 + restore champion); informs by default, auto only when enabled | A | 016.D5 | M (~30m) | #10, #12 | ⬜ | | `____` |
-| 23 | **Trigger replay / idempotency** — delivery-id / nonce store so a duplicate inbound event doesn't double-enqueue a run | A | 017.D2 | M (~30m) | #13 | ⬜ | | `____` |
-| 24 | **Per-dimension drift** — persist per-dimension eval means on `EvalRecord`; extend `drift.py` to compare per-dimension, not just aggregate mean/pass-rate | A | 016.D2 | M (~30m) | #10 | ⬜ | | `____` |
+| 22 | **Auto-rollback on drift** — when a scheduled eval flags a challenger regression, opt-in auto-revert to champion (weight→0 + restore champion); informs by default, auto only when enabled | A | 016.D5 | M (~30m) | #10, #12 | ✅ | #396 | `2026.5.24.6` |
+| 23 | **Trigger replay / idempotency** — delivery-id / nonce store so a duplicate inbound event doesn't double-enqueue a run | A | 017.D2 | M (~30m) | #13 | ✅ | #398 | `2026.5.24.8` |
+| 24 | **Per-dimension drift** — persist per-dimension eval means on `EvalRecord`; extend `drift.py` to compare per-dimension, not just aggregate mean/pass-rate | A | 016.D2 | M (~30m) | #10 | ✅ | #397 | `2026.5.24.7` |
 | 25 | **Per-tenant rate-limiting / quota** at the runtime edge — token-bucket / sliding-window per (tenant, scope), 429 on exceed; portable app-level (always-on, complements #21) | B | 013 / feature | M (~35m) | scopes | ⬜ | | `____` |
 | 26 | **DR / backup runbook + tooling** for Postgres storage — documented backup/restore + point-in-time, plus a `mdk` export/import escape hatch | B | feature | M (~35m) 🔒 | — | ⬜ | | `____` |
 | 27 | **Golden-signal SLOs + alerting** — readiness/liveness probes + latency / error-rate / queue-depth metrics → Azure Monitor alert rules (beyond drift) | B | 015 | M–L (~45m) 🔒 | #4 | ⬜ | | `____` |
