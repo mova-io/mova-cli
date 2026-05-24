@@ -581,6 +581,15 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_id TEXT;
 -- it tight — most jobs have batch_id NULL.
 CREATE INDEX IF NOT EXISTS idx_jobs_batch
     ON jobs(tenant_id, batch_id) WHERE batch_id IS NOT NULL;
+
+-- item 24: per-dimension eval means. JSONB ({dim: mean}, same codec as
+-- jobs.input) so drift detection can compare per-dimension and catch a
+-- single-dimension regression the aggregate mean_score would mask. Nullable
+-- — pre-item-24 eval rows read back as NULL → None, and detect_drift then
+-- falls back to the aggregate-only path, byte-for-byte the old behaviour. ADD
+-- COLUMN IF NOT EXISTS keeps it idempotent on every init (mirrors the
+-- target_version pattern above).
+ALTER TABLE evals ADD COLUMN IF NOT EXISTS dimension_means JSONB;
 """
 
 
@@ -889,10 +898,10 @@ class PostgresProvider:
                 eval_id, tenant_id, agent, agent_version, dataset_hash,
                 judge_method, judge_provider, runs_per_case, gate_mode,
                 threshold, mean_score, pass_rate, sample_count,
-                total_cost_usd, created_at
+                total_cost_usd, created_at, dimension_means
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15
+                $11, $12, $13, $14, $15, $16
             )
             """,
             e.eval_id,
@@ -910,6 +919,9 @@ class PostgresProvider:
             e.sample_count,
             e.total_cost_usd,
             e.created_at,
+            # item 24: JSONB column; the connection codec json.dumps a dict.
+            # None for legacy / exact-match records → SQL NULL → reads back None.
+            e.dimension_means,
         )
 
     async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
@@ -2765,6 +2777,11 @@ def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
 
 
 def _row_to_eval(row: asyncpg.Record) -> EvalRecord:
+    # item 24 per-dimension means. The JSONB ↔ dict codec (registered in
+    # _init_connection) decodes the column to a dict; NULL on pre-item-24
+    # rows → None, so old records load unchanged and drift falls back to the
+    # aggregate-only path.
+    dim_means = row["dimension_means"]
     return EvalRecord(
         eval_id=row["eval_id"],
         tenant_id=row["tenant_id"],
@@ -2781,6 +2798,7 @@ def _row_to_eval(row: asyncpg.Record) -> EvalRecord:
         sample_count=row["sample_count"],
         total_cost_usd=row["total_cost_usd"],
         created_at=row["created_at"],
+        dimension_means=dict(dim_means) if dim_means is not None else None,
     )
 
 

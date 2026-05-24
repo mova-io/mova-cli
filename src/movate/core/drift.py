@@ -14,12 +14,17 @@ It builds on :mod:`movate.core.baseline` (the existing aggregate
   "the prior eval for that agent or a designated baseline eval_id").
 
 ``EvalRecord`` persists two aggregate quality metrics — ``mean_score`` and
-``pass_rate`` — so those are the "dimensions" drift watches. (Per-dimension
-means, e.g. faithfulness vs. accuracy, are computed in-engine but not yet
-persisted on ``EvalRecord``; once they are, this module extends to a
-per-dim drift check with no caller change.) Detection is pure + side-effect
-free so it's trivially unit-testable; alerting is wired separately at the
-worker edge via :func:`alert_on_drift`.
+``pass_rate`` — which drift always watches. As of item 24 it *also* persists
+per-dimension means (``EvalRecord.dimension_means``, e.g. faithfulness vs.
+accuracy vs. safety). When BOTH the current and baseline records carry that
+map, :func:`detect_drift` additionally compares each *shared* dimension and
+flags a **per-dimension regression** when any one drops past ``tolerance`` —
+catching a single-dimension quality slide that holds the aggregate steady.
+When either record lacks ``dimension_means`` (a legacy / exact-match eval),
+the per-dimension check is skipped and behaviour is byte-for-byte the
+aggregate-only path. Detection is pure + side-effect free so it's trivially
+unit-testable; alerting is wired separately at the worker edge via
+:func:`alert_on_drift`.
 """
 
 from __future__ import annotations
@@ -41,12 +46,22 @@ logger = logging.getLogger(__name__)
 class DriftResult:
     """Structured outcome of comparing one eval against a baseline.
 
-    ``regressed`` is the headline boolean the worker alerts on.
-    ``regressed_metrics`` names which metric(s) dropped past tolerance
+    ``regressed`` is the headline boolean the worker alerts on. It is ``True``
+    when EITHER the aggregate check (``mean_score`` / ``pass_rate``) OR any
+    per-dimension check (item 24) regresses past ``tolerance``.
+    ``regressed_metrics`` names which aggregate metric(s) dropped
     (``mean_score`` and/or ``pass_rate``) so the alert can be specific.
     All deltas are ``current - baseline`` (negative = a drop). When there
     is no baseline (first-ever eval for the agent), ``baseline`` is ``None``
     and ``regressed`` is ``False`` — no false alarm on a cold start.
+
+    Per-dimension fields (item 24, additive — empty for legacy records or when
+    either side lacks ``dimension_means``):
+
+    * ``dimension_deltas`` — ``{dim: current - baseline}`` over the dimensions
+      *both* records scored.
+    * ``regressed_dimensions`` — the subset of ``dimension_deltas`` that
+      dropped past ``tolerance`` (the dim names, sorted worst-first).
     """
 
     agent: str
@@ -58,10 +73,24 @@ class DriftResult:
     regressed: bool = False
     regressed_metrics: list[str] = field(default_factory=list)
     dataset_changed: bool = False
+    dimension_deltas: dict[str, float] = field(default_factory=dict)
+    regressed_dimensions: list[str] = field(default_factory=list)
 
     @property
     def has_baseline(self) -> bool:
         return self.baseline is not None
+
+    @property
+    def worst_dimension(self) -> str | None:
+        """Name of the dimension that dropped the most past tolerance, if any.
+
+        ``None`` when no per-dimension regression fired. Drives the
+        operator-facing summary + alert so the single most damaging
+        dimension is called out by name.
+        """
+        if not self.regressed_dimensions:
+            return None
+        return min(self.regressed_dimensions, key=lambda d: self.dimension_deltas.get(d, 0.0))
 
     def summary(self) -> str:
         """One-line operator-readable summary for logs / CLI."""
@@ -72,13 +101,56 @@ class DriftResult:
             )
         verdict = "REGRESSION" if self.regressed else "OK"
         ds = " [dataset changed]" if self.dataset_changed else ""
+        # item 24: name the worst-regressing dimension when a per-dimension
+        # check fired — the aggregate Δs can look fine while one dim slid.
+        worst = self.worst_dimension
+        dim = ""
+        if worst is not None:
+            dim = f" worst dim={worst} Δ={self.dimension_deltas[worst]:+.4f}"
         return (
             f"{verdict} {self.agent!r}: mean_score Δ={self.mean_score_delta:+.4f} "
             f"pass_rate Δ={self.pass_rate_delta:+.4f} "
             f"(tolerance ±{self.tolerance:.2f}; baseline={self.baseline.eval_id} "
             f"score={self.baseline.mean_score:.4f} → {self.current.mean_score:.4f})"
-            f"{ds}"
+            f"{dim}{ds}"
         )
+
+
+def _compute_dimension_drift(
+    current: EvalRecord,
+    baseline: EvalRecord,
+    *,
+    tolerance: float,
+) -> tuple[dict[str, float], list[str]]:
+    """Per-dimension drift over the dimensions *both* records scored (item 24).
+
+    Returns ``(dimension_deltas, regressed_dimensions)``:
+
+    * ``dimension_deltas`` — ``{dim: round(current - baseline, 6)}`` for every
+      dimension present in *both* ``dimension_means`` maps. A dimension only
+      one side scored is skipped — a delta against a missing baseline is
+      meaningless, and a dataset that simply added a dimension shouldn't read
+      as a regression.
+    * ``regressed_dimensions`` — the subset whose delta dropped past
+      ``tolerance`` (same semantics as the aggregate check: ``delta <
+      -tolerance``), sorted worst-first.
+
+    When either record lacks ``dimension_means`` (``None``) both outputs are
+    empty → the caller's ``regressed`` decision reduces to the aggregate-only
+    path, byte-for-byte the pre-item-24 behaviour.
+    """
+    cur_means = current.dimension_means
+    base_means = baseline.dimension_means
+    if not cur_means or not base_means:
+        return {}, []
+
+    shared = cur_means.keys() & base_means.keys()
+    deltas = {dim: round(cur_means[dim] - base_means[dim], 6) for dim in shared}
+    regressed = sorted(
+        (dim for dim, delta in deltas.items() if delta < -tolerance),
+        key=lambda d: deltas[d],
+    )
+    return deltas, regressed
 
 
 def detect_drift(
@@ -90,9 +162,18 @@ def detect_drift(
     """Compare ``current`` against ``baseline``; return a :class:`DriftResult`.
 
     A regression fires when ``mean_score`` OR ``pass_rate`` drops by more
-    than ``tolerance`` (absolute, in 0.0-1.0 score units). ``tolerance=0.0``
-    means any drop is a regression; a small positive tolerance (default
-    0.05) absorbs LLM-judge sampling noise on the scheduled path.
+    than ``tolerance`` (absolute, in 0.0-1.0 score units), OR — as of item 24
+    — when any *per-dimension* mean both records scored drops past the same
+    ``tolerance``. ``tolerance=0.0`` means any drop is a regression; a small
+    positive tolerance (default 0.05) absorbs LLM-judge sampling noise on the
+    scheduled path.
+
+    The per-dimension check is skipped (empty deltas, no per-dim regression)
+    whenever either record lacks ``dimension_means`` — so a legacy /
+    exact-match eval falls back to aggregate-only, byte-for-byte the old
+    behaviour. This lets a single-dimension regression (e.g. faithfulness
+    slid while the aggregate held steady) trip the same drift → alert →
+    (opt-in) rollback path the aggregate metrics already use.
 
     ``baseline=None`` (no prior eval) → ``regressed=False`` and empty
     ``regressed_metrics`` — a cold start never alerts.
@@ -112,6 +193,10 @@ def detect_drift(
     if diff.pass_rate_delta < -tolerance:
         regressed_metrics.append("pass_rate")
 
+    dimension_deltas, regressed_dimensions = _compute_dimension_drift(
+        current, baseline, tolerance=tolerance
+    )
+
     return DriftResult(
         agent=current.agent,
         tolerance=tolerance,
@@ -119,9 +204,14 @@ def detect_drift(
         current=current,
         mean_score_delta=diff.mean_score_delta,
         pass_rate_delta=diff.pass_rate_delta,
-        regressed=bool(regressed_metrics),
+        # item 24: regress on EITHER an aggregate metric OR any per-dimension
+        # drop. Empty regressed_dimensions (legacy / no shared dims) leaves
+        # this equal to the aggregate-only result.
+        regressed=bool(regressed_metrics) or bool(regressed_dimensions),
         regressed_metrics=regressed_metrics,
         dataset_changed=diff.dataset_changed,
+        dimension_deltas=dimension_deltas,
+        regressed_dimensions=regressed_dimensions,
     )
 
 
@@ -186,12 +276,19 @@ async def alert_on_drift(
 
     baseline = result.baseline
     current = result.current
+    # item 24: append the per-dimension regression detail additively — the
+    # existing key/value pairs are unchanged so log-based alerting that parses
+    # the old shape keeps working; ``regressed_dimensions`` is empty for
+    # legacy / aggregate-only regressions.
+    regressed_dims = ",".join(
+        f"{dim}{result.dimension_deltas.get(dim, 0.0):+.6f}" for dim in result.regressed_dimensions
+    )
     # Structured log event — stable key/value shape for log-based alerting.
     logger.warning(
         "eval_drift_detected agent=%s tenant=%s eval_id=%s baseline_eval_id=%s "
         "mean_score_baseline=%.6f mean_score_current=%.6f mean_score_delta=%+.6f "
         "pass_rate_baseline=%.6f pass_rate_current=%.6f pass_rate_delta=%+.6f "
-        "tolerance=%.4f regressed_metrics=%s dataset_changed=%s",
+        "tolerance=%.4f regressed_metrics=%s regressed_dimensions=%s dataset_changed=%s",
         result.agent,
         current.tenant_id,
         current.eval_id,
@@ -204,6 +301,7 @@ async def alert_on_drift(
         result.pass_rate_delta,
         result.tolerance,
         ",".join(result.regressed_metrics),
+        regressed_dims,
         result.dataset_changed,
     )
 
@@ -218,8 +316,18 @@ async def alert_on_drift(
             f"(mean_score={baseline.mean_score:.4f}, pass_rate={baseline.pass_rate:.4f})\n"
             f"Delta:      mean_score {result.mean_score_delta:+.4f}, "
             f"pass_rate {result.pass_rate_delta:+.4f}\n"
-            f"Regressed:  {', '.join(result.regressed_metrics)}\n"
+            f"Regressed:  {', '.join(result.regressed_metrics) or '(no aggregate metric)'}\n"
         )
+        # item 24: call out the per-dimension regressions when any fired. The
+        # aggregate metrics above can read fine while one quality dimension
+        # (faithfulness, coverage, safety, …) silently slid — that's the case
+        # this surfaces, worst dimension first.
+        if result.regressed_dimensions:
+            dim_lines = "\n".join(
+                f"  - {dim}: {result.dimension_deltas[dim]:+.4f}"
+                for dim in result.regressed_dimensions
+            )
+            body += f"Dimensions: regressed past tolerance —\n{dim_lines}\n"
         if result.dataset_changed:
             body += "\nNote: the dataset hash changed since the baseline.\n"
         body += "\n— movate continuous eval (ADR 016 D2)\n"
