@@ -49,6 +49,7 @@ from movate.core.models import (
     TenantBudget,
     Trigger,
     WorkflowRunRecord,
+    WorkflowStatus,
 )
 
 
@@ -153,12 +154,15 @@ class StorageProvider(Protocol):
         *,
         tenant_id: str | None = None,
         workflow: str | None = None,
+        status: WorkflowStatus | None = None,
         limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         """List workflow runs newest-first, optionally filtered.
 
-        ``tenant_id=None`` returns runs across all tenants — operator
-        tooling only; never exposed on the HTTP API.
+        ``status`` narrows to one :class:`WorkflowStatus` (e.g. ``PAUSED``
+        to find runs awaiting a human signal — ADR 017 D5). ``tenant_id=None``
+        returns runs across all tenants — operator tooling only; never exposed
+        on the HTTP API.
         """
 
     # ------------------------------------------------------------------

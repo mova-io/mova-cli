@@ -34,6 +34,7 @@ from movate.core.models import (
     TenantBudget,
     Trigger,
     WorkflowRunRecord,
+    WorkflowStatus,
 )
 from movate.providers.base import (
     BaseLLMProvider,
@@ -95,6 +96,16 @@ class InMemoryStorage:
         self.bench.append(b)
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
+        # Upsert on workflow_run_id (the PRIMARY KEY in sqlite/postgres). A
+        # resume (ADR 017 D5, PR 2) re-saves the SAME id when a paused run
+        # continues, and the signal endpoint persists the merged checkpoint
+        # back under the same id — replace-in-place so get_workflow_run reads
+        # a single source of truth (no duplicate rows), matching the DB
+        # providers' ON CONFLICT DO UPDATE.
+        for i, existing in enumerate(self.workflow_runs):
+            if existing.workflow_run_id == w.workflow_run_id:
+                self.workflow_runs[i] = w
+                return
         self.workflow_runs.append(w)
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
@@ -426,6 +437,7 @@ class InMemoryStorage:
         *,
         tenant_id: str | None = None,
         workflow: str | None = None,
+        status: WorkflowStatus | None = None,
         limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         rows = self.workflow_runs
@@ -433,6 +445,8 @@ class InMemoryStorage:
             rows = [w for w in rows if w.tenant_id == tenant_id]
         if workflow:
             rows = [w for w in rows if w.workflow == workflow]
+        if status is not None:
+            rows = [w for w in rows if w.status == status]
         return list(rows)[:limit]
 
     # ------------------------------------------------------------------

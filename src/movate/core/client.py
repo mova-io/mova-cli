@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from movate.core.models import JobKind, JobStatus
+from movate.core.models import JobKind, JobStatus, WorkflowStatus
 from movate.runtime.schemas import (
     AgentListView,
     HealthView,
@@ -27,6 +27,8 @@ from movate.runtime.schemas import (
     RunAccepted,
     RunSubmission,
     RunView,
+    WorkflowRunListView,
+    WorkflowSignalRequest,
 )
 
 
@@ -158,6 +160,49 @@ class MovateClient:
         r = await self._client.get(f"/runs/{run_id}")
         self._raise_for_status(r)
         return RunView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Workflow HITL — resume-on-signal (ADR 017 D5, PR 2)
+    # ------------------------------------------------------------------
+
+    async def list_workflow_runs(
+        self,
+        *,
+        status: WorkflowStatus | None = None,
+        limit: int = 20,
+    ) -> WorkflowRunListView:
+        """``GET /api/v1/workflow-runs`` — this tenant's workflow runs.
+
+        ``status=PAUSED`` finds the HITL queue (runs awaiting a human
+        signal). Each PAUSED row carries its ``human_task`` (prompt +
+        output_contract). ``limit`` is hard-capped at 100 server-side.
+        """
+        params: dict[str, str | int] = {"limit": limit}
+        if status is not None:
+            params["status"] = status.value
+        r = await self._client.get("/api/v1/workflow-runs", params=params)
+        self._raise_for_status(r)
+        return WorkflowRunListView.model_validate(r.json())
+
+    async def signal_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        decision: dict[str, Any],
+    ) -> RunAccepted:
+        """``POST /api/v1/workflow-runs/{id}/signal`` — resume a paused run.
+
+        ``decision`` is a dict of the state keys the gate's ``output_contract``
+        requires. The server validates, merges the decision into the
+        checkpoint, and enqueues a continuation job; returns ``{job_id,
+        status}`` (the continuation job to poll). 202 on success."""
+        body = WorkflowSignalRequest(decision=decision)
+        r = await self._client.post(
+            f"/api/v1/workflow-runs/{workflow_run_id}/signal",
+            json=body.model_dump(mode="json"),
+        )
+        self._raise_for_status(r)
+        return RunAccepted.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Convenience: poll until terminal

@@ -222,6 +222,7 @@ from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
+from movate.cli.workflow_cmd import workflow_app  # noqa: E402
 
 PANEL_DEVELOP = "Develop"
 PANEL_RUN = "Run & evaluate"
@@ -500,6 +501,7 @@ app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 
 app.command("submit", rich_help_panel=PANEL_RUN)(submit_cmd.submit)
 app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
+app.add_typer(workflow_app, name="workflow", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------
 

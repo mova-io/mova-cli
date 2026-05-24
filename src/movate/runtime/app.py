@@ -45,6 +45,7 @@ from movate.core.models import (
     JobSchedule,
     JobStatus,
     Trigger,
+    WorkflowStatus,
 )
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.core.triggers import (
@@ -167,6 +168,9 @@ from movate.runtime.schemas import (
     TriggerListView,
     TriggerView,
     WizardAgentSubmission,
+    WorkflowRunListView,
+    WorkflowRunView,
+    WorkflowSignalRequest,
 )
 from movate.runtime.skill_creation import (
     SkillCreationError,
@@ -4540,6 +4544,166 @@ def build_app(
             skill_calls=chain.get("skill_calls"),
             skill_calls_hint=chain.get("skill_calls_hint"),
         )
+
+    # ------------------------------------------------------------------
+    # Workflow HITL — resume-on-signal (ADR 017 D5, PR 2).
+    #
+    # A paused workflow run (the runner stopped at a HUMAN gate and
+    # persisted a durable PAUSED checkpoint in PR 1) is resumed when an
+    # authenticated operator signals their decision. Control vs execution
+    # plane: the signal endpoint validates + records + ENQUEUES a
+    # continuation JobKind.WORKFLOW job (carrying resume_workflow_run_id);
+    # the WORKER resumes the runner from the gate's successor. The endpoint
+    # never runs the workflow inline. Idempotent: flipping the record out of
+    # PAUSED means a second signal 409s (no double-resume).
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/workflow-runs",
+        response_model=WorkflowRunListView,
+        tags=["workflow-runs-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_runs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        status: WorkflowStatus | None = None,
+        limit: int = 20,
+    ) -> WorkflowRunListView:
+        """List this tenant's workflow runs, newest first.
+
+        ``?status=paused`` finds runs awaiting a human signal (the HITL
+        queue): each PAUSED row surfaces its ``human_task`` (prompt +
+        output_contract) so an operator knows what decision to supply to
+        ``POST /workflow-runs/{id}/signal``. Omit ``status`` for all states.
+
+        Always tenant-scoped (``read`` scope); ``limit`` is hard-capped at
+        100 to keep the response bounded.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_workflow_runs(
+            tenant_id=ctx.tenant_id,
+            status=status,
+            limit=capped_limit,
+        )
+        views = [WorkflowRunView.from_record(r) for r in records]
+        return WorkflowRunListView(workflow_runs=views, count=len(views))
+
+    @v1.post(
+        "/workflow-runs/{workflow_run_id}/signal",
+        response_model=RunAccepted,
+        status_code=202,
+        tags=["workflow-runs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_signal_workflow_run(
+        workflow_run_id: str,
+        body: WorkflowSignalRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> RunAccepted:
+        """Signal a human decision to resume a paused workflow run.
+
+        The human approver (an authenticated operator, gated on the ``run``
+        scope) supplies their decision — a dict of the state keys the gate's
+        ``output_contract`` requires. The endpoint:
+
+        1. Loads the run (tenant-scoped; **404** if missing / other tenant).
+        2. **409** if the run is not ``PAUSED`` (already resumed / terminal —
+           idempotency: a second signal must not double-resume).
+        3. **422** if the decision is missing a required ``output_contract``
+           key.
+        4. Merges the decision into the checkpoint's ``paused_state``
+           (decision wins) and persists the run flipped OUT of ``PAUSED``
+           (``paused_node_id`` carried forward as the resume target, but
+           ``status`` set to ``RUNNING`` so a re-signal hits the 409 in step
+           2) — the worker reads this single source of truth.
+        5. Enqueues a continuation ``JobKind.WORKFLOW`` job carrying
+           ``resume_workflow_run_id``; the worker resumes the runner from the
+           gate's successor. Returns **202** ``{job_id, status}``.
+
+        Control vs execution plane: the workflow is NOT run inline here — it
+        is enqueued, and the worker executes it. This is the contract a Teams
+        Adaptive Card button (ADR 003) would POST to in a later PR.
+
+        Errors:
+
+        * **401** — bad / missing bearer token
+        * **404** — no paused run matches the id for this tenant
+        * **409** — the run is not PAUSED (already resumed / terminal)
+        * **422** — the decision omits a required output_contract key
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_workflow_run(workflow_run_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("workflow_run", workflow_run_id)
+        human_task = record.human_task or {}
+        # Idempotency: a run is signalable only while it is PAUSED *and* not
+        # already consumed. We mark a consumed checkpoint with
+        # ``human_task["signaled"] = True`` rather than mutating ``status``
+        # (there is no WorkflowStatus.RUNNING, and SUCCESS/ERROR are terminal
+        # + wrong here). This keeps ``status == PAUSED`` + ``paused_node_id``
+        # intact so the worker's ``runner.resume(graph, record)`` consumes the
+        # checkpoint directly, while a SECOND signal hits this 409 (no
+        # double-resume). When the worker resumes to completion / a new gate
+        # it upserts a fresh record, clearing the marker for the next gate.
+        if record.status is not WorkflowStatus.PAUSED or human_task.get("signaled"):
+            raise conflict(
+                f"workflow_run {workflow_run_id!r} is not awaiting a signal "
+                f"(status={record.status.value!r}, "
+                f"already_signaled={bool(human_task.get('signaled'))}) — "
+                f"cannot signal (already resumed or terminal)"
+            )
+
+        # Validate the decision against the gate's output_contract: every
+        # required key must be present. The contract lives on the checkpoint's
+        # human_task spec captured at pause time.
+        required = list(human_task.get("output_contract", []))
+        missing = [k for k in required if k not in body.decision]
+        if missing:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=(
+                    f"decision is missing required output_contract key(s): "
+                    f"{', '.join(sorted(missing))}"
+                ),
+            )
+
+        # Merge the decision into the paused state (decision wins) and persist
+        # the updated checkpoint as the single source of truth the worker
+        # resumes from. ``status`` STAYS ``PAUSED`` and ``paused_node_id``
+        # stays set (the worker's runner.resume needs both); the
+        # ``human_task["signaled"]`` marker is what flips the run out of
+        # "awaiting a signal" so a re-signal 409s.
+        merged_state = {**(record.paused_state or {}), **body.decision}
+        consumed_human_task = {**human_task, "signaled": True}
+        resumed_record = record.model_copy(
+            update={
+                "paused_state": merged_state,
+                "final_state": merged_state,
+                "human_task": consumed_human_task,
+            }
+        )
+        await store.save_workflow_run(resumed_record)
+
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.WORKFLOW,
+            target=record.workflow,
+            status=JobStatus.QUEUED,
+            input={},
+            api_key_id=ctx.api_key_id,
+            resume_workflow_run_id=workflow_run_id,
+        )
+        await store.save_job(job)
+        return RunAccepted(job_id=job.job_id, status=job.status)
 
     # ------------------------------------------------------------------
     # Auth key management — requires the ``admin`` scope (ADR 013 L2).

@@ -2075,6 +2075,18 @@ class JobRecord(BaseModel):
     config, or champion-by-latest) means "resolve latest", so a job with no
     canary in play is byte-for-byte identical to a pre-canary job. Additive
     + nullable: pre-canary rows read back as ``None``."""
+    resume_workflow_run_id: str | None = None
+    """Target ``workflow_run_id`` for a HITL resume continuation job (ADR 017
+    D5, PR 2). When set on a ``JobKind.WORKFLOW`` job, the worker loads that
+    PAUSED :class:`WorkflowRunRecord` checkpoint (the human's decision is
+    already merged into its ``paused_state`` by the signal endpoint) and calls
+    ``WorkflowRunner.resume`` to continue from the gate's successor instead of
+    the normal ``run(initial_state=job.input)`` path. The signal endpoint
+    enqueues this so execution stays in the worker (execution plane), not the
+    API pod. ``None`` (every non-resume job: every agent job, every
+    fresh/scheduled workflow job) means "run from the entrypoint", byte-for-
+    byte the pre-PR-2 path. Additive + nullable: pre-PR-2 rows read back as
+    ``None``."""
 
 
 class JobSchedule(BaseModel):

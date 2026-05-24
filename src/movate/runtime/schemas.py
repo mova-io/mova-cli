@@ -26,6 +26,8 @@ from movate.core.models import (
     JobStatus,
     Metrics,
     RunRecord,
+    WorkflowRunRecord,
+    WorkflowStatus,
 )
 
 
@@ -174,6 +176,88 @@ class JobListView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     jobs: list[JobView]
+    count: int
+
+
+# ---------------------------------------------------------------------------
+# Workflow HITL signal (ADR 017 D5, PR 2 — resume-on-signal)
+# ---------------------------------------------------------------------------
+
+
+class WorkflowSignalRequest(BaseModel):
+    """``POST /api/v1/workflow-runs/{id}/signal`` request body.
+
+    The human approver's decision: a dict of the state keys the paused
+    gate's ``output_contract`` requires. The endpoint validates every
+    required key is present, merges the decision into the checkpoint's
+    ``paused_state`` (decision wins), and enqueues a continuation job that
+    resumes the workflow from the gate's successor. This is the contract a
+    Teams Adaptive Card button (ADR 003) would POST to in a later PR.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: dict[str, Any] = Field(
+        ...,
+        description=(
+            "The human's response: a mapping of the state keys named in the "
+            "gate's output_contract to their values. Merged into the paused "
+            "checkpoint state (decision wins) before the workflow resumes."
+        ),
+    )
+
+
+class WorkflowRunView(BaseModel):
+    """``GET /api/v1/workflow-runs`` item + signal-context view.
+
+    Mirror of :class:`WorkflowRunRecord` minus ``tenant_id`` (audit-only,
+    never returned over the wire — same convention as ``JobView`` dropping
+    ``api_key_id``). The ``human_task`` block surfaces the gate's prompt +
+    output_contract so an operator (or a Teams card) knows what decision to
+    supply for a PAUSED run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_run_id: str
+    workflow: str
+    workflow_version: str
+    status: WorkflowStatus
+    initial_state: dict[str, Any]
+    final_state: dict[str, Any] | None = None
+    error_node_id: str | None = None
+    error: ErrorInfo | None = None
+    created_at: datetime
+    paused_node_id: str | None = None
+    human_task: dict[str, Any] | None = None
+
+    @classmethod
+    def from_record(cls, record: WorkflowRunRecord) -> WorkflowRunView:
+        return cls(
+            workflow_run_id=record.workflow_run_id,
+            workflow=record.workflow,
+            workflow_version=record.workflow_version,
+            status=record.status,
+            initial_state=record.initial_state,
+            final_state=record.final_state,
+            error_node_id=record.error_node_id,
+            error=record.error,
+            created_at=record.created_at,
+            paused_node_id=record.paused_node_id,
+            human_task=record.human_task,
+        )
+
+
+class WorkflowRunListView(BaseModel):
+    """``GET /api/v1/workflow-runs`` response — envelope around a page.
+
+    Envelope (not a bare list) for the same forward-compat reason as
+    :class:`JobListView`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_runs: list[WorkflowRunView]
     count: int
 
 
@@ -2123,6 +2207,9 @@ __all__ = [
     "TriggerListView",
     "TriggerView",
     "WizardAgentSubmission",
+    "WorkflowRunListView",
+    "WorkflowRunView",
+    "WorkflowSignalRequest",
 ]
 
 
