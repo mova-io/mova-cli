@@ -87,6 +87,9 @@ param agentsStorageName string = ''
 @description('Langfuse host URL (self-hosted). Empty string = the Langfuse SDK default (Cloud). Set by main.bicep to the self-hosted Langfuse app URL when deployLangfuse=true.')
 param langfuseHost string = ''
 
+@description('Trace sink for the runtime (MDK_TRACE_SINK). Empty = unset (legacy auto-detect / silent). "otlp" ships spans to the ACA-injected OTLP endpoint.')
+param traceSink string = ''
+
 @description('Common tags.')
 param tags object = {}
 
@@ -224,6 +227,20 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               // empty so the SDK keeps its Cloud default).
               name: 'LANGFUSE_HOST'
               value: langfuseHost
+            }
+          ], empty(traceSink) ? [] : [
+            // Trace sink selector — emitted only when main.bicep sets
+            // traceSink='otlp' (enableAppInsights=true). MDK_TRACE_SINK is
+            // aliased to MOVATE_TRACE_SINK at runtime startup; 'otlp'
+            // activates the generic OtelTracer, which ships spans to the
+            // OTEL_EXPORTER_OTLP_ENDPOINT that the CAE managed-OTel config
+            // auto-injects into this container. We deliberately do NOT set
+            // OTEL_EXPORTER_OTLP_ENDPOINT here — ACA injects it, and it is
+            // only injected when enableAppInsights gates BOTH this var and
+            // the CAE OTel destination, so the otlp sink never fails loud.
+            {
+              name: 'MDK_TRACE_SINK'
+              value: traceSink
             }
           ])
           volumeMounts: empty(agentsStorageName) ? [] : [
