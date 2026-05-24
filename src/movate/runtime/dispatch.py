@@ -323,10 +323,91 @@ class WorkerDispatch:
                 notifier=self._notifier,
                 notify_email=cfg.get("notify_email") or job.notify_email,
             )
+            # ADR 016 D5 — opt-in auto-rollback. A regression *informs* by
+            # default (the alert above); when the agent's canary has
+            # ``auto_rollback`` on AND the regression is on the challenger,
+            # also trip the kill switch back to the champion. Off by default →
+            # this is a no-op and the behaviour above is byte-for-byte today's.
+            await self._maybe_auto_rollback(job, record, result)
         except Exception:
             logger.warning(
                 "eval_drift_check_failed job_id=%s agent=%s — eval result is "
                 "unchanged; this is the drift/alert path only",
+                job.job_id,
+                record.agent,
+                exc_info=True,
+            )
+
+    async def _maybe_auto_rollback(self, job: JobRecord, record: Any, result: Any) -> None:
+        """Opt-in: revert a regressed challenger to the champion (ADR 016 D5).
+
+        After :meth:`_maybe_check_drift` detects a regression, load the agent's
+        :class:`CanaryConfig` and, *only* when the operator opted in
+        (``auto_rollback`` on) and the regression is on the live
+        ``challenger_version``, trip the kill switch (``weight`` → 0) so traffic
+        reverts to the champion instantly. The decision is the pure
+        :func:`should_auto_rollback`; the action is the pure
+        :func:`rolled_back_config` (kill switch, never a version delete).
+
+        Best-effort and independently wrapped: a rollback or notify failure is
+        logged and swallowed — it must never flip the eval's SUCCESS outcome,
+        mirroring the drift/alert discipline. With ``auto_rollback`` off (the
+        default) ``should_auto_rollback`` short-circuits to ``False`` and this
+        is a no-op — the drift hook stays alert-only.
+        """
+        from movate.core.canary import rolled_back_config, should_auto_rollback  # noqa: PLC0415
+
+        try:
+            config = await self._storage.get_canary_config(record.agent, tenant_id=job.tenant_id)
+            if not should_auto_rollback(
+                config,
+                regressed=result.regressed,
+                evaluated_version=record.agent_version,
+            ):
+                return
+            assert config is not None  # should_auto_rollback guarantees this
+            rolled_back = rolled_back_config(config)
+            await self._storage.save_canary_config(rolled_back)
+            # Structured log event — stable key/value shape for log-based
+            # alerting / audit of an automated traffic change.
+            logger.warning(
+                "canary_auto_rollback agent=%s tenant=%s challenger_version=%s "
+                "champion_version=%s prior_weight=%d new_weight=0 eval_id=%s "
+                "reason=drift_regression",
+                config.agent,
+                config.tenant_id,
+                config.challenger_version,
+                config.champion_version or "<latest>",
+                config.weight,
+                record.eval_id,
+            )
+            # Route the rollback through the same notify path operators already
+            # watch for drift, so they're told the canary was auto-reverted.
+            if self._notifier is not None:
+                champion = config.champion_version or "registry latest"
+                subject = (
+                    f"[movate] canary auto-rollback — {config.agent} "
+                    f"challenger {config.challenger_version} reverted"
+                )
+                body = (
+                    f"Scheduled eval for agent {config.agent!r} regressed on the "
+                    f"challenger version {config.challenger_version} "
+                    f"(eval {record.eval_id}).\n\n"
+                    f"auto_rollback is enabled → the canary kill switch was tripped: "
+                    f"weight {config.weight}% → 0%. Traffic has reverted to the "
+                    f"champion ({champion}). The challenger row is retained; "
+                    f"investigate, then re-enable with `mdk canary set` if desired.\n"
+                    f"\n— movate auto-rollback (ADR 016 D5)\n"
+                )
+                await self._notifier.notify_alert(
+                    subject=subject,
+                    body=body,
+                    email=job.input.get("notify_email") or job.notify_email,
+                )
+        except Exception:
+            logger.warning(
+                "canary_auto_rollback_failed job_id=%s agent=%s — eval result and "
+                "canary are unchanged; this is the rollback/alert path only",
                 job.job_id,
                 record.agent,
                 exc_info=True,

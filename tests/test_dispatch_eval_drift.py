@@ -21,7 +21,14 @@ pytest.importorskip("fastapi")
 
 from movate.core.executor import Executor
 from movate.core.loader import load_agent
-from movate.core.models import EvalRecord, JobKind, JobRecord, JobStatus, JudgeMethod
+from movate.core.models import (
+    CanaryConfig,
+    EvalRecord,
+    JobKind,
+    JobRecord,
+    JobStatus,
+    JudgeMethod,
+)
 from movate.providers.pricing import load_pricing
 from movate.runtime.dispatch import WorkerDispatch
 from movate.testing import (
@@ -201,3 +208,133 @@ async def test_adhoc_eval_no_baseline_intent_skips_drift(
     outcome = await dispatch.execute_job(job)
     assert outcome.status == JobStatus.SUCCESS
     assert dispatcher.alerts == []
+
+
+# ---------------------------------------------------------------------------
+# ADR 016 D5 — opt-in auto-rollback on drift. The scaffolded agent's eval
+# records agent_version "0.1.0" (the template's version), so a canary whose
+# challenger is "0.1.0" makes the scheduled eval a regression *on the
+# challenger* — the auto-rollback trigger.
+# ---------------------------------------------------------------------------
+
+_CHALLENGER_VERSION = "0.1.0"  # the scaffolded agent's version → its eval slice
+
+
+def _canary(
+    *,
+    agent: str = "demo",
+    tenant_id: str = "test-tenant",
+    auto_rollback: bool,
+    weight: int = 25,
+    challenger: str = _CHALLENGER_VERSION,
+) -> CanaryConfig:
+    return CanaryConfig(
+        tenant_id=tenant_id,
+        agent=agent,
+        challenger_version=challenger,
+        champion_version="champ-v0",
+        weight=weight,
+        auto_rollback=auto_rollback,
+    )
+
+
+@pytest.mark.unit
+async def test_regression_on_challenger_with_auto_rollback_trips_kill_switch(
+    tmp_path: Path, storage: InMemoryStorage
+) -> None:
+    """auto_rollback ON + regression on the challenger version → weight → 0."""
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    await storage.save_eval(_prior_eval(agent="demo", tenant_id="test-tenant", mean_score=1.0))
+    await storage.save_canary_config(_canary(auto_rollback=True, weight=25))
+
+    dispatcher = _FakeDispatcher()
+    dispatch = _build_dispatch(storage, bundle, dispatcher)
+
+    outcome = await dispatch.execute_job(_scheduled_eval_job(target="demo"))
+    assert outcome.status == JobStatus.SUCCESS
+
+    # The canary was auto-rolled back to the kill switch.
+    rolled = await storage.get_canary_config("demo", tenant_id="test-tenant")
+    assert rolled is not None
+    assert rolled.weight == 0  # kill switch
+    assert rolled.challenger_version == _CHALLENGER_VERSION  # pin preserved
+    assert rolled.champion_version == "champ-v0"  # pin preserved
+
+    # Operators got BOTH the drift alert and the auto-rollback alert.
+    subjects = [a["subject"] for a in dispatcher.alerts]
+    assert any("regressed" in (s or "") for s in subjects)
+    assert any("auto-rollback" in (s or "") for s in subjects)
+
+
+@pytest.mark.unit
+async def test_regression_with_auto_rollback_off_only_alerts(
+    tmp_path: Path, storage: InMemoryStorage
+) -> None:
+    """The regression guard: auto_rollback OFF → alert-only, canary UNCHANGED.
+
+    Byte-for-byte today's behavior — the drift alert fires, but the canary
+    weight is left exactly as set (ADR 016 D5 default = alert-only).
+    """
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    await storage.save_eval(_prior_eval(agent="demo", tenant_id="test-tenant", mean_score=1.0))
+    await storage.save_canary_config(_canary(auto_rollback=False, weight=25))
+
+    dispatcher = _FakeDispatcher()
+    dispatch = _build_dispatch(storage, bundle, dispatcher)
+
+    outcome = await dispatch.execute_job(_scheduled_eval_job(target="demo"))
+    assert outcome.status == JobStatus.SUCCESS
+
+    # Canary is UNTOUCHED — no rollback.
+    unchanged = await storage.get_canary_config("demo", tenant_id="test-tenant")
+    assert unchanged is not None
+    assert unchanged.weight == 25
+
+    # Exactly the drift alert (no auto-rollback alert).
+    assert len(dispatcher.alerts) == 1
+    assert "regressed" in (dispatcher.alerts[0]["subject"] or "")
+    assert all("auto-rollback" not in (a["subject"] or "") for a in dispatcher.alerts)
+
+
+@pytest.mark.unit
+async def test_regression_on_non_challenger_version_no_rollback(
+    tmp_path: Path, storage: InMemoryStorage
+) -> None:
+    """A regression whose version isn't the challenger → no rollback."""
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    await storage.save_eval(_prior_eval(agent="demo", tenant_id="test-tenant", mean_score=1.0))
+    # Challenger is a DIFFERENT version than the one the eval runs (0.1.0).
+    await storage.save_canary_config(_canary(auto_rollback=True, weight=25, challenger="9.9.9"))
+
+    dispatcher = _FakeDispatcher()
+    dispatch = _build_dispatch(storage, bundle, dispatcher)
+
+    outcome = await dispatch.execute_job(_scheduled_eval_job(target="demo"))
+    assert outcome.status == JobStatus.SUCCESS
+
+    unchanged = await storage.get_canary_config("demo", tenant_id="test-tenant")
+    assert unchanged is not None
+    assert unchanged.weight == 25  # untouched
+    assert all("auto-rollback" not in (a["subject"] or "") for a in dispatcher.alerts)
+
+
+@pytest.mark.unit
+async def test_regression_no_canary_config_no_rollback(
+    tmp_path: Path, storage: InMemoryStorage
+) -> None:
+    """A regression with no canary at all → alert only, nothing to roll back."""
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    await storage.save_eval(_prior_eval(agent="demo", tenant_id="test-tenant", mean_score=1.0))
+
+    dispatcher = _FakeDispatcher()
+    dispatch = _build_dispatch(storage, bundle, dispatcher)
+
+    outcome = await dispatch.execute_job(_scheduled_eval_job(target="demo"))
+    assert outcome.status == JobStatus.SUCCESS
+
+    assert await storage.get_canary_config("demo", tenant_id="test-tenant") is None
+    assert all("auto-rollback" not in (a["subject"] or "") for a in dispatcher.alerts)

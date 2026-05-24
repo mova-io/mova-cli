@@ -118,6 +118,36 @@ async def test_set_canary_then_status(client: TestClient, auth_setup, storage) -
     assert s.json()["weight"] == 25
 
 
+async def test_auto_rollback_defaults_off_and_round_trips(
+    client: TestClient, auth_setup, storage
+) -> None:
+    """ADR 016 D5: auto_rollback defaults False and round-trips through set+status."""
+    header, tenant_id = auth_setup
+    await _publish_two_versions(storage, tenant_id=tenant_id)
+
+    # Default-off when omitted.
+    r = client.post(
+        "/api/v1/agents/bot/canary",
+        json={"challenger_version": "2.0.0", "weight": 25},
+        headers=header,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_rollback"] is False
+
+    # Opt-in round-trips through set → status.
+    r = client.post(
+        "/api/v1/agents/bot/canary",
+        json={"challenger_version": "2.0.0", "weight": 25, "auto_rollback": True},
+        headers=header,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["auto_rollback"] is True
+
+    s = client.get("/api/v1/agents/bot/canary", headers=header)
+    assert s.status_code == 200
+    assert s.json()["auto_rollback"] is True
+
+
 async def test_set_unknown_challenger_version_404(client: TestClient, auth_setup, storage) -> None:
     header, tenant_id = auth_setup
     await _publish_two_versions(storage, tenant_id=tenant_id)

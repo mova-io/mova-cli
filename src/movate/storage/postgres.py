@@ -522,6 +522,13 @@ CREATE TABLE IF NOT EXISTS canary_configs (
     PRIMARY KEY (tenant_id, agent)
 );
 
+-- ADR 016 D5: opt-in auto-rollback. A scheduled-eval drift regression on the
+-- challenger trips the kill switch (weight → 0) when set. Additive +
+-- default-off (DEFAULT FALSE): pre-D5 canary rows read back as
+-- auto_rollback=False → alert-only, byte-for-byte the pre-D5 behavior. ADD
+-- COLUMN IF NOT EXISTS keeps it idempotent on every init.
+ALTER TABLE canary_configs ADD COLUMN IF NOT EXISTS auto_rollback BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- ADR 016 D3: carry the canary-chosen agent version to the async worker. The
 -- enqueue path stamps the concrete champion/challenger version it picked; the
 -- worker resolves THAT version. Nullable — pre-canary rows (and every job
@@ -1264,9 +1271,9 @@ class PostgresProvider:
             INSERT INTO canary_configs (
                 tenant_id, agent, challenger_version, champion_version, weight,
                 sticky, enabled, auto_promote, eval_gate, created_by,
-                created_at, updated_at
+                created_at, updated_at, auto_rollback
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             )
             ON CONFLICT (tenant_id, agent) DO UPDATE SET
                 challenger_version = EXCLUDED.challenger_version,
@@ -1278,7 +1285,8 @@ class PostgresProvider:
                 eval_gate = EXCLUDED.eval_gate,
                 created_by = EXCLUDED.created_by,
                 created_at = EXCLUDED.created_at,
-                updated_at = EXCLUDED.updated_at
+                updated_at = EXCLUDED.updated_at,
+                auto_rollback = EXCLUDED.auto_rollback
             """,
             config.tenant_id,
             config.agent,
@@ -1292,6 +1300,7 @@ class PostgresProvider:
             config.created_by,
             config.created_at,
             config.updated_at,
+            config.auto_rollback,
         )
 
     async def get_canary_config(self, agent: str, *, tenant_id: str) -> CanaryConfig | None:
@@ -2719,6 +2728,7 @@ def _row_to_canary_config(row: asyncpg.Record) -> CanaryConfig:
         enabled=row["enabled"],
         auto_promote=row["auto_promote"],
         eval_gate=row["eval_gate"],
+        auto_rollback=row["auto_rollback"],
         created_by=row["created_by"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
