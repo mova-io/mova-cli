@@ -49,11 +49,33 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 15 | External-orchestrator adapter pack — `mdk[prefect]` task + `mdk[airflow]` `MovateAgentOperator` + webhook contract (movate as a *callable*, no core dep) | 017.D3 | M–L (~45m) 🔒 | — | ⬜ | | `____` |
 | 16 | Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) | scopes | ⬜ | | `____` |
 | 17 | Batch inference API (bulk async run over a dataset) | feature | M (~25m) | — | ⬜ | | `____` |
-| 18 | Streaming responses (SSE) | #75 | S (~20m) | — | ⬜ | | `____` |
+| 18 | Streaming responses (SSE) — `POST …/runs/stream` + `mdk run --target --stream` | #75 | S (~20m) | — | ✅ | #391 | `2026.5.24.1` |
 | 19 | Workload identity for service-to-service (removes shared fleet key + KV bootstrap secret) | 013.D6 | M (~35m) 🔒 | — | ⬜ | | `____` |
 | 20 | Langfuse self-host Bicep module (`enableLangfuse`: ClickHouse/Redis/Blob, KV, private ingress) | 015.3 | L (~45m) 🔒 | langfuse-v3 | ⬜ | | `____` |
 | 21 | Edge gateway (APIM / Envoy — custom domain, dev portal, edge throttle/WAF) | 013.L3 | L (~1h) 🔒 | scopes | ⬜ | | `____` |
 | — | _(Temporal/Prefect durable backend — only if a single external engine is required; Deva sign-off, ADR 001)_ | 017.D4 | — | — | — | | |
+
+## Robustness & hardening (items 22+) — production-readiness gaps
+
+From the platform-robustness review: the *functional* surface is feature-complete,
+but these close the gap from "feature-complete" to "production-robust." Three
+classes — **(A) deferred safety behaviors** explicitly punted during the feature
+build, **(B) operational hardening**, **(C) operator docs**. Several are 🔒 (code
+lands in Claude time; final validation needs a live Azure subscription). The
+single biggest caveat is not a row below: **none of the 🔒 infra code (items 11,
+15, 19–21) has been exercised on a real Azure subscription — a staging deploy +
+smoke pass is the gate to calling the platform production-ready.**
+
+| # | Item | Class | ADR / ref | LOE (Claude) | Depends on | Status | PR | Merged |
+|---|------|-------|-----------|--------------|------------|--------|----|--------|
+| 22 | **Auto-rollback on drift** — when a scheduled eval flags a challenger regression, opt-in auto-revert to champion (weight→0 + restore champion); informs by default, auto only when enabled | A | 016.D5 | M (~30m) | #10, #12 | ⬜ | | `____` |
+| 23 | **Trigger replay / idempotency** — delivery-id / nonce store so a duplicate inbound event doesn't double-enqueue a run | A | 017.D2 | M (~30m) | #13 | ⬜ | | `____` |
+| 24 | **Per-dimension drift** — persist per-dimension eval means on `EvalRecord`; extend `drift.py` to compare per-dimension, not just aggregate mean/pass-rate | A | 016.D2 | M (~30m) | #10 | ⬜ | | `____` |
+| 25 | **Per-tenant rate-limiting / quota** at the runtime edge — token-bucket / sliding-window per (tenant, scope), 429 on exceed; portable app-level (always-on, complements #21) | B | 013 / feature | M (~35m) | scopes | ⬜ | | `____` |
+| 26 | **DR / backup runbook + tooling** for Postgres storage — documented backup/restore + point-in-time, plus a `mdk` export/import escape hatch | B | feature | M (~35m) 🔒 | — | ⬜ | | `____` |
+| 27 | **Golden-signal SLOs + alerting** — readiness/liveness probes + latency / error-rate / queue-depth metrics → Azure Monitor alert rules (beyond drift) | B | 015 | M–L (~45m) 🔒 | #4 | ⬜ | | `____` |
+| 28 | **Load / soak test harness** — drive the job-queue + KEDA autoscale path under load; capture baseline throughput/latency; documented results | B | feature | M (~35m) 🔒 | #11 | ⬜ | | `____` |
+| 29 | **Operator runbooks** — configure/operate/troubleshoot the new surfaces (scheduler, triggers, durable/HITL, canary, harvest, continuous-eval, batch, SSE) | C | docs | M (~30m) | (features land) | ⬜ | | `____` |
 
 ## How this is maintained
 As each PR merges, its row flips to ✅ and the **Merged** column is stamped with
