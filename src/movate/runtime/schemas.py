@@ -1831,6 +1831,120 @@ class AgentRunSubmission(BaseModel):
     )
 
 
+class BatchInlineSubmission(BaseModel):
+    """Inline JSON body for ``POST /api/v1/agents/{name}/batch`` (item 17).
+
+    The programmatic alternative to a JSONL ``UploadFile`` — a caller that
+    already has the dataset in memory POSTs ``{"inputs": [ {...}, ... ]}``
+    instead of streaming a file. Each element of ``inputs`` becomes ONE
+    ordinary ``JobKind.AGENT`` job's input, exactly as one JSONL line would.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inputs: list[dict[str, Any]] = Field(
+        ...,
+        description=(
+            "Dataset rows — one run's input per element. Each becomes one "
+            "queued AGENT job carrying the batch's shared ``batch_id``."
+        ),
+    )
+    notify_email: str | None = Field(
+        default=None,
+        description=(
+            "Optional email address propagated onto EVERY child job, so the "
+            "worker emails this address as each row reaches a terminal status."
+        ),
+    )
+
+
+class BatchAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/batch`` response — 202 Accepted.
+
+    The caller polls ``GET /api/v1/batches/{batch_id}`` for the per-status
+    aggregate, exactly as a single run polls ``GET /jobs/{id}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str
+    total: int
+    """Number of rows enqueued = number of child AGENT jobs created."""
+    status: str = "queued"
+    """Always ``"queued"`` from this endpoint — every child job starts QUEUED.
+    A literal field (not :class:`JobStatus`) because a batch's overall state
+    has its own small vocabulary (queued / running / complete), distinct from a
+    single job's lifecycle."""
+
+
+class BatchStatusCounts(BaseModel):
+    """Per-status counts over a batch's child jobs.
+
+    One field per :class:`JobStatus` member so the wire shape is stable and
+    self-documenting — a client doesn't have to know the enum to render the
+    progress bar.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    queued: int = 0
+    running: int = 0
+    success: int = 0
+    error: int = 0
+    safety_blocked: int = 0
+    dead_letter: int = 0
+
+
+class BatchStatusView(BaseModel):
+    """``GET /api/v1/batches/{batch_id}`` response — the aggregate.
+
+    ``counts`` breaks the children down per status; ``state`` is the derived
+    overall state: ``running`` if ANY child is still non-terminal (QUEUED or
+    RUNNING), else ``complete``. ``job_ids`` lists the child job ids so a
+    caller can drill into any one via ``GET /jobs/{id}`` / ``GET /runs/{id}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str
+    agent: str
+    total: int
+    """The row count recorded at submit time (from the BatchRecord)."""
+    counts: BatchStatusCounts
+    state: str
+    """Derived overall state: ``"running"`` while any child is non-terminal
+    (QUEUED / RUNNING), otherwise ``"complete"``. A literal, not
+    :class:`JobStatus` — a batch is not itself a job."""
+    created_at: datetime
+    job_ids: list[str] = Field(default_factory=list)
+    """The child job ids, newest-first. Drill in via ``GET /jobs/{id}``."""
+
+
+class BatchListItemView(BaseModel):
+    """One row in the ``GET /api/v1/batches`` list — parent metadata only.
+
+    Deliberately omits the per-status aggregate (which requires fetching every
+    child) so the list view stays cheap — clients fetch
+    ``GET /api/v1/batches/{id}`` for a specific batch's progress.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str
+    agent: str
+    total: int
+    created_at: datetime
+
+
+class BatchListView(BaseModel):
+    """``GET /api/v1/batches`` response — envelope around a page of batches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batches: list[BatchListItemView]
+    count: int
+
+
 class AgentValidationIssue(BaseModel):
     """One finding from ``POST /api/v1/agents/{name}/validate``.
 

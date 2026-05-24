@@ -21,6 +21,9 @@ import httpx
 from movate.core.models import JobKind, JobStatus, WorkflowStatus
 from movate.runtime.schemas import (
     AgentListView,
+    BatchAcceptedView,
+    BatchListView,
+    BatchStatusView,
     HealthView,
     JobListView,
     JobView,
@@ -160,6 +163,73 @@ class MovateClient:
         r = await self._client.get(f"/runs/{run_id}")
         self._raise_for_status(r)
         return RunView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Batch inference (item 17)
+    # ------------------------------------------------------------------
+
+    async def submit_batch(
+        self,
+        *,
+        agent: str,
+        rows: list[dict[str, Any]],
+        notify_email: str | None = None,
+    ) -> BatchAcceptedView:
+        """``POST /api/v1/agents/{name}/batch`` — enqueue one job per row.
+
+        Sends the dataset as the inline JSON body
+        (``{"inputs": [...], "notify_email"?: ...}``). The server mints a
+        ``batch_id`` and enqueues one ordinary AGENT job per row; returns
+        ``{batch_id, total, status: "queued"}`` (202). Poll
+        ``get_batch(batch_id)`` for progress.
+        """
+        body: dict[str, Any] = {"inputs": rows}
+        if notify_email is not None:
+            body["notify_email"] = notify_email
+        r = await self._client.post(f"/api/v1/agents/{agent}/batch", json=body)
+        self._raise_for_status(r)
+        return BatchAcceptedView.model_validate(r.json())
+
+    async def get_batch(self, batch_id: str) -> BatchStatusView:
+        """``GET /api/v1/batches/{id}`` — per-status aggregate of a batch."""
+        r = await self._client.get(f"/api/v1/batches/{batch_id}")
+        self._raise_for_status(r)
+        return BatchStatusView.model_validate(r.json())
+
+    async def list_batches(self, *, limit: int = 20) -> BatchListView:
+        """``GET /api/v1/batches`` — this tenant's recent batches, newest-first."""
+        r = await self._client.get("/api/v1/batches", params={"limit": limit})
+        self._raise_for_status(r)
+        return BatchListView.model_validate(r.json())
+
+    async def wait_for_batch(
+        self,
+        batch_id: str,
+        *,
+        poll_interval_seconds: float = 1.0,
+        max_wait_seconds: float | None = None,
+    ) -> BatchStatusView:
+        """Poll ``GET /api/v1/batches/{id}`` until the batch is ``complete``.
+
+        ``complete`` = every child job reached a terminal status (the server
+        derives ``state``). ``max_wait_seconds=None`` waits indefinitely;
+        otherwise a ``TimeoutError`` is raised once elapsed exceeds it (the
+        batch keeps running server-side).
+        """
+        import asyncio  # noqa: PLC0415
+
+        elapsed = 0.0
+        while True:
+            view = await self.get_batch(batch_id)
+            if view.state == "complete":
+                return view
+            if max_wait_seconds is not None and elapsed >= max_wait_seconds:
+                raise TimeoutError(
+                    f"batch {batch_id} still {view.state} after {elapsed:.0f}s — "
+                    f"abandoning poll, server will keep working"
+                )
+            await asyncio.sleep(poll_interval_seconds)
+            elapsed += poll_interval_seconds
 
     # ------------------------------------------------------------------
     # Workflow HITL — resume-on-signal (ADR 017 D5, PR 2)

@@ -18,6 +18,7 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
+    BatchRecord,
     BenchModelResult,
     BenchRecord,
     CanaryConfig,
@@ -530,6 +531,36 @@ _MIGRATIONS = [
     # worker runs from the entrypoint, unchanged. Mirrors the target_version
     # additive-column pattern above.
     "ALTER TABLE jobs ADD COLUMN resume_workflow_run_id TEXT",
+    # item 17: batch inference. A batch is parent metadata over N child
+    # JobKind.AGENT jobs; the submit endpoint persists one row here and
+    # stamps each child job's batch_id (the column added just below).
+    # Additive new table (CREATE TABLE IF NOT EXISTS, idempotent) — no row
+    # exists unless a batch was submitted, so non-batch behavior is
+    # unchanged.
+    """
+    CREATE TABLE IF NOT EXISTS batches (
+        batch_id    TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        agent       TEXT NOT NULL,
+        total       INTEGER NOT NULL,
+        created_by  TEXT,
+        created_at  TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_batches_tenant_created ON batches(tenant_id, created_at DESC)",
+    # item 17: link each enqueued dataset row back to its parent batch.
+    # Nullable — pre-batch rows (and every non-batch job: single runs,
+    # scheduled/triggered/threaded/workflow jobs) read back as NULL → None,
+    # byte-for-byte the pre-batch JobRecord. Mirrors the target_version
+    # additive-column pattern above.
+    "ALTER TABLE jobs ADD COLUMN batch_id TEXT",
+    # Aggregate the children of one batch (status endpoint). Partial-free:
+    # most jobs have batch_id NULL, but a batch with thousands of rows wants
+    # an index range scan, not a full table scan.
+    (
+        "CREATE INDEX IF NOT EXISTS idx_jobs_batch "
+        "ON jobs(tenant_id, batch_id) WHERE batch_id IS NOT NULL"
+    ),
 ]
 
 
@@ -1356,6 +1387,49 @@ class SqliteProvider:
     # Jobs (v0.5)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Batches (item 17 — batch inference)
+    # ------------------------------------------------------------------
+
+    async def save_batch(self, batch: BatchRecord) -> None:
+        await self._db.execute(
+            "INSERT INTO batches VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                batch.batch_id,
+                batch.tenant_id,
+                batch.agent,
+                batch.total,
+                batch.created_by,
+                batch.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_batch(self, batch_id: str, *, tenant_id: str) -> BatchRecord | None:
+        async with self._db.execute(
+            "SELECT * FROM batches WHERE batch_id = ? AND tenant_id = ?",
+            (batch_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_batch(row) if row else None
+
+    async def list_batches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 20,
+    ) -> list[BatchRecord]:
+        sql = "SELECT * FROM batches"
+        params: list[object] = []
+        if tenant_id is not None:
+            sql += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_batch(r) for r in rows]
+
     async def save_job(self, job: JobRecord) -> None:
         await self._db.execute(
             """
@@ -1364,8 +1438,8 @@ class SqliteProvider:
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
-                target_version, resume_workflow_run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target_version, resume_workflow_run_id, batch_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -1386,6 +1460,7 @@ class SqliteProvider:
                 job.thread_id,
                 job.target_version,
                 job.resume_workflow_run_id,
+                job.batch_id,
             ),
         )
         await self._db.commit()
@@ -1413,6 +1488,7 @@ class SqliteProvider:
         tenant_id: str | None = None,
         status: JobStatus | None = None,
         target: str | None = None,
+        batch_id: str | None = None,
         limit: int = 20,
     ) -> list[JobRecord]:
         clauses: list[str] = []
@@ -1426,6 +1502,9 @@ class SqliteProvider:
         if target is not None:
             clauses.append("target = ?")
             params.append(target)
+        if batch_id is not None:
+            clauses.append("batch_id = ?")
+            params.append(batch_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
@@ -2651,6 +2730,21 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # the time we read here; .get() stays defensive against a pre-PR-2
         # row, which is a non-resume job — exactly None.
         resume_workflow_run_id=dict(row).get("resume_workflow_run_id"),
+        # item 17 batch linkage. init() has run the ALTER by the time we read
+        # here; .get() stays defensive against a pre-batch row, which is a
+        # non-batch job — exactly None.
+        batch_id=dict(row).get("batch_id"),
+    )
+
+
+def _row_to_batch(row: aiosqlite.Row) -> BatchRecord:
+    return BatchRecord(
+        batch_id=row["batch_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        total=row["total"],
+        created_by=row["created_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 

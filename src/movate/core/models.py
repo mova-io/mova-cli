@@ -2087,6 +2087,50 @@ class JobRecord(BaseModel):
     fresh/scheduled workflow job) means "run from the entrypoint", byte-for-
     byte the pre-PR-2 path. Additive + nullable: pre-PR-2 rows read back as
     ``None``."""
+    batch_id: str | None = None
+    """Parent batch this job belongs to (item 17 — batch inference). Each row
+    of a submitted dataset becomes ONE ordinary ``JobKind.AGENT`` job carrying
+    the shared ``batch_id`` of its :class:`BatchRecord`; the batch-status
+    endpoint aggregates over the children via ``list_jobs(batch_id=...)``. The
+    worker never reads this — a batch row is byte-for-byte a normal agent job,
+    so it inherits retry / dead-letter / canary / observability with no new
+    execution path. ``None`` (every non-batch job: every single run, every
+    scheduled / triggered / threaded / workflow job) means "not part of a
+    batch", byte-for-byte the pre-batch path. Additive + nullable: pre-batch
+    rows read back as ``None``. Mirrors the ``target_version`` /
+    ``resume_workflow_run_id`` additive-column pattern above."""
+
+
+class BatchRecord(BaseModel):
+    """Parent metadata for a batch-inference submission (item 17).
+
+    A caller submits a whole dataset of inputs for one agent; movate mints a
+    ``batch_id``, persists this record (``total`` = the number of rows it
+    enqueued), and enqueues ONE ordinary ``JobKind.AGENT`` job per row, each
+    stamped with :attr:`JobRecord.batch_id` = ``batch_id``. Because each row
+    is a normal queue job, it is observable, retryable, dead-letter-handled,
+    and canary-aware for free — no new execution path. The batch-status
+    endpoint loads this record and aggregates over the child jobs fetched via
+    ``list_jobs(batch_id=...)``.
+
+    Immutable after creation — there is no per-row mutation here; the live
+    per-status counts always come from the children, never from this record.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: str
+    tenant_id: str
+    agent: str
+    """The agent every row of this batch runs against (the ``target`` of each
+    child :class:`JobRecord`)."""
+    total: int = Field(..., ge=0)
+    """Number of rows enqueued = number of child jobs. The status endpoint
+    cross-checks this against the child count it fetches."""
+    created_by: str | None = None
+    """The api_key_id (or other identity) that submitted the batch — audit
+    only, mirrors :attr:`JobRecord.api_key_id`. Never returned over the wire."""
+    created_at: datetime = Field(default_factory=_now)
 
 
 class JobSchedule(BaseModel):

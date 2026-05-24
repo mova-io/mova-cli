@@ -32,6 +32,7 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
+    BatchRecord,
     BenchModelResult,
     BenchRecord,
     CanaryConfig,
@@ -546,6 +547,33 @@ ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS human_task JSONB;
 -- worker runs from the entrypoint, unchanged. ADD COLUMN IF NOT EXISTS keeps
 -- it idempotent on every init (mirrors the target_version pattern above).
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resume_workflow_run_id TEXT;
+
+-- item 17: batch inference. A batch is parent metadata over N child
+-- JobKind.AGENT jobs; the submit endpoint persists one row here and stamps
+-- each child job's batch_id (the column added just below). Additive new
+-- table (CREATE TABLE IF NOT EXISTS, idempotent) — no row exists unless a
+-- batch was submitted, so non-batch behavior is unchanged.
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id    TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    agent       TEXT NOT NULL,
+    total       INTEGER NOT NULL,
+    created_by  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batches_tenant_created
+    ON batches(tenant_id, created_at DESC);
+
+-- item 17: link each enqueued dataset row back to its parent batch. Nullable
+-- — pre-batch rows (and every non-batch job: single runs, scheduled /
+-- triggered / threaded / workflow jobs) read back as NULL → None, byte-for-
+-- byte the pre-batch JobRecord. ADD COLUMN IF NOT EXISTS keeps it idempotent
+-- (mirrors the target_version pattern above).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_id TEXT;
+-- Aggregate the children of one batch (status endpoint). Partial index keeps
+-- it tight — most jobs have batch_id NULL.
+CREATE INDEX IF NOT EXISTS idx_jobs_batch
+    ON jobs(tenant_id, batch_id) WHERE batch_id IS NOT NULL;
 """
 
 
@@ -1495,6 +1523,49 @@ class PostgresProvider:
     # Jobs
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Batches (item 17 — batch inference)
+    # ------------------------------------------------------------------
+
+    async def save_batch(self, batch: BatchRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO batches (
+                batch_id, tenant_id, agent, total, created_by, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            batch.batch_id,
+            batch.tenant_id,
+            batch.agent,
+            batch.total,
+            batch.created_by,
+            batch.created_at,
+        )
+
+    async def get_batch(self, batch_id: str, *, tenant_id: str) -> BatchRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM batches WHERE batch_id = $1 AND tenant_id = $2",
+            batch_id,
+            tenant_id,
+        )
+        return _row_to_batch(row) if row else None
+
+    async def list_batches(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 20,
+    ) -> list[BatchRecord]:
+        params: list[Any] = []
+        where = ""
+        if tenant_id is not None:
+            params.append(tenant_id)
+            where = f"WHERE tenant_id = ${len(params)}"
+        params.append(limit)
+        sql = f"SELECT * FROM batches {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_batch(r) for r in rows]
+
     async def save_job(self, job: JobRecord) -> None:
         await self._db.execute(
             """
@@ -1503,10 +1574,10 @@ class PostgresProvider:
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
-                target_version, resume_workflow_run_id
+                target_version, resume_workflow_run_id, batch_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18
+                $11, $12, $13, $14, $15, $16, $17, $18, $19
             )
             """,
             job.job_id,
@@ -1527,6 +1598,7 @@ class PostgresProvider:
             job.thread_id,
             job.target_version,
             job.resume_workflow_run_id,
+            job.batch_id,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -1543,6 +1615,7 @@ class PostgresProvider:
         tenant_id: str | None = None,
         status: JobStatus | None = None,
         target: str | None = None,
+        batch_id: str | None = None,
         limit: int = 20,
     ) -> list[JobRecord]:
         clauses: list[str] = []
@@ -1556,6 +1629,9 @@ class PostgresProvider:
         if target is not None:
             params.append(target)
             clauses.append(f"target = ${len(params)}")
+        if batch_id is not None:
+            params.append(batch_id)
+            clauses.append(f"batch_id = ${len(params)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         sql = f"SELECT * FROM jobs {where} ORDER BY created_at DESC LIMIT ${len(params)}"
@@ -2692,6 +2768,18 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         thread_id=row["thread_id"],
         target_version=row["target_version"],
         resume_workflow_run_id=row["resume_workflow_run_id"],
+        batch_id=row["batch_id"],
+    )
+
+
+def _row_to_batch(row: asyncpg.Record) -> BatchRecord:
+    return BatchRecord(
+        batch_id=row["batch_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        total=row["total"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
     )
 
 
