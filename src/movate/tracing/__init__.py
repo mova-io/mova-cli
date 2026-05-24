@@ -49,6 +49,12 @@ import sys
 from movate.tracing.base import SpanCtx, Tracer
 from movate.tracing.composite import CompositeTracer
 from movate.tracing.null import SilentTracer
+from movate.tracing.propagation import (
+    attach_trace_context,
+    continue_trace_context,
+    detach_trace_context,
+    inject_current_trace_context,
+)
 from movate.tracing.stdout import StdoutTracer
 
 # Track which backend warning messages have already been emitted this
@@ -63,7 +69,11 @@ __all__ = [
     "StdoutTracer",
     "TraceSinkError",
     "Tracer",
+    "attach_trace_context",
     "build_tracer",
+    "continue_trace_context",
+    "detach_trace_context",
+    "inject_current_trace_context",
 ]
 
 # Valid values for the ADR-015 deployment sink selector.

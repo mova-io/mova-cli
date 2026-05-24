@@ -599,6 +599,14 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS batch_id TEXT;
 -- it tight — most jobs have batch_id NULL.
 CREATE INDEX IF NOT EXISTS idx_jobs_batch
     ON jobs(tenant_id, batch_id) WHERE batch_id IS NOT NULL;
+-- item 32 (ADR 019): W3C trace-context carrier captured at enqueue so the
+-- worker can continue the originating distributed trace (submit → execute as
+-- ONE trace). Just a dict[str,str] of traceparent/tracestate — storage never
+-- imports OTel. Nullable — pre-R2 rows (and any job enqueued with OTel off)
+-- read back as NULL → {} → the worker starts a fresh root span, byte-for-byte
+-- the pre-R2 behaviour. ADD COLUMN IF NOT EXISTS keeps it idempotent (mirrors
+-- the target_version pattern above).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_context JSONB;
 
 -- item 24: per-dimension eval means. JSONB ({dim: mean}, same codec as
 -- jobs.input) so drift detection can compare per-dimension and catch a
@@ -1707,10 +1715,11 @@ class PostgresProvider:
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
-                target_version, resume_workflow_run_id, batch_id
+                target_version, resume_workflow_run_id, batch_id,
+                trace_context
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
             )
             """,
             job.job_id,
@@ -1732,6 +1741,10 @@ class PostgresProvider:
             job.target_version,
             job.resume_workflow_run_id,
             job.batch_id,
+            # item 32 (ADR 019): W3C trace-context carrier. JSONB via the
+            # pool's json codec (encoder=json.dumps). Empty dict {} when OTel
+            # was off / no active span at enqueue.
+            job.trace_context,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -3025,6 +3038,10 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         target_version=row["target_version"],
         resume_workflow_run_id=row["resume_workflow_run_id"],
         batch_id=row["batch_id"],
+        # item 32 (ADR 019): W3C trace-context carrier. NULL (pre-R2 row, or a
+        # job enqueued with OTel off) → {} so the worker starts a fresh root
+        # span — byte-for-byte the pre-R2 behaviour.
+        trace_context=dict(row["trace_context"]) if row["trace_context"] else {},
     )
 
 
