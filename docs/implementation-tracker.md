@@ -34,9 +34,13 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 > - **ADR 016 improvement loop** — harvest (#5) → continuous-eval/drift (#10) →
 >   canary / champion–challenger (#386).
 >
-> **Remaining (items 15–21) are independent standalone enhancements** — no shared
-> arc; several are 🔒 (code lands in Claude time, final validation needs live
-> Azure). Pick by priority rather than dependency order.
+> **Standalone quick wins done** (`.1`→`.4`): SSE streaming (#391), batch inference
+> (#393), key rotation (#394) — all fully validatable in Claude time.
+>
+> **Remaining feature items 15, 19–21 are all 🔒** (code lands in Claude time;
+> final validation needs a live Azure subscription / IdP). The **robustness &
+> hardening backlog (items 22–29)** is below. Pick by priority — these are not
+> dependency-ordered, and the 🔒 ones are gated on a staging deploy + smoke pass.
 
 ## Items 11+ (sequenced; orchestration ADR 017 woven in by leverage/dependency)
 
@@ -47,8 +51,8 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 13 | Event / webhook triggers — run an agent/workflow on an inbound event | 017.D2 | M (~35m) | #11 | ✅ | #384 | `2026.5.23.31` |
 | 14 | Durable + HITL — `HUMAN` node pause/persist/resume-on-signal (long, human-gated pipelines) | 017.D5 / #28 | L (~1.5–2h, 2 PRs) | #11, #13 | ✅ | #388, #389 | `2026.5.23.36` |
 | 15 | External-orchestrator adapter pack — `mdk[prefect]` task + `mdk[airflow]` `MovateAgentOperator` + webhook contract (movate as a *callable*, no core dep) | 017.D3 | M–L (~45m) 🔒 | — | ⬜ | | `____` |
-| 16 | Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) | scopes | ⬜ | | `____` |
-| 17 | Batch inference API (bulk async run over a dataset) | feature | M (~25m) | — | ⬜ | | `____` |
+| 16 | Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) | scopes | ✅ | #394 | `2026.5.24.4` |
+| 17 | Batch inference API (bulk async run over a dataset) | feature | M (~25m) | — | ✅ | #393 | `2026.5.24.3` |
 | 18 | Streaming responses (SSE) — `POST …/runs/stream` + `mdk run --target --stream` | #75 | S (~20m) | — | ✅ | #391 | `2026.5.24.1` |
 | 19 | Workload identity for service-to-service (removes shared fleet key + KV bootstrap secret) | 013.D6 | M (~35m) 🔒 | — | ⬜ | | `____` |
 | 20 | Langfuse self-host Bicep module (`enableLangfuse`: ClickHouse/Redis/Blob, KV, private ingress) | 015.3 | L (~45m) 🔒 | langfuse-v3 | ⬜ | | `____` |
