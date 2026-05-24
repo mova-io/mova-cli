@@ -1829,6 +1829,52 @@ class PostgresProvider:
             tenant_id,
         )
 
+    async def set_api_key_expiry(
+        self, key_id: str, *, tenant_id: str, expires_at: datetime
+    ) -> None:
+        # Grace window on the OLD key during rotation (ADR 013 D5).
+        # tenant_id + revoked_at IS NULL: tenant-scoped, never re-arm a
+        # dead key. No-op on missing / cross-tenant / already-revoked.
+        await self._db.execute(
+            """
+            UPDATE api_keys SET expires_at = $1
+            WHERE key_id = $2 AND tenant_id = $3 AND revoked_at IS NULL
+            """,
+            expires_at,
+            key_id,
+            tenant_id,
+        )
+
+    async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
+        # Compromise-response bulk revoke (ADR 013 D5). Returns the count
+        # revoked. asyncpg's execute() returns a status string like
+        # "UPDATE 3" — parse the trailing integer. Each UPDATE touches
+        # only the active subset, so a re-run returns 0.
+        if except_key_id is not None:
+            status = await self._db.execute(
+                """
+                UPDATE api_keys SET revoked_at = $1
+                WHERE tenant_id = $2 AND revoked_at IS NULL AND key_id != $3
+                """,
+                datetime.now(UTC),
+                tenant_id,
+                except_key_id,
+            )
+        else:
+            status = await self._db.execute(
+                """
+                UPDATE api_keys SET revoked_at = $1
+                WHERE tenant_id = $2 AND revoked_at IS NULL
+                """,
+                datetime.now(UTC),
+                tenant_id,
+            )
+        # status: "UPDATE <n>" — the affected row count is the last token.
+        try:
+            return int(status.split()[-1])
+        except (ValueError, IndexError):  # pragma: no cover — defensive
+            return 0
+
     # ------------------------------------------------------------------
     # Tenant budgets (post-v1.0)
     # ------------------------------------------------------------------

@@ -1734,6 +1734,38 @@ class SqliteProvider:
         )
         await self._db.commit()
 
+    async def set_api_key_expiry(
+        self, key_id: str, *, tenant_id: str, expires_at: datetime
+    ) -> None:
+        """Set ``expires_at`` on an active key (grace window; ADR 013 D5).
+
+        ``tenant_id`` + ``revoked_at IS NULL`` in WHERE: tenant-scoped,
+        and we never re-arm a dead key. No-op on missing / cross-tenant /
+        already-revoked."""
+        await self._db.execute(
+            "UPDATE api_keys SET expires_at = ? "
+            "WHERE key_id = ? AND tenant_id = ? AND revoked_at IS NULL",
+            (expires_at.isoformat(), key_id, tenant_id),
+        )
+        await self._db.commit()
+
+    async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
+        """Revoke every active key for ``tenant_id``; return count revoked.
+
+        Compromise-response bulk revoke (ADR 013 D5). ``except_key_id``
+        spares one key (the operator's own). ``rowcount`` is reliable here
+        because each UPDATE only touches the still-active subset
+        (``revoked_at IS NULL``), so re-running returns 0."""
+        now = datetime.now(UTC).isoformat()
+        sql = "UPDATE api_keys SET revoked_at = ? WHERE tenant_id = ? AND revoked_at IS NULL"
+        params: list[object] = [now, tenant_id]
+        if except_key_id is not None:
+            sql += " AND key_id != ?"
+            params.append(except_key_id)
+        cur = await self._db.execute(sql, params)
+        await self._db.commit()
+        return cur.rowcount
+
     # ------------------------------------------------------------------
     # Tenant budgets (post-v1.0)
     # ------------------------------------------------------------------
