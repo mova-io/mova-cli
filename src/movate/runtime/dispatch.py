@@ -464,7 +464,25 @@ class WorkerDispatch:
                 result_run_id=result.workflow_run_id,
                 error=None,
             )
-        # Workflow can only land in SUCCESS or ERROR per WorkflowStatus.
+        if result.status == WorkflowStatus.PAUSED:
+            # ADR 017 D5 (PR 1): the workflow reached a HUMAN gate, persisted a
+            # durable PAUSED checkpoint, and stopped. The job segment that drove
+            # it *to the gate* succeeded — the paused WorkflowRunRecord (keyed by
+            # workflow_run_id) is the durable handle. We map PAUSED → SUCCESS so
+            # the job state machine stays untouched (no new JobStatus), and
+            # surface the workflow_run_id as result_run_id so callers can locate
+            # the checkpoint.
+            #
+            # PR 2 (resume-on-signal): when the human's decision arrives, the
+            # signal endpoint loads this checkpoint and enqueues a FRESH
+            # continuation job that resumes the runner from the gate's successor.
+            # This job does not resume itself.
+            return DispatchOutcome(
+                status=JobStatus.SUCCESS,
+                result_run_id=result.workflow_run_id,
+                error=None,
+            )
+        # Otherwise ERROR (a node failed); partial state retained.
         return DispatchOutcome(
             status=JobStatus.ERROR,
             result_run_id=result.workflow_run_id,

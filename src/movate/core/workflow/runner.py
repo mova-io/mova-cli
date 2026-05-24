@@ -18,6 +18,20 @@ State plumbing rules (v0.3, may evolve):
 * On node failure the runner stops and returns the partial state plus the
   failed node's ``RunRecord``. No subsequent nodes execute.
 
+HITL pause (ADR 017 D5, PR 1):
+
+* When the walker reaches a ``NodeType.HUMAN`` node it executes NOTHING.
+  It persists a durable checkpoint — a ``WorkflowRunRecord`` with
+  ``status=PAUSED``, the gate's ``paused_node_id``, the ``paused_state``
+  captured at the gate (the post-merge state of every node up to but not
+  including the gate), and the gate's ``human_task`` spec — then returns a
+  ``WorkflowResult(status=PAUSED, ...)``. No node after the gate runs.
+* PR 2 (resume-on-signal, a separate PR) loads that checkpoint, merges the
+  human's decision into ``paused_state``, and continues from the gate's
+  successor. The checkpoint persisted here is designed to be sufficient for
+  that: ``paused_node_id`` + ``paused_state`` + ``human_task`` +
+  ``workflow``/``workflow_version`` fully reconstruct where to resume.
+
 Explicit ``inputs:`` / ``outputs:`` mappings are deliberately deferred to
 v0.4 — easy to add when real workflows demand finer control.
 """
@@ -67,7 +81,9 @@ class WorkflowResult:
     """The state dict at the moment the workflow halted. On success this is
     the post-merge state after the sink node ran; on partial failure this is
     the state captured *before* the failing node executed (so the user can
-    inspect what node N saw before crashing)."""
+    inspect what node N saw before crashing); on PAUSED this is the state
+    captured at the human gate (same value as the checkpoint's
+    ``paused_state``)."""
 
     runs: list[RunRecord] = field(default_factory=list)
     error_node_id: str | None = None
@@ -190,6 +206,45 @@ class WorkflowRunner:
                 runs.extend(router_runs)
                 current_id = chosen_next
                 continue
+
+            if node.type is NodeType.HUMAN:
+                # --- HITL gate: pause + persist a durable checkpoint --------
+                # ADR 017 D5 (PR 1). Execute NOTHING at the gate. ``state`` is
+                # already the post-merge state of every node up to (but not
+                # including) this one — that is exactly the checkpoint PR 2
+                # resumes from. We persist a PAUSED WorkflowRunRecord carrying
+                # the gate id, that state, and the human-task spec, then return
+                # a PAUSED WorkflowResult. PR 2's resume-on-signal path loads
+                # this record, merges the human's decision into ``paused_state``,
+                # and continues from this node's sequential successor.
+                finished = time.monotonic()
+                human_task = {
+                    "prompt": node.metadata.get("prompt", ""),
+                    "output_contract": list(node.metadata.get("output_contract", [])),
+                }
+                paused_state = dict(state)
+                wf_record = WorkflowRunRecord(
+                    workflow_run_id=wf_id,
+                    tenant_id=self._tenant_id,
+                    workflow=graph.name,
+                    workflow_version=graph.version,
+                    status=WorkflowStatus.PAUSED,
+                    initial_state=initial_state,
+                    final_state=paused_state,
+                    paused_node_id=node_id,
+                    paused_state=paused_state,
+                    human_task=human_task,
+                )
+                await self._storage.save_workflow_run(wf_record)
+                return WorkflowResult(
+                    workflow_run_id=wf_id,
+                    status=WorkflowStatus.PAUSED,
+                    initial_state=initial_state,
+                    final_state=paused_state,
+                    runs=runs,
+                    started_at=started,
+                    finished_at=finished,
+                )
 
             # --- agent node --------------------------------------------------
             # Load agent — runner-level error if the bundle won't parse.

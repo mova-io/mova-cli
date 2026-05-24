@@ -676,6 +676,9 @@ def _emit_workflow_text(result: WorkflowResult) -> None:
 def _status_badge(result: WorkflowResult) -> str:
     if result.status is WorkflowStatus.SUCCESS:
         return "[green]SUCCESS[/green]"
+    if result.status is WorkflowStatus.PAUSED:
+        # ADR 017 D5 (PR 1): paused at a HUMAN gate — resumable, not a failure.
+        return "[yellow]PAUSED[/yellow]"
     return "[red]ERROR[/red]"
 
 

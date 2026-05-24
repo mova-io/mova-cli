@@ -137,7 +137,7 @@ def test_load_workflow_spec_rejects_wrong_api_version(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_load_workflow_spec_rejects_non_agent_node_at_parse_time(
+def test_load_workflow_spec_rejects_unknown_node_type_at_parse_time(
     tmp_path: Path,
 ) -> None:
     workflow_dir = tmp_path / "wf"
@@ -146,11 +146,11 @@ def test_load_workflow_spec_rejects_non_agent_node_at_parse_time(
         workflow_dir,
         nodes=[
             {"id": "first", "type": "agent", "ref": "./agents/first"},
-            {"id": "second", "type": "human", "ref": "./agents/second"},
+            {"id": "second", "type": "tool", "ref": "./agents/second"},
         ],
         edges=[{"from": "first", "to": "second"}],
     )
-    # The Literal["agent"] in NodeSpec rejects this at Pydantic time.
+    # ``tool`` is not in the NodeSpec discriminated union → Pydantic rejects.
     with pytest.raises(WorkflowSpecLoadError):
         load_workflow_spec(yaml_path)
 
@@ -311,6 +311,55 @@ def test_compile_detects_orphan_nodes(tmp_path: Path) -> None:
     )
     spec, parent = load_workflow_spec(yaml_path)
     with pytest.raises(WorkflowCompileError, match="unreachable from entrypoint"):
+        compile_workflow(spec, parent)
+
+
+# ---------------------------------------------------------------------------
+# HUMAN gate compile + validate (ADR 017 D5, PR 1)
+# ---------------------------------------------------------------------------
+
+
+def _agent_then_human(tmp_path: Path, *, prompt: str = "Approve this?") -> Path:
+    """Scaffold a linear ``first(agent) → gate(human)`` workflow."""
+    workflow_dir = tmp_path / "wf"
+    scaffold_agent(workflow_dir / "agents" / "first", name="first-agent")
+    return _write_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            {
+                "id": "gate",
+                "type": "human",
+                "prompt": prompt,
+                "output_contract": ["decision"],
+            },
+        ],
+        edges=[{"from": "first", "to": "gate"}],
+    )
+
+
+@pytest.mark.unit
+def test_compile_accepts_human_node(tmp_path: Path) -> None:
+    """The compiler builds a HUMAN node carrying its task spec in metadata,
+    and the v0.3 phase gate (validate_linear) accepts it."""
+    yaml_path = _agent_then_human(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+    validate_linear(graph)  # must not raise
+    gate = graph.nodes["gate"]
+    assert gate.type is NodeType.HUMAN
+    assert gate.ref == ""  # human gates carry no executable ref
+    assert gate.metadata["prompt"] == "Approve this?"
+    assert gate.metadata["output_contract"] == ["decision"]
+
+
+@pytest.mark.unit
+def test_compile_rejects_blank_human_prompt(tmp_path: Path) -> None:
+    """A whitespace-only prompt passes Pydantic (min_length=1) but the
+    compiler validates the task spec and rejects it with a clear error."""
+    yaml_path = _agent_then_human(tmp_path, prompt="   ")
+    spec, parent = load_workflow_spec(yaml_path)
+    with pytest.raises(WorkflowCompileError, match=r"human node 'gate': 'prompt'"):
         compile_workflow(spec, parent)
 
 
@@ -480,6 +529,7 @@ def test_validate_linear_rejects_conditional_edges() -> None:
 
 @pytest.mark.unit
 def test_validate_linear_rejects_non_agent_nodes() -> None:
+    # TOOL is still a rejected node type (ADR 017 D5 only un-gated HUMAN).
     g = WorkflowGraph(
         name="demo",
         version="0.1.0",
@@ -488,13 +538,37 @@ def test_validate_linear_rejects_non_agent_nodes() -> None:
         entrypoint="a",
         nodes={
             "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
-            "b": WorkflowNode(id="b", type=NodeType.HUMAN, ref="/y"),
+            "b": WorkflowNode(id="b", type=NodeType.TOOL, ref="/y"),
         },
         edges=[WorkflowEdge(from_id="a", to_id="b")],
         workflow_dir=Path("/"),
     )
-    with pytest.raises(WorkflowCompileError, match="only type=agent and type=intent-router nodes"):
+    with pytest.raises(WorkflowCompileError, match=r"type=agent.*type=human"):
         validate_linear(g)
+
+
+@pytest.mark.unit
+def test_validate_linear_accepts_human_gate() -> None:
+    """ADR 017 D5: a HUMAN gate in a linear chain passes the v0.3 phase gate."""
+    g = WorkflowGraph(
+        name="demo",
+        version="0.1.0",
+        description="",
+        state_schema={"type": "object"},
+        entrypoint="a",
+        nodes={
+            "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
+            "b": WorkflowNode(
+                id="b",
+                type=NodeType.HUMAN,
+                ref="",
+                metadata={"prompt": "approve?", "output_contract": ["decision"]},
+            ),
+        },
+        edges=[WorkflowEdge(from_id="a", to_id="b")],
+        workflow_dir=Path("/"),
+    )
+    validate_linear(g)  # must not raise
 
 
 @pytest.mark.unit

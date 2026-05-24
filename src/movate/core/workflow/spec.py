@@ -11,6 +11,11 @@ v0.3 surface intentionally narrow:
 * node types limited to ``"agent"`` and ``"intent-router"``
 * edges have ``from`` and ``to`` only — no ``when:``, no parallel fan-out
 
+ADR 017 D5 (PR 1) additionally admits a ``"human"`` node — a HITL gate the
+runner pauses at (it persists a checkpoint and stops; PR 2 resumes on an
+external signal). Other future variants (tool, sub-workflow) stay rejected
+by :func:`validate_linear`.
+
 Later phases relax these via separate validator passes.
 """
 
@@ -110,9 +115,50 @@ class IntentRouterNodeSpec(BaseModel):
         )
 
 
-# NodeSpec is a discriminated union of agent and intent-router nodes.
+class HumanNodeSpec(BaseModel):
+    """One ``human`` (HITL gate) workflow node as written in YAML (ADR 017 D5).
+
+    A human node carries no executable ``ref`` — when the runner reaches it,
+    it does NOT execute anything. Instead it persists a durable checkpoint
+    (current state + this spec) with status ``PAUSED`` and returns. PR 2's
+    resume-on-signal path loads that checkpoint, shows ``prompt`` to the
+    operator, validates the returned decision against ``output_contract``,
+    merges it into state, and continues from this node's successor.
+
+    The spec is intentionally minimal: a required human-readable ``prompt``
+    plus an optional ``output_contract`` — the list of state keys the human's
+    eventual response is expected to contribute. ``output_contract`` is the
+    seam PR 2 uses to validate the decision before merging; PR 1 only persists
+    it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    type: Literal["human"]
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        description="Human-readable prompt/label shown to the operator at the gate",
+    )
+    output_contract: list[str] = Field(
+        default_factory=list,
+        description="State keys the human's response is expected to contribute (optional)",
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", v):
+            raise ValueError(
+                f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
+            )
+        return v
+
+
+# NodeSpec is a discriminated union of agent, intent-router, and human nodes.
 NodeSpec = Annotated[
-    AgentNodeSpec | IntentRouterNodeSpec,
+    AgentNodeSpec | IntentRouterNodeSpec | HumanNodeSpec,
     Field(discriminator="type"),
 ]
 

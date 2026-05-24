@@ -513,6 +513,16 @@ _MIGRATIONS = [
     # (and every job with no canary in play) read back as NULL → None → the
     # worker resolves latest, unchanged.
     "ALTER TABLE jobs ADD COLUMN target_version TEXT",
+    # ADR 017 D5 (PR 1): HITL pause checkpoint on workflow_runs. When a
+    # workflow pauses at a HUMAN gate the runner stamps these three columns;
+    # PR 2's resume-on-signal path reads them to continue. All nullable —
+    # existing rows (and every non-paused SUCCESS/ERROR run) read back as
+    # NULL → None, so the schema change is additive + backward compatible.
+    # sqlite has no native JSON column type, so paused_state / human_task are
+    # TEXT holding json.dumps(...) — same strategy as workflow_runs.initial_state.
+    "ALTER TABLE workflow_runs ADD COLUMN paused_node_id TEXT",
+    "ALTER TABLE workflow_runs ADD COLUMN paused_state TEXT",
+    "ALTER TABLE workflow_runs ADD COLUMN human_task TEXT",
 ]
 
 
@@ -1264,8 +1274,8 @@ class SqliteProvider:
             INSERT INTO workflow_runs (
                 workflow_run_id, tenant_id, workflow, workflow_version,
                 status, initial_state, final_state, error_node_id, error,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, paused_node_id, paused_state, human_task
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 w.workflow_run_id,
@@ -1278,6 +1288,9 @@ class SqliteProvider:
                 w.error_node_id,
                 w.error.model_dump_json() if w.error else None,
                 w.created_at.isoformat(),
+                w.paused_node_id,
+                json.dumps(w.paused_state) if w.paused_state is not None else None,
+                json.dumps(w.human_task) if w.human_task is not None else None,
             ),
         )
         await self._db.commit()
@@ -2561,6 +2574,11 @@ def _row_to_workflow_run(row: aiosqlite.Row) -> WorkflowRunRecord:
         error_node_id=row["error_node_id"],
         error=ErrorInfo.model_validate_json(row["error"]) if row["error"] else None,
         created_at=datetime.fromisoformat(row["created_at"]),
+        # ADR 017 D5 (PR 1): HITL checkpoint. NULL on pre-migration / non-paused
+        # rows → None, so old records load unchanged.
+        paused_node_id=row["paused_node_id"],
+        paused_state=json.loads(row["paused_state"]) if row["paused_state"] else None,
+        human_task=json.loads(row["human_task"]) if row["human_task"] else None,
     )
 
 
