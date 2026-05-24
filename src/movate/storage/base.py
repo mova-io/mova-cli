@@ -568,6 +568,33 @@ class StorageProvider(Protocol):
         layer enforces it independently.
         """
 
+    async def set_api_key_expiry(
+        self, key_id: str, *, tenant_id: str, expires_at: datetime
+    ) -> None:
+        """Set ``expires_at`` on an existing, non-revoked key (ADR 013 D5).
+
+        Used to start the **grace window** on the OLD key during a
+        zero-downtime rotation: the old key keeps authenticating until
+        ``expires_at`` passes, then :func:`movate.core.auth.check_record`
+        rejects it. ``tenant_id`` in WHERE keeps it tenant-scoped — a
+        tenant can't touch another tenant's keys. No-op on a missing,
+        cross-tenant, or already-revoked key (an already-revoked key is
+        dead regardless of expiry).
+        """
+
+    async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
+        """Revoke every active key for ``tenant_id``; return the count revoked.
+
+        Compromise-response primitive (ADR 013 D5 — ``mdk auth revoke
+        --all-for <tenant>``). Sets ``revoked_at`` on every key whose
+        ``revoked_at IS NULL``. ``except_key_id`` spares one key (the
+        operator's own, so a bulk revoke doesn't instantly lock them out).
+        Tenant-scoped: only the caller's tenant's keys are affected.
+        Idempotent — re-running revokes only what's still active (0 the
+        second time).
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Tenant budgets (post-v1.0)
     # ------------------------------------------------------------------

@@ -51,6 +51,18 @@ SECRET_BYTES = 32  # 256 bits of entropy
 SALT_BYTES = 16
 KEY_DEFAULT_TTL_DAYS = 90
 
+# --- Rotation grace window (ADR 013 D5) ------------------------------------
+#
+# When a key is rotated, the OLD key stays valid for this long so in-flight
+# clients have time to pick up the successor — zero-downtime rotation. The
+# default is generous enough for a human-driven deploy/redeploy cycle; the
+# cap bounds how long a (potentially compromised) key lingers.
+KEY_DEFAULT_ROTATION_GRACE_SECONDS = 24 * 60 * 60  # 24h
+KEY_MAX_ROTATION_GRACE_SECONDS = 30 * 24 * 60 * 60  # 30d — hard upper bound
+# Suffix appended to the successor's inherited label so the two are
+# distinguishable in `list-keys` without losing the original note.
+ROTATED_LABEL_SUFFIX = " (rotated)"
+
 # --- Scopes (ADR 013 L2 / D3) ----------------------------------------------
 #
 # A small, FLAT, least-privilege scope set carried on both opaque keys
@@ -238,6 +250,70 @@ def mint_api_key(
     return MintedApiKey(full_key=full_key, record=record)
 
 
+# --- Rotation (ADR 013 D5) -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RotatedKey:
+    """Result of :func:`rotate_key_record` — the successor + the old key's
+    new (grace-window) expiry.
+
+    ``minted`` is the freshly-minted successor (full key shown once +
+    its record). ``old_expires_at`` is the UTC instant the OLD key should
+    now expire — ``now + grace``. The caller persists ``minted.record``
+    and sets the old key's ``expires_at`` to ``old_expires_at`` so BOTH
+    keys authenticate until the grace window lapses (zero downtime).
+    """
+
+    minted: MintedApiKey
+    old_expires_at: datetime
+
+
+def rotate_key_record(
+    old: ApiKeyRecord,
+    *,
+    grace_seconds: int = KEY_DEFAULT_ROTATION_GRACE_SECONDS,
+    ttl_days: int = KEY_DEFAULT_TTL_DAYS,
+    now: datetime | None = None,
+) -> RotatedKey:
+    """Build the successor of ``old`` and compute the old key's grace expiry.
+
+    Pure function — no DB, no I/O — so it's unit-testable without HTTP.
+    The successor **inherits** the old key's ``env``, ``scopes``, and
+    ``label`` (label suffixed with :data:`ROTATED_LABEL_SUFFIX` so the two
+    are distinguishable). Inheriting ``scopes`` verbatim means rotation
+    never silently widens or narrows access (ADR 013 L2 / D5).
+
+    ``grace_seconds`` is clamped to ``[0, KEY_MAX_ROTATION_GRACE_SECONDS]``
+    — a negative grace would expire the old key in the past (callers that
+    want an immediate cutover pass ``0``); an over-long grace is capped so
+    a rotated-away key can't linger indefinitely.
+
+    The old key's new ``expires_at`` is ``now + grace`` even if the old key
+    already had a *later* expiry — rotation is an explicit signal to retire
+    it, so we never extend its life. If the old key already expires *sooner*
+    than ``now + grace`` we still set ``now + grace`` so clients reliably get
+    the full window regardless of the old key's original TTL.
+    """
+    clamped = max(0, min(grace_seconds, KEY_MAX_ROTATION_GRACE_SECONDS))
+    moment = now or datetime.now(UTC)
+
+    label = old.label
+    if label is not None and not label.endswith(ROTATED_LABEL_SUFFIX):
+        label = f"{label}{ROTATED_LABEL_SUFFIX}"
+    elif label is None:
+        label = ROTATED_LABEL_SUFFIX.strip()
+
+    minted = mint_api_key(
+        tenant_id=old.tenant_id,
+        env=old.env,
+        label=label,
+        ttl_days=ttl_days,
+        scopes=old.scopes,
+    )
+    return RotatedKey(minted=minted, old_expires_at=moment + timedelta(seconds=clamped))
+
+
 # --- Parse + verify --------------------------------------------------------
 
 
@@ -336,7 +412,11 @@ def check_record(parsed: ParsedApiKey, record: ApiKeyRecord | None) -> Verificat
 
 __all__ = [
     "ALL_SCOPES",
+    "KEY_DEFAULT_ROTATION_GRACE_SECONDS",
+    "KEY_DEFAULT_TTL_DAYS",
+    "KEY_MAX_ROTATION_GRACE_SECONDS",
     "LEGACY_DEFAULT_SCOPES",
+    "ROTATED_LABEL_SUFFIX",
     "SCOPE_ADMIN",
     "SCOPE_EVAL",
     "SCOPE_FLEET_ADMIN",
@@ -346,6 +426,7 @@ __all__ = [
     "ApiKeyParseError",
     "MintedApiKey",
     "ParsedApiKey",
+    "RotatedKey",
     "VerificationFailure",
     "check_record",
     "effective_scopes",
@@ -353,5 +434,6 @@ __all__ = [
     "mint_api_key",
     "normalize_scopes",
     "parse_api_key",
+    "rotate_key_record",
     "verify_secret",
 ]

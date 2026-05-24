@@ -643,6 +643,28 @@ class InMemoryStorage:
                 self.api_keys[i] = k.model_copy(update={"last_used_at": datetime.now(UTC)})
                 return
 
+    async def set_api_key_expiry(
+        self, key_id: str, *, tenant_id: str, expires_at: datetime
+    ) -> None:
+        # Grace window on a rotated key (ADR 013 D5). Tenant-scoped; never
+        # re-arm a revoked key. No-op on missing / cross-tenant / revoked.
+        for i, k in enumerate(self.api_keys):
+            if k.key_id == key_id and k.tenant_id == tenant_id and k.revoked_at is None:
+                self.api_keys[i] = k.model_copy(update={"expires_at": expires_at})
+                return
+
+    async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
+        # Compromise-response bulk revoke (ADR 013 D5). Spares
+        # ``except_key_id`` so the operator isn't locked out. Returns the
+        # number actually revoked (already-revoked + spared are skipped).
+        now = datetime.now(UTC)
+        revoked = 0
+        for i, k in enumerate(self.api_keys):
+            if k.tenant_id == tenant_id and k.revoked_at is None and k.key_id != except_key_id:
+                self.api_keys[i] = k.model_copy(update={"revoked_at": now})
+                revoked += 1
+        return revoked
+
     # ------------------------------------------------------------------
     # Tenant budgets (post-v1.0)
     # ------------------------------------------------------------------

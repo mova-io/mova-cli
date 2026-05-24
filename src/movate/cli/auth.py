@@ -28,12 +28,18 @@ from rich.table import Table
 from movate.cli._console import confirm_destructive, error, hint, success
 from movate.core.auth import (
     ALL_SCOPES,
+    KEY_DEFAULT_ROTATION_GRACE_SECONDS,
     LEGACY_DEFAULT_SCOPES,
     mint_api_key,
     normalize_scopes,
+    rotate_key_record,
 )
 from movate.core.models import ApiKeyEnv, ApiKeyRecord
 from movate.storage import build_storage
+
+# Pre-expiry warning threshold (ADR 013 D5): keys whose ``expires_at`` is
+# within this many days are flagged with a ⚠ marker in `list-keys`.
+EXPIRY_WARN_DAYS = 7
 
 stdout = Console()
 err = Console(stderr=True)
@@ -70,6 +76,59 @@ def _parse_scope_options(raw: list[str] | None) -> list[str]:
         )
         raise typer.Exit(code=2)
     return scopes
+
+
+def _parse_grace(raw: str | None) -> int:
+    """Parse a ``--grace`` duration into seconds.
+
+    Accepts a bare integer (seconds) or a suffixed duration: ``s`` seconds,
+    ``m`` minutes, ``h`` hours, ``d`` days (e.g. ``24h``, ``7d``, ``3600``).
+    ``None`` → the default grace window. A negative or unparseable value is
+    a hard error (fail-closed)."""
+    if raw is None:
+        return KEY_DEFAULT_ROTATION_GRACE_SECONDS
+    text = raw.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    try:
+        value = int(text[:-1]) * units[text[-1]] if text and text[-1] in units else int(text)
+    except ValueError as exc:
+        error(f"invalid --grace {raw!r}; use seconds or a suffix like 24h, 7d, 30m.")
+        raise typer.Exit(code=2) from exc
+    if value < 0:
+        error("--grace must be ≥ 0 (0 = immediate cutover).")
+        raise typer.Exit(code=2)
+    return value
+
+
+def _expiry_cell(expires_at: object, *, now: object = None) -> str:
+    """Render an ``expires_at`` value as a table cell with a ⚠ pre-expiry
+    marker (ADR 013 D5).
+
+    ``expires_at`` may be a ``datetime`` (local path) or an ISO string
+    (remote path) or ``None``. Within :data:`EXPIRY_WARN_DAYS` of expiry →
+    yellow + ⚠; already past → red ``expired``; ``None`` → ``never``."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    if not expires_at:
+        return "never"
+    if isinstance(expires_at, str):
+        try:
+            exp = datetime.fromisoformat(expires_at)
+        except ValueError:
+            return expires_at[:10]
+    elif isinstance(expires_at, datetime):
+        exp = expires_at
+    else:  # pragma: no cover — defensive
+        return str(expires_at)
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=UTC)
+    moment = now if isinstance(now, datetime) else datetime.now(UTC)
+    date_str = exp.date().isoformat()
+    if exp < moment:
+        return f"[red]{date_str} expired[/red]"
+    if exp <= moment + timedelta(days=EXPIRY_WARN_DAYS):
+        return f"[yellow]⚠ {date_str}[/yellow]"
+    return date_str
 
 
 @auth_app.command("create-key")
@@ -200,6 +259,7 @@ def list_keys(
     table.add_column("label")
     table.add_column("created")
     table.add_column("last_used")
+    table.add_column("expires")
     table.add_column("status")
 
     for k in keys:
@@ -211,9 +271,12 @@ def list_keys(
             k.label or "",
             k.created_at.date().isoformat(),
             k.last_used_at.date().isoformat() if k.last_used_at else "—",
+            # Pre-expiry warning marker (ADR 013 D5) — ⚠ within 7 days.
+            _expiry_cell(k.expires_at),
             status,
         )
     stdout.print(table)
+    hint(f"[dim]⚠ = expires within {EXPIRY_WARN_DAYS} days — consider rotating[/dim]")
 
 
 def _list_keys_remote(*, target: str, include_revoked: bool) -> None:
@@ -286,7 +349,10 @@ def _list_keys_remote(*, target: str, include_revoked: bool) -> None:
         status_cell = _status_style.get(raw_status, raw_status)
         created = (k.get("created_at") or "")[:10]
         last_used = (k.get("last_used_at") or "")[:10] or "—"
-        expires = (k.get("expires_at") or "")[:10] or "—"
+        # Pre-expiry warning marker (ADR 013 D5) — ⚠ within 7 days. The
+        # server already returns status="expired" for past keys; the cell
+        # adds the near-expiry warning the raw status doesn't carry.
+        expires = _expiry_cell(k.get("expires_at"))
         table.add_row(
             k.get("key_id", "?"),
             k.get("tenant_id", "?"),
@@ -299,6 +365,7 @@ def _list_keys_remote(*, target: str, include_revoked: bool) -> None:
         )
     stdout.print(table)
     stdout.print(f"[dim]{data.get('count', len(keys))} key(s)[/dim]")
+    hint(f"[dim]⚠ = expires within {EXPIRY_WARN_DAYS} days — consider rotating[/dim]")
 
 
 @auth_app.command("whoami")
@@ -480,10 +547,25 @@ async def _revoke(key_id: str) -> None:
 @auth_app.command("rotate-key")
 def rotate_key(
     key_id: str = typer.Argument(..., help="Key id of the key to rotate."),
+    grace: str = typer.Option(
+        None,
+        "--grace",
+        help=(
+            "Grace window the OLD key stays valid (zero-downtime). "
+            "Seconds or a suffix: 24h, 7d, 30m. Default 24h; 0 = immediate "
+            "cutover; capped at 30d server-side."
+        ),
+    ),
     ttl_days: int = typer.Option(
         90,
         "--ttl-days",
-        help="Validity of the new key in days. 0 = no expiry.",
+        help="Validity of the new (successor) key in days. 0 = no expiry.",
+    ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Rotate on a deployed runtime via HTTP instead of local storage.",
     ),
     yes: bool = typer.Option(
         False,
@@ -492,23 +574,39 @@ def rotate_key(
         help="Skip the confirm prompt.",
     ),
 ) -> None:
-    """Rotate an API key — mint a fresh one, revoke the old one.
+    """Rotate an API key with a zero-downtime grace window (ADR 013 D5).
 
-    Prints the new key to stdout once (pipe into your vault).
-    The old key is revoked immediately after the new one is saved, so
-    there is a brief window where both are valid. Use ``--yes`` in
-    automated rotation scripts.
+    Mints a successor (inheriting the old key's env/scopes/label) and keeps
+    the OLD key valid for ``--grace`` (default 24h). [bold]Both[/bold] keys
+    authenticate until the window lapses, so in-flight clients have time to
+    pick up the new key — no downtime. After the window only the successor
+    works.
 
-    [bold]Example:[/bold]
+    Prints the new key to stdout **once** (pipe into your vault) and the
+    old key's grace-expiry to stderr.
+
+    Without [bold]--target[/bold], rotates in local storage (operator tool).
+    With [bold]--target[/bold], calls
+    [bold]POST /api/v1/auth/keys/{key_id}/rotate[/bold] on the runtime.
+
+    [bold]Examples:[/bold]
 
       [dim]$ NEW=$(mdk auth rotate-key <key_id> --yes)[/dim]
+      [dim]$ mdk auth rotate-key <key_id> --grace 7d --target dev[/dim]
     """
     confirm_destructive(
-        f"Rotate API key {key_id}? The old key will be revoked immediately.",
+        f"Rotate API key {key_id}? The old key expires after the grace window.",
         yes=yes,
     )
+    grace_seconds = _parse_grace(grace)
 
-    async def _rotate(old_key_id: str) -> str:
+    if target is not None:
+        _rotate_key_remote(
+            target=target, key_id=key_id, grace_seconds=grace_seconds, ttl_days=ttl_days
+        )
+        return
+
+    async def _rotate(old_key_id: str) -> tuple[str, object]:
         storage = build_storage()
         await storage.init()
         try:
@@ -519,28 +617,216 @@ def rotate_key(
             if old_record.revoked_at is not None:
                 error(f"key {old_key_id!r} is already revoked")
                 raise typer.Exit(code=2)
-            # Preserve the rotated key's scope grant verbatim (ADR 013 L2):
-            # an explicit set carries over; an empty set stays empty (→
-            # legacy default at check time), so rotation never silently
-            # narrows or widens access.
-            minted = mint_api_key(
+            # Pure helper builds the successor (scopes/env/label inherited
+            # verbatim — never widens/narrows access, ADR 013 L2) and the
+            # old key's grace expiry.
+            rotated = rotate_key_record(old_record, grace_seconds=grace_seconds, ttl_days=ttl_days)
+            # Save successor first, THEN arm the old key's expiry — if the
+            # second write fails, worst case is a spare valid key, not an
+            # outage.
+            await storage.save_api_key(rotated.minted.record)
+            await storage.set_api_key_expiry(
+                old_key_id,
                 tenant_id=old_record.tenant_id,
-                env=old_record.env,
-                label=old_record.label,
-                ttl_days=ttl_days,
-                scopes=old_record.scopes,
+                expires_at=rotated.old_expires_at,
             )
-            await storage.save_api_key(minted.record)
-            await storage.revoke_api_key(old_key_id, tenant_id=old_record.tenant_id)
-            return minted.full_key
+            return rotated.minted.full_key, rotated.old_expires_at
         finally:
             await storage.close()
 
-    new_key = asyncio.run(_rotate(key_id))
+    new_key, old_expiry = asyncio.run(_rotate(key_id))
     stdout.print(new_key, soft_wrap=True, highlight=False)
     err.print("[yellow]save this now — never shown again[/yellow]")
-    err.print(f"[dim]old key {key_id} revoked[/dim]")
-    success("rotated → new key minted")
+    err.print(f"[dim]old key {key_id} stays valid until {old_expiry} (grace window)[/dim]")
+    success("rotated → new key minted; old key in grace window")
+
+
+def _rotate_key_remote(*, target: str, key_id: str, grace_seconds: int, ttl_days: int) -> None:
+    """Call POST /api/v1/auth/keys/{key_id}/rotate on a deployed runtime."""
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.config import resolve_target  # noqa: PLC0415
+    from movate.core.user_config import UserConfigError  # noqa: PLC0415
+
+    try:
+        _, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    base_url = target_cfg.url.rstrip("/")
+    if not api_key:
+        error(f"env var ${target_cfg.key_env} is empty. Run mdk auth refresh-runtime-key {target}.")
+        raise typer.Exit(code=2)
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+            resp = client.post(
+                f"{base_url}/api/v1/auth/keys/{key_id}/rotate",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"grace_seconds": grace_seconds, "ttl_days": ttl_days},
+            )
+    except httpx.HTTPError as exc:
+        error(f"could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code == httpx.codes.UNAUTHORIZED:
+        error("401 Unauthorized — key is invalid or expired.")
+        raise typer.Exit(code=2)
+    if resp.status_code == httpx.codes.FORBIDDEN:
+        error("403 Forbidden — your key lacks the 'admin' scope.")
+        raise typer.Exit(code=2)
+    if resp.status_code == httpx.codes.NOT_FOUND:
+        error(f"404 — key {key_id!r} not found, not yours, or already revoked.")
+        raise typer.Exit(code=2)
+    if resp.status_code not in (httpx.codes.OK, httpx.codes.CREATED):
+        error(f"HTTP {resp.status_code}: {resp.text[:200]!r}")
+        raise typer.Exit(code=2)
+
+    data = resp.json()
+    stdout.print(data["full_key"], soft_wrap=True, highlight=False)
+    err.print("[yellow]save this now — never shown again[/yellow]")
+    err.print(
+        f"[dim]old key {data['old_key_id']} stays valid until "
+        f"{data['old_expires_at']} (grace window)[/dim]"
+    )
+    success("rotated → new key minted; old key in grace window")
+
+
+@auth_app.command("revoke-all")
+def revoke_all(
+    tenant_id: str = typer.Option(
+        None,
+        "--tenant-id",
+        help=(
+            "Tenant whose keys to bulk-revoke (local mode). Required without "
+            "--target. Ignored with --target (the runtime uses the caller's tenant)."
+        ),
+    ),
+    except_key_id: str = typer.Option(
+        None,
+        "--except",
+        help=(
+            "Key id to SPARE from the bulk revoke (so you aren't locked out). "
+            "With --target this overrides the auto-spare of your calling key."
+        ),
+    ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Bulk-revoke on a deployed runtime via HTTP instead of local storage.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirm prompt (use in scripts / CI).",
+    ),
+) -> None:
+    """Revoke ALL active keys for a tenant — compromise response (ADR 013 D5).
+
+    [bold red]Destructive.[/bold red] Prompts for confirmation; pass
+    [bold]-y[/bold] to skip. Reports how many keys were revoked.
+
+    [bold]Safety:[/bold] pass [bold]--except <key_id>[/bold] to spare one
+    key so you keep a working credential. With [bold]--target[/bold] the
+    runtime auto-spares your calling key by default (so a remote bulk
+    revoke can't lock you out); [bold]--except[/bold] overrides which key
+    is spared.
+
+    Without [bold]--target[/bold], operates on local storage and requires
+    [bold]--tenant-id[/bold]. With [bold]--target[/bold], calls
+    [bold]POST /api/v1/auth/keys/revoke-all[/bold].
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk auth revoke-all --tenant-id <uuid> --except <keep-this>[/dim]
+      [dim]$ mdk auth revoke-all --target dev   # spares your calling key[/dim]
+    """
+    if target is not None:
+        confirm_destructive(
+            f"Revoke ALL active keys on '{target}' for your tenant? This cannot be undone.",
+            yes=yes,
+        )
+        _revoke_all_remote(target=target, except_key_id=except_key_id)
+        return
+
+    if not tenant_id:
+        error("--tenant-id is required without --target.")
+        raise typer.Exit(code=2)
+
+    confirm_destructive(
+        f"Revoke ALL active keys for tenant {tenant_id}? This cannot be undone.",
+        yes=yes,
+    )
+
+    async def _bulk(tid: str) -> int:
+        storage = build_storage()
+        await storage.init()
+        try:
+            return await storage.revoke_all_api_keys(tenant_id=tid, except_key_id=except_key_id)
+        finally:
+            await storage.close()
+
+    count = asyncio.run(_bulk(tenant_id))
+    spared = f" (spared {except_key_id})" if except_key_id else ""
+    success(f"revoked {count} key(s) for tenant {tenant_id}{spared}")
+
+
+def _revoke_all_remote(*, target: str, except_key_id: str | None) -> None:
+    """Call POST /api/v1/auth/keys/revoke-all on a deployed runtime."""
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.config import resolve_target  # noqa: PLC0415
+    from movate.core.user_config import UserConfigError  # noqa: PLC0415
+
+    try:
+        _, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    base_url = target_cfg.url.rstrip("/")
+    if not api_key:
+        error(f"env var ${target_cfg.key_env} is empty. Run mdk auth refresh-runtime-key {target}.")
+        raise typer.Exit(code=2)
+
+    params: dict[str, str] = {}
+    if except_key_id is not None:
+        params["except_key_id"] = except_key_id
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+            resp = client.post(
+                f"{base_url}/api/v1/auth/keys/revoke-all",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params=params,
+            )
+    except httpx.HTTPError as exc:
+        error(f"could not reach {base_url}: {exc}")
+        raise typer.Exit(code=2) from None
+
+    if resp.status_code == httpx.codes.UNAUTHORIZED:
+        error("401 Unauthorized — key is invalid or expired.")
+        raise typer.Exit(code=2)
+    if resp.status_code == httpx.codes.FORBIDDEN:
+        error("403 Forbidden — your key lacks the 'admin' scope.")
+        raise typer.Exit(code=2)
+    if resp.status_code != httpx.codes.OK:
+        error(f"HTTP {resp.status_code}: {resp.text[:200]!r}")
+        raise typer.Exit(code=2)
+
+    data = resp.json()
+    spared = data.get("spared_key_id")
+    spared_note = f" (spared {spared})" if spared else ""
+    success(f"revoked {data.get('revoked_count', 0)} key(s) on {target}{spared_note}")
 
 
 # ---------------------------------------------------------------------------

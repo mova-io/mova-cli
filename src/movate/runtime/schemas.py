@@ -1766,6 +1766,58 @@ class ApiKeyRevokedView(BaseModel):
     revoked: bool = True
 
 
+class ApiKeyRotateRequest(BaseModel):
+    """``POST /api/v1/auth/keys/{key_id}/rotate`` request body (ADR 013 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    grace_seconds: int | None = None
+    """How long the OLD key stays valid after rotation (the grace window).
+    ``None``/omitted → the server default (24h). Clamped server-side to
+    ``[0, 30d]``: ``0`` is an immediate cutover, the cap bounds how long a
+    rotated-away key lingers."""
+    ttl_days: int | None = None
+    """Validity of the NEW (successor) key in days. ``None``/omitted →
+    the server default (90). ``0`` = non-expiring successor."""
+
+
+class ApiKeyRotatedView(BaseModel):
+    """``POST /api/v1/auth/keys/{key_id}/rotate`` response (ADR 013 D5).
+
+    ``full_key`` is the successor and is shown **once** — irrecoverable
+    after this response. Both keys authenticate until ``old_expires_at``
+    passes (zero downtime).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    """The NEW (successor) key's id."""
+    full_key: str
+    """The NEW key's full secret — shown once."""
+    tenant_id: str
+    env: str
+    label: str | None
+    expires_at: datetime | None
+    """The NEW key's expiry."""
+    old_key_id: str
+    """The rotated (old) key's id."""
+    old_expires_at: datetime
+    """When the OLD key stops authenticating (now + grace)."""
+
+
+class ApiKeyBulkRevokedView(BaseModel):
+    """``POST /api/v1/auth/keys/revoke-all`` response (ADR 013 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revoked_count: int
+    """How many active keys were revoked."""
+    spared_key_id: str | None = None
+    """The key (if any) deliberately spared from the bulk revoke — the
+    caller's own key by default, so the operator isn't locked out."""
+
+
 class AuthWhoamiView(BaseModel):
     """``GET /api/v1/auth/me`` response — identity of the calling key."""
 

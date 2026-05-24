@@ -32,7 +32,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import movate
-from movate.core.auth import ALL_SCOPES, LEGACY_DEFAULT_SCOPES, mint_api_key
+from movate.core.auth import (
+    ALL_SCOPES,
+    KEY_DEFAULT_ROTATION_GRACE_SECONDS,
+    KEY_DEFAULT_TTL_DAYS,
+    LEGACY_DEFAULT_SCOPES,
+    mint_api_key,
+    rotate_key_record,
+)
 from movate.core.cache import build_cache
 from movate.core.canary import aggregate_side, choose_version
 from movate.core.loader import AgentBundle
@@ -104,10 +111,13 @@ from movate.runtime.schemas import (
     AgentVersionsView,
     AgentVersionView,
     AgentView,
+    ApiKeyBulkRevokedView,
     ApiKeyListView,
     ApiKeyMintedView,
     ApiKeyMintRequest,
     ApiKeyRevokedView,
+    ApiKeyRotatedView,
+    ApiKeyRotateRequest,
     ApiKeyView,
     AuthWhoamiView,
     BatchAcceptedView,
@@ -5437,6 +5447,111 @@ def build_app(
             raise not_found("api_key", key_id)
         await store.revoke_api_key(key_id, tenant_id=ctx.tenant_id)
         return ApiKeyRevokedView(key_id=key_id)
+
+    @v1.post(
+        "/auth/keys/{key_id}/rotate",
+        response_model=ApiKeyRotatedView,
+        status_code=201,
+        summary="Rotate an API key with a zero-downtime grace window (admin only).",
+        dependencies=[_scope("admin")],
+    )
+    async def v1_rotate_key(
+        request: Request,
+        key_id: str,
+        body: ApiKeyRotateRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ApiKeyRotatedView:
+        """Rotate the key ``key_id``: mint a successor, then start a grace
+        window on the old key (ADR 013 D5).
+
+        The successor inherits the old key's ``env``, ``scopes`` and
+        ``label`` (label suffixed ``(rotated)``) — rotation never widens or
+        narrows access. The old key's ``expires_at`` is set to
+        ``now + grace_seconds`` (default 24h, capped at 30d), so **both**
+        keys authenticate until the window lapses — zero downtime. After
+        the window, only the successor works.
+
+        The ``full_key`` in the response is shown **once** — store it now.
+
+        The calling key must carry the ``admin`` scope.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        * **403** — authenticated but key lacks the ``admin`` scope
+        * **404** — key not found, another tenant's, or already revoked
+        """
+        store: StorageProvider = request.app.state.storage
+        old = await store.get_api_key(key_id)
+        # 404 (not 403/409) on missing / cross-tenant / revoked — never
+        # leak whether another tenant's key id exists, and a revoked key
+        # is not a rotation candidate.
+        if old is None or old.tenant_id != ctx.tenant_id or old.revoked_at is not None:
+            raise not_found("api_key", key_id)
+
+        grace = (
+            body.grace_seconds
+            if body.grace_seconds is not None
+            else KEY_DEFAULT_ROTATION_GRACE_SECONDS
+        )
+        ttl = body.ttl_days if body.ttl_days is not None else KEY_DEFAULT_TTL_DAYS
+        rotated = rotate_key_record(old, grace_seconds=grace, ttl_days=ttl)
+
+        # Persist the successor first, THEN arm the old key's grace expiry.
+        # Ordering matters: if the second write fails the worst case is a
+        # spare valid successor (safe) rather than a prematurely-dead old
+        # key (an outage).
+        await store.save_api_key(rotated.minted.record)
+        await store.set_api_key_expiry(
+            old.key_id, tenant_id=ctx.tenant_id, expires_at=rotated.old_expires_at
+        )
+        return ApiKeyRotatedView(
+            key_id=rotated.minted.record.key_id,
+            full_key=rotated.minted.full_key,
+            tenant_id=rotated.minted.record.tenant_id,
+            env=rotated.minted.record.env.value,
+            label=rotated.minted.record.label,
+            expires_at=rotated.minted.record.expires_at,
+            old_key_id=old.key_id,
+            old_expires_at=rotated.old_expires_at,
+        )
+
+    @v1.post(
+        "/auth/keys/revoke-all",
+        response_model=ApiKeyBulkRevokedView,
+        summary="Revoke ALL active keys for the calling tenant (admin only).",
+        dependencies=[_scope("admin")],
+    )
+    async def v1_revoke_all_keys(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        except_key_id: str | None = None,
+    ) -> ApiKeyBulkRevokedView:
+        """Revoke **every** active key for the calling tenant — a
+        compromise-response break-glass (ADR 013 D5).
+
+        **Safety:** the calling key is spared by default so the operator
+        isn't instantly locked out (they keep a working key to mint
+        replacements). Pass ``except_key_id`` to spare a *different* key
+        instead (e.g. a CI key you trust); it overrides the auto-spare of
+        the caller's own key.
+
+        Tenant-scoped: only the caller's tenant's keys are touched. Returns
+        the count revoked and which key was spared.
+
+        The calling key must carry the ``admin`` scope.
+
+        Errors:
+
+        * **401** — bad or missing bearer token
+        * **403** — authenticated but key lacks the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        # Default safety: spare the caller's own key. An explicit
+        # ``except_key_id`` overrides (operator chooses which to keep).
+        spared = except_key_id if except_key_id is not None else ctx.api_key_id
+        count = await store.revoke_all_api_keys(tenant_id=ctx.tenant_id, except_key_id=spared)
+        return ApiKeyBulkRevokedView(revoked_count=count, spared_key_id=spared)
 
     @v1.get(
         "/auth/me",
