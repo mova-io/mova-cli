@@ -119,7 +119,15 @@ def effective_scopes(record: ApiKeyRecord) -> set[str]:
 
     The read-time back-compat rule (ADR 013 D3), in order:
 
-    1. **Explicit ``scopes``** set on the record → use them verbatim.
+    1. **Explicit ``scopes``** set on the record → use them verbatim,
+       EXCEPT that ``fleet-admin`` is an all-powerful admin grant: if it
+       appears in the list it expands to the full :data:`ALL_SCOPES` set.
+       The expansion is **representation-agnostic** — ``fleet-admin``
+       carries the same all-scopes meaning whether it sits in the new
+       ``scopes`` list or the legacy ``scope`` field (see rule 2). This is
+       why the runtime's auto-seeded bootstrap key, which carries
+       ``scopes=["fleet-admin"]``, passes ``read``/``run``/``admin``
+       checks rather than resolving to the literal ``{"fleet-admin"}``.
     2. Else, **legacy single ``scope == "fleet-admin"``** (the only scope
        value that existed before this ADR — an all-powerful admin grant)
        → expand to the full :data:`ALL_SCOPES` set so existing fleet keys
@@ -128,10 +136,17 @@ def effective_scopes(record: ApiKeyRecord) -> set[str]:
        (``{read, run, eval}``). Existing tenant keys keep working on
        read/run/eval but get 403 on admin endpoints.
 
+    Note: ``fleet-admin`` granting all *scopes* is orthogonal to the
+    tenant-scoped *data* filtering done in storage (``WHERE tenant_id=``);
+    a fleet-admin key passes every scope check but still only reads its
+    own tenant's rows on tenant-scoped queries.
+
     Pure function — no I/O. The middleware calls it once per request on
     the opaque-key path.
     """
     if record.scopes:
+        if SCOPE_FLEET_ADMIN in record.scopes:
+            return set(ALL_SCOPES)
         return set(record.scopes)
     if record.scope == SCOPE_FLEET_ADMIN:
         return set(ALL_SCOPES)

@@ -114,6 +114,30 @@ class TestEffectiveScopes:
         # New field takes precedence — the legacy column is ignored.
         assert effective_scopes(record) == {"read"}
 
+    def test_fleet_admin_in_new_scopes_list_expands_to_full_set(self) -> None:
+        # HEADLINE REGRESSION: a key whose NEW `scopes` list is
+        # ["fleet-admin"] (exactly what the runtime's _seed_bootstrap_key
+        # writes) must expand to ALL_SCOPES — not return {"fleet-admin"}
+        # literally. Before the fix this bootstrap key 403'd everywhere.
+        minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=["fleet-admin"])
+        assert minted.record.scopes == ["fleet-admin"]
+        resolved = effective_scopes(minted.record)
+        assert resolved == set(ALL_SCOPES)
+        # Sanity: the expansion really does carry read/run/eval/admin.
+        assert {"read", "run", "eval", "admin"}.issubset(resolved)
+
+    def test_fleet_admin_mixed_with_other_scopes_expands_to_full_set(self) -> None:
+        # fleet-admin present alongside another scope → still the full set.
+        minted = mint_api_key(
+            tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=["fleet-admin", "read"]
+        )
+        assert effective_scopes(minted.record) == set(ALL_SCOPES)
+
+    def test_non_fleet_explicit_scopes_unchanged(self) -> None:
+        # Back-compat guard: a normal explicit scope list is NOT widened.
+        minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=["read"])
+        assert effective_scopes(minted.record) == {"read"}
+
 
 # ---------------------------------------------------------------------------
 # Legacy default: read/run/eval succeed, admin 403s (the headline behavior)
@@ -236,6 +260,32 @@ class TestAdminScope:
             json={"label": "fleet-mints"},
             headers={"Authorization": header},
         )
+        assert r.status_code == 201, r.text
+
+    async def test_new_fleet_admin_scopes_list_reads(
+        self, client: TestClient, storage: InMemoryStorage
+    ) -> None:
+        # RUNTIME REGRESSION (the live deploy failure): a key whose NEW
+        # `scopes` list is ["fleet-admin"] — exactly what _seed_bootstrap_key
+        # writes — must pass require_scope("read"). Before the fix this
+        # bootstrap key 403'd on every tenant read endpoint.
+        header, _ = await _save_key(storage, scopes=["fleet-admin"])
+        r = client.get("/agents", headers={"Authorization": header})
+        assert r.status_code == 200, r.text
+
+    async def test_new_fleet_admin_scopes_list_mints_keys(
+        self, client: TestClient, storage: InMemoryStorage
+    ) -> None:
+        # RUNTIME REGRESSION: the same ["fleet-admin"] key must pass
+        # require_scope("admin") so the bootstrap key can mint other keys
+        # via the API (the chicken-and-egg break). Was 403 before the fix.
+        header, _ = await _save_key(storage, scopes=["fleet-admin"])
+        r = client.post(
+            "/api/v1/auth/keys",
+            json={"label": "bootstrap-mints"},
+            headers={"Authorization": header},
+        )
+        assert r.status_code != 403, r.text
         assert r.status_code == 201, r.text
 
     async def test_mint_with_unknown_scope_rejected(
