@@ -55,8 +55,14 @@ from movate.core.models import (
     JobRecord,
     JobSchedule,
     JobStatus,
+    TenantProviderKey,
     Trigger,
     WorkflowStatus,
+)
+from movate.core.provider_keys import (
+    ProviderKeyError,
+    mint_tenant_provider_key,
+    normalize_provider,
 )
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.core.triggers import (
@@ -173,6 +179,9 @@ from movate.runtime.schemas import (
     ModelInfoView,
     PricingEntryView,
     PricingView,
+    ProviderKeyListView,
+    ProviderKeySetRequest,
+    ProviderKeyView,
     ReadyView,
     RunAccepted,
     RunExplainLlmCallView,
@@ -4653,6 +4662,122 @@ def build_app(
         await store.touch_trigger(trigger.trigger_id, last_fired_at=datetime.now(UTC))
         response.status_code = 202
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    # ------------------------------------------------------------------
+    # Per-tenant provider keys (BYOK, ADR 018). Each tenant manages its own
+    # OpenAI/Anthropic/etc. provider key, encrypted at rest; the runtime
+    # resolves it tenant-key-first at run time (shared fleet key as a
+    # back-compat fallback). All endpoints are tenant-scoped off the
+    # AuthContext, and the plaintext key is NEVER returned (only a masked
+    # fingerprint). PUT/DELETE gate on `admin` (writing/revoking a long-lived
+    # credential); GET on `read`. Additive + default-off: a tenant with no
+    # key transparently uses the env-default fleet key — today's behavior.
+    # ------------------------------------------------------------------
+    def _provider_key_to_view(k: TenantProviderKey) -> ProviderKeyView:
+        # Metadata + masked fingerprint ONLY — never the ciphertext/plaintext.
+        return ProviderKeyView(
+            provider=k.provider,
+            fingerprint=k.fingerprint,
+            created_at=k.created_at.isoformat(),
+            updated_at=k.updated_at.isoformat(),
+        )
+
+    @v1.put(
+        "/provider-keys/{provider}",
+        response_model=ProviderKeyView,
+        tags=["provider-keys"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_set_provider_key(
+        provider: str,
+        body: ProviderKeySetRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProviderKeyView:
+        """Set (or rotate) this tenant's own key for ``provider`` (ADR 018 BYOK).
+
+        Encrypts the plaintext ``api_key`` at rest (Fernet, keyed by
+        ``MOVATE_PROVIDER_KEY_SECRET``) and persists it scoped to the calling
+        tenant. The response carries only metadata + a masked fingerprint —
+        the value is **never** returned. A re-PUT rotates the key in place.
+
+        Gated on ``admin`` (it stores a long-lived provider credential).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **500** — ``MOVATE_PROVIDER_KEY_SECRET`` is unset/misconfigured
+          (the operator must set the encryption key before BYOK can be used)
+        """
+        store: StorageProvider = request.app.state.storage
+        try:
+            record = mint_tenant_provider_key(
+                tenant_id=ctx.tenant_id,
+                provider=provider,
+                plaintext=body.api_key,
+                created_by=ctx.api_key_id,
+            )
+        except ProviderKeyError as exc:
+            raise http_error(
+                ErrorCode.INTERNAL,
+                status_code=500,
+                message=str(exc),
+            ) from exc
+        await store.save_tenant_provider_key(record)
+        return _provider_key_to_view(record)
+
+    @v1.get(
+        "/provider-keys",
+        response_model=ProviderKeyListView,
+        tags=["provider-keys"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_provider_keys(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProviderKeyListView:
+        """List this tenant's configured provider keys (providers + fingerprints).
+
+        Never returns a secret — only which providers have a key set and a
+        masked fingerprint for each.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_tenant_provider_keys(tenant_id=ctx.tenant_id)
+        views = [_provider_key_to_view(r) for r in rows]
+        return ProviderKeyListView(provider_keys=views, count=len(views))
+
+    @v1.delete(
+        "/provider-keys/{provider}",
+        status_code=204,
+        tags=["provider-keys"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_provider_key(
+        provider: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove this tenant's key for ``provider`` (ADR 018 BYOK).
+
+        Idempotent: deleting a non-existent key still returns 204. After
+        deletion the tenant falls back to the shared fleet key (if the
+        fallback is on) on its next run. Gated on ``admin``.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        norm = normalize_provider(provider)
+        await store.delete_tenant_provider_key(norm, tenant_id=ctx.tenant_id)
+        return Response(status_code=204)
 
     # ------------------------------------------------------------------
     # Canary / champion-challenger rollout (ADR 016 D3). Additive +

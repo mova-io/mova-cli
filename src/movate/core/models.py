@@ -1421,6 +1421,54 @@ class TenantBudget(BaseModel):
     updated_at: datetime = Field(default_factory=_now)
 
 
+class TenantProviderKey(BaseModel):
+    """A tenant's own provider API key, encrypted at rest (ADR 018, BYOK).
+
+    Each tenant can store its own OpenAI/Anthropic/etc. provider key so its
+    LLM spend, blast radius, and rotation are its own — resolved
+    tenant-key-first at run time, with the shared fleet key as a back-compat
+    fallback (see :class:`movate.core.provider_keys.ProviderKeyResolver`).
+
+    ``(tenant_id, provider)`` is the unique key — one stored key per provider
+    per tenant; a re-set overwrites in place (rotation). Unlike an API key
+    (which we only ever *verify*, so a one-way hash suffices) a provider key
+    must be *decrypted to use*, so the secret is stored as a Fernet
+    ``ciphertext`` — symmetric encryption keyed by ``MOVATE_PROVIDER_KEY_SECRET``
+    (:mod:`movate.core.provider_keys`). The plaintext key is **never**
+    persisted, **never** returned by any API, and **redacted** in logs/traces;
+    ``fingerprint`` is a non-sensitive masked tail (e.g. ``…AbCd``) shown in
+    listings so an operator can recognise which key is configured without ever
+    decrypting it.
+
+    Additive + default-off: a row exists only when a tenant brings its own
+    key. With no row (and the shared-key fallback on, the default) the run
+    path is byte-for-byte today's — the provider uses its env-default key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    provider: str
+    """Provider credential namespace the key belongs to — ``openai`` /
+    ``anthropic`` / etc. This is the LiteLLM-style *head* prefix (the part
+    before the first ``/`` in a ``model.provider`` string), so a tenant's
+    ``openai`` key applies to every ``openai/<model>`` an agent runs. Paired
+    with ``tenant_id`` as the unique key."""
+    ciphertext: str
+    """Fernet token (url-safe base64 text) of the plaintext provider key.
+    Decrypted only inside :class:`ProviderKeyResolver`; never returned by an
+    API or logged. Stored as TEXT (Fernet tokens are ASCII)."""
+    fingerprint: str
+    """Non-sensitive masked tail of the plaintext key (e.g. last 4 chars,
+    ``…AbCd``) for display. Lets a listing show *which* key is configured
+    without decrypting — a human affordance, not a security boundary."""
+    created_by: str | None = None
+    """Auth identity that set the key (ADR 013), or ``None`` for a local/CLI
+    write."""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+
+
 class SkillCallRecord(BaseModel):
     """One tool/skill invocation captured inside a run's tool-use loop.
 

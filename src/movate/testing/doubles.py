@@ -33,6 +33,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    TenantProviderKey,
     Trigger,
     WorkflowRunRecord,
     WorkflowStatus,
@@ -74,6 +75,9 @@ class InMemoryStorage:
         self.eval_schedules: list[EvalSchedule] = []
         self.job_schedules: list[JobSchedule] = []
         self.triggers: list[Trigger] = []
+        # ADR 018: per-tenant BYOK provider keys (encrypted-at-rest ciphertext),
+        # keyed by (tenant_id, provider). Empty by default → no-config run path.
+        self.tenant_provider_keys: list[TenantProviderKey] = []
         # item 23: trigger delivery dedup, keyed by (trigger_id, delivery_id)
         # → the job_id the first delivery enqueued.
         self.trigger_deliveries: dict[tuple[str, str], str] = {}
@@ -347,6 +351,44 @@ class InMemoryStorage:
             return False
         self.trigger_deliveries[key] = job_id
         return True
+
+    # ------------------------------------------------------------------
+    # Tenant provider keys (ADR 018 — per-tenant BYOK provider credentials)
+    # ------------------------------------------------------------------
+
+    async def save_tenant_provider_key(self, key: TenantProviderKey) -> None:
+        # Upsert keyed by (tenant_id, provider) — last write wins (rotation).
+        self.tenant_provider_keys = [
+            k
+            for k in self.tenant_provider_keys
+            if not (k.provider == key.provider and k.tenant_id == key.tenant_id)
+        ]
+        self.tenant_provider_keys.append(key)
+
+    async def get_tenant_provider_key(
+        self, provider: str, *, tenant_id: str
+    ) -> TenantProviderKey | None:
+        return next(
+            (
+                k
+                for k in self.tenant_provider_keys
+                if k.provider == provider and k.tenant_id == tenant_id
+            ),
+            None,
+        )
+
+    async def list_tenant_provider_keys(self, *, tenant_id: str) -> list[TenantProviderKey]:
+        rows = [k for k in self.tenant_provider_keys if k.tenant_id == tenant_id]
+        return sorted(rows, key=lambda k: k.provider)
+
+    async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
+        before = len(self.tenant_provider_keys)
+        self.tenant_provider_keys = [
+            k
+            for k in self.tenant_provider_keys
+            if not (k.provider == provider and k.tenant_id == tenant_id)
+        ]
+        return len(self.tenant_provider_keys) < before
 
     # ------------------------------------------------------------------
     # Canary configs (ADR 016 D3 — champion/challenger rollout)

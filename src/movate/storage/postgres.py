@@ -56,6 +56,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    TenantProviderKey,
     Trigger,
     WorkflowRunRecord,
     WorkflowStatus,
@@ -606,6 +607,25 @@ CREATE INDEX IF NOT EXISTS idx_jobs_batch
 -- COLUMN IF NOT EXISTS keeps it idempotent on every init (mirrors the
 -- target_version pattern above).
 ALTER TABLE evals ADD COLUMN IF NOT EXISTS dimension_means JSONB;
+
+-- ADR 018: per-tenant BYOK provider keys. One row per (tenant, provider)
+-- holding a Fernet ``ciphertext`` of the tenant's own provider key + a masked
+-- ``fingerprint`` for display. The ProviderKeyResolver decrypts ``ciphertext``
+-- at run time (tenant-key-first, shared-key fallback). NO row → the run path
+-- uses the provider's env-default key → byte-for-byte the pre-BYOK behavior.
+-- Additive new table (CREATE TABLE IF NOT EXISTS, idempotent) — default-off,
+-- no ALTER, no backfill. The plaintext key is NEVER stored (only its
+-- ciphertext + masked tail).
+CREATE TABLE IF NOT EXISTS tenant_provider_keys (
+    tenant_id   TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    ciphertext  TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created_by  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, provider)
+);
 """
 
 
@@ -1312,6 +1332,57 @@ class PostgresProvider:
             datetime.now(UTC),
         )
         return status.endswith(" 1")
+
+    # ------------------------------------------------------------------
+    # Tenant provider keys (ADR 018 — per-tenant BYOK provider credentials)
+    # ------------------------------------------------------------------
+
+    async def save_tenant_provider_key(self, key: TenantProviderKey) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO tenant_provider_keys (
+                tenant_id, provider, ciphertext, fingerprint,
+                created_by, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (tenant_id, provider) DO UPDATE SET
+                ciphertext = EXCLUDED.ciphertext,
+                fingerprint = EXCLUDED.fingerprint,
+                created_by = EXCLUDED.created_by,
+                updated_at = EXCLUDED.updated_at
+            """,
+            key.tenant_id,
+            key.provider,
+            key.ciphertext,
+            key.fingerprint,
+            key.created_by,
+            key.created_at,
+            key.updated_at,
+        )
+
+    async def get_tenant_provider_key(
+        self, provider: str, *, tenant_id: str
+    ) -> TenantProviderKey | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM tenant_provider_keys WHERE provider = $1 AND tenant_id = $2",
+            provider,
+            tenant_id,
+        )
+        return _row_to_tenant_provider_key(row) if row else None
+
+    async def list_tenant_provider_keys(self, *, tenant_id: str) -> list[TenantProviderKey]:
+        rows = await self._db.fetch(
+            "SELECT * FROM tenant_provider_keys WHERE tenant_id = $1 ORDER BY provider ASC",
+            tenant_id,
+        )
+        return [_row_to_tenant_provider_key(r) for r in rows]
+
+    async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
+        status: str = await self._db.execute(
+            "DELETE FROM tenant_provider_keys WHERE provider = $1 AND tenant_id = $2",
+            provider,
+            tenant_id,
+        )
+        return status.startswith("DELETE ") and not status.endswith(" 0")
 
     # ------------------------------------------------------------------
     # Canary configs (ADR 016 D3 — champion/challenger rollout)
@@ -2801,6 +2872,18 @@ def _row_to_trigger(row: asyncpg.Record) -> Trigger:
         created_by=row["created_by"],
         created_at=row["created_at"],
         last_fired_at=row["last_fired_at"],
+    )
+
+
+def _row_to_tenant_provider_key(row: asyncpg.Record) -> TenantProviderKey:
+    return TenantProviderKey(
+        tenant_id=row["tenant_id"],
+        provider=row["provider"],
+        ciphertext=row["ciphertext"],
+        fingerprint=row["fingerprint"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

@@ -48,6 +48,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    TenantProviderKey,
     Trigger,
     WorkflowRunRecord,
     WorkflowStatus,
@@ -376,6 +377,55 @@ class StorageProvider(Protocol):
         a single winner rather than recording two jobs. Returns ``True`` if
         this call inserted the row, ``False`` if a row already existed (the
         existing ``job_id`` is preserved — never overwritten).
+        """
+
+    # ------------------------------------------------------------------
+    # Tenant provider keys (ADR 018 — per-tenant BYOK provider credentials)
+    #
+    # Additive, default-off: a row exists only when a tenant brings its own
+    # provider key. ``(tenant_id, provider)`` is the unique key;
+    # ``save_tenant_provider_key`` upserts (a re-set rotates in place). The
+    # secret is stored as a Fernet ``ciphertext`` (encrypted at the edge in
+    # movate.core.provider_keys before save, decrypted ONLY inside the
+    # ProviderKeyResolver) — the plaintext is never persisted, returned, or
+    # logged. With no row (and the shared-key fallback on, the default) the
+    # run path is byte-for-byte today's. All methods are tenant-scoped: a
+    # wrong-tenant get/delete is a no-op / None (no existence leak).
+    # ------------------------------------------------------------------
+
+    async def save_tenant_provider_key(self, key: TenantProviderKey) -> None:
+        """Upsert one provider key keyed by ``(tenant_id, provider)``.
+
+        Re-setting a provider's key overwrites the prior row (last write wins,
+        re-fingerprinted) rather than creating a duplicate — one stored key per
+        provider per tenant. The caller encrypts the plaintext before this
+        call; only the ``ciphertext`` + masked ``fingerprint`` persist.
+        """
+
+    async def get_tenant_provider_key(
+        self, provider: str, *, tenant_id: str
+    ) -> TenantProviderKey | None:
+        """Exact lookup by ``(provider, tenant_id)`` — the resolver path.
+
+        Returns ``None`` if no key OR it belongs to a different tenant — same
+        no-leak contract as the other ``get_*`` methods. The returned record
+        carries the ``ciphertext``; the resolver decrypts it.
+        """
+
+    async def list_tenant_provider_keys(self, *, tenant_id: str) -> list[TenantProviderKey]:
+        """List a tenant's configured provider keys (metadata only).
+
+        Tenant-scoped (no cross-tenant mode — provider keys are never listed
+        fleet-wide). Callers render ``provider`` + masked ``fingerprint``;
+        the ``ciphertext`` is present on the record but must never be returned
+        on the wire.
+        """
+
+    async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
+        """Delete the key for ``(provider, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none existed.
+        Tenant-scoped: a wrong-tenant delete is a no-op (returns ``False``).
         """
 
     # ------------------------------------------------------------------

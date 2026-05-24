@@ -846,6 +846,52 @@ class TriggerListView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Per-tenant provider keys (BYOK, ADR 018)
+# ---------------------------------------------------------------------------
+
+
+class ProviderKeySetRequest(BaseModel):
+    """``PUT /api/v1/provider-keys/{provider}`` request body (ADR 018).
+
+    Stores the tenant's own provider API key, encrypted at rest. The plaintext
+    ``api_key`` is the ONLY place the key appears on the wire — it is encrypted
+    before persist and is **never** echoed back (the response carries only a
+    masked fingerprint). Mirrors ``mdk keys set``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str = Field(min_length=1)
+    """The plaintext provider key (e.g. ``sk-...``). Encrypted at the edge and
+    never returned. A new value rotates the stored key in place."""
+
+
+class ProviderKeyView(BaseModel):
+    """One configured provider key (metadata only — never the secret).
+
+    The plaintext key is never carried by any response; only the provider
+    namespace + a masked ``fingerprint`` (e.g. ``…AbCd``) so an operator can
+    recognise which key is set without decrypting it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    fingerprint: str
+    created_at: str
+    updated_at: str
+
+
+class ProviderKeyListView(BaseModel):
+    """``GET /api/v1/provider-keys`` response — configured providers only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_keys: list[ProviderKeyView]
+    count: int
+
+
+# ---------------------------------------------------------------------------
 # Canary / champion-challenger rollout (ADR 016 D3)
 # ---------------------------------------------------------------------------
 
