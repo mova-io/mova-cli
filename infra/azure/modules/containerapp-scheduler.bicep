@@ -123,7 +123,7 @@ resource scheduler 'Microsoft.App/jobs@2024-03-01' = {
           }
           env: [
             {
-              name: 'MOVATE_DB_URL'
+              name: 'MDK_DB_URL'
               value: 'postgresql://${postgresAdminUsername}:@${postgresFqdn}:5432/${postgresDatabase}?sslmode=require'
             }
             {

@@ -173,7 +173,7 @@ psql "postgresql://movateadmin@${PG_FQDN}:5432/movate?sslmode=require" \
 ## Mint the first API key
 
 The Container App's Bicep references a Key Vault secret called
-`bootstrap-api-key` and surfaces it as the `MOVATE_SEED_API_KEY` env
+`bootstrap-api-key` and surfaces it as the `MDK_SEED_API_KEY` env
 var. On every pod start, the runtime's `_seed_bootstrap_key()` reads
 that value and idempotently inserts the matching row into the
 `api_keys` table. This is the recommended path because the key
@@ -197,10 +197,10 @@ If you'd rather mint tenant-scoped keys by hand (legacy flow, doesn't
 benefit from the seed key auto-reseed):
 
 ```bash
-# (a) From your laptop, with MOVATE_DB_URL pointing at the live DB:
+# (a) From your laptop, with MDK_DB_URL pointing at the live DB:
 PGPASSWORD=$(az keyvault secret show --vault-name movate-${ENV}-kv \
                 --name pg-admin-password --query value -o tsv)
-export MOVATE_DB_URL="postgresql://movateadmin:${PGPASSWORD}@${PG_FQDN}:5432/movate?sslmode=require"
+export MDK_DB_URL="postgresql://movateadmin:${PGPASSWORD}@${PG_FQDN}:5432/movate?sslmode=require"
 
 movate auth create-key --tenant-id $(uuidgen | tr -d -) --env live --label first-key
 # → prints the full mvt_live_... key on stdout; save it to your vault.
@@ -222,7 +222,7 @@ serving before returning.
 # `movate deploy` knows where to push.
 movate config add-target ${ENV} \
     --url $API_URL \
-    --key-env MOVATE_${ENV^^}_KEY \
+    --key-env MDK_${ENV^^}_KEY \
     --azure-subscription $(az account show --query id -o tsv) \
     --azure-resource-group movate-${ENV}-rg \
     --azure-acr movate${ENV}acr \

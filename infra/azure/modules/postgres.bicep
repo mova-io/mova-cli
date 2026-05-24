@@ -134,7 +134,7 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
   }
 }
 
-@description('Server FQDN — used to build MOVATE_DB_URL.')
+@description('Server FQDN — used to build MDK_DB_URL.')
 output serverFqdn string = server.properties.fullyQualifiedDomainName
 
 @description('Server resource id.')

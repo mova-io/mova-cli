@@ -170,6 +170,34 @@ param deployLangfuse bool = false
 @description('Langfuse image. Pin a 2.x tag (e.g. langfuse/langfuse:2.95.0) for reproducible deploys.')
 param langfuseImage string = 'langfuse/langfuse:2'
 
+@description('''
+Cold-start knob for the API. Override for the API Container App's
+``scale.minReplicas``. Leave at the ``-1`` sentinel (default) to keep
+the per-env default (``dev``/``staging`` = 1, ``prod`` = 2) — i.e. no
+change to today's scaling behavior.
+
+Set to ``0`` to let the API scale to zero between requests (cheapest;
+the first request after idle pays a cold-start, which can time out a
+tight ``GET /healthz`` probe). Set to ``1``+ to keep at least one
+replica always-warm so QA/prod never pays the cold-start. Any value
+``>= 0`` overrides the per-env default; ``-1`` means "use the default".
+''')
+@minValue(-1)
+@maxValue(30)
+param apiMinReplicas int = -1
+
+@description('''
+Cold-start knob for the worker — same contract as ``apiMinReplicas``.
+Leave at ``-1`` (default) to keep the per-env default
+(``dev``/``staging`` = 1, ``prod`` = 2). Set ``0`` to allow scale-to-zero
+(KEDA spins a replica up on queue depth, paying a cold-start on the
+first queued job after idle); set ``1``+ to keep a warm worker. Any
+value ``>= 0`` overrides; ``-1`` uses the per-env default.
+''')
+@minValue(-1)
+@maxValue(30)
+param workerMinReplicas int = -1
+
 // ---------------------------------------------------------------------------
 // Per-env defaults — keep in sync with docs/v1.0-azure-design §4
 // ---------------------------------------------------------------------------
@@ -183,12 +211,15 @@ var pgStorageGB = isProd ? 64 : 32
 var pgBackupDays = isProd ? 14 : 7
 var logRetentionDays = isProd ? 90 : 30
 
-var apiMinReplicas = isProd ? 2 : 1
+// Per-env minReplicas defaults. Used unless the operator overrides via
+// the apiMinReplicas / workerMinReplicas params (sentinel -1 = "use
+// this default"). Resolved into the effective values below.
+var apiMinReplicasDefault = isProd ? 2 : 1
 var apiMaxReplicas = isProd ? 10 : 2
 var apiCpu = isProd ? '1.0' : '0.5'
 var apiMemory = isProd ? '2.0Gi' : '1.0Gi'
 
-var workerMinReplicas = isProd ? 2 : 1
+var workerMinReplicasDefault = isProd ? 2 : 1
 var workerMaxReplicas = isProd ? 20 : 2
 var workerCpu = isProd ? '1.0' : '0.5'
 var workerMemory = isProd ? '2.0Gi' : '1.0Gi'
@@ -197,6 +228,17 @@ var workerMemory = isProd ? '2.0Gi' : '1.0Gi'
 // events, slightly higher steady-state queue); dev scales aggressively
 // at 3/replica so a small queue is enough to spin up the second pod.
 var workerQueueDepthPerReplica = isProd ? 10 : 3
+
+// Effective minReplicas: the operator override (apiMinReplicas /
+// workerMinReplicas) when set to a real value (>= 0), else the per-env
+// default. The -1 sentinel keeps today's behavior unchanged; an
+// operator sets 1 to avoid cold-start (QA/prod) or 0 for scale-to-zero.
+// max(override, 0) clamps the override to the module's @minValue(0) and
+// proves to the type-checker that the branch result is non-negative (the
+// >= 0 guard already excludes the sentinel, so max() never alters a real
+// value — it only narrows the inferred type away from -1).
+var apiMinReplicasEffective = apiMinReplicas >= 0 ? max(apiMinReplicas, 0) : apiMinReplicasDefault
+var workerMinReplicasEffective = workerMinReplicas >= 0 ? max(workerMinReplicas, 0) : workerMinReplicasDefault
 
 // ---------------------------------------------------------------------------
 // Resource names — see docs/v1.0-azure-design §2 for the convention.
@@ -414,7 +456,7 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     postgresFqdn: pg.outputs.serverFqdn
     postgresDatabase: pg.outputs.databaseName
     postgresAdminUsername: pg.outputs.adminUsername
-    minReplicas: apiMinReplicas
+    minReplicas: apiMinReplicasEffective
     maxReplicas: apiMaxReplicas
     cpu: apiCpu
     memory: apiMemory
@@ -441,7 +483,7 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     postgresFqdn: pg.outputs.serverFqdn
     postgresDatabase: pg.outputs.databaseName
     postgresAdminUsername: pg.outputs.adminUsername
-    minReplicas: workerMinReplicas
+    minReplicas: workerMinReplicasEffective
     maxReplicas: workerMaxReplicas
     cpu: workerCpu
     memory: workerMemory

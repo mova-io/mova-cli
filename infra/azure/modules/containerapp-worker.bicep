@@ -79,7 +79,7 @@ param userAssignedIdentityId string
 @description('''
 Name of the Container Apps Environment storage config that backs the
 Azure Files agents volume. When non-empty, a volume named ``agents-vol``
-is mounted at ``/home/movate/agents`` and ``MOVATE_AGENTS_PATH`` points
+is mounted at ``/home/movate/agents`` and ``MDK_AGENTS_PATH`` points
 there. See the API module param of the same name for full docs.
 ''')
 param agentsStorageName string = ''
@@ -178,7 +178,7 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat([
             {
-              name: 'MOVATE_DB_URL'
+              name: 'MDK_DB_URL'
               value: 'postgresql://${postgresAdminUsername}:@${postgresFqdn}:5432/${postgresDatabase}?sslmode=require'
             }
             {
@@ -203,7 +203,7 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               secretRef: 'anthropic-api-key'
             }
             {
-              name: 'MOVATE_AGENTS_PATH'
+              name: 'MDK_AGENTS_PATH'
               value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'
             }
           ], empty(langfuseHost) ? [] : [
