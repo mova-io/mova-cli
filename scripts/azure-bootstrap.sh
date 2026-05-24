@@ -23,6 +23,9 @@
 #   AZURE_REGION       — default "eastus2"
 #   ACR_NAME_OVERRIDE  — default "movate${env}acr" (ACR names are
 #                        globally unique; override if there's a collision)
+#   KV_NAME_OVERRIDE   — default "movate-${env}-kv" (Key Vault names are
+#                        globally unique; override if you set nameSuffix
+#                        in the bicepparam to dodge a collision)
 #   GITHUB_REPO        — default "mova-io/mova-cli" (for the
 #                        federated-credential subject)
 
@@ -41,6 +44,7 @@ ENV="$1"
 REGION="${AZURE_REGION:-eastus2}"
 RG="movate-${ENV}-rg"
 ACR="${ACR_NAME_OVERRIDE:-movate${ENV}acr}"
+KV="${KV_NAME_OVERRIDE:-movate-${ENV}-kv}"
 SP_NAME="movate-${ENV}-github-actions"
 REPO="${GITHUB_REPO:-mova-io/mova-cli}"
 FED_CRED_NAME="github-release-${ENV}"
@@ -175,6 +179,32 @@ else
     note "  az role assignment create --assignee ${APP_ID} --role AcrPush --scope ${ACR_SCOPE}"
 fi
 
+# Key Vault Secrets Officer on the KV (when it exists). The operator (this
+# SP, or the human running the two-pass deploy) must SET the KV secrets
+# between passes; on an RBAC-mode Key Vault that requires a data-plane
+# role — without it, `az keyvault secret set` fails with ForbiddenByRbac.
+# Same defer-with-warning shape as AcrPush: Bicep creates the KV on the
+# first pass, so re-run this script after that pass to lock the grant in.
+KV_SCOPE="${RG_SCOPE}/providers/Microsoft.KeyVault/vaults/${KV}"
+if az keyvault show -n "$KV" --resource-group "$RG" >/dev/null 2>&1; then
+    if az role assignment create \
+            --assignee "$APP_ID" \
+            --role "Key Vault Secrets Officer" \
+            --scope "$KV_SCOPE" \
+            -o none 2>/dev/null; then
+        ok "Key Vault Secrets Officer on ${KV}"
+    elif az role assignment list --assignee "$APP_ID" --scope "$KV_SCOPE" \
+            --query "[?roleDefinitionName=='Key Vault Secrets Officer'] | length(@)" -o tsv \
+            2>/dev/null | grep -q "^[1-9]"; then
+        ok "Key Vault Secrets Officer on ${KV} (already existed)"
+    else
+        warn "Key Vault Secrets Officer assignment didn't take — retry in ~30s if a fresh SP"
+    fi
+else
+    warn "Key Vault '${KV}' doesn't exist yet — assign Secrets Officer after Bicep deploy:"
+    note "  az role assignment create --assignee ${APP_ID} --role 'Key Vault Secrets Officer' --scope ${KV_SCOPE}"
+fi
+
 # ---------------------------------------------------------------------------
 # Federated credential — pins the SP to a specific GitHub branch
 # ---------------------------------------------------------------------------
@@ -242,9 +272,13 @@ cat <<EOF
            --command "movate auth create-key --tenant-id \$(uuidgen) --env live --label bootstrap"
      Save the mvt_live_... value as the RUNTIME_KEY secret above.
 
-  3. If ACR didn't exist when this script ran, assign AcrPush now:
+  3. If ACR / Key Vault didn't exist when this script ran, re-run this
+     script after the first Bicep pass to lock in the deferred grants
+     (AcrPush on ACR, Key Vault Secrets Officer on KV), or assign now:
        az role assignment create --assignee ${APP_ID} --role AcrPush \\
            --scope ${ACR_SCOPE}
+       az role assignment create --assignee ${APP_ID} \\
+           --role 'Key Vault Secrets Officer' --scope ${KV_SCOPE}
 
   4. Then test the deploy path locally:
        export MOVATE_${ENV^^}_KEY="<the mvt_live_... key>"

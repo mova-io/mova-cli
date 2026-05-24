@@ -58,9 +58,13 @@ re-print the GitHub secrets list. It:
   override with `AZURE_REGION=westus2 scripts/azure-bootstrap.sh dev`).
 - Creates a service principal `movate-<env>-github-actions` if
   missing (no-op if it already exists from a prior run).
-- Assigns **Contributor** on the RG and **AcrPush** on the ACR
-  (deferred with a warning if ACR doesn't exist yet — Bicep creates
-  it in step 4; you re-run step 3 after step 4 to lock in AcrPush).
+- Assigns **Contributor** on the RG, **AcrPush** on the ACR, and
+  **Key Vault Secrets Officer** on the KV (the latter two deferred with
+  a warning if those resources don't exist yet — Bicep creates them in
+  step 4; you re-run step 3 after step 4 to lock in both grants). The
+  KV Secrets Officer role is what lets the deployer set secrets on the
+  RBAC-mode Key Vault between the two Bicep passes (otherwise
+  `az keyvault secret set` fails with `ForbiddenByRbac`).
 - Creates the **federated credential** pinning the SP to
   `refs/heads/release/<env>`, so GitHub Actions can exchange its
   OIDC token for an Azure access token. No client secrets stored
@@ -94,7 +98,19 @@ az deployment group create \
 This deploys Log Analytics + ACR + KV + Postgres + ACA env, but skips
 the API + worker apps. Takes ~15-25 min (Postgres is the slow one).
 
-Now populate the KV secrets the apps will reference:
+> **You need data-plane write access to the (RBAC-mode) Key Vault.**
+> The KV created by Bicep uses Azure RBAC, so management-plane roles
+> (Contributor/Owner) are *not* enough to set secrets — you need the
+> **Key Vault Secrets Officer** data-plane role. `scripts/azure-bootstrap.sh`
+> (step 3) now grants it to the deploy service principal (deferred on the
+> first run, since the KV doesn't exist yet — re-run step 3 after this
+> pass to lock it in). If you set secrets as a human instead, grant
+> yourself the same role:
+> `az role assignment create --assignee <you@org> --role "Key Vault Secrets Officer" --scope <kv-resource-id>`.
+> Without it, `az keyvault secret set` fails with `ForbiddenByRbac`.
+
+Now populate the KV secrets the apps will reference. The api + worker
+modules read these via their managed identities at boot:
 
 ```bash
 KV=movate-<env>-kv
@@ -113,8 +129,36 @@ az keyvault secret set --vault-name $KV --name pg-connection-string \
 
 # Provider keys (and anything else the runtime needs at boot)
 az keyvault secret set --vault-name $KV --name openai-api-key --value "sk-..."
-# ... repeat per secret your deployment references
+az keyvault secret set --vault-name $KV --name anthropic-api-key --value "sk-ant-..."
 ```
+
+The full set of KV secrets the api + worker modules reference:
+
+| Secret | Required | Set by |
+|---|---|---|
+| `pg-admin-password` | always | you (matches the bicepparam) |
+| `pg-connection-string` | always (worker autoscale) | you (DSN, see above) |
+| `openai-api-key` | always | you |
+| `anthropic-api-key` | always | you |
+| `bootstrap-api-key` | always | **`mdk auth bootstrap-seed`** — *not* hand-set; see below |
+| `langfuse-secret-key` | only when `deployLangfuse=true` | you (from the Langfuse UI) |
+| `langfuse-public-key` | only when `deployLangfuse=true` | you (from the Langfuse UI) |
+
+Two notes on that list:
+
+- **`bootstrap-api-key`** is populated by `mdk auth bootstrap-seed <target>
+  --keyvault $KV`, not a hand-typed `az keyvault secret set`. It mints the
+  key and uploads it in one step; the runtime's `_seed_bootstrap_key()`
+  inserts the matching record on pod start. Run it before flipping
+  `enableApiWorker = true`.
+- **`langfuse-secret-key` / `langfuse-public-key`** are referenced by the
+  api + worker apps **only when `deployLangfuse=true`** (set them from the
+  self-hosted Langfuse UI, reachable at the deploy's `langfuseUrl`
+  output: open it, create a project, mint keys, store them in KV). With
+  Langfuse off (`deployLangfuse=false`, the default), the api + worker
+  modules no longer reference these secrets at all, so you do **not** need
+  to pre-create placeholder values for them — a fresh two-pass deploy with
+  Langfuse off succeeds without them.
 
 Then flip `enableApiWorker = true` in the param file and re-run
 `az deployment group create`. The api + worker apps come up reading
@@ -129,8 +173,9 @@ the secrets, then run Bicep referencing the pre-existing KV. The
 Either way, end state: ACA environment + API + worker apps running.
 
 After this step, re-run `scripts/azure-bootstrap.sh <env>` once more
-to assign **AcrPush** to the SP (it was deferred because ACR didn't
-exist on the first pass).
+to lock in the grants that were deferred because their resources didn't
+exist on the first pass — **AcrPush** on the ACR and **Key Vault
+Secrets Officer** on the KV.
 
 ## 5. Mint the first runtime API key
 

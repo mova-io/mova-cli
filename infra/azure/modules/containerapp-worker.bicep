@@ -116,7 +116,13 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
           identity: userAssignedIdentityId
         }
       ]
-      secrets: [
+      // The langfuse-* secrets are gated on `empty(langfuseHost)` (the
+      // same flag that drives LANGFUSE_HOST below): when Langfuse is off
+      // those Key Vault secrets don't exist, and referencing them here
+      // would hard-fail revision provisioning ("unable to fetch secret
+      // 'langfuse-secret-key'…"). The pg/provider secrets are always
+      // required, so they stay unconditional.
+      secrets: concat([
         {
           name: 'pg-password'
           keyVaultUrl: '${keyVaultUri}secrets/pg-admin-password'
@@ -146,6 +152,7 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: '${keyVaultUri}secrets/anthropic-api-key'
           identity: userAssignedIdentityId
         }
+      ], empty(langfuseHost) ? [] : [
         {
           name: 'langfuse-secret-key'
           keyVaultUrl: '${keyVaultUri}secrets/langfuse-secret-key'
@@ -156,7 +163,7 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: '${keyVaultUri}secrets/langfuse-public-key'
           identity: userAssignedIdentityId
         }
-      ]
+      ])
     }
     template: {
       containers: [
@@ -196,6 +203,15 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               secretRef: 'anthropic-api-key'
             }
             {
+              name: 'MOVATE_AGENTS_PATH'
+              value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'
+            }
+          ], empty(langfuseHost) ? [] : [
+            // Langfuse tracing creds + host — gated together with the
+            // langfuse-* KV secret refs above. When Langfuse is off the
+            // secrets don't exist, so neither the secretRef env vars nor
+            // the host are emitted (the SDK keeps its Cloud default).
+            {
               name: 'LANGFUSE_SECRET_KEY'
               secretRef: 'langfuse-secret-key'
             }
@@ -203,11 +219,6 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'LANGFUSE_PUBLIC_KEY'
               secretRef: 'langfuse-public-key'
             }
-            {
-              name: 'MOVATE_AGENTS_PATH'
-              value: empty(agentsStorageName) ? '/app/agents' : '/home/movate/agents'
-            }
-          ], empty(langfuseHost) ? [] : [
             {
               // Point tracing at the self-hosted Langfuse (omitted when
               // empty so the SDK keeps its Cloud default).
