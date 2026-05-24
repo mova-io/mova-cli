@@ -29,6 +29,10 @@ tests/
 
 # Local dev artifacts
 .movate/
+.mdk/
+# Claude agent worktrees + session state — can be GBs of nested repo
+# copies (.claude/worktrees/), must never enter the build context.
+.claude/
 *.db
 *.db-journal
 local.db
