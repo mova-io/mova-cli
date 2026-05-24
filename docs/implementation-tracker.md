@@ -81,6 +81,11 @@ smoke pass is the gate to calling the platform production-ready.**
 | 28 | **Load / soak test harness** — drive the job-queue + KEDA autoscale path under load; capture baseline throughput/latency; documented results | B | feature | M (~35m) 🔒 | #11 | ⬜ | | `____` |
 | 29 | **Operator runbooks** — configure/operate/troubleshoot the new surfaces (scheduler, triggers, durable/HITL, canary, harvest, continuous-eval, batch, SSE) | C | docs | M (~30m) | (features land) | ⬜ | | `____` |
 | 30 | **Per-tenant BYOK provider keys** — each tenant stores its own OpenAI/Anthropic key (Fernet-encrypted at rest); `ProviderKeyResolver` (tenant→shared fallback); `mdk keys set\|list\|delete\|test` + `/api/v1/provider-keys`; admin-gated, value never returned | D | **018** | M–L (~45m) | scopes | ⬜ | | `____` |
+| 31 | **Stale-job reaper / visibility timeout** — requeue jobs orphaned in `running` when a worker hard-crashes (OOM/SIGKILL/node loss); dead-letter once the retry budget is exhausted. Reaper runs in the worker loop (primary) + scheduler tick (scaled-to-zero backstop). No schema change (reuses `claimed_at`/`attempt_count`). | A | 017 / feature | M (~30m) | scheduler, worker | ⬜ | | `____` |
+| 32 | **Distributed trace propagation across the queue** — inject W3C `traceparent` into `JobRecord` at enqueue, extract + continue in the worker so submit→queue→execute is ONE trace in App Insights (additive `trace_context` column; ADR 019) | B | 015 / 019 | M–L (~45m) | #62 | ⬜ | | `____` |
+| 33 | **OTel metrics instruments** — `Meter` + counters/histograms (queue depth, job latency, dead-letter rate, in-flight, per-tenant tokens/cost) feeding the item-27 alert rules | B | 015 | M (~35m) | #62 | ⬜ | | `____` |
+| 34 | **Per-job execution timeout + run cancellation** — bound a hung provider call (→ retry/dead-letter); cancel a queued/in-flight async run | A | 017 / feature | M (~30m) | #31 | ⬜ | | `____` |
+| 35 | **Control-plane audit telemetry** — structured audit events for key mint/revoke/rotate, canary promote, drift auto-rollback (the "who did what, when" trail) | B | 013 / 016 | M (~30m) | — | ⬜ | | `____` |
 
 ## How this is maintained
 As each PR merges, its row flips to ✅ and the **Merged** column is stamped with

@@ -14,6 +14,7 @@ from typing import Any
 
 import aiosqlite
 
+from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
@@ -1797,6 +1798,70 @@ class SqliteProvider:
             ),
         )
         await self._db.commit()
+
+    async def reclaim_stale_jobs(
+        self,
+        *,
+        older_than: datetime,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> ReclaimResult:
+        """Reclaim orphaned ``RUNNING`` jobs — cross-tenant, atomic.
+
+        Same two-statement logic as the postgres provider, under a
+        single ``BEGIN IMMEDIATE`` transaction (matching ``claim_next_job``):
+        dead-letter the budget-exhausted rows FIRST, then requeue the
+        remaining stale ``running`` rows. ``changes()`` after each UPDATE
+        gives the affected-row counts.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+        now_iso = effective_now.isoformat()
+        older_than_iso = older_than.isoformat()
+        dead_letter_error = json.dumps(
+            {
+                "type": "reaper_dead_letter",
+                "message": ("orphaned in running past visibility timeout; retry budget exhausted"),
+            }
+        )
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            async with self._db.execute(
+                """
+                UPDATE jobs
+                SET status = 'dead_letter',
+                    completed_at = ?,
+                    error = ?
+                WHERE status = 'running'
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at < ?
+                  AND attempt_count + 1 >= ?
+                """,
+                (now_iso, dead_letter_error, older_than_iso, max_attempts),
+            ) as cur:
+                dead_lettered = cur.rowcount
+            async with self._db.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued',
+                    claimed_at = NULL,
+                    attempt_count = attempt_count + 1,
+                    next_retry_at = ?
+                WHERE status = 'running'
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at < ?
+                """,
+                (now_iso, older_than_iso),
+            ) as cur:
+                requeued = cur.rowcount
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        # aiosqlite returns -1 for rowcount on some statements; floor at 0.
+        return ReclaimResult(
+            requeued=max(0, requeued),
+            dead_lettered=max(0, dead_lettered),
+        )
 
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)

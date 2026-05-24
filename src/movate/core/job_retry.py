@@ -74,6 +74,30 @@ DEFAULT_POLICY = JobRetryPolicy()
 """Module-level default. Override at the worker layer if needed."""
 
 
+DEFAULT_VISIBILITY_TIMEOUT_SECONDS = 900.0
+"""Default visibility timeout for the stale-job reaper (15 minutes).
+
+A job that's been ``RUNNING`` with ``claimed_at`` older than this is
+treated as orphaned (worker OOM/SIGKILL/node loss) and reclaimed. This
+MUST be generously larger than the longest expected job: a value smaller
+than a still-running job's runtime would reclaim a healthy in-flight job
+and cause at-least-once double-execution. The worker loop and the
+scheduler-tick backstop both default to this single source of truth."""
+
+
+@dataclass(frozen=True)
+class ReclaimResult:
+    """Outcome of one :meth:`StorageProvider.reclaim_stale_jobs` sweep.
+
+    ``requeued`` is the count of orphaned ``RUNNING`` jobs flipped back
+    to ``QUEUED`` (retry budget remained); ``dead_lettered`` is the count
+    that exhausted their budget and landed in ``DEAD_LETTER`` instead.
+    Both are zero on an idle sweep (nothing stale)."""
+
+    requeued: int
+    dead_lettered: int
+
+
 def should_retry(
     *, retryable: bool, attempt_count: int, policy: JobRetryPolicy = DEFAULT_POLICY
 ) -> bool:
@@ -143,7 +167,9 @@ def is_exhausted(*, attempt_count: int, policy: JobRetryPolicy = DEFAULT_POLICY)
 
 __all__ = [
     "DEFAULT_POLICY",
+    "DEFAULT_VISIBILITY_TIMEOUT_SECONDS",
     "JobRetryPolicy",
+    "ReclaimResult",
     "compute_next_retry_at",
     "is_exhausted",
     "should_retry",

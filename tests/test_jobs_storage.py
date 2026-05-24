@@ -318,3 +318,65 @@ async def test_postgres_claim_skip_locked_runs_concurrent() -> None:
     finally:
         await worker_a.close()
         await worker_b.close()
+
+
+# ---------------------------------------------------------------------------
+# `mdk jobs reap` — local-runtime reaper escape hatch (item 31)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_jobs_reap_cli_reclaims_orphan(tmp_path: Path, monkeypatch) -> None:
+    """`mdk jobs reap --output json` runs the reaper against the local
+    sqlite DB and reports counts. Seeds an orphaned RUNNING job, then
+    asserts the command requeues it."""
+    import json as _json  # noqa: PLC0415
+
+    from typer.testing import CliRunner  # noqa: PLC0415
+
+    from movate.cli.main import app as cli_app  # noqa: PLC0415
+
+    # Redirect the local DB to a tmp file so we never touch ~/.movate.
+    db_path = tmp_path / "local.db"
+    monkeypatch.setenv("MOVATE_DB", str(db_path))
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.delenv("MDK_DB_URL", raising=False)
+
+    # Seed an orphaned RUNNING job via the same sqlite provider the CLI
+    # will open. local tenant matches build_local_runtime's executor.
+    async def _seed() -> str:
+        provider = SqliteProvider(db_path=db_path)
+        await provider.init()
+        stale = datetime.now(UTC) - timedelta(seconds=10_000)
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id="local",
+            kind=JobKind.AGENT,
+            target="alpha",
+            input={"text": "hi"},
+            status=JobStatus.RUNNING,
+            claimed_at=stale,
+            attempt_count=0,
+        )
+        await provider.save_job(job)
+        await provider.close()
+        return job.job_id
+
+    job_id = asyncio.run(_seed())
+
+    runner = CliRunner(mix_stderr=False)
+    result = runner.invoke(cli_app, ["jobs", "reap", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = _json.loads(result.stdout)
+    assert payload == {"requeued": 1, "dead_lettered": 0}
+
+    # Verify the row was actually requeued in the DB.
+    async def _check() -> JobStatus:
+        provider = SqliteProvider(db_path=db_path)
+        await provider.init()
+        got = await provider.get_job(job_id, tenant_id="local")
+        await provider.close()
+        assert got is not None
+        return got.status
+
+    assert asyncio.run(_check()) == JobStatus.QUEUED

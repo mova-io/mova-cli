@@ -26,6 +26,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
@@ -604,6 +605,53 @@ class StorageProvider(Protocol):
         dispatch outcome reports a retryable error AND the retry
         budget isn't exhausted (see :mod:`movate.core.job_retry`).
         Tenant-scoped in WHERE; silently no-ops on mismatch.
+        """
+
+    async def reclaim_stale_jobs(
+        self,
+        *,
+        older_than: datetime,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> ReclaimResult:
+        """Crash-recovery sweep: reclaim jobs orphaned in ``RUNNING``.
+
+        ``claim_next_job`` flips a job to ``RUNNING`` and stamps
+        ``claimed_at``, but if the worker is hard-killed mid-job
+        (OOM / SIGKILL / node loss) nothing ever transitions the row —
+        the claim path only scans ``status='queued'``, so the orphan is
+        stuck forever. This reaper finds those rows and recovers them.
+
+        **Operator-level / cross-tenant** — this is a system action, NOT
+        tenant-scoped. It targets every tenant's orphaned jobs in one
+        atomic sweep.
+
+        Target rows: ``status = 'running' AND claimed_at IS NOT NULL AND
+        claimed_at < older_than``. Callers pass
+        ``older_than = now - visibility_timeout`` (the timeout MUST be
+        generously larger than the longest expected job — a too-small
+        value risks reclaiming a still-running job, causing at-least-once
+        double-execution).
+
+        Of those rows:
+
+        * ``attempt_count + 1 >= max_attempts`` → ``DEAD_LETTER``
+          (``completed_at = now``, ``error`` set to a
+          ``reaper_dead_letter`` JSON blob). A reclaim counts as an
+          attempt, so a worker that keeps crashing on a poison job
+          eventually dead-letters instead of cycling forever.
+        * the rest → ``QUEUED`` (``claimed_at = NULL``,
+          ``attempt_count += 1``, ``next_retry_at = now`` for immediate
+          re-claim eligibility — the crash wasn't a dispatch error, so no
+          backoff is warranted).
+
+        Both transitions happen in a SINGLE transaction (atomic). Two
+        workers racing the reaper is safe: the atomic
+        ``UPDATE ... WHERE status='running'`` means the second worker's
+        predicate won't match rows the first already flipped.
+
+        Returns a :class:`ReclaimResult` with the
+        ``(requeued, dead_lettered)`` counts.
         """
 
     # ------------------------------------------------------------------

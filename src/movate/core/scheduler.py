@@ -50,10 +50,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol, TypeVar
 from uuid import uuid4
 
+from movate.core.job_retry import DEFAULT_POLICY, DEFAULT_VISIBILITY_TIMEOUT_SECONDS
 from movate.core.models import EvalSchedule, JobKind, JobRecord, JobSchedule, _now
 from movate.storage.base import StorageProvider
 
@@ -161,6 +162,14 @@ class TickResult:
     """``job_id``s enqueued this tick (one per due schedule)."""
     skipped: list[str] = field(default_factory=list)
     """Schedule labels skipped because they weren't due (cadence not elapsed)."""
+    reclaimed_requeued: int = 0
+    """Orphaned ``RUNNING`` jobs requeued by the scaled-to-zero reaper
+    backstop this tick (see :func:`run_all_scheduler_ticks`). ``0`` when
+    the reaper didn't run (per-surface ticks) or found nothing stale."""
+    reclaimed_dead_lettered: int = 0
+    """Orphaned ``RUNNING`` jobs dead-lettered (retry budget exhausted) by
+    the reaper backstop this tick. ``0`` when the reaper didn't run or
+    found nothing exhausted."""
 
     @property
     def enqueued_count(self) -> int:
@@ -172,9 +181,13 @@ class TickResult:
         Keeps this tick's ``now`` and concatenates the enqueued / skipped
         lists, so :func:`run_all_scheduler_ticks` can report a single
         combined :class:`TickResult` across both scheduling surfaces.
+        Reclaim counts are summed (the reaper runs once per unified tick,
+        so in practice only one side carries non-zero values).
         """
         self.enqueued.extend(other.enqueued)
         self.skipped.extend(other.skipped)
+        self.reclaimed_requeued += other.reclaimed_requeued
+        self.reclaimed_dead_lettered += other.reclaimed_dead_lettered
         return self
 
     def summary(self) -> str:
@@ -322,11 +335,41 @@ async def run_all_scheduler_ticks(
     (agent/workflow) against the same ``now`` and merges their
     :class:`TickResult`\\ s. Either surface being empty is a no-op — the
     tick stays additive + default-off.
+
+    It ALSO runs the stale-job reaper once, as the scaled-to-zero
+    BACKSTOP: when the queue is empty and KEDA has scaled all workers to
+    zero (it scales on ``queued`` depth, not ``running``), a single job
+    orphaned in ``RUNNING`` has no worker to reap it. The cron tick fires
+    regardless, so it recovers the orphan. Racing the worker-loop reaper
+    is safe (atomic ``UPDATE ... WHERE status='running'``). The reaper
+    call is wrapped so a storage hiccup never fails the tick.
     """
     effective_now = now or _now()
     eval_result = await run_scheduler_tick(storage, tenant_id=tenant_id, now=effective_now)
     job_result = await run_job_scheduler_tick(storage, tenant_id=tenant_id, now=effective_now)
-    return eval_result.merge(job_result)
+    result = eval_result.merge(job_result)
+
+    try:
+        reclaimed = await storage.reclaim_stale_jobs(
+            older_than=effective_now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+            max_attempts=DEFAULT_POLICY.max_attempts,
+            now=effective_now,
+        )
+        result.reclaimed_requeued = reclaimed.requeued
+        result.reclaimed_dead_lettered = reclaimed.dead_lettered
+        if reclaimed.requeued or reclaimed.dead_lettered:
+            logger.info(
+                "scheduler_tick_reaper requeued=%d dead_lettered=%d",
+                reclaimed.requeued,
+                reclaimed.dead_lettered,
+            )
+    except Exception:
+        logger.warning(
+            "scheduler_tick_reaper_failed — tick result is otherwise valid",
+            exc_info=True,
+        )
+
+    return result
 
 
 __all__ = [

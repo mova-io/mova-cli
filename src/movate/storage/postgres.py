@@ -28,6 +28,7 @@ from typing import Any
 
 import asyncpg
 
+from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
@@ -1884,6 +1885,64 @@ class PostgresProvider:
             next_retry_at,
             job_id,
             tenant_id,
+        )
+
+    async def reclaim_stale_jobs(
+        self,
+        *,
+        older_than: datetime,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> ReclaimResult:
+        """Reclaim orphaned ``RUNNING`` jobs — cross-tenant, atomic.
+
+        Two ``UPDATE ... RETURNING`` statements inside ONE transaction.
+        The dead-letter UPDATE runs FIRST (stricter
+        ``attempt_count + 1 >= max_attempts`` predicate); the requeue
+        UPDATE then sweeps the remaining stale ``running`` rows. Counts
+        come back via ``len(RETURNING)``.
+        """
+        effective_now = now if now is not None else datetime.now(UTC)
+        dead_letter_error: dict[str, object] = {
+            "type": "reaper_dead_letter",
+            "message": "orphaned in running past visibility timeout; retry budget exhausted",
+        }
+        async with self._db.acquire() as conn, conn.transaction():
+            dead_rows = await conn.fetch(
+                """
+                UPDATE jobs
+                SET status = 'dead_letter',
+                    completed_at = $1,
+                    error = $2
+                WHERE status = 'running'
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at < $3
+                  AND attempt_count + 1 >= $4
+                RETURNING job_id
+                """,
+                effective_now,
+                dead_letter_error,
+                older_than,
+                max_attempts,
+            )
+            requeued_rows = await conn.fetch(
+                """
+                UPDATE jobs
+                SET status = 'queued',
+                    claimed_at = NULL,
+                    attempt_count = attempt_count + 1,
+                    next_retry_at = $1
+                WHERE status = 'running'
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at < $2
+                RETURNING job_id
+                """,
+                effective_now,
+                older_than,
+            )
+        return ReclaimResult(
+            requeued=len(requeued_rows),
+            dead_lettered=len(dead_rows),
         )
 
     # ------------------------------------------------------------------

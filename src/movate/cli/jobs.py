@@ -169,6 +169,45 @@ def list_agents(
     stdout.print(table)
 
 
+@jobs_app.command("reap")
+def reap(
+    visibility_timeout: float = typer.Option(
+        None,
+        "--visibility-timeout",
+        help=(
+            "Seconds a job may sit in RUNNING before it's treated as orphaned "
+            "and reclaimed. Defaults to the 15-min reaper default. Must be "
+            "generously larger than the longest expected job."
+        ),
+    ),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Run the stale-job reaper once against the LOCAL runtime.
+
+    Crash-recovery one-shot: finds jobs orphaned in RUNNING past the
+    visibility timeout and requeues them (or dead-letters once the retry
+    budget is exhausted). Mirrors how [bold]mdk scheduler-tick[/bold] runs
+    locally — it builds the local runtime and calls the storage reaper
+    directly; it does NOT hit a deployed runtime's HTTP API.
+
+    In production the worker loop + scheduler tick run this automatically;
+    this command is an operator escape hatch for the local queue.
+    """
+    requeued, dead_lettered = asyncio.run(_reap(visibility_timeout=visibility_timeout))
+    if output_format == TableJson.JSON:
+        stdout.print_json(data={"requeued": requeued, "dead_lettered": dead_lettered})
+        return
+    if requeued == 0 and dead_lettered == 0:
+        hint("[dim]no stale jobs — reclaimed 0[/dim]")
+        return
+    stdout.print(
+        f"[green]✓[/green] reclaimed [bold]{requeued}[/bold] requeued, "
+        f"[bold]{dead_lettered}[/bold] dead-lettered"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Async glue — kept narrow because each command has a slightly different
 # shape (one-shot vs poll vs list).
@@ -225,6 +264,35 @@ async def _fetch_list(*, target: str | None, status: JobStatus | None, limit: in
     except MovateClientError as exc:
         error(str(exc), context="list")
         raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _reap(*, visibility_timeout: float | None) -> tuple[int, int]:
+    """Build the local runtime and run the stale-job reaper once.
+
+    Local-only (mirrors ``mdk scheduler-tick``'s local path) — does NOT
+    require an API route or auth scope, so it stays in the CLI plane.
+    Returns ``(requeued, dead_lettered)``.
+    """
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.core.job_retry import (  # noqa: PLC0415
+        DEFAULT_POLICY,
+        DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
+    )
+
+    timeout = visibility_timeout if visibility_timeout else DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+    runtime = await build_local_runtime(mock=True)
+    try:
+        now = datetime.now(UTC)
+        result = await runtime.storage.reclaim_stale_jobs(
+            older_than=now - timedelta(seconds=timeout),
+            max_attempts=DEFAULT_POLICY.max_attempts,
+            now=now,
+        )
+        return result.requeued, result.dead_lettered
+    finally:
+        await shutdown_runtime(runtime.storage, runtime.tracer)
 
 
 def _build_client(target: str | None) -> MovateClient:
