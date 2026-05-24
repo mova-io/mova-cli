@@ -16,10 +16,12 @@ Asserts the generalization of the ADR-016 eval scheduler:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 
-from movate.core.models import EvalSchedule, JobKind, JobSchedule, JobStatus
+from movate.core.job_retry import DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+from movate.core.models import EvalSchedule, JobKind, JobRecord, JobSchedule, JobStatus
 from movate.core.scheduler import (
     build_scheduled_job,
     is_due,
@@ -267,3 +269,81 @@ async def test_run_all_with_no_schedules_is_noop(storage: InMemoryStorage) -> No
     result = await run_all_scheduler_ticks(storage, tenant_id="tenant-a")
     assert result.enqueued_count == 0
     assert storage.jobs == []
+
+
+# ---------------------------------------------------------------------------
+# Scheduler-tick reaper backstop (item 31) — the scaled-to-zero path:
+# all workers gone, the cron tick still reclaims orphaned RUNNING jobs.
+# ---------------------------------------------------------------------------
+
+
+def _stale_running_job(*, tenant_id: str = "tenant-a", attempt_count: int = 0) -> JobRecord:
+    """A job orphaned in RUNNING with a claimed_at well past the timeout."""
+    stale = datetime.now(UTC) - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS + 60)
+    return JobRecord(
+        job_id=uuid4().hex,
+        tenant_id=tenant_id,
+        kind=JobKind.AGENT,
+        target="alpha",
+        input={"text": "hi"},
+        status=JobStatus.RUNNING,
+        claimed_at=stale,
+        attempt_count=attempt_count,
+    )
+
+
+@pytest.mark.unit
+async def test_run_all_reclaims_orphaned_running(storage: InMemoryStorage) -> None:
+    """With no schedules and no workers, the unified tick still reaps a
+    job orphaned in RUNNING — the scaled-to-zero backstop."""
+    orphan = _stale_running_job(attempt_count=0)
+    await storage.save_job(orphan)
+
+    result = await run_all_scheduler_ticks(storage, tenant_id="tenant-a")
+    assert result.reclaimed_requeued == 1
+    assert result.reclaimed_dead_lettered == 0
+
+    got = await storage.get_job(orphan.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.QUEUED
+    assert got.attempt_count == 1
+
+
+@pytest.mark.unit
+async def test_run_all_reaper_dead_letters_exhausted(storage: InMemoryStorage) -> None:
+    """The backstop dead-letters an orphan that's out of retry budget."""
+    orphan = _stale_running_job(attempt_count=2)  # 2 + 1 >= 3 (default budget)
+    await storage.save_job(orphan)
+
+    result = await run_all_scheduler_ticks(storage, tenant_id="tenant-a")
+    assert result.reclaimed_requeued == 0
+    assert result.reclaimed_dead_lettered == 1
+
+    got = await storage.get_job(orphan.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.DEAD_LETTER
+
+
+@pytest.mark.unit
+async def test_run_all_reaper_zero_when_nothing_stale(storage: InMemoryStorage) -> None:
+    """A healthy in-flight RUNNING job (claimed recently) is not reaped
+    by the backstop — reclaim counts stay zero."""
+    fresh = JobRecord(
+        job_id=uuid4().hex,
+        tenant_id="tenant-a",
+        kind=JobKind.AGENT,
+        target="alpha",
+        input={"text": "hi"},
+        status=JobStatus.RUNNING,
+        claimed_at=datetime.now(UTC) - timedelta(seconds=5),
+        attempt_count=0,
+    )
+    await storage.save_job(fresh)
+
+    result = await run_all_scheduler_ticks(storage, tenant_id="tenant-a")
+    assert result.reclaimed_requeued == 0
+    assert result.reclaimed_dead_lettered == 0
+
+    got = await storage.get_job(fresh.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.RUNNING

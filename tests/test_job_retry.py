@@ -23,7 +23,9 @@ from uuid import uuid4
 import pytest
 
 from movate.core.job_retry import (
+    DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
     JobRetryPolicy,
+    ReclaimResult,
     compute_next_retry_at,
     is_exhausted,
     should_retry,
@@ -260,6 +262,191 @@ async def test_save_job_persists_retry_fields(storage) -> None:
     assert got is not None
     assert got.attempt_count == 0
     assert got.next_retry_at is None
+
+
+# ---------------------------------------------------------------------------
+# 2b. Stale-job reaper — reclaim_stale_jobs (item 31)
+#     Parametrized over memory + sqlite (+ postgres when configured).
+# ---------------------------------------------------------------------------
+
+
+def _make_running_job(
+    *,
+    tenant_id: str = "t1",
+    claimed_at: datetime,
+    attempt_count: int = 0,
+) -> JobRecord:
+    """A job already in RUNNING with an explicit ``claimed_at`` —
+    simulates a worker that claimed the job then (maybe) crashed."""
+    return JobRecord(
+        job_id=uuid4().hex,
+        tenant_id=tenant_id,
+        kind=JobKind.AGENT,
+        target="alpha",
+        input={"text": "hi"},
+        status=JobStatus.RUNNING,
+        claimed_at=claimed_at,
+        attempt_count=attempt_count,
+    )
+
+
+@pytest.mark.unit
+async def test_reclaim_requeues_stale_running_with_budget(storage) -> None:
+    """A RUNNING job claimed before the visibility timeout, with attempts
+    remaining, is requeued: QUEUED, claimed_at cleared, attempt_count
+    bumped, next_retry_at set for immediate re-claim."""
+    now = datetime.now(UTC)
+    stale = now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS + 60)
+    j = _make_running_job(claimed_at=stale, attempt_count=0)
+    await storage.save_job(j)
+
+    result = await storage.reclaim_stale_jobs(
+        older_than=now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+        max_attempts=3,
+        now=now,
+    )
+    assert result == ReclaimResult(requeued=1, dead_lettered=0)
+
+    got = await storage.get_job(j.job_id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.QUEUED
+    assert got.claimed_at is None
+    assert got.attempt_count == 1
+    assert got.next_retry_at is not None
+    # next_retry_at == now → immediately claimable (no backoff: a crash
+    # isn't a dispatch error).
+    assert abs((got.next_retry_at - now).total_seconds()) < 1.0
+
+
+@pytest.mark.unit
+async def test_reclaim_dead_letters_at_budget(storage) -> None:
+    """A RUNNING job whose attempt_count+1 hits max_attempts is
+    dead-lettered, not requeued — a poison job that keeps crashing the
+    worker eventually stops cycling."""
+    now = datetime.now(UTC)
+    stale = now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS + 60)
+    # attempt_count=2, max_attempts=3 → 2 + 1 >= 3 → dead-letter.
+    j = _make_running_job(claimed_at=stale, attempt_count=2)
+    await storage.save_job(j)
+
+    result = await storage.reclaim_stale_jobs(
+        older_than=now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+        max_attempts=3,
+        now=now,
+    )
+    assert result == ReclaimResult(requeued=0, dead_lettered=1)
+
+    got = await storage.get_job(j.job_id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.DEAD_LETTER
+    assert got.completed_at is not None
+    assert got.error is not None
+    assert got.error.type == "reaper_dead_letter"
+
+
+@pytest.mark.unit
+async def test_reclaim_leaves_fresh_running_untouched(storage) -> None:
+    """A RUNNING job claimed AFTER the cutoff (healthy in-flight) is NOT
+    reclaimed — the core safety property: a slow-but-alive job must
+    never be double-executed."""
+    now = datetime.now(UTC)
+    # Claimed only 10s ago — well inside the timeout window.
+    fresh = now - timedelta(seconds=10)
+    j = _make_running_job(claimed_at=fresh, attempt_count=0)
+    await storage.save_job(j)
+
+    result = await storage.reclaim_stale_jobs(
+        older_than=now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+        max_attempts=3,
+        now=now,
+    )
+    assert result == ReclaimResult(requeued=0, dead_lettered=0)
+
+    got = await storage.get_job(j.job_id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.RUNNING
+    assert got.claimed_at is not None
+    assert got.attempt_count == 0
+
+
+@pytest.mark.unit
+async def test_reclaim_leaves_queued_untouched(storage) -> None:
+    """A QUEUED job (never claimed) is not a reaper target — only
+    RUNNING rows with a stale claimed_at are."""
+    now = datetime.now(UTC)
+    j = _make_job_record()  # QUEUED, claimed_at=None
+    await storage.save_job(j)
+
+    result = await storage.reclaim_stale_jobs(
+        older_than=now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+        max_attempts=3,
+        now=now,
+    )
+    assert result == ReclaimResult(requeued=0, dead_lettered=0)
+
+    got = await storage.get_job(j.job_id, tenant_id="t1")
+    assert got is not None
+    assert got.status == JobStatus.QUEUED
+
+
+@pytest.mark.unit
+async def test_reclaim_is_cross_tenant(storage) -> None:
+    """The reaper is an operator-level system action — it reclaims
+    orphaned jobs across ALL tenants in one sweep, not scoped to one."""
+    now = datetime.now(UTC)
+    stale = now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS + 60)
+    a = _make_running_job(tenant_id="tenant-a", claimed_at=stale, attempt_count=0)
+    b = _make_running_job(tenant_id="tenant-b", claimed_at=stale, attempt_count=0)
+    await storage.save_job(a)
+    await storage.save_job(b)
+
+    result = await storage.reclaim_stale_jobs(
+        older_than=now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+        max_attempts=3,
+        now=now,
+    )
+    assert result == ReclaimResult(requeued=2, dead_lettered=0)
+
+    for jid, tenant in ((a.job_id, "tenant-a"), (b.job_id, "tenant-b")):
+        got = await storage.get_job(jid, tenant_id=tenant)
+        assert got is not None
+        assert got.status == JobStatus.QUEUED
+
+
+@pytest.mark.unit
+async def test_reclaim_counts_mixed_batch(storage) -> None:
+    """One sweep over a mixed batch returns the right (requeued,
+    dead_lettered) split, and a second sweep is idempotent (nothing
+    stale left → zeros)."""
+    now = datetime.now(UTC)
+    stale = now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS + 60)
+    requeue_me = _make_running_job(claimed_at=stale, attempt_count=0)
+    dead_me = _make_running_job(claimed_at=stale, attempt_count=2)
+    fresh = _make_running_job(claimed_at=now - timedelta(seconds=5), attempt_count=0)
+    for j in (requeue_me, dead_me, fresh):
+        await storage.save_job(j)
+
+    cutoff = now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS)
+    first = await storage.reclaim_stale_jobs(older_than=cutoff, max_attempts=3, now=now)
+    assert first == ReclaimResult(requeued=1, dead_lettered=1)
+
+    # Idempotent: the requeued job is now QUEUED (not running), the
+    # dead one is terminal, the fresh one is still inside the window —
+    # nothing stale remains.
+    second = await storage.reclaim_stale_jobs(older_than=cutoff, max_attempts=3, now=now)
+    assert second == ReclaimResult(requeued=0, dead_lettered=0)
+
+
+@pytest.mark.unit
+async def test_reclaim_empty_queue_returns_zeros(storage) -> None:
+    """Idempotency / no-op: an empty queue reclaims nothing."""
+    now = datetime.now(UTC)
+    result = await storage.reclaim_stale_jobs(
+        older_than=now - timedelta(seconds=DEFAULT_VISIBILITY_TIMEOUT_SECONDS),
+        max_attempts=3,
+        now=now,
+    )
+    assert result == ReclaimResult(requeued=0, dead_lettered=0)
 
 
 # ---------------------------------------------------------------------------

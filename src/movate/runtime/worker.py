@@ -27,9 +27,11 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from movate.core.job_retry import (
     DEFAULT_POLICY,
+    DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
     JobRetryPolicy,
     compute_next_retry_at,
     is_exhausted,
@@ -65,6 +67,24 @@ class WorkerConfig:
     attempts (initial + 2 retries), 5s base, 3x factor, 5min cap,
     ±25% jitter. Set ``max_attempts=1`` to disable retries entirely
     (every retryable error → ``DEAD_LETTER``)."""
+
+    visibility_timeout_seconds: float = DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+    """How long a job may sit in ``RUNNING`` before the reaper treats it
+    as orphaned (worker OOM/SIGKILL/node loss) and reclaims it. Default
+    15 minutes.
+
+    This MUST be generously larger than the longest expected job. A
+    value smaller than a still-running job's actual runtime would let
+    the reaper requeue a HEALTHY in-flight job, causing at-least-once
+    DOUBLE EXECUTION (two workers running the same job). When in doubt,
+    err high — a stuck job recovers a few minutes late, but a too-low
+    timeout silently double-runs work."""
+
+    reap_interval_seconds: float = 60.0
+    """How often :meth:`Worker.run_forever` runs the stale-job reaper.
+    Throttled independently of ``poll_interval_seconds`` so a fast poll
+    loop doesn't hammer the reaper UPDATE every tick. The reaper is
+    cheap and racing-safe across workers, so this is a coarse knob."""
 
 
 class Worker:
@@ -260,19 +280,65 @@ class Worker:
             return JobStatus.DEAD_LETTER, "terminal"
         return JobStatus.ERROR, "terminal"
 
+    async def _maybe_reap(self, *, now: datetime, last_reap: datetime) -> datetime:
+        """Run the stale-job reaper if ``reap_interval_seconds`` has elapsed.
+
+        Returns the timestamp to use as the next ``last_reap`` — ``now``
+        if we reaped this tick, otherwise the unchanged ``last_reap``.
+
+        Crash-recovery for jobs orphaned in ``RUNNING`` by a hard-killed
+        worker (OOM/SIGKILL/node loss). Racing with other workers' reapers
+        is safe — the atomic ``UPDATE ... WHERE status='running'`` means
+        the loser's predicate won't match rows the winner already flipped.
+
+        A reaper hiccup (storage blip) must NEVER kill the worker loop, so
+        the call is wrapped: we log and carry on, and we still advance
+        ``last_reap`` so a persistently-failing reaper doesn't busy-loop.
+        """
+        if (now - last_reap).total_seconds() < self._config.reap_interval_seconds:
+            return last_reap
+        try:
+            result = await self._storage.reclaim_stale_jobs(
+                older_than=now - timedelta(seconds=self._config.visibility_timeout_seconds),
+                max_attempts=self._config.retry_policy.max_attempts,
+                now=now,
+            )
+            if result.requeued or result.dead_lettered:
+                logger.info(
+                    "reaper_reclaimed requeued=%d dead_lettered=%d",
+                    result.requeued,
+                    result.dead_lettered,
+                )
+        except Exception:
+            logger.warning("reaper_failed — worker loop continues", exc_info=True)
+        return now
+
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         """Loop until ``stop_event`` is set. Sleeps when the queue is empty.
 
         Tests call ``run_one_cycle`` directly to avoid timing
         flakiness. The CLI uses this method with a SIGINT/SIGTERM
         handler that sets the event.
+
+        Each iteration also runs the stale-job reaper on a throttle
+        (``reap_interval_seconds``) — the PRIMARY crash-recovery path for
+        jobs orphaned in ``RUNNING``. ``run_one_cycle`` stays reaper-free
+        so tests that call it directly are unaffected.
         """
         logger.info(
-            "worker_started tenant_id=%s poll_interval=%.2fs",
+            "worker_started tenant_id=%s poll_interval=%.2fs "
+            "visibility_timeout=%.0fs reap_interval=%.0fs",
             self._config.tenant_id or "<all>",
             self._config.poll_interval_seconds,
+            self._config.visibility_timeout_seconds,
+            self._config.reap_interval_seconds,
         )
+        # Start "fully elapsed" so the first iteration reaps immediately —
+        # a worker booting after a crash should recover orphans right away,
+        # not wait a full interval.
+        last_reap = datetime.now(UTC) - timedelta(seconds=self._config.reap_interval_seconds)
         while not stop_event.is_set():
+            last_reap = await self._maybe_reap(now=datetime.now(UTC), last_reap=last_reap)
             handled = await self.run_one_cycle()
             if handled is None:
                 # No work — wait, but cancel-able via the stop event.

@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
+from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
@@ -660,6 +661,62 @@ class InMemoryStorage:
                 )
                 return
         return
+
+    async def reclaim_stale_jobs(
+        self,
+        *,
+        older_than: datetime,
+        max_attempts: int = 3,
+        now: datetime | None = None,
+    ) -> ReclaimResult:
+        """Reclaim orphaned ``RUNNING`` jobs — cross-tenant, in-memory.
+
+        Iterates the jobs list applying the same rules as the SQL
+        backends: budget-exhausted stale rows → ``DEAD_LETTER``; the rest
+        → ``QUEUED`` with ``attempt_count`` bumped and immediate re-claim
+        eligibility (``next_retry_at = now``). Single event loop means
+        this is atomic by construction.
+        """
+        from movate.core.models import ErrorInfo  # noqa: PLC0415
+
+        effective_now = now if now is not None else datetime.now(UTC)
+        requeued = 0
+        dead_lettered = 0
+        for i, j in enumerate(self.jobs):
+            if (
+                j.status != JobStatus.RUNNING
+                or j.claimed_at is None
+                or not (j.claimed_at < older_than)
+            ):
+                continue
+            if j.attempt_count + 1 >= max_attempts:
+                self.jobs[i] = j.model_copy(
+                    update={
+                        "status": JobStatus.DEAD_LETTER,
+                        "completed_at": effective_now,
+                        "error": ErrorInfo.model_validate(
+                            {
+                                "type": "reaper_dead_letter",
+                                "message": (
+                                    "orphaned in running past visibility timeout; "
+                                    "retry budget exhausted"
+                                ),
+                            }
+                        ),
+                    }
+                )
+                dead_lettered += 1
+            else:
+                self.jobs[i] = j.model_copy(
+                    update={
+                        "status": JobStatus.QUEUED,
+                        "claimed_at": None,
+                        "attempt_count": j.attempt_count + 1,
+                        "next_retry_at": effective_now,
+                    }
+                )
+                requeued += 1
+        return ReclaimResult(requeued=requeued, dead_lettered=dead_lettered)
 
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)

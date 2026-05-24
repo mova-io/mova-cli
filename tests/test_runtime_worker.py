@@ -18,6 +18,7 @@ processes.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -637,3 +638,104 @@ async def test_worker_run_forever_exits_when_stop_event_set(
 
     # Should exit within ~50ms even though the configured poll is 10s.
     await asyncio.gather(worker.run_forever(stop), stop_soon())
+
+
+# ---------------------------------------------------------------------------
+# Stale-job reaper throttle — Worker._maybe_reap / run_forever (item 31)
+# ---------------------------------------------------------------------------
+
+
+class _ReaperSpyStorage(InMemoryStorage):
+    """InMemoryStorage that counts reclaim_stale_jobs calls.
+
+    Lets the throttle tests assert HOW OFTEN the reaper fires without
+    sleeping on real wall-clock intervals (non-flaky)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reclaim_calls = 0
+
+    async def reclaim_stale_jobs(self, **kwargs):  # type: ignore[override]
+        self.reclaim_calls += 1
+        return await super().reclaim_stale_jobs(**kwargs)
+
+
+class _EmptyDispatch:
+    """Dispatch double that's never invoked — the queue stays empty so
+    run_one_cycle returns None every tick."""
+
+    async def execute_job(self, job: JobRecord):  # pragma: no cover - never called
+        raise AssertionError("dispatch should not run on an empty queue")
+
+
+@pytest.mark.unit
+async def test_maybe_reap_throttles_on_interval() -> None:
+    """_maybe_reap only fires once the reap interval has elapsed; before
+    that it's a no-op and leaves last_reap untouched."""
+    storage = _ReaperSpyStorage()
+    await storage.init()
+    worker = Worker(
+        storage=storage,
+        dispatch=_EmptyDispatch(),  # type: ignore[arg-type]
+        config=WorkerConfig(reap_interval_seconds=60.0),
+    )
+
+    base = datetime.now(UTC)
+    # 30s after last reap — under the 60s interval → no reap, last_reap unchanged.
+    last_reap = await worker._maybe_reap(now=base, last_reap=base - timedelta(seconds=30))
+    assert storage.reclaim_calls == 0
+    assert last_reap == base - timedelta(seconds=30)
+
+    # 90s after last reap — interval elapsed → reaps, last_reap advances to now.
+    last_reap = await worker._maybe_reap(now=base, last_reap=base - timedelta(seconds=90))
+    assert storage.reclaim_calls == 1
+    assert last_reap == base
+
+
+@pytest.mark.unit
+async def test_maybe_reap_survives_storage_error() -> None:
+    """A reaper hiccup must NEVER kill the worker loop — _maybe_reap
+    swallows the error, logs, and still advances last_reap so a
+    persistently-failing reaper doesn't busy-loop."""
+
+    class _BoomStorage(InMemoryStorage):
+        async def reclaim_stale_jobs(self, **kwargs):  # type: ignore[override]
+            raise RuntimeError("storage down")
+
+    storage = _BoomStorage()
+    await storage.init()
+    worker = Worker(
+        storage=storage,
+        dispatch=_EmptyDispatch(),  # type: ignore[arg-type]
+        config=WorkerConfig(reap_interval_seconds=1.0),
+    )
+
+    base = datetime.now(UTC)
+    # Interval elapsed → tries to reap, storage raises; _maybe_reap must
+    # NOT propagate and must still return `now` (advance the throttle).
+    last_reap = await worker._maybe_reap(now=base, last_reap=base - timedelta(seconds=10))
+    assert last_reap == base
+
+
+@pytest.mark.unit
+async def test_run_forever_invokes_reaper() -> None:
+    """run_forever runs the reaper at least once (it starts the throttle
+    fully-elapsed so a freshly-booted worker recovers orphans on the
+    first tick)."""
+    storage = _ReaperSpyStorage()
+    await storage.init()
+    worker = Worker(
+        storage=storage,
+        dispatch=_EmptyDispatch(),  # type: ignore[arg-type]
+        config=WorkerConfig(poll_interval_seconds=10.0, reap_interval_seconds=60.0),
+    )
+
+    stop = asyncio.Event()
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.05)
+        stop.set()
+
+    await asyncio.gather(worker.run_forever(stop), stop_soon())
+    # At least the first-tick reap fired.
+    assert storage.reclaim_calls >= 1

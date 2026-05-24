@@ -14,6 +14,8 @@ SKIP LOCKED``) so two workers never dispatch the same job.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import signal
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +25,7 @@ from rich.console import Console
 
 from movate.cli._console import hint, success
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
+from movate.core.job_retry import DEFAULT_VISIBILITY_TIMEOUT_SECONDS
 from movate.core.models import JobRecord, JobStatus
 from movate.core.notify import build_dispatcher
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
@@ -30,6 +33,43 @@ from movate.runtime.registry import scan_agents, scan_workflows
 from movate.runtime.worker import Worker, WorkerConfig
 
 err = Console(stderr=True)
+logger = logging.getLogger(__name__)
+
+# Operators override the reaper's visibility timeout via this env var.
+# The MDK_*↔MOVATE_* alias shim (sync_env_aliases, run at CLI startup)
+# already bridges the legacy MOVATE_ prefix, so we only read MDK_ here.
+_VISIBILITY_TIMEOUT_ENV = "MDK_JOB_VISIBILITY_TIMEOUT_SECONDS"
+
+
+def _resolve_visibility_timeout() -> float:
+    """Read the visibility timeout from env, defaulting on missing/bad input.
+
+    A malformed or non-positive value falls back to the default rather
+    than failing the worker — a misconfigured env var shouldn't take a
+    queue worker down, and the default is a safe (generous) timeout.
+    """
+    raw = os.environ.get(_VISIBILITY_TIMEOUT_ENV)
+    if not raw:
+        return DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number — using default %.0fs",
+            _VISIBILITY_TIMEOUT_ENV,
+            raw,
+            DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+    if value <= 0:
+        logger.warning(
+            "%s=%r must be positive — using default %.0fs",
+            _VISIBILITY_TIMEOUT_ENV,
+            raw,
+            DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+    return value
 
 
 def worker(
@@ -132,6 +172,7 @@ async def _run_worker(
     config = WorkerConfig(
         poll_interval_seconds=poll_interval,
         tenant_id=tenant_id,
+        visibility_timeout_seconds=_resolve_visibility_timeout(),
     )
 
     def on_job_complete(job: JobRecord, outcome: DispatchOutcome, duration_ms: int) -> None:
