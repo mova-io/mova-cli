@@ -48,6 +48,13 @@ import sys
 
 from movate.tracing.base import SpanCtx, Tracer
 from movate.tracing.composite import CompositeTracer
+from movate.tracing.metrics import (
+    dec_in_flight,
+    inc_in_flight,
+    init_metrics,
+    record_job_completed,
+    record_run_usage,
+)
 from movate.tracing.null import SilentTracer
 from movate.tracing.propagation import (
     attach_trace_context,
@@ -72,8 +79,13 @@ __all__ = [
     "attach_trace_context",
     "build_tracer",
     "continue_trace_context",
+    "dec_in_flight",
     "detach_trace_context",
+    "inc_in_flight",
+    "init_metrics",
     "inject_current_trace_context",
+    "record_job_completed",
+    "record_run_usage",
 ]
 
 # Valid values for the ADR-015 deployment sink selector.

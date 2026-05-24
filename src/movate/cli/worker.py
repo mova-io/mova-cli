@@ -136,6 +136,14 @@ async def _run_worker(
     poll_interval: float,
     mock: bool,
 ) -> None:
+    from movate.tracing import init_metrics  # noqa: PLC0415
+
+    # Initialize OTel metrics once at worker startup (R3 / item 33), after
+    # dotenv + MDK_*→MOVATE_* alias sync (both run at CLI import in main.py).
+    # Mirrors the tracer wiring; a complete no-op when the otel extra is absent
+    # or the OTLP sink/endpoint isn't configured. Never raises.
+    init_metrics()
+
     rt = await build_local_runtime(mock=mock)
 
     agents = scan_agents(agents_path)
