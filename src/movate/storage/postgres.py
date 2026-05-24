@@ -527,6 +527,17 @@ CREATE TABLE IF NOT EXISTS canary_configs (
 -- with no canary in play) read back as NULL → None → resolve latest,
 -- unchanged. ADD COLUMN IF NOT EXISTS keeps it idempotent on every init.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_version TEXT;
+
+-- ADR 017 D5 (PR 1): HITL pause checkpoint on workflow_runs. When a workflow
+-- pauses at a HUMAN gate the runner stamps these three columns; PR 2's
+-- resume-on-signal path reads them to continue. All nullable — existing rows
+-- (and every non-paused SUCCESS/ERROR run) read back as NULL → None, so the
+-- change is additive + backward compatible. paused_state / human_task are
+-- JSONB (same codec as workflow_runs.initial_state). ADD COLUMN IF NOT EXISTS
+-- keeps it idempotent on every init.
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_node_id TEXT;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_state JSONB;
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS human_task JSONB;
 """
 
 
@@ -1400,8 +1411,8 @@ class PostgresProvider:
             INSERT INTO workflow_runs (
                 workflow_run_id, tenant_id, workflow, workflow_version,
                 status, initial_state, final_state, error_node_id, error,
-                created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                created_at, paused_node_id, paused_state, human_task
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             """,
             w.workflow_run_id,
             w.tenant_id,
@@ -1413,6 +1424,9 @@ class PostgresProvider:
             w.error_node_id,
             w.error.model_dump() if w.error else None,
             w.created_at,
+            w.paused_node_id,
+            w.paused_state,
+            w.human_task,
         )
 
     async def get_workflow_run(
@@ -2618,6 +2632,11 @@ def _row_to_workflow_run(row: asyncpg.Record) -> WorkflowRunRecord:
         error_node_id=row["error_node_id"],
         error=ErrorInfo.model_validate(dict(row["error"])) if row["error"] else None,
         created_at=row["created_at"],
+        # ADR 017 D5 (PR 1): HITL checkpoint. NULL on pre-migration / non-paused
+        # rows → None, so old records load unchanged.
+        paused_node_id=row["paused_node_id"],
+        paused_state=dict(row["paused_state"]) if row["paused_state"] else None,
+        human_task=dict(row["human_task"]) if row["human_task"] else None,
     )
 
 

@@ -265,6 +265,61 @@ edges: []
     assert outcome.result_run_id is not None
 
 
+@pytest.mark.unit
+async def test_dispatch_workflow_paused_maps_to_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 017 D5 (PR 1): a workflow that pauses at a HUMAN gate yields a
+    PAUSED WorkflowResult. Dispatch maps that → JobStatus.SUCCESS (no new
+    JobStatus) and surfaces the workflow_run_id as result_run_id (the durable
+    handle PR 2's resume job loads)."""
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from movate.core.models import WorkflowStatus  # noqa: PLC0415
+    from movate.core.workflow import WorkflowGraph, WorkflowRunner  # noqa: PLC0415
+    from movate.core.workflow.runner import WorkflowResult  # noqa: PLC0415
+
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = _make_executor(storage)
+
+    # A placeholder graph object — only its presence in the registry matters;
+    # the runner is monkeypatched to return a PAUSED result.
+    graph = WorkflowGraph(
+        name="approval-flow",
+        version="0.1.0",
+        description="",
+        state_schema={"type": "object"},
+        entrypoint="first",
+        nodes={},
+        edges=[],
+        workflow_dir=_Path("/"),
+    )
+
+    async def _fake_run(self, graph, initial_state, **kwargs):
+        return WorkflowResult(
+            workflow_run_id="wf-paused-123",
+            status=WorkflowStatus.PAUSED,
+            initial_state=initial_state,
+            final_state={"text": "hi", "step1": "done"},
+        )
+
+    monkeypatch.setattr(WorkflowRunner, "run", _fake_run)
+
+    dispatch = WorkerDispatch(
+        storage=storage,
+        executor=executor,
+        agents=[],
+        workflows={"approval-flow": graph},
+    )
+    job = _make_job(kind=JobKind.WORKFLOW, target="approval-flow", input_payload={"text": "hi"})
+    outcome = await dispatch.execute_job(job)
+
+    assert outcome.status is JobStatus.SUCCESS
+    assert outcome.result_run_id == "wf-paused-123"
+    assert outcome.error is None
+
+
 # ---------------------------------------------------------------------------
 # Worker loop — claim + update
 # ---------------------------------------------------------------------------

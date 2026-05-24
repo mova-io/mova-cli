@@ -1706,6 +1706,12 @@ class WorkflowStatus(StrEnum):
     SUCCESS = "success"
     ERROR = "error"
     """Terminal: at least one node failed; partial state retained."""
+    PAUSED = "paused"
+    """Non-terminal: the runner reached a ``HUMAN`` gate node (ADR 017 D5),
+    persisted a durable checkpoint, and stopped. Resumable — PR 2's
+    resume-on-signal path loads the checkpoint, merges the human's decision,
+    and continues from the gate's successor. Distinct from ``SUCCESS``
+    (ran to the sink) and ``ERROR`` (a node failed)."""
 
 
 class WorkflowRunRecord(BaseModel):
@@ -1713,6 +1719,14 @@ class WorkflowRunRecord(BaseModel):
 
     Each child agent run carries this id in its ``workflow_run_id`` field;
     join on that to reconstruct the timeline.
+
+    HITL checkpoint (ADR 017 D5): when ``status`` is ``PAUSED`` the three
+    ``paused_*`` / ``human_task`` fields below carry the durable checkpoint
+    that PR 2's resume-on-signal path consumes — the node the runner paused
+    at, the state captured at that gate, and the human-task spec shown to the
+    operator. They are nullable + additive: a non-paused record (SUCCESS or
+    ERROR) leaves them ``None``, so existing rows and code paths are
+    byte-for-byte unchanged.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1727,6 +1741,24 @@ class WorkflowRunRecord(BaseModel):
     error_node_id: str | None = None
     error: ErrorInfo | None = None
     created_at: datetime = Field(default_factory=_now)
+
+    # --- HITL checkpoint (ADR 017 D5, PR 1) -------------------------------
+    # Populated only on a PAUSED record. PR 2 (resume-on-signal) reads these
+    # to reconstruct the runner state and continue from the gate's successor.
+    paused_node_id: str | None = None
+    """ID of the ``HUMAN`` node the runner paused at. PR 2 resumes from this
+    node's successor once the human's decision is merged."""
+    paused_state: dict[str, Any] | None = None
+    """The workflow state captured at the gate (post-merge of every node up to
+    but NOT including the human node). PR 2 merges the human's response into
+    this and continues. Mirrors ``final_state`` on a paused record but kept as
+    a distinct field so the checkpoint's intent is explicit and PR 2 doesn't
+    overload the dual-purpose ``final_state``."""
+    human_task: dict[str, Any] | None = None
+    """The human-task spec for the gate: ``{"prompt": <str>, "output_contract":
+    [<state keys the human's response contributes>]}``. PR 2 renders this to
+    the operator (Teams card / API) and validates the returned decision
+    against ``output_contract`` before merging into ``paused_state``."""
 
 
 class EvalRecord(BaseModel):

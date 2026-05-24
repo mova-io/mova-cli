@@ -411,6 +411,134 @@ async def test_runner_partial_failure_at_node_2(
 
 
 # ---------------------------------------------------------------------------
+# HITL pause at a HUMAN gate (ADR 017 D5, PR 1)
+# ---------------------------------------------------------------------------
+
+
+def _scaffold_agent_human_agent(tmp_path: Path) -> Path:
+    """text → first(agent: step1) → gate(human) → second(agent: step2).
+
+    The runner should execute ``first``, pause at ``gate``, and NEVER run
+    ``second`` (PR 1 stops at the gate; PR 2 resumes from its successor).
+    """
+    workflow_dir = tmp_path / "wf"
+    _make_agent(
+        workflow_dir / "agents" / "first", name="first-agent", input_key="text", output_key="step1"
+    )
+    _make_agent(
+        workflow_dir / "agents" / "second",
+        name="second-agent",
+        input_key="step1",
+        output_key="step2",
+    )
+    return _make_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            {
+                "id": "gate",
+                "type": "human",
+                "prompt": "Approve before step 2?",
+                "output_contract": ["decision"],
+            },
+            {"id": "second", "type": "agent", "ref": "./agents/second"},
+        ],
+        edges=[{"from": "first", "to": "gate"}, {"from": "gate", "to": "second"}],
+    )
+
+
+@pytest.mark.unit
+async def test_runner_pauses_at_human_gate(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    yaml_path = _scaffold_agent_human_agent(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+
+    runner = _build_runner_simple(storage, tracer, pricing, response='{"step1": "alpha"}')
+    result = await runner.run(graph, initial_state={"text": "seed"})
+
+    # The workflow paused — not SUCCESS, not ERROR.
+    assert result.status is WorkflowStatus.PAUSED
+    # State reflects the post-first-agent merge (step1 present), and step2 is
+    # absent because the second agent NEVER ran.
+    assert result.final_state == {"text": "seed", "step1": "alpha"}
+    assert "step2" not in result.final_state
+    # Exactly one node executed (the first agent) — the gate executed nothing.
+    assert len(result.runs) == 1
+    assert result.runs[0].node_id == "first"
+
+    # The durable checkpoint persisted with PAUSED status + the full handle PR 2
+    # resumes from.
+    assert len(storage.workflow_runs) == 1
+    wf = storage.workflow_runs[0]
+    assert wf.workflow_run_id == result.workflow_run_id
+    assert wf.status is WorkflowStatus.PAUSED
+    assert wf.paused_node_id == "gate"
+    assert wf.paused_state == {"text": "seed", "step1": "alpha"}
+    assert wf.human_task == {
+        "prompt": "Approve before step 2?",
+        "output_contract": ["decision"],
+    }
+    # Tenant correctly stamped on the paused record.
+    assert wf.tenant_id == runner._tenant_id
+
+    # The second agent did NOT run: no per-node RunRecord exists for it past the
+    # gate. (Only the first agent's executor-persisted row is present.)
+    rows = await storage.list_runs(workflow_run_id=result.workflow_run_id)
+    assert {r.node_id for r in rows} == {"first"}
+    assert all(r.node_id != "second" for r in rows)
+
+
+@pytest.mark.unit
+async def test_human_free_workflow_unchanged_regression(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """No-regression guard: a workflow with NO human gate still runs to SUCCESS
+    exactly as before — the pause branch is inert when no gate is present."""
+    yaml_path = _scaffold_two_step(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+
+    class TwoOutputs(BaseLLMProvider):
+        name = "two"
+        version = "0.0.1"
+
+        async def complete(self, request: CompletionRequest) -> CompletionResponse:
+            body = request.messages[0].content
+            if "step1" in body and "step2" not in body:
+                return CompletionResponse(text='{"step1": "x"}')
+            return CompletionResponse(text='{"step2": "y"}')
+
+        async def stream(self, request):  # pragma: no cover
+            raise NotImplementedError
+
+        async def embed(self, text, *, model):  # pragma: no cover
+            raise NotImplementedError
+
+    executor = Executor(provider=TwoOutputs(), pricing=pricing, storage=storage, tracer=tracer)
+    runner = WorkflowRunner(executor=executor, storage=storage)
+    result = await runner.run(graph, initial_state={"text": "seed"})
+
+    assert result.status is WorkflowStatus.SUCCESS
+    assert result.final_state == {"text": "seed", "step1": "x", "step2": "y"}
+    assert len(result.runs) == 2
+    # The persisted record is a plain SUCCESS run with no checkpoint fields set.
+    assert len(storage.workflow_runs) == 1
+    wf = storage.workflow_runs[0]
+    assert wf.status is WorkflowStatus.SUCCESS
+    assert wf.paused_node_id is None
+    assert wf.paused_state is None
+    assert wf.human_task is None
+
+
+# ---------------------------------------------------------------------------
 # State projection: only schema-named keys reach the agent
 # ---------------------------------------------------------------------------
 

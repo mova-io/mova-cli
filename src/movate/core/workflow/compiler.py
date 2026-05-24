@@ -27,7 +27,12 @@ from movate.core.workflow.ir import (
     WorkflowGraph,
     WorkflowNode,
 )
-from movate.core.workflow.spec import AgentNodeSpec, IntentRouterNodeSpec, WorkflowSpec
+from movate.core.workflow.spec import (
+    AgentNodeSpec,
+    HumanNodeSpec,
+    IntentRouterNodeSpec,
+    WorkflowSpec,
+)
 
 
 class WorkflowCompileError(Exception):
@@ -85,6 +90,32 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
                     "fallback": ns.fallback,
                     "classifier_agent": ns.classifier_agent,
                     "input_field": ns.input_field,
+                },
+            )
+        elif isinstance(ns, HumanNodeSpec):
+            # HUMAN gate (ADR 017 D5). No file-system ref — the node carries
+            # its human-task spec in ``metadata``. The runner does NOT execute
+            # it: it pauses + persists a checkpoint there (PR 1) and PR 2
+            # resumes on an external signal. Validate the spec here so a
+            # malformed gate fails loud at compile time, mirroring how
+            # agent/intent-router config is checked.
+            prompt = ns.prompt.strip()
+            if not prompt:
+                raise WorkflowCompileError(
+                    f"human node {ns.id!r}: 'prompt' must be a non-empty string"
+                )
+            if not all(isinstance(k, str) and k for k in ns.output_contract):
+                raise WorkflowCompileError(
+                    f"human node {ns.id!r}: 'output_contract' must be a list of "
+                    f"non-empty state-key strings"
+                )
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.HUMAN,
+                ref="",  # unused for human gates
+                metadata={
+                    "prompt": prompt,
+                    "output_contract": list(ns.output_contract),
                 },
             )
         else:
@@ -228,18 +259,24 @@ def validate_linear(graph: WorkflowGraph) -> None:
     Synthetic CONDITIONAL edges injected by the compiler for intent-router
     route targets are also exempt from the sequential-only edge check.
 
+    ADR 017 D5 (PR 1): ``human`` (HITL gate) nodes (``NodeType.HUMAN``) are
+    now also permitted — the runner pauses + persists a durable checkpoint
+    at a human gate rather than executing it. TOOL / FUNCTION / sub-workflow
+    node types remain rejected (they land in later phases).
+
     Replaceable: v0.4+ phases can call a different validator (or none)
     against the same :class:`WorkflowGraph` without modifying the IR or
     the structural compiler.
     """
-    # Node types — agent + intent-router. Most specific user-facing failure first.
-    _allowed_types = {NodeType.AGENT, NodeType.INTENT_ROUTER}
+    # Node types — agent + intent-router + human (HITL gate). Tools/functions/
+    # sub-workflows are still rejected. Most specific user-facing failure first.
+    _allowed_types = {NodeType.AGENT, NodeType.INTENT_ROUTER, NodeType.HUMAN}
     bad_types = sorted(n.id for n in graph.nodes.values() if n.type not in _allowed_types)
     if bad_types:
         raise WorkflowCompileError(
-            f"v0.3 supports only type=agent and type=intent-router nodes; "
+            f"v0.3 supports only type=agent, type=intent-router, and type=human nodes; "
             f"offenders: {', '.join(bad_types)}. "
-            f"Tools/HITL/sub-workflows land in v1.1+."
+            f"Tools/sub-workflows land in v1.1+."
         )
 
     # Edge kinds — sequential only, EXCEPT synthetic conditional edges from
