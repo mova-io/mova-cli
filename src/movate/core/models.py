@@ -1780,6 +1780,22 @@ class EvalRecord(BaseModel):
     pass_rate: float
     sample_count: int
     total_cost_usd: float
+    dimension_means: dict[str, float] | None = None
+    """Per-dimension mean scores (0.0-1.0) across the eval's cases (item 24).
+
+    Maps a :class:`movate.core.eval.Dimension` name (e.g. ``"faithfulness"``,
+    ``"coverage"``, ``"safety"``) to its mean over the cases/runs where that
+    dimension was scored. A dimension that *no* case scored is omitted from
+    the dict entirely (never stored as ``0.0``); the aggregate ``mean_score``
+    above stays the gate-relevant headline.
+
+    Additive + nullable: ``None`` for legacy ``EvalRecord`` rows persisted
+    before this field existed (and for any record built without dimensional
+    scoring). Drift detection (:func:`movate.core.drift.detect_drift`) uses it
+    to catch a single-dimension regression the aggregate would mask, and falls
+    back to aggregate-only comparison when either side is ``None`` — so
+    pre-item-24 behaviour is byte-for-byte unchanged.
+    """
     created_at: datetime = Field(default_factory=_now)
 
 

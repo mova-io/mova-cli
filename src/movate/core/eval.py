@@ -439,6 +439,37 @@ class DimensionalMeans:
     ux_tone: float | None = None
     task_success: float | None = None
 
+    def as_dict(self) -> dict[str, float]:
+        """Scored dims as a ``{Dimension name: mean}`` dict, skipping unscored.
+
+        Drops every field whose mean is ``None`` (the dim was not scored by
+        any case), so a dimension is *absent* rather than stored as ``0.0``.
+        Keys are the :class:`Dimension` enum values. This is what
+        :meth:`EvalSummary.to_record` persists onto
+        :attr:`movate.core.models.EvalRecord.dimension_means` (item 24) for
+        per-dimension drift detection.
+        """
+        return {
+            name: value
+            for name, value in (
+                (Dimension.ACCURACY.value, self.accuracy),
+                (Dimension.FAITHFULNESS.value, self.faithfulness),
+                (Dimension.COVERAGE.value, self.coverage),
+                (Dimension.LATENCY.value, self.latency),
+                (Dimension.CONTEXT_COMPLIANCE.value, self.context_compliance),
+                (Dimension.REFUSAL.value, self.refusal),
+                (Dimension.RETRIEVAL_ACCURACY.value, self.retrieval_accuracy),
+                (Dimension.COMPLETENESS.value, self.completeness),
+                (Dimension.TOOL_USAGE.value, self.tool_usage),
+                (Dimension.WORKFLOW_ADHERENCE.value, self.workflow_adherence),
+                (Dimension.CONSISTENCY.value, self.consistency),
+                (Dimension.SAFETY.value, self.safety),
+                (Dimension.UX_TONE.value, self.ux_tone),
+                (Dimension.TASK_SUCCESS.value, self.task_success),
+            )
+            if value is not None
+        }
+
 
 # ---------------------------------------------------------------------------
 # Weighted 10-category scorecard (movate-evals parity)
@@ -552,6 +583,15 @@ class EvalSummary:
         return self.sample_count > 0 and all(c.passed for c in self.cases)
 
     def to_record(self, *, tenant_id: str = "local") -> EvalRecord:
+        # item 24: project the per-dimension means (already aggregated in
+        # ``dimensional_means`` by ``_compute_dimensional_means``) onto the
+        # persisted record. Unscored dims are omitted (never stored as 0.0);
+        # an empty projection (e.g. a legacy exact-match dataset that scored
+        # no dimension) persists as ``None`` so the record is indistinguishable
+        # from a pre-item-24 row — drift then falls back to aggregate-only.
+        dim_means = {
+            name: round(value, 6) for name, value in self.dimensional_means.as_dict().items()
+        }
         return EvalRecord(
             eval_id=str(uuid4()),
             tenant_id=tenant_id,
@@ -567,6 +607,7 @@ class EvalSummary:
             pass_rate=round(self.pass_rate, 6),
             sample_count=self.sample_count,
             total_cost_usd=self.total_cost_usd,
+            dimension_means=dim_means or None,
         )
 
 

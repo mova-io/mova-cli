@@ -567,6 +567,13 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_jobs_batch "
         "ON jobs(tenant_id, batch_id) WHERE batch_id IS NOT NULL"
     ),
+    # item 24: per-dimension eval means. A JSON column ({dim: mean}) so drift
+    # detection can compare per-dimension, catching a single-dimension
+    # regression the aggregate mean_score would mask. Nullable — pre-item-24
+    # rows read back as NULL → None, and detect_drift then falls back to the
+    # aggregate-only path, byte-for-byte the old behaviour. Mirrors the
+    # target_version additive-column pattern above.
+    "ALTER TABLE evals ADD COLUMN dimension_means TEXT",
 ]
 
 
@@ -761,8 +768,19 @@ class SqliteProvider:
         return [_row_to_run(r) for r in rows]
 
     async def save_eval(self, e: EvalRecord) -> None:
+        # Explicit column list (not positional) so the additive
+        # ``dimension_means`` column (item 24, appended by the migration) is
+        # written by name — robust to column ordering. NULL when the record
+        # carries no per-dimension means (legacy / exact-match datasets).
         await self._db.execute(
-            "INSERT INTO evals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO evals (
+                eval_id, tenant_id, agent, agent_version, dataset_hash,
+                judge_method, judge_provider, runs_per_case, gate_mode,
+                threshold, mean_score, pass_rate, sample_count,
+                total_cost_usd, created_at, dimension_means
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 e.eval_id,
                 e.tenant_id,
@@ -779,6 +797,7 @@ class SqliteProvider:
                 e.sample_count,
                 e.total_cost_usd,
                 e.created_at.isoformat(),
+                json.dumps(e.dimension_means) if e.dimension_means is not None else None,
             ),
         )
         await self._db.commit()
@@ -2601,6 +2620,11 @@ def _row_to_agent_bundle(row: aiosqlite.Row) -> AgentBundleRecord:
 
 
 def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
+    # item 24 per-dimension means. init() has run the ALTER by the time we
+    # read here; .get() stays defensive against a row read on a connection
+    # that somehow predates the migration — such a row is a pre-item-24 eval,
+    # which is exactly None (drift falls back to aggregate-only).
+    raw_dim_means = dict(row).get("dimension_means")
     return EvalRecord(
         eval_id=row["eval_id"],
         tenant_id=row["tenant_id"],
@@ -2617,6 +2641,7 @@ def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
         sample_count=row["sample_count"],
         total_cost_usd=row["total_cost_usd"],
         created_at=datetime.fromisoformat(row["created_at"]),
+        dimension_means=json.loads(raw_dim_means) if raw_dim_means else None,
     )
 
 
