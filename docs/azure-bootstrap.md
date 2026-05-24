@@ -177,6 +177,39 @@ to lock in the grants that were deferred because their resources didn't
 exist on the first pass — **AcrPush** on the ACR and **Key Vault
 Secrets Officer** on the KV.
 
+### Optional: App Insights / OTel Collector (two-pass)
+
+Routing the runtime's OpenTelemetry traces to Application Insights is opt-in
+(`enableAppInsights`) and is itself a **two-pass** flow, because the App
+Insights connection string only exists *after* the component is created. The
+runtime stays generic-OTLP (ADR 001); an in-cluster OTel Collector translates
+to App Insights via its `azuremonitor` exporter (`api/worker → otel-collector →
+App Insights`). See ADR 020 for why we don't use ACA's managed OpenTelemetry
+(its App Insights destination fails on live ACA).
+
+1. **Pass 1 — create the component.** In the param file set
+   `enableAppInsights = true` and leave `appInsightsConnectionString = ''`,
+   then deploy. This creates the workspace-linked App Insights component but
+   the collector + app trace-wiring stay gated off (empty connection string).
+2. **Read the connection string** from the created component:
+   ```bash
+   az monitor app-insights component show \
+       -g movate-<env>-rg -a movate-<env>-appi \
+       --query connectionString -o tsv
+   ```
+3. **Pass 2 — bring up the collector.** Set
+   `appInsightsConnectionString = '<that value>'` in the param file and
+   re-deploy. The OTel Collector Container App comes up (internal ingress,
+   :4318) and the api/worker get `MDK_TRACE_SINK=otlp` +
+   `OTEL_EXPORTER_OTLP_ENDPOINT=https://<collector-fqdn>` so spans flow to App
+   Insights.
+
+The connection string is passed as a **plain** Bicep param (not a Key Vault
+secret / `@secure()`): it carries a write-only ingestion key, is never emitted
+as a deployment output, and ARM omits `@secure()` params during preflight —
+which is exactly when ACA needs to see the value. With `enableAppInsights =
+false` (the default) none of this is emitted.
+
 ## 5. Mint the first runtime API key
 
 `mdk auth create-key` runs against whichever storage backend the
