@@ -586,6 +586,15 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_jobs_batch "
         "ON jobs(tenant_id, batch_id) WHERE batch_id IS NOT NULL"
     ),
+    # item 32 (ADR 019): W3C trace-context carrier captured at enqueue so the
+    # worker can continue the originating distributed trace (submit → execute
+    # as ONE trace). Stored as JSON text (a dict[str,str] of
+    # traceparent/tracestate) — storage never imports OTel. Nullable — pre-R2
+    # rows (and any job enqueued with OTel off) read back as NULL → {} → the
+    # worker starts a fresh root span, byte-for-byte the pre-R2 behaviour. The
+    # duplicate-column guard in init() keeps this idempotent on re-run (mirrors
+    # the target_version additive-column pattern above).
+    "ALTER TABLE jobs ADD COLUMN trace_context TEXT",
     # item 24: per-dimension eval means. A JSON column ({dim: mean}) so drift
     # detection can compare per-dimension, catching a single-dimension
     # regression the aggregate mean_score would mask. Nullable — pre-item-24
@@ -1588,8 +1597,9 @@ class SqliteProvider:
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
-                target_version, resume_workflow_run_id, batch_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target_version, resume_workflow_run_id, batch_id,
+                trace_context
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -1611,6 +1621,9 @@ class SqliteProvider:
                 job.target_version,
                 job.resume_workflow_run_id,
                 job.batch_id,
+                # item 32 (ADR 019): W3C trace-context carrier as JSON text.
+                # Empty dict {} when OTel was off / no active span at enqueue.
+                json.dumps(job.trace_context),
             ),
         )
         await self._db.commit()
@@ -2999,6 +3012,12 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # here; .get() stays defensive against a pre-batch row, which is a
         # non-batch job — exactly None.
         batch_id=dict(row).get("batch_id"),
+        # item 32 (ADR 019): W3C trace-context carrier (JSON text). init() has
+        # run the ALTER by the time we read here; NULL (pre-R2 row, or a job
+        # enqueued with OTel off) → {} so the worker starts a fresh root span,
+        # byte-for-byte the pre-R2 behaviour. .get() stays defensive against a
+        # row predating the migration.
+        trace_context=_loads_trace_context(dict(row).get("trace_context")),
     )
 
 
@@ -3057,6 +3076,24 @@ def _decode_scopes(raw: object) -> list[str]:
         if isinstance(decoded, list):
             return [str(s) for s in decoded]
     return []
+
+
+def _loads_trace_context(raw: object) -> dict[str, str]:
+    """Decode the JSON-encoded ``jobs.trace_context`` column → carrier dict.
+
+    Tolerant of NULL/empty (pre-R2 rows, or a job enqueued with OTel off →
+    ``{}`` so the worker starts a fresh root span) and of a malformed value
+    (defensive — should always be a JSON object of ``str → str``)."""
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if isinstance(decoded, dict):
+            return {str(k): str(v) for k, v in decoded.items()}
+    return {}
 
 
 def _first_of_month_utc() -> datetime:

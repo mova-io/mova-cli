@@ -2163,6 +2163,17 @@ class JobRecord(BaseModel):
     batch", byte-for-byte the pre-batch path. Additive + nullable: pre-batch
     rows read back as ``None``. Mirrors the ``target_version`` /
     ``resume_workflow_run_id`` additive-column pattern above."""
+    trace_context: dict[str, str] = Field(default_factory=dict)
+    """W3C trace-context carrier (traceparent/tracestate) captured at enqueue
+    so the worker can continue the originating distributed trace. Empty = no
+    propagated parent (pre-R2 rows, or OTel not active) → the worker starts a
+    fresh root span (today's behavior). Populated explicitly at the enqueue
+    edge via :func:`movate.tracing.inject_current_trace_context` — NOT via an
+    ambient-capturing default_factory (no implicit magic); the default is an
+    empty dict. The worker re-attaches it via
+    :func:`movate.tracing.continue_trace_context` before starting the job's
+    root span (ADR 019, item 32). Additive + JSONB/TEXT column: pre-R2 rows
+    read back as ``{}``."""
 
 
 class BatchRecord(BaseModel):

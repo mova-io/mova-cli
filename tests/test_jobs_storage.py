@@ -75,6 +75,50 @@ async def test_get_job_returns_none_for_missing(storage) -> None:
     assert await storage.get_job("ghost", tenant_id="tenant-a") is None
 
 
+# ---------------------------------------------------------------------------
+# trace_context round-trip (ADR 019, item 32) — additive JSONB/TEXT column.
+# Parametrized over memory + sqlite + postgres via the shared ``storage``
+# fixture (postgres skips when MOVATE_PG_TEST_URL is unset).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_trace_context_roundtrip_preserves_carrier(storage) -> None:
+    """A non-empty W3C carrier saved on a job survives a save/get round-trip
+    on every backend, so the worker can continue the originating trace."""
+    carrier = {
+        "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        "tracestate": "movate=1",
+    }
+    j = JobRecord(
+        job_id=str(uuid4()),
+        tenant_id="tenant-a",
+        kind=JobKind.AGENT,
+        target="demo-agent",
+        status=JobStatus.QUEUED,
+        input={"text": "hi"},
+        created_at=datetime.now(UTC),
+        trace_context=carrier,
+    )
+    await storage.save_job(j)
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.trace_context == carrier
+
+
+@pytest.mark.unit
+async def test_trace_context_defaults_empty_and_roundtrips(storage) -> None:
+    """Back-compat: a job with no carrier (the default — pre-R2 rows, or OTel
+    off at enqueue) round-trips as ``{}`` on every backend → the worker starts
+    a fresh root span, byte-for-byte the pre-R2 behaviour."""
+    j = _make_job()
+    assert j.trace_context == {}  # default_factory=dict, no ambient magic
+    await storage.save_job(j)
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.trace_context == {}
+
+
 @pytest.mark.unit
 async def test_list_jobs_filters_by_tenant_and_status(storage) -> None:
     a1 = _make_job(tenant_id="tenant-a", status=JobStatus.QUEUED)

@@ -30,6 +30,7 @@ from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.storage.base import StorageProvider
+from movate.tracing import continue_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -95,20 +96,34 @@ class WorkerDispatch:
 
     async def execute_job(self, job: JobRecord) -> DispatchOutcome:
         """Execute one job. Returns a :class:`DispatchOutcome` regardless
-        of success or user-facing failure."""
-        if job.kind == JobKind.AGENT:
-            return await self._execute_agent(job)
-        if job.kind == JobKind.WORKFLOW:
-            return await self._execute_workflow(job)
-        if job.kind == JobKind.EVAL:
-            return await self._execute_eval(job)
-        if job.kind == JobKind.BENCH:
-            return await self._execute_bench(job)
-        return _error(
-            "unknown_kind",
-            f"unsupported JobKind {job.kind!r}",
-            retryable=False,
-        )
+        of success or user-facing failure.
+
+        Trace continuation (ADR 019, item 32): the API stamped the originating
+        trace's W3C carrier onto ``job.trace_context`` at enqueue. Re-attach it
+        for the whole execution so the executor's / workflow runner's top-level
+        span — which the OtelTracer starts against the *ambient* current
+        context — nests under the originating distributed trace, joining
+        ``submit → queue-wait → claim → execute → result`` into ONE trace in
+        the APM. An empty carrier (pre-R2 job, or OTel off at enqueue) is a
+        complete no-op → a fresh root span, byte-for-byte the pre-R2 behaviour.
+        At-least-once note: if a job is reaped + retried, the SAME originating
+        context is re-attached on each attempt — every attempt's spans nest
+        under the original submit trace, which is the intended grouping.
+        """
+        with continue_trace_context(job.trace_context):
+            if job.kind == JobKind.AGENT:
+                return await self._execute_agent(job)
+            if job.kind == JobKind.WORKFLOW:
+                return await self._execute_workflow(job)
+            if job.kind == JobKind.EVAL:
+                return await self._execute_eval(job)
+            if job.kind == JobKind.BENCH:
+                return await self._execute_bench(job)
+            return _error(
+                "unknown_kind",
+                f"unsupported JobKind {job.kind!r}",
+                retryable=False,
+            )
 
     async def _resolve_bundle(self, job: JobRecord) -> AgentBundle | None:
         """Resolve ``job.target`` to a runnable bundle for ``job.tenant_id``.

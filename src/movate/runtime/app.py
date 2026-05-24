@@ -208,6 +208,7 @@ from movate.runtime.skill_creation import (
     persist_skill_bundle,
 )
 from movate.storage.base import StorageProvider
+from movate.tracing import inject_current_trace_context
 
 if TYPE_CHECKING:
     from movate.providers.model_catalog import ModelInfo
@@ -1418,6 +1419,8 @@ def build_app(
             input=body.input,
             api_key_id=ctx.api_key_id,
             notify_email=body.notify_email,
+            # ADR 019: capture the originating trace so the worker continues it.
+            trace_context=inject_current_trace_context(),
         )
         store: StorageProvider = request.app.state.storage
         await store.save_job(job)
@@ -3462,6 +3465,9 @@ def build_app(
             notify_email=body.notify_email,
             thread_id=body.thread_id,
             target_version=chosen_version,
+            # ADR 019: the submit→execute trace operators care about. Capture
+            # the originating trace so the worker continues it.
+            trace_context=inject_current_trace_context(),
         )
         await store.save_job(job)
         response.status_code = 202
@@ -3565,6 +3571,9 @@ def build_app(
         )
         await store.save_batch(batch)
 
+        # ADR 019: capture the originating submit trace once — every child job
+        # of this batch continues the same trace in its worker.
+        batch_trace_context = inject_current_trace_context()
         for row in rows:
             job = JobRecord(
                 job_id=str(uuid4()),
@@ -3576,6 +3585,7 @@ def build_app(
                 api_key_id=ctx.api_key_id,
                 notify_email=notify_email,
                 batch_id=batch_id,
+                trace_context=dict(batch_trace_context),
             )
             await store.save_job(job)
 
@@ -4010,6 +4020,9 @@ def build_app(
                     "regression_tolerance": body.regression_tolerance,
                 },
                 api_key_id=ctx.api_key_id,
+                # ADR 019: capture the originating trace so the worker
+                # continues it.
+                trace_context=inject_current_trace_context(),
             )
             await store.save_job(job)
             return EvalAcceptedView(
@@ -5216,6 +5229,8 @@ def build_app(
                 "mock": body.mock,
             },
             api_key_id=ctx.api_key_id,
+            # ADR 019: capture the originating trace so the worker continues it.
+            trace_context=inject_current_trace_context(),
         )
         await store.save_job(job)
         return BenchAcceptedView(
@@ -5592,6 +5607,9 @@ def build_app(
             input={},
             api_key_id=ctx.api_key_id,
             resume_workflow_run_id=workflow_run_id,
+            # ADR 019: the submit→execute workflow trace operators care about.
+            # Capture the originating trace so the worker continues it.
+            trace_context=inject_current_trace_context(),
         )
         await store.save_job(job)
         return RunAccepted(job_id=job.job_id, status=job.status)
@@ -6200,6 +6218,8 @@ def build_app(
             api_key_id=ctx.api_key_id,
             notify_email=body.notify_email,
             thread_id=thread_id,
+            # ADR 019: capture the originating trace so the worker continues it.
+            trace_context=inject_current_trace_context(),
         )
         await store.save_job(job)
 

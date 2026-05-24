@@ -149,3 +149,52 @@ async def test_agent_jobs_still_route_with_eval_dispatch(
     )
     outcome = await dispatch.execute_job(agent_job)
     assert outcome.status == JobStatus.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# ADR 019 (item 32) — trace continuation in the worker. execute_job wraps the
+# whole execution in continue_trace_context(job.trace_context); it must be a
+# complete no-op for the empty (back-compat / pre-R2) carrier and must not
+# crash for a populated carrier, with or without the OTel extra installed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "trace_context",
+    [
+        {},  # default — pre-R2 row / OTel off at enqueue → fresh root
+        {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"},
+    ],
+)
+async def test_execute_job_continues_trace_context_without_crash(
+    tmp_path: Path, storage: InMemoryStorage, pricing, trace_context
+) -> None:
+    """The worker re-attaches the job's trace_context for execution. Both an
+    empty carrier (back-compat) and a populated one execute successfully."""
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    provider = JudgeStubProvider(agent_response='{"message": "Hello!"}', judge_score=0.9)
+    executor = Executor(
+        provider=provider,
+        pricing=pricing,
+        storage=storage,
+        tracer=NullTracer(),
+    )
+    dispatch = WorkerDispatch(
+        storage=storage,
+        executor=executor,
+        agents=[bundle],
+        use_mock_for_eval=True,
+    )
+
+    agent_job = JobRecord(
+        job_id=str(uuid4()),
+        tenant_id="t",
+        kind=JobKind.AGENT,
+        target="demo",
+        input={"text": "hi"},
+        trace_context=trace_context,
+    )
+    outcome = await dispatch.execute_job(agent_job)
+    assert outcome.status == JobStatus.SUCCESS
