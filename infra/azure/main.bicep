@@ -171,6 +171,28 @@ param deployLangfuse bool = false
 param langfuseImage string = 'langfuse/langfuse:2'
 
 @description('''
+Provision a workspace-linked Application Insights component and route the
+runtime's OpenTelemetry traces to it via the Container Apps Environment's
+managed OpenTelemetry. When true: (1) an App Insights component is created
+in workspace-based mode against the EXISTING Log Analytics workspace (no new
+workspace), (2) the CAE's openTelemetryConfiguration points traces + logs at
+it — so ACA auto-injects OTEL_EXPORTER_OTLP_ENDPOINT into the api/worker
+containers, and (3) the api + worker get MDK_TRACE_SINK=otlp so movate's
+generic OtelTracer activates and ships spans to that injected endpoint. The
+app stays portable (ADR 001 — no Azure SDK; generic OTLP only).
+
+Off by default — purely additive (matches deployLangfuse / enableScheduler /
+enableTeamsBot). When false, ZERO new resources or env vars are emitted and
+the deployment is byte-for-byte unchanged. Two-pass-safe: enabling it on a
+later pass just adds the component + the OTel routing; it requires no KV
+secrets, so it can be flipped on independently of enableApiWorker. The
+scheduler Job is intentionally left untouched (managed-OTel injection into
+Container Apps Jobs is not guaranteed; an unset endpoint with an otlp sink
+would fail the tick loud).
+''')
+param enableAppInsights bool = false
+
+@description('''
 Cold-start knob for the API. Override for the API Container App's
 ``scale.minReplicas``. Leave at the ``-1`` sentinel (default) to keep
 the per-env default (``dev``/``staging`` = 1, ``prod`` = 2) — i.e. no
@@ -278,6 +300,9 @@ var workerUaiName = 'movate-${env}-worker-mi'
 var teamsBotUaiName = 'movate-${env}-teams-bot-mi'
 var langfuseName = 'movate-${env}-langfuse'
 var langfuseUaiName = 'movate-${env}-langfuse-mi'
+// RG-scoped — no global-uniqueness suffix needed (App Insights component
+// names only have to be unique within the resource group).
+var appInsightsName = 'movate-${env}-appi'
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -289,6 +314,21 @@ module logs 'modules/loganalytics.bicep' = {
     name: logName
     location: location
     retentionInDays: logRetentionDays
+    tags: tags
+  }
+}
+
+// Optional Application Insights (workspace-based) — the receiving end for
+// the runtime's OTLP traces. Gated on enableAppInsights (default off). Binds
+// to the EXISTING Log Analytics workspace via logs.outputs.workspaceId — no
+// new workspace. The connection string is threaded into the CAE module
+// below so ACA's managed OpenTelemetry exports spans here.
+module appInsights 'modules/appinsights.bicep' = if (enableAppInsights) {
+  name: 'appi-${env}'
+  params: {
+    name: appInsightsName
+    location: location
+    workspaceResourceId: logs.outputs.workspaceId
     tags: tags
   }
 }
@@ -341,6 +381,11 @@ module cae 'modules/containerapp-env.bicep' = {
       '2023-09-01'
     ).primarySharedKey
     isProd: isProd
+    // When App Insights is enabled, hand the CAE its connection string so
+    // the env's managed OpenTelemetry exports traces + logs there (and ACA
+    // auto-injects OTEL_EXPORTER_OTLP_ENDPOINT into the apps). Empty string
+    // (default) leaves the CAE's openTelemetryConfiguration unset entirely.
+    appInsightsConnectionString: enableAppInsights ? appInsights!.outputs.connectionString : ''
     tags: tags
   }
   // No explicit dependsOn — Bicep infers the dependency on `logs`
@@ -463,6 +508,11 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: apiUai.id
     corsAllowedOrigins: corsAllowedOrigins
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    // 'otlp' only when App Insights is on — the SAME flag that configures
+    // the CAE managed-OTel destination (which injects the OTLP endpoint).
+    // Gating both together guarantees the otlp sink always has an endpoint,
+    // so movate's fail-loud OtelTracer can't raise TraceSinkError.
+    traceSink: enableAppInsights ? 'otlp' : ''
     // Pass the CAE storage config name when Azure Files is enabled;
     // empty string means no volume mount (pod-local /app/agents).
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
@@ -491,6 +541,10 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: workerUai.id
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    // 'otlp' only when App Insights is on — see the api module above for
+    // why gating on the same flag as the CAE OTel destination keeps the
+    // fail-loud OtelTracer safe.
+    traceSink: enableAppInsights ? 'otlp' : ''
     tags: tags
   }
 }
@@ -740,3 +794,6 @@ output botServiceId string = enableTeamsBot ? botService!.outputs.botServiceId :
 
 @description('Self-hosted Langfuse URL. Empty when deployLangfuse=false. Open it to create a project + mint keys, then store them in KV as langfuse-public-key / langfuse-secret-key.')
 output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''
+
+@description('App Insights component name. Empty when enableAppInsights=false. The connection string is intentionally NOT output (it carries an ingestion key).')
+output appInsightsName string = enableAppInsights ? appInsights!.outputs.name : ''

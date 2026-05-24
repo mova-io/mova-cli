@@ -97,3 +97,13 @@ param corsAllowedOrigins = ''
 //   param workerMinReplicas = 1   // always-warm worker
 // param apiMinReplicas = -1
 // param workerMinReplicas = -1
+
+// OPTIONAL — provision a workspace-linked Application Insights component and
+// route the runtime's OpenTelemetry traces to it via the Container Apps
+// Environment's managed OpenTelemetry. When true: App Insights is created in
+// workspace-based mode against the EXISTING Log Analytics workspace, the CAE
+// exports traces + logs there (ACA auto-injects OTEL_EXPORTER_OTLP_ENDPOINT
+// into the api/worker), and the api + worker get MDK_TRACE_SINK=otlp so the
+// generic OtelTracer ships spans to that endpoint. Default false (purely
+// additive; no KV secrets required, so it can be flipped on any pass).
+// param enableAppInsights = false
