@@ -34,6 +34,7 @@ def _make_canary(
         enabled=True,
         auto_promote=True,
         eval_gate=0.9,
+        auto_rollback=True,
         created_by="key-xyz",
         created_at=created_at or datetime.now(UTC),
     )
@@ -65,6 +66,7 @@ async def test_save_and_get_round_trip(storage) -> None:
     assert got.enabled is True
     assert got.auto_promote is True
     assert got.eval_gate == 0.9
+    assert got.auto_rollback is True  # ADR 016 D5 column round-trips
     assert got.created_by == "key-xyz"
 
 
@@ -92,6 +94,7 @@ async def test_champion_version_none_round_trips(storage) -> None:
     assert got is not None
     assert got.champion_version is None
     assert got.eval_gate is None
+    assert got.auto_rollback is False  # default-off persists (alert-only)
 
 
 # ---------------------------------------------------------------------------

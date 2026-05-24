@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from movate.core.models import CanaryConfig, JobStatus
@@ -52,6 +53,8 @@ __all__ = [
     "bucket_for_thread",
     "choose_version",
     "is_active",
+    "rolled_back_config",
+    "should_auto_rollback",
 ]
 
 
@@ -64,6 +67,53 @@ def is_active(config: CanaryConfig | None) -> bool:
     "is anything being split?" can short-circuit on this.
     """
     return config is not None and config.enabled and config.weight > 0
+
+
+def should_auto_rollback(
+    config: CanaryConfig | None,
+    *,
+    regressed: bool,
+    evaluated_version: str | None,
+) -> bool:
+    """Whether a drift regression should auto-trip the canary kill switch.
+
+    Pure decision function for ADR 016 D5's *opt-in* auto-rollback: when a
+    scheduled-eval drift check finds a regression on the **challenger**, an
+    operator who has opted in wants traffic reverted to the champion instantly
+    (``weight`` → 0). Returns ``True`` only when **every** guard holds:
+
+    * ``config`` exists, is ``enabled``, and is ``auto_rollback`` (the opt-in
+      — default-off means alert-only, ADR 016 D5);
+    * the drift check ``regressed``;
+    * the eval that regressed was the ``challenger_version`` — a regression on
+      the champion (or any other version) is *not* a reason to kill a canary;
+    * ``config.weight > 0`` — there is live challenger traffic to pull back; a
+      canary already at the kill switch needs no rollback (idempotent / no-op).
+
+    No DB, no clock, no I/O — trivially unit-testable; the dispatch hook calls
+    this then persists :func:`rolled_back_config` on ``True``.
+    """
+    if config is None or not config.enabled or not config.auto_rollback:
+        return False
+    if not regressed:
+        return False
+    if evaluated_version is None or evaluated_version != config.challenger_version:
+        return False
+    return config.weight > 0
+
+
+def rolled_back_config(config: CanaryConfig) -> CanaryConfig:
+    """Return a copy of ``config`` with the kill switch tripped (``weight`` → 0).
+
+    The rollback action itself: route 100% of traffic back to the champion by
+    zeroing the weight, refreshing ``updated_at``. Champion and challenger
+    pins are preserved (rollback is a *pointer* move, never a version delete —
+    the challenger stays in the registry and the config so it can be
+    re-investigated or re-enabled). Mirrors the manual ``mdk canary off`` /
+    ``weight=0`` kill switch — :func:`choose_version` already routes a
+    ``weight == 0`` config 100% to the champion.
+    """
+    return config.model_copy(update={"weight": 0, "updated_at": datetime.now(UTC)})
 
 
 def bucket_for_thread(thread_id: str) -> int:

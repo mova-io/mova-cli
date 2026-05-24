@@ -508,6 +508,12 @@ _MIGRATIONS = [
         PRIMARY KEY (tenant_id, agent)
     )
     """,
+    # ADR 016 D5: opt-in auto-rollback. A scheduled-eval drift regression on
+    # the challenger trips the kill switch (weight → 0) when set. Additive +
+    # default-off (DEFAULT 0): pre-D5 canary rows read back as auto_rollback=
+    # False → alert-only, byte-for-byte the pre-D5 behavior. Placed after the
+    # CREATE so upgraders with an existing canary_configs table get the column.
+    "ALTER TABLE canary_configs ADD COLUMN auto_rollback INTEGER NOT NULL DEFAULT 0",
     # ADR 016 D3: carry the canary-chosen agent version to the async worker.
     # The enqueue path stamps the concrete champion/challenger version it
     # picked; the worker resolves THAT version. Nullable — pre-canary rows
@@ -1146,7 +1152,12 @@ class SqliteProvider:
         # Upsert on the (tenant_id, agent) primary key.
         await self._db.execute(
             """
-            INSERT INTO canary_configs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO canary_configs (
+                tenant_id, agent, challenger_version, champion_version, weight,
+                sticky, enabled, auto_promote, eval_gate, created_by,
+                created_at, updated_at, auto_rollback
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id, agent) DO UPDATE SET
                 challenger_version = excluded.challenger_version,
                 champion_version = excluded.champion_version,
@@ -1157,7 +1168,8 @@ class SqliteProvider:
                 eval_gate = excluded.eval_gate,
                 created_by = excluded.created_by,
                 created_at = excluded.created_at,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                auto_rollback = excluded.auto_rollback
             """,
             (
                 config.tenant_id,
@@ -1172,6 +1184,7 @@ class SqliteProvider:
                 config.created_by,
                 config.created_at.isoformat(),
                 config.updated_at.isoformat(),
+                int(config.auto_rollback),
             ),
         )
         await self._db.commit()
@@ -2658,6 +2671,7 @@ def _row_to_canary_config(row: aiosqlite.Row) -> CanaryConfig:
         enabled=bool(row["enabled"]),
         auto_promote=bool(row["auto_promote"]),
         eval_gate=row["eval_gate"],
+        auto_rollback=bool(row["auto_rollback"]),
         created_by=row["created_by"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),

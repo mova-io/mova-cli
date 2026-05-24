@@ -869,6 +869,10 @@ class CanarySetRequest(BaseModel):
     eval_gate: float | None = Field(default=None)
     """Min challenger quality required for auto-promote. Required (non-None)
     when ``auto_promote`` is true."""
+    auto_rollback: bool = Field(default=False)
+    """Opt-in: a scheduled-eval drift regression on the challenger auto-trips
+    the kill switch (``weight`` → 0), reverting to the champion. Default false
+    = alert-only (ADR 016 D5 safety default)."""
 
 
 class CanaryView(BaseModel):
@@ -884,6 +888,7 @@ class CanaryView(BaseModel):
     enabled: bool
     auto_promote: bool
     eval_gate: float | None = None
+    auto_rollback: bool = False
     created_at: str
     updated_at: str
 

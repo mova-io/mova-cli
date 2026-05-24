@@ -100,6 +100,35 @@ def test_set_json_round_trips(local_db: Path) -> None:
 
 
 @pytest.mark.unit
+def test_auto_rollback_defaults_off(local_db: Path) -> None:
+    runner.invoke(app, ["canary", "set", "bot", "--challenger", "2.0.0", "--weight", "25"])
+    cfg = asyncio.run(_get_canary("bot"))
+    assert cfg is not None
+    assert cfg.auto_rollback is False  # ADR 016 D5 safety default
+
+
+@pytest.mark.unit
+def test_auto_rollback_round_trips_through_set_and_status(local_db: Path) -> None:
+    r = runner.invoke(
+        app,
+        ["canary", "set", "bot", "--challenger", "2.0.0", "--weight", "25", "--auto-rollback"],
+    )
+    assert r.exit_code == 0, r.stdout + r.stderr
+    cfg = asyncio.run(_get_canary("bot"))
+    assert cfg is not None
+    assert cfg.auto_rollback is True
+
+    s = runner.invoke(app, ["canary", "status", "bot"])
+    assert s.exit_code == 0
+    assert "auto-rollback" in s.stdout
+    assert "yes" in s.stdout
+
+    # JSON status surfaces it too.
+    j = runner.invoke(app, ["canary", "status", "bot", "--format", "json"])
+    assert json.loads(j.stdout)["auto_rollback"] is True
+
+
+@pytest.mark.unit
 def test_auto_promote_without_gate_rejected(local_db: Path) -> None:
     r = runner.invoke(
         app,

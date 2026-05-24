@@ -2416,6 +2416,14 @@ class CanaryConfig(BaseModel):
     meaningful when ``auto_promote`` is true. ``None`` + ``auto_promote`` →
     the gate is unsatisfiable, so auto-promote is refused (fail-safe: never
     auto-ship without a measurable bar)."""
+    auto_rollback: bool = False
+    """Opt-in: when true, a scheduled-eval *regression on the
+    ``challenger_version``* auto-trips the kill switch (``weight`` → 0),
+    reverting all traffic to the champion. Default false = **alert-only** — a
+    drift alert *informs*, a human pulls the kill switch (ADR 016 D5 safety
+    default: "a drift alert informs; auto-rollback is opt-in, not default").
+    Rollback is the existing kill switch (``weight`` → 0), never a version
+    delete; the challenger row is retained for re-enable / audit."""
     created_by: str | None = None
     """Auth identity that created/updated the canary (ADR 013), or ``None``
     for a local/CLI write."""

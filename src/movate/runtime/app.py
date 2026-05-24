@@ -4500,6 +4500,7 @@ def build_app(
             enabled=c.enabled,
             auto_promote=c.auto_promote,
             eval_gate=c.eval_gate,
+            auto_rollback=c.auto_rollback,
             created_at=c.created_at.isoformat(),
             updated_at=c.updated_at.isoformat(),
         )
@@ -4599,6 +4600,7 @@ def build_app(
             enabled=body.enabled,
             auto_promote=body.auto_promote,
             eval_gate=body.eval_gate,
+            auto_rollback=body.auto_rollback,
             created_by=ctx.api_key_id,
             created_at=existing.created_at if existing else now,
             updated_at=now,

@@ -95,6 +95,12 @@ def set_canary(
         "--eval-gate",
         help="Min challenger quality (0-1) for auto-promote. Required with --auto-promote.",
     ),
+    auto_rollback: bool = typer.Option(
+        False,
+        "--auto-rollback/--no-auto-rollback",
+        help="Opt-in: a drift regression on the challenger auto-trips the kill "
+        "switch (weight → 0). Default off = alert-only (ADR 016 D5).",
+    ),
     disabled: bool = typer.Option(
         False, "--disabled", help="Create the canary but leave it dormant (routes to champion)."
     ),
@@ -132,6 +138,7 @@ def set_canary(
         enabled=not disabled,
         auto_promote=auto_promote,
         eval_gate=eval_gate,
+        auto_rollback=auto_rollback,
         created_at=existing.created_at if existing else now,
         updated_at=now,
     )
@@ -177,6 +184,7 @@ def canary_status(
     table.add_row("enabled", "yes" if config.enabled else "no")
     table.add_row("auto-promote", "yes" if config.auto_promote else "no")
     table.add_row("eval-gate", "—" if config.eval_gate is None else f"{config.eval_gate:.3f}")
+    table.add_row("auto-rollback", "yes" if config.auto_rollback else "no")
     table.add_row("updated", config.updated_at.isoformat(timespec="seconds"))
     console.print(table)
 
