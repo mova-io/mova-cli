@@ -42,6 +42,7 @@ from movate.core.models import (
     RunRecord,
     Subgraph,
     TenantBudget,
+    TenantProviderKey,
     Trigger,
     WorkflowRunRecord,
     WorkflowStatus,
@@ -591,6 +592,26 @@ _MIGRATIONS = [
     # aggregate-only path, byte-for-byte the old behaviour. Mirrors the
     # target_version additive-column pattern above.
     "ALTER TABLE evals ADD COLUMN dimension_means TEXT",
+    # ADR 018: per-tenant BYOK provider keys. One row per (tenant, provider)
+    # holding a Fernet ``ciphertext`` of the tenant's own provider key + a
+    # masked ``fingerprint`` for display. The ProviderKeyResolver decrypts
+    # ``ciphertext`` at run time (tenant-key-first, shared-key fallback). NO
+    # row → the run path uses the provider's env-default key → byte-for-byte
+    # the pre-BYOK behavior. Additive new table (CREATE TABLE IF NOT EXISTS,
+    # idempotent) — default-off, no backfill. The plaintext key is NEVER
+    # stored here (only its ciphertext + masked tail).
+    """
+    CREATE TABLE IF NOT EXISTS tenant_provider_keys (
+        tenant_id   TEXT NOT NULL,
+        provider    TEXT NOT NULL,
+        ciphertext  TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        created_by  TEXT,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, provider)
+    )
+    """,
 ]
 
 
@@ -1198,6 +1219,63 @@ class SqliteProvider:
             "INSERT OR IGNORE INTO trigger_deliveries "
             "(trigger_id, delivery_id, job_id, created_at) VALUES (?, ?, ?, ?)",
             (trigger_id, delivery_id, job_id, datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Tenant provider keys (ADR 018 — per-tenant BYOK provider credentials)
+    # ------------------------------------------------------------------
+
+    async def save_tenant_provider_key(self, key: TenantProviderKey) -> None:
+        # Upsert on the (tenant_id, provider) primary key — a re-set rotates.
+        await self._db.execute(
+            """
+            INSERT INTO tenant_provider_keys (
+                tenant_id, provider, ciphertext, fingerprint,
+                created_by, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, provider) DO UPDATE SET
+                ciphertext = excluded.ciphertext,
+                fingerprint = excluded.fingerprint,
+                created_by = excluded.created_by,
+                updated_at = excluded.updated_at
+            """,
+            (
+                key.tenant_id,
+                key.provider,
+                key.ciphertext,
+                key.fingerprint,
+                key.created_by,
+                key.created_at.isoformat(),
+                key.updated_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_tenant_provider_key(
+        self, provider: str, *, tenant_id: str
+    ) -> TenantProviderKey | None:
+        async with self._db.execute(
+            "SELECT * FROM tenant_provider_keys WHERE provider = ? AND tenant_id = ? LIMIT 1",
+            (provider, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_tenant_provider_key(row) if row else None
+
+    async def list_tenant_provider_keys(self, *, tenant_id: str) -> list[TenantProviderKey]:
+        async with self._db.execute(
+            "SELECT * FROM tenant_provider_keys WHERE tenant_id = ? ORDER BY provider ASC",
+            (tenant_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_tenant_provider_key(r) for r in rows]
+
+    async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM tenant_provider_keys WHERE provider = ? AND tenant_id = ?",
+            (provider, tenant_id),
         )
         await self._db.commit()
         return cur.rowcount > 0
@@ -2758,6 +2836,18 @@ def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
         last_fired_at=(
             datetime.fromisoformat(row["last_fired_at"]) if row["last_fired_at"] else None
         ),
+    )
+
+
+def _row_to_tenant_provider_key(row: aiosqlite.Row) -> TenantProviderKey:
+    return TenantProviderKey(
+        tenant_id=row["tenant_id"],
+        provider=row["provider"],
+        ciphertext=row["ciphertext"],
+        fingerprint=row["fingerprint"],
+        created_by=row["created_by"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
     )
 
 

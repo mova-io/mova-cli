@@ -208,6 +208,7 @@ from movate.cli.infra_cmd import infra_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.kb_cmd import kb_app  # noqa: E402
+from movate.cli.keys_cmd import keys_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.models_cmd import models_app  # noqa: E402
@@ -551,6 +552,7 @@ app.add_typer(playground_app, name="playground", rich_help_panel=PANEL_DEPLOY)
 # ----- Manage ---------------------------------------------------------------
 
 app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
+app.add_typer(keys_app, name="keys", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(fleet_app, name="fleet", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)

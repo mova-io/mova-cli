@@ -47,6 +47,7 @@ from movate.core.failures import (
 )
 from movate.core.loader import AgentBundle
 from movate.core.models import (
+    AgentRuntime,
     AgentSpec,
     ErrorInfo,
     FailureRecord,
@@ -60,6 +61,7 @@ from movate.core.models import (
     SkillCallRecord,
     TokenUsage,
 )
+from movate.core.provider_keys import ProviderKeyResolver
 from movate.core.reflection import build_revision_prompt, call_judge
 from movate.core.retry import RetryExhaustedError, run_with_retries
 from movate.guardrails import check_input as _guardrails_check_input
@@ -160,6 +162,14 @@ class Executor:
         # _run_with_tool_use.
         self._cache: CacheProvider = cache or NoOpCache()
         self._cache_ttl_s = cache_ttl_s()
+        # ADR 018 — per-tenant BYOK provider keys. Lazily built (only when a
+        # tenant has a stored key) off the same storage the executor already
+        # holds, so no construction-site change is needed. Reads the calling
+        # tenant's encrypted key at run time and threads it into the
+        # provider's ``api_key`` param; falls through to the env-default key
+        # when there's no tenant key (default-on shared fallback) — the
+        # no-config path stays byte-for-byte unchanged.
+        self._provider_key_resolver: ProviderKeyResolver | None = None
 
     @property
     def tracer(self) -> Tracer:
@@ -397,6 +407,15 @@ class Executor:
                     merged = dict(spec.model.params)
                     merged.update(fb.params)
                     chain.append((fb.provider, merged))
+
+            # ADR 018 — per-tenant BYOK. Resolve the calling tenant's own
+            # provider key for each chain entry and thread it into the
+            # provider call via the existing ``api_key`` param. When the
+            # resolver returns None (no tenant key + shared-key fallback on,
+            # the default) NOTHING is added, so the provider uses its env
+            # default exactly as before BYOK — the no-config path is
+            # byte-for-byte unchanged. Mutates the params dicts in place.
+            await self._inject_tenant_provider_keys(chain, tenant_id, spec.runtime)
 
             completion: CompletionResponse | None = None
             chosen_provider = ""
@@ -1165,8 +1184,6 @@ class Executor:
         # ``reflection.judge_model`` is documented as a LiteLLM-style
         # ``<family>/<model>`` string. Native-SDK judges land later
         # alongside the equivalent agent-side adapters.
-        from movate.core.models import AgentRuntime  # noqa: PLC0415  -- avoid TYPE_CHECKING
-
         try:
             judge_provider = self._registry.get(AgentRuntime.LITELLM)
         except Exception:
@@ -1310,6 +1327,51 @@ class Executor:
                 f"`movate tenants set-budget {tenant_id} --monthly-usd <new>` "
                 f"or wait for next-month rollover."
             )
+
+    async def _inject_tenant_provider_keys(
+        self,
+        chain: list[tuple[str, dict[str, Any]]],
+        tenant_id: str,
+        runtime: AgentRuntime,
+    ) -> None:
+        """Thread the tenant's BYOK provider key into each chain entry (ADR 018).
+
+        For each ``(provider_str, params)`` in the fallback chain, resolves
+        the calling tenant's own provider key (tenant-key-first, shared-key
+        fallback per :class:`ProviderKeyResolver`) and, when a tenant key is
+        found, sets ``params["api_key"]`` so the provider call uses it. When
+        the resolver returns ``None`` (no tenant key + shared fallback on, the
+        default) **nothing** is added — the provider uses its env-default key
+        exactly as before BYOK, so the no-config run path is byte-for-byte
+        unchanged.
+
+        Only the **LiteLLM** runtime is wired today: ``litellm.acompletion``
+        honours a per-call ``api_key=`` kwarg (passed through from ``params``).
+        The native_openai / native_anthropic SDKs construct their client from
+        the env at startup and don't accept a per-call key, so a BYOK key
+        can't be threaded through their existing surface without a provider
+        signature change (out of scope here) — those runtimes fall through to
+        the env default unchanged. An agent that pre-set ``api_key`` in its
+        own ``model.params`` is left untouched (explicit config wins).
+
+        Mutates the ``params`` dicts in ``chain`` in place. The resolved
+        plaintext key lives only in the params dict for the duration of the
+        provider call and is never logged or persisted.
+        """
+        # Only LiteLLM can take a per-call api_key today (see docstring). Skip
+        # entirely for native runtimes → byte-for-byte unchanged.
+        if runtime != AgentRuntime.LITELLM:
+            return
+        if self._provider_key_resolver is None:
+            self._provider_key_resolver = ProviderKeyResolver(self._storage)
+        for provider_str, params in chain:
+            # Respect an explicit api_key the agent baked into model.params —
+            # never override operator-set config.
+            if params.get("api_key"):
+                continue
+            resolved = await self._provider_key_resolver.resolve(tenant_id, provider_str)
+            if resolved is not None:
+                params["api_key"] = resolved
 
     def _enforce_policy(
         self,
