@@ -26,7 +26,9 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app as cli_app
+from movate.cli.worker import _DEFAULT_JOB_TIMEOUT_SECONDS, _resolve_job_timeout
 from movate.core.executor import Executor
+from movate.core.job_retry import JobRetryPolicy
 from movate.core.models import (
     JobKind,
     JobRecord,
@@ -35,7 +37,7 @@ from movate.core.models import (
 )
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import load_pricing
-from movate.runtime.dispatch import WorkerDispatch
+from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.runtime.registry import scan_agents, scan_workflows
 from movate.runtime.worker import Worker, WorkerConfig
 from movate.testing import InMemoryStorage, NullTracer
@@ -712,6 +714,226 @@ async def test_worker_run_forever_exits_when_stop_event_set(
 
     # Should exit within ~50ms even though the configured poll is 10s.
     await asyncio.gather(worker.run_forever(stop), stop_soon())
+
+
+# ---------------------------------------------------------------------------
+# Per-job execution timeout — Worker.run_one_cycle (item 34)
+# ---------------------------------------------------------------------------
+
+
+class _SleepyDispatch:
+    """Dispatch double whose ``execute_job`` sleeps before returning.
+
+    Models a slow/hung provider/agent call so the per-job timeout can be
+    asserted without a real executor. ``delay`` controls how long it
+    blocks; a delay > the configured ``job_timeout_seconds`` trips the
+    timeout, a delay under it completes normally."""
+
+    def __init__(self, *, delay: float, outcome: DispatchOutcome | None = None) -> None:
+        self.delay = delay
+        self.started = 0
+        self.cancelled = False
+        self._outcome = outcome or DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id="run-sleepy",
+            error=None,
+        )
+
+    async def execute_job(self, job: JobRecord):
+        self.started += 1
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            # wait_for cancels us on timeout — record it so the test can
+            # prove the coroutine was actually torn down (slot freed).
+            self.cancelled = True
+            raise
+        return self._outcome
+
+
+@pytest.mark.unit
+async def test_run_one_cycle_times_out_slow_job_as_retryable_error() -> None:
+    """A dispatch that exceeds job_timeout_seconds → retryable timeout ERROR.
+
+    With the default retry budget left (fresh job, attempt_count=0), the
+    job RE-QUEUES rather than dead-letters."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    dispatch = _SleepyDispatch(delay=5.0)  # far past the tiny timeout below
+    worker = Worker(
+        storage=storage,
+        dispatch=dispatch,  # type: ignore[arg-type]
+        config=WorkerConfig(job_timeout_seconds=0.05),
+    )
+
+    handled = await worker.run_one_cycle()
+    assert handled is not None
+    # The hung coroutine was cancelled (worker slot freed).
+    assert dispatch.cancelled is True
+
+    # Retryable → re-queued (not terminal). The job is back to QUEUED with
+    # an incremented attempt_count, NOT dead-lettered.
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.QUEUED
+    assert final.attempt_count == 1
+
+
+@pytest.mark.unit
+async def test_run_one_cycle_timeout_dead_letters_when_budget_exhausted() -> None:
+    """When the retry budget is exhausted, the timeout ERROR is terminal —
+    it dead-letters with the retryable ``timeout`` error recorded, proving
+    the timeout flows through the standard retryable-error path."""
+    storage = InMemoryStorage()
+    await storage.init()
+    # max_attempts=1 → no retries; the first failure is terminal.
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    dispatch = _SleepyDispatch(delay=5.0)
+    worker = Worker(
+        storage=storage,
+        dispatch=dispatch,  # type: ignore[arg-type]
+        config=WorkerConfig(
+            job_timeout_seconds=0.05,
+            retry_policy=JobRetryPolicy(max_attempts=1),
+        ),
+    )
+
+    await worker.run_one_cycle()
+
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.DEAD_LETTER
+    assert final.error is not None
+    assert final.error.type == "timeout"
+    assert final.error.retryable is True
+    assert "execution timeout" in final.error.message
+
+
+@pytest.mark.unit
+async def test_run_one_cycle_fast_job_under_timeout_is_unaffected() -> None:
+    """A job that completes well under the timeout drains normally — the
+    wait_for wrapper is transparent on the happy path."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    dispatch = _SleepyDispatch(delay=0.0)  # returns immediately
+    worker = Worker(
+        storage=storage,
+        dispatch=dispatch,  # type: ignore[arg-type]
+        config=WorkerConfig(job_timeout_seconds=5.0),
+    )
+
+    handled = await worker.run_one_cycle()
+    assert handled is not None
+    assert dispatch.cancelled is False
+
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.SUCCESS
+    assert final.result_run_id == "run-sleepy"
+
+
+@pytest.mark.unit
+async def test_run_one_cycle_timeout_zero_disables_bound() -> None:
+    """``job_timeout_seconds <= 0`` opts out: the dispatch runs unwrapped,
+    so a slow-ish job still completes rather than being cut off."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    # 50ms is "slow-ish" relative to a sub-ms tripwire, but with the bound
+    # disabled it must run to completion.
+    dispatch = _SleepyDispatch(delay=0.05)
+    worker = Worker(
+        storage=storage,
+        dispatch=dispatch,  # type: ignore[arg-type]
+        config=WorkerConfig(job_timeout_seconds=0.0),
+    )
+
+    handled = await worker.run_one_cycle()
+    assert handled is not None
+    assert dispatch.cancelled is False
+
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.SUCCESS
+    assert final.result_run_id == "run-sleepy"
+
+
+@pytest.mark.unit
+async def test_run_one_cycle_timeout_still_decrements_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-flight gauge nets to zero even on a timeout — the dec_in_flight
+    finally runs because the wait_for sits inside the try/finally bracket."""
+    in_flight: list[str] = []
+    monkeypatch.setattr(
+        "movate.runtime.worker.inc_in_flight",
+        lambda *, tenant_id: in_flight.append(f"+{tenant_id}"),
+    )
+    monkeypatch.setattr(
+        "movate.runtime.worker.dec_in_flight",
+        lambda *, tenant_id: in_flight.append(f"-{tenant_id}"),
+    )
+
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha", tenant_id="tenant-a")
+    await storage.save_job(job)
+
+    dispatch = _SleepyDispatch(delay=5.0)
+    worker = Worker(
+        storage=storage,
+        dispatch=dispatch,  # type: ignore[arg-type]
+        config=WorkerConfig(job_timeout_seconds=0.05),
+    )
+    await worker.run_one_cycle()
+
+    # inc before dispatch, dec after — even though dispatch timed out.
+    assert in_flight == ["+tenant-a", "-tenant-a"]
+
+
+# ---------------------------------------------------------------------------
+# CLI env override — _resolve_job_timeout (item 34)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_resolve_job_timeout_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MDK_JOB_TIMEOUT_SECONDS", raising=False)
+    assert _resolve_job_timeout() == _DEFAULT_JOB_TIMEOUT_SECONDS
+
+
+@pytest.mark.unit
+def test_resolve_job_timeout_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MDK_JOB_TIMEOUT_SECONDS", "120")
+    assert _resolve_job_timeout() == 120.0
+
+
+@pytest.mark.unit
+def test_resolve_job_timeout_non_positive_is_valid_optout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlike the visibility timeout, a non-positive value is a valid opt-out
+    (disable the per-job bound) — passed through, not coerced to the default."""
+    monkeypatch.setenv("MDK_JOB_TIMEOUT_SECONDS", "0")
+    assert _resolve_job_timeout() == 0.0
+
+
+@pytest.mark.unit
+def test_resolve_job_timeout_bad_value_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MDK_JOB_TIMEOUT_SECONDS", "not-a-number")
+    assert _resolve_job_timeout() == _DEFAULT_JOB_TIMEOUT_SECONDS
 
 
 # ---------------------------------------------------------------------------
