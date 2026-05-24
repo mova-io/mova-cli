@@ -30,6 +30,7 @@ from movate.core.models import (
     JobKind,
     JobRecord,
     JobStatus,
+    WorkflowStatus,
 )
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import load_pricing
@@ -318,6 +319,195 @@ async def test_dispatch_workflow_paused_maps_to_success(
     assert outcome.status is JobStatus.SUCCESS
     assert outcome.result_run_id == "wf-paused-123"
     assert outcome.error is None
+
+
+@pytest.mark.unit
+async def test_dispatch_resume_job_drives_runner_resume(tmp_path: Path) -> None:
+    """ADR 017 D5 (PR 2): a JobKind.WORKFLOW job carrying
+    resume_workflow_run_id loads the PAUSED checkpoint, calls
+    WorkflowRunner.resume, and completes the run (the 2nd agent runs with the
+    merged human decision)."""
+    import json as _json  # noqa: PLC0415
+    import os.path  # noqa: PLC0415
+
+    from movate.core.workflow import (  # noqa: PLC0415
+        WorkflowRunner,
+        compile_workflow,
+        load_workflow_spec,
+    )
+    from movate.providers.base import (  # noqa: PLC0415
+        BaseLLMProvider,
+        CompletionRequest,
+        CompletionResponse,
+    )
+
+    class _PerNode(BaseLLMProvider):
+        name = "per_node"
+        version = "0.0.1"
+
+        async def complete(self, request: CompletionRequest) -> CompletionResponse:
+            body = request.messages[0].content
+            for key in ("step2", "step1"):
+                if f"as {key}" in body:
+                    return CompletionResponse(text=_json.dumps({key: f"{key}-out"}))
+            return CompletionResponse(text='{"step1": "step1-out"}')
+
+        async def stream(self, request):  # pragma: no cover
+            raise NotImplementedError
+
+        async def embed(self, text, *, model):  # pragma: no cover
+            raise NotImplementedError
+
+    # Build an agent -> human -> agent workflow on disk.
+    def _agent(dir_: Path, name: str, in_key: str, out_key: str) -> None:
+        dir_.mkdir(parents=True, exist_ok=True)
+        (dir_ / "schema").mkdir(exist_ok=True)
+        (dir_ / "agent.yaml").write_text(
+            f"""
+api_version: movate/v1
+kind: Agent
+name: {name}
+version: 0.1.0
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+prompt: ./prompt.md
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+""".strip()
+        )
+        (dir_ / "prompt.md").write_text("echo {{ input." + in_key + " }} as " + out_key + "\n")
+        (dir_ / "schema" / "input.json").write_text(
+            _json.dumps(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [in_key],
+                    "properties": {in_key: {"type": "string", "minLength": 1}},
+                }
+            )
+        )
+        (dir_ / "schema" / "output.json").write_text(
+            _json.dumps(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [out_key],
+                    "properties": {out_key: {"type": "string"}},
+                }
+            )
+        )
+
+    wf_root = tmp_path / "workflows" / "approval"
+    wf_root.mkdir(parents=True)
+    _agent(tmp_path / "agents" / "first", "first-agent", "text", "step1")
+    _agent(tmp_path / "agents" / "second", "second-agent", "step1", "step2")
+    (wf_root / "state.json").write_text(
+        '{"type": "object", "additionalProperties": true, '
+        '"properties": {"text": {"type": "string"}}}'
+    )
+    first_rel = os.path.relpath(tmp_path / "agents" / "first", wf_root)
+    second_rel = os.path.relpath(tmp_path / "agents" / "second", wf_root)
+    (wf_root / "workflow.yaml").write_text(
+        f"""
+api_version: movate/v1
+kind: Workflow
+name: approval
+version: 0.1.0
+entrypoint: first
+state_schema: state.json
+nodes:
+  - id: first
+    type: agent
+    ref: {first_rel}
+  - id: gate
+    type: human
+    prompt: Approve?
+    output_contract: [decision]
+  - id: second
+    type: agent
+    ref: {second_rel}
+edges:
+  - from: first
+    to: gate
+  - from: gate
+    to: second
+""".strip()
+    )
+
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = Executor(
+        provider=_PerNode(),
+        pricing=load_pricing(),
+        storage=storage,
+        tracer=NullTracer(),
+        tenant_id="tenant-a",
+    )
+    workflows = scan_workflows(tmp_path / "workflows")
+    assert "approval" in workflows
+
+    # Pause the workflow at the gate (the PR-1 path) using a runner against the
+    # SAME storage, scoped to the job's tenant.
+    spec, parent = load_workflow_spec(wf_root / "workflow.yaml")
+    graph = compile_workflow(spec, parent)
+    runner = WorkflowRunner(executor=executor, storage=storage, tenant_id="tenant-a")
+    paused = await runner.run(graph, initial_state={"text": "seed"})
+    assert paused.status is WorkflowStatus.SUCCESS or paused.status.value == "paused"
+
+    # Simulate the signal endpoint merging the decision into the checkpoint.
+    record = await storage.get_workflow_run(paused.workflow_run_id, tenant_id="tenant-a")
+    assert record is not None
+    record = record.model_copy(
+        update={"paused_state": {**(record.paused_state or {}), "decision": "approve"}}
+    )
+    await storage.save_workflow_run(record)
+
+    # A continuation job carrying resume_workflow_run_id drives the resume.
+    dispatch = WorkerDispatch(storage=storage, executor=executor, agents=[], workflows=workflows)
+    resume_job = JobRecord(
+        job_id=str(uuid4()),
+        tenant_id="tenant-a",
+        kind=JobKind.WORKFLOW,
+        target="approval",
+        status=JobStatus.QUEUED,
+        input={},
+        resume_workflow_run_id=paused.workflow_run_id,
+    )
+    outcome = await dispatch.execute_job(resume_job)
+
+    assert outcome.status is JobStatus.SUCCESS
+    assert outcome.result_run_id == paused.workflow_run_id
+    # The run completed: final record is SUCCESS with the 2nd agent's output.
+    final = await storage.get_workflow_run(paused.workflow_run_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status is WorkflowStatus.SUCCESS
+    assert final.final_state is not None
+    assert final.final_state.get("step2") == "step2-out"
+    assert final.final_state.get("decision") == "approve"
+
+
+@pytest.mark.unit
+async def test_dispatch_resume_unknown_run_is_error() -> None:
+    """A resume job whose workflow_run_id doesn't exist for the tenant →
+    terminal ERROR (unknown_workflow_run), not a crash."""
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = _make_executor(storage)
+    dispatch = WorkerDispatch(storage=storage, executor=executor, agents=[], workflows={})
+    job = JobRecord(
+        job_id=str(uuid4()),
+        tenant_id="tenant-a",
+        kind=JobKind.WORKFLOW,
+        target="approval",
+        status=JobStatus.QUEUED,
+        input={},
+        resume_workflow_run_id="does-not-exist",
+    )
+    outcome = await dispatch.execute_job(job)
+    assert outcome.status is JobStatus.ERROR
+    assert outcome.error is not None
+    assert outcome.error["type"] == "unknown_workflow_run"
 
 
 # ---------------------------------------------------------------------------

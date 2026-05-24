@@ -26,11 +26,18 @@ HITL pause (ADR 017 D5, PR 1):
   captured at the gate (the post-merge state of every node up to but not
   including the gate), and the gate's ``human_task`` spec — then returns a
   ``WorkflowResult(status=PAUSED, ...)``. No node after the gate runs.
-* PR 2 (resume-on-signal, a separate PR) loads that checkpoint, merges the
-  human's decision into ``paused_state``, and continues from the gate's
-  successor. The checkpoint persisted here is designed to be sufficient for
-  that: ``paused_node_id`` + ``paused_state`` + ``human_task`` +
-  ``workflow``/``workflow_version`` fully reconstruct where to resume.
+HITL resume (ADR 017 D5, PR 2):
+
+* :meth:`WorkflowRunner.resume` loads a PAUSED checkpoint (the signal
+  endpoint has already merged the human's decision into ``paused_state``)
+  and continues the walk from the **sequential successor** of
+  ``paused_node_id`` with that merged state, reusing the SAME loop as
+  :meth:`run` (:meth:`_walk`). ``paused_node_id`` + ``paused_state`` +
+  ``human_task`` + ``workflow``/``workflow_version`` fully reconstruct where
+  to resume. If the successor is itself a HUMAN node the walk re-pauses with
+  a fresh checkpoint, so multi-gate workflows resume one gate at a time for
+  free. The terminal/paused record is persisted under the SAME
+  ``workflow_run_id`` (``save_workflow_run`` upserts on the id).
 
 Explicit ``inputs:`` / ``outputs:`` mappings are deliberately deferred to
 v0.4 — easy to add when real workflows demand finer control.
@@ -136,9 +143,8 @@ class WorkflowRunner:
         workflow can be exercised under ``mdk run --mock``.
         """
         wf_id = workflow_run_id or str(uuid4())
-        started = time.monotonic()
 
-        # 1. Validate initial state against the workflow's schema.
+        # Validate initial state against the workflow's schema.
         try:
             Draft202012Validator(graph.state_schema).validate(initial_state)
         except JsonSchemaError as exc:
@@ -146,15 +152,106 @@ class WorkflowRunner:
                 f"initial_state failed workflow state_schema: {exc.message}"
             ) from exc
 
-        state: dict[str, Any] = dict(initial_state)
+        return await self._walk(
+            graph,
+            start_id=graph.entrypoint,
+            state=dict(initial_state),
+            initial_state=initial_state,
+            wf_id=wf_id,
+            mock=mock,
+        )
+
+    async def resume(
+        self,
+        graph: WorkflowGraph,
+        record: WorkflowRunRecord,
+    ) -> WorkflowResult:
+        """Resume a workflow paused at a HUMAN gate (ADR 017 D5, PR 2).
+
+        The signal endpoint has already validated the human's decision
+        against the gate's ``output_contract`` and merged it into
+        ``record.paused_state`` (decision wins), persisting the updated
+        checkpoint. We continue the walk from the **sequential successor**
+        of ``record.paused_node_id`` with that merged state, reusing the
+        SAME loop as :meth:`run` via :meth:`_walk`. If the successor is
+        itself a HUMAN node the walk re-pauses (a fresh PAUSED checkpoint),
+        so multi-gate workflows resume one gate at a time for free.
+
+        The terminal/paused :class:`WorkflowRunRecord` is persisted under
+        the SAME ``workflow_run_id`` (resuming updates the existing run; it
+        does not create a new one — ``save_workflow_run`` upserts on the id).
+        ``initial_state`` is carried from the record so the resumed run's
+        provenance stays intact.
+
+        Guards (the endpoint maps these to 4xx):
+
+        * ``record.status != PAUSED`` → not a resumable checkpoint (already
+          resumed / terminal). Raises :class:`WorkflowRunError`.
+        * ``record.paused_node_id is None`` → no gate to resume from (a
+          malformed / non-checkpoint record). Raises :class:`WorkflowRunError`.
+        """
+        if record.status is not WorkflowStatus.PAUSED:
+            raise WorkflowRunError(
+                f"cannot resume workflow_run {record.workflow_run_id!r}: status is "
+                f"{record.status.value!r}, expected {WorkflowStatus.PAUSED.value!r}"
+            )
+        if record.paused_node_id is None:
+            raise WorkflowRunError(
+                f"cannot resume workflow_run {record.workflow_run_id!r}: no "
+                f"paused_node_id on the checkpoint"
+            )
+
+        # The merged state to resume with. ``paused_state`` is the post-merge
+        # state captured at the gate, already merged with the human decision
+        # by the signal endpoint. Fall back to an empty dict defensively (a
+        # PAUSED record should always carry it).
+        resume_state = dict(record.paused_state or {})
+
+        # Resume from the gate's single sequential successor. The gate
+        # executed nothing, so its successor is where execution continues.
+        successor = self._sequential_successor(graph, record.paused_node_id)
+
+        return await self._walk(
+            graph,
+            start_id=successor,
+            state=resume_state,
+            initial_state=record.initial_state,
+            wf_id=record.workflow_run_id,
+            mock=False,
+        )
+
+    async def _walk(
+        self,
+        graph: WorkflowGraph,
+        *,
+        start_id: str | None,
+        state: dict[str, Any],
+        initial_state: dict[str, Any],
+        wf_id: str,
+        mock: bool,
+    ) -> WorkflowResult:
+        """Walk the graph from ``start_id``, threading ``state``.
+
+        The shared traversal loop for both :meth:`run` (start at the
+        entrypoint with the validated initial state) and :meth:`resume`
+        (start at a paused gate's successor with the merged checkpoint
+        state). Persists a terminal/paused :class:`WorkflowRunRecord` keyed
+        by ``wf_id`` (``save_workflow_run`` upserts) and returns a
+        :class:`WorkflowResult`.
+
+        ``start_id is None`` (a paused gate that is itself the sink — no
+        successor) means "nothing left to run": the walk completes
+        immediately as SUCCESS with ``state`` as the final state.
+        """
+        started = time.monotonic()
         runs: list[RunRecord] = []
 
-        # Dynamic traversal: start at entrypoint, follow each node's single
+        # Dynamic traversal: start at ``start_id``, follow each node's single
         # sequential successor (for agent nodes) or the router's chosen
         # branch (for intent-router nodes).  We track visited ids to guard
         # against pathological graph shapes that bypass the compiler's cycle
         # detector.
-        current_id: str | None = graph.entrypoint
+        current_id: str | None = start_id
         visited: set[str] = set()
 
         while current_id is not None:
@@ -320,10 +417,7 @@ class WorkflowRunner:
             state.update(response.data)
 
             # Advance: follow the single sequential successor (or None at sink).
-            seq_successors = [
-                e.to_id for e in graph.successors(node_id) if not e.metadata.get("synthetic")
-            ]
-            current_id = seq_successors[0] if seq_successors else None
+            current_id = self._sequential_successor(graph, node_id)
 
         finished = time.monotonic()
         wf_record = WorkflowRunRecord(
@@ -346,6 +440,19 @@ class WorkflowRunner:
             started_at=started,
             finished_at=finished,
         )
+
+    @staticmethod
+    def _sequential_successor(graph: WorkflowGraph, node_id: str) -> str | None:
+        """The single sequential successor of ``node_id`` (or ``None`` at a sink).
+
+        Filters out ``synthetic`` edges (compiler-added bookkeeping edges,
+        e.g. an intent-router's fan-out) so only the real next-in-chain node
+        is followed. Both the agent-node advance in :meth:`_walk` and
+        :meth:`resume` (continuing from a paused gate's successor) use this so
+        the "what runs next" rule lives in exactly one place.
+        """
+        seq = [e.to_id for e in graph.successors(node_id) if not e.metadata.get("synthetic")]
+        return seq[0] if seq else None
 
     async def _run_intent_router(
         self,

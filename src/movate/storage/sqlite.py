@@ -523,6 +523,13 @@ _MIGRATIONS = [
     "ALTER TABLE workflow_runs ADD COLUMN paused_node_id TEXT",
     "ALTER TABLE workflow_runs ADD COLUMN paused_state TEXT",
     "ALTER TABLE workflow_runs ADD COLUMN human_task TEXT",
+    # ADR 017 D5 (PR 2): resume-on-signal. The signal endpoint enqueues a
+    # JobKind.WORKFLOW continuation job carrying the workflow_run_id to resume
+    # from; the worker reads this and calls WorkflowRunner.resume. Nullable —
+    # pre-PR-2 rows (and every non-resume job) read back as NULL → None → the
+    # worker runs from the entrypoint, unchanged. Mirrors the target_version
+    # additive-column pattern above.
+    "ALTER TABLE jobs ADD COLUMN resume_workflow_run_id TEXT",
 ]
 
 
@@ -1269,6 +1276,15 @@ class SqliteProvider:
         return cur.rowcount
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
+        # Upsert on the workflow_run_id PRIMARY KEY: the runner saves a row
+        # when a run reaches a terminal/paused state, and a resume (ADR 017
+        # D5, PR 2) re-saves the SAME workflow_run_id when the paused run
+        # continues to completion (or re-pauses). The signal endpoint also
+        # persists the merged checkpoint back under the same id. ON CONFLICT
+        # DO UPDATE makes save idempotent on the id — the latest write wins,
+        # so a resumed run UPDATES its row rather than violating the PK.
+        # A first-time SUCCESS/ERROR/PAUSED save takes the INSERT path
+        # unchanged (no existing row → no conflict).
         await self._db.execute(
             """
             INSERT INTO workflow_runs (
@@ -1276,6 +1292,19 @@ class SqliteProvider:
                 status, initial_state, final_state, error_node_id, error,
                 created_at, paused_node_id, paused_state, human_task
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workflow_run_id) DO UPDATE SET
+                tenant_id        = excluded.tenant_id,
+                workflow         = excluded.workflow,
+                workflow_version = excluded.workflow_version,
+                status           = excluded.status,
+                initial_state    = excluded.initial_state,
+                final_state      = excluded.final_state,
+                error_node_id    = excluded.error_node_id,
+                error            = excluded.error,
+                created_at       = excluded.created_at,
+                paused_node_id   = excluded.paused_node_id,
+                paused_state     = excluded.paused_state,
+                human_task       = excluded.human_task
             """,
             (
                 w.workflow_run_id,
@@ -1300,6 +1329,7 @@ class SqliteProvider:
         *,
         tenant_id: str | None = None,
         workflow: str | None = None,
+        status: WorkflowStatus | None = None,
         limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         clauses: list[str] = []
@@ -1310,6 +1340,9 @@ class SqliteProvider:
         if workflow:
             clauses.append("workflow = ?")
             params.append(workflow)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value)
         sql = "SELECT * FROM workflow_runs"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -1331,8 +1364,8 @@ class SqliteProvider:
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
-                target_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target_version, resume_workflow_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -1352,6 +1385,7 @@ class SqliteProvider:
                 job.next_retry_at.isoformat() if job.next_retry_at else None,
                 job.thread_id,
                 job.target_version,
+                job.resume_workflow_run_id,
             ),
         )
         await self._db.commit()
@@ -2613,6 +2647,10 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # read on a connection that somehow predates the migration —
         # such a row is a pre-canary job, which is exactly None.
         target_version=dict(row).get("target_version"),
+        # ADR 017 D5 (PR 2) HITL resume target. init() has run the ALTER by
+        # the time we read here; .get() stays defensive against a pre-PR-2
+        # row, which is a non-resume job — exactly None.
+        resume_workflow_run_id=dict(row).get("resume_workflow_run_id"),
     )
 
 

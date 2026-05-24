@@ -436,6 +436,41 @@ class WorkerDispatch:
         )
 
     async def _execute_workflow(self, job: JobRecord) -> DispatchOutcome:
+        # ADR 017 D5 (PR 2) — HITL resume. When the job carries a
+        # resume_workflow_run_id, this is a continuation job the signal
+        # endpoint enqueued: load that PAUSED checkpoint (the human's
+        # decision is already merged into its paused_state) and resume the
+        # runner from the gate's successor, rather than running from the
+        # entrypoint. Resolve the graph by the RECORD's workflow name (the
+        # job's ``target`` mirrors it, but the record is authoritative).
+        resume_id = job.resume_workflow_run_id
+        if resume_id is not None:
+            record = await self._storage.get_workflow_run(resume_id, tenant_id=job.tenant_id)
+            if record is None:
+                return _error(
+                    "unknown_workflow_run",
+                    f"workflow_run {resume_id!r} not found for tenant {job.tenant_id!r}",
+                    retryable=False,
+                )
+            graph = self._workflows.get(record.workflow)
+            if graph is None:
+                return _error(
+                    "unknown_workflow",
+                    f"workflow {record.workflow!r} not registered on this worker",
+                    retryable=False,
+                )
+            runner = WorkflowRunner(
+                executor=self._executor,
+                storage=self._storage,
+                tenant_id=job.tenant_id,
+            )
+            try:
+                result = await runner.resume(graph, record)
+            except Exception as exc:
+                logger.exception("workflow_resume_unhandled job_id=%s", job.job_id)
+                return _error("internal", str(exc), retryable=True)
+            return self._workflow_result_to_outcome(result)
+
         graph = self._workflows.get(job.target)
         if graph is None:
             return _error(
@@ -457,6 +492,18 @@ class WorkerDispatch:
         except Exception as exc:
             logger.exception("workflow_execute_unhandled job_id=%s", job.job_id)
             return _error("internal", str(exc), retryable=True)
+        return self._workflow_result_to_outcome(result)
+
+    @staticmethod
+    def _workflow_result_to_outcome(result: Any) -> DispatchOutcome:
+        """Map a :class:`WorkflowResult` to a :class:`DispatchOutcome`.
+
+        Shared by the run + resume paths so a resumed workflow's terminal
+        states are mapped identically to a fresh run's: SUCCESS→SUCCESS,
+        PAUSED→SUCCESS (the job segment that drove the run to the gate
+        succeeded; the durable PAUSED checkpoint is the handle a later
+        signal resumes), ERROR→ERROR.
+        """
 
         if result.status == WorkflowStatus.SUCCESS:
             return DispatchOutcome(
@@ -476,7 +523,9 @@ class WorkerDispatch:
             # PR 2 (resume-on-signal): when the human's decision arrives, the
             # signal endpoint loads this checkpoint and enqueues a FRESH
             # continuation job that resumes the runner from the gate's successor.
-            # This job does not resume itself.
+            # This job does not resume itself. A multi-gate workflow re-pauses
+            # here on each gate, so the same SUCCESS mapping covers both a
+            # fresh-run pause and a resumed-run re-pause.
             return DispatchOutcome(
                 status=JobStatus.SUCCESS,
                 result_run_id=result.workflow_run_id,

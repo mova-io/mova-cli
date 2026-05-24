@@ -538,6 +538,14 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_version TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_node_id TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_state JSONB;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS human_task JSONB;
+
+-- ADR 017 D5 (PR 2): resume-on-signal. The signal endpoint enqueues a
+-- JobKind.WORKFLOW continuation job carrying the workflow_run_id to resume
+-- from; the worker reads this and calls WorkflowRunner.resume. Nullable —
+-- pre-PR-2 rows (and every non-resume job) read back as NULL → None → the
+-- worker runs from the entrypoint, unchanged. ADD COLUMN IF NOT EXISTS keeps
+-- it idempotent on every init (mirrors the target_version pattern above).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resume_workflow_run_id TEXT;
 """
 
 
@@ -1406,6 +1414,12 @@ class PostgresProvider:
     # ------------------------------------------------------------------
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
+        # Upsert on the workflow_run_id PRIMARY KEY: a resume (ADR 017 D5,
+        # PR 2) re-saves the SAME workflow_run_id when a paused run continues
+        # to completion (or re-pauses), and the signal endpoint persists the
+        # merged checkpoint back under the same id. ON CONFLICT DO UPDATE
+        # makes save idempotent on the id — latest write wins. A first-time
+        # save (no existing row) takes the plain INSERT path unchanged.
         await self._db.execute(
             """
             INSERT INTO workflow_runs (
@@ -1413,6 +1427,19 @@ class PostgresProvider:
                 status, initial_state, final_state, error_node_id, error,
                 created_at, paused_node_id, paused_state, human_task
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT (workflow_run_id) DO UPDATE SET
+                tenant_id        = EXCLUDED.tenant_id,
+                workflow         = EXCLUDED.workflow,
+                workflow_version = EXCLUDED.workflow_version,
+                status           = EXCLUDED.status,
+                initial_state    = EXCLUDED.initial_state,
+                final_state      = EXCLUDED.final_state,
+                error_node_id    = EXCLUDED.error_node_id,
+                error            = EXCLUDED.error,
+                created_at       = EXCLUDED.created_at,
+                paused_node_id   = EXCLUDED.paused_node_id,
+                paused_state     = EXCLUDED.paused_state,
+                human_task       = EXCLUDED.human_task
             """,
             w.workflow_run_id,
             w.tenant_id,
@@ -1444,6 +1471,7 @@ class PostgresProvider:
         *,
         tenant_id: str | None = None,
         workflow: str | None = None,
+        status: WorkflowStatus | None = None,
         limit: int = 20,
     ) -> list[WorkflowRunRecord]:
         clauses: list[str] = []
@@ -1454,6 +1482,9 @@ class PostgresProvider:
         if workflow is not None:
             params.append(workflow)
             clauses.append(f"workflow = ${len(params)}")
+        if status is not None:
+            params.append(status.value)
+            clauses.append(f"status = ${len(params)}")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         sql = f"SELECT * FROM workflow_runs {where} ORDER BY created_at DESC LIMIT ${len(params)}"
@@ -1472,10 +1503,10 @@ class PostgresProvider:
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
-                target_version
+                target_version, resume_workflow_run_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17
+                $11, $12, $13, $14, $15, $16, $17, $18
             )
             """,
             job.job_id,
@@ -1495,6 +1526,7 @@ class PostgresProvider:
             job.next_retry_at,
             job.thread_id,
             job.target_version,
+            job.resume_workflow_run_id,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -2659,6 +2691,7 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         next_retry_at=row["next_retry_at"],
         thread_id=row["thread_id"],
         target_version=row["target_version"],
+        resume_workflow_run_id=row["resume_workflow_run_id"],
     )
 
 

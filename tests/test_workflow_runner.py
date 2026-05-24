@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from movate.core.executor import Executor
-from movate.core.models import JobStatus, WorkflowStatus
+from movate.core.models import JobStatus, WorkflowRunRecord, WorkflowStatus
 from movate.core.workflow import (
     WorkflowRunError,
     WorkflowRunner,
@@ -581,3 +581,215 @@ async def test_runner_filters_state_to_agent_input_schema(
     # over) plus the new step1.
     assert result.final_state["extra_garbage"] == "ignored"
     assert result.final_state["step1"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# HITL resume from a paused gate (ADR 017 D5, PR 2)
+# ---------------------------------------------------------------------------
+
+
+class _PerNodeProvider(BaseLLMProvider):
+    """Returns whichever output key matches the prompt body.
+
+    Each agent's prompt.md is ``echo {{ input.<in> }} as <out>``, so the
+    rendered prompt names the output key. We dispatch on the LAST matching
+    output key present in the prompt so a multi-node workflow (step1/step2/
+    step3) gets the right shape at every node.
+    """
+
+    name = "per_node"
+    version = "0.0.1"
+
+    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        body = request.messages[0].content
+        # The prompt says "echo {{ input.X }} as stepN" — pick stepN.
+        for key in ("step3", "step2", "step1"):
+            if f"as {key}" in body:
+                return CompletionResponse(text=json.dumps({key: f"{key}-out"}))
+        return CompletionResponse(text='{"step1": "step1-out"}')
+
+    async def stream(self, request):  # pragma: no cover
+        raise NotImplementedError
+
+    async def embed(self, text, *, model):  # pragma: no cover
+        raise NotImplementedError
+
+
+def _build_per_node_runner(storage: InMemoryStorage, tracer: NullTracer, pricing: PricingTable):
+    executor = Executor(
+        provider=_PerNodeProvider(), pricing=pricing, storage=storage, tracer=tracer
+    )
+    return WorkflowRunner(executor=executor, storage=storage)
+
+
+@pytest.mark.unit
+async def test_resume_completes_workflow(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """agent -> human -> agent: pause at the gate (PR 1), then resume with the
+    human decision merged -> the SECOND agent runs and the workflow reaches
+    SUCCESS. Final state reflects both the human decision and the 2nd output."""
+    yaml_path = _scaffold_agent_human_agent(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+
+    runner = _build_per_node_runner(storage, tracer, pricing)
+    paused = await runner.run(graph, initial_state={"text": "seed"})
+    assert paused.status is WorkflowStatus.PAUSED
+
+    # The endpoint would merge the human decision into paused_state. Simulate
+    # that here (the endpoint is tested separately).
+    record = await storage.get_workflow_run(paused.workflow_run_id, tenant_id=runner._tenant_id)
+    assert record is not None
+    record = record.model_copy(
+        update={"paused_state": {**(record.paused_state or {}), "decision": "approve"}}
+    )
+
+    resumed = await runner.resume(graph, record)
+
+    assert resumed.status is WorkflowStatus.SUCCESS
+    # Same workflow_run_id — a resume UPDATES the existing run, not a new one.
+    assert resumed.workflow_run_id == paused.workflow_run_id
+    # The 2nd agent ran (step2 present) and the human decision is in final state.
+    assert resumed.final_state["step1"] == "step1-out"
+    assert resumed.final_state["step2"] == "step2-out"
+    assert resumed.final_state["decision"] == "approve"
+    # Only the second agent ran during resume (the runs view starts fresh).
+    assert [r.node_id for r in resumed.runs] == ["second"]
+
+    # One workflow_run row (upserted, not duplicated), now SUCCESS with the
+    # checkpoint fields cleared.
+    rows = await storage.list_workflow_runs(tenant_id=runner._tenant_id)
+    assert len(rows) == 1
+    final = rows[0]
+    assert final.status is WorkflowStatus.SUCCESS
+    assert final.paused_node_id is None
+
+
+@pytest.mark.unit
+async def test_resume_guards_non_paused_and_no_gate(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """resume() raises a clear error if the record isn't PAUSED or has no gate."""
+    yaml_path = _scaffold_agent_human_agent(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+    runner = _build_per_node_runner(storage, tracer, pricing)
+
+    # status SUCCESS (terminal) -> not resumable.
+    terminal = WorkflowRunRecord(
+        workflow_run_id="wf-1",
+        tenant_id=runner._tenant_id,
+        workflow=graph.name,
+        workflow_version=graph.version,
+        status=WorkflowStatus.SUCCESS,
+        initial_state={"text": "x"},
+        final_state={"text": "x"},
+    )
+    with pytest.raises(WorkflowRunError, match=r"expected 'paused'"):
+        await runner.resume(graph, terminal)
+
+    # PAUSED but no paused_node_id -> not resumable.
+    no_gate = WorkflowRunRecord(
+        workflow_run_id="wf-2",
+        tenant_id=runner._tenant_id,
+        workflow=graph.name,
+        workflow_version=graph.version,
+        status=WorkflowStatus.PAUSED,
+        initial_state={"text": "x"},
+        paused_state={"text": "x"},
+    )
+    with pytest.raises(WorkflowRunError, match=r"no .*paused_node_id"):
+        await runner.resume(graph, no_gate)
+
+
+def _scaffold_multi_gate(tmp_path: Path) -> Path:
+    """text -> first(step1) -> gate1(human) -> second(step2) -> gate2(human)
+    -> third(step3). Resuming gate1 should re-pause at gate2."""
+    workflow_dir = tmp_path / "wf"
+    _make_agent(
+        workflow_dir / "agents" / "first", name="first-agent", input_key="text", output_key="step1"
+    )
+    _make_agent(
+        workflow_dir / "agents" / "second",
+        name="second-agent",
+        input_key="step1",
+        output_key="step2",
+    )
+    _make_agent(
+        workflow_dir / "agents" / "third",
+        name="third-agent",
+        input_key="step2",
+        output_key="step3",
+    )
+    return _make_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            {"id": "gate1", "type": "human", "prompt": "gate 1?", "output_contract": ["d1"]},
+            {"id": "second", "type": "agent", "ref": "./agents/second"},
+            {"id": "gate2", "type": "human", "prompt": "gate 2?", "output_contract": ["d2"]},
+            {"id": "third", "type": "agent", "ref": "./agents/third"},
+        ],
+        edges=[
+            {"from": "first", "to": "gate1"},
+            {"from": "gate1", "to": "second"},
+            {"from": "second", "to": "gate2"},
+            {"from": "gate2", "to": "third"},
+        ],
+    )
+
+
+@pytest.mark.unit
+async def test_resume_multi_gate_repauses_at_next_gate(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """5-node multi-gate: run pauses at gate1; resuming gate1 runs `second`
+    and RE-PAUSES at gate2 (a fresh PAUSED checkpoint with the right
+    paused_node_id). Resuming gate2 then runs `third` to SUCCESS."""
+    yaml_path = _scaffold_multi_gate(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+    runner = _build_per_node_runner(storage, tracer, pricing)
+
+    # 1) Run -> pause at gate1.
+    p1 = await runner.run(graph, initial_state={"text": "seed"})
+    assert p1.status is WorkflowStatus.PAUSED
+    rec1 = await storage.get_workflow_run(p1.workflow_run_id, tenant_id=runner._tenant_id)
+    assert rec1 is not None and rec1.paused_node_id == "gate1"
+
+    # 2) Resume gate1 with d1 -> runs `second` -> re-pauses at gate2.
+    rec1 = rec1.model_copy(update={"paused_state": {**(rec1.paused_state or {}), "d1": "ok1"}})
+    p2 = await runner.resume(graph, rec1)
+    assert p2.status is WorkflowStatus.PAUSED
+    assert p2.workflow_run_id == p1.workflow_run_id  # same run
+    rec2 = await storage.get_workflow_run(p1.workflow_run_id, tenant_id=runner._tenant_id)
+    assert rec2 is not None
+    assert rec2.paused_node_id == "gate2"
+    assert rec2.human_task == {"prompt": "gate 2?", "output_contract": ["d2"]}
+    # The merged state carried forward: step1 + step2 + d1 captured at gate2.
+    assert rec2.paused_state == {
+        "text": "seed",
+        "step1": "step1-out",
+        "d1": "ok1",
+        "step2": "step2-out",
+    }
+    # Still exactly one workflow_run row (upserted across both pauses).
+    assert len(await storage.list_workflow_runs(tenant_id=runner._tenant_id)) == 1
+
+    # 3) Resume gate2 with d2 -> runs `third` -> SUCCESS.
+    rec2 = rec2.model_copy(update={"paused_state": {**(rec2.paused_state or {}), "d2": "ok2"}})
+    done = await runner.resume(graph, rec2)
+    assert done.status is WorkflowStatus.SUCCESS
+    assert done.final_state["step3"] == "step3-out"
+    assert done.final_state["d1"] == "ok1"
+    assert done.final_state["d2"] == "ok2"
