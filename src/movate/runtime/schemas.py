@@ -68,6 +68,13 @@ class RunAccepted(BaseModel):
     """Always ``QUEUED`` from this endpoint; included for forward compat
     if we ever add a synchronous ``?wait=true`` mode."""
 
+    deduplicated: bool = False
+    """item 23: ``True`` only on the trigger fire endpoint when an
+    ``X-Movate-Delivery-Id`` replay matched a prior delivery — the returned
+    ``job_id`` is the original (no new job was enqueued). Defaulted ``False``
+    so every other producer of this model (``POST /run``, the scheduler, etc.)
+    is byte-for-byte unchanged."""
+
 
 class JobView(BaseModel):
     """``GET /jobs/{id}`` response.

@@ -60,6 +60,8 @@ from movate.core.models import (
 )
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.core.triggers import (
+    DELIVERY_ID_HEADER,
+    DELIVERY_ID_MAX_LEN,
     SIGNATURE_HEADER,
     build_triggered_job,
     mint_trigger,
@@ -4252,8 +4254,12 @@ def build_app(
     #    POST /run + the scheduler produce (via build_triggered_job) so the
     #    run flows through the existing dispatch with no new branch.
     #
-    # Replay/idempotency (a nonce/delivery-id store to drop duplicate events)
-    # is a documented follow-up — not built here.
+    # Replay/idempotency (item 23, ADR 017 D2 follow-up): an OPTIONAL
+    # X-Movate-Delivery-Id header makes the fire path idempotent — a repeated
+    # delivery (at-least-once webhook retry) returns the SAME job without
+    # re-enqueuing, dedup'd on (trigger_id, delivery_id). Absent header →
+    # byte-for-byte today's always-enqueue behavior. Auth still gates first:
+    # an unauthenticated request never reads or writes the dedup store.
     # ------------------------------------------------------------------
     def _trigger_to_view(t: Trigger) -> TriggerView:
         return TriggerView(
@@ -4421,7 +4427,19 @@ def build_app(
         produces, so it runs through the existing dispatch with no new branch,
         and is observable + retryable as a normal job.
 
-        Returns **202** ``{job_id, status}`` (mirrors ``RunAccepted``).
+        Returns **202** ``{job_id, status, deduplicated}`` (mirrors
+        ``RunAccepted``).
+
+        **Idempotency (item 23).** Send an optional
+        ``X-Movate-Delivery-Id: <id>`` header (the GitHub ``X-GitHub-Delivery``
+        convention) to make a delivery idempotent: a repeated delivery of the
+        same id for this trigger returns the SAME ``job_id`` with
+        ``deduplicated: true`` and does **not** enqueue a second job or
+        re-stamp ``last_fired_at``. Auth gates first — the dedup store is only
+        ever touched after the signature verifies. The id is capped at 200
+        chars; an empty or over-long value is ignored (treated as absent →
+        today's always-enqueue behavior). Omit the header entirely to keep the
+        pre-item-23 behavior (every valid request enqueues).
 
         Errors:
 
@@ -4471,8 +4489,44 @@ def build_app(
                 )
             event_body = parsed
 
+        # item 23 — replay / idempotency. Read the OPTIONAL delivery id only
+        # AFTER auth (above): an unauthenticated request never touches the
+        # dedup store. Cap the length + reject empty so an arbitrary header
+        # can't bloat storage; an unusable value is treated as absent →
+        # today's always-enqueue behavior.
+        raw_delivery_id = request.headers.get(DELIVERY_ID_HEADER)
+        delivery_id = raw_delivery_id.strip() if raw_delivery_id else None
+        if not delivery_id or len(delivery_id) > DELIVERY_ID_MAX_LEN:
+            delivery_id = None
+
+        if delivery_id is not None:
+            # A prior delivery of this id for this trigger → return the SAME
+            # job; do NOT enqueue again and do NOT re-stamp last_fired_at.
+            prior_job_id = await store.get_trigger_delivery(trigger.trigger_id, delivery_id)
+            if prior_job_id is not None:
+                response.status_code = 202
+                return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
+
         job = build_triggered_job(trigger, event_body)
         await store.save_job(job)
+
+        if delivery_id is not None:
+            # Atomic INSERT-OR-IGNORE: if a concurrent duplicate delivery won
+            # the race, record_trigger_delivery returns False and we prefer
+            # its stored job_id (the common retry path stays exact; under a
+            # true simultaneous race we may have enqueued one extra job, but
+            # the response is consistent — one canonical job_id).
+            recorded = await store.record_trigger_delivery(
+                trigger.trigger_id, delivery_id, job.job_id
+            )
+            if not recorded:
+                winning_job_id = await store.get_trigger_delivery(trigger.trigger_id, delivery_id)
+                if winning_job_id is not None and winning_job_id != job.job_id:
+                    response.status_code = 202
+                    return RunAccepted(
+                        job_id=winning_job_id, status=JobStatus.QUEUED, deduplicated=True
+                    )
+
         await store.touch_trigger(trigger.trigger_id, last_fired_at=datetime.now(UTC))
         response.status_code = 202
         return RunAccepted(job_id=job.job_id, status=job.status)

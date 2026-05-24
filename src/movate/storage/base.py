@@ -347,6 +347,38 @@ class StorageProvider(Protocol):
         """
 
     # ------------------------------------------------------------------
+    # Trigger delivery dedup (item 23 — trigger replay / idempotency,
+    # ADR 017 D2 follow-up)
+    #
+    # Additive, opt-in by the caller: a row exists only when a fire request
+    # carries an ``X-Movate-Delivery-Id`` header (the GitHub
+    # ``X-GitHub-Delivery`` convention). The dedup key is
+    # ``(trigger_id, delivery_id)`` → the ``job_id`` the first delivery
+    # enqueued. A repeated delivery of the same id returns the SAME job and
+    # does NOT re-enqueue. No header → no row → byte-for-byte the pre-item-23
+    # fire behavior. ``trigger_id`` is tenant-bound, so the key is implicitly
+    # tenant-scoped and never leaks across triggers.
+    # ------------------------------------------------------------------
+
+    async def get_trigger_delivery(self, trigger_id: str, delivery_id: str) -> str | None:
+        """Return the ``job_id`` a prior delivery of this id enqueued, or ``None``.
+
+        Keyed by the public ``trigger_id`` (the fire path has no tenant
+        context) + the caller-supplied ``delivery_id``. ``None`` means this
+        is the first time we've seen this delivery for this trigger.
+        """
+
+    async def record_trigger_delivery(self, trigger_id: str, delivery_id: str, job_id: str) -> bool:
+        """Record that ``delivery_id`` for ``trigger_id`` enqueued ``job_id``.
+
+        Atomic insert (``INSERT ... ON CONFLICT DO NOTHING`` /
+        ``INSERT OR IGNORE``) so a concurrent double-delivery races safely to
+        a single winner rather than recording two jobs. Returns ``True`` if
+        this call inserted the row, ``False`` if a row already existed (the
+        existing ``job_id`` is preserved — never overwritten).
+        """
+
+    # ------------------------------------------------------------------
     # Canary configs (ADR 016 D3 — champion/challenger rollout)
     #
     # Additive, default-off: a row exists only when an operator opts an
