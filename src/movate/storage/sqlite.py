@@ -485,6 +485,23 @@ _MIGRATIONS = [
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id)",
+    # item 23: trigger replay / idempotency (ADR 017 D2 follow-up). One row
+    # per (trigger_id, delivery_id) recording the job_id the FIRST delivery
+    # enqueued, so an at-least-once webhook retry returns the same job instead
+    # of double-enqueuing. Additive new table (CREATE TABLE IF NOT EXISTS,
+    # idempotent) — a row exists only when a fire request carried an
+    # X-Movate-Delivery-Id header, so the no-header path is unchanged. The
+    # composite PRIMARY KEY makes record_trigger_delivery's INSERT OR IGNORE
+    # an atomic dedup: a concurrent double-delivery races to one winner.
+    """
+    CREATE TABLE IF NOT EXISTS trigger_deliveries (
+        trigger_id  TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        job_id      TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (trigger_id, delivery_id)
+    )
+    """,
     # ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
     # agent): a challenger version + a traffic weight (0 = kill switch), with
     # optional champion pin + auto-promote eval gate. The run/enqueue path
@@ -1162,6 +1179,28 @@ class SqliteProvider:
             (last_fired_at.isoformat(), trigger_id),
         )
         await self._db.commit()
+
+    async def get_trigger_delivery(self, trigger_id: str, delivery_id: str) -> str | None:
+        async with self._db.execute(
+            "SELECT job_id FROM trigger_deliveries "
+            "WHERE trigger_id = ? AND delivery_id = ? LIMIT 1",
+            (trigger_id, delivery_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return row["job_id"] if row else None
+
+    async def record_trigger_delivery(self, trigger_id: str, delivery_id: str, job_id: str) -> bool:
+        # INSERT OR IGNORE on the (trigger_id, delivery_id) PRIMARY KEY: the
+        # row is written only if absent, so a concurrent double-delivery
+        # races atomically to one winner. cur.rowcount is 1 on a fresh
+        # insert, 0 when the row already existed.
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO trigger_deliveries "
+            "(trigger_id, delivery_id, job_id, created_at) VALUES (?, ?, ?, ?)",
+            (trigger_id, delivery_id, job_id, datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Canary configs (ADR 016 D3 — champion/challenger rollout)

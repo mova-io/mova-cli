@@ -72,6 +72,15 @@ TRIGGER_SALT_BYTES = 16
 SIGNATURE_HEADER = "X-Movate-Signature"
 _SIG_PREFIX = "sha256="
 
+# item 23 (ADR 017 D2 follow-up): the optional per-delivery idempotency key an
+# external caller may send to suppress at-least-once retries — the GitHub
+# ``X-GitHub-Delivery`` convention. When present, the fire endpoint dedups on
+# ``(trigger_id, delivery_id)`` so a repeated delivery returns the SAME job
+# without re-enqueuing. Absent → today's behavior (always enqueue). Capped to
+# bound storage; an empty value is treated as absent.
+DELIVERY_ID_HEADER = "X-Movate-Delivery-Id"
+DELIVERY_ID_MAX_LEN = 200
+
 
 @dataclass(frozen=True)
 class MintedTrigger:
@@ -188,6 +197,8 @@ def verify_signature(trigger: Trigger, raw_body: bytes, presented: str | None) -
 
 
 __all__ = [
+    "DELIVERY_ID_HEADER",
+    "DELIVERY_ID_MAX_LEN",
     "SIGNATURE_HEADER",
     "TRIGGER_SALT_BYTES",
     "TRIGGER_SECRET_BYTES",

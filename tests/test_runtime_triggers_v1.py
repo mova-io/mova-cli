@@ -308,3 +308,173 @@ def test_fire_non_object_body_400(client: TestClient, auth_setup) -> None:
         headers={"X-Movate-Signature": sig},
     )
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Idempotency / replay (item 23 — X-Movate-Delivery-Id dedup)
+# ---------------------------------------------------------------------------
+
+
+def _fire(client: TestClient, created: dict, raw: bytes, *, delivery_id: str | None = None):
+    headers = {"X-Movate-Signature": _sign(created, raw), "Content-Type": "application/json"}
+    if delivery_id is not None:
+        headers["X-Movate-Delivery-Id"] = delivery_id
+    return client.post(
+        f"/api/v1/triggers/{created['trigger_id']}/events",
+        content=raw,
+        headers=headers,
+    )
+
+
+def test_fire_same_delivery_id_twice_enqueues_one_job(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """Same delivery-id twice → exactly ONE job; the second is a flagged replay."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = json.dumps({"ticket": 1}).encode()
+
+    first = _fire(client, created, raw, delivery_id="delivery-abc")
+    assert first.status_code == 202, first.text
+    assert first.json()["deduplicated"] is False
+    job_id = first.json()["job_id"]
+
+    second = _fire(client, created, raw, delivery_id="delivery-abc")
+    assert second.status_code == 202, second.text
+    # Same job_id, flagged as a replay.
+    assert second.json()["job_id"] == job_id
+    assert second.json()["deduplicated"] is True
+
+    # Exactly ONE job was enqueued (the retry did NOT double-enqueue).
+    assert len(storage.jobs) == 1
+    assert storage.jobs[0].job_id == job_id
+
+
+def test_fire_different_delivery_ids_enqueue_two_jobs(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = json.dumps({"ticket": 1}).encode()
+
+    r1 = _fire(client, created, raw, delivery_id="delivery-1")
+    r2 = _fire(client, created, raw, delivery_id="delivery-2")
+    assert r1.status_code == 202 and r2.status_code == 202
+    assert r1.json()["deduplicated"] is False
+    assert r2.json()["deduplicated"] is False
+    assert r1.json()["job_id"] != r2.json()["job_id"]
+    assert len(storage.jobs) == 2
+
+
+def test_fire_no_delivery_id_enqueues_each_call(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """Back-compat: with no delivery-id header, EVERY valid call enqueues."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = json.dumps({"ticket": 1}).encode()
+
+    r1 = _fire(client, created, raw)
+    r2 = _fire(client, created, raw)
+    assert r1.status_code == 202 and r2.status_code == 202
+    # No dedup → default False, two distinct jobs.
+    assert r1.json()["deduplicated"] is False
+    assert r2.json()["deduplicated"] is False
+    assert r1.json()["job_id"] != r2.json()["job_id"]
+    assert len(storage.jobs) == 2
+    # Nothing recorded in the dedup store.
+    assert storage.trigger_deliveries == {}
+
+
+def test_fire_empty_delivery_id_treated_as_absent(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """An empty / whitespace delivery-id is ignored → no dedup, always enqueue."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = json.dumps({"ticket": 1}).encode()
+
+    r1 = _fire(client, created, raw, delivery_id="   ")
+    r2 = _fire(client, created, raw, delivery_id="   ")
+    assert r1.status_code == 202 and r2.status_code == 202
+    assert r1.json()["deduplicated"] is False
+    assert r2.json()["deduplicated"] is False
+    assert len(storage.jobs) == 2
+    assert storage.trigger_deliveries == {}
+
+
+def test_fire_overlong_delivery_id_treated_as_absent(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """An over-long delivery-id is ignored (storage-bloat guard) → always enqueue."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = json.dumps({"ticket": 1}).encode()
+    too_long = "x" * 201
+
+    r1 = _fire(client, created, raw, delivery_id=too_long)
+    r2 = _fire(client, created, raw, delivery_id=too_long)
+    assert r1.status_code == 202 and r2.status_code == 202
+    assert len(storage.jobs) == 2
+    assert storage.trigger_deliveries == {}
+
+
+def test_fire_bad_signature_with_delivery_id_records_nothing(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """Auth gates BEFORE dedup: a bad signature → 401, nothing read/written."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    r = client.post(
+        f"/api/v1/triggers/{created['trigger_id']}/events",
+        content=b"{}",
+        headers={"X-Movate-Signature": "sha256=deadbeef", "X-Movate-Delivery-Id": "delivery-abc"},
+    )
+    assert r.status_code == 401
+    assert storage.jobs == []
+    assert storage.trigger_deliveries == {}
+
+
+def test_fire_unknown_trigger_with_delivery_id_records_nothing(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """An unknown trigger 404s before any dedup read/write."""
+    r = client.post(
+        "/api/v1/triggers/does-not-exist/events",
+        content=b"{}",
+        headers={"X-Movate-Signature": "sha256=deadbeef", "X-Movate-Delivery-Id": "delivery-abc"},
+    )
+    assert r.status_code == 404
+    assert storage.jobs == []
+    assert storage.trigger_deliveries == {}
+
+
+def test_fire_disabled_trigger_with_delivery_id_records_nothing(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """A disabled trigger 404s before any dedup read/write."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk", enabled=False)
+    r = _fire(client, created, b"{}", delivery_id="delivery-abc")
+    assert r.status_code == 404
+    assert storage.jobs == []
+    assert storage.trigger_deliveries == {}
+
+
+def test_fire_replay_does_not_restamp_last_fired_at(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """A replay must NOT re-touch the trigger's last_fired_at."""
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = b"{}"
+
+    _fire(client, created, raw, delivery_id="delivery-abc")
+    stamped = client.get("/api/v1/triggers/zendesk", headers=header).json()["last_fired_at"]
+    assert stamped is not None
+
+    # Replay: last_fired_at must be unchanged.
+    second = _fire(client, created, raw, delivery_id="delivery-abc")
+    assert second.json()["deduplicated"] is True
+    after = client.get("/api/v1/triggers/zendesk", headers=header).json()["last_fired_at"]
+    assert after == stamped

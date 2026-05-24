@@ -500,6 +500,22 @@ CREATE TABLE IF NOT EXISTS triggers (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id);
 
+-- item 23: trigger replay / idempotency (ADR 017 D2 follow-up). One row per
+-- (trigger_id, delivery_id) recording the job_id the FIRST delivery enqueued,
+-- so an at-least-once webhook retry returns the same job instead of double-
+-- enqueuing. Additive new table (CREATE TABLE IF NOT EXISTS, idempotent) — a
+-- row exists only when a fire request carried an X-Movate-Delivery-Id header,
+-- so the no-header path is unchanged. The composite PRIMARY KEY makes
+-- record_trigger_delivery's INSERT ... ON CONFLICT DO NOTHING an atomic dedup:
+-- a concurrent double-delivery races to one winner.
+CREATE TABLE IF NOT EXISTS trigger_deliveries (
+    trigger_id  TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    job_id      TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (trigger_id, delivery_id)
+);
+
 -- ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
 -- agent): a challenger version + a traffic weight (0 = kill switch), with an
 -- optional champion pin + auto-promote eval gate. The run/enqueue path reads
@@ -1272,6 +1288,30 @@ class PostgresProvider:
             last_fired_at,
             trigger_id,
         )
+
+    async def get_trigger_delivery(self, trigger_id: str, delivery_id: str) -> str | None:
+        row = await self._db.fetchrow(
+            "SELECT job_id FROM trigger_deliveries WHERE trigger_id = $1 AND delivery_id = $2",
+            trigger_id,
+            delivery_id,
+        )
+        return row["job_id"] if row else None
+
+    async def record_trigger_delivery(self, trigger_id: str, delivery_id: str, job_id: str) -> bool:
+        # INSERT ... ON CONFLICT DO NOTHING on the (trigger_id, delivery_id)
+        # PRIMARY KEY: the row is written only if absent, so a concurrent
+        # double-delivery races atomically to one winner. asyncpg returns the
+        # command tag "INSERT 0 1" on a fresh insert, "INSERT 0 0" when the
+        # conflict suppressed it.
+        status: str = await self._db.execute(
+            "INSERT INTO trigger_deliveries (trigger_id, delivery_id, job_id, created_at) "
+            "VALUES ($1, $2, $3, $4) ON CONFLICT (trigger_id, delivery_id) DO NOTHING",
+            trigger_id,
+            delivery_id,
+            job_id,
+            datetime.now(UTC),
+        )
+        return status.endswith(" 1")
 
     # ------------------------------------------------------------------
     # Canary configs (ADR 016 D3 — champion/challenger rollout)

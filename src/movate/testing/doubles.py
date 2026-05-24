@@ -74,6 +74,9 @@ class InMemoryStorage:
         self.eval_schedules: list[EvalSchedule] = []
         self.job_schedules: list[JobSchedule] = []
         self.triggers: list[Trigger] = []
+        # item 23: trigger delivery dedup, keyed by (trigger_id, delivery_id)
+        # → the job_id the first delivery enqueued.
+        self.trigger_deliveries: dict[tuple[str, str], str] = {}
         self.canary_configs: list[CanaryConfig] = []
 
     async def init(self) -> None:
@@ -332,6 +335,18 @@ class InMemoryStorage:
             if t.trigger_id == trigger_id:
                 self.triggers[i] = t.model_copy(update={"last_fired_at": last_fired_at})
                 return
+
+    async def get_trigger_delivery(self, trigger_id: str, delivery_id: str) -> str | None:
+        return self.trigger_deliveries.get((trigger_id, delivery_id))
+
+    async def record_trigger_delivery(self, trigger_id: str, delivery_id: str, job_id: str) -> bool:
+        # setdefault mirrors the DB's atomic INSERT-OR-IGNORE: only the first
+        # write for a key lands; a later one finds the row and is a no-op.
+        key = (trigger_id, delivery_id)
+        if key in self.trigger_deliveries:
+            return False
+        self.trigger_deliveries[key] = job_id
+        return True
 
     # ------------------------------------------------------------------
     # Canary configs (ADR 016 D3 — champion/challenger rollout)

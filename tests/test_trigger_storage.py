@@ -167,3 +167,47 @@ async def test_touch_stamps_last_fired_at(storage) -> None:
 async def test_touch_missing_trigger_is_noop(storage) -> None:
     await storage.touch_trigger("ghost", last_fired_at=datetime.now(UTC))
     assert await storage.get_trigger_by_id("ghost") is None
+
+
+# ---------------------------------------------------------------------------
+# Trigger delivery dedup (item 23 — trigger replay / idempotency)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_delivery_default_off_no_rows(storage) -> None:
+    assert await storage.get_trigger_delivery("trig-1", "del-1") is None
+
+
+@pytest.mark.unit
+async def test_record_delivery_round_trip(storage) -> None:
+    assert await storage.record_trigger_delivery("trig-1", "del-1", "job-1") is True
+    assert await storage.get_trigger_delivery("trig-1", "del-1") == "job-1"
+
+
+@pytest.mark.unit
+async def test_record_delivery_second_call_returns_false_and_keeps_first_job(storage) -> None:
+    """A duplicate delivery does NOT overwrite the stored job_id (atomic dedup)."""
+    assert await storage.record_trigger_delivery("trig-1", "del-1", "job-1") is True
+    # Same (trigger_id, delivery_id) again — INSERT-OR-IGNORE: no insert.
+    assert await storage.record_trigger_delivery("trig-1", "del-1", "job-2") is False
+    # The first writer's job_id wins; the second is dropped.
+    assert await storage.get_trigger_delivery("trig-1", "del-1") == "job-1"
+
+
+@pytest.mark.unit
+async def test_delivery_is_per_trigger_scoped(storage) -> None:
+    """The same delivery_id under a different trigger is independent."""
+    assert await storage.record_trigger_delivery("trig-a", "del-1", "job-a") is True
+    # Different trigger, same delivery_id → a distinct key, inserts fine.
+    assert await storage.record_trigger_delivery("trig-b", "del-1", "job-b") is True
+    assert await storage.get_trigger_delivery("trig-a", "del-1") == "job-a"
+    assert await storage.get_trigger_delivery("trig-b", "del-1") == "job-b"
+
+
+@pytest.mark.unit
+async def test_delivery_distinct_ids_independent(storage) -> None:
+    assert await storage.record_trigger_delivery("trig-1", "del-1", "job-1") is True
+    assert await storage.record_trigger_delivery("trig-1", "del-2", "job-2") is True
+    assert await storage.get_trigger_delivery("trig-1", "del-1") == "job-1"
+    assert await storage.get_trigger_delivery("trig-1", "del-2") == "job-2"
