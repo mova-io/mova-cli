@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 # already bridges the legacy MOVATE_ prefix, so we only read MDK_ here.
 _VISIBILITY_TIMEOUT_ENV = "MDK_JOB_VISIBILITY_TIMEOUT_SECONDS"
 
+# Operators override the per-job execution timeout (item 34) via this env
+# var. Same MDK_*↔MOVATE_* shim applies; we only read MDK_ here. Keep this
+# strictly below the visibility timeout (see WorkerConfig.job_timeout_seconds).
+_JOB_TIMEOUT_ENV = "MDK_JOB_TIMEOUT_SECONDS"
+
+# The per-job execution timeout (item 34) defaults to 600s. Mirror the
+# WorkerConfig default rather than reaching into runtime for it — this is
+# the operator-facing default surfaced in the CLI/env contract.
+_DEFAULT_JOB_TIMEOUT_SECONDS = 600.0
+
 
 def _resolve_visibility_timeout() -> float:
     """Read the visibility timeout from env, defaulting on missing/bad input.
@@ -69,6 +79,32 @@ def _resolve_visibility_timeout() -> float:
             DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
         )
         return DEFAULT_VISIBILITY_TIMEOUT_SECONDS
+    return value
+
+
+def _resolve_job_timeout() -> float:
+    """Read the per-job execution timeout from env, defaulting on missing/bad input.
+
+    Mirrors :func:`_resolve_visibility_timeout`, with ONE difference: a
+    non-positive value is a VALID operator opt-out (disable the per-job
+    bound — see ``WorkerConfig.job_timeout_seconds``), so it's passed
+    through verbatim rather than coerced to the default. Only a missing
+    or unparseable value falls back to the default; a misconfigured env
+    var shouldn't take a worker down.
+    """
+    raw = os.environ.get(_JOB_TIMEOUT_ENV)
+    if not raw:
+        return _DEFAULT_JOB_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number — using default %.0fs",
+            _JOB_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_JOB_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_JOB_TIMEOUT_SECONDS
     return value
 
 
@@ -181,6 +217,7 @@ async def _run_worker(
         poll_interval_seconds=poll_interval,
         tenant_id=tenant_id,
         visibility_timeout_seconds=_resolve_visibility_timeout(),
+        job_timeout_seconds=_resolve_job_timeout(),
     )
 
     def on_job_complete(job: JobRecord, outcome: DispatchOutcome, duration_ms: int) -> None:

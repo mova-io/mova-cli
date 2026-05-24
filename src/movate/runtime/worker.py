@@ -87,6 +87,26 @@ class WorkerConfig:
     loop doesn't hammer the reaper UPDATE every tick. The reaper is
     cheap and racing-safe across workers, so this is a coarse knob."""
 
+    job_timeout_seconds: float = 600.0
+    """Per-job execution timeout (item 34). Bounds a SLOW/HUNG job whose
+    worker is still alive — complementary to the reaper, which only
+    reclaims jobs orphaned by a CRASHED worker. When a single
+    ``execute_job`` exceeds this, the worker cancels it and records a
+    retryable ``timeout`` ERROR (re-queued with backoff, dead-lettered
+    after the retry budget).
+
+    ORDERING INVARIANT: this MUST stay strictly SMALLER than
+    ``visibility_timeout_seconds`` (default 600 < 900). The per-job
+    timeout fails a hung job fast — long before the reaper's visibility
+    window would ever consider it orphaned — so the reaper never
+    double-runs a job that's merely slow. Were this larger than the
+    visibility timeout, the reaper could reclaim (and a second worker
+    re-run) a job that this worker is still actively timing out.
+
+    ``<= 0`` disables the bound entirely (operator opt-out) — the
+    dispatch runs unwrapped, exactly today's behavior, with only the
+    reaper as a backstop."""
+
 
 class Worker:
     """Drains a queue using a :class:`WorkerDispatch`."""
@@ -136,21 +156,7 @@ class Worker:
         # metrics are off (OTel extra absent or sink not OTLP).
         inc_in_flight(tenant_id=job.tenant_id)
         try:
-            try:
-                outcome = await self._dispatch.execute_job(job)
-            except Exception as exc:
-                # Programming bug in dispatch (or in the executor it
-                # wraps). Record as INTERNAL so operators can triage.
-                logger.exception("worker_dispatch_crashed job_id=%s", job.job_id)
-                outcome = DispatchOutcome(
-                    status=JobStatus.ERROR,
-                    result_run_id=None,
-                    error=ErrorInfo(
-                        type="internal",
-                        message=f"worker dispatch crashed: {exc}",
-                        retryable=True,
-                    ).model_dump(),
-                )
+            outcome = await self._dispatch_job(job)
         finally:
             dec_in_flight(tenant_id=job.tenant_id)
 
@@ -265,6 +271,63 @@ class Worker:
                     exc_info=True,
                 )
         return job
+
+    async def _dispatch_job(self, job: JobRecord) -> DispatchOutcome:
+        """Run dispatch for one job, converting failures into outcomes.
+
+        Never raises: a per-job execution timeout (item 34) and a real
+        dispatch crash both become a retryable ERROR ``DispatchOutcome``
+        so the worker loop's single update path handles them uniformly.
+        Lives between the in-flight try/finally in ``run_one_cycle`` —
+        ``dec_in_flight`` still runs whichever branch fires.
+        """
+        timeout = self._config.job_timeout_seconds
+        try:
+            # Per-job execution timeout. Bound a slow/hung job so it can't
+            # hold a worker slot indefinitely. The timeout MUST be <
+            # visibility_timeout_seconds (see the WorkerConfig docstring):
+            # we fail the job fast as a retryable error long before the
+            # reaper would consider it orphaned, so a merely-slow job is
+            # never double-run.
+            #
+            # ``<= 0`` opts out — call unwrapped (today's behavior).
+            # asyncio.wait_for CANCELS the underlying coroutine on timeout,
+            # which is intended: it frees the worker slot. A job cancelled
+            # mid-execution may leave a partial run record; we record it as
+            # a retryable timeout error and re-queue it, which is desired.
+            if timeout > 0:
+                return await asyncio.wait_for(self._dispatch.execute_job(job), timeout=timeout)
+            return await self._dispatch.execute_job(job)
+        except TimeoutError:
+            # The dispatch exceeded job_timeout_seconds. asyncio.wait_for
+            # (Python 3.11+) raises the builtin TimeoutError here; this
+            # branch is checked BEFORE the generic Exception below
+            # (TimeoutError IS an Exception) so a real timeout doesn't
+            # masquerade as an "internal" crash. Matches how run_forever's
+            # poll wait suppresses TimeoutError from the same wait_for.
+            logger.warning("worker_job_timeout job_id=%s timeout=%.0fs", job.job_id, timeout)
+            return DispatchOutcome(
+                status=JobStatus.ERROR,
+                result_run_id=None,
+                error=ErrorInfo(
+                    type="timeout",
+                    message=f"job exceeded {timeout:.0f}s execution timeout",
+                    retryable=True,
+                ).model_dump(),
+            )
+        except Exception as exc:
+            # Programming bug in dispatch (or in the executor it wraps).
+            # Record as INTERNAL so operators can triage.
+            logger.exception("worker_dispatch_crashed job_id=%s", job.job_id)
+            return DispatchOutcome(
+                status=JobStatus.ERROR,
+                result_run_id=None,
+                error=ErrorInfo(
+                    type="internal",
+                    message=f"worker dispatch crashed: {exc}",
+                    retryable=True,
+                ).model_dump(),
+            )
 
     def _resolve_outcome(self, job: JobRecord, outcome: DispatchOutcome) -> tuple[JobStatus, str]:
         """Decide what to do with a dispatch outcome.
