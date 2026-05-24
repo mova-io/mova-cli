@@ -90,9 +90,12 @@ class AuthContext:
 def make_auth_dependency(
     storage: StorageProvider,
     rate_limiter: RateLimiter | None = None,
+    *,
+    tenant_rate_limiter: RateLimiter | None = None,
 ) -> Callable[..., Awaitable[AuthContext]]:
     """Build the FastAPI auth dependency bound to ``storage`` + an
-    optional ``rate_limiter``.
+    optional ``rate_limiter`` (and an optional per-tenant aggregate
+    limiter, item 25).
 
     Called once in :func:`build_app`. Tests build a fresh app per case
     so each one closes over its own ``InMemoryStorage`` (and, when
@@ -103,8 +106,20 @@ def make_auth_dependency(
     opted in. The headers ``X-RateLimit-*`` still attach with the
     sentinel zero limit so clients don't see them appear/disappear
     based on opt-in.
+
+    ``tenant_rate_limiter`` (item 25) is a SECOND limiter keyed by
+    ``tenant_id`` rather than ``key_id`` — an aggregate ceiling across
+    ALL of a tenant's keys, so minting more keys can't sidestep the cap.
+    ``None`` → :class:`NoOpRateLimiter` (the default, OFF). When both
+    limiters are consulted the request is allowed only if BOTH allow; if
+    either denies the response is 429 with ``Retry-After`` = the max of
+    the two retry-afters. Like the per-key limiter, the per-tenant
+    bucket state is in-process per replica, so the effective tenant limit
+    is ``limit * replica_count`` in v1.x; Redis-backed shared state is
+    the documented future seam (see ``core/rate_limit``).
     """
     limiter: RateLimiter = rate_limiter or NoOpRateLimiter()
+    tenant_limiter: RateLimiter = tenant_rate_limiter or NoOpRateLimiter()
 
     async def auth_dependency(
         response: Response,
@@ -166,29 +181,63 @@ def make_auth_dependency(
         await _safe_touch(storage, record.key_id, record.tenant_id)
 
         # Rate-limit AFTER auth succeeds — we use ``record.key_id`` as
-        # the bucket key (not the presented token, which differs on
-        # every refresh). Unauthenticated requests never reach here,
+        # the per-key bucket key (not the presented token, which differs
+        # on every refresh). Unauthenticated requests never reach here,
         # so the limiter is never asked about an anonymous identity.
-        # If the bucket is empty, raise 429 with Retry-After + the
-        # same X-RateLimit-* headers we set on the 200 path.
+        #
+        # Two buckets are consulted, in order:
+        #   1. per-API-key, keyed by ``record.key_id`` (unchanged)
+        #   2. per-tenant aggregate (item 25), keyed by the tenant_id —
+        #      a ceiling across ALL of a tenant's keys so minting more
+        #      keys can't sidestep the cap. OFF by default (NoOp limiter).
+        # The request is allowed only if BOTH allow; if either denies we
+        # 429 with Retry-After = max of the two waits, so a single
+        # back-off clears whichever ceiling is binding.
         decision = await limiter.check(record.key_id)
-        # Attach the headers regardless — gives clients a way to see
-        # their current budget on every successful response.
+        tenant_decision = await tenant_limiter.check(f"tenant:{record.tenant_id}")
+
+        # Per-key headers — unchanged names/semantics. Attached on every
+        # response so clients can budget proactively.
         response.headers["X-RateLimit-Limit"] = str(decision.limit)
         response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
         response.headers["X-RateLimit-Reset"] = str(decision.reset_at_unix)
-        if not decision.allowed:
+        # Tenant-scoped headers (additive). Let a client tell which
+        # ceiling it's near / hit. With the default NoOp tenant limiter
+        # these carry the sentinel zero limit (mirrors the per-key OFF
+        # signal) — present but inert.
+        tenant_headers = {
+            "X-RateLimit-Tenant-Limit": str(tenant_decision.limit),
+            "X-RateLimit-Tenant-Remaining": str(tenant_decision.remaining),
+            "X-RateLimit-Tenant-Reset": str(tenant_decision.reset_at_unix),
+        }
+        for header_name, header_value in tenant_headers.items():
+            response.headers[header_name] = header_value
+
+        if not decision.allowed or not tenant_decision.allowed:
+            # Retry-After = the longer of the two waits so a single
+            # back-off clears whichever ceiling (or both) is binding.
+            # ``X-RateLimit-*`` (per-key) stays the canonical 429 limit
+            # contract; the tenant headers ride along for diagnosis.
+            key_retry = decision.retry_after_seconds or 0
+            tenant_retry = tenant_decision.retry_after_seconds or 0
+            retry_after = max(key_retry, tenant_retry)
             logger.info(
-                "rate_limited key_id=%s limit=%d retry_after=%s",
+                "rate_limited key_id=%s tenant_id=%s "
+                "key_allowed=%s tenant_allowed=%s "
+                "key_limit=%d tenant_limit=%d retry_after=%d",
                 record.key_id,
+                record.tenant_id,
+                decision.allowed,
+                tenant_decision.allowed,
                 decision.limit,
-                decision.retry_after_seconds,
+                tenant_decision.limit,
+                retry_after,
             )
-            assert decision.retry_after_seconds is not None
             raise rate_limited(
-                retry_after_seconds=decision.retry_after_seconds,
+                retry_after_seconds=retry_after,
                 limit=decision.limit,
                 reset_at_unix=decision.reset_at_unix,
+                tenant_headers=tenant_headers,
             )
 
         return AuthContext(

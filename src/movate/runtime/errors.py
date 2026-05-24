@@ -127,6 +127,7 @@ def rate_limited(
     retry_after_seconds: int,
     limit: int,
     reset_at_unix: int,
+    tenant_headers: dict[str, str] | None = None,
 ) -> HTTPException:
     """429 with ``Retry-After`` + the same ``X-RateLimit-*`` headers as
     successful responses, so the client can recover programmatically.
@@ -134,6 +135,18 @@ def rate_limited(
     RFC 7231 §7.1.3: ``Retry-After`` is either a delta-seconds or a
     HTTP-date. We send the delta-seconds form because it's friendlier
     to clients that don't keep accurate wall clocks.
+
+    ``limit`` / ``reset_at_unix`` / ``X-RateLimit-Remaining: 0`` describe
+    the **per-API-key** ceiling (unchanged contract). ``retry_after_seconds``
+    is the wait the caller should honor — when the per-tenant aggregate cap
+    (item 25) is also in play it's the *max* of the per-key and per-tenant
+    retry-afters, so a single back-off clears whichever ceiling is binding.
+
+    ``tenant_headers`` (additive, default ``None`` → today's exact header
+    set) carries the tenant-scoped budget snapshot
+    (``X-RateLimit-Tenant-Limit`` / ``-Remaining`` / ``-Reset``) so a
+    client can tell *which* ceiling it hit. The per-key header names and
+    semantics are never mutated.
     """
     exc = http_error(
         ErrorCode.RATE_LIMITED,
@@ -144,12 +157,15 @@ def rate_limited(
     # we can stamp before raising. The middleware attaches the same
     # rate-limit headers to the 200 path; doing it here for 429 keeps
     # the client-side handling symmetric.
-    exc.headers = {
+    headers = {
         "Retry-After": str(retry_after_seconds),
         "X-RateLimit-Limit": str(limit),
         "X-RateLimit-Remaining": "0",
         "X-RateLimit-Reset": str(reset_at_unix),
     }
+    if tenant_headers:
+        headers.update(tenant_headers)
+    exc.headers = headers
     return exc
 
 
