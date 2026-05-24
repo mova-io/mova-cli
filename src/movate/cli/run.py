@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -90,8 +90,9 @@ def run(
             "Resolves to a target from ~/.movate/config.yaml (URL + key_env). "
             "POSTs the input to /api/v1/agents/<name>/runs?wait=true and "
             "renders the resulting RunView the same way as a local run. "
-            "Mutually exclusive with --replay and --stream (remote runtime "
-            "owns persistence + provider; no local stream callback)."
+            "With --stream, POSTs to /api/v1/agents/<name>/runs/stream and "
+            "renders tokens live over SSE. Mutually exclusive with --replay "
+            "(remote runtime owns the RunRecord history)."
         ),
     ),
     stream: bool = typer.Option(
@@ -159,8 +160,9 @@ def run(
     """
     # Remote dispatch wins early — when --target is set, we don't need
     # the local bundle (the runtime has it). Mutex with --replay (replay
-    # rebuilds from a local RunRecord; nothing remote about it) and
-    # --stream (no token callback path through the runtime in v0.5).
+    # rebuilds from a local RunRecord; nothing remote about it). --stream
+    # IS supported remotely: it POSTs to the runtime's SSE endpoint and
+    # renders tokens as they arrive (BACKLOG #75).
     if target is not None:
         if replay_id is not None:
             console.print(
@@ -169,11 +171,14 @@ def run(
             )
             raise typer.Exit(code=2)
         if stream:
-            console.print(
-                "[red]✗[/red] --target does not support --stream in v0.7; "
-                "the runtime returns the final RunView once execution completes."
+            _dispatch_remote_agent_stream(
+                agent_name=str(path),
+                raw=input_flag or input_arg,
+                target=target,
+                mock=mock,
+                output_format=output_format,
             )
-            raise typer.Exit(code=2)
+            return
         _dispatch_remote_agent(
             agent_name=str(path),
             raw=input_flag or input_arg,
@@ -825,6 +830,7 @@ def _configure_mock_for_bundle(provider: Any, bundle: AgentBundle) -> None:
 
 _HTTP_OK = 200
 _HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
 _HTTP_NOT_FOUND = 404
 _HTTP_UNPROCESSABLE = 422
 
@@ -1124,3 +1130,276 @@ def _emit_remote_summary(
         f"ok={'true' if ok else 'false'}\n"
     )
     sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# Remote streaming (--target + --stream) — SSE over /runs/stream (BACKLOG #75)
+# ---------------------------------------------------------------------------
+
+
+def parse_sse_events(
+    lines: Iterable[str],
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Parse an SSE line stream into ``(event, data)`` tuples.
+
+    Minimal Server-Sent Events reader matching the runtime's
+    ``/runs/stream`` frame shape: an ``event:`` line, a ``data:`` line
+    (compact JSON), terminated by a blank line. Lines are expected to be
+    already-decoded strings (trailing ``\\r``/``\\n`` tolerated). A blank
+    line flushes the buffered frame; ``data`` is JSON-decoded (a non-JSON
+    ``data:`` line is wrapped as ``{"raw": "<value>"}`` so a malformed
+    frame never crashes the consumer).
+
+    Pulled out as a pure function so it's unit-testable without a live
+    HTTP stream.
+    """
+    event: str | None = None
+    data_buf: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\r\n")
+        if line == "":
+            if event is not None or data_buf:
+                yield (event or "message", _decode_sse_data(data_buf))
+            event = None
+            data_buf = []
+            continue
+        if line.startswith(":"):
+            # SSE comment / heartbeat — ignore.
+            continue
+        if line.startswith("event:"):
+            event = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data_buf.append(line[len("data:") :].lstrip(" "))
+
+
+def _decode_sse_data(data_buf: list[str]) -> dict[str, Any]:
+    """JSON-decode a frame's accumulated ``data:`` lines into a dict.
+
+    Multi-line ``data:`` fields join with ``\\n`` per the SSE spec.
+    Non-JSON / non-object payloads are wrapped as ``{"raw": ...}`` so the
+    consumer always gets a dict."""
+    payload = "\n".join(data_buf)
+    try:
+        data = json.loads(payload) if payload else {}
+    except json.JSONDecodeError:
+        return {"raw": payload}
+    if not isinstance(data, dict):
+        return {"raw": data}
+    return data
+
+
+async def _aiter_sse(resp: Any) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """Async analog of :func:`parse_sse_events` over an ``httpx``
+    streaming response's ``aiter_lines()``. Same framing rules, so the
+    wire shape has a single source of truth."""
+    event: str | None = None
+    data_buf: list[str] = []
+    async for raw_line in resp.aiter_lines():
+        line = raw_line.rstrip("\r\n")
+        if line == "":
+            if event is not None or data_buf:
+                yield (event or "message", _decode_sse_data(data_buf))
+            event = None
+            data_buf = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data_buf.append(line[len("data:") :].lstrip(" "))
+
+
+def _dispatch_remote_agent_stream(
+    *,
+    agent_name: str,
+    raw: str | None,
+    target: str,
+    mock: bool,
+    output_format: Run,
+) -> None:
+    """Run an agent against a deployed runtime, streaming tokens via SSE.
+
+    The streaming sibling of :func:`_dispatch_remote_agent`: resolves the
+    target's URL + bearer the same way, but POSTs to
+    ``/api/v1/agents/<name>/runs/stream`` with an ``httpx`` streaming
+    request, parses the SSE frames, and prints each token delta to stderr
+    live (mirroring the local ``--stream`` render — stderr so stdout stays
+    clean for the final output). On the terminal ``done`` frame it renders
+    the final output to stdout; on an ``error`` frame it surfaces the
+    runtime's error envelope.
+    """
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
+
+    name = Path(agent_name).name or agent_name
+
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    if not api_key:
+        console.print(
+            f"[red]✗[/red] env var ${target_cfg.key_env} is empty. "
+            f"Run [bold]mdk auth save-runtime-key {target_name} <key>[/bold] "
+            f"to persist + autoload, or [bold]export {target_cfg.key_env}=mvt_live_...[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    if raw is None:
+        console.print(
+            "[red]✗[/red] provide input as a positional arg or via --input "
+            "(remote runs require JSON input; no schema available client-side)."
+        )
+        raise typer.Exit(code=2)
+
+    payload = _coerce_remote_agent_input(raw, name)
+
+    base_url = target_cfg.url.rstrip("/")
+    body = {"input": payload, "mock": mock}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+    # Read timeout disabled (None) so a slow token stream doesn't trip a
+    # per-read deadline; connect timeout stays bounded so a dead pod
+    # fails fast rather than hanging.
+    timeout = httpx.Timeout(None, connect=10.0)
+
+    console.print(
+        f"[dim]→ streaming [bold]{name}[/bold] on [bold]{target_name}[/bold] "
+        f"({target_cfg.url}) …[/dim]"
+    )
+
+    async def _consume() -> dict[str, Any]:
+        """Open the SSE stream, render token deltas live, return the
+        terminal frame's data (``done`` or ``error``). Raises
+        :class:`typer.Exit` on HTTP errors so the caller's summary line
+        still fires."""
+        terminal: dict[str, Any] = {}
+        async with (
+            httpx.AsyncClient(timeout=timeout) as client,
+            client.stream(
+                "POST",
+                f"{base_url}/api/v1/agents/{name}/runs/stream",
+                json=body,
+                headers=headers,
+            ) as resp,
+        ):
+            if resp.status_code != _HTTP_OK:
+                # Drain so the friendly mapper can read the body.
+                await resp.aread()
+                _handle_remote_stream_http_error(
+                    resp, name=name, target_name=target_name, target_cfg=target_cfg
+                )
+            async for event, data in _aiter_sse(resp):
+                if event == "token":
+                    text = data.get("text", "")
+                    if text:
+                        sys.stderr.write(text)
+                        sys.stderr.flush()
+                elif event in ("done", "error"):
+                    terminal = {"event": event, **data}
+                    break
+        return terminal
+
+    try:
+        terminal = asyncio.run(_consume())
+    except httpx.HTTPError as exc:
+        sys.stderr.write("\n")
+        console.print(f"[red]✗ network error:[/red] {exc}")
+        _emit_remote_summary(
+            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+        )
+        raise typer.Exit(code=2) from None
+
+    # Newline terminates the streamed preview so the JSON/summary below
+    # starts cleanly — mirrors the local --stream path.
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+    if terminal.get("event") == "done":
+        run_id = terminal.get("run_id")
+        status = (terminal.get("status") or "").lower()
+        ok = status == "success"
+        metrics = terminal.get("metrics") or {}
+        output = terminal.get("output")
+
+        if output_format == Run.TEXT:
+            sys.stdout.write(json.dumps(output, indent=2, default=str) + "\n")
+        else:
+            sys.stdout.write(json.dumps(terminal, indent=2, default=str) + "\n")
+        if run_id:
+            short = str(run_id)[:8]
+            _console.hint(
+                f"[dim]→ remote run_id [bold]{short}[/bold] "
+                f"(persisted on the runtime, not locally)[/dim]"
+            )
+        _emit_remote_summary(
+            agent=name,
+            target=target_name,
+            run_id=run_id,
+            cost=metrics.get("cost_usd"),
+            latency=metrics.get("latency_ms"),
+            ok=ok,
+        )
+        if not ok:
+            raise typer.Exit(code=1)
+        return
+
+    # error frame (or no terminal frame at all → treat as error)
+    msg = terminal.get("message", "stream ended without a terminal event")
+    code = terminal.get("code", "stream_error")
+    console.print(f"[red]✗ run errored:[/red] {code}: {msg}")
+    _emit_remote_summary(
+        agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+    )
+    raise typer.Exit(code=1)
+
+
+def _handle_remote_stream_http_error(
+    resp: Any,
+    *,
+    name: str,
+    target_name: str,
+    target_cfg: Any,
+) -> None:
+    """Map a non-200 SSE response to the same friendly errors the
+    non-streaming remote path uses, then exit. ``resp`` must already be
+    drained (``await resp.aread()``)."""
+    status_code = resp.status_code
+    if status_code == _HTTP_UNAUTHORIZED:
+        console.print(
+            "[red]✗ runtime rejected the bearer token[/red].\n"
+            f"  Check your env: [bold]echo ${target_cfg.key_env}[/bold] — "
+            "likely stale.\n"
+            f"  Fix: [bold]mdk auth save-runtime-key {target_name} <new-key>[/bold]."
+        )
+    elif status_code == _HTTP_FORBIDDEN:
+        console.print(
+            "[red]✗ token lacks the [bold]run[/bold] scope[/red] — "
+            "streaming needs a key minted with run permission."
+        )
+    elif status_code == _HTTP_NOT_FOUND:
+        console.print(
+            f"[red]✗ agent [bold]{name}[/bold] not found on [bold]{target_name}[/bold].[/red]\n"
+            f"  Did you forget to [bold]mdk deploy --target {target_name}[/bold] first?"
+        )
+    else:
+        try:
+            detail = resp.json()
+        except (ValueError, json.JSONDecodeError):
+            detail = {"raw": resp.text[:300]}
+        console.print(f"[red]✗ HTTP {status_code}[/red] from {target_cfg.url}: {detail}")
+    _emit_remote_summary(
+        agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
+    )
+    raise typer.Exit(code=1)
