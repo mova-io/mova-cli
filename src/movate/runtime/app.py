@@ -3819,6 +3819,59 @@ def build_app(
         views = [JobView.from_record(r) for r in records]
         return JobListView(jobs=views, count=len(views))
 
+    # ------------------------------------------------------------------
+    # /api/v1 aliases for the unversioned job-poll + run-fetch routes.
+    #
+    # A caller that submits via ``POST /api/v1/agents/{name}/runs`` gets
+    # back a ``job_id`` and naturally polls the *versioned* path
+    # ``GET /api/v1/jobs/{job_id}`` (then fetches the run at
+    # ``GET /api/v1/runs/{run_id}``). Those routes only existed
+    # UNVERSIONED (``/jobs/{id}``, ``/runs/{id}``) — the obvious v1 path
+    # 404'd. These thin aliases delegate to the SAME unversioned handler
+    # closures (``get_job`` / ``get_run`` above) so there is exactly one
+    # copy of the business logic, scope, and tenant-scoping. The
+    # unversioned routes stay as-is for back-compat; these are additive.
+    #
+    # ``GET /api/v1/jobs`` (list) already exists as ``v1_list_jobs``
+    # above (a superset with an ``agent=`` filter), so no list alias is
+    # added here.
+    # ------------------------------------------------------------------
+    @v1.get(
+        "/jobs/{job_id}",
+        response_model=JobView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_job(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobView:
+        """Versioned alias of ``GET /jobs/{job_id}``.
+
+        Delegates to the unversioned :func:`get_job` handler — identical
+        ``read`` scope, ``JobView`` response, and tenant-scoping (404 on
+        cross-tenant access, never 403)."""
+        return await get_job(job_id, request, ctx)
+
+    @v1.get(
+        "/runs/{run_id}",
+        response_model=RunView,
+        tags=["runs-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_run(
+        run_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> RunView:
+        """Versioned alias of ``GET /runs/{run_id}``.
+
+        Delegates to the unversioned :func:`get_run` handler — identical
+        ``read`` scope, ``RunView`` response (including ``output``), and
+        tenant-scoping (404 on cross-tenant access, never 403)."""
+        return await get_run(run_id, request, ctx)
+
     @v1.get(
         "/runs/{run_id}/trace",
         response_model=RunTraceView,
