@@ -75,11 +75,12 @@ smoke pass is the gate to calling the platform production-ready.**
 | 22 | **Auto-rollback on drift** — when a scheduled eval flags a challenger regression, opt-in auto-revert to champion (weight→0 + restore champion); informs by default, auto only when enabled | A | 016.D5 | M (~30m) | #10, #12 | ✅ | #396 | `2026.5.24.6` |
 | 23 | **Trigger replay / idempotency** — delivery-id / nonce store so a duplicate inbound event doesn't double-enqueue a run | A | 017.D2 | M (~30m) | #13 | ✅ | #398 | `2026.5.24.8` |
 | 24 | **Per-dimension drift** — persist per-dimension eval means on `EvalRecord`; extend `drift.py` to compare per-dimension, not just aggregate mean/pass-rate | A | 016.D2 | M (~30m) | #10 | ✅ | #397 | `2026.5.24.7` |
-| 25 | **Per-tenant rate-limiting / quota** at the runtime edge — token-bucket / sliding-window per (tenant, scope), 429 on exceed; portable app-level (always-on, complements #21) | B | 013 / feature | M (~35m) | scopes | ⬜ | | `____` |
+| 25 | **Per-tenant rate-limiting / quota** at the runtime edge — token-bucket / sliding-window per (tenant, scope), 429 on exceed; portable app-level (always-on, complements #21) | B | 013 / feature | M (~35m) | scopes | ✅ | #400 | `2026.5.24.10` |
 | 26 | **DR / backup runbook + tooling** for Postgres storage — documented backup/restore + point-in-time, plus a `mdk` export/import escape hatch | B | feature | M (~35m) 🔒 | — | ⬜ | | `____` |
 | 27 | **Golden-signal SLOs + alerting** — readiness/liveness probes + latency / error-rate / queue-depth metrics → Azure Monitor alert rules (beyond drift) | B | 015 | M–L (~45m) 🔒 | #4 | ⬜ | | `____` |
 | 28 | **Load / soak test harness** — drive the job-queue + KEDA autoscale path under load; capture baseline throughput/latency; documented results | B | feature | M (~35m) 🔒 | #11 | ⬜ | | `____` |
 | 29 | **Operator runbooks** — configure/operate/troubleshoot the new surfaces (scheduler, triggers, durable/HITL, canary, harvest, continuous-eval, batch, SSE) | C | docs | M (~30m) | (features land) | ⬜ | | `____` |
+| 30 | **Per-tenant BYOK provider keys** — each tenant stores its own OpenAI/Anthropic key (Fernet-encrypted at rest); `ProviderKeyResolver` (tenant→shared fallback); `mdk keys set\|list\|delete\|test` + `/api/v1/provider-keys`; admin-gated, value never returned | D | **018** | M–L (~45m) | scopes | ⬜ | | `____` |
 
 ## How this is maintained
 As each PR merges, its row flips to ✅ and the **Merged** column is stamped with
