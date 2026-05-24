@@ -20,6 +20,14 @@ The :class:`RateLimiter` Protocol is the seam: the middleware calls
 ``RedisRateLimiter`` implements the same interface; the middleware
 doesn't change.
 
+The same Protocol is reused for the **per-tenant aggregate** cap (item
+25): the runtime builds a SECOND :class:`InProcessRateLimiter` keyed by
+``tenant:<tenant_id>`` instead of by ``key_id``, so a tenant can't
+sidestep the per-key limit by minting more keys. No new algorithm — just
+a second instance, with the same in-process / per-replica caveat below
+(effective tenant limit ≈ ``limit * replica_count`` in v1.x; the
+``RedisRateLimiter`` seam is the shared-state future for both).
+
 Algorithm
 ---------
 

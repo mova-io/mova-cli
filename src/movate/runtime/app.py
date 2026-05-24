@@ -371,6 +371,40 @@ def _resolve_cors_origins(explicit: list[str] | None) -> list[str]:
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
+def _resolve_tenant_rate_limit(explicit: int | None) -> int | None:
+    """Resolve the per-tenant aggregate rate limit (item 25), in
+    priority order:
+
+    1. ``explicit`` (the ``build_app(tenant_rate_limit_per_minute=...)``
+       kwarg) — wins whenever it is not ``None``. Tests pass it directly.
+    2. ``MDK_TENANT_RATE_LIMIT_PER_MINUTE`` env var (an integer; e.g.
+       ``"600"``). A non-integer / blank value is treated as unset so a
+       typo can't silently disable a configured limit elsewhere — it
+       falls through to OFF.
+    3. ``None`` — per-tenant limiting OFF (the default; the runtime keeps
+       today's per-key-only behavior, byte-for-byte).
+
+    Returns the resolved limit (``int``) or ``None`` for OFF. A
+    non-positive resolved value is left as-is for the caller to map to a
+    :class:`NoOpRateLimiter` (mirrors ``rate_limit_per_minute<=0``)."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get("MDK_TENANT_RATE_LIMIT_PER_MINUTE", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning(
+            "ignoring non-integer MDK_TENANT_RATE_LIMIT_PER_MINUTE=%r; "
+            "per-tenant rate limiting stays OFF",
+            raw,
+        )
+        return None
+
+
 async def _collect_bundle_files(
     *,
     agent_yaml: UploadFile | None,
@@ -1005,6 +1039,7 @@ def build_app(
     agents_path: Path | None = None,
     skills_path: Path | None = None,
     rate_limit_per_minute: int | None = 60,
+    tenant_rate_limit_per_minute: int | None = None,
     cors_allowed_origins: list[str] | None = None,
     github_client: object | None = None,
     import_tenant_id: str | None = None,
@@ -1020,6 +1055,20 @@ def build_app(
     capacity (and the steady-state allowed request rate). Default
     60. Pass ``None`` to disable rate limiting entirely (uses a
     :class:`NoOpRateLimiter` that always allows).
+
+    ``tenant_rate_limit_per_minute`` (item 25) is a SECOND, aggregate
+    ceiling applied across ALL of a tenant's API keys — so a tenant
+    can't sidestep the per-key limit by minting more keys (each key
+    gets its own per-key bucket; the per-tenant bucket is shared by
+    every key of that tenant). Default ``None`` → OFF (a
+    :class:`NoOpRateLimiter`, behavior byte-for-byte the per-key-only
+    path); env-overridable via ``MDK_TENANT_RATE_LIMIT_PER_MINUTE``
+    (the explicit kwarg wins when not ``None``). When enabled, a
+    request is allowed only if BOTH the per-key and per-tenant buckets
+    allow; the 429 ``Retry-After`` is the max of the two waits. Like
+    the per-key limiter, per-tenant state is in-process per replica
+    (effective tenant limit ≈ ``limit * replica_count`` in v1.x);
+    Redis-backed shared state is the documented future seam.
 
     The app's ``state`` carries collaborators so handlers can read
     them without closing over the factory's locals — keeps
@@ -1146,6 +1195,11 @@ def build_app(
                 "X-RateLimit-Limit",
                 "X-RateLimit-Remaining",
                 "X-RateLimit-Reset",
+                # Per-tenant aggregate budget (item 25) — additive; lets
+                # the browser client tell which ceiling it's near / hit.
+                "X-RateLimit-Tenant-Limit",
+                "X-RateLimit-Tenant-Remaining",
+                "X-RateLimit-Tenant-Reset",
                 "Retry-After",
             ],
         )
@@ -1160,6 +1214,20 @@ def build_app(
         limiter = InProcessRateLimiter(limit_per_minute=rate_limit_per_minute)
     app.state.rate_limiter = limiter
 
+    # Per-tenant aggregate rate limiter (item 25) — a SECOND bucket keyed
+    # by tenant_id, capping total throughput across all of a tenant's
+    # keys. Additive + OFF by default: the explicit kwarg wins, else fall
+    # back to ``MDK_TENANT_RATE_LIMIT_PER_MINUTE``, else None → NoOp (no
+    # behavior change vs the per-key-only path). Built once here so the
+    # bucket state persists across requests for this replica's lifetime.
+    tenant_limit = _resolve_tenant_rate_limit(tenant_rate_limit_per_minute)
+    tenant_limiter: RateLimiter
+    if tenant_limit is None or tenant_limit <= 0:
+        tenant_limiter = NoOpRateLimiter()
+    else:
+        tenant_limiter = InProcessRateLimiter(limit_per_minute=tenant_limit)
+    app.state.tenant_rate_limiter = tenant_limiter
+
     # Build the LLM response cache once at app construction so entries
     # persist across requests within this replica (mirrors the rate
     # limiter's lifecycle). NoOp / OFF unless MOVATE_LLM_CACHE selects
@@ -1167,7 +1235,9 @@ def build_app(
     # in v1.x; shared backends slot in behind the CacheProvider later.
     app.state.llm_cache = build_cache()
 
-    auth_dep = make_auth_dependency(storage, rate_limiter=limiter)
+    auth_dep = make_auth_dependency(
+        storage, rate_limiter=limiter, tenant_rate_limiter=tenant_limiter
+    )
 
     # ``require_scope(auth_dep, ...)`` (ADR 013 L2) layers a per-endpoint
     # scope check on top of ``auth_dep``. Passing the SAME ``auth_dep``
