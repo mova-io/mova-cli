@@ -28,13 +28,15 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 9 | Response cache — `CacheProvider` adapter (exact + optional semantic), Redis/Postgres-backed | feature | M (~35m) | — | ✅ | #378 | `2026.5.23.25` |
 | 10 | Continuous eval + drift alerting — scheduler enqueues eval-job on cadence/publish; baseline-diff; alerts | 016.D2 | L (~1–1.5h, 1 PR) | #2, scheduler | ✅ | #380 | `2026.5.23.27` |
 
-> ✅ **Next-10 arc complete** (`2026.5.23.13` → `.27`). Two loops closed since:
-> **ADR 017 D2 orchestration substrate** — scheduler (#382, `.29`) + event/webhook
-> triggers (#384, `.31`); and the **ADR 016 improvement loop** — harvest (#5) →
-> continuous-eval/drift (#10) → **canary / champion–challenger (#386, `.33`)**.
-> **Item 14 (durable + HITL — finish the `HUMAN` node) is next** — the remaining
-> orchestration capstone (depends on 11+13, both merged); the heaviest item (a
-> durable pause/persist/resume-on-signal state machine, ~2 PRs).
+> ✅ **Next-10 arc + both major ADR arcs complete** (`2026.5.23.13` → `.36`):
+> - **ADR 017 orchestration** — D2 scheduler (#382) + event/webhook triggers (#384);
+>   D5 durable + HITL `HUMAN` node, pause/persist (#388) + resume-on-signal (#389).
+> - **ADR 016 improvement loop** — harvest (#5) → continuous-eval/drift (#10) →
+>   canary / champion–challenger (#386).
+>
+> **Remaining (items 15–21) are independent standalone enhancements** — no shared
+> arc; several are 🔒 (code lands in Claude time, final validation needs live
+> Azure). Pick by priority rather than dependency order.
 
 ## Items 11+ (sequenced; orchestration ADR 017 woven in by leverage/dependency)
 
@@ -43,7 +45,7 @@ builds. Buckets: **S ≈ ≤25 min · M ≈ 25–45 min · L ≈ 1–2 hr (often
 | 11 | **Generalize the scheduler** — cron→enqueue arbitrary agent/workflow jobs (ACA Jobs substrate); extends item 10's eval scheduler | 017.D2 / 016 | L (~1h) 🔒 | #10 | ✅ | #382 | `2026.5.23.29` |
 | 12 | Canary / champion–challenger (version-tagged runs, weighted routing, assisted-promote) — completes the improvement loop | 016.D3 | L (~1–1.5h) | registry, obs, scopes | ✅ | #386 | `2026.5.23.33` |
 | 13 | Event / webhook triggers — run an agent/workflow on an inbound event | 017.D2 | M (~35m) | #11 | ✅ | #384 | `2026.5.23.31` |
-| 14 | Durable + HITL — `HUMAN` node pause/persist/resume-on-signal (long, human-gated pipelines) | 017.D5 / #28 | L (~1.5–2h, ~2 PRs) | #11, #13 | ⬜ | | `____` |
+| 14 | Durable + HITL — `HUMAN` node pause/persist/resume-on-signal (long, human-gated pipelines) | 017.D5 / #28 | L (~1.5–2h, 2 PRs) | #11, #13 | ✅ | #388, #389 | `2026.5.23.36` |
 | 15 | External-orchestrator adapter pack — `mdk[prefect]` task + `mdk[airflow]` `MovateAgentOperator` + webhook contract (movate as a *callable*, no core dep) | 017.D3 | M–L (~45m) 🔒 | — | ⬜ | | `____` |
 | 16 | Key rotation UX (`mdk auth rotate-key` grace overlap, expiry warnings, bulk revoke) | 013.D5 | M (~25m) | scopes | ⬜ | | `____` |
 | 17 | Batch inference API (bulk async run over a dataset) | feature | M (~25m) | — | ⬜ | | `____` |
