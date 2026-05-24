@@ -30,6 +30,7 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
     BenchRecord,
+    CanaryConfig,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -338,6 +339,54 @@ class StorageProvider(Protocol):
         Keyed by the public ``trigger_id`` (the fire path has no tenant
         context). Observational only — does not gate firing. No-op if the
         trigger doesn't exist (it may have been deleted mid-request).
+        """
+
+    # ------------------------------------------------------------------
+    # Canary configs (ADR 016 D3 — champion/challenger rollout)
+    #
+    # Additive, default-off: a row exists only when an operator opts an
+    # agent into a canary (``mdk canary set`` / ``POST .../canary``).
+    # ``(tenant_id, agent)`` is the unique key; ``save_canary_config``
+    # upserts. The run/enqueue path reads ``get_canary_config`` once per run
+    # to decide champion vs challenger (movate.core.canary.choose_version);
+    # NO row → no read effect → byte-for-byte the pre-canary behavior.
+    # ------------------------------------------------------------------
+
+    async def save_canary_config(self, config: CanaryConfig) -> None:
+        """Upsert one canary keyed by ``(tenant_id, agent)``.
+
+        Re-setting an agent's canary overwrites the prior row (last write
+        wins) rather than creating a duplicate — one active canary per agent
+        per tenant. Used for set, promote (challenger→champion, weight→0),
+        and rollback.
+        """
+
+    async def get_canary_config(self, agent: str, *, tenant_id: str) -> CanaryConfig | None:
+        """Exact lookup by ``(agent, tenant_id)`` — the routing path.
+
+        Returns ``None`` if no canary OR if it belongs to a different tenant
+        — same no-leak contract as the other ``get_*`` methods. ``None`` is
+        the common case: the routing helper treats it as "champion, latest".
+        """
+
+    async def list_canary_configs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[CanaryConfig]:
+        """List canaries, optionally tenant-scoped.
+
+        ``tenant_id=None`` returns canaries across all tenants — reserved for
+        operator tooling; never exposed on the HTTP API.
+        """
+
+    async def delete_canary_config(self, agent: str, *, tenant_id: str) -> bool:
+        """Delete the canary for ``(agent, tenant_id)`` — the kill switch's
+        hard variant (``mdk canary off --delete``).
+
+        Returns ``True`` if a row was deleted, ``False`` if none existed.
+        Tenant-scoped: a wrong-tenant delete is a no-op (returns ``False``).
         """
 
     # ------------------------------------------------------------------

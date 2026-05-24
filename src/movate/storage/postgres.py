@@ -34,6 +34,7 @@ from movate.core.models import (
     ApiKeyRecord,
     BenchModelResult,
     BenchRecord,
+    CanaryConfig,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -497,6 +498,35 @@ CREATE TABLE IF NOT EXISTS triggers (
     PRIMARY KEY (tenant_id, name)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id);
+
+-- ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
+-- agent): a challenger version + a traffic weight (0 = kill switch), with an
+-- optional champion pin + auto-promote eval gate. The run/enqueue path reads
+-- this to choose champion vs challenger; NO row → champion-by-latest →
+-- byte-for-byte the pre-canary behavior. Additive new table (CREATE TABLE IF
+-- NOT EXISTS, idempotent) — default-off, no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS canary_configs (
+    tenant_id          TEXT NOT NULL,
+    agent              TEXT NOT NULL,
+    challenger_version TEXT NOT NULL,
+    champion_version   TEXT,
+    weight             INTEGER NOT NULL,
+    sticky             BOOLEAN NOT NULL,
+    enabled            BOOLEAN NOT NULL,
+    auto_promote       BOOLEAN NOT NULL,
+    eval_gate          DOUBLE PRECISION,
+    created_by         TEXT,
+    created_at         TIMESTAMPTZ NOT NULL,
+    updated_at         TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, agent)
+);
+
+-- ADR 016 D3: carry the canary-chosen agent version to the async worker. The
+-- enqueue path stamps the concrete champion/challenger version it picked; the
+-- worker resolves THAT version. Nullable — pre-canary rows (and every job
+-- with no canary in play) read back as NULL → None → resolve latest,
+-- unchanged. ADD COLUMN IF NOT EXISTS keeps it idempotent on every init.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_version TEXT;
 """
 
 
@@ -1178,6 +1208,79 @@ class PostgresProvider:
         )
 
     # ------------------------------------------------------------------
+    # Canary configs (ADR 016 D3 — champion/challenger rollout)
+    # ------------------------------------------------------------------
+
+    async def save_canary_config(self, config: CanaryConfig) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO canary_configs (
+                tenant_id, agent, challenger_version, champion_version, weight,
+                sticky, enabled, auto_promote, eval_gate, created_by,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            )
+            ON CONFLICT (tenant_id, agent) DO UPDATE SET
+                challenger_version = EXCLUDED.challenger_version,
+                champion_version = EXCLUDED.champion_version,
+                weight = EXCLUDED.weight,
+                sticky = EXCLUDED.sticky,
+                enabled = EXCLUDED.enabled,
+                auto_promote = EXCLUDED.auto_promote,
+                eval_gate = EXCLUDED.eval_gate,
+                created_by = EXCLUDED.created_by,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at
+            """,
+            config.tenant_id,
+            config.agent,
+            config.challenger_version,
+            config.champion_version,
+            config.weight,
+            config.sticky,
+            config.enabled,
+            config.auto_promote,
+            config.eval_gate,
+            config.created_by,
+            config.created_at,
+            config.updated_at,
+        )
+
+    async def get_canary_config(self, agent: str, *, tenant_id: str) -> CanaryConfig | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM canary_configs WHERE agent = $1 AND tenant_id = $2",
+            agent,
+            tenant_id,
+        )
+        return _row_to_canary_config(row) if row else None
+
+    async def list_canary_configs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[CanaryConfig]:
+        params: list[Any] = []
+        where = ""
+        if tenant_id is not None:
+            params.append(tenant_id)
+            where = f"WHERE tenant_id = ${len(params)}"
+        params.append(limit)
+        sql = f"SELECT * FROM canary_configs {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_canary_config(r) for r in rows]
+
+    async def delete_canary_config(self, agent: str, *, tenant_id: str) -> bool:
+        status: str = await self._db.execute(
+            "DELETE FROM canary_configs WHERE agent = $1 AND tenant_id = $2",
+            agent,
+            tenant_id,
+        )
+        # asyncpg returns a status string like "DELETE 1" / "DELETE 0".
+        return status.startswith("DELETE ") and not status.endswith(" 0")
+
+    # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1)
     # ------------------------------------------------------------------
 
@@ -1354,10 +1457,11 @@ class PostgresProvider:
                 job_id, tenant_id, kind, target, status, input,
                 result_run_id, error, api_key_id,
                 created_at, claimed_at, completed_at,
-                notify_email, attempt_count, next_retry_at, thread_id
+                notify_email, attempt_count, next_retry_at, thread_id,
+                target_version
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16
+                $11, $12, $13, $14, $15, $16, $17
             )
             """,
             job.job_id,
@@ -1376,6 +1480,7 @@ class PostgresProvider:
             job.attempt_count,
             job.next_retry_at,
             job.thread_id,
+            job.target_version,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -2435,6 +2540,23 @@ def _row_to_job_schedule(row: asyncpg.Record) -> JobSchedule:
     )
 
 
+def _row_to_canary_config(row: asyncpg.Record) -> CanaryConfig:
+    return CanaryConfig(
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        challenger_version=row["challenger_version"],
+        champion_version=row["champion_version"],
+        weight=row["weight"],
+        sticky=row["sticky"],
+        enabled=row["enabled"],
+        auto_promote=row["auto_promote"],
+        eval_gate=row["eval_gate"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
 def _row_to_trigger(row: asyncpg.Record) -> Trigger:
     return Trigger(
         tenant_id=row["tenant_id"],
@@ -2517,6 +2639,7 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         attempt_count=row["attempt_count"],
         next_retry_at=row["next_retry_at"],
         thread_id=row["thread_id"],
+        target_version=row["target_version"],
     )
 
 

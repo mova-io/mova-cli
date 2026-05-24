@@ -754,6 +754,134 @@ class TriggerListView(BaseModel):
     count: int
 
 
+# ---------------------------------------------------------------------------
+# Canary / champion-challenger rollout (ADR 016 D3)
+# ---------------------------------------------------------------------------
+
+
+class CanarySetRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/canary`` request body (ADR 016 D3).
+
+    Opt an agent into a canary rollout: route ``weight``% of prod traffic to
+    ``challenger_version`` and compare it against the champion. Additive +
+    default-off — no request, no canary. Mirrors ``mdk canary set``. Gated on
+    ``admin`` (it changes which version prod traffic hits).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    challenger_version: str
+    """The published version to receive canary traffic."""
+    weight: int = Field(default=0, ge=0, le=100)
+    """Percent (0-100) of traffic to the challenger. 0 = kill switch."""
+    champion_version: str | None = Field(default=None)
+    """Optional champion pin. None → champion is registry latest."""
+    sticky: bool = Field(default=True)
+    """Consistent routing per ``thread_id`` (no champion↔challenger flip
+    mid-conversation)."""
+    enabled: bool = Field(default=True)
+    auto_promote: bool = Field(default=False)
+    """Opt-in: auto-promote the challenger once it clears ``eval_gate``."""
+    eval_gate: float | None = Field(default=None)
+    """Min challenger quality required for auto-promote. Required (non-None)
+    when ``auto_promote`` is true."""
+
+
+class CanaryView(BaseModel):
+    """One canary config (response shape for set/status endpoints)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    challenger_version: str
+    champion_version: str | None = None
+    weight: int
+    sticky: bool
+    enabled: bool
+    auto_promote: bool
+    eval_gate: float | None = None
+    created_at: str
+    updated_at: str
+
+
+class CanarySideView(BaseModel):
+    """Aggregated live quality for ONE side (champion or challenger).
+
+    Sliced by ``agent_version`` (the canary slice key). Counts come from
+    ``list_runs`` (run/error counts) joined to ``list_feedback`` (👍/👎).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str | None = None
+    """The resolved version for this side. ``None`` for the champion side
+    when the champion is registry-latest (not pinned) — runs are still
+    sliced by whatever ``agent_version`` they recorded."""
+    run_count: int
+    success_count: int
+    error_count: int
+    thumbs_up: int
+    thumbs_down: int
+    feedback_count: int
+    success_rate: float
+    """``success_count / run_count`` (0.0 when no runs)."""
+    thumbs_up_rate: float
+    """``thumbs_up / feedback_count`` (0.0 when no feedback)."""
+
+
+class CanaryCompareView(BaseModel):
+    """``GET /api/v1/agents/{name}/canary/compare`` response (ADR 016 D3).
+
+    Champion-vs-challenger live quality + the delta (challenger - champion).
+    Positive deltas favor the challenger.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    champion: CanarySideView
+    challenger: CanarySideView
+    success_rate_delta: float
+    thumbs_up_rate_delta: float
+    canary: CanaryView | None = None
+    """The current canary config, or None if the agent has no canary set
+    (the compare still works — it slices by the challenger version supplied
+    via query — but typically there is a config)."""
+
+
+class CanaryPromoteRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/canary/promote`` request body (ADR 016 D3).
+
+    Promote a version to champion. Assisted by default (a human calls this);
+    ``auto_promote`` honors the config's eval-gate. Gated on ``admin``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_version: str | None = Field(default=None)
+    """Version to promote. None → promote the configured challenger."""
+    auto_promote: bool = Field(default=False)
+    """When true, only proceed if the target's measured quality clears the
+    config's ``eval_gate`` (else 409). Default (assisted) skips the gate —
+    the human IS the gate."""
+
+
+class CanaryPromotedView(BaseModel):
+    """``POST .../canary/promote`` + ``.../canary/rollback`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    promoted_version: str
+    """The version now serving as champion."""
+    previous_champion: str | None = None
+    """The champion before this promotion (for rollback / audit)."""
+    mode: str
+    """``"assisted"`` or ``"auto"`` (promote), or ``"rollback"``."""
+    canary: CanaryView
+    """The updated canary config (challenger→champion, weight→0 on promote)."""
+
+
 class EvalCaseView(BaseModel):
     """One row in the eval scorecard. Matches the shape produced by
     ``mdk eval --output json`` for per-case data."""
@@ -1604,6 +1732,17 @@ class AgentRunSubmission(BaseModel):
             "Default false uses the agent's declared model. Ignored in "
             "async/worker mode (the worker has its own provider "
             "configuration)."
+        ),
+    )
+    thread_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional conversation/session id. Additive + back-compat "
+            "(omitting it is unchanged behavior). When a canary (ADR 016 "
+            "D3) with sticky routing is configured for this agent, this is "
+            "the key that keeps every turn of one conversation on the same "
+            "champion/challenger side. Ignored when no sticky canary is in "
+            "play."
         ),
     )
 

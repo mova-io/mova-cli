@@ -192,6 +192,7 @@ from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.agent_cmd import agent_app  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
+from movate.cli.canary_cmd import canary_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.contexts_cmd import contexts_app  # noqa: E402
@@ -483,6 +484,11 @@ app.command("scheduler-tick", rich_help_panel=PANEL_RUN)(schedule_cmd.scheduler_
 # schedule fires on cron, a trigger fires on an external webhook POST. Same
 # panel since both register a standing way to enqueue agent/workflow jobs.
 app.add_typer(trigger_cmd.trigger_app, name="trigger", rich_help_panel=PANEL_RUN)
+# `canary` (ADR 016 D3) closes the improvement loop: route a slice of prod
+# traffic to a challenger version, compare champion-vs-challenger live, then
+# assisted-promote the winner. Additive + default-off; same panel since it's a
+# rollout/lifecycle verb alongside schedule/trigger.
+app.add_typer(canary_app, name="canary", rich_help_panel=PANEL_RUN)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /

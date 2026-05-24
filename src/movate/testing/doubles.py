@@ -15,6 +15,7 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
     BenchRecord,
+    CanaryConfig,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -70,6 +71,7 @@ class InMemoryStorage:
         self.eval_schedules: list[EvalSchedule] = []
         self.job_schedules: list[JobSchedule] = []
         self.triggers: list[Trigger] = []
+        self.canary_configs: list[CanaryConfig] = []
 
     async def init(self) -> None:
         return None
@@ -317,6 +319,43 @@ class InMemoryStorage:
             if t.trigger_id == trigger_id:
                 self.triggers[i] = t.model_copy(update={"last_fired_at": last_fired_at})
                 return
+
+    # ------------------------------------------------------------------
+    # Canary configs (ADR 016 D3 — champion/challenger rollout)
+    # ------------------------------------------------------------------
+
+    async def save_canary_config(self, config: CanaryConfig) -> None:
+        # Upsert keyed by (tenant_id, agent) — last write wins.
+        self.canary_configs = [
+            c
+            for c in self.canary_configs
+            if not (c.agent == config.agent and c.tenant_id == config.tenant_id)
+        ]
+        self.canary_configs.append(config)
+
+    async def get_canary_config(self, agent: str, *, tenant_id: str) -> CanaryConfig | None:
+        return next(
+            (c for c in self.canary_configs if c.agent == agent and c.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_canary_configs(
+        self,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+    ) -> list[CanaryConfig]:
+        rows = self.canary_configs
+        if tenant_id is not None:
+            rows = [c for c in rows if c.tenant_id == tenant_id]
+        return sorted(rows, key=lambda c: c.created_at, reverse=True)[:limit]
+
+    async def delete_canary_config(self, agent: str, *, tenant_id: str) -> bool:
+        before = len(self.canary_configs)
+        self.canary_configs = [
+            c for c in self.canary_configs if not (c.agent == agent and c.tenant_id == tenant_id)
+        ]
+        return len(self.canary_configs) < before
 
     # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1)
