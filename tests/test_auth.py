@@ -308,6 +308,48 @@ async def test_touch_api_key_updates_last_used(storage) -> None:
     assert got.last_used_at is not None
 
 
+@pytest.mark.unit
+async def test_update_api_key_scopes_overwrites_in_place(storage) -> None:
+    """``update_api_key_scopes`` rewrites ONLY the scopes column on every
+    backend (memory + sqlite + postgres-when-available), preserving the
+    secret material + identity columns. This is the bootstrap-key
+    self-heal primitive."""
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=["admin"])
+    await storage.save_api_key(minted.record)
+
+    await storage.update_api_key_scopes(minted.record.key_id, scopes=["fleet-admin"])
+
+    got = await storage.get_api_key(minted.record.key_id)
+    assert got is not None
+    assert got.scopes == ["fleet-admin"]
+    # Secret material + identity untouched (the key value didn't change).
+    assert got.secret_hash == minted.record.secret_hash
+    assert got.salt == minted.record.salt
+    assert got.tenant_id == minted.record.tenant_id
+    assert got.env == minted.record.env
+
+
+@pytest.mark.unit
+async def test_update_api_key_scopes_empty_round_trips_as_empty(storage) -> None:
+    """Clearing scopes to ``[]`` round-trips as empty on every backend
+    (empty list → NULL, indistinguishable from a never-scoped row)."""
+    minted = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=["admin"])
+    await storage.save_api_key(minted.record)
+
+    await storage.update_api_key_scopes(minted.record.key_id, scopes=[])
+
+    got = await storage.get_api_key(minted.record.key_id)
+    assert got is not None
+    assert got.scopes == []
+
+
+@pytest.mark.unit
+async def test_update_api_key_scopes_missing_key_is_noop(storage) -> None:
+    """No row for the key_id → silent no-op (no exception, no insert)."""
+    await storage.update_api_key_scopes("never-existed", scopes=["fleet-admin"])
+    assert await storage.get_api_key("never-existed") is None
+
+
 # ---------------------------------------------------------------------------
 # Storage + crypto end-to-end: mint, persist, verify
 # ---------------------------------------------------------------------------

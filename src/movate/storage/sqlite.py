@@ -1976,6 +1976,20 @@ class SqliteProvider:
         )
         await self._db.commit()
 
+    async def update_api_key_scopes(self, key_id: str, *, scopes: list[str]) -> None:
+        """Overwrite ONLY the ``scopes`` column by ``key_id`` (bootstrap heal).
+
+        Not tenant-scoped — the sole caller resolves the row by the parsed
+        ``key_id`` from ``MOVATE_SEED_API_KEY`` at startup. Mirrors
+        ``save_api_key``'s scope encoding (empty list → NULL). No-op on
+        missing. Leaves every other column (secret_hash/salt/tenant_id/env/
+        created_at) untouched."""
+        await self._db.execute(
+            "UPDATE api_keys SET scopes = ? WHERE key_id = ?",
+            (json.dumps(scopes) if scopes else None, key_id),
+        )
+        await self._db.commit()
+
     async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
         """Revoke every active key for ``tenant_id``; return count revoked.
 

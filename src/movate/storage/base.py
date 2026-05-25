@@ -712,6 +712,23 @@ class StorageProvider(Protocol):
         dead regardless of expiry).
         """
 
+    async def update_api_key_scopes(self, key_id: str, *, scopes: list[str]) -> None:
+        """Overwrite an existing key's ``scopes`` in place by ``key_id``.
+
+        Touches ONLY the ``scopes`` column — ``secret_hash`` / ``salt`` /
+        ``tenant_id`` / ``env`` / ``created_at`` and every other field stay
+        exactly as stored (the key value itself is unchanged, so re-hashing
+        would be wrong). No-op on a missing key.
+
+        Deliberately NOT tenant-scoped: the only caller is the runtime's
+        startup bootstrap-key self-heal (``_seed_bootstrap_key``), which
+        resolves the row by the parsed ``key_id`` from ``MOVATE_SEED_API_KEY``
+        before any request/tenant context exists. ``save_api_key`` is
+        insert-only on every backend (errors on a duplicate ``key_id``), so
+        an in-place scope correction needs its own narrow update path rather
+        than a re-save.
+        """
+
     async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
         """Revoke every active key for ``tenant_id``; return the count revoked.
 
