@@ -32,6 +32,7 @@ from movate.cli.deploy import (
     _print_next_steps,
     _print_plan,
     _run_predeploy_validation,
+    _upload_one_agent_bundle,
     _wait_for_healthz,
 )
 from movate.cli.main import app as cli_app
@@ -926,3 +927,168 @@ def test_cli_deploy_verified_prints_deployed_next_steps(
     assert "doctor --target prod" in result.stderr
     # FQDN came from the resolved target URL.
     assert "movate-prod-api.example.azurecontainerapps.io" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Per-agent bundle upload: inline-schema agents materialize JSON Schema parts
+# (regression for `mdk add default <name>` → `mdk deploy` HTTP 400)
+# ---------------------------------------------------------------------------
+
+
+class _CapturingClient(httpx.Client):
+    """Stand-in for ``httpx.Client`` that records the ``files=`` payload of
+    the POST and returns a canned 201, so ``_upload_one_agent_bundle`` runs
+    end-to-end without a network or live runtime.
+
+    Subclasses ``httpx.Client`` so it satisfies the ``isinstance`` guard
+    in ``_upload_one_agent_bundle`` (which re-imports the real ``httpx``
+    locally); the real ``post`` is shadowed to capture, never send.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.captured_files: list[tuple[str, tuple[str, bytes, str]]] = []
+
+    def post(self, url: str, *, files=None, headers=None, **kwargs):  # type: ignore[override]
+        self.captured_files = list(files or [])
+        return httpx.Response(201, json={"name": "ok"})
+
+
+def _parts_by_field(
+    files: list[tuple[str, tuple[str, bytes, str]]],
+) -> dict[str, tuple[str, bytes, str]]:
+    """Index a captured multipart payload by its form-field name."""
+    return {field: spec for field, spec in files}
+
+
+def _write_inline_agent(agent_dir: Path) -> None:
+    """Scaffold an inline-schema agent dir mirroring the default
+    ``mdk add`` template: agent.yaml with inline ``schema:`` shorthand,
+    a prompt.md, and an evals dataset. No schema/*.json files on disk."""
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "agent.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Agent\n"
+        "name: inline-agent\n"
+        "version: 0.1.0\n"
+        "model:\n"
+        "  provider: openai/gpt-4o-mini-2024-07-18\n"
+        "prompt: ./prompt.md\n"
+        "schema:\n"
+        "  input:\n"
+        "    text: string\n"
+        "  output:\n"
+        "    message: string\n"
+        "skills: []\n"
+        "evals:\n"
+        "  dataset: ./evals/dataset.jsonl\n"
+    )
+    (agent_dir / "prompt.md").write_text("Reply to {{ input.text }}.\n")
+    (agent_dir / "evals").mkdir()
+    (agent_dir / "evals" / "dataset.jsonl").write_text('{"input": {"text": "hi"}}\n')
+
+
+def _write_pathref_agent(agent_dir: Path) -> None:
+    """Scaffold a path-ref agent dir: agent.yaml points at on-disk
+    schema/input.yaml + schema/output.yaml shorthand files."""
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "agent.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Agent\n"
+        "name: pathref-agent\n"
+        "version: 0.1.0\n"
+        "model:\n"
+        "  provider: openai/gpt-4o-mini-2024-07-18\n"
+        "prompt: ./prompt.md\n"
+        "schema:\n"
+        "  input: ./schema/input.yaml\n"
+        "  output: ./schema/output.yaml\n"
+        "skills: []\n"
+    )
+    (agent_dir / "prompt.md").write_text("Reply to {{ input.text }}.\n")
+    (agent_dir / "schema").mkdir()
+    (agent_dir / "schema" / "input.yaml").write_text("query: string\n")
+    (agent_dir / "schema" / "output.yaml").write_text("answer: string\n")
+
+
+@pytest.mark.unit
+def test_upload_inline_agent_materializes_compiled_schema_parts(
+    tmp_path: Path,
+) -> None:
+    """An inline-schema agent (default template) now uploads input.json +
+    output.json parts whose bytes are a valid compiled JSON Schema — the
+    fallback that fixes `mdk add default` → `mdk deploy` HTTP 400."""
+    agent_dir = tmp_path / "agents" / "inline-agent"
+    _write_inline_agent(agent_dir)
+    client = _CapturingClient()
+
+    reason = _upload_one_agent_bundle(
+        client=client,
+        base_url="https://rt.example",
+        headers={"Authorization": "Bearer x"},
+        agent_dir=agent_dir,
+        project_root=tmp_path,
+    )
+    assert reason is None  # 201 → success
+
+    parts = _parts_by_field(client.captured_files)
+    # The schema parts are NO LONGER omitted for an inline agent.
+    assert "input_schema" in parts
+    assert "output_schema" in parts
+
+    in_name, in_bytes, in_ctype = parts["input_schema"]
+    out_name, out_bytes, out_ctype = parts["output_schema"]
+    # Persisted under the canonical names the runtime expects.
+    assert in_name == "input.json"
+    assert out_name == "output.json"
+    assert in_ctype == "application/json"
+    assert out_ctype == "application/json"
+
+    # The bytes are valid JSON Schema (compiled from the inline shorthand).
+    import json as _json  # noqa: PLC0415
+
+    in_schema = _json.loads(in_bytes)
+    out_schema = _json.loads(out_bytes)
+    assert in_schema["type"] == "object"
+    assert "text" in in_schema["properties"]
+    assert out_schema["type"] == "object"
+    assert "message" in out_schema["properties"]
+    # Sanity: it actually validates as a Draft 2020-12 schema.
+    from jsonschema import Draft202012Validator  # noqa: PLC0415
+
+    Draft202012Validator.check_schema(in_schema)
+    Draft202012Validator.check_schema(out_schema)
+
+
+@pytest.mark.unit
+def test_upload_pathref_agent_still_uploads_on_disk_schema(
+    tmp_path: Path,
+) -> None:
+    """Regression: a path-ref agent (schema/input.yaml on disk) still
+    uploads its on-disk schema — the fallback only fires when no file
+    exists, so this path is unchanged (YAML compiled to JSON in-flight)."""
+    agent_dir = tmp_path / "agents" / "pathref-agent"
+    _write_pathref_agent(agent_dir)
+    client = _CapturingClient()
+
+    reason = _upload_one_agent_bundle(
+        client=client,
+        base_url="https://rt.example",
+        headers={"Authorization": "Bearer x"},
+        agent_dir=agent_dir,
+        project_root=tmp_path,
+    )
+    assert reason is None
+
+    parts = _parts_by_field(client.captured_files)
+    assert "input_schema" in parts
+    assert "output_schema" in parts
+
+    import json as _json  # noqa: PLC0415
+
+    in_schema = _json.loads(parts["input_schema"][1])
+    out_schema = _json.loads(parts["output_schema"][1])
+    # Compiled from the on-disk shorthand files (query/answer), NOT the
+    # inline-fallback fields (text/message) — proves the file path won.
+    assert "query" in in_schema["properties"]
+    assert "answer" in out_schema["properties"]
