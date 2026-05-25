@@ -411,6 +411,66 @@ class TestAuthStatusTable:
         assert summary_line
         assert "rejected=" not in summary_line[0]
 
+    def test_status_shell_shadow_hint_when_rejected_shell_var(
+        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Real-user footgun (P8): the operator ran ``mdk auth login
+        openai`` (saved a GOOD key to the credentials file) but a STALE
+        ``OPENAI_API_KEY`` is still exported in their shell — and shell
+        wins over the file. So ``status`` shows the row as Source=shell,
+        rejected, and the OLD hint said "run mdk auth login openai to
+        rotate" — which loops forever (login writes the file, the shell
+        var keeps shadowing it). The fix: a rejected + Source=shell row
+        must tell the operator to UNSET the shell var instead.
+        """
+        # Good key saved to the credentials file; a DIFFERENT (stale)
+        # value exported in the shell. key_source() returns "shell"
+        # because os.environ wins and matches neither file nor dotenv.
+        CredentialsStore().set("OPENAI_API_KEY", "sk-good-saved-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-stale-shell-key")
+        auth_mod._verify_cache.clear()
+        monkeypatch.setattr(
+            "movate.credentials.verify_provider_key",
+            lambda provider, key: VerifyResult(ok=False, detail="401 Unauthorized"),
+        )
+
+        result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.stdout
+        out = result.stdout
+        assert "rejected" in out.lower()
+        # The shell-shadow hint mentions the real fix (unset the var) and
+        # the actual env-var name for the row.
+        assert "unset OPENAI_API_KEY" in out
+        assert "shadowing the saved key" in out
+        # The OLD misleading hint must NOT appear for this row.
+        assert "to rotate" not in out
+
+    def test_status_rotate_hint_when_rejected_file_var(
+        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The normal (non-shell) rejected case is UNCHANGED: a key
+        sourced from the credentials file that 401s still gets the
+        "run mdk auth login openai to rotate" hint — NOT the
+        shell-shadow hint."""
+        # Key lives ONLY in the credentials file (autoload pulls it into
+        # os.environ matching the file), so key_source() == credentials_file.
+        CredentialsStore().set("OPENAI_API_KEY", "sk-test-*****2345")
+        autoload_credentials()
+        auth_mod._verify_cache.clear()
+        monkeypatch.setattr(
+            "movate.credentials.verify_provider_key",
+            lambda provider, key: VerifyResult(ok=False, detail="401 Unauthorized"),
+        )
+
+        result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.stdout
+        out = result.stdout
+        assert "rejected" in out.lower()
+        # Normal rotate hint present; shell-shadow hint absent.
+        assert "mdk auth login openai" in out
+        assert "to rotate" in out
+        assert "shadowing the saved key" not in out
+
 
 # ---------------------------------------------------------------------------
 # Python-callable login() (2026-05-19)
@@ -522,3 +582,67 @@ class TestLoginCallableFromPython:
         assert provider_picker_calls, (
             "provider sentinel should have been normalized to None, triggering the picker"
         )
+
+
+# ---------------------------------------------------------------------------
+# login shell-shadow warning (P8b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLoginShellShadowWarning:
+    """``mdk auth login <provider>`` saves the key to the credentials
+    file (or .env), but shell-exported env vars take precedence over
+    both. So if the operator already has a STALE ``OPENAI_API_KEY``
+    exported in their shell, the key they just saved never takes effect
+    — and a later ``mdk auth status`` confusingly attributes the value
+    to ``shell``. The fix (P8b): warn at SAVE time when the matching
+    shell var is set to a DIFFERENT value than what was just saved.
+    """
+
+    def test_login_warns_when_shell_var_set_to_different_value(
+        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stale shell export with a DIFFERENT value than the saved
+        key → warn (shell wins, saved key won't take effect)."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-stale-shell-key")
+        auth_mod._verify_cache.clear()
+        result = runner.invoke(
+            app,
+            ["auth", "login", "openai", "--key", "sk-new-saved-key", "--no-verify"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # Warning goes to stderr (mix_stderr=False on the runner).
+        assert "OVERRIDE this saved key" in result.stderr
+        assert "unset OPENAI_API_KEY" in result.stderr
+
+    def test_login_no_warning_when_shell_var_unset(
+        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No shell export of the provider var → no warning (the saved
+        key is the only source, so it WILL take effect)."""
+        # isolated_creds already deletes OPENAI_API_KEY from the env.
+        auth_mod._verify_cache.clear()
+        result = runner.invoke(
+            app,
+            ["auth", "login", "openai", "--key", "sk-new-saved-key", "--no-verify"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "OVERRIDE this saved key" not in result.stderr
+
+    def test_login_no_warning_when_shell_var_matches_saved(
+        self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Shell var set to the SAME value being saved → harmless, no
+        warning (shell winning doesn't change the effective key)."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-same-key")
+        auth_mod._verify_cache.clear()
+        result = runner.invoke(
+            app,
+            ["auth", "login", "openai", "--key", "sk-same-key", "--no-verify"],
+            env={"COLUMNS": "200"},
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "OVERRIDE this saved key" not in result.stderr
