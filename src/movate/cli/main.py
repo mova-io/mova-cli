@@ -225,6 +225,7 @@ from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
 from movate.cli.workflow_cmd import workflow_app  # noqa: E402
+from movate.tracing import install_log_correlation  # noqa: E402
 
 PANEL_DEVELOP = "Develop"
 PANEL_RUN = "Run & evaluate"
@@ -368,6 +369,14 @@ def _main(
         level=level,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # Stamp the active OTel trace context (trace_id/span_id) onto every log
+    # record and surface a non-empty trace_id in the deployed log line, so an
+    # operator viewing a trace in App Insights can find the correlated logs in
+    # Log Analytics by trace_id (item 38). A complete no-op when the `otel`
+    # extra is absent or no span is active; local CLI logs stay byte-for-byte
+    # unchanged. `serve`/`worker` run in this same process after basicConfig, so
+    # they inherit the filter without a separate install call.
+    install_log_correlation()
     # Suppress dim "FYI" stderr hints (the kind of "queued j-1 on dev,
     # poll with..." line that's friendly interactively but a nuisance
     # when piping). Error / warning prints stay on regardless.

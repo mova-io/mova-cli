@@ -49,6 +49,11 @@ import sys
 from movate.tracing.audit import record_audit_event
 from movate.tracing.base import SpanCtx, Tracer
 from movate.tracing.composite import CompositeTracer
+from movate.tracing.log_correlation import (
+    TraceContextFilter,
+    TraceContextFormatter,
+    install_log_correlation,
+)
 from movate.tracing.metrics import (
     dec_in_flight,
     inc_in_flight,
@@ -75,6 +80,8 @@ __all__ = [
     "SilentTracer",
     "SpanCtx",
     "StdoutTracer",
+    "TraceContextFilter",
+    "TraceContextFormatter",
     "TraceSinkError",
     "Tracer",
     "attach_trace_context",
@@ -85,6 +92,7 @@ __all__ = [
     "inc_in_flight",
     "init_metrics",
     "inject_current_trace_context",
+    "install_log_correlation",
     "record_audit_event",
     "record_job_completed",
     "record_run_usage",
