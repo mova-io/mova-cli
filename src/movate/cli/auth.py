@@ -1053,6 +1053,24 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
         raise typer.Exit(code=2)
 
+    # Shell-shadow warning: shell-exported env vars take precedence over
+    # both the credentials file and the project .env, so a stale
+    # ``OPENAI_API_KEY`` already in the operator's shell would OVERRIDE the
+    # key we just saved — the saved key never takes effect, and a later
+    # `mdk auth status` would confusingly show the shadowing (stale) key
+    # as the source. Warn now, at save time, rather than letting the
+    # operator discover it through a misleading status later. Only warns
+    # when the shell value DIFFERS from what we just saved (a matching
+    # value is harmless). Don't fail the command — just warn to stderr.
+    shell_value = os.environ.get(env_var, "").strip()
+    if shell_value and shell_value != key:
+        err.print(
+            f"[yellow]⚠[/yellow] [bold]{env_var}[/bold] is also set in your shell and "
+            f"will OVERRIDE this saved key (shell wins). "
+            f"[bold]unset {env_var}[/bold] (and remove it from your profile) for the "
+            f"saved key to take effect."
+        )
+
 
 # ---------------------------------------------------------------------------
 # OIDC device-code SSO (ADR 013 L1)
@@ -1411,12 +1429,30 @@ def status() -> None:
                 )
             elif state == "rejected":
                 counts["rejected"] += 1
+                # Shell-shadow case: a STALE value exported in the
+                # operator's shell shadows the (possibly good) saved key
+                # and 401s. ``mdk auth login`` writes to the credentials
+                # file, but the shell var keeps winning (shell > file
+                # precedence), so the old "run login to rotate" hint
+                # loops forever. Tell the operator to unset the shell var
+                # instead. Only the file/keychain-sourced rejected rows
+                # still get the rotate hint.
+                if src == "shell":
+                    reject_hint = (
+                        f"stale [bold]{env_var}[/bold] in your shell is shadowing the "
+                        f"saved key — [bold]unset {env_var}[/bold] (and remove the export "
+                        f"from your shell profile), then re-run"
+                    )
+                else:
+                    reject_hint = (
+                        f"key set but provider 401'd — "
+                        f"run [bold]mdk auth login {provider}[/bold] to rotate"
+                    )
                 table.add_row(
                     env_var,
                     "[red]✗ set but rejected[/red]",
                     src.replace("_", " "),
-                    f"key set but provider 401'd — "
-                    f"run [bold]mdk auth login {provider}[/bold] to rotate",
+                    reject_hint,
                 )
             else:  # unverifiable
                 counts["ok"] += 1
