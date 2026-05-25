@@ -37,6 +37,16 @@ from movate.storage import build_storage
 runner = CliRunner(mix_stderr=False)
 
 
+def _flat(s: str) -> str:
+    """Collapse runs of whitespace so substring assertions survive Rich
+    line-wrapping. CLI errors are rendered through a Rich console whose width
+    is non-deterministic under CliRunner (CI wraps at a narrower width than a
+    local terminal), and these messages prepend a tmp_path, so a wrap can land
+    *inside* the asserted phrase (e.g. ``is not\\nvalid JSON``). Flattening to
+    single spaces makes the checks width-independent."""
+    return " ".join(s.split())
+
+
 @pytest.fixture
 def env_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MOVATE_TRACER", "silent")
@@ -159,7 +169,7 @@ def test_export_refuses_overwrite_without_force(
 
     r = runner.invoke(app, ["export", "state", str(backup)])
     assert r.exit_code == 2
-    assert "already exists" in r.stderr
+    assert "already exists" in _flat(r.stderr)
 
     forced = runner.invoke(app, ["export", "state", str(backup), "--force"])
     assert forced.exit_code == 0, forced.stdout + forced.stderr
@@ -176,7 +186,7 @@ def test_import_malformed_file_clean_error(
     bad.write_text("this is not json {{{")
     r = runner.invoke(app, ["import", "state", str(bad)])
     assert r.exit_code == 2
-    assert "not valid JSON" in r.stderr
+    assert "not valid JSON" in _flat(r.stderr)
 
 
 @pytest.mark.unit
@@ -190,7 +200,7 @@ def test_import_future_schema_version_clean_error(
     future.write_text(json.dumps({"schema_version": 999, "entities": {}}))
     r = runner.invoke(app, ["import", "state", str(future)])
     assert r.exit_code == 2
-    assert "newer than this build" in r.stderr
+    assert "newer than this build" in _flat(r.stderr)
 
 
 @pytest.mark.unit
@@ -201,4 +211,4 @@ def test_import_missing_file_clean_error(
     monkeypatch.setenv("MOVATE_DB", str(target_db))
     r = runner.invoke(app, ["import", "state", str(tmp_path / "nope.json")])
     assert r.exit_code == 2
-    assert "no such backup file" in r.stderr
+    assert "no such backup file" in _flat(r.stderr)
