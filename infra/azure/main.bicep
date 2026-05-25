@@ -218,6 +218,31 @@ back from the component and the collector + OTLP wiring come up.
 param appInsightsConnectionString string = ''
 
 @description('''
+Provision Azure Monitor golden-signal alert rules (item 27) on top of the
+workspace-based App Insights telemetry — a dead-letter spike, a high
+agent.execute error rate, a high agent.execute p95 latency, and an
+API-availability / no-traffic alert, each wired to an Action Group. These page
+operators on RUNTIME regressions and are distinct from the application-level
+drift alerts (item 10, which fire via the NotificationDispatcher/webhook).
+
+Gated on BOTH this flag AND ``enableAppInsights`` (the rules query the App*
+tables the workspace-based App Insights populates — no data, no point). Off by
+default and purely additive (matches deployLangfuse / enableScheduler /
+enableTeamsBot): when false, ZERO Action Group / scheduledQueryRules resources
+are emitted and the template is byte-for-byte unchanged.
+''')
+param enableAlerts bool = false
+
+@description('''
+Email address the alerts' Action Group notifies. Empty (default) means the
+Action Group is still created when ``enableAlerts=true`` (so the rules evaluate
+and surface in the portal Alerts blade) but with NO receiver — nobody is paged
+until an operator adds one. Set a distribution list / on-call address to get
+emails. Ignored entirely when ``enableAlerts=false``.
+''')
+param alertEmail string = ''
+
+@description('''
 Cold-start knob for the API. Override for the API Container App's
 ``scale.minReplicas``. Leave at the ``-1`` sentinel (default) to keep
 the per-env default (``dev``/``staging`` = 1, ``prod`` = 2) — i.e. no
@@ -665,6 +690,34 @@ module otelCollector 'modules/containerapp-otel-collector.bicep' = if (appInsigh
 }
 
 // ---------------------------------------------------------------------------
+// Azure Monitor golden-signal alert rules (item 27). Gated on BOTH
+// ``enableAlerts`` AND ``enableAppInsights`` — the scheduledQueryRules query the
+// App* tables (AppDependencies / AppRequests / AppMetrics) that the
+// workspace-based App Insights populates via the OTel Collector's azuremonitor
+// exporter, so without App Insights there's nothing to alert on. Scoped to the
+// EXISTING Log Analytics workspace (logs.outputs.workspaceId) where those tables
+// live. Default-off: with enableAlerts=false the module isn't instantiated, so
+// no Action Group / rules are emitted.
+//
+// Note the gate does NOT require appInsightsExportEnabled (the connection
+// string) — the component exists after pass 1, and the workspace tables fill as
+// soon as the collector ships data. Operators typically flip enableAlerts on the
+// same pass-2 deploy that brings the collector up, but the rules are valid the
+// moment App Insights exists.
+// ---------------------------------------------------------------------------
+module alerts 'modules/monitor-alerts.bicep' = if (enableAlerts && enableAppInsights) {
+  name: 'alerts-${env}'
+  params: {
+    workspaceResourceId: logs.outputs.workspaceId
+    appInsightsId: appInsights!.outputs.id
+    appInsightsName: appInsights!.outputs.name
+    location: location
+    alertEmail: alertEmail
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Teams bot (slice 3.1.e) — Container App + Azure Bot Service.
 //
 // Gated on ``enableTeamsBot`` for the same first-pass / second-pass
@@ -866,3 +919,6 @@ output appInsightsName string = enableAppInsights ? appInsights!.outputs.name : 
 
 @description('Internal ingress FQDN of the OTel Collector. Empty unless App Insights export is wired (enableAppInsights + a connection string). Internal-only — the api/worker reach it via OTEL_EXPORTER_OTLP_ENDPOINT.')
 output otelCollectorFqdn string = appInsightsExportEnabled ? otelCollector!.outputs.fqdn : ''
+
+@description('Resource id of the golden-signal alerts Action Group. Empty unless alerts are wired (enableAlerts AND enableAppInsights). Operators can attach extra receivers (webhook/SMS/ITSM) to it post-deploy.')
+output alertsActionGroupId string = (enableAlerts && enableAppInsights) ? alerts!.outputs.actionGroupId : ''
