@@ -145,6 +145,92 @@ class TestCredentialsStore:
 
 
 # ---------------------------------------------------------------------------
+# Duplicate-key dedupe — regression for the stale-shadow bug
+#
+# Real-user scenario: `mdk auth pull-runtime-key dev` reported the key was
+# saved, but `mdk run` kept sending an OLD value (shell env empty, so it
+# came from the file). The credentials file had TWO `MDK_DEV_KEY=` lines:
+# set() updated the first but left the stale later one, and read resolved
+# the wrong one — permanently shadowing the freshly-saved value. The fix:
+# set() collapses duplicates to a single line, and read is last-wins so a
+# pre-existing dupe stops shadowing the newer value.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDuplicateKeyDedupe:
+    def test_set_existing_key_leaves_exactly_one_line(self, isolated_creds: Path) -> None:
+        """set() on an existing key replaces it — one line, new value."""
+        store = CredentialsStore()
+        store.set("MDK_DEV_KEY", "old")
+        store.set("MDK_DEV_KEY", "new")
+        text = isolated_creds.read_text()
+        assert text.count("MDK_DEV_KEY=") == 1
+        assert "MDK_DEV_KEY=new" in text
+        assert "old" not in text
+        assert store.get("MDK_DEV_KEY") == "new"
+
+    def test_set_collapses_preexisting_duplicates(self, isolated_creds: Path) -> None:
+        """A file that ALREADY has duplicate lines for the key collapses
+        to ONE line with the new value on the next set()."""
+        isolated_creds.parent.mkdir(parents=True, exist_ok=True)
+        # Legacy file written before the dedupe guarantee: two MDK_DEV_KEY lines.
+        isolated_creds.write_text("MDK_DEV_KEY=stale-1\nOPENAI_API_KEY=sk-1\nMDK_DEV_KEY=stale-2\n")
+        store = CredentialsStore()
+        store.set("MDK_DEV_KEY", "fresh")
+        text = isolated_creds.read_text()
+        assert text.count("MDK_DEV_KEY=") == 1, text
+        assert "MDK_DEV_KEY=fresh" in text
+        assert "stale-1" not in text
+        assert "stale-2" not in text
+        # Unrelated key untouched.
+        assert "OPENAI_API_KEY=sk-1" in text
+        assert store.get("MDK_DEV_KEY") == "fresh"
+
+    def test_set_dedupe_preserves_first_position_and_comments(self, isolated_creds: Path) -> None:
+        """Collapsing dupes honors PR #12: the first occurrence keeps its
+        position; comments, ordering, and other keys stay intact."""
+        isolated_creds.parent.mkdir(parents=True, exist_ok=True)
+        isolated_creds.write_text(
+            "# my notes\n"
+            "MDK_DEV_KEY=stale-1\n"
+            "# section two\n"
+            "ANTHROPIC_API_KEY=ant-1\n"
+            "MDK_DEV_KEY=stale-2\n"
+        )
+        CredentialsStore().set("MDK_DEV_KEY", "fresh")
+        text = isolated_creds.read_text()
+        assert "# my notes" in text
+        assert "# section two" in text
+        assert "ANTHROPIC_API_KEY=ant-1" in text
+        assert text.count("MDK_DEV_KEY=") == 1
+        assert "MDK_DEV_KEY=fresh" in text
+        # The (single) MDK line keeps the FIRST occurrence's position:
+        # before the section-two comment, not appended at the end.
+        assert text.index("MDK_DEV_KEY") < text.index("# section two")
+
+    def test_read_preexisting_duplicates_last_wins(self, isolated_creds: Path) -> None:
+        """read/parse of a file with pre-existing duplicate lines returns
+        the LAST value — a stale earlier line can't shadow the newer one."""
+        isolated_creds.parent.mkdir(parents=True, exist_ok=True)
+        isolated_creds.write_text("MDK_DEV_KEY=stale\nMDK_DEV_KEY=newest\n")
+        assert CredentialsStore().get("MDK_DEV_KEY") == "newest"
+        assert CredentialsStore().read()["MDK_DEV_KEY"] == "newest"
+
+    def test_round_trip_set_a_b_a_collapses_to_one_each(self, isolated_creds: Path) -> None:
+        """set A, set B, set A again → one A (latest) + one B, correct values."""
+        store = CredentialsStore()
+        store.set("MDK_DEV_KEY", "a1")
+        store.set("OPENAI_API_KEY", "b1")
+        store.set("MDK_DEV_KEY", "a2")
+        text = isolated_creds.read_text()
+        assert text.count("MDK_DEV_KEY=") == 1
+        assert text.count("OPENAI_API_KEY=") == 1
+        assert store.get("MDK_DEV_KEY") == "a2"
+        assert store.get("OPENAI_API_KEY") == "b1"
+
+
+# ---------------------------------------------------------------------------
 # autoload_credentials — fills unset env vars; doesn't clobber set ones
 # ---------------------------------------------------------------------------
 
