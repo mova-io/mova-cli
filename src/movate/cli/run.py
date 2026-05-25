@@ -350,6 +350,21 @@ def _run_hint(run_short: str, metrics: Any, output_format: Run) -> str:
     return "[dim]→ " + " · ".join(parts) + "[/dim]"
 
 
+def _looks_like_existing_file(raw: str) -> bool:
+    """True only if ``raw`` names an existing regular file.
+
+    Guards ``Path.is_file()`` against ``OSError``: when ``raw`` is a long
+    JSON string rather than a path (common for ``mdk run <agent> '<json>'``),
+    ``os.stat`` raises ``ENAMETOOLONG`` (errno 63) and ``Path.is_file()``
+    re-raises it instead of returning ``False``. A string that can't even be
+    a valid path is simply not a file.
+    """
+    try:
+        return Path(raw).is_file()
+    except OSError:
+        return False
+
+
 def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
     """Best-effort interpretation of an agent's positional input.
 
@@ -364,9 +379,8 @@ def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
     if arg == "-":
         return _ensure_dict(json.loads(sys.stdin.read()))
 
-    p = Path(arg)
-    if p.is_file():
-        return _ensure_dict(json.loads(p.read_text()))
+    if _looks_like_existing_file(arg):
+        return _ensure_dict(json.loads(Path(arg).read_text()))
 
     try:
         parsed = json.loads(arg)
@@ -577,9 +591,8 @@ def _coerce_workflow_input(arg: str) -> dict[str, Any]:
     """
     if arg == "-":
         return _ensure_dict(json.loads(sys.stdin.read()))
-    p = Path(arg)
-    if p.is_file():
-        return _ensure_dict(json.loads(p.read_text()))
+    if _looks_like_existing_file(arg):
+        return _ensure_dict(json.loads(Path(arg).read_text()))
     try:
         parsed = json.loads(arg)
     except json.JSONDecodeError as exc:
@@ -1037,9 +1050,8 @@ def _coerce_remote_agent_input(raw: str, agent_name: str) -> dict[str, Any]:
     """
     if raw == "-":
         return _ensure_dict(json.loads(sys.stdin.read()))
-    p = Path(raw)
-    if p.is_file():
-        return _ensure_dict(json.loads(p.read_text()))
+    if _looks_like_existing_file(raw):
+        return _ensure_dict(json.loads(Path(raw).read_text()))
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
