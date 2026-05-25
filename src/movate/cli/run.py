@@ -365,6 +365,59 @@ def _looks_like_existing_file(raw: str) -> bool:
         return False
 
 
+_SCHEMA_ERROR_TYPES = frozenset({"schema_error", "output_validation_error", "validation_error"})
+
+
+def _is_schema_error(error_type: str | None) -> bool:
+    """True when an error envelope's ``type`` denotes a schema / output-
+    validation failure (the class the MockProvider's generic output can't
+    satisfy). Tolerant of the few near-synonyms the executor emits; matches
+    case-insensitively and on a ``schema`` substring so a renamed variant
+    still triggers the hint."""
+    if not error_type:
+        return False
+    lowered = error_type.lower()
+    return lowered in _SCHEMA_ERROR_TYPES or "schema" in lowered
+
+
+_MOCK_SCHEMA_HINT = (
+    "hint: the MockProvider's generic output doesn't satisfy this agent's "
+    "output_schema. Run without --mock (real provider) to validate end-to-end, "
+    "or test against a lenient-schema agent."
+)
+
+
+def _maybe_mock_schema_hint(*, error_type: str | None, mock: bool) -> None:
+    """P4 — when a run errored on a schema/output-validation failure AND it
+    used ``--mock``, append the actionable hint. Real-provider schema errors
+    keep today's bare message. Always renders (it IS an error hint, so it must
+    survive ``--quiet``) but only on this specific combination."""
+    if mock and _is_schema_error(error_type):
+        console.print(f"[yellow]{_MOCK_SCHEMA_HINT}[/yellow]")
+
+
+def _maybe_trace_line(trace_id: str | None, *, output_format: Run, target: str | None) -> None:
+    """P1 — surface the run's trace id (+ how to view it) on stderr.
+
+    Skipped cleanly when there's no trace id or under ``--json`` (JSON stdout
+    must stay machine-parseable; this human hint never goes to stdout). For a
+    deployed ``--target`` run we ALSO print a one-line pointer to view the
+    trace. Honors ``--quiet`` via ``_console.hint``."""
+    if output_format != Run.TEXT:
+        return
+    tid = (trace_id or "").strip()
+    if not tid:
+        return
+    if target:
+        _console.hint(
+            f"[dim]trace: [bold]{tid}[/bold]  ·  view: [cyan]mdk trace {tid} "
+            f"--target {target}[/cyan]  (or App Insights → Transaction search "
+            f"→ paste the id)[/dim]"
+        )
+    else:
+        _console.hint(f"[dim]trace: [bold]{tid}[/bold][/dim]")
+
+
 def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:
     """Best-effort interpretation of an agent's positional input.
 
@@ -473,6 +526,10 @@ async def _run_local_agent(  # noqa: PLR0912 — linear pipeline + error branche
         short = response.run_id[:8]
         _console.hint(_run_hint(short, response.metrics, output_format))
 
+    # P1 — surface the trace id (local runs have no --target pointer).
+    trace_id = getattr(response.metrics, "trace_id", "") or response.trace_id
+    _maybe_trace_line(trace_id, output_format=output_format, target=None)
+
     # Greppable summary line — mirrors mdk_init_summary / mdk_add_summary
     # / mdk_validate_summary / mdk_eval_*_summary so CI workflows can
     # scrape one shape for every command. Goes to stderr so it doesn't
@@ -492,6 +549,9 @@ async def _run_local_agent(  # noqa: PLR0912 — linear pipeline + error branche
     sys.stderr.flush()
 
     if response.status == "error":
+        # P4 — friendly hint only on (error + schema_error + --mock).
+        err_type = response.error.type if response.error else None
+        _maybe_mock_schema_hint(error_type=err_type, mock=mock)
         raise typer.Exit(code=1)
 
 
@@ -842,6 +902,7 @@ def _configure_mock_for_bundle(provider: Any, bundle: AgentBundle) -> None:
 
 
 _HTTP_OK = 200
+_HTTP_ACCEPTED = 202
 _HTTP_UNAUTHORIZED = 401
 _HTTP_FORBIDDEN = 403
 _HTTP_NOT_FOUND = 404
@@ -985,6 +1046,15 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
             agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
         )
         raise typer.Exit(code=1)
+    # P5 — async submission. Even with ?wait=true the runtime MAY return a
+    # queued job (202 + RunAccepted: {job_id, status: queued}) rather than an
+    # inline result. Surface the poll/cancel follow-ups + exit cleanly instead
+    # of mis-reporting a queued job as an HTTP error.
+    if response.status_code == _HTTP_ACCEPTED:
+        _handle_remote_async_submission(
+            response, name=name, target_name=target_name, output_format=output_format
+        )
+        return
     if response.status_code != _HTTP_OK:
         try:
             body_json = response.json()
@@ -1018,6 +1088,10 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
     cost = metrics.get("cost_usd")
     latency = metrics.get("latency_ms")
     run_id = run_view.get("run_id")
+
+    # P1 — surface the trace id + a deployed-target view pointer.
+    _maybe_trace_line(metrics.get("trace_id"), output_format=output_format, target=target_name)
+
     _emit_remote_summary(
         agent=name,
         target=target_name,
@@ -1035,6 +1109,8 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
             console.print(
                 f"[red]✗ run errored:[/red] {err.get('type', 'unknown')}: {err.get('message', '')}"
             )
+        # P4 — mock + schema-error hint (only on that combination).
+        _maybe_mock_schema_hint(error_type=err.get("type") if err else None, mock=mock)
         raise typer.Exit(code=1)
 
 
@@ -1118,6 +1194,51 @@ def _render_remote_run(run_view: dict[str, Any], *, output_format: Run) -> None:
             f"[dim]→ remote run_id [bold]{short}[/bold] "
             f"(persisted on the runtime, not locally)[/dim]"
         )
+
+
+def _handle_remote_async_submission(
+    response: Any,
+    *,
+    name: str,
+    target_name: str,
+    output_format: Run,
+) -> None:
+    """P5 — render the poll/cancel follow-ups for an async (queued)
+    submission and emit a success summary.
+
+    The runtime returns ``202 + {job_id, status: queued}`` when it enqueues a
+    job instead of running inline. We print the JSON body to stdout (so it
+    stays pipe-parseable) and, in text mode, a one-line hint to stderr with the
+    ``mdk jobs wait`` / ``mdk jobs cancel`` follow-ups. Exits 0 — a queued
+    submission is a successful handoff, not a failure."""
+    try:
+        accepted = response.json()
+    except ValueError:
+        accepted = {"raw": response.text[:300]}
+
+    # Body to stdout in both modes — the RunAccepted shape (job_id + status)
+    # is small and already machine-parseable, so it doubles as the text-mode
+    # render and the JSON output a caller would pipe to jq.
+    sys.stdout.write(json.dumps(accepted, indent=2, default=str) + "\n")
+
+    job_id = accepted.get("job_id") if isinstance(accepted, dict) else None
+    if job_id and output_format == Run.TEXT:
+        _console.hint(
+            f"[dim]job [bold]{job_id}[/bold] queued · "
+            f"poll: [cyan]mdk jobs wait {job_id} --target {target_name}[/cyan] · "
+            f"cancel: [cyan]mdk jobs cancel {job_id} --target {target_name}[/cyan][/dim]"
+        )
+
+    # Greppable summary — the handoff succeeded (job is enqueued); the run's
+    # own success/failure is observed later via `mdk jobs wait`.
+    _emit_remote_summary(
+        agent=name,
+        target=target_name,
+        run_id=None,
+        cost=None,
+        latency=None,
+        ok=True,
+    )
 
 
 def _emit_remote_summary(
@@ -1355,6 +1476,8 @@ def _dispatch_remote_agent_stream(
                 f"[dim]→ remote run_id [bold]{short}[/bold] "
                 f"(persisted on the runtime, not locally)[/dim]"
             )
+        # P1 — surface the trace id + a deployed-target view pointer.
+        _maybe_trace_line(metrics.get("trace_id"), output_format=output_format, target=target_name)
         _emit_remote_summary(
             agent=name,
             target=target_name,
@@ -1364,6 +1487,9 @@ def _dispatch_remote_agent_stream(
             ok=ok,
         )
         if not ok:
+            # P4 — a done frame can still carry an error envelope.
+            err = terminal.get("error") or {}
+            _maybe_mock_schema_hint(error_type=err.get("type") if err else None, mock=mock)
             raise typer.Exit(code=1)
         return
 
@@ -1371,6 +1497,8 @@ def _dispatch_remote_agent_stream(
     msg = terminal.get("message", "stream ended without a terminal event")
     code = terminal.get("code", "stream_error")
     console.print(f"[red]✗ run errored:[/red] {code}: {msg}")
+    # P4 — mock + schema-error hint (the error frame's ``code`` is the type).
+    _maybe_mock_schema_hint(error_type=code, mock=mock)
     _emit_remote_summary(
         agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
     )
