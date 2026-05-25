@@ -327,6 +327,12 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         )
         return
 
+    # Pre-flight: the target Postgres must allow-list pgvector or the new
+    # revision will silently ActivationFail (see _preflight_pgvector). Runs
+    # before the build + revision roll so a misconfig fails fast with the fix
+    # rather than spinning the /healthz gate below.
+    _preflight_pgvector(plan)
+
     # Track wall-clock duration of the deploy from this point forward
     # so the notification carries an accurate "took N seconds" figure.
     started_at = time.monotonic()
@@ -1918,6 +1924,42 @@ def _print_plan(plan: DeployPlan, *, dry_run: bool) -> None:
         err.print("  build:           az acr build (multi-stage Dockerfile)")
     err.print(f"  apps to update:  {', '.join(plan.apps_to_update)}")
     err.print()
+
+
+def _preflight_pgvector(plan: DeployPlan) -> None:
+    """Abort the deploy if the target Postgres doesn't allow-list pgvector.
+
+    The runtime runs ``CREATE EXTENSION IF NOT EXISTS vector`` at startup
+    (``storage/postgres.py`` ``_ensure_pgvector``) and raises if it fails. On
+    Azure Postgres Flexible Server that ``CREATE EXTENSION`` only succeeds when
+    ``vector`` is in the *value* of the ``azure.extensions`` server parameter
+    (being in ``allowedValues`` isn't enough). When it isn't, the new revision
+    ActivationFails, ACA silently keeps the OLD revision serving, and the
+    ``/healthz`` gate below spins ("still seeing version X, retrying…") with no
+    clear cause. Catch it here — before rolling the revision.
+
+    Acts only on a confirmed misconfig. A missing Postgres server, an
+    sqlite-backed target, or any ``az`` error all degrade to a no-op (the
+    shared check returns ``skip``), so this never blocks a deploy it can't
+    reason about. Reuses the doctor's ``az`` helpers — no hand-rolled
+    subprocess here.
+    """
+    from movate.cli._azure_doctor import check_pgvector_allowlisted  # noqa: PLC0415
+
+    result = check_pgvector_allowlisted(plan.subscription, plan.resource_group)
+    if result.status == "ok":
+        err.print(f"  [green]✓[/green] pgvector allow-listed on {result.server}")
+        return
+    if result.status == "skip":
+        # No Postgres server to gate on (sqlite target / not deployed) or az
+        # couldn't resolve it — proceed silently rather than block a deploy we
+        # can't reason about.
+        return
+    # status == "error": vector isn't enabled — rolling the revision now would
+    # ActivationFail. Abort with the one-shot fix (the detail names the exact
+    # `az ... parameter set` + restart commands).
+    error(f"pre-flight failed — {result.detail}")
+    raise typer.Exit(code=2)
 
 
 def _run_acr_build(plan: DeployPlan) -> None:

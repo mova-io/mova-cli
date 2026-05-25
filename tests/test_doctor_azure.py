@@ -892,3 +892,213 @@ def test_new_checks_degrade_when_az_subprocess_raises(monkeypatch) -> None:
     # Worker show raised → treated as not-found (missing); KV list raised → error.
     assert _row(rows, "containerapp worker").status == "missing"
     assert _row(rows, "key vault secrets").status == "error"
+
+
+# ---------------------------------------------------------------------------
+# pgvector allow-list — Azure Postgres `azure.extensions` server parameter.
+#
+# Live-validation finding: on Azure Postgres Flexible Server the runtime's
+# CREATE EXTENSION vector fails unless 'vector' is in the *value* of
+# azure.extensions (being in allowedValues isn't enough). When it isn't, the
+# new revision ActivationFails and ACA silently keeps the old one serving.
+# These exercise the doctor row + the shared check both directions.
+# ---------------------------------------------------------------------------
+
+
+def _pg_handlers(*, value: str | None, with_server: bool = True) -> dict[str, tuple[int, str]]:
+    """Base az responses + a Postgres flexible server whose azure.extensions
+    parameter has ``value``. ``with_server=False`` simulates an RG with no
+    Postgres server (sqlite-backed target / Postgres not deployed)."""
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["keyvault list"] = (0, "[]")
+    if with_server:
+        handlers["flexible-server list"] = (0, '[{"name": "movate-prod-pg"}]')
+        if value is not None:
+            handlers["parameter show"] = (
+                0,
+                json_dumps_param(value),
+            )
+    else:
+        handlers["flexible-server list"] = (0, "[]")
+    return handlers
+
+
+def json_dumps_param(value: str) -> str:
+    import json  # noqa: PLC0415
+
+    return json.dumps({"value": value, "allowedValues": "vector,uuid-ossp,pg_trgm"})
+
+
+@pytest.mark.unit
+def test_pgvector_enabled_is_ok(monkeypatch) -> None:
+    """azure.extensions value contains vector → green row. The healthy case."""
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(_pg_handlers(value="VECTOR")),
+    )
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "pgvector extension")
+    assert row.status == "ok"
+    assert "movate-prod-pg" in row.detail
+
+
+@pytest.mark.unit
+def test_pgvector_enabled_is_case_insensitive(monkeypatch) -> None:
+    """Azure stores extensions case-folded; a lowercase 'vector' still passes."""
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(_pg_handlers(value="pg_trgm,vector")),
+    )
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "pgvector extension")
+    assert row.status == "ok"
+
+
+@pytest.mark.unit
+def test_pgvector_empty_value_is_error_with_fix(monkeypatch) -> None:
+    """azure.extensions value is empty (the real-world misconfig) → error row
+    naming the exact `az ... parameter set --value VECTOR` + restart fix."""
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(_pg_handlers(value="")),
+    )
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "pgvector extension")
+    assert row.status == "error"
+    # The fix command is surfaced verbatim.
+    assert "az postgres flexible-server parameter set" in row.detail
+    assert "--name azure.extensions --value VECTOR" in row.detail
+    assert "az postgres flexible-server restart" in row.detail
+    assert "ActivationFail" in row.detail
+
+
+@pytest.mark.unit
+def test_pgvector_missing_vector_preserves_existing_extensions_in_fix(monkeypatch) -> None:
+    """When other extensions are already enabled, the fix appends VECTOR
+    rather than clobbering them (which would break those features)."""
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(_pg_handlers(value="uuid-ossp")),
+    )
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "pgvector extension")
+    assert row.status == "error"
+    # Existing extension preserved, VECTOR appended.
+    assert "--value uuid-ossp,VECTOR" in row.detail
+
+
+@pytest.mark.unit
+def test_pgvector_no_server_is_missing_skip(monkeypatch) -> None:
+    """RG has no Postgres flexible server (sqlite target / not deployed) →
+    missing/skip, never an error. We don't gate a target we can't reason about."""
+    _patch_az_present(monkeypatch)
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(_pg_handlers(value=None, with_server=False)),
+    )
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "pgvector extension")
+    assert row.status == "missing"
+    assert "no Postgres flexible server" in row.detail
+
+
+@pytest.mark.unit
+def test_pgvector_az_error_degrades_without_crashing(monkeypatch) -> None:
+    """If the `az postgres` call blows up (OSError / not logged in), the row
+    degrades to missing/skip and downstream checks still run — no crash."""
+    _patch_az_present(monkeypatch)
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "postgres" in joined:
+            raise OSError("az crashed")
+        for needle, (rc, out) in {
+            **_base_handlers(),
+            "containerapp show": (0, _RUNNING_APP),
+            "keyvault list": (0, "[]"),
+        }.items():
+            if needle in joined:
+                return subprocess.CompletedProcess(cmd, rc, out)
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _run)
+    _patch_healthz_ok(monkeypatch)
+
+    rows = run_azure_preflight("prod", _target())
+    assert _row(rows, "pgvector extension").status == "missing"
+    # Downstream /healthz still ran (the pgvector skip didn't short-circuit).
+    assert any(r.name == "/healthz" for r in rows)
+
+
+# --- check_pgvector_allowlisted — shared helper, direct unit tests ----------
+
+
+@pytest.mark.unit
+def test_check_pgvector_allowlisted_ok_carries_server(monkeypatch) -> None:
+    """The shared check returns status=ok + the resolved server name."""
+    from movate.cli._azure_doctor import check_pgvector_allowlisted  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "flexible-server list": (0, '[{"name": "movate-prod-pg"}]'),
+                "parameter show": (0, json_dumps_param("VECTOR")),
+            }
+        ),
+    )
+    result = check_pgvector_allowlisted("sub", "movate-prod-rg")
+    assert result.status == "ok"
+    assert result.server == "movate-prod-pg"
+    assert result.fix_command is None
+
+
+@pytest.mark.unit
+def test_check_pgvector_allowlisted_error_carries_fix_command(monkeypatch) -> None:
+    """status=error surfaces a populated fix_command (used by deploy's abort)."""
+    from movate.cli._azure_doctor import check_pgvector_allowlisted  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "flexible-server list": (0, '[{"name": "movate-prod-pg"}]'),
+                "parameter show": (0, json_dumps_param("")),
+            }
+        ),
+    )
+    result = check_pgvector_allowlisted("sub", "movate-prod-rg")
+    assert result.status == "error"
+    assert result.fix_command is not None
+    assert "az postgres flexible-server parameter set" in result.fix_command
+    assert "movate-prod-pg" in result.fix_command
+
+
+@pytest.mark.unit
+def test_check_pgvector_allowlisted_param_unreadable_is_skip(monkeypatch) -> None:
+    """Server resolves but the parameter read errors (RBAC) → skip, not error.
+    We only block a deploy on a CONFIRMED misconfig."""
+    from movate.cli._azure_doctor import check_pgvector_allowlisted  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        "movate.cli._azure_doctor.subprocess.run",
+        _fake_az(
+            {
+                "flexible-server list": (0, '[{"name": "movate-prod-pg"}]'),
+                # `parameter show` left at the rc=1 default → unreadable.
+            }
+        ),
+    )
+    result = check_pgvector_allowlisted("sub", "movate-prod-rg")
+    assert result.status == "skip"
+    assert result.server == "movate-prod-pg"

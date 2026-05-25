@@ -42,6 +42,29 @@ class Check:
     detail: str = ""
 
 
+@dataclass
+class PgvectorStatus:
+    """Result of the Azure Postgres pgvector allow-list pre-flight.
+
+    Shared by ``movate doctor --target`` (rendered as a table row) and
+    ``movate deploy`` (a gate that aborts a runtime roll-out). ``status``:
+
+    * ``ok``    — ``vector`` is present in the server's ``azure.extensions``
+      value; the runtime's ``CREATE EXTENSION vector`` will succeed.
+    * ``error`` — a Postgres flexible server exists but ``vector`` isn't in
+      ``azure.extensions``; the runtime startup will fail and a new revision
+      ActivationFails. ``fix_command`` names the one-shot az remediation.
+    * ``skip``  — nothing to gate on: no Postgres server in the RG (sqlite
+      target / Postgres not deployed) or az couldn't resolve it (not logged
+      in / RBAC). Never an actionable failure.
+    """
+
+    status: Literal["ok", "error", "skip"]
+    detail: str
+    server: str | None = None
+    fix_command: str | None = None
+
+
 def run_azure_preflight(target_name: str, target: TargetConfig) -> list[Check]:
     """Run every Azure-side check for ``target``. Returns rows for the
     doctor table; never raises.
@@ -246,6 +269,19 @@ def run_azure_preflight(target_name: str, target: TargetConfig) -> list[Check]:
             target.azure_env,
         )
     )
+
+    # ------------------------------------------------------------------
+    # Azure Postgres allow-lists the pgvector extension
+    # ------------------------------------------------------------------
+    # The runtime runs `CREATE EXTENSION vector` at startup
+    # (storage/postgres.py `_ensure_pgvector`) and raises if it fails. On
+    # Azure Postgres Flexible Server that only succeeds when 'vector' is in
+    # the *value* of the `azure.extensions` server parameter — being in
+    # `allowedValues` isn't enough. When it isn't, the new revision
+    # ActivationFails, ACA silently keeps the old revision serving, and a
+    # `mdk deploy` health gate just spins with no clear cause. sqlite-backed
+    # targets / RGs with no Postgres server skip cleanly (no server to gate).
+    checks.append(_check_pgvector_extension(target.azure_subscription, target.azure_resource_group))
 
     # ------------------------------------------------------------------
     # /healthz responds
@@ -588,6 +624,116 @@ def _check_keyvault_secrets(subscription: str, resource_group: str, env: str) ->
     )
 
 
+def check_pgvector_allowlisted(subscription: str, resource_group: str) -> PgvectorStatus:
+    """Confirm the RG's Postgres flexible server allow-lists ``vector``.
+
+    Resolves the Postgres flexible server in ``resource_group`` (the first
+    one — a movate deploy provisions exactly one), reads its
+    ``azure.extensions`` server parameter, and classifies whether the
+    runtime's ``CREATE EXTENSION vector`` will succeed. See
+    :class:`PgvectorStatus` for the three outcomes.
+
+    Degrades gracefully: any failed ``az`` call or absent server yields
+    ``skip`` (never raises), so both the doctor row and the deploy gate can
+    call it unconditionally without a try/except.
+    """
+    servers = _az_json_list(
+        [
+            "az",
+            "postgres",
+            "flexible-server",
+            "list",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+        ]
+    )
+    if not servers:
+        # None (az errored / not logged in) or [] (no Postgres server in the
+        # RG — sqlite-backed target, or Postgres not deployed). Nothing to
+        # gate on either way.
+        return PgvectorStatus(
+            "skip",
+            f"no Postgres flexible server in {resource_group} "
+            "(sqlite-backed target, or Postgres not deployed)",
+        )
+    server_name = next(
+        (s.get("name") for s in servers if isinstance(s, dict) and s.get("name")),
+        None,
+    )
+    if not server_name:
+        return PgvectorStatus("skip", f"Postgres server in {resource_group} has no resolvable name")
+
+    param = _az_json(
+        [
+            "az",
+            "postgres",
+            "flexible-server",
+            "parameter",
+            "show",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--server-name",
+            server_name,
+            "--name",
+            "azure.extensions",
+        ]
+    )
+    if param is None:
+        return PgvectorStatus(
+            "skip",
+            f"could not read azure.extensions on {server_name} (az error / RBAC)",
+            server=server_name,
+        )
+
+    value = str(param.get("value") or "")
+    enabled = [ext.strip() for ext in value.split(",") if ext.strip()]
+    if any(ext.lower() == "vector" for ext in enabled):
+        return PgvectorStatus(
+            "ok",
+            f"{server_name}: azure.extensions allow-lists vector",
+            server=server_name,
+        )
+
+    # vector missing from the value → the runtime's CREATE EXTENSION will
+    # fail. Build a fix that PRESERVES any already-enabled extensions
+    # (clobbering them would break other features) and adds VECTOR.
+    new_value = ",".join([*enabled, "VECTOR"]) if enabled else "VECTOR"
+    fix = (
+        f"az postgres flexible-server parameter set -g {resource_group} -s {server_name} "
+        f"--name azure.extensions --value {new_value} && "
+        f"az postgres flexible-server restart -g {resource_group} -n {server_name}"
+    )
+    return PgvectorStatus(
+        "error",
+        f"{server_name}: azure.extensions does not allow-list 'vector' "
+        f"(value={value or '(empty)'}); the runtime's CREATE EXTENSION vector will "
+        f"fail and the new revision will ActivationFail. Fix: {fix}",
+        server=server_name,
+        fix_command=fix,
+    )
+
+
+def _check_pgvector_extension(subscription: str, resource_group: str) -> Check:
+    """Doctor row for the Azure Postgres pgvector allow-list.
+
+    Maps the shared :func:`check_pgvector_allowlisted` result onto the
+    doctor's ok/missing/error vocabulary: ``ok`` (vector allow-listed),
+    ``error`` (a Postgres server exists but vector isn't enabled — the
+    deploy-blocking misconfig, az fix in the detail), ``missing`` (skip —
+    no Postgres server / not Postgres-backed / az couldn't resolve it).
+    """
+    result = check_pgvector_allowlisted(subscription, resource_group)
+    if result.status == "ok":
+        return Check("pgvector extension", "ok", result.detail)
+    if result.status == "error":
+        return Check("pgvector extension", "error", result.detail)
+    return Check("pgvector extension", "missing", result.detail)
+
+
 def _check_healthz(url: str) -> Check:
     """``GET /healthz`` against the deployed runtime. Reports the version
     when reachable so an operator can see at a glance what's serving."""
@@ -692,4 +838,4 @@ def _check_auth_roundtrip(target: TargetConfig) -> Check:
     return Check("auth roundtrip", "ok", "saved bearer accepted")
 
 
-__all__ = ["Check", "run_azure_preflight"]
+__all__ = ["Check", "PgvectorStatus", "check_pgvector_allowlisted", "run_azure_preflight"]
