@@ -107,3 +107,17 @@ param corsAllowedOrigins = ''
 // generic OtelTracer ships spans to that endpoint. Default false (purely
 // additive; no KV secrets required, so it can be flipped on any pass).
 // param enableAppInsights = false
+
+// OPTIONAL — Azure Monitor golden-signal alert rules (item 27). Provisions an
+// Action Group + four scheduledQueryRules (dead-letter spike, high error rate,
+// high p95 latency, API no-traffic) over the workspace-based App Insights
+// telemetry, paging operators on runtime regressions (separate from the
+// app-level drift alerts). Gated on BOTH this flag AND enableAppInsights — the
+// rules query the App* tables App Insights populates, so they're only created
+// when App Insights exists. Default false (purely additive). Set alertEmail to
+// a distribution list / on-call address to receive emails; leave it empty to
+// create the Action Group with no receiver (alerts still evaluate + show in the
+// portal). Thresholds/windows/severities have sensible module defaults; expose
+// them here only if you need to tune.
+// param enableAlerts = false
+// param alertEmail = ''

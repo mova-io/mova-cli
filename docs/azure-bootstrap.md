@@ -210,6 +210,37 @@ as a deployment output, and ARM omits `@secure()` params during preflight —
 which is exactly when ACA needs to see the value. With `enableAppInsights =
 false` (the default) none of this is emitted.
 
+### Optional: golden-signal alerts (item 27)
+
+Once App Insights is on and the collector is shipping telemetry, flip
+`enableAlerts = true` to provision Azure Monitor alert rules on the runtime's
+golden signals (this is separate from the application-level drift alerts, which
+fire via the NotificationDispatcher/webhook). It's gated on **both**
+`enableAlerts` AND `enableAppInsights` — the rules are log-search alerts
+(`scheduledQueryRules` v2) scoped to the **Log Analytics workspace**, querying
+the `App*` tables that workspace-based App Insights populates from the OTel
+Collector's `azuremonitor` exporter. The OTel instrument names map through
+verbatim (e.g. `mdk.jobs.completed` → an `AppMetrics` row with `Name ==
+"mdk.jobs.completed"`).
+
+The four rules + their sources:
+
+| Rule | Table | Fires when (default) |
+|---|---|---|
+| Dead-letter spike | `AppMetrics` (`mdk.jobs.completed`, `status==dead_letter`) | count over 15m > 1 |
+| High error rate | `AppDependencies` (`agent.execute`, role `movate-runtime`) | `Success==false` fraction over 15m > 10% |
+| High latency p95 | `AppDependencies` (`agent.execute`, role `movate-runtime`) | p95 `DurationMs` over 15m > 30000 |
+| API availability / no-traffic | `AppRequests` (role `movate-runtime`) | successful requests over 15m <= 0 (stall) |
+
+All four notify a single **Action Group** (`movate-<env>-appi-ag`). Set
+`alertEmail` to an on-call address / distribution list to receive emails; leave
+it empty to create the group with **no receiver** — the rules still evaluate and
+show in the portal Alerts blade, you just attach a receiver (email/webhook/SMS)
+later. The deploy emits `alertsActionGroupId` so you can wire extra receivers
+post-deploy. Thresholds, windows (15m), evaluation cadence (5m), and severities
+are module params with defaults — override in the param file to tune. With
+`enableAlerts = false` (the default) no Action Group or rules are created.
+
 ## 5. Mint the first runtime API key
 
 `mdk auth create-key` runs against whichever storage backend the
