@@ -26,6 +26,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol
 
+from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
@@ -452,6 +453,23 @@ class StorageProvider(Protocol):
         fleet-wide). Callers render ``provider`` + masked ``fingerprint``;
         the ``ciphertext`` is present on the record but must never be returned
         on the wire.
+        """
+
+    async def list_all_tenant_provider_keys(
+        self, *, limit: int = 100_000
+    ) -> list[TenantProviderKey]:
+        """List every tenant's provider keys, fleet-wide (item 26 — DR export).
+
+        The cross-tenant companion to :meth:`list_tenant_provider_keys`,
+        added for the logical DR export (``mdk export``). Deliberately
+        **operator-only** — like the other ``tenant_id=None`` list modes it is
+        never exposed on the HTTP API; the only caller is
+        :func:`movate.core.dr_backup.export_state`, run as an operator against
+        the DB directly. Carries the ``ciphertext`` (the whole point of the
+        backup is to preserve the encrypted-at-rest secret); the plaintext is
+        still never recoverable without ``MOVATE_PROVIDER_KEY_SECRET``, which
+        is NOT in the export. Ordered ``(tenant_id, provider)`` for a stable,
+        diff-friendly snapshot.
         """
 
     async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
@@ -1097,6 +1115,22 @@ class StorageProvider(Protocol):
         rather than raising — same no-leak contract as the getters.
         """
 
+    async def list_all_agent_bundles(self, *, limit: int = 100_000) -> list[AgentBundleRecord]:
+        """List **every** published agent-bundle version, all tenants
+        (item 26 — DR export).
+
+        Unlike :meth:`list_agents` (latest version per name, one tenant) and
+        :meth:`list_agent_versions` (all versions of one name, one tenant),
+        this returns the *whole* ``agent_bundles`` table — every
+        ``(name, tenant_id, version)`` row — because the registry table
+        doubles as the version history, and a faithful backup must preserve
+        all versions so a restore can roll back to any of them.
+
+        Deliberately **operator-only** — never exposed on the HTTP API; the
+        only caller is :func:`movate.core.dr_backup.export_state`. Ordered
+        ``(tenant_id, name, created_at)`` for a stable, diff-friendly snapshot.
+        """
+
     async def delete_agent_bundle(
         self,
         name: str,
@@ -1229,5 +1263,40 @@ class StorageProvider(Protocol):
         trace to chunks from that source URI (the per-source re-ingest
         workflow, mirroring :meth:`delete_kb_chunks`). Returns the total
         rows deleted (entities + relations)."""
+
+    # ------------------------------------------------------------------
+    # DR backup/restore (item 26) — a portable logical snapshot of the
+    # operator-critical, non-reconstructible control-plane state (agent
+    # registry, api keys, canary configs, eval/job schedules, per-tenant
+    # provider keys). This is the *escape hatch*; the primary DR for a
+    # deployed runtime is Azure Postgres PITR (docs/runbooks/dr-backup.md).
+    # High-volume/reconstructible history (runs, jobs, evals, KB, threads,
+    # memory) is EXCLUDED by design — PITR owns it.
+    #
+    # The orchestration is backend-agnostic and lives once in
+    # movate.core.dr_backup; every backend's implementation delegates there,
+    # reading/writing only through the Protocol's existing list/get/save
+    # methods (+ the two cross-tenant list accessors above), so the snapshot
+    # round-trips identically across sqlite / postgres / in-memory.
+    # ------------------------------------------------------------------
+
+    async def export_state(self) -> dict[str, object]:
+        """Return a JSON-serializable snapshot of the in-scope control-plane
+        state, versioned with ``schema_version`` + ``exported_at``.
+
+        See :func:`movate.core.dr_backup.export_state` for the entity scope,
+        the secrets/Fernet posture, and the snapshot shape.
+        """
+
+    async def import_state(
+        self, snapshot: dict[str, object], *, mode: str = "skip-existing"
+    ) -> ImportResult:
+        """Load a snapshot from :meth:`export_state` back into this store.
+
+        ``mode="skip-existing"`` (the safe default) never clobbers a row that
+        already exists; ``mode="overwrite"`` re-saves every row. Idempotent +
+        safe to re-run. Returns per-entity imported/skipped counts. See
+        :func:`movate.core.dr_backup.import_state`.
+        """
 
     async def close(self) -> None: ...

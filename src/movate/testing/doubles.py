@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
+from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
@@ -399,6 +400,12 @@ class InMemoryStorage:
         rows = [k for k in self.tenant_provider_keys if k.tenant_id == tenant_id]
         return sorted(rows, key=lambda k: k.provider)
 
+    async def list_all_tenant_provider_keys(
+        self, *, limit: int = 100_000
+    ) -> list[TenantProviderKey]:
+        rows = sorted(self.tenant_provider_keys, key=lambda k: (k.tenant_id, k.provider))
+        return rows[:limit]
+
     async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
         before = len(self.tenant_provider_keys)
         self.tenant_provider_keys = [
@@ -492,6 +499,10 @@ class InMemoryStorage:
     ) -> list[AgentBundleRecord]:
         rows = [b for b in self.agent_bundles if b.name == name and b.tenant_id == tenant_id]
         return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
+
+    async def list_all_agent_bundles(self, *, limit: int = 100_000) -> list[AgentBundleRecord]:
+        rows = sorted(self.agent_bundles, key=lambda b: (b.tenant_id, b.name, b.created_at))
+        return rows[:limit]
 
     async def delete_agent_bundle(
         self,
@@ -1214,6 +1225,24 @@ class InMemoryStorage:
             rows = [f for f in rows if f.user_id == user_id]
         rows = sorted(rows, key=lambda f: f.created_at, reverse=True)
         return rows[: int(limit)]
+
+    # ------------------------------------------------------------------
+    # DR backup/restore (item 26) — delegate to the same backend-agnostic
+    # orchestration the real providers use, so the in-memory double exercises
+    # the identical export/import path under test.
+    # ------------------------------------------------------------------
+
+    async def export_state(self) -> dict[str, object]:
+        from movate.core.dr_backup import export_state  # noqa: PLC0415
+
+        return await export_state(self)
+
+    async def import_state(
+        self, snapshot: dict[str, object], *, mode: str = "skip-existing"
+    ) -> ImportResult:
+        from movate.core.dr_backup import import_state  # noqa: PLC0415
+
+        return await import_state(self, snapshot, mode=mode)
 
     async def close(self) -> None:
         return None

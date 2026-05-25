@@ -28,6 +28,7 @@ from typing import Any
 
 import asyncpg
 
+from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
@@ -895,6 +896,24 @@ class PostgresProvider:
             self._pool = None
 
     # ------------------------------------------------------------------
+    # DR backup/restore (item 26) — delegate to the backend-agnostic
+    # orchestration in movate.core.dr_backup (reads/writes only through this
+    # Protocol's methods, so the snapshot round-trips across all backends).
+    # ------------------------------------------------------------------
+
+    async def export_state(self) -> dict[str, object]:
+        from movate.core.dr_backup import export_state  # noqa: PLC0415
+
+        return await export_state(self)
+
+    async def import_state(
+        self, snapshot: dict[str, object], *, mode: str = "skip-existing"
+    ) -> ImportResult:
+        from movate.core.dr_backup import import_state  # noqa: PLC0415
+
+        return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
     # Runs
     # ------------------------------------------------------------------
 
@@ -1471,6 +1490,16 @@ class PostgresProvider:
         )
         return [_row_to_tenant_provider_key(r) for r in rows]
 
+    async def list_all_tenant_provider_keys(
+        self, *, limit: int = 100_000
+    ) -> list[TenantProviderKey]:
+        # item 26 (DR export) — fleet-wide, operator-only. Stable order.
+        rows = await self._db.fetch(
+            "SELECT * FROM tenant_provider_keys ORDER BY tenant_id, provider LIMIT $1",
+            limit,
+        )
+        return [_row_to_tenant_provider_key(r) for r in rows]
+
     async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
         status: str = await self._db.execute(
             "DELETE FROM tenant_provider_keys WHERE provider = $1 AND tenant_id = $2",
@@ -1637,6 +1666,14 @@ class PostgresProvider:
             "ORDER BY created_at DESC LIMIT $3",
             name,
             tenant_id,
+            limit,
+        )
+        return [_row_to_agent_bundle(r) for r in rows]
+
+    async def list_all_agent_bundles(self, *, limit: int = 100_000) -> list[AgentBundleRecord]:
+        # item 26 (DR export) — every version, every tenant. Stable order.
+        rows = await self._db.fetch(
+            "SELECT * FROM agent_bundles ORDER BY tenant_id, name, created_at LIMIT $1",
             limit,
         )
         return [_row_to_agent_bundle(r) for r in rows]
