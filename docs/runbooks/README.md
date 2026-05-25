@@ -13,6 +13,7 @@ verified against the source.
 | [`improvement-loop.md`](improvement-loop.md) | **Harvest** (`mdk eval harvest`), **continuous eval + drift** (`mdk eval-schedule`, `mdk eval-scheduler-tick`, per-dimension drift), **canary** champion/challenger (`mdk canary`). ADR 016. |
 | [`serving-and-keys.md`](serving-and-keys.md) | **Batch** (`mdk batch`), **SSE streaming** (`mdk run --stream`), **job/run polling** (`/api/v1/jobs` + unversioned alias), **auth** (scopes, `mdk auth create-key/rotate-key/revoke-all`), **rate limits**, and the **proposed** per-tenant BYOK surface (ADR 018, not yet shipped). ADR 012/013/018. |
 | [`load-soak.md`](load-soak.md) | **Load / soak harness** (`scripts/loadtest.py`) — drive the job-queue + worker-drain (and KEDA autoscale) path under load, capture a throughput/latency baseline, read the JSON report. The production-readiness sign-off gate (🔒 real soak needs a deployed target). |
+| [`dr-backup.md`](dr-backup.md) | **Disaster recovery** — **Azure Postgres PITR** (the primary DR: automated backups + point-in-time restore + the restore procedure) and the **`mdk export` / `mdk import`** control-plane escape hatch (agent registry, api keys, canary, schedules, BYOK provider keys), plus a full restore drill. (🔒 real PITR needs a deployed server). |
 
 ## Deploying in the first place
 

@@ -191,6 +191,7 @@ from movate.cli import watch as watch_cmd  # noqa: E402
 from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.agent_cmd import agent_app  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
+from movate.cli.backup_cmd import export_state_cmd, import_state_cmd  # noqa: E402
 from movate.cli.batch_cmd import batch_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.canary_cmd import canary_app  # noqa: E402
@@ -406,6 +407,9 @@ app.command("compose", rich_help_panel=PANEL_DEVELOP)(compose_cmd.compose)
 # Sits next to `compose` (multi-agent) and `init` (single agent) since all
 # three answer "how do I scaffold a new thing?"
 app.command("plan", rich_help_panel=PANEL_DEVELOP)(plan_cmd.plan)
+# `import state` (item 26) restores a `mdk export state` DR backup of
+# control-plane state — the escape-hatch counterpart to the export.
+import_app.command("state")(import_state_cmd)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
@@ -553,7 +557,9 @@ app.command("deploy", rich_help_panel=PANEL_DEPLOY)(deploy_cmd.deploy)
 # one command. Lives next to `deploy` since both target shared infra.
 app.add_typer(infra_app, name="infra", rich_help_panel=PANEL_DEPLOY)
 # `export` packages primitives for portability — adjacent to deploy
-# (both ship things off-host).
+# (both ship things off-host). `export state` (item 26) is the DR escape
+# hatch: a logical backup of operator-critical control-plane state.
+export_app.command("state")(export_state_cmd)
 app.add_typer(export_app, name="export", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(playground_app, name="playground", rich_help_panel=PANEL_DEPLOY)

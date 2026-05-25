@@ -14,6 +14,7 @@ from typing import Any
 
 import aiosqlite
 
+from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
@@ -1334,6 +1335,17 @@ class SqliteProvider:
             rows = await cur.fetchall()
         return [_row_to_tenant_provider_key(r) for r in rows]
 
+    async def list_all_tenant_provider_keys(
+        self, *, limit: int = 100_000
+    ) -> list[TenantProviderKey]:
+        # item 26 (DR export) — fleet-wide, operator-only. Stable order.
+        async with self._db.execute(
+            "SELECT * FROM tenant_provider_keys ORDER BY tenant_id, provider LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_tenant_provider_key(r) for r in rows]
+
     async def delete_tenant_provider_key(self, provider: str, *, tenant_id: str) -> bool:
         cur = await self._db.execute(
             "DELETE FROM tenant_provider_keys WHERE provider = ? AND tenant_id = ?",
@@ -1496,6 +1508,15 @@ class SqliteProvider:
             "SELECT * FROM agent_bundles WHERE name = ? AND tenant_id = ? "
             "ORDER BY created_at DESC LIMIT ?",
             (name, tenant_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_agent_bundle(r) for r in rows]
+
+    async def list_all_agent_bundles(self, *, limit: int = 100_000) -> list[AgentBundleRecord]:
+        # item 26 (DR export) — every version, every tenant. Stable order.
+        async with self._db.execute(
+            "SELECT * FROM agent_bundles ORDER BY tenant_id, name, created_at LIMIT ?",
+            (limit,),
         ) as cur:
             rows = await cur.fetchall()
         return [_row_to_agent_bundle(r) for r in rows]
@@ -2887,6 +2908,24 @@ class SqliteProvider:
         )
         await self._db.commit()
         return (cur.rowcount or 0) > 0
+
+    # ------------------------------------------------------------------
+    # DR backup/restore (item 26) — delegate to the backend-agnostic
+    # orchestration in movate.core.dr_backup (reads/writes only through this
+    # Protocol's methods, so the snapshot round-trips across all backends).
+    # ------------------------------------------------------------------
+
+    async def export_state(self) -> dict[str, object]:
+        from movate.core.dr_backup import export_state  # noqa: PLC0415
+
+        return await export_state(self)
+
+    async def import_state(
+        self, snapshot: dict[str, object], *, mode: str = "skip-existing"
+    ) -> ImportResult:
+        from movate.core.dr_backup import import_state  # noqa: PLC0415
+
+        return await import_state(self, snapshot, mode=mode)
 
     async def close(self) -> None:
         if self._conn is not None:
