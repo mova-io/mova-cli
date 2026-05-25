@@ -29,6 +29,7 @@ from movate.cli.deploy import (
     DeployPlan,
     _build_plan,
     _ingest_bundled_kb,
+    _preflight_pgvector,
     _print_next_steps,
     _print_plan,
     _run_predeploy_validation,
@@ -94,6 +95,17 @@ def deploy_env(tmp_path: Path, monkeypatch):
     # about `az` call shape. The dedicated guardrail tests below override
     # this patch (or call _run_predeploy_validation directly).
     monkeypatch.setattr("movate.cli.deploy._run_predeploy_validation", lambda: None)
+
+    # The runtime-deploy path runs a pgvector pre-flight that shells out to
+    # `az postgres flexible-server ...` via the _azure_doctor helpers (a
+    # DIFFERENT subprocess hook than `mock_subprocess`). Default it to "no
+    # Postgres server in the RG" so the gate cleanly skips and the existing
+    # runtime-deploy tests stay hermetic. pgvector-specific tests override
+    # `movate.cli._azure_doctor.subprocess.run` themselves.
+    def _fake_doctor_az(cmd, *_a, **_k):
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_doctor_az)
     return tmp_path
 
 
@@ -356,15 +368,18 @@ def test_cli_deploy_full_run_invokes_acr_build_and_two_updates(
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     # Verify the shape of the subprocess calls: first an acr build, then
-    # two containerapp updates. Each call begins with 'az'.
-    assert len(mock_subprocess) == 3
-    build_cmd = mock_subprocess[0]
+    # two containerapp updates. Each call begins with 'az'. The pgvector
+    # pre-flight's read-only `az postgres ...` call is filtered out — it's a
+    # gate, not part of the build/roll shape under test.
+    deploy_calls = [c for c in mock_subprocess if "postgres" not in c]
+    assert len(deploy_calls) == 3
+    build_cmd = deploy_calls[0]
     assert build_cmd[:3] == ["az", "acr", "build"]
     assert "movate:9.9.9-test" in build_cmd
     assert "--target" in build_cmd
     assert "runtime" in build_cmd
 
-    update_cmds = mock_subprocess[1:]
+    update_cmds = deploy_calls[1:]
     assert all(c[:3] == ["az", "containerapp", "update"] for c in update_cmds)
     app_names = {c[c.index("--name") + 1] for c in update_cmds}
     assert app_names == {"movate-prod-api", "movate-prod-worker"}
@@ -389,8 +404,9 @@ def test_cli_deploy_skip_build_omits_acr_build(deploy_env, mock_subprocess) -> N
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert len(mock_subprocess) == 2
-    assert all(c[:3] == ["az", "containerapp", "update"] for c in mock_subprocess)
+    deploy_calls = [c for c in mock_subprocess if "postgres" not in c]
+    assert len(deploy_calls) == 2
+    assert all(c[:3] == ["az", "containerapp", "update"] for c in deploy_calls)
 
 
 @pytest.mark.unit
@@ -410,8 +426,9 @@ def test_cli_deploy_only_api_runs_one_update(deploy_env, mock_subprocess) -> Non
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert len(mock_subprocess) == 2  # build + 1 update
-    update_cmd = mock_subprocess[1]
+    deploy_calls = [c for c in mock_subprocess if "postgres" not in c]
+    assert len(deploy_calls) == 2  # build + 1 update
+    update_cmd = deploy_calls[1]
     assert "movate-prod-api" in update_cmd
     assert "movate-prod-worker" not in update_cmd
 
@@ -500,6 +517,138 @@ def test_cli_deploy_unknown_target_exits_2(tmp_path: Path, monkeypatch) -> None:
     assert result.exit_code == 2
     # The resolver's error mentions the missing target.
     assert "ghost" in result.stderr or "not found" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# pgvector pre-flight gate — runtime-mode deploy aborts before rolling a
+# revision when the target Postgres doesn't allow-list pgvector.
+#
+# The runtime's CREATE EXTENSION vector ActivationFails on an Azure Postgres
+# whose azure.extensions value lacks 'vector'; ACA then silently keeps the old
+# revision and the /healthz gate spins. The gate catches that up-front.
+# ---------------------------------------------------------------------------
+
+
+def _fake_runtime_az(pg_servers: str, pg_param: str | None):
+    """A `subprocess.run` that answers the pgvector pre-flight's `az postgres`
+    reads + records every OTHER az call (acr build / containerapp update) so a
+    test can assert what did — and didn't — get rolled.
+
+    Returns ``(fake_run, calls)``. The `az postgres` reads are answered inline
+    (not recorded) since they're the gate, not the roll-out under test.
+    """
+    calls: list[list[str]] = []
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "flexible-server list" in joined:
+            return subprocess.CompletedProcess(cmd, 0, pg_servers)
+        if "parameter show" in joined:
+            return subprocess.CompletedProcess(cmd, 0, pg_param or "")
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "")
+
+    return _run, calls
+
+
+@pytest.mark.unit
+def test_cli_deploy_aborts_when_pgvector_not_enabled(deploy_env, monkeypatch) -> None:
+    """Postgres exists but azure.extensions lacks vector → exit 2 with the fix,
+    and NO revision is rolled (no acr build, no containerapp update)."""
+    fake, calls = _fake_runtime_az(
+        '[{"name": "movate-prod-pg"}]',
+        '{"value": "", "allowedValues": "vector,uuid-ossp"}',
+    )
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 2, result.stdout + result.stderr
+    # Nothing was built or rolled — the gate fired before the roll-out.
+    assert not any(c[:3] == ["az", "acr", "build"] for c in calls)
+    assert not any(c[:3] == ["az", "containerapp", "update"] for c in calls)
+    # The operator gets the one-shot fix.
+    assert "azure.extensions" in result.stderr
+    assert "--value VECTOR" in result.stderr
+    assert "restart" in result.stderr
+
+
+@pytest.mark.unit
+def test_cli_deploy_proceeds_when_pgvector_enabled(deploy_env, monkeypatch) -> None:
+    """azure.extensions allow-lists vector → the deploy rolls normally and
+    reports the green pre-flight line."""
+    fake, calls = _fake_runtime_az(
+        '[{"name": "movate-prod-pg"}]',
+        '{"value": "VECTOR", "allowedValues": "vector"}',
+    )
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert any(c[:3] == ["az", "acr", "build"] for c in calls)
+    update_apps = {
+        c[c.index("--name") + 1] for c in calls if c[:3] == ["az", "containerapp", "update"]
+    }
+    assert update_apps == {"movate-prod-api", "movate-prod-worker"}
+    assert "pgvector allow-listed" in result.stderr
+
+
+@pytest.mark.unit
+def test_cli_deploy_proceeds_when_no_postgres_server(deploy_env, monkeypatch) -> None:
+    """No Postgres server in the RG (sqlite target / not deployed) → the gate
+    skips silently and the deploy proceeds; no false green pre-flight line."""
+    fake, calls = _fake_runtime_az("[]", None)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert any(c[:3] == ["az", "acr", "build"] for c in calls)
+    assert "pgvector allow-listed" not in result.stderr
+
+
+@pytest.mark.unit
+def test_preflight_pgvector_raises_typer_exit_on_misconfig(monkeypatch) -> None:
+    """Direct unit: the gate raises typer.Exit(2) on a confirmed misconfig and
+    returns cleanly when vector is enabled."""
+    plan = _build_plan(
+        target_name="prod",
+        target_cfg=_full_target(),
+        image_tag="movate:1.2.3-abc",
+        skip_build=False,
+        only=None,
+    )
+
+    def _enabled(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "flexible-server list" in joined:
+            return subprocess.CompletedProcess(cmd, 0, '[{"name": "movate-prod-pg"}]')
+        if "parameter show" in joined:
+            return subprocess.CompletedProcess(cmd, 0, '{"value": "VECTOR"}')
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _enabled)
+    _preflight_pgvector(plan)  # must NOT raise
+
+    def _disabled(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "flexible-server list" in joined:
+            return subprocess.CompletedProcess(cmd, 0, '[{"name": "movate-prod-pg"}]')
+        if "parameter show" in joined:
+            return subprocess.CompletedProcess(cmd, 0, '{"value": ""}')
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _disabled)
+    with pytest.raises(typer.Exit) as exc:
+        _preflight_pgvector(plan)
+    assert exc.value.exit_code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -744,9 +893,12 @@ def test_cli_deploy_skip_validate_bypasses_the_gate(
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     assert called["n"] == 0  # guardrail never ran
-    # Build + two updates still happened.
-    assert len(mock_subprocess) == 3
-    assert mock_subprocess[0][:3] == ["az", "acr", "build"]
+    # Build + two container-app updates still happened. (The runtime path also
+    # runs a pgvector pre-flight `az postgres flexible-server ...` discovery
+    # call, so assert on the specific calls rather than an exact total.)
+    az_cmds = [c for c in mock_subprocess if c and c[0] == "az"]
+    assert any(c[:3] == ["az", "acr", "build"] for c in az_cmds)
+    assert sum(1 for c in az_cmds if c[:2] == ["az", "containerapp"] and "update" in c) == 2
 
 
 @pytest.mark.unit
