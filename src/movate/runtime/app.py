@@ -158,6 +158,7 @@ from movate.runtime.schemas import (
     HarvestedCaseView,
     HarvestView,
     HealthView,
+    JobCancelView,
     JobListView,
     JobScheduleListView,
     JobScheduleSubmission,
@@ -3965,6 +3966,51 @@ def build_app(
         ``read`` scope, ``JobView`` response, and tenant-scoping (404 on
         cross-tenant access, never 403)."""
         return await get_job(job_id, request, ctx)
+
+    @v1.post(
+        "/jobs/{job_id}/cancel",
+        response_model=JobCancelView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_cancel_job(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobCancelView:
+        """Cooperatively cancel a queued/running job (item 36, R4b).
+
+        Body-less. Gated on the ``run`` scope (a stronger capability than
+        the ``read`` scope used to poll) and tenant-scoped via ``ctx`` —
+        a caller can only cancel its own tenant's jobs.
+
+        Semantics (the returned ``status`` is the state AFTER the call):
+
+        * ``QUEUED`` → ``cancelled`` immediately (the worker's claim only
+          takes ``queued`` rows, so it's never executed).
+        * ``RUNNING`` → returns ``running``: the cancel is *pending*. The
+          worker finishes the in-flight work (cooperative — NO
+          mid-LLM-call interruption), then DISCARDS the result and writes
+          ``cancelled`` at its terminal checkpoint. Poll
+          ``GET /jobs/{id}`` to observe the transition.
+        * already terminal → no-op; returns the unchanged status (you
+          can't cancel a finished job).
+
+        Tenant-scoped at the storage layer (``request_job_cancel(...,
+        tenant_id=...)`` filters in WHERE) so a cross-tenant id returns
+        ``None`` and we 404 — never 403, which would leak the id.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``run`` scope
+        * **404** — no such job for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        status = await store.request_job_cancel(job_id, tenant_id=ctx.tenant_id)
+        if status is None:
+            raise not_found("job", job_id)
+        return JobCancelView(job_id=job_id, status=status)
 
     @v1.get(
         "/runs/{run_id}",

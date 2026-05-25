@@ -1385,6 +1385,19 @@ class JobStatus(StrEnum):
     ``DEAD_LETTER`` is "we tried N times and gave up." Operators
     triage with ``movate jobs list --status dead_letter``.
     """
+    CANCELLED = "cancelled"
+    """Terminal: the job was cancelled by an operator (item 36, R4b).
+
+    Cancellation is **cooperative**, not pre-emptive — there is no
+    mid-LLM-call interruption. A ``QUEUED`` job is cancelled atomically
+    (the claim path only takes ``queued`` rows, so it's never picked up).
+    A ``RUNNING`` job is flagged via ``JobRecord.cancel_requested``; the
+    worker honors the flag at a checkpoint (either skips a not-yet-started
+    job, or — if it was claimed before the request — finishes the in-flight
+    work but discards the outcome and writes ``CANCELLED`` instead of the
+    dispatch result). ``CANCELLED`` is terminal: it is NEVER retried.
+    Operators triage with ``movate jobs list --status cancelled``.
+    """
 
 
 def _now() -> datetime:
@@ -2071,11 +2084,16 @@ class JobRecord(BaseModel):
 
     * ``QUEUED`` (just inserted, waiting for a worker)
     * ``RUNNING`` (claimed by a worker, ``claimed_at`` set)
-    * ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED`` / ``DEAD_LETTER``
-      (terminal, ``completed_at`` and (for success) ``result_run_id`` set)
+    * ``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED`` / ``DEAD_LETTER`` /
+      ``CANCELLED`` (terminal, ``completed_at`` and (for success)
+      ``result_run_id`` set)
     * ``QUEUED`` again — re-queue after a transient failure
       (``attempt_count`` incremented, ``next_retry_at`` set in the
       future; ``claim_next_job`` skips until then)
+
+    A ``QUEUED`` job can also be cancelled straight to ``CANCELLED``
+    (never claimed); a ``RUNNING`` job carries ``cancel_requested`` so
+    the worker writes ``CANCELLED`` at its terminal checkpoint (item 36).
 
     Re-uses :class:`JobStatus` (defined for ``RunRecord``) so the queue
     and the produced run share a single status vocabulary.
@@ -2121,6 +2139,20 @@ class JobRecord(BaseModel):
     jobs and jobs that don't need retry) means "claim immediately."
     Set when the worker re-queues a transient failure; the value is
     ``now + backoff(attempt_count)`` from the retry policy."""
+    cancel_requested: bool = False
+    """Cooperative-cancel flag (item 36, R4b). Set by
+    ``StorageProvider.request_job_cancel`` when an operator cancels a
+    job that is already ``RUNNING`` (a ``QUEUED`` job is flipped straight
+    to ``CANCELLED`` instead — the worker never sees it). The worker
+    honors this at a checkpoint: a job claimed while the flag is already
+    set is skipped (never dispatched) and written ``CANCELLED``; a job
+    flagged mid-dispatch finishes its in-flight work but the outcome is
+    discarded in favor of ``CANCELLED``. There is NO mid-LLM-call
+    interruption — that's explicitly out of scope.
+
+    Additive + default-off: ``False`` for every job that was never
+    cancelled, so pre-cancel rows (and the overwhelming common case)
+    read back as ``False`` and behave byte-for-byte as before."""
     thread_id: str | None = None
     """For threaded runs (Tier 10.5 / PR-Q), the
     :class:`ConversationThread` id this job belongs to. The worker

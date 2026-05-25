@@ -25,6 +25,7 @@ from movate.runtime.schemas import (
     BatchListView,
     BatchStatusView,
     HealthView,
+    JobCancelView,
     JobListView,
     JobView,
     RunAccepted,
@@ -133,6 +134,20 @@ class MovateClient:
         r = await self._client.get(f"/jobs/{job_id}")
         self._raise_for_status(r)
         return JobView.model_validate(r.json())
+
+    async def cancel_job(self, job_id: str) -> JobCancelView:
+        """``POST /api/v1/jobs/{id}/cancel`` — cooperatively cancel a job.
+
+        Body-less; requires the ``run`` scope. The returned ``status``
+        is the state AFTER the request: ``cancelled`` (was queued, now
+        terminal), ``running`` (was running — cancel is pending; the
+        worker finalizes it as ``cancelled`` at its next checkpoint), or
+        an already-terminal status (no-op). Cancellation is cooperative —
+        a running job's in-flight work isn't interrupted; its result is
+        discarded in favor of ``cancelled``."""
+        r = await self._client.post(f"/api/v1/jobs/{job_id}/cancel")
+        self._raise_for_status(r)
+        return JobCancelView.model_validate(r.json())
 
     async def list_jobs(
         self,

@@ -186,6 +186,32 @@ class JobListView(BaseModel):
     count: int
 
 
+class JobCancelView(BaseModel):
+    """``POST /api/v1/jobs/{id}/cancel`` response (item 36, R4b).
+
+    ``status`` is the job's status AFTER the cancel request:
+
+    * ``cancelled`` — the job was ``QUEUED`` and is now terminally
+      cancelled (it will never be claimed/executed).
+    * ``running`` — the job was already ``RUNNING`` when the cancel
+      landed; the cancel is *pending*. The worker honors it at its next
+      checkpoint and the job becomes ``cancelled`` shortly after (poll
+      ``GET /jobs/{id}`` to observe the transition).
+    * a terminal status (``success`` / ``error`` / ``safety_blocked`` /
+      ``dead_letter`` / ``cancelled``) — the job was already finished;
+      cancel was a no-op (you can't cancel a completed job).
+
+    Cancellation is **cooperative**: there is no mid-LLM-call
+    interruption. A ``RUNNING`` job's in-flight work is allowed to
+    complete, then its result is discarded in favor of ``cancelled``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: JobStatus
+
+
 # ---------------------------------------------------------------------------
 # Workflow HITL signal (ADR 017 D5, PR 2 — resume-on-signal)
 # ---------------------------------------------------------------------------

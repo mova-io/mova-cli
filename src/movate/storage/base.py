@@ -686,6 +686,36 @@ class StorageProvider(Protocol):
         ``(requeued, dead_lettered)`` counts.
         """
 
+    async def request_job_cancel(self, job_id: str, *, tenant_id: str) -> JobStatus | None:
+        """Cooperatively cancel a job, scoped to ``tenant_id`` (item 36, R4b).
+
+        Atomic, state-dependent transition:
+
+        * ``QUEUED`` → flip straight to ``CANCELLED`` (stamp
+          ``completed_at = now``). The claim path only ever takes
+          ``status='queued'`` rows, so a cancelled-while-queued job is
+          NEVER picked up — the cancellation is effective immediately.
+          Returns ``CANCELLED``.
+        * ``RUNNING`` → set ``cancel_requested = TRUE`` (status stays
+          ``RUNNING``). The cancellation is *pending*: a worker is
+          actively running this job and finalizes it at its terminal
+          checkpoint (writing ``CANCELLED`` instead of the dispatch
+          outcome). Returns ``RUNNING`` so the caller knows the cancel
+          was accepted but isn't terminal yet.
+        * already terminal (``SUCCESS`` / ``ERROR`` / ``SAFETY_BLOCKED``
+          / ``DEAD_LETTER`` / ``CANCELLED``) → no-op; returns the
+          unchanged current status (you can't cancel a finished job).
+
+        Returns ``None`` if no row matches ``job_id`` AND ``tenant_id``
+        — same shape as :meth:`get_job` so a caller can't probe for the
+        existence of another tenant's job (cross-tenant → 404, never 403).
+
+        There is **no** mid-execution interruption: cancellation is
+        cooperative (the worker honors the flag at a checkpoint), so a
+        ``RUNNING`` job's in-flight LLM call is allowed to complete; its
+        result is then discarded in favor of ``CANCELLED``.
+        """
+
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)
     # ------------------------------------------------------------------

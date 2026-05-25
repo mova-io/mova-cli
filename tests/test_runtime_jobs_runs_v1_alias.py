@@ -229,6 +229,103 @@ def test_v1_list_jobs_matches_unversioned(client: TestClient, minted_key) -> Non
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/jobs/{id}/cancel — cooperative run cancellation (item 36, R4b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_v1_cancel_queued_job_returns_cancelled(client: TestClient, minted_key) -> None:
+    """A queued job → 200 + status 'cancelled'; subsequent fetch confirms
+    the terminal transition."""
+    _, bearer = minted_key
+    submit = client.post(
+        "/run",
+        json={"kind": "agent", "target": "demo", "input": {"x": 1}},
+        headers=_auth_headers(bearer),
+    )
+    job_id = submit.json()["job_id"]
+
+    r = client.post(f"/api/v1/jobs/{job_id}/cancel", headers=_auth_headers(bearer))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["status"] == "cancelled"
+
+    # The job is terminally cancelled.
+    got = client.get(f"/api/v1/jobs/{job_id}", headers=_auth_headers(bearer))
+    assert got.json()["status"] == "cancelled"
+
+
+@pytest.mark.unit
+def test_v1_cancel_unknown_id_404(client: TestClient, minted_key) -> None:
+    _, bearer = minted_key
+    r = client.post("/api/v1/jobs/no-such-id/cancel", headers=_auth_headers(bearer))
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"]["code"] == "not_found"
+
+
+@pytest.mark.unit
+async def test_v1_cancel_cross_tenant_404(
+    client: TestClient, minted_key, storage: InMemoryStorage
+) -> None:
+    """Another tenant's key can't cancel the job — 404, never 403 (which
+    would leak the id's existence)."""
+    _, bearer = minted_key
+    submit = client.post(
+        "/run",
+        json={"kind": "agent", "target": "demo", "input": {}},
+        headers=_auth_headers(bearer),
+    )
+    job_id = submit.json()["job_id"]
+
+    other = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
+    await storage.save_api_key(other.record)
+
+    r = client.post(
+        f"/api/v1/jobs/{job_id}/cancel",
+        headers={"Authorization": f"Bearer {other.full_key}"},
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"]["code"] == "not_found"
+
+    # The real owner's job is untouched — still queued.
+    got = client.get(f"/api/v1/jobs/{job_id}", headers=_auth_headers(bearer))
+    assert got.json()["status"] == "queued"
+
+
+@pytest.mark.unit
+async def test_v1_cancel_missing_run_scope_403(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """Cancel requires the ``run`` scope (stronger than ``read``). A
+    read-only key for the same tenant is rejected 403 — the scope gate
+    fires before the tenant lookup."""
+    owner = mint_api_key(tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, scopes=list(ALL_SCOPES))
+    await storage.save_api_key(owner.record)
+    submit = client.post(
+        "/run",
+        json={"kind": "agent", "target": "demo", "input": {}},
+        headers={"Authorization": f"Bearer {owner.full_key}"},
+    )
+    job_id = submit.json()["job_id"]
+
+    read_only = mint_api_key(tenant_id=owner.record.tenant_id, env=ApiKeyEnv.LIVE, scopes=["read"])
+    await storage.save_api_key(read_only.record)
+
+    r = client.post(
+        f"/api/v1/jobs/{job_id}/cancel",
+        headers={"Authorization": f"Bearer {read_only.full_key}"},
+    )
+    assert r.status_code == 403, r.text
+
+
+@pytest.mark.unit
+def test_v1_cancel_requires_auth(client: TestClient) -> None:
+    r = client.post("/api/v1/jobs/any-id/cancel")  # no auth header
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # GET /api/v1/runs/{id} — alias of GET /runs/{id}
 # ---------------------------------------------------------------------------
 
