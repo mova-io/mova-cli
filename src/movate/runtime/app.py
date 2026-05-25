@@ -910,6 +910,17 @@ def _batch_max_rows() -> int:
 
 _BATCH_MAX_ROWS_DEFAULT = 10_000
 
+# item 37: submission idempotency. The OPTIONAL header an async-submit caller
+# may send so a retry (network blip / timeout) returns the SAME job instead of
+# double-enqueuing. When present, the submit path dedups on
+# ``(tenant_id, idempotency_key)`` (per-tenant via the AuthContext) so a repeat
+# returns the original job without re-enqueuing. Absent → byte-for-byte today's
+# always-enqueue behavior. Capped to bound storage; an empty value is treated
+# as absent. The header name follows the de-facto industry convention
+# (Stripe/IETF ``Idempotency-Key``).
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_KEY_MAX_LEN = 200
+
 
 def _parse_jsonl_rows(raw: bytes) -> list[dict[str, Any]]:
     """Parse a JSONL byte payload into a list of input-row dicts.
@@ -999,6 +1010,39 @@ async def _parse_batch_dataset(request: Request) -> tuple[list[dict[str, Any]], 
             message=f"batch body must be {{'inputs': [ {{...}}, ... ]}}: {exc.errors()}",
         ) from exc
     return submission.inputs, submission.notify_email
+
+
+def _read_idempotency_key(request: Request) -> str | None:
+    """Read + normalize the OPTIONAL ``Idempotency-Key`` header (item 37).
+
+    Strips surrounding whitespace; returns ``None`` (→ treated as absent, i.e.
+    today's always-enqueue behavior) when the header is missing, empty after
+    stripping, or longer than :data:`IDEMPOTENCY_KEY_MAX_LEN` (so an arbitrary
+    header can't bloat the dedup store).
+    """
+    raw = request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    key = raw.strip() if raw else None
+    if not key or len(key) > IDEMPOTENCY_KEY_MAX_LEN:
+        return None
+    return key
+
+
+async def _idempotent_submit_guard(
+    request: Request, store: StorageProvider, ctx: AuthContext
+) -> str | None:
+    """Return the ``job_id`` a prior submission with this key enqueued, or ``None``.
+
+    Pre-create check for the async (queued, 202) submit endpoints (item 37): if
+    the caller sent an ``Idempotency-Key`` we've already seen for this tenant,
+    the endpoint returns that SAME job instead of enqueuing a second one. No
+    header (or an unusable one) → ``None`` → the endpoint creates a job as
+    today. After creating, the endpoint calls
+    :meth:`StorageProvider.record_run_submission` (race-safe) to bind the key.
+    """
+    key = _read_idempotency_key(request)
+    if key is None:
+        return None
+    return await store.get_run_submission(ctx.tenant_id, key)
 
 
 def _apply_history_char_budget(
@@ -1409,7 +1453,20 @@ def build_app(
         being created is the *job*, but it's not yet executed; clients
         poll ``/jobs/{id}`` until terminal. The 202 status code makes
         that distinction wire-visible.
+
+        item 37: an OPTIONAL ``Idempotency-Key`` header makes a retry
+        (network blip / timeout) return the SAME job instead of double-
+        enqueuing. Absent → byte-for-byte today's always-enqueue path.
         """
+        store: StorageProvider = request.app.state.storage
+
+        # item 37 — submission idempotency. Pre-create check: a prior submit
+        # with this key for this tenant returns the SAME job; do NOT enqueue
+        # again. No header → prior is None → today's path.
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        if prior_job_id is not None:
+            return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
+
         job = JobRecord(
             job_id=str(uuid4()),
             tenant_id=ctx.tenant_id,
@@ -1422,8 +1479,21 @@ def build_app(
             # ADR 019: capture the originating trace so the worker continues it.
             trace_context=inject_current_trace_context(),
         )
-        store: StorageProvider = request.app.state.storage
         await store.save_job(job)
+
+        # item 37 — bind the key AFTER create so the recorded job_id is real.
+        # Race-safe: if a concurrent retry won, record returns False and we
+        # prefer its stored job_id (one canonical response; under a true
+        # simultaneous race we may have enqueued one extra job).
+        key = _read_idempotency_key(request)
+        if key is not None:
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            if not recorded:
+                winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
+                if winning_job_id is not None and winning_job_id != job.job_id:
+                    return RunAccepted(
+                        job_id=winning_job_id, status=JobStatus.QUEUED, deduplicated=True
+                    )
         return RunAccepted(job_id=job.job_id, status=job.status)
 
     # ------------------------------------------------------------------
@@ -3447,6 +3517,15 @@ def build_app(
                 created_at=_datetime.now(UTC),
             )
 
+        # item 37 — submission idempotency (async path only; the inline
+        # ?wait=true branch above returns before here and is out of scope).
+        # Pre-create check: a prior submit with this key for this tenant
+        # returns the SAME job; do NOT enqueue again. No header → today's path.
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        if prior_job_id is not None:
+            response.status_code = 202
+            return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
+
         # Default async path — same as before, plus the canary-chosen
         # version (ADR 016 D3) stamped onto the job so the worker resolves
         # the SAME version this request's routing decision picked (it must
@@ -3471,6 +3550,20 @@ def build_app(
         )
         await store.save_job(job)
         response.status_code = 202
+
+        # item 37 — bind the key AFTER create so the recorded job_id is real.
+        # Race-safe: if a concurrent retry won, prefer its stored job_id (one
+        # canonical response; under a true simultaneous race we may have
+        # enqueued one extra job).
+        key = _read_idempotency_key(request)
+        if key is not None:
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            if not recorded:
+                winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
+                if winning_job_id is not None and winning_job_id != job.job_id:
+                    return RunAccepted(
+                        job_id=winning_job_id, status=JobStatus.QUEUED, deduplicated=True
+                    )
         return RunAccepted(job_id=job.job_id, status=job.status)
 
     # ------------------------------------------------------------------

@@ -504,6 +504,24 @@ _MIGRATIONS = [
         PRIMARY KEY (trigger_id, delivery_id)
     )
     """,
+    # item 37: submission idempotency. One row per (tenant_id, idempotency_key)
+    # recording the job_id the FIRST async submit enqueued, so a client retry
+    # (network blip / timeout) returns the same job instead of double-
+    # enqueuing. Mirrors trigger_deliveries above but is per-TENANT scoped (the
+    # submit path has an AuthContext). Additive new table (CREATE TABLE IF NOT
+    # EXISTS, idempotent) — a row exists only when a submit carried an
+    # Idempotency-Key header, so the no-header path is unchanged. The composite
+    # PRIMARY KEY makes record_run_submission's INSERT OR IGNORE an atomic
+    # dedup: a concurrent retry races to one winner.
+    """
+    CREATE TABLE IF NOT EXISTS run_submissions (
+        tenant_id       TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        job_id          TEXT NOT NULL,
+        created_at      TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, idempotency_key)
+    )
+    """,
     # ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
     # agent): a challenger version + a traffic weight (0 = kill switch), with
     # optional champion pin + auto-promote eval gate. The run/enqueue path
@@ -1229,6 +1247,30 @@ class SqliteProvider:
             "INSERT OR IGNORE INTO trigger_deliveries "
             "(trigger_id, delivery_id, job_id, created_at) VALUES (?, ?, ?, ?)",
             (trigger_id, delivery_id, job_id, datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
+        async with self._db.execute(
+            "SELECT job_id FROM run_submissions "
+            "WHERE tenant_id = ? AND idempotency_key = ? LIMIT 1",
+            (tenant_id, idempotency_key),
+        ) as cur:
+            row = await cur.fetchone()
+        return row["job_id"] if row else None
+
+    async def record_run_submission(
+        self, tenant_id: str, idempotency_key: str, job_id: str
+    ) -> bool:
+        # INSERT OR IGNORE on the (tenant_id, idempotency_key) PRIMARY KEY: the
+        # row is written only if absent, so a concurrent retry races atomically
+        # to one winner. cur.rowcount is 1 on a fresh insert, 0 when the row
+        # already existed.
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO run_submissions "
+            "(tenant_id, idempotency_key, job_id, created_at) VALUES (?, ?, ?, ?)",
+            (tenant_id, idempotency_key, job_id, datetime.now(UTC).isoformat()),
         )
         await self._db.commit()
         return cur.rowcount > 0

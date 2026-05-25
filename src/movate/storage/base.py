@@ -381,6 +381,38 @@ class StorageProvider(Protocol):
         """
 
     # ------------------------------------------------------------------
+    # Run-submission dedup (item 37 — submission idempotency)
+    #
+    # Additive, opt-in by the caller: a row exists only when an async submit
+    # request carries an ``Idempotency-Key`` header. The dedup key is
+    # ``(tenant_id, idempotency_key)`` → the ``job_id`` the first submission
+    # enqueued. A retry with the same key returns the SAME job and does NOT
+    # re-enqueue, bounding the at-least-once submit story (complements the
+    # trigger-delivery dedup above). No header → no row → byte-for-byte the
+    # pre-item-37 submit behavior. Tenant-scoped: two tenants reusing the same
+    # key string never collide.
+    # ------------------------------------------------------------------
+
+    async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
+        """Return the ``job_id`` a prior submission with this key enqueued, or ``None``.
+
+        Keyed by ``(tenant_id, idempotency_key)``. ``None`` means this is the
+        first time we've seen this key for this tenant.
+        """
+
+    async def record_run_submission(
+        self, tenant_id: str, idempotency_key: str, job_id: str
+    ) -> bool:
+        """Record that ``idempotency_key`` for ``tenant_id`` enqueued ``job_id``.
+
+        Atomic insert (``INSERT ... ON CONFLICT DO NOTHING`` /
+        ``INSERT OR IGNORE``) so a concurrent retry races safely to a single
+        winner rather than recording two jobs. Returns ``True`` if this call
+        inserted the row, ``False`` if a row already existed (the existing
+        ``job_id`` is preserved — never overwritten).
+        """
+
+    # ------------------------------------------------------------------
     # Tenant provider keys (ADR 018 — per-tenant BYOK provider credentials)
     #
     # Additive, default-off: a row exists only when a tenant brings its own

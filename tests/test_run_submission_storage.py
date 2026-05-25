@@ -1,0 +1,63 @@
+"""Run-submission dedup storage (item 37 — submission idempotency).
+
+Mirrors the trigger-delivery dedup tests in tests/test_trigger_storage.py: the
+same three backends via the shared ``storage`` fixture in conftest.py —
+``InMemoryStorage``, ``SqliteProvider``, and ``PostgresProvider`` (skipped when
+``MOVATE_PG_TEST_URL`` is unset).
+
+Asserts the additive ``run_submissions`` table is default-off (no rows until
+written), round-trips ``(tenant_id, idempotency_key) -> job_id``, is race-safe
+(a second record for the same key returns False and keeps the first job_id),
+and is PER-TENANT scoped (two tenants reusing the same key string never
+collide).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.mark.unit
+async def test_default_off_no_rows(storage) -> None:
+    assert await storage.get_run_submission("tenant-a", "key-1") is None
+
+
+@pytest.mark.unit
+async def test_record_round_trip(storage) -> None:
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-1") is True
+    assert await storage.get_run_submission("tenant-a", "key-1") == "job-1"
+
+
+@pytest.mark.unit
+async def test_record_second_call_returns_false_and_keeps_first_job(storage) -> None:
+    """A retry does NOT overwrite the stored job_id (atomic dedup)."""
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-1") is True
+    # Same (tenant_id, idempotency_key) again — INSERT-OR-IGNORE: no insert.
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-2") is False
+    # The first writer's job_id wins; the second is dropped.
+    assert await storage.get_run_submission("tenant-a", "key-1") == "job-1"
+
+
+@pytest.mark.unit
+async def test_is_per_tenant_scoped(storage) -> None:
+    """The same idempotency key under a different tenant is independent."""
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-a") is True
+    # Different tenant, same key string → a distinct row, inserts fine.
+    assert await storage.record_run_submission("tenant-b", "key-1", "job-b") is True
+    assert await storage.get_run_submission("tenant-a", "key-1") == "job-a"
+    assert await storage.get_run_submission("tenant-b", "key-1") == "job-b"
+
+
+@pytest.mark.unit
+async def test_distinct_keys_independent(storage) -> None:
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-1") is True
+    assert await storage.record_run_submission("tenant-a", "key-2", "job-2") is True
+    assert await storage.get_run_submission("tenant-a", "key-1") == "job-1"
+    assert await storage.get_run_submission("tenant-a", "key-2") == "job-2"
+
+
+@pytest.mark.unit
+async def test_get_unknown_key_returns_none(storage) -> None:
+    await storage.record_run_submission("tenant-a", "key-1", "job-1")
+    assert await storage.get_run_submission("tenant-a", "missing") is None
+    assert await storage.get_run_submission("tenant-other", "key-1") is None

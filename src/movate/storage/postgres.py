@@ -518,6 +518,23 @@ CREATE TABLE IF NOT EXISTS trigger_deliveries (
     PRIMARY KEY (trigger_id, delivery_id)
 );
 
+-- item 37: submission idempotency. One row per (tenant_id, idempotency_key)
+-- recording the job_id the FIRST async submit enqueued, so a client retry
+-- (network blip / timeout) returns the same job instead of double-enqueuing.
+-- Mirrors trigger_deliveries above but is per-TENANT scoped (the submit path
+-- has an AuthContext). Additive new table (CREATE TABLE IF NOT EXISTS,
+-- idempotent) — a row exists only when a submit carried an Idempotency-Key
+-- header, so the no-header path is unchanged. The composite PRIMARY KEY makes
+-- record_run_submission's INSERT ... ON CONFLICT DO NOTHING an atomic dedup:
+-- a concurrent retry races to one winner.
+CREATE TABLE IF NOT EXISTS run_submissions (
+    tenant_id       TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    job_id          TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, idempotency_key)
+);
+
 -- ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
 -- agent): a challenger version + a traffic weight (0 = kill switch), with an
 -- optional champion pin + auto-promote eval gate. The run/enqueue path reads
@@ -1337,6 +1354,32 @@ class PostgresProvider:
             "VALUES ($1, $2, $3, $4) ON CONFLICT (trigger_id, delivery_id) DO NOTHING",
             trigger_id,
             delivery_id,
+            job_id,
+            datetime.now(UTC),
+        )
+        return status.endswith(" 1")
+
+    async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
+        row = await self._db.fetchrow(
+            "SELECT job_id FROM run_submissions WHERE tenant_id = $1 AND idempotency_key = $2",
+            tenant_id,
+            idempotency_key,
+        )
+        return row["job_id"] if row else None
+
+    async def record_run_submission(
+        self, tenant_id: str, idempotency_key: str, job_id: str
+    ) -> bool:
+        # INSERT ... ON CONFLICT DO NOTHING on the (tenant_id, idempotency_key)
+        # PRIMARY KEY: the row is written only if absent, so a concurrent retry
+        # races atomically to one winner. asyncpg returns the command tag
+        # "INSERT 0 1" on a fresh insert, "INSERT 0 0" when the conflict
+        # suppressed it.
+        status: str = await self._db.execute(
+            "INSERT INTO run_submissions (tenant_id, idempotency_key, job_id, created_at) "
+            "VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+            tenant_id,
+            idempotency_key,
             job_id,
             datetime.now(UTC),
         )

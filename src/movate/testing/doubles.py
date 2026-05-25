@@ -82,6 +82,9 @@ class InMemoryStorage:
         # item 23: trigger delivery dedup, keyed by (trigger_id, delivery_id)
         # → the job_id the first delivery enqueued.
         self.trigger_deliveries: dict[tuple[str, str], str] = {}
+        # item 37: submission idempotency, keyed by (tenant_id, idempotency_key)
+        # → the job_id the first async submit enqueued.
+        self.run_submissions: dict[tuple[str, str], str] = {}
         self.canary_configs: list[CanaryConfig] = []
 
     async def init(self) -> None:
@@ -351,6 +354,20 @@ class InMemoryStorage:
         if key in self.trigger_deliveries:
             return False
         self.trigger_deliveries[key] = job_id
+        return True
+
+    async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
+        return self.run_submissions.get((tenant_id, idempotency_key))
+
+    async def record_run_submission(
+        self, tenant_id: str, idempotency_key: str, job_id: str
+    ) -> bool:
+        # Mirrors the DB's atomic INSERT-OR-IGNORE: only the first write for a
+        # key lands; a later one finds the row and is a no-op.
+        key = (tenant_id, idempotency_key)
+        if key in self.run_submissions:
+            return False
+        self.run_submissions[key] = job_id
         return True
 
     # ------------------------------------------------------------------
