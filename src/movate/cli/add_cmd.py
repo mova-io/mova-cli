@@ -1021,6 +1021,17 @@ def _add_one(
         f"ok=true[/dim]"
     )
 
+    # Static next-steps hint — always printed on the verbose success
+    # path (both TTY and piped/CI), so the onboarding flow continues
+    # instead of dead-ending after the success Panel. The interactive
+    # picker below only fires on a TTY and is scoped to "add another
+    # agent"; this block is the explicit "now run / test / validate
+    # THIS agent" pointer that operators kept asking for. Scoped to the
+    # success path because it lives inside `_add_one`, reached only
+    # after a successful scaffold (the --list/--search/--preview/
+    # --remove/--update paths all return before the scaffold loop).
+    _render_next_steps_hint(agent_name=agent_name, dest=dest, project_root=project_root)
+
     # Interactive 'What next?' picker — TTY-gated, shared with init/
     # validate/eval. The helper renders the menu and shells out; this
     # call site just assembles the per-agent step list.
@@ -1057,6 +1068,36 @@ def _add_one(
     )
     prompt_next_step(console=console, steps=steps)
     return None
+
+
+def _render_next_steps_hint(*, agent_name: str, dest: Path, project_root: Path) -> None:
+    """Print a short "next steps" hint after a successful single-agent add.
+
+    Additive, human-output only: continues the onboarding flow instead
+    of dead-ending after the success Panel. Points at the three
+    natural follow-ups on the *just-added* agent — live-test loop,
+    one-shot mock run, project validate.
+
+    The run path is rendered project-relative (``./agents/<name>``)
+    when ``dest`` is under ``project_root`` — the form `mdk run`
+    accepts — falling back to the absolute ``dest`` otherwise (e.g. a
+    ``--target`` outside the project tree).
+    """
+    try:
+        rel = dest.relative_to(project_root)
+        agent_path = f"./{rel}"
+    except ValueError:
+        agent_path = str(dest)
+
+    console.print(
+        f"\n[green]✓[/green] added [cyan]{agent_name}[/cyan]\n"
+        f"  [bold]next:[/bold]  [bold]mdk dev {agent_name}[/bold]"
+        f"                      [dim]# live-test loop (edit → see output)[/dim]\n"
+        f'         [bold]mdk run {agent_path} "<input>" --mock[/bold]'
+        f"   [dim]# one-shot local run[/dim]\n"
+        f"         [bold]mdk validate[/bold]"
+        f"                        [dim]# check the project[/dim]"
+    )
 
 
 def _render_batch_summary(added_names: list[str], *, project_root: Path) -> None:
