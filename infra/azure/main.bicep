@@ -172,25 +172,50 @@ param langfuseImage string = 'langfuse/langfuse:2'
 
 @description('''
 Provision a workspace-linked Application Insights component and route the
-runtime's OpenTelemetry traces to it via the Container Apps Environment's
-managed OpenTelemetry. When true: (1) an App Insights component is created
-in workspace-based mode against the EXISTING Log Analytics workspace (no new
-workspace), (2) the CAE's openTelemetryConfiguration points traces + logs at
-it — so ACA auto-injects OTEL_EXPORTER_OTLP_ENDPOINT into the api/worker
-containers, and (3) the api + worker get MDK_TRACE_SINK=otlp so movate's
-generic OtelTracer activates and ships spans to that injected endpoint. The
-app stays portable (ADR 001 — no Azure SDK; generic OTLP only).
+runtime's OpenTelemetry traces to it through an in-cluster OpenTelemetry
+Collector. When true AND ``appInsightsConnectionString`` is non-empty:
+(1) an App Insights component is created in workspace-based mode against the
+EXISTING Log Analytics workspace (no new workspace), (2) an OTel Collector
+Container App (modules/containerapp-otel-collector.bicep) is deployed with
+internal ingress on :4318 and its `azuremonitor` exporter pointed at the
+connection string, and (3) the api + worker get MDK_TRACE_SINK=otlp PLUS
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<collector-fqdn> so movate's generic
+OtelTracer ships spans to the collector, which forwards them to App Insights.
+The app stays portable (ADR 001 — no Azure SDK; generic OTLP only).
+
+WHY THE COLLECTOR (ADR 020): ACA's *managed* OpenTelemetry does NOT support an
+App Insights destination on the live RP — `appInsightsConfiguration` is not in
+the type defs (BCP037) and a real deploy fails preflight with
+"AppInsightsConfiguration.ConnectionString can not be empty" even with a valid
+connection string. The in-cluster collector's `azuremonitor` exporter is the
+working path. NOTE: the two-pass nature — the connection string only exists
+AFTER the App Insights component is created. Pass 1 creates the component (set
+enableAppInsights=true, leave appInsightsConnectionString=''): the collector +
+endpoint wiring are gated off until a connection string is supplied. Read the
+connection string from the created component, set it as
+appInsightsConnectionString, and re-deploy (pass 2) to bring the collector up.
 
 Off by default — purely additive (matches deployLangfuse / enableScheduler /
-enableTeamsBot). When false, ZERO new resources or env vars are emitted and
-the deployment is byte-for-byte unchanged. Two-pass-safe: enabling it on a
-later pass just adds the component + the OTel routing; it requires no KV
-secrets, so it can be flipped on independently of enableApiWorker. The
-scheduler Job is intentionally left untouched (managed-OTel injection into
-Container Apps Jobs is not guaranteed; an unset endpoint with an otlp sink
-would fail the tick loud).
+enableTeamsBot). When false (or with an empty connection string), ZERO new env
+vars / collector are emitted and the api/worker stay byte-for-byte unchanged.
+The scheduler Job is intentionally left untouched (it does not get the OTLP
+endpoint; an otlp sink with no endpoint would fail the tick loud, so the
+scheduler keeps its existing trace behavior).
 ''')
 param enableAppInsights bool = false
+
+@description('''
+Application Insights connection string the OTel Collector's azuremonitor
+exporter ships telemetry to. PLAIN (not @secure()) on purpose: ARM omits
+@secure() params during preflight (exactly when the value must be present),
+the string carries only a write-only ingestion key (low sensitivity), and it
+is never surfaced as a deployment output. Empty (default) means "no collector
+yet" — the connection string only exists AFTER the App Insights component is
+created, so this drives the two-pass flow described on ``enableAppInsights``:
+pass 1 creates the component with this empty, pass 2 supplies the value read
+back from the component and the collector + OTLP wiring come up.
+''')
+param appInsightsConnectionString string = ''
 
 @description('''
 Cold-start knob for the API. Override for the API Container App's
@@ -303,6 +328,18 @@ var langfuseUaiName = 'movate-${env}-langfuse-mi'
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
 // names only have to be unique within the resource group).
 var appInsightsName = 'movate-${env}-appi'
+// In-cluster OTel Collector Container App (RG-scoped). Receives generic OTLP
+// from the api/worker and forwards to App Insights via its azuremonitor
+// exporter — see ADR 020 / modules/containerapp-otel-collector.bicep.
+var otelCollectorName = 'movate-${env}-otelcol'
+
+// App Insights export is wired (collector + OTLP endpoint on the apps) only
+// when BOTH the feature is on AND a connection string is supplied. The
+// connection string only exists after the App Insights component is created,
+// so this is the two-pass gate: pass 1 creates the component (connStr=''),
+// pass 2 supplies the connStr and the collector + endpoint come up. Used by
+// the otelCollector module condition and the api/worker trace wiring below.
+var appInsightsExportEnabled = enableAppInsights && !empty(appInsightsConnectionString)
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -381,11 +418,10 @@ module cae 'modules/containerapp-env.bicep' = {
       '2023-09-01'
     ).primarySharedKey
     isProd: isProd
-    // When App Insights is enabled, hand the CAE its connection string so
-    // the env's managed OpenTelemetry exports traces + logs there (and ACA
-    // auto-injects OTEL_EXPORTER_OTLP_ENDPOINT into the apps). Empty string
-    // (default) leaves the CAE's openTelemetryConfiguration unset entirely.
-    appInsightsConnectionString: enableAppInsights ? appInsights!.outputs.connectionString : ''
+    // The CAE no longer carries any openTelemetryConfiguration — its managed
+    // OpenTelemetry can't export to App Insights on live ACA (ADR 020). App
+    // Insights export is handled by the in-cluster OTel Collector below, which
+    // the api/worker emit OTLP to. The CAE is back to its baseline shape.
     tags: tags
   }
   // No explicit dependsOn — Bicep infers the dependency on `logs`
@@ -508,11 +544,14 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: apiUai.id
     corsAllowedOrigins: corsAllowedOrigins
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
-    // 'otlp' only when App Insights is on — the SAME flag that configures
-    // the CAE managed-OTel destination (which injects the OTLP endpoint).
-    // Gating both together guarantees the otlp sink always has an endpoint,
-    // so movate's fail-loud OtelTracer can't raise TraceSinkError.
-    traceSink: enableAppInsights ? 'otlp' : ''
+    // 'otlp' + the collector endpoint are gated on the SAME condition
+    // (appInsightsExportEnabled) so the otlp sink always has an endpoint to
+    // ship to — movate's fail-loud OtelTracer can't raise TraceSinkError.
+    // The endpoint is the collector's INTERNAL ingress base URL: ACA internal
+    // ingress serves on :443 → targetPort 4318, and the OTLP/HTTP exporter
+    // appends /v1/traces itself, so it's just https://<fqdn> (no port).
+    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
     // Pass the CAE storage config name when Azure Files is enabled;
     // empty string means no volume mount (pod-local /app/agents).
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
@@ -541,10 +580,11 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: workerUai.id
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
-    // 'otlp' only when App Insights is on — see the api module above for
-    // why gating on the same flag as the CAE OTel destination keeps the
-    // fail-loud OtelTracer safe.
-    traceSink: enableAppInsights ? 'otlp' : ''
+    // 'otlp' + the collector endpoint gated on the SAME condition — see the
+    // api module above for why pairing them keeps the fail-loud OtelTracer
+    // safe, and why the endpoint is the bare https://<fqdn> (no port).
+    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
     tags: tags
   }
 }
@@ -594,6 +634,32 @@ module langfuse 'modules/langfuse.bicep' = if (deployLangfuse) {
     publicUrl: 'https://${langfuseName}.${cae.outputs.defaultDomain}'
     image: langfuseImage
     userAssignedIdentityId: langfuseUai.id
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OpenTelemetry Collector (ADR 020) — the in-cluster bridge that exports the
+// runtime's generic OTLP traces to Application Insights via the collector's
+// `azuremonitor` exporter. Replaces the (unsupported-on-live-ACA) managed-OTel
+// App Insights destination we used to put on the CAE.
+//
+// Data flow:  api/worker (OTLP/HTTP) → otel-collector (azuremonitor) → App Insights
+//
+// Gated on appInsightsExportEnabled (enableAppInsights AND a non-empty
+// connection string). The connection string only exists AFTER the App Insights
+// component is created, so this is a two-pass flow: pass 1 creates the
+// component (connStr=''), read it back, pass 2 supplies it and the collector
+// comes up. No UAI / role assignments needed: it runs the public contrib image
+// (no ACR pull) and the connection string arrives as a plain param (no KV).
+// ---------------------------------------------------------------------------
+module otelCollector 'modules/containerapp-otel-collector.bicep' = if (appInsightsExportEnabled) {
+  name: 'otelcol-${env}'
+  params: {
+    name: otelCollectorName
+    location: location
+    environmentId: cae.outputs.envId
+    appInsightsConnectionString: appInsightsConnectionString
     tags: tags
   }
 }
@@ -797,3 +863,6 @@ output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''
 
 @description('App Insights component name. Empty when enableAppInsights=false. The connection string is intentionally NOT output (it carries an ingestion key).')
 output appInsightsName string = enableAppInsights ? appInsights!.outputs.name : ''
+
+@description('Internal ingress FQDN of the OTel Collector. Empty unless App Insights export is wired (enableAppInsights + a connection string). Internal-only — the api/worker reach it via OTEL_EXPORTER_OTLP_ENDPOINT.')
+output otelCollectorFqdn string = appInsightsExportEnabled ? otelCollector!.outputs.fqdn : ''

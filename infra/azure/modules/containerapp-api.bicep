@@ -82,8 +82,18 @@ param agentsStorageName string = ''
 @description('Langfuse host URL (self-hosted). Empty string = the Langfuse SDK default (Cloud). Set by main.bicep to the self-hosted Langfuse app URL when deployLangfuse=true.')
 param langfuseHost string = ''
 
-@description('Trace sink for the runtime (MDK_TRACE_SINK). Empty = unset (legacy auto-detect / silent). "otlp" ships spans to the ACA-injected OTLP endpoint.')
+@description('Trace sink for the runtime (MDK_TRACE_SINK). Empty = unset (legacy auto-detect / silent). "otlp" ships spans to the OTLP endpoint below.')
 param traceSink string = ''
+
+@description('''
+OTLP exporter endpoint (OTEL_EXPORTER_OTLP_ENDPOINT) the runtime ships spans
+to. Set by main.bicep to the in-cluster OpenTelemetry Collector's internal
+ingress URL (https://<collector-fqdn>, no port — see the env-emit comment
+below) when App Insights export is enabled; empty otherwise. main.bicep gates
+this on the SAME condition as ``traceSink`` so a pod never gets
+MDK_TRACE_SINK=otlp without an endpoint to ship to (which would fail loud).
+''')
+param otelExporterEndpoint string = ''
 
 @description('Common tags.')
 param tags object = {}
@@ -263,17 +273,29 @@ resource api 'Microsoft.App/containerApps@2024-03-01' = {
             }
           ], empty(traceSink) ? [] : [
             // Trace sink selector — emitted only when main.bicep sets
-            // traceSink='otlp' (enableAppInsights=true). MDK_TRACE_SINK is
-            // aliased to MOVATE_TRACE_SINK at runtime startup; 'otlp'
-            // activates the generic OtelTracer, which ships spans to the
-            // OTEL_EXPORTER_OTLP_ENDPOINT that the CAE managed-OTel config
-            // auto-injects into this container. We deliberately do NOT set
-            // OTEL_EXPORTER_OTLP_ENDPOINT here — ACA injects it, and it is
-            // only injected when enableAppInsights gates BOTH this var and
-            // the CAE OTel destination, so the otlp sink never fails loud.
+            // traceSink='otlp' (enableAppInsights + a collector endpoint).
+            // MDK_TRACE_SINK is aliased to MOVATE_TRACE_SINK at runtime
+            // startup; 'otlp' activates the generic OtelTracer, which ships
+            // spans to OTEL_EXPORTER_OTLP_ENDPOINT (set below). main.bicep
+            // gates traceSink and otelExporterEndpoint on the SAME condition,
+            // so the otlp sink always has an endpoint and never fails loud.
+            // (We no longer rely on ACA managed-OTel to inject the endpoint —
+            // that App Insights destination is unsupported on live ACA; see
+            // ADR 020. The endpoint now points at the in-cluster collector.)
             {
               name: 'MDK_TRACE_SINK'
               value: traceSink
+            }
+          ], empty(otelExporterEndpoint) ? [] : [
+            // OTLP exporter endpoint → the in-cluster OpenTelemetry Collector's
+            // internal ingress. This is the bare base URL (https://<fqdn>, no
+            // port): ACA internal ingress serves on :443 → targetPort 4318, and
+            // the OTLP/HTTP exporter appends the signal path (/v1/traces,
+            // /v1/metrics, /v1/logs) itself. Set together with MDK_TRACE_SINK
+            // above (same gate in main.bicep) so 'otlp' always has a target.
+            {
+              name: 'OTEL_EXPORTER_OTLP_ENDPOINT'
+              value: otelExporterEndpoint
             }
           ])
           volumeMounts: empty(agentsStorageName) ? [] : [
