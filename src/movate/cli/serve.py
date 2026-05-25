@@ -239,8 +239,18 @@ async def _seed_bootstrap_key(storage: StorageProvider) -> None:
     Solves the chicken-and-egg bootstrap problem on fresh deployments
     where no keys exist in the DB yet (e.g. ephemeral SQLite in a
     container that has no persistent volume, or a Postgres DB on first
-    boot). The key is inserted exactly once; subsequent restarts find
-    it already present and skip.
+    boot). The key is inserted exactly once.
+
+    On a redeploy the row already exists. If it already grants
+    ``fleet-admin`` we leave it untouched. But a bootstrap key seeded by
+    an OLDER image — before fleet-admin seeding, or before the #61 scope
+    fix — keeps a stale/narrow scope (e.g. ``["admin"]`` with no ``read``)
+    forever, because the seed was historically insert-only. Such a key
+    then 403s on ``read``-scoped endpoints even on a fixed image. We
+    therefore **self-heal** a stale bootstrap-key scope here: rewrite it
+    in place to ``["fleet-admin"]``, preserving the existing
+    ``secret_hash`` / ``salt`` / ``tenant_id`` / ``env`` / ``created_at``
+    (the key value is unchanged, so we never re-hash or re-salt).
 
     The env var value must be a valid movate key string:
         mvt_<env>_<tenant_prefix>_<key_id>_<secret>
@@ -249,7 +259,12 @@ async def _seed_bootstrap_key(storage: StorageProvider) -> None:
     if not seed_key:
         return
 
-    from movate.core.auth import ApiKeyParseError, hash_secret, parse_api_key  # noqa: PLC0415
+    from movate.core.auth import (  # noqa: PLC0415
+        SCOPE_FLEET_ADMIN,
+        ApiKeyParseError,
+        hash_secret,
+        parse_api_key,
+    )
     from movate.core.models import ApiKeyRecord  # noqa: PLC0415
 
     try:
@@ -260,7 +275,25 @@ async def _seed_bootstrap_key(storage: StorageProvider) -> None:
 
     existing = await storage.get_api_key(parsed.key_id)
     if existing is not None:
-        err.print(f"[dim]bootstrap key {parsed.key_id} already present — skipping seed[/dim]")
+        # Already a fleet-admin grant → nothing to do (idempotent on redeploy).
+        # ``fleet-admin`` in the scopes list is the all-powerful grant that
+        # ``effective_scopes`` expands to the full set, so checking membership
+        # here is representation-agnostic and matches the seed target below.
+        if SCOPE_FLEET_ADMIN in existing.scopes:
+            err.print(
+                f"[dim]bootstrap key {parsed.key_id} already present "
+                f"(scope: fleet-admin) — skipping seed[/dim]"
+            )
+            return
+        # Stale/narrow scope from an older image (e.g. ``["admin"]`` with no
+        # ``read``) → heal in place to fleet-admin. PRESERVE the secret_hash /
+        # salt / tenant_id / env / created_at (the key value is unchanged).
+        old_scopes = list(existing.scopes)
+        await storage.update_api_key_scopes(existing.key_id, scopes=[SCOPE_FLEET_ADMIN])
+        err.print(
+            f"[dim]healed bootstrap key {parsed.key_id} scope → fleet-admin "
+            f"(was {old_scopes})[/dim]"
+        )
         return
 
     import base64  # noqa: PLC0415

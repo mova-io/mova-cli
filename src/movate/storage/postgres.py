@@ -2049,6 +2049,18 @@ class PostgresProvider:
             tenant_id,
         )
 
+    async def update_api_key_scopes(self, key_id: str, *, scopes: list[str]) -> None:
+        # Bootstrap-key self-heal: rewrite ONLY the scopes column by key_id.
+        # Not tenant-scoped — the sole caller resolves the row by the parsed
+        # key_id from MOVATE_SEED_API_KEY at startup. Mirrors save_api_key's
+        # JSONB encoding (empty list → NULL). No-op on missing; leaves every
+        # other column (secret_hash/salt/tenant_id/env/created_at) untouched.
+        await self._db.execute(
+            "UPDATE api_keys SET scopes = $1 WHERE key_id = $2",
+            list(scopes) if scopes else None,
+            key_id,
+        )
+
     async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
         # Compromise-response bulk revoke (ADR 013 D5). Returns the count
         # revoked. asyncpg's execute() returns a status string like

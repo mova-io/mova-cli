@@ -767,6 +767,15 @@ class InMemoryStorage:
                 self.api_keys[i] = k.model_copy(update={"expires_at": expires_at})
                 return
 
+    async def update_api_key_scopes(self, key_id: str, *, scopes: list[str]) -> None:
+        # Bootstrap-key self-heal: rewrite ONLY the scopes column, preserving
+        # secret_hash/salt/tenant_id/env/created_at. Not tenant-scoped. No-op
+        # on missing.
+        for i, k in enumerate(self.api_keys):
+            if k.key_id == key_id:
+                self.api_keys[i] = k.model_copy(update={"scopes": list(scopes)})
+                return
+
     async def revoke_all_api_keys(self, *, tenant_id: str, except_key_id: str | None = None) -> int:
         # Compromise-response bulk revoke (ADR 013 D5). Spares
         # ``except_key_id`` so the operator isn't locked out. Returns the
