@@ -183,43 +183,69 @@ def run_azure_preflight(target_name: str, target: TargetConfig) -> list[Check]:
         )
 
     # ------------------------------------------------------------------
-    # Container Apps exist (api + worker)
+    # Container Apps exist + are running (api + worker)
     # ------------------------------------------------------------------
+    # A deployed api with a dead worker = jobs enqueue but never drain
+    # (item 65 live-validation finding). So we report the worker's
+    # running state, not just its existence — a Failed/Suspended worker
+    # is an `error`, not a green ✓.
     for app_suffix in ("api", "worker"):
-        app_name = f"movate-{target.azure_env}-{app_suffix}"
-        app = _az_json(
-            [
-                "az",
-                "containerapp",
-                "show",
-                "--subscription",
+        checks.append(
+            _check_containerapp(
                 target.azure_subscription,
-                "--resource-group",
                 target.azure_resource_group,
-                "--name",
-                app_name,
-            ]
-        )
-        if app is None:
-            checks.append(
-                Check(
-                    f"containerapp {app_suffix}",
-                    "missing",
-                    f"{app_name!r} not found; run the Bicep deploy",
-                )
+                f"movate-{target.azure_env}-{app_suffix}",
+                label=f"containerapp {app_suffix}",
             )
-        else:
-            # Pull the running image tag for at-a-glance "what's deployed?"
-            try:
-                image = (
-                    app.get("properties", {})
-                    .get("template", {})
-                    .get("containers", [{}])[0]
-                    .get("image", "?")
-                )
-            except (AttributeError, IndexError, TypeError):
-                image = "?"
-            checks.append(Check(f"containerapp {app_suffix}", "ok", image))
+        )
+
+    # ------------------------------------------------------------------
+    # Scheduler Job exists + reports its last run (item 65)
+    # ------------------------------------------------------------------
+    # The scheduler is a Container Apps *Job* (ADR 017 D2), not an app —
+    # it's optional (gated by `enableScheduler` in Bicep), so absence is
+    # informational (`missing`), never an `error`. When present we surface
+    # the last execution's status so the operator can spot a tick that
+    # has been failing silently.
+    checks.append(
+        _check_scheduler_job(
+            target.azure_subscription,
+            target.azure_resource_group,
+            f"movate-{target.azure_env}-scheduler",
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # OTel Collector health when App Insights export is enabled (item 65)
+    # ------------------------------------------------------------------
+    # The item-41 collector (`*-otelcol`) is the in-cluster bridge to App
+    # Insights (ADR 020). It's only deployed when App Insights export is
+    # on, so its absence is a no-op (`ok`, n/a). When present, a crash-loop
+    # (e.g. the `command`-vs-`args` bug we hit) means telemetry silently
+    # never reaches App Insights — that's an `error`.
+    checks.append(
+        _check_otel_collector(
+            target.azure_subscription,
+            target.azure_resource_group,
+            f"movate-{target.azure_env}-otelcol",
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Required Key Vault secrets present (item 65)
+    # ------------------------------------------------------------------
+    # A deploy that comes up but 500s on first request usually means a
+    # required secret never got set in KV. Catch it here rather than at
+    # runtime. The KV name carries a global-uniqueness suffix (Bicep
+    # `nameSuffix`) the target config doesn't store, so we discover it in
+    # the RG by its `movate-{env}-kv` prefix rather than hardcoding.
+    checks.append(
+        _check_keyvault_secrets(
+            target.azure_subscription,
+            target.azure_resource_group,
+            target.azure_env,
+        )
+    )
 
     # ------------------------------------------------------------------
     # /healthz responds
@@ -271,6 +297,295 @@ def _az_json(cmd: list[str]) -> dict[str, Any] | None:
     # Sometimes az returns an empty array for `account list` etc.; here
     # we only call commands that return objects, so reject non-dicts.
     return parsed if isinstance(parsed, dict) else None
+
+
+def _az_json_list(cmd: list[str]) -> list[Any] | None:
+    """Run an ``az`` command with ``-o json`` that returns an array.
+
+    Sibling to :func:`_az_json` for the list-shaped commands (``keyvault
+    list``, ``keyvault secret list``). Returns the parsed list, or None if
+    the command failed / returned a non-list (so callers can distinguish
+    "errored" from "empty list").
+    """
+    import json  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            [*cmd, "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _check_containerapp(
+    subscription: str, resource_group: str, app_name: str, *, label: str
+) -> Check:
+    """Report a Container App's existence + running state.
+
+    The existing api/worker rows only proved the app *existed*; this also
+    classifies its ``runningStatus``. A Failed/Suspended worker (the dead
+    worker = jobs never drain failure mode) is an ``error``, not a green
+    ✓. Degrades gracefully: a missing app is ``missing`` (run the deploy),
+    an ``az`` error / unparseable response surfaces a finding rather than
+    raising.
+    """
+    app = _az_json(
+        [
+            "az",
+            "containerapp",
+            "show",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            app_name,
+        ]
+    )
+    if app is None:
+        return Check(label, "missing", f"{app_name!r} not found; run the Bicep deploy")
+
+    props = app.get("properties", {}) if isinstance(app, dict) else {}
+    if not isinstance(props, dict):
+        props = {}
+    # Pull the running image tag for at-a-glance "what's deployed?"
+    try:
+        image = props.get("template", {}).get("containers", [{}])[0].get("image", "?")
+    except (AttributeError, IndexError, TypeError):
+        image = "?"
+    running = props.get("runningStatus") or props.get("provisioningState")
+    # Older API versions may omit runningStatus; treat unknown as ok so we
+    # don't false-positive a healthy app on an older az/runtime.
+    if running and str(running).lower() not in ("running", "succeeded"):
+        return Check(
+            label,
+            "error",
+            f"{app_name} runningStatus={running} ({image}); inspect with "
+            f"`az containerapp logs show -n {app_name} -g {resource_group} --type system`",
+        )
+    detail = image if not running else f"{image} ({running})"
+    return Check(label, "ok", detail)
+
+
+def _check_scheduler_job(subscription: str, resource_group: str, job_name: str) -> Check:
+    """Report the scheduler Container Apps **Job**'s existence + last run.
+
+    The scheduler (ADR 017 D2) is optional — gated by ``enableScheduler``
+    in Bicep — so its absence is ``missing`` (informational), never an
+    ``error``. When present we surface the most recent execution's status
+    so a tick that has been failing silently is visible. Degrades
+    gracefully: an ``az``-unavailable / errored call yields a finding, and
+    a missing execution history still reports the job as ``ok`` (deployed
+    but not yet run).
+    """
+    job = _az_json(
+        [
+            "az",
+            "containerapp",
+            "job",
+            "show",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            job_name,
+        ]
+    )
+    if job is None:
+        return Check(
+            "scheduler job",
+            "missing",
+            f"{job_name!r} not found (scheduler not deployed — enableScheduler=false?)",
+        )
+
+    executions = _az_json_list(
+        [
+            "az",
+            "containerapp",
+            "job",
+            "execution",
+            "list",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            job_name,
+        ]
+    )
+    if not executions:
+        # Deployed but no run recorded yet (or list errored) — still a
+        # healthy "it exists" signal; don't manufacture a red row.
+        return Check("scheduler job", "ok", f"{job_name} (no runs yet)")
+
+    # Most recent execution first (az returns newest-first; be defensive).
+    latest = executions[0] if isinstance(executions[0], dict) else {}
+    props = latest.get("properties", {})
+    if not isinstance(props, dict):
+        props = {}
+    status = props.get("status") or latest.get("status") or "?"
+    if str(status).lower() in ("failed", "degraded"):
+        return Check(
+            "scheduler job",
+            "error",
+            f"{job_name} last run {status}; inspect with "
+            f"`az containerapp job execution list -n {job_name} -g {resource_group}`",
+        )
+    return Check("scheduler job", "ok", f"{job_name} (last run {status})")
+
+
+def _check_otel_collector(subscription: str, resource_group: str, app_name: str) -> Check:
+    """Report the OTel Collector Container App's health *when present*.
+
+    The collector (item 41 / ADR 020) is the in-cluster bridge to App
+    Insights and is only deployed when App Insights export is enabled, so
+    its absence is a no-op: ``ok`` with an "n/a" detail, never a red row.
+    When present, a crash-loop (the ``command``-vs-``args`` bug we hit in
+    live validation) means telemetry silently never reaches App Insights —
+    a Failed/Suspended ``runningStatus`` is an ``error``. Degrades
+    gracefully on any ``az`` error.
+    """
+    app = _az_json(
+        [
+            "az",
+            "containerapp",
+            "show",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--name",
+            app_name,
+        ]
+    )
+    if app is None:
+        # No collector = App Insights export not enabled. Nothing wrong.
+        return Check("otel collector", "ok", "n/a (App Insights export not enabled)")
+
+    props = app.get("properties", {}) if isinstance(app, dict) else {}
+    if not isinstance(props, dict):
+        props = {}
+    running = props.get("runningStatus") or props.get("provisioningState")
+    if running and str(running).lower() not in ("running", "succeeded"):
+        return Check(
+            "otel collector",
+            "error",
+            f"{app_name} runningStatus={running} — telemetry not reaching App "
+            f"Insights; inspect with `az containerapp logs show -n {app_name} "
+            f"-g {resource_group} --type system`",
+        )
+    return Check("otel collector", "ok", f"{app_name} ({running or 'present'})")
+
+
+# The runtime cannot boot / serve without these in Key Vault. langfuse-*
+# and appinsights-* secrets are intentionally NOT here — they're optional
+# (App Insights / Langfuse export are opt-in), so their absence must never
+# fail the preflight.
+_REQUIRED_KV_SECRETS = (
+    "pg-admin-password",
+    "openai-api-key",
+    "anthropic-api-key",
+    "bootstrap-api-key",
+)
+
+
+def _check_keyvault_secrets(subscription: str, resource_group: str, env: str) -> Check:
+    """Verify the runtime's required Key Vault secrets exist.
+
+    The KV name carries a global-uniqueness suffix (Bicep ``nameSuffix``)
+    the target config doesn't store, so we discover the vault in the RG by
+    its ``movate-{env}-kv`` prefix rather than hardcoding a suffix. Yields
+    ``ok`` (all present), ``missing`` (lists the absent secrets + how to
+    set them), or ``error`` (KV / list could not be resolved). Degrades
+    gracefully: an ``az``-unavailable / errored call yields a finding, and
+    optional langfuse/appinsights secrets are never counted as missing.
+    """
+    prefix = f"movate-{env}-kv"
+    vaults = _az_json_list(
+        [
+            "az",
+            "keyvault",
+            "list",
+            "--subscription",
+            subscription,
+            "--resource-group",
+            resource_group,
+            "--query",
+            f"[?starts_with(name, '{prefix}')]",
+        ]
+    )
+    if vaults is None:
+        return Check(
+            "key vault secrets",
+            "error",
+            f"could not list Key Vaults in {resource_group!r} "
+            "(missing 'Key Vault Reader' / Azure RBAC?)",
+        )
+    if not vaults:
+        return Check(
+            "key vault secrets",
+            "missing",
+            f"no Key Vault matching {prefix!r} in {resource_group}; run the Bicep deploy first",
+        )
+    vault_name = vaults[0].get("name") if isinstance(vaults[0], dict) else None
+    if not vault_name:
+        return Check(
+            "key vault secrets",
+            "error",
+            f"Key Vault in {resource_group} has no resolvable name",
+        )
+
+    secrets = _az_json_list(
+        [
+            "az",
+            "keyvault",
+            "secret",
+            "list",
+            "--subscription",
+            subscription,
+            "--vault-name",
+            vault_name,
+        ]
+    )
+    if secrets is None:
+        return Check(
+            "key vault secrets",
+            "error",
+            f"could not list secrets in {vault_name!r} "
+            "(missing 'Key Vault Secrets User' on your principal?)",
+        )
+
+    present = {
+        s.get("name", "").rsplit("/", 1)[-1]
+        for s in secrets
+        if isinstance(s, dict) and s.get("name")
+    }
+    absent = [name for name in _REQUIRED_KV_SECRETS if name not in present]
+    if absent:
+        return Check(
+            "key vault secrets",
+            "missing",
+            f"{vault_name} missing: {', '.join(absent)}; set with "
+            f"`az keyvault secret set --vault-name {vault_name} --name <name> --value ...` "
+            f"(bootstrap-api-key via `mdk auth bootstrap-seed {env} --keyvault {vault_name}`)",
+        )
+    return Check(
+        "key vault secrets",
+        "ok",
+        f"{vault_name} ({len(_REQUIRED_KV_SECRETS)} required present)",
+    )
 
 
 def _check_healthz(url: str) -> Check:

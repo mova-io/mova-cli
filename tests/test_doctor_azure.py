@@ -544,3 +544,351 @@ def test_auth_roundtrip_network_error_reports_unreachable(monkeypatch) -> None:
     auth_row = next(r for r in rows if r.name == "auth roundtrip")
     assert auth_row.status == "error"
     assert "ConnectError" in auth_row.detail or "unreachable" in auth_row.detail
+
+
+# ---------------------------------------------------------------------------
+# Deploy-readiness checks (item 65): KV secrets, scheduler, otel collector,
+# worker/api running state.
+#
+# These build on _fake_az but disambiguate by the resource NAME embedded in
+# the joined command (e.g. "movate-prod-worker" vs "movate-prod-otelcol"),
+# because every Container App shells the same `az containerapp show`.
+# ---------------------------------------------------------------------------
+
+_ACCOUNT_OK = (
+    0,
+    '{"id": "00000000-0000-0000-0000-000000000000", "tenantId": "tenant-id"}',
+)
+_RUNNING_APP = (
+    '{"properties": {"runningStatus": "Running", '
+    '"template": {"containers": [{"image": "img:tag"}]}}}'
+)
+
+
+def _base_handlers() -> dict[str, tuple[int, str]]:
+    """az responses up to (and including) ACR — shared by the item-65 cases.
+
+    The four new checks (worker state, scheduler job, otel collector, KV
+    secrets) run AFTER ACR, so every item-65 test layers its own
+    name-specific handlers on top of this base.
+    """
+    return {
+        "account show": _ACCOUNT_OK,
+        "group show": (0, '{"name": "movate-prod-rg", "location": "eastus2"}'),
+        "acr show": (0, '{"name": "movateprodacr", "sku": {"name": "Basic"}}'),
+    }
+
+
+def _row(rows, name):
+    return next(r for r in rows if r.name == name)
+
+
+# --- Required Key Vault secrets --------------------------------------------
+
+
+@pytest.mark.unit
+def test_kv_secrets_all_present_is_ok(monkeypatch) -> None:
+    """Vault discovered by its movate-{env}-kv prefix; all four required
+    secrets present (optional langfuse-* present too, but irrelevant)."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["keyvault list"] = (0, '[{"name": "movate-prod-kv-mvio"}]')
+    handlers["keyvault secret list"] = (
+        0,
+        '[{"name": "pg-admin-password"}, {"name": "openai-api-key"}, '
+        '{"name": "anthropic-api-key"}, {"name": "bootstrap-api-key"}, '
+        '{"name": "langfuse-secret-key"}]',
+    )
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "key vault secrets")
+    assert row.status == "ok"
+    # Discovered the suffixed vault name without it being hardcoded on the target.
+    assert "movate-prod-kv-mvio" in row.detail
+
+
+@pytest.mark.unit
+def test_kv_secrets_missing_lists_only_the_gaps(monkeypatch) -> None:
+    """Two required secrets absent → missing row naming exactly those two,
+    and never flagging optional langfuse-* secrets."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["keyvault list"] = (0, '[{"name": "movate-prod-kv"}]')
+    # Only two of the four required present.
+    handlers["keyvault secret list"] = (
+        0,
+        '[{"name": "pg-admin-password"}, {"name": "openai-api-key"}]',
+    )
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "key vault secrets")
+    assert row.status == "missing"
+    assert "anthropic-api-key" in row.detail
+    assert "bootstrap-api-key" in row.detail
+    # The present ones aren't named as gaps.
+    assert "openai-api-key" not in row.detail.split("missing:")[1].split(";")[0]
+    # Actionable recovery pointers.
+    assert "az keyvault secret set" in row.detail
+    assert "mdk auth bootstrap-seed" in row.detail
+
+
+@pytest.mark.unit
+def test_kv_optional_secrets_never_counted_missing(monkeypatch) -> None:
+    """All four required present but NO langfuse/appinsights → still ok.
+    Optional export secrets must never fail the preflight."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["keyvault list"] = (0, '[{"name": "movate-prod-kv"}]')
+    handlers["keyvault secret list"] = (
+        0,
+        '[{"name": "pg-admin-password"}, {"name": "openai-api-key"}, '
+        '{"name": "anthropic-api-key"}, {"name": "bootstrap-api-key"}]',
+    )
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "key vault secrets")
+    assert row.status == "ok"
+
+
+@pytest.mark.unit
+def test_kv_no_vault_found_is_missing(monkeypatch) -> None:
+    """`keyvault list` returns [] (no vault matching the prefix) →
+    missing, not a crash."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["keyvault list"] = (0, "[]")
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "key vault secrets")
+    assert row.status == "missing"
+    assert "movate-prod-kv" in row.detail
+
+
+@pytest.mark.unit
+def test_kv_list_errors_is_error_not_raise(monkeypatch) -> None:
+    """`keyvault list` returns non-zero (RBAC denied) → error finding,
+    preflight still completes."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    # keyvault list left to the rc=1 default → errored.
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    rows = run_azure_preflight("prod", _target())
+    row = _row(rows, "key vault secrets")
+    assert row.status == "error"
+    # Downstream checks still ran (no crash).
+    assert any(r.name == "/healthz" for r in rows)
+
+
+# --- OTel collector health -------------------------------------------------
+
+
+@pytest.mark.unit
+def test_otel_collector_failed_is_error(monkeypatch) -> None:
+    """Collector present but crash-looping (the command-vs-args bug) →
+    error pointing at the system logs."""
+    _patch_az_present(monkeypatch)
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "movate-prod-otelcol" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, '{"properties": {"runningStatus": "Failed"}}'
+            )
+        for needle, (rc, out) in {
+            **_base_handlers(),
+            "containerapp show": (0, _RUNNING_APP),
+        }.items():
+            if needle in joined:
+                return subprocess.CompletedProcess(cmd, rc, out)
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _run)
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "otel collector")
+    assert row.status == "error"
+    assert "Failed" in row.detail
+    assert "logs show" in row.detail
+
+
+@pytest.mark.unit
+def test_otel_collector_absent_is_ok_na(monkeypatch) -> None:
+    """No `*-otelcol` app (App Insights export not enabled) → ok/n-a,
+    never a red row."""
+    _patch_az_present(monkeypatch)
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "movate-prod-otelcol" in joined:
+            return subprocess.CompletedProcess(cmd, 1, "")  # not found
+        for needle, (rc, out) in {
+            **_base_handlers(),
+            "containerapp show": (0, _RUNNING_APP),
+        }.items():
+            if needle in joined:
+                return subprocess.CompletedProcess(cmd, rc, out)
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _run)
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "otel collector")
+    assert row.status == "ok"
+    assert "n/a" in row.detail.lower()
+
+
+# --- Worker / api running state --------------------------------------------
+
+
+@pytest.mark.unit
+def test_worker_dead_is_error(monkeypatch) -> None:
+    """Worker exists but runningStatus=Failed (jobs never drain) →
+    error, while the api stays ok."""
+    _patch_az_present(monkeypatch)
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "movate-prod-worker" in joined and "containerapp show" in joined:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                '{"properties": {"runningStatus": "Failed", "template": '
+                '{"containers": [{"image": "img:tag"}]}}}',
+            )
+        if "containerapp show" in joined:  # api + otelcol
+            return subprocess.CompletedProcess(cmd, 0, _RUNNING_APP)
+        for needle, (rc, out) in _base_handlers().items():
+            if needle in joined:
+                return subprocess.CompletedProcess(cmd, rc, out)
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _run)
+    _patch_healthz_ok(monkeypatch)
+
+    rows = run_azure_preflight("prod", _target())
+    assert _row(rows, "containerapp worker").status == "error"
+    assert "Failed" in _row(rows, "containerapp worker").detail
+    assert "logs show" in _row(rows, "containerapp worker").detail
+    assert _row(rows, "containerapp api").status == "ok"
+
+
+@pytest.mark.unit
+def test_worker_missing_is_missing(monkeypatch) -> None:
+    """Worker app not deployed at all → missing (run the deploy)."""
+    _patch_az_present(monkeypatch)
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        if "movate-prod-worker" in joined and "containerapp show" in joined:
+            return subprocess.CompletedProcess(cmd, 1, "")  # not found
+        if "containerapp show" in joined:
+            return subprocess.CompletedProcess(cmd, 0, _RUNNING_APP)
+        for needle, (rc, out) in _base_handlers().items():
+            if needle in joined:
+                return subprocess.CompletedProcess(cmd, rc, out)
+        return subprocess.CompletedProcess(cmd, 1, "")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _run)
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "containerapp worker")
+    assert row.status == "missing"
+    assert "movate-prod-worker" in row.detail
+
+
+# --- Scheduler job ---------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_scheduler_job_absent_is_missing_not_error(monkeypatch) -> None:
+    """Scheduler is optional (enableScheduler=false) → missing, never an
+    error row."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    # `containerapp job show` left at rc=1 default → not found.
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "scheduler job")
+    assert row.status == "missing"
+    assert "not deployed" in row.detail.lower() or "not found" in row.detail.lower()
+
+
+@pytest.mark.unit
+def test_scheduler_job_failed_last_run_is_error(monkeypatch) -> None:
+    """Scheduler present and its last execution Failed → error."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["containerapp job show"] = (0, '{"properties": {"provisioningState": "Succeeded"}}')
+    handlers["job execution list"] = (
+        0,
+        '[{"properties": {"status": "Failed"}}]',
+    )
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "scheduler job")
+    assert row.status == "error"
+    assert "Failed" in row.detail
+
+
+@pytest.mark.unit
+def test_scheduler_job_running_last_run_is_ok(monkeypatch) -> None:
+    """Scheduler present, last run Succeeded → ok with the status surfaced."""
+    _patch_az_present(monkeypatch)
+    handlers = _base_handlers()
+    handlers["containerapp show"] = (0, _RUNNING_APP)
+    handlers["containerapp job show"] = (0, '{"properties": {"provisioningState": "Succeeded"}}')
+    handlers["job execution list"] = (
+        0,
+        '[{"properties": {"status": "Succeeded"}}]',
+    )
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _fake_az(handlers))
+    _patch_healthz_ok(monkeypatch)
+
+    row = _row(run_azure_preflight("prod", _target()), "scheduler job")
+    assert row.status == "ok"
+    assert "Succeeded" in row.detail
+
+
+# --- Graceful degradation when az itself is unavailable --------------------
+
+
+@pytest.mark.unit
+def test_new_checks_degrade_when_az_subprocess_raises(monkeypatch) -> None:
+    """If `az` blows up mid-preflight (OSError), the new checks yield
+    findings rather than propagating the exception. We let infra resolve
+    up to ACR, then make every later `az` call raise."""
+    _patch_az_present(monkeypatch)
+
+    def _run(cmd, *_a, **_k):
+        joined = " ".join(cmd)
+        for needle, (rc, out) in _base_handlers().items():
+            if needle in joined:
+                return subprocess.CompletedProcess(cmd, rc, out)
+        # Everything past ACR (containerapp show/job, keyvault) explodes.
+        raise OSError("az crashed")
+
+    monkeypatch.setattr("movate.cli._azure_doctor.subprocess.run", _run)
+    _patch_healthz_ok(monkeypatch)
+
+    # Must not raise.
+    rows = run_azure_preflight("prod", _target())
+    names = {r.name for r in rows}
+    assert {"containerapp worker", "scheduler job", "otel collector", "key vault secrets"} <= names
+    # Worker show raised → treated as not-found (missing); KV list raised → error.
+    assert _row(rows, "containerapp worker").status == "missing"
+    assert _row(rows, "key vault secrets").status == "error"
