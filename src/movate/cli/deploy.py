@@ -1489,22 +1489,33 @@ def _upload_one_agent_bundle(
     files.append(("agent_yaml", ("agent.yaml", agent_yaml_bytes, "text/yaml")))
     files.append(("prompt", ("prompt.md", prompt_md.read_bytes(), "text/markdown")))
 
-    if input_schema is not None:
-        input_bytes, input_name = _schema_bytes_for_upload(input_schema, label="input")
-        files.append(
-            (
-                "input_schema",
-                (input_name, input_bytes, "application/json"),
-            )
-        )
-    if output_schema is not None:
-        output_bytes, output_name = _schema_bytes_for_upload(output_schema, label="output")
-        files.append(
-            (
-                "output_schema",
-                (output_name, output_bytes, "application/json"),
-            )
-        )
+    # Schema parts. Two ways an agent declares its I/O contract:
+    #   1. **Path-ref** — `schema: {input: ./schema/input.yaml}` points at
+    #      a file on disk. We upload that file (compiling YAML→JSON as
+    #      needed) — primary path, unchanged.
+    #   2. **Inline shorthand** — `schema: {input: {text: string}}` lives
+    #      directly in agent.yaml; there's NO schema file on disk. The
+    #      default `mdk add` template uses this form. Without a fallback
+    #      the upload omits both schema parts and the runtime's
+    #      individual-files endpoint rejects with HTTP 400 (it requires
+    #      schema/input.json + schema/output.json). So when a file is
+    #      absent we materialize the loader's COMPILED JSON Schema and
+    #      upload it as input.json / output.json — exactly what the
+    #      runtime persists.
+    #
+    # The loader is consulted lazily — only when at least one schema file
+    # is missing — so path-ref agents stay a pure filesystem read.
+    compiled = (
+        _compiled_schemas_for_upload(agent_dir)
+        if input_schema is None or output_schema is None
+        else (None, None)
+    )
+    _append_schema_part(
+        files, field="input_schema", label="input", file_path=input_schema, compiled=compiled[0]
+    )
+    _append_schema_part(
+        files, field="output_schema", label="output", file_path=output_schema, compiled=compiled[1]
+    )
     if dataset.is_file():
         files.append(
             (
@@ -1624,6 +1635,59 @@ def _schema_bytes_for_upload(path: Path, *, label: str) -> tuple[bytes, str]:
             # surface the canonical error message.
             return path.read_bytes(), f"{label}.json"
     return json.dumps(data, separators=(",", ":")).encode(), f"{label}.json"
+
+
+def _append_schema_part(
+    files: list[tuple[str, tuple[str, bytes, str]]],
+    *,
+    field: str,
+    label: str,
+    file_path: Path | None,
+    compiled: bytes | None,
+) -> None:
+    """Append one schema multipart part to ``files``, if we have content.
+
+    Prefers the on-disk file (``file_path``, compiled YAML→JSON as
+    needed) — the primary, unchanged path. Falls back to ``compiled``
+    bytes (the loader's compiled inline schema) when no file exists. The
+    fallback is uploaded under the canonical ``<label>.json`` name the
+    runtime persists. No-op when neither source is available.
+    """
+    if file_path is not None:
+        schema_bytes, name = _schema_bytes_for_upload(file_path, label=label)
+        files.append((field, (name, schema_bytes, "application/json")))
+    elif compiled is not None:
+        files.append((field, (f"{label}.json", compiled, "application/json")))
+
+
+def _compiled_schemas_for_upload(agent_dir: Path) -> tuple[bytes | None, bytes | None]:
+    """Materialize an agent's COMPILED I/O JSON Schemas as upload bytes.
+
+    For inline-shorthand agents (the default ``mdk add`` template:
+    ``schema: {input: {text: string}, output: {message: string}}``)
+    there's no ``schema/*.json`` file on disk, so the file-based upload
+    path uploads nothing — and the runtime's individual-files endpoint
+    rejects the bundle with HTTP 400 (it requires ``schema/input.json``
+    + ``schema/output.json``). This fallback runs :func:`load_agent`,
+    which compiles the inline shorthand into a full JSON Schema in
+    memory, and serializes ``bundle.input_schema`` /
+    ``bundle.output_schema`` to JSON bytes ready for the multipart
+    upload. The on-disk files are never touched.
+
+    Returns ``(input_bytes, output_bytes)``. On any load failure we
+    return ``(None, None)`` so the upload proceeds unchanged and the
+    runtime surfaces the canonical validation error — we don't want a
+    transient load hiccup here to mask the real cause.
+    """
+    from movate.core.loader import AgentLoadError, load_agent  # noqa: PLC0415
+
+    try:
+        bundle = load_agent(agent_dir)
+    except AgentLoadError:
+        return None, None
+    input_bytes = json.dumps(bundle.input_schema, separators=(",", ":")).encode()
+    output_bytes = json.dumps(bundle.output_schema, separators=(",", ":")).encode()
+    return input_bytes, output_bytes
 
 
 def _maybe_rewrite_agent_yaml_for_upload(
