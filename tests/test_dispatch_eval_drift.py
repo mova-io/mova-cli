@@ -11,6 +11,7 @@ hook stays default-off for existing eval/job behaviour.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -338,3 +339,72 @@ async def test_regression_no_canary_config_no_rollback(
 
     assert await storage.get_canary_config("demo", tenant_id="test-tenant") is None
     assert all("auto-rollback" not in (a["subject"] or "") for a in dispatcher.alerts)
+
+
+# ---------------------------------------------------------------------------
+# Item 40 — control-plane audit telemetry for the drift auto-rollback path.
+# An auto-rollback is a server-initiated canary traffic change; it joins the
+# same "who did what" trail as the human-driven canary.promote/rollback
+# endpoints (item 35), with a synthetic ``system:drift`` actor. We assert via
+# caplog on the ``movate.audit`` logger (the repo's caplog-not-capsys
+# convention — movate emits through stdlib logging; see tests/conftest.py).
+# ---------------------------------------------------------------------------
+
+_AUDIT_LOGGER = "movate.audit"
+
+
+def _audit_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _AUDIT_LOGGER]
+
+
+@pytest.mark.unit
+async def test_auto_rollback_emits_audit_event(
+    tmp_path: Path, storage: InMemoryStorage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When an auto-rollback actually fires, a ``canary.auto_rollback`` audit
+    event lands on the ``movate.audit`` trail with the system actor + tenant."""
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    await storage.save_eval(_prior_eval(agent="demo", tenant_id="test-tenant", mean_score=1.0))
+    await storage.save_canary_config(_canary(auto_rollback=True, weight=25))
+
+    dispatcher = _FakeDispatcher()
+    dispatch = _build_dispatch(storage, bundle, dispatcher)
+
+    with caplog.at_level(logging.INFO, logger=_AUDIT_LOGGER):
+        outcome = await dispatch.execute_job(_scheduled_eval_job(target="demo"))
+    assert outcome.status == JobStatus.SUCCESS
+
+    recs = _audit_records(caplog)
+    assert len(recs) == 1
+    audit = recs[0].audit  # type: ignore[attr-defined]
+    assert audit["action"] == "canary.auto_rollback"
+    assert audit["actor"] == "system:drift"  # server-initiated, no human actor
+    assert audit["tenant_id"] == "test-tenant"
+    # target mirrors the canary.promote/rollback ``agent@version`` convention.
+    assert audit["target"] == "demo@champ-v0"
+    assert audit["challenger_version"] == _CHALLENGER_VERSION
+    assert audit["champion_version"] == "champ-v0"
+    assert audit["reason"] == "drift_regression"
+
+
+@pytest.mark.unit
+async def test_no_auto_rollback_audit_event_when_disabled(
+    tmp_path: Path, storage: InMemoryStorage, caplog: pytest.LogCaptureFixture
+) -> None:
+    """auto_rollback OFF → alert-only, so NO ``canary.auto_rollback`` audit
+    event. The guard must fire the audit trail only on a real rollback."""
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    await storage.save_eval(_prior_eval(agent="demo", tenant_id="test-tenant", mean_score=1.0))
+    await storage.save_canary_config(_canary(auto_rollback=False, weight=25))
+
+    dispatcher = _FakeDispatcher()
+    dispatch = _build_dispatch(storage, bundle, dispatcher)
+
+    with caplog.at_level(logging.INFO, logger=_AUDIT_LOGGER):
+        outcome = await dispatch.execute_job(_scheduled_eval_job(target="demo"))
+    assert outcome.status == JobStatus.SUCCESS
+
+    # Regression detected (alert fired) but no rollback → no audit event.
+    assert _audit_records(caplog) == []

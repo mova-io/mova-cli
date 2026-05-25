@@ -30,7 +30,7 @@ from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.storage.base import StorageProvider
-from movate.tracing import continue_trace_context, record_run_usage
+from movate.tracing import continue_trace_context, record_audit_event, record_run_usage
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +396,21 @@ class WorkerDispatch:
             assert config is not None  # should_auto_rollback guarantees this
             rolled_back = rolled_back_config(config)
             await self._storage.save_canary_config(rolled_back)
+            # Control-plane audit telemetry (item 35/40). The rollback is now
+            # persisted — emit the audit event on the SAME "who did what" trail
+            # as the human-driven canary.promote/rollback endpoints, but with a
+            # synthetic ``system:drift`` actor (server-initiated, no human).
+            # Fail-soft by construction; only low-cardinality, non-secret ids.
+            champion_version = config.champion_version or "<latest>"
+            record_audit_event(
+                action="canary.auto_rollback",
+                actor="system:drift",
+                tenant_id=job.tenant_id,
+                target=f"{config.agent}@{champion_version}",
+                challenger_version=config.challenger_version,
+                champion_version=champion_version,
+                reason="drift_regression",
+            )
             # Structured log event — stable key/value shape for log-based
             # alerting / audit of an automated traffic change.
             logger.warning(
