@@ -54,6 +54,7 @@ _PG_TABLES = (
     "kb_entities",
     "kb_relations",
     "trigger_deliveries",
+    "run_submissions",
 )
 
 
