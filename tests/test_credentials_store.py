@@ -391,6 +391,19 @@ class TestAuthStatus:
         # section doesn't bleed in counts from the operator's real
         # ~/.movate/config.yaml.
         monkeypatch.setenv("MOVATE_CONFIG_PATH", str(isolated_creds.parent / "config.yaml"))
+        # `mdk auth status` LIVE-verifies every set provider key (calls the
+        # provider's metadata endpoint via `verify_provider_key`). The fake
+        # `sk-test` below would 401 on a CI runner WITH egress (→ classified
+        # `rejected`, set=0) but error out as a network error WITHOUT egress
+        # (→ classified as set, set=1) — making this assertion green/red
+        # purely on the runner's network state. Pin the verifier to a
+        # deterministic OK so the saved key reliably classifies as "set",
+        # which is exactly what this test means to assert. `_provider_status`
+        # imports the symbol from `movate.credentials`, so patch it there.
+        monkeypatch.setattr(
+            "movate.credentials.verify_provider_key",
+            lambda provider, key: VerifyResult(ok=True, detail="OK — mocked, 1 model available"),
+        )
         CredentialsStore().set("OPENAI_API_KEY", "sk-test")
         # The mdk CLI runs autoload at startup, but CliRunner does NOT
         # re-import main.py — we need to manually re-autoload before
