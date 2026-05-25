@@ -83,6 +83,14 @@ def _parse_blob(text: str) -> dict[str, str]:
     Comments and blank lines are skipped. Lines without ``=`` are
     silently ignored — the store is operator-curated, but we tolerate
     stray junk rather than breaking on malformed entries.
+
+    Duplicate keys: **last occurrence wins**. ``set`` keeps the file
+    de-duped (see :func:`_set_in_blob`), but a legacy file written
+    before that guarantee may already contain two ``KEY=`` lines for
+    one key. Iterating top-to-bottom and overwriting means the value
+    that wins is the *newest* line (writers update/append, so newer
+    edits land later in the file) — a stale earlier line can no longer
+    permanently shadow a freshly-saved value.
     """
     result: dict[str, str] = {}
     for raw in text.splitlines():
@@ -103,6 +111,16 @@ def _set_in_blob(text: str, key: str, value: str) -> str:
     what lets operators keep hand-added comments/structure without
     ``mdk auth login`` clobbering them on the next write.
 
+    **Idempotent across duplicates.** If ``key`` already appears one or
+    more times, the FIRST occurrence is rewritten in place (preserving
+    its position) and every LATER duplicate line for the same key is
+    dropped — so the file never ends with two ``KEY=`` lines for one
+    key. This closes a footgun where a stale earlier line could
+    permanently shadow a freshly-saved value: an operator runs e.g.
+    ``mdk auth pull-runtime-key dev``, the new value is written, yet a
+    leftover duplicate line still resolved on read. Collapsing on write
+    (plus last-wins parsing in :func:`_parse_blob`) makes the save stick.
+
     An empty/blank starting blob gets the standard narration header.
     """
     if not text.strip():
@@ -112,11 +130,15 @@ def _set_in_blob(text: str, key: str, value: str) -> str:
     out: list[str] = []
     replaced = False
     for raw in text.splitlines():
-        if not replaced and _entry_key(raw) == key:
-            out.append(new_line)
-            replaced = True
-        else:
-            out.append(raw)
+        if _entry_key(raw) == key:
+            if not replaced:
+                # Rewrite the first occurrence in place; preserve position.
+                out.append(new_line)
+                replaced = True
+            # Drop any later duplicate lines for the same key so the
+            # file collapses to a single entry.
+            continue
+        out.append(raw)
     if not replaced:
         out.append(new_line)
     return "\n".join(out) + "\n"
