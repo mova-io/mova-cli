@@ -625,6 +625,16 @@ CREATE INDEX IF NOT EXISTS idx_jobs_batch
 -- the target_version pattern above).
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_context JSONB;
 
+-- item 36 (R4b): cooperative run cancellation. A RUNNING job flagged for
+-- cancellation carries cancel_requested = TRUE; the worker honors it at its
+-- terminal checkpoint and writes CANCELLED instead of the dispatch outcome (a
+-- QUEUED job is flipped straight to CANCELLED by request_job_cancel and never
+-- claimed). NOT NULL DEFAULT FALSE so existing rows (and every job that's never
+-- cancelled — the overwhelming common case) read back as FALSE and behave
+-- byte-for-byte as before. ADD COLUMN IF NOT EXISTS keeps it idempotent on
+-- every init (mirrors the attempt_count additive-column pattern above).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- item 24: per-dimension eval means. JSONB ({dim: mean}, same codec as
 -- jobs.input) so drift detection can compare per-dimension and catch a
 -- single-dimension regression the aggregate mean_score would mask. Nullable
@@ -1759,10 +1769,10 @@ class PostgresProvider:
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
                 target_version, resume_workflow_run_id, batch_id,
-                trace_context
+                trace_context, cancel_requested
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
             )
             """,
             job.job_id,
@@ -1788,6 +1798,10 @@ class PostgresProvider:
             # pool's json codec (encoder=json.dumps). Empty dict {} when OTel
             # was off / no active span at enqueue.
             job.trace_context,
+            # item 36 (R4b): cooperative-cancel flag. Always FALSE at insert
+            # (a fresh job is never pre-cancelled); set later by
+            # request_job_cancel for a RUNNING job.
+            job.cancel_requested,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -1892,6 +1906,7 @@ class PostgresProvider:
             JobStatus.ERROR,
             JobStatus.SAFETY_BLOCKED,
             JobStatus.DEAD_LETTER,
+            JobStatus.CANCELLED,
         ):
             raise ValueError(
                 f"update_job only accepts terminal statuses; got {status!r}. "
@@ -2000,6 +2015,50 @@ class PostgresProvider:
             requeued=len(requeued_rows),
             dead_lettered=len(dead_rows),
         )
+
+    async def request_job_cancel(self, job_id: str, *, tenant_id: str) -> JobStatus | None:
+        """Cooperatively cancel a job — single atomic UPDATE … RETURNING.
+
+        One statement covers all three live transitions via a ``CASE``:
+
+        * ``queued`` → ``cancelled`` (+ ``completed_at = now``); never
+          claimed, so cancellation is immediate.
+        * ``running`` → keep ``running`` but set ``cancel_requested =
+          TRUE``; the worker writes ``CANCELLED`` at its checkpoint.
+        * any terminal status → the ``CASE`` leaves status untouched and
+          the row is still RETURNED, so we report the unchanged status.
+
+        The UPDATE matches every status (no status filter in WHERE) so a
+        terminal row is returned as a no-op rather than appearing
+        ``None`` (missing). ``tenant_id`` IS in WHERE — a cross-tenant id
+        returns ``None`` (→ 404), never mutating another tenant's job.
+        """
+        row = await self._db.fetchrow(
+            """
+            UPDATE jobs
+            SET status = CASE
+                    WHEN status = 'queued' THEN 'cancelled'
+                    ELSE status
+                END,
+                completed_at = CASE
+                    WHEN status = 'queued' THEN $1
+                    ELSE completed_at
+                END,
+                cancel_requested = CASE
+                    WHEN status = 'running' THEN TRUE
+                    ELSE cancel_requested
+                END
+            WHERE job_id = $2 AND tenant_id = $3
+            RETURNING status
+            """,
+            datetime.now(UTC),
+            job_id,
+            tenant_id,
+        )
+        if row is None:
+            # No row for this (job_id, tenant_id) — missing or cross-tenant.
+            return None
+        return JobStatus(row["status"])
 
     # ------------------------------------------------------------------
     # API keys
@@ -3097,6 +3156,9 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         # job enqueued with OTel off) → {} so the worker starts a fresh root
         # span — byte-for-byte the pre-R2 behaviour.
         trace_context=dict(row["trace_context"]) if row["trace_context"] else {},
+        # item 36 (R4b): cooperative-cancel flag. NOT NULL DEFAULT FALSE in the
+        # schema, so a pre-cancel / never-cancelled row reads back as False.
+        cancel_requested=row["cancel_requested"],
     )
 
 

@@ -4,6 +4,7 @@ Subcommands:
 
 * ``movate jobs show <id>`` — single job's current state
 * ``movate jobs wait <id>`` — block until terminal (without re-submitting)
+* ``movate jobs cancel <id>`` — cooperatively cancel a queued/running job
 * ``movate jobs list`` — paginate this tenant's recent jobs (--status filter)
 * ``movate jobs list-agents`` — what the runtime can run
 
@@ -29,7 +30,7 @@ from movate.core.user_config import (
     resolve_bearer_token,
     resolve_target,
 )
-from movate.runtime.schemas import AgentListView, JobListView, JobView
+from movate.runtime.schemas import AgentListView, JobCancelView, JobListView, JobView
 
 stdout = Console()
 err = Console(stderr=True)
@@ -85,6 +86,45 @@ def wait(
         raise typer.Exit(code=1)
 
 
+@jobs_app.command("cancel")
+def cancel(
+    job_id: str = typer.Argument(..., help="Job id from `movate submit`."),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Cooperatively cancel a queued or running job.
+
+    A [bold]queued[/bold] job is cancelled immediately (it's never
+    executed). A [bold]running[/bold] job is flagged: the worker finishes
+    its in-flight work (cancellation is cooperative — there is no
+    mid-LLM-call interruption), then discards the result and records the
+    job as [bold]cancelled[/bold]. An already-finished job is a no-op.
+
+    Requires the [bold]run[/bold] scope on the API key.
+
+      $ movate jobs cancel "$JOB_ID"
+    """
+    view = asyncio.run(_cancel_one(job_id=job_id, target=target))
+    if output_format == TableJson.JSON:
+        stdout.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    if view.status == JobStatus.CANCELLED:
+        stdout.print(f"[green]✓[/green] cancelled job [bold]{view.job_id}[/bold]")
+    elif view.status == JobStatus.RUNNING:
+        stdout.print(
+            f"[yellow]●[/yellow] cancel requested for running job "
+            f"[bold]{view.job_id}[/bold] — the worker will finalize it as "
+            f"[bold]cancelled[/bold] at its next checkpoint"
+        )
+    else:
+        # Already terminal — nothing to cancel.
+        warn(
+            f"job {view.job_id} is already [bold]{view.status.value}[/bold]; nothing to cancel",
+        )
+
+
 @jobs_app.command("list")
 def list_jobs(
     status: JobStatus = typer.Option(
@@ -134,6 +174,7 @@ def list_jobs(
         JobStatus.SAFETY_BLOCKED: "[yellow]⊘ safety_blocked[/yellow]",
         JobStatus.QUEUED: "[dim]● queued[/dim]",
         JobStatus.RUNNING: "[blue]● running[/blue]",
+        JobStatus.CANCELLED: "[magenta]⊗ cancelled[/magenta]",
     }
     for j in listing.jobs:
         table.add_row(
@@ -222,6 +263,17 @@ async def _fetch_one(*, job_id: str, target: str | None) -> JobView:
                 return await client.get_job(job_id)
     except MovateClientError as exc:
         error(str(exc), context="fetch")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _cancel_one(*, job_id: str, target: str | None) -> JobCancelView:
+    client = _build_client(target)
+    try:
+        async with client:
+            with spinner("requesting cancellation..."):
+                return await client.cancel_job(job_id)
+    except MovateClientError as exc:
+        error(str(exc), context="cancel")
         raise typer.Exit(code=exc.status_code // 100) from None
 
 
@@ -328,6 +380,7 @@ def _emit(view: JobView, *, output_format: TableJson) -> None:
         JobStatus.SAFETY_BLOCKED: "[yellow]⊘[/yellow]",
         JobStatus.QUEUED: "[dim]●[/dim]",
         JobStatus.RUNNING: "[blue]●[/blue]",
+        JobStatus.CANCELLED: "[magenta]⊗[/magenta]",
     }.get(view.status, "?")
     table = Table(title=f"{icon} job {view.job_id[:8]}…", show_header=False)
     table.add_column("field", style="dim")

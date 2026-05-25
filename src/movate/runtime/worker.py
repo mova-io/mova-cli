@@ -149,6 +149,17 @@ class Worker:
         if job is None:
             return None
 
+        # Cancellation checkpoint #1 (item 36, R4b): a job whose cancel was
+        # requested while it was still QUEUED-but-just-claimed (the claim and
+        # the cancel raced, and the cancel won by flipping cancel_requested
+        # before we read the row). Skip dispatch entirely and write CANCELLED —
+        # there's no point running work we already know is cancelled. This is
+        # the cooperative model: we never start execution. CANCELLED is
+        # terminal, so it's never retried.
+        if job.cancel_requested:
+            await self._finalize_cancelled(job, started=time.monotonic())
+            return job
+
         started = time.monotonic()
         # Bracket dispatch with the in-flight gauge (mdk.jobs.in_flight, R3 /
         # item 33). try/finally so the decrement always runs — even if dispatch
@@ -163,8 +174,9 @@ class Worker:
         # Decide retry vs terminal BEFORE writing back to storage.
         # The decision is a pure function of the outcome's retryable
         # flag + the job's current attempt_count; centralizing it
-        # here keeps the worker loop's three branches obvious.
-        final_status, final_action = self._resolve_outcome(job, outcome)
+        # here keeps the worker loop's three branches obvious. Then apply
+        # the cancellation checkpoint #2 override (item 36).
+        final_status, final_action = await self._resolve_final(job, outcome)
 
         # Even if the storage write fails, the loop should continue.
         # The job will appear stuck in RUNNING; an operator can
@@ -272,6 +284,76 @@ class Worker:
                 )
         return job
 
+    async def _finalize_cancelled(self, job: JobRecord, *, started: float) -> None:
+        """Write a CANCELLED terminal for a job cancelled BEFORE dispatch.
+
+        Checkpoint #1 path (item 36, R4b): the job carried
+        ``cancel_requested`` at claim time, so we never executed it — no
+        dispatch, no in-flight gauge bracket (we never inc'd it), no
+        retry decision (CANCELLED is terminal, never re-queued). We just
+        write the terminal status, mirror the normal path's completion
+        metrics / progress hook / notification so observers see a real
+        terminal, and return.
+
+        Storage-write failure must NOT sink the loop — same contract as
+        the normal terminal write: log and move on (the job stays
+        RUNNING; the reaper/an operator can recover it).
+        """
+        try:
+            await self._storage.update_job(
+                job.job_id,
+                tenant_id=job.tenant_id,
+                status=JobStatus.CANCELLED,
+                result_run_id=None,
+                error=None,
+            )
+        except Exception:
+            logger.exception(
+                "worker_update_failed job_id=%s status=cancelled — job stuck in RUNNING",
+                job.job_id,
+            )
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "worker_completed job_id=%s kind=%s target=%s status=cancelled "
+            "duration_ms=%d (cancelled before dispatch; not executed)",
+            job.job_id,
+            job.kind.value,
+            job.target,
+            duration_ms,
+        )
+        record_job_completed(
+            kind=job.kind.value,
+            status=JobStatus.CANCELLED.value,
+            duration_ms=duration_ms,
+            tenant_id=job.tenant_id,
+        )
+        if self._on_job_complete is not None:
+            try:
+                self._on_job_complete(
+                    job,
+                    DispatchOutcome(
+                        status=JobStatus.CANCELLED,
+                        result_run_id=None,
+                        error=None,
+                    ),
+                    duration_ms,
+                )
+            except Exception:
+                logger.warning("on_job_complete callback raised", exc_info=True)
+        if self._notifier is not None and job.notify_email:
+            try:
+                terminal_view = await self._storage.get_job(job.job_id, tenant_id=job.tenant_id)
+                if terminal_view is not None:
+                    await self._notifier.notify_terminal(terminal_view)
+            except Exception:
+                logger.warning(
+                    "notify_dispatcher_raised job_id=%s — job state "
+                    "is unchanged; this is notification path only",
+                    job.job_id,
+                    exc_info=True,
+                )
+
     async def _dispatch_job(self, job: JobRecord) -> DispatchOutcome:
         """Run dispatch for one job, converting failures into outcomes.
 
@@ -328,6 +410,31 @@ class Worker:
                     retryable=True,
                 ).model_dump(),
             )
+
+    async def _resolve_final(
+        self, job: JobRecord, outcome: DispatchOutcome
+    ) -> tuple[JobStatus, str]:
+        """Resolve the dispatch outcome, then apply the cancel override.
+
+        Cancellation checkpoint #2 (item 36, R4b): the job was claimed
+        and dispatched normally, but an operator may have requested
+        cancellation WHILE it was running. We re-fetch to read the latest
+        ``cancel_requested`` flag — the dispatch we just ran is NOT
+        pre-empted (cooperative model: no mid-LLM-call interruption), so
+        the in-flight work completed, but if cancellation was requested we
+        DISCARD that outcome and write ``CANCELLED`` instead.
+
+        ``CANCELLED`` is terminal, so it overrides any "retry" the
+        resolver picked — a cancelled job is never re-queued. The
+        in-flight gauge dec already ran (run_one_cycle's finally), and the
+        retry/timeout decision in :meth:`_resolve_outcome` stays intact
+        for the non-cancelled path.
+        """
+        final_status, final_action = self._resolve_outcome(job, outcome)
+        latest = await self._storage.get_job(job.job_id, tenant_id=job.tenant_id)
+        if latest is not None and latest.cancel_requested:
+            return JobStatus.CANCELLED, "terminal"
+        return final_status, final_action
 
     def _resolve_outcome(self, job: JobRecord, outcome: DispatchOutcome) -> tuple[JobStatus, str]:
         """Decide what to do with a dispatch outcome.

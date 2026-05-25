@@ -630,6 +630,7 @@ class InMemoryStorage:
             JobStatus.ERROR,
             JobStatus.SAFETY_BLOCKED,
             JobStatus.DEAD_LETTER,
+            JobStatus.CANCELLED,
         ):
             raise ValueError(f"update_job only accepts terminal statuses; got {status!r}")
         for i, j in enumerate(self.jobs):
@@ -734,6 +735,38 @@ class InMemoryStorage:
                 )
                 requeued += 1
         return ReclaimResult(requeued=requeued, dead_lettered=dead_lettered)
+
+    async def request_job_cancel(self, job_id: str, *, tenant_id: str) -> JobStatus | None:
+        """Cooperatively cancel a job — same state machine as the SQL backends.
+
+        Single event loop → atomic by construction (no lock needed):
+
+        * ``QUEUED`` → ``CANCELLED`` (+ ``completed_at = now``); the
+          claim path only takes ``QUEUED`` rows, so it's never picked up.
+        * ``RUNNING`` → set ``cancel_requested = True`` (status stays
+          ``RUNNING``); the worker finalizes it at its checkpoint.
+        * already terminal → no-op; return the unchanged status.
+
+        Tenant-scoped: a missing / cross-tenant id returns ``None`` (the
+        same shape as ``get_job`` → 404, never 403).
+        """
+        for i, j in enumerate(self.jobs):
+            if j.job_id == job_id and j.tenant_id == tenant_id:
+                if j.status == JobStatus.QUEUED:
+                    self.jobs[i] = j.model_copy(
+                        update={
+                            "status": JobStatus.CANCELLED,
+                            "completed_at": datetime.now(UTC),
+                        }
+                    )
+                    return JobStatus.CANCELLED
+                if j.status == JobStatus.RUNNING:
+                    self.jobs[i] = j.model_copy(update={"cancel_requested": True})
+                    return JobStatus.RUNNING
+                # Already terminal — no-op, report the unchanged status.
+                return j.status
+        # Missing or cross-tenant — matches get_job's None shape.
+        return None
 
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)

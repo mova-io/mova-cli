@@ -640,6 +640,16 @@ _MIGRATIONS = [
         PRIMARY KEY (tenant_id, provider)
     )
     """,
+    # item 36 (R4b): cooperative run cancellation. A RUNNING job flagged for
+    # cancellation carries cancel_requested = 1; the worker honors it at its
+    # terminal checkpoint and writes CANCELLED instead of the dispatch outcome
+    # (a QUEUED job is flipped straight to CANCELLED by request_job_cancel and
+    # never claimed). Stored as INTEGER (sqlite has no bool) NOT NULL DEFAULT 0
+    # so existing rows (and every job that's never cancelled — the common case)
+    # read back as 0/False and behave byte-for-byte as before. The
+    # duplicate-column guard in init() keeps this idempotent on re-run (mirrors
+    # the attempt_count additive-column pattern above).
+    "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
 ]
 
 
@@ -1640,8 +1650,8 @@ class SqliteProvider:
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
                 target_version, resume_workflow_run_id, batch_id,
-                trace_context
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trace_context, cancel_requested
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -1666,6 +1676,11 @@ class SqliteProvider:
                 # item 32 (ADR 019): W3C trace-context carrier as JSON text.
                 # Empty dict {} when OTel was off / no active span at enqueue.
                 json.dumps(job.trace_context),
+                # item 36 (R4b): cooperative-cancel flag as INTEGER (sqlite has
+                # no bool). Always 0 at insert (a fresh job is never
+                # pre-cancelled); set later by request_job_cancel for a RUNNING
+                # job.
+                int(job.cancel_requested),
             ),
         )
         await self._db.commit()
@@ -1792,6 +1807,7 @@ class SqliteProvider:
             JobStatus.ERROR,
             JobStatus.SAFETY_BLOCKED,
             JobStatus.DEAD_LETTER,
+            JobStatus.CANCELLED,
         ):
             raise ValueError(
                 f"update_job only accepts terminal statuses; got {status!r}. "
@@ -1917,6 +1933,53 @@ class SqliteProvider:
             requeued=max(0, requeued),
             dead_lettered=max(0, dead_lettered),
         )
+
+    async def request_job_cancel(self, job_id: str, *, tenant_id: str) -> JobStatus | None:
+        """Cooperatively cancel a job — atomic CASE UPDATE then re-fetch.
+
+        Mirrors the postgres provider's single-statement CASE logic, run
+        under ``BEGIN IMMEDIATE`` (same write-lock discipline as
+        ``claim_next_job``):
+
+        * ``queued`` → ``cancelled`` (+ ``completed_at = now``); never
+          claimed, so the cancel is immediate.
+        * ``running`` → status stays ``running`` but ``cancel_requested
+          = 1``; the worker finalizes it as ``CANCELLED`` at its checkpoint.
+        * any terminal status → CASE leaves it untouched (no-op).
+
+        ``tenant_id`` is in WHERE so a cross-tenant id never mutates
+        another tenant's row; we then re-fetch (tenant-scoped) and return
+        the resulting status, or ``None`` if no row matched (missing or
+        cross-tenant) — same shape as ``get_job`` (→ 404, never 403).
+        """
+        now_iso = datetime.now(UTC).isoformat()
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._db.execute(
+                """
+                UPDATE jobs
+                SET status = CASE
+                        WHEN status = 'queued' THEN 'cancelled'
+                        ELSE status
+                    END,
+                    completed_at = CASE
+                        WHEN status = 'queued' THEN ?
+                        ELSE completed_at
+                    END,
+                    cancel_requested = CASE
+                        WHEN status = 'running' THEN 1
+                        ELSE cancel_requested
+                    END
+                WHERE job_id = ? AND tenant_id = ?
+                """,
+                (now_iso, job_id, tenant_id),
+            )
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        record = await self.get_job(job_id, tenant_id=tenant_id)
+        return record.status if record is not None else None
 
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)
@@ -3074,6 +3137,11 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # byte-for-byte the pre-R2 behaviour. .get() stays defensive against a
         # row predating the migration.
         trace_context=_loads_trace_context(dict(row).get("trace_context")),
+        # item 36 (R4b): cooperative-cancel flag stored as INTEGER (0/1).
+        # init() has run the ALTER by the time we read here; .get() stays
+        # defensive against a row predating the migration (NULL/missing → 0 →
+        # False), which is exactly a never-cancelled job.
+        cancel_requested=bool(dict(row).get("cancel_requested") or 0),
     )
 
 

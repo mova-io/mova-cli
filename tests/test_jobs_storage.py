@@ -266,6 +266,114 @@ async def test_update_job_rejects_non_terminal_status(storage) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cooperative run cancellation (item 36, R4b) — request_job_cancel +
+# cancel_requested additive column. Parametrized over memory + sqlite +
+# postgres via the shared ``storage`` fixture.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_cancel_requested_defaults_false_and_roundtrips(storage) -> None:
+    """The additive column defaults False on a fresh row and round-trips."""
+    j = _make_job()
+    await storage.save_job(j)
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.cancel_requested is False
+
+
+@pytest.mark.unit
+async def test_request_cancel_queued_becomes_cancelled_terminal(storage) -> None:
+    """A QUEUED job → CANCELLED immediately; never claimable afterwards."""
+    j = _make_job()
+    await storage.save_job(j)
+
+    result = await storage.request_job_cancel(j.job_id, tenant_id="tenant-a")
+    assert result == JobStatus.CANCELLED
+
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.CANCELLED
+    assert got.completed_at is not None
+
+    # The claim path only takes 'queued' rows, so a cancelled job is skipped.
+    assert await storage.claim_next_job() is None
+
+
+@pytest.mark.unit
+async def test_request_cancel_running_sets_flag_keeps_running(storage) -> None:
+    """A RUNNING job → cancel_requested flag set; status stays RUNNING.
+
+    The worker (not the storage call) finalizes it; request_job_cancel
+    returns RUNNING so the caller knows the cancel is pending."""
+    j = _make_job()
+    await storage.save_job(j)
+    await storage.claim_next_job()  # → RUNNING
+
+    result = await storage.request_job_cancel(j.job_id, tenant_id="tenant-a")
+    assert result == JobStatus.RUNNING
+
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.RUNNING
+    assert got.cancel_requested is True
+
+
+@pytest.mark.unit
+async def test_request_cancel_terminal_is_noop(storage) -> None:
+    """Cancelling an already-terminal job is a no-op; returns its status."""
+    j = _make_job()
+    await storage.save_job(j)
+    await storage.claim_next_job()
+    await storage.update_job(
+        j.job_id, tenant_id="tenant-a", status=JobStatus.SUCCESS, result_run_id="run-1"
+    )
+
+    result = await storage.request_job_cancel(j.job_id, tenant_id="tenant-a")
+    assert result == JobStatus.SUCCESS
+
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.SUCCESS  # unchanged
+    assert got.cancel_requested is False
+
+
+@pytest.mark.unit
+async def test_request_cancel_cross_tenant_returns_none_no_effect(storage) -> None:
+    """A cross-tenant cancel returns None (→ 404) and never mutates the row."""
+    j = _make_job(tenant_id="tenant-a")
+    await storage.save_job(j)
+
+    result = await storage.request_job_cancel(j.job_id, tenant_id="tenant-b")
+    assert result is None
+
+    # The job is untouched for its real tenant — still queued.
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.QUEUED
+    assert got.cancel_requested is False
+
+
+@pytest.mark.unit
+async def test_request_cancel_missing_returns_none(storage) -> None:
+    assert await storage.request_job_cancel("ghost", tenant_id="tenant-a") is None
+
+
+@pytest.mark.unit
+async def test_update_job_accepts_cancelled_terminal(storage) -> None:
+    """The worker writes CANCELLED via update_job — the terminal-status
+    allow-list must accept it (item 36)."""
+    j = _make_job()
+    await storage.save_job(j)
+    await storage.claim_next_job()
+    await storage.update_job(j.job_id, tenant_id="tenant-a", status=JobStatus.CANCELLED)
+    got = await storage.get_job(j.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.CANCELLED
+    assert got.completed_at is not None
+
+
+# ---------------------------------------------------------------------------
 # Concurrent claim — sqlite-only because the in-memory double is single-loop
 # ---------------------------------------------------------------------------
 

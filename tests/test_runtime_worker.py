@@ -1035,3 +1035,148 @@ async def test_run_forever_invokes_reaper() -> None:
     await asyncio.gather(worker.run_forever(stop), stop_soon())
     # At least the first-tick reap fired.
     assert storage.reclaim_calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# Cooperative run cancellation (item 36, R4b) — worker checkpoints.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDispatch:
+    """Fake dispatch with a controllable outcome + an execute-time hook.
+
+    ``on_execute`` (if set) is awaited inside ``execute_job`` — used to
+    simulate an operator cancelling a job WHILE it's running (checkpoint
+    #2). ``started`` counts invocations so a test can prove a job was
+    never dispatched (checkpoint #1)."""
+
+    def __init__(self, outcome: DispatchOutcome, on_execute=None) -> None:
+        self._outcome = outcome
+        self._on_execute = on_execute
+        self.started = 0
+
+    async def execute_job(self, job: JobRecord) -> DispatchOutcome:
+        self.started += 1
+        if self._on_execute is not None:
+            await self._on_execute(job)
+        return self._outcome
+
+
+@pytest.mark.unit
+async def test_worker_skips_dispatch_when_cancel_requested_before_claim() -> None:
+    """Checkpoint #1: a job flagged cancel_requested before claim is NOT
+    executed — the worker writes CANCELLED straight away."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+    await storage.claim_next_job()  # → RUNNING
+    # Operator cancels the running job → cancel_requested flag set. Then the
+    # worker re-claims after a crash/requeue scenario; simulate by flipping
+    # it back to a claimable state but keeping the flag. Simplest: requeue it
+    # and re-set the flag so the NEXT claim sees cancel_requested=True.
+    await storage.request_job_cancel(job.job_id, tenant_id="tenant-a")
+    # Put it back to queued-but-cancel_requested to exercise checkpoint #1 on
+    # the next claim (the claim+cancel race the docstring describes).
+    for i, j in enumerate(storage.jobs):
+        if j.job_id == job.job_id:
+            storage.jobs[i] = j.model_copy(
+                update={"status": JobStatus.QUEUED, "claimed_at": None, "cancel_requested": True}
+            )
+
+    dispatch = _RecordingDispatch(
+        DispatchOutcome(status=JobStatus.SUCCESS, result_run_id="run-x", error=None)
+    )
+    worker = Worker(storage=storage, dispatch=dispatch)  # type: ignore[arg-type]
+
+    handled = await worker.run_one_cycle()
+    assert handled is not None
+    # Never dispatched — cooperative cancel skips execution entirely.
+    assert dispatch.started == 0
+
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.CANCELLED
+    assert final.completed_at is not None
+
+
+@pytest.mark.unit
+async def test_worker_writes_cancelled_when_cancel_requested_mid_run() -> None:
+    """Checkpoint #2: cancel requested WHILE running → worker discards the
+    (successful) dispatch outcome and writes CANCELLED instead. The
+    in-flight work isn't interrupted (cooperative)."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    async def cancel_during_execute(running_job: JobRecord) -> None:
+        # Operator cancels the job while the worker is mid-dispatch.
+        await storage.request_job_cancel(running_job.job_id, tenant_id="tenant-a")
+
+    dispatch = _RecordingDispatch(
+        DispatchOutcome(status=JobStatus.SUCCESS, result_run_id="run-x", error=None),
+        on_execute=cancel_during_execute,
+    )
+    worker = Worker(storage=storage, dispatch=dispatch)  # type: ignore[arg-type]
+
+    await worker.run_one_cycle()
+    # The dispatch DID run (cooperative — not interrupted)...
+    assert dispatch.started == 1
+    # ...but its SUCCESS outcome is discarded in favor of CANCELLED.
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.CANCELLED
+
+
+@pytest.mark.unit
+async def test_worker_normal_job_unaffected_by_cancel_path() -> None:
+    """A job with no cancellation runs to its normal terminal — the cancel
+    checkpoints are inert for the common case."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    dispatch = _RecordingDispatch(
+        DispatchOutcome(status=JobStatus.SUCCESS, result_run_id="run-x", error=None)
+    )
+    worker = Worker(storage=storage, dispatch=dispatch)  # type: ignore[arg-type]
+
+    await worker.run_one_cycle()
+    assert dispatch.started == 1
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    assert final.status == JobStatus.SUCCESS
+    assert final.result_run_id == "run-x"
+
+
+@pytest.mark.unit
+async def test_worker_cancelled_is_terminal_not_retried() -> None:
+    """Even when the dispatch outcome is a RETRYABLE error, a cancel
+    requested mid-run forces CANCELLED (terminal) — NOT a re-queue.
+
+    Proves cancellation overrides the retry decision: a cancelled job is
+    never sent back to the queue."""
+    storage = InMemoryStorage()
+    await storage.init()
+    job = _make_job(target="alpha")
+    await storage.save_job(job)
+
+    async def cancel_during_execute(running_job: JobRecord) -> None:
+        await storage.request_job_cancel(running_job.job_id, tenant_id="tenant-a")
+
+    # A retryable error would normally re-queue (fresh attempt budget).
+    retryable_error = {"type": "internal", "message": "boom", "retryable": True}
+    dispatch = _RecordingDispatch(
+        DispatchOutcome(status=JobStatus.ERROR, result_run_id=None, error=retryable_error),
+        on_execute=cancel_during_execute,
+    )
+    worker = Worker(storage=storage, dispatch=dispatch)  # type: ignore[arg-type]
+
+    await worker.run_one_cycle()
+    final = await storage.get_job(job.job_id, tenant_id="tenant-a")
+    assert final is not None
+    # CANCELLED, not QUEUED (no re-queue) and not ERROR/DEAD_LETTER.
+    assert final.status == JobStatus.CANCELLED
+    assert final.attempt_count == 0  # never re-queued (would've bumped to 1)
