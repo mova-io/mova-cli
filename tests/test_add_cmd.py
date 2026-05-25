@@ -274,3 +274,100 @@ def test_add_non_kb_template_no_kb_dir(tmp_path: Path, monkeypatch: pytest.Monke
     assert result.exit_code == 0, result.stdout + result.stderr
     kb_dir = proj / "agents" / "faq" / "kb"
     assert not kb_dir.exists(), f"Unexpected kb/ dir at {kb_dir}"
+
+
+# ---------------------------------------------------------------------------
+# Next-steps hint after a successful add
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_add_prints_next_steps_hint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful add ends with a short 'next:' hint pointing at the
+    natural follow-ups (dev / run --mock / validate) so the onboarding
+    flow continues instead of dead-ending."""
+    proj = _bootstrap_project(tmp_path)
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "rag-qa"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "added rag-qa" in out
+    assert "next:" in out
+    # Uses the resolved agent name + project-relative run path.
+    assert "mdk dev rag-qa" in out
+    assert "mdk run ./agents/rag-qa" in out
+    assert "--mock" in out
+    assert "mdk validate" in out
+
+
+@pytest.mark.unit
+def test_add_next_steps_hint_uses_resolved_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hint reflects the renamed agent name + path, not the template
+    name, when a positional rename is supplied."""
+    proj = _bootstrap_project(tmp_path)
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "rag-qa", "pricing-qa"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "added pricing-qa" in out
+    assert "mdk dev pricing-qa" in out
+    assert "mdk run ./agents/pricing-qa" in out
+    # The template name is NOT the agent name in the hint.
+    assert "mdk dev rag-qa" not in out
+
+
+@pytest.mark.unit
+def test_list_does_not_print_next_steps_hint() -> None:
+    """The informational --list / list paths must NOT print the
+    per-agent next-steps hint (nothing was added)."""
+    for invoke_args in (["add", "--list"], ["add", "list"]):
+        result = runner.invoke(app, invoke_args, env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "next:" not in result.stdout
+        assert "mdk dev" not in result.stdout
+
+
+@pytest.mark.unit
+def test_search_does_not_print_next_steps_hint() -> None:
+    """`--list --search` filters the catalog; it must NOT print the
+    next-steps hint."""
+    result = runner.invoke(app, ["add", "--list", "--search", "rag"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "next:" not in result.stdout
+    assert "mdk dev" not in result.stdout
+
+
+@pytest.mark.unit
+def test_preview_does_not_print_next_steps_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--preview` renders template files without writing — it must NOT
+    print the per-agent next-steps hint."""
+    proj = _bootstrap_project(tmp_path)
+    monkeypatch.chdir(proj)
+    result = runner.invoke(app, ["add", "rag-qa", "--preview"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "added rag-qa" not in result.stdout
+    assert "next:" not in result.stdout
+
+
+@pytest.mark.unit
+def test_add_target_outside_project_uses_absolute_run_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When --target lands the agent outside the project tree, the run
+    path in the hint falls back to the absolute dest (still a valid
+    `mdk run` argument)."""
+    proj = _bootstrap_project(tmp_path)
+    monkeypatch.chdir(proj)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    result = runner.invoke(app, ["add", "rag-qa", "--target", str(outside)], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "added rag-qa" in out
+    assert "mdk run" in out
+    # Project-relative form is NOT used for an out-of-tree target.
+    assert "mdk run ./agents/rag-qa" not in out
