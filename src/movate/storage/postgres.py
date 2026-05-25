@@ -746,6 +746,16 @@ _MIGRATIONS: list[tuple[str, Any]] = [
     ("001_kb_embedding_to_vector", _migrate_kb_embedding_to_vector),
 ]
 
+# Session-level advisory-lock key serializing ``_run_migrations`` across pods
+# (item 39). On a fresh/scaled deploy every api/worker pod runs migrations on
+# startup; without a lock they race the ``schema_migrations`` tracking and the
+# (not-fully-idempotent) DDL. A fixed signed-64-bit constant — it MUST be
+# identical across all pods, since ``pg_advisory_lock`` only blocks callers
+# contending for the *same* key. Memorable hardcoded value; documented here so
+# it's never reused for another lock. (Postgres advisory keys are bigint, so
+# this stays inside the int64 range.)
+_MIGRATION_LOCK_KEY = 0x4D44_4B5F_4D49_4752  # "MDK_MIGR" packed as hex bytes
+
 
 # ---------------------------------------------------------------------------
 # Provider
@@ -828,20 +838,43 @@ class PostgresProvider:
         migration runs at most once, tracked in ``schema_migrations``, inside
         its own transaction (so a failure rolls back cleanly and leaves the
         version unrecorded for a safe retry).
+
+        Concurrent-startup safety (item 39): on a fresh/scaled deploy multiple
+        api/worker pods call this at once, racing the ``schema_migrations``
+        tracking and the not-fully-idempotent DDL. We serialize with a
+        *session-level* ``pg_advisory_lock`` on ``conn`` so exactly one pod
+        runs migrations at a time; the rest block at acquisition, then proceed
+        and find every migration already applied (idempotent no-ops). We use
+        the blocking lock (not ``try_advisory_lock``) deliberately — a late pod
+        must wait for migrations to finish, never skip them and serve against a
+        half-migrated schema. The lock is session-scoped, so if a pod dies
+        mid-migration its connection drops and Postgres auto-releases the lock;
+        a stuck migration can't wedge the lock forever. (SQLite's single-writer
+        model already serializes this, so only Postgres needs the bracket.)
         """
-        await conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            "  version TEXT PRIMARY KEY,"
-            "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-            ")"
-        )
-        applied = {r["version"] for r in await conn.fetch("SELECT version FROM schema_migrations")}
-        for version, migrate in _MIGRATIONS:
-            if version in applied:
-                continue
-            async with conn.transaction():
-                await migrate(conn)
-                await conn.execute("INSERT INTO schema_migrations (version) VALUES ($1)", version)
+        # Acquire on the SAME connection (session-scoped); release in finally so
+        # an erroring migration can't leak the lock.
+        await conn.execute("SELECT pg_advisory_lock($1)", _MIGRATION_LOCK_KEY)
+        try:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "  version TEXT PRIMARY KEY,"
+                "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            )
+            applied = {
+                r["version"] for r in await conn.fetch("SELECT version FROM schema_migrations")
+            }
+            for version, migrate in _MIGRATIONS:
+                if version in applied:
+                    continue
+                async with conn.transaction():
+                    await migrate(conn)
+                    await conn.execute(
+                        "INSERT INTO schema_migrations (version) VALUES ($1)", version
+                    )
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock($1)", _MIGRATION_LOCK_KEY)
 
     async def ping(self) -> None:
         """``SELECT 1`` against the pool — picks up DB-down /
