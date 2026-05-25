@@ -92,6 +92,18 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         "--dry-run",
         help="Print the `az` commands that would run; don't execute.",
     ),
+    skip_validate: bool = typer.Option(
+        False,
+        "--skip-validate",
+        help=(
+            "Skip the validate-before-deploy guardrail. By default a "
+            "runtime-mode deploy runs the same checks as [bold]mdk "
+            "validate --all[/bold] on the project in cwd and aborts before "
+            "building/pushing any image if any agent or workflow fails. Use "
+            "this to deploy a known-good image despite a transient validation "
+            "issue (e.g. an env var only set in the deployed pod)."
+        ),
+    ),
     only: str = typer.Option(
         None,
         "--only",
@@ -284,9 +296,27 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         error(str(exc))
         raise typer.Exit(code=2) from None
 
+    # Validate-before-deploy guardrail. Run the same checks as
+    # `mdk validate --all` against the project in cwd BEFORE building or
+    # pushing any image — a broken agent.yaml / failing schema should
+    # never ship. Runs even under --dry-run (validate, then show the
+    # plan). `--skip-validate` bypasses it for the "I know this image is
+    # good, the validation failure is environmental" case. No-op when
+    # cwd isn't inside a project (nothing on disk to validate).
+    if not skip_validate:
+        _run_predeploy_validation()
+
     _print_plan(plan, dry_run=dry_run)
 
     if dry_run:
+        # Next steps as a PLAN — nothing was deployed, so the block
+        # describes what the operator would have after running for real.
+        _print_next_steps(
+            target_name=target_name,
+            base_url=target_cfg.url.rstrip("/"),
+            first_agent=_first_agent_name() or None,
+            phase="planned",
+        )
         # Even dry-runs emit the summary line so CI can confirm the plan
         # parsed cleanly. ok=true means "the plan is well-formed"; the
         # real deploy will emit ok=true|false based on /healthz.
@@ -319,6 +349,15 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
                 "[dim]→ --notify skipped under --no-wait "
                 "(success unconfirmed without /healthz poll)[/dim]"
             )
+        # Next steps — wording adapted: under --no-wait health was NOT
+        # verified, so the health line is "run this to confirm" rather
+        # than "✓ confirmed".
+        _print_next_steps(
+            target_name=target_name,
+            base_url=target_cfg.url.rstrip("/"),
+            first_agent=_first_agent_name() or None,
+            phase="submitted",
+        )
         # Greppable summary — under --no-wait we report submitted=true
         # but cannot prove ok=true, so emit health=unknown.
         err.print(
@@ -360,6 +399,17 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         f"-n {plan.apps_to_update[0]} --tail 20[/cyan]"
     )
     err.print()
+
+    # Concise "next steps" block — the smallest set of commands an
+    # operator reaches for right after a verified rollout: where the API
+    # lives, how to invoke an agent, the health check, and where traces
+    # land. Human-output only.
+    _print_next_steps(
+        target_name=target_name,
+        base_url=base_url,
+        first_agent=first_agent,
+        phase="verified",
+    )
 
     # Greppable summary — full success path: build + roll + /healthz
     # confirmed. CI gates branch on ok=true here.
@@ -1644,6 +1694,140 @@ def _first_agent_name() -> str | None:
         if entry.is_dir() and (entry / "agent.yaml").is_file():
             return entry.name
     return None
+
+
+def _run_predeploy_validation() -> None:
+    """Validate the project in cwd before a runtime-mode deploy builds.
+
+    Reuses the exact logic behind ``mdk validate --all`` — imports the
+    per-item validators (:func:`movate.cli.validate._validate_agent` /
+    ``_validate_workflow``) and runs each against the agents + workflows
+    discovered under the project root (walked up from cwd). This is the
+    same discovery + per-item validation ``_validate_all`` performs; we
+    call the primitives directly rather than ``_validate_all`` itself so
+    we skip its summary table + interactive "what next?" picker (both
+    inappropriate mid-deploy) and keep this a clean pass/fail gate.
+
+    No-op when cwd isn't inside a project — there's nothing on disk to
+    validate (e.g. a ``--skip-build`` rollback from outside any project
+    tree). On ANY agent/workflow failure, prints the count + a pointer
+    and raises ``typer.Exit(1)`` so the caller aborts BEFORE building or
+    pushing any image. Each item's own failure detail was already
+    printed by the validator it delegates to.
+    """
+    from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
+
+    project_root = walk_up_for_project_root()
+    if project_root is None:
+        # Outside a project (or a bare rollback) — nothing to validate.
+        return
+
+    # Same discovery as validate._validate_all: every agent.yaml under
+    # agents/ and every workflow.yaml under workflows/, sorted for
+    # deterministic output.
+    agent_dirs = (
+        sorted(p.parent for p in (project_root / "agents").glob("*/agent.yaml"))
+        if (project_root / "agents").is_dir()
+        else []
+    )
+    workflow_dirs = (
+        sorted(p.parent for p in (project_root / "workflows").glob("*/workflow.yaml"))
+        if (project_root / "workflows").is_dir()
+        else []
+    )
+    if not agent_dirs and not workflow_dirs:
+        # Empty workspace — vacuous pass, same as `mdk validate --all`.
+        return
+
+    # Import the underlying validators (the functions behind
+    # `mdk validate`) — do NOT re-implement validation here.
+    from movate.cli.validate import _validate_agent, _validate_workflow  # noqa: PLC0415
+
+    err.print()
+    err.print(
+        "[bold]Validating project before deploy[/bold] [dim](--skip-validate to bypass)[/dim]"
+    )
+
+    failed: list[str] = []
+    for agent_dir in agent_dirs:
+        try:
+            _validate_agent(agent_dir, strict=False, run_linter=True)
+        except typer.Exit:
+            # _validate_agent already printed the failure detail.
+            failed.append(agent_dir.name)
+    for workflow_dir in workflow_dirs:
+        try:
+            _validate_workflow(workflow_dir)
+        except typer.Exit:
+            failed.append(workflow_dir.name)
+
+    if failed:
+        error(
+            f"validation failed for {len(failed)} item(s) "
+            f"({', '.join(failed)}); aborting before build. Fix the "
+            f"issue(s) above, or re-run with [bold]--skip-validate[/bold] "
+            f"to deploy anyway."
+        )
+        raise typer.Exit(code=1)
+
+
+def _print_next_steps(
+    *,
+    target_name: str,
+    base_url: str,
+    first_agent: str | None,
+    phase: str,
+) -> None:
+    """Print a concise post-deploy "next steps" block (human output only).
+
+    ``phase`` adapts the wording to what's actually true at the call site:
+
+    * ``"verified"`` — full rollout + ``/healthz`` confirmed. Leads with
+      ``✓ deployed``.
+    * ``"submitted"`` — ``--no-wait``: the update was submitted but health
+      was NOT polled, so the header says "submitted" and the health line
+      reads as "confirm with…" rather than implying it's already up.
+    * ``"planned"`` — ``--dry-run``: nothing ran; the block previews what
+      the operator would have after a real deploy.
+
+    The API FQDN is taken from ``base_url`` (the target's resolved URL —
+    the same one ``/healthz`` is polled against), so it's always the
+    real deployed endpoint. The ``test:`` line uses the first project
+    agent when one exists, else a ``<agent>`` placeholder.
+    """
+    from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
+    agent_token = first_agent or "<agent>"
+
+    if phase == "planned":
+        header = f"[bold](dry-run)[/bold] after deploy you'd have → {target_name}"
+        health_label = "health"
+    elif phase == "submitted":
+        header = (
+            f"[green]✓[/green] deploy submitted to {target_name} "
+            "[dim](health not yet verified — --no-wait)[/dim]"
+        )
+        health_label = "verify"
+    else:  # "verified"
+        header = f"[green]✓[/green] deployed to {target_name}"
+        health_label = "health"
+
+    err.print()
+    err.print(header)
+    err.print(f"  [bold]API:[/bold]    {base_url}")
+    err.print(
+        f"  [bold]test:[/bold]   [cyan]{bin_name} run {agent_token} "
+        f'"<input>" --target {target_name}[/cyan]'
+    )
+    err.print(
+        f"  [bold]{health_label}:[/bold] [cyan]{bin_name} doctor --target {target_name}[/cyan]"
+    )
+    err.print(
+        "  [bold]traces:[/bold] App Insights → Transaction search "
+        "[dim](paste a run's trace_id)[/dim]"
+    )
+    err.print()
 
 
 def _print_plan(plan: DeployPlan, *, dry_run: bool) -> None:

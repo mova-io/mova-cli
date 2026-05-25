@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import movate
@@ -28,7 +29,9 @@ from movate.cli.deploy import (
     DeployPlan,
     _build_plan,
     _ingest_bundled_kb,
+    _print_next_steps,
     _print_plan,
+    _run_predeploy_validation,
     _wait_for_healthz,
 )
 from movate.cli.main import app as cli_app
@@ -83,6 +86,13 @@ def deploy_env(tmp_path: Path, monkeypatch):
         "which",
         lambda name: f"/usr/bin/{name}" if name in {"az", "git"} else None,
     )
+    # Stub the validate-before-deploy guardrail to a no-op for tests that
+    # exercise build/roll mechanics. The repo cwd these tests run under is
+    # itself a movate project (project.yaml + 6 real agents), so the real
+    # guardrail would validate all of them — slow + brittle for a test
+    # about `az` call shape. The dedicated guardrail tests below override
+    # this patch (or call _run_predeploy_validation directly).
+    monkeypatch.setattr("movate.cli.deploy._run_predeploy_validation", lambda: None)
     return tmp_path
 
 
@@ -666,3 +676,253 @@ def test_ingest_bundled_kb_failure_is_non_fatal(tmp_path: Path, monkeypatch) -> 
 
     # Must not raise.
     _ingest_bundled_kb(uploaded=["alpha"], project_root=root, target_name="prod")
+
+
+# ---------------------------------------------------------------------------
+# P3 — validate-before-deploy guardrail
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_cli_deploy_aborts_before_build_on_invalid_project(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """A validation failure aborts the deploy BEFORE any image is built or
+    pushed: exit non-zero and zero ``az`` (build/push/update) calls fire.
+
+    The ``deploy_env`` fixture stubs the guardrail to a no-op for the
+    build-mechanics tests; here we re-install a stub that raises, modeling
+    a project that fails ``mdk validate --all``.
+    """
+
+    def boom() -> None:
+        from movate.cli._console import error as _error  # noqa: PLC0415
+
+        _error("validation failed for 1 item(s) (broken-agent); aborting before build.")
+        raise typer.Exit(code=1)
+
+    monkeypatch.setattr("movate.cli.deploy._run_predeploy_validation", boom)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code != 0
+    assert "validation failed" in result.stderr
+    # The whole point: nothing was built or pushed.
+    az_calls = [c for c in mock_subprocess if c and c[0] == "az"]
+    assert az_calls == []
+
+
+@pytest.mark.unit
+def test_cli_deploy_skip_validate_bypasses_the_gate(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """``--skip-validate`` must short-circuit the guardrail entirely — the
+    (raising) validation stub is never invoked, and the deploy proceeds to
+    build + roll as normal."""
+    called = {"n": 0}
+
+    def boom() -> None:
+        called["n"] += 1
+        raise typer.Exit(code=1)
+
+    monkeypatch.setattr("movate.cli.deploy._run_predeploy_validation", boom)
+
+    result = runner.invoke(
+        cli_app,
+        [
+            "deploy",
+            "--target",
+            "prod",
+            "--no-wait",
+            "--skip-validate",
+            "--image-tag",
+            "movate:9.9.9-test",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert called["n"] == 0  # guardrail never ran
+    # Build + two updates still happened.
+    assert len(mock_subprocess) == 3
+    assert mock_subprocess[0][:3] == ["az", "acr", "build"]
+
+
+@pytest.mark.unit
+def test_cli_deploy_dry_run_validates_then_shows_plan(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """Under ``--dry-run`` the guardrail still runs (validate, THEN show the
+    plan). A passing validation lets the dry-run print its plan; a failing
+    one aborts before the plan is shown."""
+    order: list[str] = []
+
+    def record_validate() -> None:
+        order.append("validate")
+
+    monkeypatch.setattr("movate.cli.deploy._run_predeploy_validation", record_validate)
+    real_print_plan = __import__("movate.cli.deploy", fromlist=["_print_plan"])._print_plan
+
+    def record_plan(plan, *, dry_run):
+        order.append("plan")
+        return real_print_plan(plan, dry_run=dry_run)
+
+    monkeypatch.setattr("movate.cli.deploy._print_plan", record_plan)
+
+    result = runner.invoke(cli_app, ["deploy", "--target", "prod", "--dry-run"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Validation ran before the plan was printed.
+    assert order == ["validate", "plan"]
+    assert "dry-run" in result.stderr
+    # No az calls under dry-run.
+    assert [c for c in mock_subprocess if c and c[0] == "az"] == []
+
+
+@pytest.mark.unit
+def test_run_predeploy_validation_noop_outside_project(tmp_path: Path, monkeypatch) -> None:
+    """Called from a directory with no project marker up the tree → returns
+    cleanly (nothing on disk to validate), never raises."""
+    monkeypatch.chdir(tmp_path)
+    # No project.yaml / policy.yaml / movate.yaml anywhere up the tree.
+    _run_predeploy_validation()  # must not raise
+
+
+@pytest.mark.unit
+def test_run_predeploy_validation_noop_on_empty_project(tmp_path: Path, monkeypatch) -> None:
+    """A project with no agents/ and no workflows/ → vacuous pass, no raise."""
+    # An empty policy.yaml is a valid project marker that loads as defaults.
+    (tmp_path / "policy.yaml").write_text("")
+    monkeypatch.chdir(tmp_path)
+    _run_predeploy_validation()  # must not raise
+
+
+@pytest.mark.unit
+def test_run_predeploy_validation_raises_exit_1_on_broken_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A project whose agent fails to load surfaces as ``typer.Exit(1)`` —
+    the real per-agent validator (``validate._validate_agent``) raises
+    ``typer.Exit`` on a malformed bundle, which the guardrail aggregates
+    into an abort. Proves the guardrail delegates to the real validation
+    primitives rather than re-implementing them."""
+    (tmp_path / "policy.yaml").write_text("")  # valid project marker (defaults)
+    agent_dir = tmp_path / "agents" / "broken-agent"
+    agent_dir.mkdir(parents=True)
+    # An agent.yaml that can't load (missing required fields / no prompt) —
+    # load_agent() raises AgentLoadError → _validate_agent raises Exit(2).
+    (agent_dir / "agent.yaml").write_text("name: broken-agent\n")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        _run_predeploy_validation()
+    assert exc_info.value.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# P2 — post-deploy "next steps" block
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_print_next_steps_verified_contains_api_test_health_traces(capsys) -> None:
+    """The verified-phase block leads with ✓ deployed and lists the API
+    URL, a `run` test line scoped to the target, a doctor health check, and
+    the App Insights traces pointer."""
+    _print_next_steps(
+        target_name="prod",
+        base_url="https://movate-prod-api.example.azurecontainerapps.io",
+        first_agent="faq-agent",
+        phase="verified",
+    )
+    out = capsys.readouterr().err
+    assert "deployed to prod" in out
+    assert "https://movate-prod-api.example.azurecontainerapps.io" in out
+    assert "run faq-agent" in out
+    assert "--target prod" in out
+    assert "doctor --target prod" in out
+    assert "App Insights" in out
+    assert "trace_id" in out
+
+
+@pytest.mark.unit
+def test_print_next_steps_submitted_adapts_wording_for_no_wait(capsys) -> None:
+    """``--no-wait`` (submitted) phase must NOT claim health is verified —
+    it says "submitted" and frames the doctor line as a verify step."""
+    _print_next_steps(
+        target_name="prod",
+        base_url="https://x.example.io",
+        first_agent="faq-agent",
+        phase="submitted",
+    )
+    out = capsys.readouterr().err
+    assert "submitted" in out
+    assert "not yet verified" in out
+    # Doctor line is framed as "verify:" rather than "health:".
+    assert "verify:" in out
+
+
+@pytest.mark.unit
+def test_print_next_steps_planned_frames_as_dry_run(capsys) -> None:
+    """``--dry-run`` (planned) phase frames the block as a hypothetical."""
+    _print_next_steps(
+        target_name="prod",
+        base_url="https://x.example.io",
+        first_agent="faq-agent",
+        phase="planned",
+    )
+    out = capsys.readouterr().err
+    assert "dry-run" in out
+    assert "https://x.example.io" in out
+
+
+@pytest.mark.unit
+def test_print_next_steps_uses_placeholder_when_no_agents(capsys) -> None:
+    """No project agent → the test line uses an ``<agent>`` placeholder
+    rather than crashing."""
+    _print_next_steps(
+        target_name="prod",
+        base_url="https://x.example.io",
+        first_agent=None,
+        phase="verified",
+    )
+    out = capsys.readouterr().err
+    assert "run <agent>" in out
+
+
+@pytest.mark.unit
+def test_cli_deploy_no_wait_prints_submitted_next_steps(deploy_env, mock_subprocess) -> None:
+    """End-to-end: a ``--no-wait`` deploy prints the submitted-phase
+    next-steps block (health framed as a follow-up, not verified)."""
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "submitted" in result.stderr
+    assert "verify:" in result.stderr
+    assert "doctor --target prod" in result.stderr
+
+
+@pytest.mark.unit
+def test_cli_deploy_verified_prints_deployed_next_steps(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """End-to-end happy path WITHOUT --no-wait: stub the /healthz poll so
+    the test stays sync, then assert the verified-phase next-steps block is
+    printed (✓ deployed + the doctor health line)."""
+
+    async def _instant_healthz(*, url, expected_version, timeout):
+        return None
+
+    monkeypatch.setattr("movate.cli.deploy._wait_for_healthz", _instant_healthz)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "deployed to prod" in result.stderr
+    assert "health:" in result.stderr
+    assert "doctor --target prod" in result.stderr
+    # FQDN came from the resolved target URL.
+    assert "movate-prod-api.example.azurecontainerapps.io" in result.stderr
