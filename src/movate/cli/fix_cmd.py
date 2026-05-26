@@ -16,6 +16,8 @@ Bundled fixes for MVP:
 * ``ensure-env-from-example`` — ``cp .env.example .env``
 * ``ensure-agents-dir`` — create empty ``agents/.gitkeep``
 * ``fix-secrets-permissions`` — chmod 0600 on ``~/.movate/secrets/*.yaml``
+* ``unshadow-runtime-keys`` — comment a stale ``export <VAR>=...`` shell-profile
+  line that shadows a saved key in ``~/.movate/credentials``
 
 Each fix is idempotent — re-running on a clean tree is a no-op.
 

@@ -22,6 +22,8 @@ Bundled fixes (MVP):
 * ``fix-secrets-permissions`` — chmod 0600 on ``~/.movate/secrets/*.yaml``
 * ``ensure-agents-dir`` — create empty ``agents/.gitkeep``
 * ``fix-yaml-style`` — run ``mdk fmt`` over the project (delegates)
+* ``unshadow-runtime-keys`` — comment a stale ``export <VAR>=...`` shell-profile
+  line that shadows a saved key in ``~/.movate/credentials``
 
 What we deliberately DON'T auto-fix:
 

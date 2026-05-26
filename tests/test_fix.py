@@ -21,6 +21,7 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
+from movate.credentials.store import CredentialsStore
 from movate.fixes import FixStatus, available_fixes, diagnose_and_fix
 from movate.fixes import registry as reg_mod
 
@@ -178,6 +179,152 @@ class TestFixSecretsPermissions:
         assert mode == 0o600
         # No group/world bits
         assert not (mode & stat.S_IRGRP)
+
+
+@pytest.mark.unit
+class TestUnshadowRuntimeKeys:
+    """The shell-shadow auth fix: a stale `export <VAR>=...` in a shell
+    profile shadows a freshly-saved key in ~/.movate/credentials."""
+
+    FIX_ID = "unshadow-runtime-keys"
+
+    @pytest.fixture
+    def shadow_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[Path, CredentialsStore]:
+        """Isolate HOME (for profile discovery) + the credentials store.
+
+        Returns ``(home, store)``. The store is pointed at a tempfile via
+        ``MOVATE_CREDENTIALS_PATH`` so we never read the real
+        ``~/.movate/credentials``; HOME points at a temp dir so profile
+        discovery never reads real ~/.zshrc etc.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "credentials"))
+        # Make sure the file backend (not a stray keychain selection) is used.
+        monkeypatch.delenv("MOVATE_CRED_BACKEND", raising=False)
+        return home, CredentialsStore()
+
+    def _fix(self) -> reg_mod.Fix:
+        return next(f for f in available_fixes() if f.id == self.FIX_ID)
+
+    def test_check_true_when_saved_cred_and_active_export(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        home, store = shadow_env
+        store.set("MDK_DEV_KEY", "the-real-rotated-key")
+        (home / ".zshrc").write_text("export MDK_DEV_KEY=stale-shadowing-value\n")
+        assert self._fix().check(tmp_path) is True
+
+    def test_check_false_with_only_saved_cred(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        """Saved cred but no profile export → no shadow."""
+        _home, store = shadow_env
+        store.set("MDK_DEV_KEY", "the-real-rotated-key")
+        assert self._fix().check(tmp_path) is False
+
+    def test_check_false_with_only_profile_export(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        """A lone profile export with no saved cred is benign — not flagged."""
+        home, _store = shadow_env
+        (home / ".zshrc").write_text("export MDK_DEV_KEY=some-value\n")
+        assert self._fix().check(tmp_path) is False
+
+    def test_check_false_when_export_already_commented(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        """Idempotency: a commented export is not an active shadow."""
+        home, store = shadow_env
+        store.set("MDK_DEV_KEY", "the-real-rotated-key")
+        (home / ".zshrc").write_text("# export MDK_DEV_KEY=stale-shadowing-value\n")
+        assert self._fix().check(tmp_path) is False
+
+    def test_check_detects_provider_key(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        """Provider keys (OPENAI_API_KEY etc.) are tracked too."""
+        home, store = shadow_env
+        store.set("OPENAI_API_KEY", "sk-real")
+        (home / ".bashrc").write_text("export OPENAI_API_KEY=sk-stale\n")
+        assert self._fix().check(tmp_path) is True
+
+    def test_dry_run_reports_would_apply_and_does_not_modify(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        home, store = shadow_env
+        store.set("MDK_DEV_KEY", "the-real-rotated-key")
+        profile = home / ".zshrc"
+        original = "export MDK_DEV_KEY=stale-shadowing-value\n"
+        profile.write_text(original)
+
+        result = self._fix().run(tmp_path, dry_run=True)
+        assert result.status is FixStatus.WOULD_APPLY
+        # Names the var + profile, NEVER the secret value.
+        assert "MDK_DEV_KEY" in result.message
+        assert str(profile) in result.message
+        assert "stale-shadowing-value" not in result.message
+        assert "the-real-rotated-key" not in result.message
+        # Profile untouched, no backup written.
+        assert profile.read_text() == original
+        assert not profile.with_name(profile.name + ".mdk-bak").exists()
+
+    def test_apply_comments_line_writes_backup_and_is_idempotent(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        home, store = shadow_env
+        store.set("MDK_DEV_KEY", "the-real-rotated-key")
+        profile = home / ".zshrc"
+        original = (
+            "# my profile\n"
+            "export PATH=$PATH:/usr/local/bin\n"
+            "export MDK_DEV_KEY=stale-shadowing-value\n"
+        )
+        profile.write_text(original)
+
+        result = self._fix().run(tmp_path, dry_run=False)
+        assert result.status is FixStatus.APPLIED
+
+        # The export is now commented (inert) with the self-documenting marker.
+        text = profile.read_text()
+        lines = text.splitlines()
+        active = [ln for ln in lines if reg_mod._active_export_pattern("MDK_DEV_KEY").match(ln)]
+        assert active == []  # no active export remains
+        assert any("disabled by mdk fix" in ln and "MDK_DEV_KEY" in ln for ln in lines)
+        # Unrelated lines preserved.
+        assert "export PATH=$PATH:/usr/local/bin" in text
+
+        # A one-time backup of the PRISTINE profile was written.
+        backup = profile.with_name(profile.name + ".mdk-bak")
+        assert backup.read_text() == original
+
+        # Result names the var + the manual follow-up, never the secret.
+        assert "MDK_DEV_KEY" in result.message
+        assert "unset MDK_DEV_KEY" in result.message
+        assert "stale-shadowing-value" not in result.message
+        assert "the-real-rotated-key" not in result.message
+
+        # Idempotent: re-running on the now-clean tree is a no-op.
+        assert self._fix().check(tmp_path) is False
+        second = self._fix().run(tmp_path, dry_run=False)
+        assert second.status is FixStatus.NOT_NEEDED
+
+    def test_apply_does_not_clobber_existing_backup(
+        self, tmp_path: Path, shadow_env: tuple[Path, CredentialsStore]
+    ) -> None:
+        """A pre-existing .mdk-bak is never overwritten."""
+        home, store = shadow_env
+        store.set("MDK_DEV_KEY", "the-real-rotated-key")
+        profile = home / ".zshrc"
+        profile.write_text("export MDK_DEV_KEY=stale\n")
+        backup = profile.with_name(profile.name + ".mdk-bak")
+        backup.write_text("PRISTINE ORIGINAL FROM EARLIER RUN\n")
+
+        self._fix().run(tmp_path, dry_run=False)
+        assert backup.read_text() == "PRISTINE ORIGINAL FROM EARLIER RUN\n"
 
 
 # ---------------------------------------------------------------------------
