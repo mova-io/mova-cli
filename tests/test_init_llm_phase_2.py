@@ -326,8 +326,12 @@ def test_llm_invalid_response_fails_with_debug_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When MockProvider returns valid JSON that doesn't match the
-    GeneratedAgent schema, BOTH attempts fail (same mock response on
-    retry) → exit 2 and a debug artifact is written."""
+    GeneratedAgent schema, BOTH attempts fail (same explicit mock
+    response on retry) → exit 2 and a debug artifact is written.
+
+    Post-PR: a first-attempt generation error (schema mismatch) now
+    earns a retry; the retry hits the same canned response and also
+    fails, so we still exit 2 — and a debug artifact is stashed."""
     monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"wrong": "shape"}')
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(
@@ -342,12 +346,13 @@ def test_llm_invalid_response_fails_with_debug_artifact(
             str(tmp_path),
         ],
     )
-    # First attempt fails LLMScaffoldError → exit 2 (no retry path because
-    # the failure was during generation, not validation).
+    # Both attempts fail generation → exit 2 (hard scaffold failure).
     assert result.exit_code == 2
     assert "LLM scaffold failed" in result.stderr or "schema" in result.stderr.lower()
     # The agent dir was NOT created.
     assert not (tmp_path / "fails-agent").exists()
+    # A debug artifact was stashed for operator inspection.
+    assert (tmp_path / ".mdk" / "llm-init-failed-fails-agent.json").is_file()
 
 
 @pytest.mark.unit
