@@ -235,6 +235,12 @@ def _scaffold_project_with_one_agent_and_target(
     # backend so these tests never touch the developer's real store.
     monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / ".movate" / "credentials"))
     monkeypatch.setenv("MOVATE_CRED_BACKEND", "file")
+    # The `fake` target names no Key Vault, so deploy's recovery would try to
+    # DISCOVER one in the resource group (an `az keyvault list` shell-out)
+    # before falling back to the in-pod mint. These tests model the
+    # no-discoverable-vault → mint path, so pin discovery to a miss to keep
+    # them hermetic (no real `az`).
+    monkeypatch.setattr(deploy_mod, "_discover_keyvault_in_resource_group", lambda target_cfg: None)
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -306,12 +312,13 @@ def test_deploy_agents_401_in_upload_loop_triggers_auto_recovery_and_retries(
         call_count["refresh"] += 1
         return "mvt_live_fresh_keyid_secret", "FAKE_KEY"
 
-    # The recovery path round-trip-verifies the minted bearer before keeping
-    # it: only the freshly-minted key authenticates against GET /api/v1/agents.
+    # The recovery path verifies the minted bearer is ADMIN-capable before
+    # keeping it: the probe is GET /api/v1/auth/keys (admin-scoped). Only the
+    # freshly-minted fleet-admin key gets a 200 there.
     def verify_handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/agents" and request.method == "GET":
+        if request.url.path == "/api/v1/auth/keys" and request.method == "GET":
             if request.headers.get("Authorization") == "Bearer mvt_live_fresh_keyid_secret":
-                return httpx.Response(200, json={"agents": []})
+                return httpx.Response(200, json={"keys": [], "count": 0})
             return httpx.Response(401, json={"detail": "stale"})
         return httpx.Response(201, json={"ok": True})
 
@@ -410,14 +417,17 @@ def test_preflight_401_with_auto_recovery_silently_refreshes_then_succeeds(
     seen = {"stale_gets": 0, "verify_gets": 0, "refresh_calls": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        # The preflight probes GET /api/v1/agents with the STALE bearer
+        # (reject → triggers recovery).
         if request.url.path == "/api/v1/agents" and request.method == "GET":
-            # The preflight presents the STALE bearer (reject); the
-            # post-recovery round-trip presents the FRESH minted bearer
-            # (accept). Differentiate by the token actually sent.
+            seen["stale_gets"] += 1
+            return httpx.Response(401, json={"detail": "stale"})
+        # The post-recovery admin-capability verify probes GET
+        # /api/v1/auth/keys with the FRESH minted bearer (accept).
+        if request.url.path == "/api/v1/auth/keys" and request.method == "GET":
             if request.headers.get("Authorization") == "Bearer mvt_live_fresh_keyid_secret":
                 seen["verify_gets"] += 1
-                return httpx.Response(200, json={"agents": []})
-            seen["stale_gets"] += 1
+                return httpx.Response(200, json={"keys": [], "count": 0})
             return httpx.Response(401, json={"detail": "stale"})
         # Skill and agent POSTs.
         return httpx.Response(201, json={"ok": True})

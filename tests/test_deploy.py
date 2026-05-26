@@ -1518,6 +1518,19 @@ def _always_verifies(monkeypatch, *, ok: bool = True, reason: str = "") -> None:
     )
 
 
+def _no_kv_discovery(monkeypatch) -> None:
+    """Pin resource-group Key Vault discovery to a miss.
+
+    The mint-path recovery tests model a target with NO discoverable vault
+    (so recovery falls through to the in-pod mint). Stubbing the discovery
+    helper keeps them hermetic — without it, `_attempt_auto_recovery` would
+    shell out to `az keyvault list` against the (fake) resource group."""
+    monkeypatch.setattr(
+        "movate.cli.deploy._discover_keyvault_in_resource_group",
+        lambda target_cfg: None,
+    )
+
+
 @pytest.mark.unit
 def test_auto_recovery_warns_when_shell_shadows_minted_key(
     capsys, monkeypatch, tmp_path: Path
@@ -1527,9 +1540,10 @@ def test_auto_recovery_warns_when_shell_shadows_minted_key(
     _hermetic_creds(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "movate.cli.auth.refresh_runtime_key_inline",
-        lambda target_name: ("mvt_dev_FRESH_minted", "MDK_DEV_KEY"),
+        lambda target_name, *, scopes=None: ("mvt_dev_FRESH_minted", "MDK_DEV_KEY"),
     )
     _always_verifies(monkeypatch)
+    _no_kv_discovery(monkeypatch)
     monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
 
     new_key = _attempt_auto_recovery(
@@ -1549,9 +1563,10 @@ def test_auto_recovery_no_warn_when_shell_unset(capsys, monkeypatch, tmp_path: P
     _hermetic_creds(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "movate.cli.auth.refresh_runtime_key_inline",
-        lambda target_name: ("mvt_dev_FRESH_minted", "MDK_DEV_KEY"),
+        lambda target_name, *, scopes=None: ("mvt_dev_FRESH_minted", "MDK_DEV_KEY"),
     )
     _always_verifies(monkeypatch)
+    _no_kv_discovery(monkeypatch)
     monkeypatch.delenv("MDK_DEV_KEY", raising=False)
 
     _attempt_auto_recovery(
@@ -1565,16 +1580,21 @@ def test_auto_recovery_no_warn_when_shell_unset(capsys, monkeypatch, tmp_path: P
 
 
 # ---------------------------------------------------------------------------
-# Round-trip bearer verification — the heart of the deploy-auth fix.
+# Admin-capability bearer verification — the heart of the deploy-auth fix.
 #
-# Regression: deploy used to mint a fresh `demotenant` key inside the pod
+# Regression 1: deploy used to mint a fresh `demotenant` key inside the pod
 # and SAVE it as the runtime bearer, declaring "✓ bearer key ready" — but
 # an in-pod mint lands in a store the serving replica may never read
 # (non-durable SQLite / multi-replica), so the key 401'd on the very next
-# call and CLOBBERED whatever working key the operator already had. The fix:
-# round-trip-verify (GET /api/v1/agents) the candidate BEFORE keeping it,
-# prefer pulling the guaranteed-trusted bootstrap key from Key Vault, and
-# never overwrite a previously-working saved key with one that 401s.
+# call and CLOBBERED whatever working key the operator already had.
+#
+# Regression 2 (the live 403): even when the minted key DID authenticate, it
+# defaulted to read,run,eval — so the read-only `GET /api/v1/agents` verify
+# said "✓ verified", the key got saved, and then every agent UPLOAD 403'd
+# (`missing required scope(s): admin`). The fix: mint fleet-admin, verify the
+# ADMIN capability the deploy needs (GET /api/v1/auth/keys, an admin-scoped
+# read) BEFORE keeping the key, prefer the fleet-admin bootstrap key from Key
+# Vault, and never overwrite a previously-working saved key with a 401/403 one.
 # ---------------------------------------------------------------------------
 
 
@@ -1608,6 +1628,38 @@ def test_verify_bearer_roundtrip_false_on_401(monkeypatch) -> None:
     ok, reason = _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_x")
     assert ok is False
     assert reason == "HTTP 401"
+
+
+@pytest.mark.unit
+def test_verify_bearer_roundtrip_rejects_read_only_key_on_403(monkeypatch) -> None:
+    """THE live regression: a key that authenticates but lacks `admin` (the
+    default read,run,eval in-pod mint) 403s on the admin-scoped probe. Verify
+    must REJECT it so it is never saved/announced as deploy-ready — otherwise
+    the very next agent UPLOAD (which needs `admin`) 403s."""
+    _verify_transport(
+        monkeypatch,
+        lambda req: httpx.Response(403, json={"detail": "missing required scope(s): admin"}),
+    )
+    ok, reason = _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_read_only")
+    assert ok is False
+    assert "403" in reason
+    assert "admin" in reason
+
+
+@pytest.mark.unit
+def test_verify_bearer_roundtrip_probes_admin_scoped_endpoint(monkeypatch) -> None:
+    """Verify must probe the ADMIN-scoped endpoint (`GET /api/v1/auth/keys`),
+    not the read-scoped `GET /api/v1/agents` — only the former proves the
+    bearer can do what the deploy needs (admin uploads)."""
+    seen: dict[str, str] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["path"] = req.url.path
+        return httpx.Response(200, json={"keys": [], "count": 0})
+
+    _verify_transport(monkeypatch, handler)
+    _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_live_admin")
+    assert seen["path"] == "/api/v1/auth/keys"
 
 
 @pytest.mark.unit
@@ -1646,9 +1698,10 @@ def test_auto_recovery_keeps_and_saves_verified_minted_key(
     monkeypatch.delenv("MDK_DEV_KEY", raising=False)
     monkeypatch.setattr(
         "movate.cli.auth.refresh_runtime_key_inline",
-        lambda target_name: ("mvt_live_demotena_FRESH_secret", "MDK_DEV_KEY"),
+        lambda target_name, *, scopes=None: ("mvt_live_demotena_FRESH_secret", "MDK_DEV_KEY"),
     )
     _always_verifies(monkeypatch, ok=True)
+    _no_kv_discovery(monkeypatch)
 
     new_key = _attempt_auto_recovery(
         target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
@@ -1660,6 +1713,115 @@ def test_auto_recovery_keeps_and_saves_verified_minted_key(
     assert "bearer key ready" in out
     assert "verified against the runtime" in out
     assert "minted in-pod" in out
+
+
+@pytest.mark.unit
+def test_auto_recovery_mint_requests_admin_capable_scope(monkeypatch, tmp_path: Path) -> None:
+    """The in-pod mint MUST request an admin-capable grant (fleet-admin/admin)
+    — the deploy bearer performs admin uploads (POST/PUT /api/v1/agents). A
+    default-scoped (read,run,eval) key authenticates but 403s on upload, which
+    is the live regression this fix closes."""
+    from movate.core.auth import SCOPE_ADMIN, SCOPE_FLEET_ADMIN  # noqa: PLC0415
+
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+    captured: dict[str, Any] = {}
+
+    def fake_refresh(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
+        captured["scopes"] = list(scopes) if scopes is not None else None
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_FLEET_secret")
+        return "mvt_live_demotena_FLEET_secret", "MDK_DEV_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+    _always_verifies(monkeypatch, ok=True)
+    _no_kv_discovery(monkeypatch)
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    assert new_key == "mvt_live_demotena_FLEET_secret"
+    # The mint was asked for an admin-capable scope, not the legacy default.
+    assert captured["scopes"] is not None
+    assert SCOPE_FLEET_ADMIN in captured["scopes"] or SCOPE_ADMIN in captured["scopes"]
+
+
+@pytest.mark.unit
+def test_auto_recovery_under_scoped_403_key_does_not_clobber_prior(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """A recovered key that authenticates but is UNDER-SCOPED (403 on the
+    admin probe — the live regression) must be rejected: not saved, not
+    announced ready, and the prior working key left intact."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+    # Operator already has a working admin-capable bearer saved.
+    CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_PRIOR_admin")
+
+    def fake_refresh_saves_under_scoped(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
+        # Mirror the real helper saving before return so we prove a rollback.
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_READONLY_minted")
+        return "mvt_live_demotena_READONLY_minted", "MDK_DEV_KEY"
+
+    monkeypatch.setattr(
+        "movate.cli.auth.refresh_runtime_key_inline", fake_refresh_saves_under_scoped
+    )
+    # 403: authenticated but lacks admin — exactly the upload-needs-admin path.
+    _always_verifies(
+        monkeypatch, ok=False, reason="HTTP 403 (key lacks admin scope; uploads need admin)"
+    )
+    _no_kv_discovery(monkeypatch)
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    assert new_key is None
+    # Prior admin key preserved — NOT clobbered by the under-scoped recovery key.
+    assert CredentialsStore().get("MDK_DEV_KEY") == "mvt_live_demotena_PRIOR_admin"
+    out = _collapsed(capsys.readouterr().err)
+    assert "rejected by the runtime" in out
+    assert "NOT saving it" in out
+    assert "Kept your previously-saved" in out
+
+
+@pytest.mark.unit
+def test_auto_recovery_discovers_keyvault_in_resource_group_and_pulls(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """When the target names NO vault but one is DISCOVERABLE in the resource
+    group, recovery pulls the fleet-admin bootstrap key (guaranteed-trusted +
+    admin-capable) instead of falling straight to an in-pod mint."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+
+    monkeypatch.setattr(
+        "movate.cli.deploy._discover_keyvault_in_resource_group",
+        lambda target_cfg: "movate-dev-kv-mvt",
+    )
+
+    def fake_pull(target: str, *, keyvault: str, secret_name: str = "bootstrap-api-key"):
+        assert keyvault == "movate-dev-kv-mvt"
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BOOT_secret")
+        return "mvt_live_demotena_BOOT_secret", "MDK_DEV_KEY"
+
+    def fail_if_minted(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
+        raise AssertionError("must not mint when a vault was discovered")
+
+    monkeypatch.setattr("movate.cli.auth.pull_runtime_key_inline", fake_pull)
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fail_if_minted)
+    _always_verifies(monkeypatch, ok=True)
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev",
+        base_url="https://dev.example.com",
+        target_cfg=_fake_target(),  # no azure_keyvault set
+    )
+
+    assert new_key == "mvt_live_demotena_BOOT_secret"
+    out = _collapsed(capsys.readouterr().err)
+    assert "Discovered Key Vault" in out
+    assert "pulled from Key Vault" in out
 
 
 @pytest.mark.unit
@@ -1675,12 +1837,13 @@ def test_auto_recovery_rejected_key_does_not_clobber_prior_working_key(
 
     # The real refresh_runtime_key_inline SAVES before returning; mirror that
     # so the test proves the bad value is rolled back, not merely never-set.
-    def fake_refresh_saves_bad(target_name: str) -> tuple[str, str]:
+    def fake_refresh_saves_bad(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
         CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BAD_minted")
         return "mvt_live_demotena_BAD_minted", "MDK_DEV_KEY"
 
     monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh_saves_bad)
     _always_verifies(monkeypatch, ok=False, reason="HTTP 401")
+    _no_kv_discovery(monkeypatch)
 
     new_key = _attempt_auto_recovery(
         target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
@@ -1704,12 +1867,13 @@ def test_auto_recovery_rejected_key_with_no_prior_is_deleted(monkeypatch, tmp_pa
     _hermetic_creds(monkeypatch, tmp_path)
     monkeypatch.delenv("MDK_DEV_KEY", raising=False)
 
-    def fake_refresh_saves_bad(target_name: str) -> tuple[str, str]:
+    def fake_refresh_saves_bad(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
         CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BAD_minted")
         return "mvt_live_demotena_BAD_minted", "MDK_DEV_KEY"
 
     monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh_saves_bad)
     _always_verifies(monkeypatch, ok=False, reason="HTTP 401")
+    _no_kv_discovery(monkeypatch)
 
     new_key = _attempt_auto_recovery(
         target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
@@ -1733,7 +1897,7 @@ def test_auto_recovery_prefers_keyvault_pull_over_mint_when_known(
         CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BOOT_secret")
         return "mvt_live_demotena_BOOT_secret", "MDK_DEV_KEY"
 
-    def fail_if_minted(target_name: str) -> tuple[str, str]:
+    def fail_if_minted(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
         raise AssertionError("must not mint when a Key Vault pull is available")
 
     monkeypatch.setattr("movate.cli.auth.pull_runtime_key_inline", fake_pull)
@@ -1764,7 +1928,7 @@ def test_auto_recovery_falls_back_to_mint_when_keyvault_pull_fails(
     def fake_pull_fails(target: str, *, keyvault: str, secret_name: str = "bootstrap-api-key"):
         raise PullRuntimeKeyError("SecretNotFound")
 
-    def fake_refresh(target_name: str) -> tuple[str, str]:
+    def fake_refresh(target_name: str, *, scopes: Any = None) -> tuple[str, str]:
         CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_FRESH_secret")
         return "mvt_live_demotena_FRESH_secret", "MDK_DEV_KEY"
 

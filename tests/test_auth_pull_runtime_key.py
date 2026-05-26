@@ -317,3 +317,81 @@ def test_pull_runtime_key_inline_raises_on_non_mvt_value(
     creds_path = tmp_path / ".movate" / "credentials"
     if creds_path.exists():
         assert "MDK_DEV_KEY=" not in creds_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# refresh_runtime_key_inline — the in-pod `az containerapp exec mdk auth
+# create-key` mint. The deploy 401 auto-recovery calls this with an admin-
+# capable scope so the minted bearer can actually perform admin uploads.
+# ---------------------------------------------------------------------------
+
+
+def _patch_exec_mint(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    minted_key: str = "mvt_live_demotena_kidEXEC123_secretEXECdataABCDE",
+) -> dict[str, list[list[str]]]:
+    """Mock `az account set` + `az containerapp exec` for the in-pod mint.
+
+    The exec returns the minted key on stderr (mirrors create-key --quiet,
+    which prints the secret to stderr). Captures every az argv so a test can
+    inspect the inner `mdk auth create-key` command for forwarded scopes."""
+    captures: dict[str, list[list[str]]] = {"calls": []}
+
+    class _Done:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> _Done:
+        captures["calls"].append(list(cmd))
+        if cmd[:3] == ["az", "containerapp", "exec"]:
+            return _Done(returncode=0, stdout="", stderr=f"secret: {minted_key}\n")
+        return _Done(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/az" if cmd == "az" else None)
+    return captures
+
+
+@pytest.mark.unit
+def test_refresh_runtime_key_inline_forwards_scope_to_inner_create_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deploy recovery path passes `scopes=["fleet-admin"]`; the in-pod
+    `mdk auth create-key` must receive a matching `--scope fleet-admin` so the
+    minted bearer is admin-capable (deploy uploads need `admin`)."""
+    from movate.cli.auth import refresh_runtime_key_inline  # noqa: PLC0415
+
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    captures = _patch_exec_mint(monkeypatch)
+
+    key, env_var = refresh_runtime_key_inline("dev", scopes=["fleet-admin"])
+
+    assert key == "mvt_live_demotena_kidEXEC123_secretEXECdataABCDE"
+    assert env_var == "MDK_DEV_KEY"
+    exec_call = next(c for c in captures["calls"] if c[:3] == ["az", "containerapp", "exec"])
+    inner = next(part for part in exec_call if "mdk auth create-key" in part)
+    assert "--scope fleet-admin" in inner
+
+
+@pytest.mark.unit
+def test_refresh_runtime_key_inline_default_omits_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default callers (interactive `refresh-runtime-key`) pass no scopes — the
+    inner create-key must NOT gain a `--scope` flag, preserving the legacy
+    read,run,eval tenant-key behaviour."""
+    from movate.cli.auth import refresh_runtime_key_inline  # noqa: PLC0415
+
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    captures = _patch_exec_mint(monkeypatch)
+
+    refresh_runtime_key_inline("dev")
+
+    exec_call = next(c for c in captures["calls"] if c[:3] == ["az", "containerapp", "exec"])
+    inner = next(part for part in exec_call if "mdk auth create-key" in part)
+    assert "--scope" not in inner
