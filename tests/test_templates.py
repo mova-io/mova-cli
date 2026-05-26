@@ -7,13 +7,23 @@ from pathlib import Path
 
 import pytest
 
+from movate.core.eval import (
+    EvalEngine,
+    assert_cross_family,
+    load_judge_config,
+)
 from movate.core.executor import Executor
 from movate.core.loader import load_agent
-from movate.core.models import RunRequest
+from movate.core.models import JudgeMethod, RunRequest
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import PricingTable, load_pricing
 from movate.templates import TEMPLATES, get_template_path, list_templates
-from movate.testing import InMemoryStorage, NullTracer, scaffold_agent
+from movate.testing import (
+    InMemoryStorage,
+    JudgeStubProvider,
+    NullTracer,
+    scaffold_agent,
+)
 
 # Per-template canonical input + an output the MockProvider can return that
 # satisfies that template's output schema. Keep these in sync with the
@@ -357,3 +367,114 @@ def test_deterministic_templates_skip_judge_example(template: str, tmp_path: Pat
     dst = tmp_path / template
     scaffold_agent(dst, name="demo", template=template)
     assert not (dst / "evals" / "judge.yaml.example").exists()
+
+
+# ---------------------------------------------------------------------------
+# hr-policy eval is valid + meaningful (regression for #121)
+# ---------------------------------------------------------------------------
+#
+# The hr-policy template shipped a broken eval that scored 0/N:
+#   1. dataset rows carried a stray ``file_format_under_test`` field, and
+#   2. agent.yaml declared a dataset but no judge → the harness fell back
+#      to exact-match, which can never pass a free-text HR-policy answer.
+# These tests pin both fixes: the dataset only uses the recognized eval-row
+# schema, and the shipped judge.yaml is an LLM-as-judge (so a correct answer
+# scores non-zero) rather than the exact-match default.
+
+# Fields the eval-row loader recognizes (movate.core.eval._parse_dataset_path).
+# A row carrying anything outside this set has a stray field.
+_ALLOWED_EVAL_ROW_KEYS = {
+    "input",
+    "expected",
+    "tags",
+    "objective",
+    "grounding",
+    "expected_coverage",
+    "latency_budget_ms",
+    "skill_responses",
+    "refusal_expected",
+    "required_fields",
+    "expected_tool_calls",
+    "kb_query",
+}
+
+
+@pytest.mark.unit
+def test_hr_policy_dataset_has_no_stray_fields(tmp_path: Path) -> None:
+    """Every hr-policy dataset row uses only the recognized eval-row schema.
+
+    Regression for #121 problem 1: rows had a stray
+    ``file_format_under_test`` field that isn't part of the eval schema.
+    """
+    dst = tmp_path / "hr-policy"
+    scaffold_agent(dst, name="demo", template="hr-policy")
+    raw = (dst / "evals" / "dataset.jsonl").read_bytes().decode().splitlines()
+    rows = [json.loads(line) for line in raw if line.strip()]
+    assert len(rows) >= 1
+    for i, row in enumerate(rows, start=1):
+        assert "input" in row and "expected" in row, f"row {i} missing input/expected"
+        stray = set(row) - _ALLOWED_EVAL_ROW_KEYS
+        assert not stray, f"row {i} has stray top-level field(s): {stray}"
+        # Input + expected only carry the agent's schema fields.
+        assert set(row["input"]) <= {"question", "context"}, f"row {i} stray input field"
+        assert set(row["expected"]) <= {
+            "answer",
+            "citations",
+            "grounded",
+            "confidence",
+            "needs_escalation",
+        }, f"row {i} stray expected field"
+
+
+@pytest.mark.unit
+def test_hr_policy_ships_semantic_judge(tmp_path: Path) -> None:
+    """hr-policy resolves to an LLM-as-judge, cross-family from the agent.
+
+    Regression for #121 problem 2: with no judge config the harness fell
+    back to exact-match scoring (``JudgeMethod.EXACT``), which can never
+    pass free-text prose. A shipped ``judge.yaml`` (auto-discovered by the
+    ``evals/judge.yaml`` convention) makes scoring semantic.
+    """
+    dst = tmp_path / "hr-policy"
+    scaffold_agent(dst, name="demo", template="hr-policy")
+    bundle = load_agent(dst)
+
+    judge = load_judge_config(bundle)
+    assert judge.method is JudgeMethod.LLM_JUDGE, "must not fall back to exact-match"
+    assert judge.model is not None and judge.rubric, "llm_judge needs a model + rubric"
+    # Judge must be a different family than the agent (engine enforces this).
+    assert_cross_family(bundle.spec.model.provider, judge.model.provider)
+
+
+@pytest.mark.unit
+async def test_hr_policy_eval_scores_non_zero_with_correct_answer(
+    tmp_path: Path,
+    pricing: PricingTable,
+    storage: InMemoryStorage,
+    tracer: NullTracer,
+) -> None:
+    """End-to-end: a correct hr-policy answer passes the shipped judge.
+
+    Uses :class:`JudgeStubProvider` so no live API key is needed — the
+    agent provider (openai) returns a schema-valid answer and the judge
+    provider (anthropic, from the shipped judge.yaml) returns a passing
+    score. Proves the eval is wired to the semantic judge and yields a
+    non-zero pass rather than the 0/N exact-match it shipped with.
+    """
+    dst = tmp_path / "hr-policy"
+    scaffold_agent(dst, name="demo", template="hr-policy")
+    bundle = load_agent(dst)
+
+    _, mock_response = CANONICAL["hr-policy"]
+    provider = JudgeStubProvider(agent_response=mock_response, judge_score=0.95)
+    executor = Executor(provider=provider, pricing=pricing, storage=storage, tracer=tracer)
+    engine = EvalEngine(executor=executor, provider=provider)
+
+    summary = await engine.run(bundle)
+    assert summary.sample_count == 18
+    assert summary.judge_provider == "anthropic/claude-sonnet-4-6"
+    assert summary.pass_rate == 1.0
+    assert summary.mean_score == pytest.approx(0.95)
+    # Both the agent (openai) and judge (anthropic) providers were exercised.
+    assert any(c.startswith("openai/") for c in provider.calls)
+    assert any(c.startswith("anthropic/") for c in provider.calls)
