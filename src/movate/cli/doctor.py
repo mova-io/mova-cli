@@ -214,6 +214,37 @@ def _missing(label: str) -> str:
     return f"[yellow]missing[/yellow] [dim]{label}[/dim]" if label else "[yellow]missing[/yellow]"
 
 
+def _is_runtime_key_shadowed(var: str) -> bool:
+    """True when ``var`` is set from the shell AND ~/.movate/credentials
+    holds a DIFFERENT non-empty value for it.
+
+    This is the exact failure that bit operators repeatedly: a freshly
+    saved runtime key in ``~/.movate/credentials`` is silently shadowed
+    by a stale ``export MDK_<TARGET>_KEY=...`` left in a shell profile.
+    Because the shell value is set before the CLI starts, autoload never
+    overwrites it (narrowest-beats-widest), so the saved key never takes
+    effect — every live call 401s with no obvious cause.
+
+    Reuses :func:`movate.credentials.key_source` for source attribution
+    and :class:`CredentialsStore` for the file value rather than
+    reimplementing either — kept local to ``doctor.py`` so the
+    credentials/loader seam stays untouched (a separate concern may
+    evolve it). The ``mdk fix unshadow-runtime-keys`` remediation
+    targets exactly this predicate.
+    """
+    from movate.credentials import key_source  # noqa: PLC0415
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    if key_source(var) != "shell":
+        return False
+    current = os.environ.get(var, "").strip()
+    file_value = (CredentialsStore().get(var) or "").strip()
+    # Shadow only when the file actually holds a competing value that
+    # differs from the live shell value. A shell-only export with no
+    # saved counterpart is NOT a shadow — there's nothing being hidden.
+    return bool(file_value) and file_value != current
+
+
 def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section diagnostic
     target: str = typer.Option(
         None,
@@ -436,6 +467,11 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
 
     _add("", "")
 
+    # Runtime bearer keys (MDK_<TARGET>_KEY) — presence, source, and the
+    # shell-shadow condition that `mdk fix unshadow-runtime-keys`
+    # remediates. Closes the doctor(diagnose) ↔ fix(remediate) loop.
+    _render_runtime_keys_section(_add)
+
     # Storage
     sqlite_path = Path("~/.movate/local.db").expanduser()
     state = "exists" if sqlite_path.exists() else "will be created on first run"
@@ -536,6 +572,76 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # context is a separate concern), and at least one fixable issue.
     if target is None and (counts["missing"] > 0 or counts["error"] > 0):
         _maybe_offer_fix(no_prompt=no_fix_prompt)
+
+
+def _render_runtime_keys_section(_add: Any) -> None:
+    """Render the "Runtime keys" section: one row per key-auth target.
+
+    Enumerates every target in ``~/.movate/config.yaml`` via
+    :func:`load_user_config` (``cfg.targets`` — the same dict
+    ``resolve_target`` reads). Only ``auth == "key"`` targets are
+    checked; ``oidc`` targets mint a short-lived JWT and have no
+    ``MDK_<TARGET>_KEY`` to diagnose, so they're skipped silently.
+
+    Per target, the row reports its ``key_env`` var by:
+
+    * **set + shadowed** → ⚠ (counts as ``missing``). The live value is
+      a stale shell export hiding a different value saved in
+      ``~/.movate/credentials``. Remediation points at
+      ``mdk fix unshadow-runtime-keys --apply`` (auto) and the manual
+      ``unset <VAR>``.
+    * **set, not shadowed** → ✓ ``ok``, annotated with the source
+      (``shell`` / ``dotenv`` / ``credentials_file``). The key value is
+      NEVER printed — only its source, matching how the provider-key
+      rows above report set/unset rather than the secret.
+    * **unset** → ⚠ ``missing`` with the
+      ``mdk auth save-runtime-key <target>`` hint.
+
+    No configured targets (or no config file at all) → a clean no-op:
+    the section header isn't even emitted, so the table stays quiet for
+    operators who only run agents locally.
+    """
+    from movate.core.user_config import UserConfigError, load_user_config  # noqa: PLC0415
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError:
+        # Malformed config is surfaced elsewhere (resolve_target / the
+        # azure preflight). The runtime-key section degrades to a no-op
+        # rather than crashing the whole doctor table.
+        return
+
+    # Only key-auth targets carry a bearer var worth diagnosing.
+    key_targets = [(name, tcfg) for name, tcfg in sorted(cfg.targets.items()) if tcfg.auth == "key"]
+    if not key_targets:
+        return
+
+    _add("", "")
+    for name, tcfg in key_targets:
+        var = tcfg.key_env
+        source = key_source(var)
+        if source == "unset":
+            _add(
+                var,
+                _missing(
+                    f"target {name!r} has no key — run mdk auth save-runtime-key {name} <key>"
+                ),
+            )
+            continue
+        if _is_runtime_key_shadowed(var):
+            # ⚠: a stale shell export shadows the saved key. Point at the
+            # auto-fix AND the manual unset so operators have both paths.
+            _add(
+                var,
+                f"[yellow]shadowed[/yellow] [dim]target {name!r}: shell export hides a "
+                f"different value in ~/.movate/credentials — run "
+                f"[bold]mdk fix unshadow-runtime-keys --apply[/bold] "
+                f"(or manually: unset {var})[/dim]",
+            )
+            continue
+        # Set + not shadowed — report the source, never the value.
+        _add(var, _ok(f"target {name!r} (source: {source})"))
 
 
 def _detect_project_config_row(
