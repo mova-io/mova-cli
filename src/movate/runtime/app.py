@@ -1156,6 +1156,18 @@ def build_app(
 
     @asynccontextmanager
     async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        # Belt-and-suspenders MDK_* ↔ MOVATE_* env bridge (#67). The CLI
+        # entrypoint (movate.cli.main) already runs this at startup, but a
+        # runtime booted via a direct ASGI/uvicorn factory, embedded, or in
+        # tests never hits that path — so re-run it here, BEFORE any storage
+        # or seed env var is read, to guarantee the bridge holds. Idempotent
+        # (a no-op when already synced). Imported from movate.core (NOT
+        # movate.cli) so the execution plane never imports the control plane
+        # — see docs/architecture-principles.md.
+        from movate.core.env_aliases import sync_env_aliases  # noqa: PLC0415
+
+        sync_env_aliases()
+
         import_tenant: str | None = app_.state.import_tenant_id
         fs_agents: list[AgentBundle] = app_.state.agents
         if import_tenant and fs_agents:

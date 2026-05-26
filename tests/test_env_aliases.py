@@ -12,7 +12,12 @@ import os
 
 import pytest
 
-import movate.cli._env_aliases as env_aliases_mod
+# The implementation lives in movate.core.env_aliases (so the runtime can
+# call it without importing cli — see docs/architecture-principles.md); the
+# one-shot _WARN_FIRED flag is owned there, so the reset fixture re-arms it on
+# that module. We import the public entrypoint via the legacy cli shim to keep
+# that compat path (movate.cli.main imports from here) covered.
+import movate.core.env_aliases as env_aliases_mod
 from movate.cli._env_aliases import sync_env_aliases
 
 
@@ -166,3 +171,91 @@ def test_idempotent_no_double_propagation(monkeypatch: pytest.MonkeyPatch) -> No
     assert os.environ["MDK_FOO"] == "legacy"
     assert os.environ["MDK_BAR"] == "canonical"
     assert os.environ["MOVATE_BAR"] == "canonical"
+
+
+# ---------------------------------------------------------------------------
+# Empty-shadow edge case (#67 — the deploy-401 root cause)
+#
+# In the deployed Azure Container App, MOVATE_DB_URL / MOVATE_SEED_API_KEY
+# were PRESENT but set to "" while bicep set the canonical MDK_* names to
+# real values. A pure presence check ("other key not in os.environ") left
+# the empty legacy var in place, so os.environ.get("MOVATE_DB_URL") readers
+# saw "" and fell back to ephemeral SQLite → keys vanished on revision
+# recycle → recurring deploy-401. An empty/blank destination must count as
+# "needs filling" in BOTH directions.
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_fills_empty_legacy_shadow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MDK_DB_URL set, MOVATE_DB_URL="" present → after sync the empty
+    legacy shadow is overwritten with the real canonical value."""
+    monkeypatch.setenv("MDK_DB_URL", "postgresql://real")
+    monkeypatch.setenv("MOVATE_DB_URL", "")
+    sync_env_aliases()
+    assert os.environ["MDK_DB_URL"] == "postgresql://real"
+    assert os.environ["MOVATE_DB_URL"] == "postgresql://real"
+
+
+def test_canonical_fills_whitespace_only_legacy_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whitespace-only legacy shadow ("   ") is also treated as unset."""
+    monkeypatch.setenv("MDK_SEED_API_KEY", "mvt_real_key")
+    monkeypatch.setenv("MOVATE_SEED_API_KEY", "   ")
+    sync_env_aliases()
+    assert os.environ["MOVATE_SEED_API_KEY"] == "mvt_real_key"
+
+
+def test_legacy_fills_empty_canonical_shadow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Symmetric direction: MOVATE_X set, MDK_X="" present → the empty
+    canonical shadow is filled from the legacy value."""
+    monkeypatch.setenv("MOVATE_DB_URL", "postgresql://legacy")
+    monkeypatch.setenv("MDK_DB_URL", "")
+    sync_env_aliases()
+    assert os.environ["MDK_DB_URL"] == "postgresql://legacy"
+    assert os.environ["MOVATE_DB_URL"] == "postgresql://legacy"
+
+
+def test_both_set_nonempty_mdk_wins_legacy_unchanged_no_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Both set non-empty → MDK_* wins, the (non-empty) legacy var is left
+    untouched, and no copy/warning happens (existing semantics preserved)."""
+    monkeypatch.setenv("MDK_DB_URL", "postgresql://canonical")
+    monkeypatch.setenv("MOVATE_DB_URL", "postgresql://legacy")
+    sync_env_aliases()
+    assert os.environ["MDK_DB_URL"] == "postgresql://canonical"
+    assert os.environ["MOVATE_DB_URL"] == "postgresql://legacy"
+    assert "deprecated" not in capsys.readouterr().err
+
+
+def test_canonical_only_still_bridges_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Canonical-only (no legacy var at all) still copies down — the
+    empty-shadow fix must not regress the absent-destination path."""
+    monkeypatch.setenv("MDK_TRACER", "stdout")
+    sync_env_aliases()
+    assert os.environ["MOVATE_TRACER"] == "stdout"
+
+
+def test_legacy_only_still_bridges_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy-only (no canonical var at all) still copies up."""
+    monkeypatch.setenv("MOVATE_TRACER", "stdout")
+    sync_env_aliases()
+    assert os.environ["MDK_TRACER"] == "stdout"
+
+
+def test_warning_fires_for_bridged_legacy_not_for_empty_shadow(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The deprecation warning fires once for a genuinely-bridged non-empty
+    legacy var (MOVATE_TRACER → MDK_TRACER) but NOT for an empty legacy
+    shadow that was overwritten by a canonical value (MOVATE_DB_URL="")."""
+    monkeypatch.setenv("MOVATE_TRACER", "stdout")  # genuinely bridged up
+    monkeypatch.setenv("MDK_DB_URL", "postgresql://real")
+    monkeypatch.setenv("MOVATE_DB_URL", "")  # empty shadow — not "in use"
+    sync_env_aliases()
+    err = capsys.readouterr().err
+    assert "MOVATE_* env vars are deprecated" in err
+    assert "MOVATE_TRACER" in err
+    # The empty shadow must NOT be listed as a legacy var "in use".
+    assert "MOVATE_DB_URL" not in err
