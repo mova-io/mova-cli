@@ -146,6 +146,17 @@ class TargetConfig(BaseModel):
             "Used to derive Container App names: movate-{env}-api, movate-{env}-worker."
         ),
     )
+    azure_keyvault: str | None = Field(
+        default=None,
+        description=(
+            "Key Vault name (no FQDN, e.g. movate-dev-kv-mvt) holding the "
+            "`bootstrap-api-key` secret the runtime seeds at startup. When set, "
+            "`mdk deploy` recovers a missing/stale bearer by PULLING this "
+            "guaranteed-trusted key rather than minting a fresh one in-pod. The "
+            "vault name embeds an operator-chosen suffix so it can't be derived "
+            "from azure_env alone — set it explicitly to enable auto-pull."
+        ),
+    )
 
 
 class UserConfig(BaseModel):

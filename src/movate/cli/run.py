@@ -1008,14 +1008,34 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
     # first, then the raw body for power users.
     if response.status_code == _HTTP_UNAUTHORIZED:
         prefix = api_key[:16]
-        console.print(
-            f"[red]✗ runtime rejected the bearer token[/red] "
-            f"(value starts with: '{prefix}…').\n"
-            f"  Check your env: [bold]echo ${target_cfg.key_env}[/bold] — "
-            f"likely stale from .zshrc or a prior tenant.\n"
-            f"  Fix: [bold]mdk auth save-runtime-key {target_name} <new-key>[/bold] "
-            f"to persist + autoload across shells."
-        )
+        # Shell-shadow case: the bearer we sent came from $<key_env>, and
+        # the credentials file holds a DIFFERENT (presumably fresher, e.g.
+        # just-deployed) value for the same var. Autoload never clobbers a
+        # shell export, so the stale shell value is winning. `unset` is the
+        # real fix here — `save-runtime-key` writes to the file the shell is
+        # already shadowing, so it would loop. Only when the file has no
+        # entry (shell is the sole source) do we fall back to save/pull.
+        from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+        file_value = (CredentialsStore().get(target_cfg.key_env) or "").strip()
+        if file_value and file_value != api_key:
+            console.print(
+                f"[red]✗ runtime rejected the bearer token[/red] "
+                f"(value starts with: '{prefix}…').\n"
+                f"  A stale [bold]{target_cfg.key_env}[/bold] exported in your shell is "
+                f"shadowing a different key saved in ~/.movate/credentials.\n"
+                f"  Fix: [bold]unset {target_cfg.key_env}[/bold] (and remove it from your "
+                f"profile) so the saved key is used."
+            )
+        else:
+            console.print(
+                f"[red]✗ runtime rejected the bearer token[/red] "
+                f"(value starts with: '{prefix}…').\n"
+                f"  Check your env: [bold]echo ${target_cfg.key_env}[/bold] — "
+                f"likely stale from .zshrc or a prior tenant.\n"
+                f"  Fix: [bold]mdk auth save-runtime-key {target_name} <new-key>[/bold] "
+                f"to persist + autoload across shells."
+            )
         _emit_remote_summary(
             agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
         )

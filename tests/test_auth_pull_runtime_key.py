@@ -258,3 +258,62 @@ def test_pull_runtime_key_unknown_target_exits_2(
     assert result.exit_code == 2
     assert "unknown target" in result.stderr.lower()
     assert "ghost" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# pull_runtime_key_inline — the programmatic helper `mdk deploy`'s bearer
+# auto-recovery calls to pull the guaranteed-trusted bootstrap key (returns a
+# tuple + raises PullRuntimeKeyError, instead of printing + typer.Exit).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_inline_returns_key_and_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from movate.cli.auth import pull_runtime_key_inline  # noqa: PLC0415
+
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch)
+
+    key, env_var = pull_runtime_key_inline("dev", keyvault="movate-dev-kv-mvt")
+
+    assert key == "mvt_live_demotena_kid123abc_secretdataXYZ"
+    assert env_var == "MDK_DEV_KEY"
+    creds = (tmp_path / ".movate" / "credentials").read_text()
+    assert "MDK_DEV_KEY=mvt_live_demotena_kid123abc_secretdataXYZ" in creds
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_inline_raises_on_az_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from movate.cli.auth import PullRuntimeKeyError, pull_runtime_key_inline  # noqa: PLC0415
+
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch, secret_show_rc=1, secret_show_stderr="ERROR: (SecretNotFound)")
+
+    with pytest.raises(PullRuntimeKeyError) as exc:
+        pull_runtime_key_inline("dev", keyvault="movate-dev-kv-mvt")
+    assert "az keyvault secret show failed" in str(exc.value)
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_inline_raises_on_non_mvt_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from movate.cli.auth import PullRuntimeKeyError, pull_runtime_key_inline  # noqa: PLC0415
+
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch, secret_value="not-a-movate-key")
+
+    with pytest.raises(PullRuntimeKeyError) as exc:
+        pull_runtime_key_inline("dev", keyvault="movate-dev-kv-mvt")
+    assert "movate bearer" in str(exc.value)
+    # Nothing got saved.
+    creds_path = tmp_path / ".movate" / "credentials"
+    if creds_path.exists():
+        assert "MDK_DEV_KEY=" not in creds_path.read_text()

@@ -78,6 +78,17 @@ def add_target(
             "`env` param used when running the Bicep deployment."
         ),
     ),
+    azure_keyvault: str = typer.Option(
+        None,
+        "--azure-keyvault",
+        help=(
+            "Key Vault name (no FQDN, e.g. movate-dev-kv-mvt) holding the "
+            "`bootstrap-api-key` secret. When set, `mdk deploy` recovers a "
+            "missing/stale bearer by PULLING this guaranteed-trusted key "
+            "instead of minting a fresh one in-pod (which a non-durable / "
+            "multi-replica runtime may not trust)."
+        ),
+    ),
 ) -> None:
     """Register a deployment target.
 
@@ -104,6 +115,7 @@ def add_target(
         azure_resource_group=azure_resource_group,
         azure_acr_name=azure_acr_name,
         azure_env=azure_env,
+        azure_keyvault=azure_keyvault,
     )
     if set_active or cfg.active is None:
         cfg.active = name

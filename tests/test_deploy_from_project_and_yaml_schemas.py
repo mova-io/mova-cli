@@ -229,6 +229,12 @@ def _scaffold_project_with_one_agent_and_target(
     expected to ``monkeypatch.chdir(tmp_path / "proj")`` afterward.
     """
     monkeypatch.setenv("MOVATE_HOME", str(tmp_path / ".movate"))
+    # Isolate the credentials store: deploy's bearer auto-recovery reads +
+    # writes ~/.movate/credentials (verify-before-clobber rolls a rejected
+    # candidate back to the prior saved key). Pin it to a tmp file + the file
+    # backend so these tests never touch the developer's real store.
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / ".movate" / "credentials"))
+    monkeypatch.setenv("MOVATE_CRED_BACKEND", "file")
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(app, ["init", "proj", "--skip-snapshot"], env={"COLUMNS": "200"})
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -300,8 +306,18 @@ def test_deploy_agents_401_in_upload_loop_triggers_auto_recovery_and_retries(
         call_count["refresh"] += 1
         return "mvt_live_fresh_keyid_secret", "FAKE_KEY"
 
+    # The recovery path round-trip-verifies the minted bearer before keeping
+    # it: only the freshly-minted key authenticates against GET /api/v1/agents.
+    def verify_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/agents" and request.method == "GET":
+            if request.headers.get("Authorization") == "Bearer mvt_live_fresh_keyid_secret":
+                return httpx.Response(200, json={"agents": []})
+            return httpx.Response(401, json={"detail": "stale"})
+        return httpx.Response(201, json={"ok": True})
+
     monkeypatch.setattr(deploy_mod, "_upload_one_agent_bundle", fake_upload_agent)
     monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _httpx_transport(verify_handler))
 
     result = runner.invoke(app, ["deploy", "--target", "fake"], env={"COLUMNS": "200"})
 
@@ -309,10 +325,11 @@ def test_deploy_agents_401_in_upload_loop_triggers_auto_recovery_and_retries(
     assert result.exit_code == 0, combined
     assert call_count["agent"] == 2, "expected one initial 401 + one retry"
     assert call_count["refresh"] == 1, "expected exactly one refresh call"
-    # Friendly recovery messaging: dim spinner + green check, no
+    # Friendly recovery messaging: dim spinner + green check (verified), no
     # "saved bearer rejected" jargon.
-    assert "Minting fresh bearer key" in combined
+    assert "Recovering a runtime bearer" in combined
     assert "bearer key ready" in combined
+    assert "verified against the runtime" in combined
     assert "ok=true" in combined
 
 
@@ -348,7 +365,7 @@ def test_deploy_agents_401_with_no_auto_recover_skips_refresh_and_fails(
     assert result.exit_code == 2, combined
     assert call_count["agent"] == 1, "expected only the initial attempt, no retry"
     assert call_count["refresh"] == 0, "refresh must not run with --no-auto-recover"
-    assert "Minting fresh bearer key" not in combined
+    assert "Recovering a runtime bearer" not in combined
     assert "mdk doctor --target fake" in combined
     assert "mdk auth refresh-runtime-key fake" in combined
 
@@ -390,15 +407,17 @@ def test_preflight_401_with_auto_recovery_silently_refreshes_then_succeeds(
     _scaffold_project_with_one_agent_and_target(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_KEY", "mvt_live_stale_keyid_secret")
 
-    seen = {"preflight_calls": 0, "refresh_calls": 0, "upload_calls": 0}
+    seen = {"stale_gets": 0, "verify_gets": 0, "refresh_calls": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/agents" and request.method == "GET":
-            seen["preflight_calls"] += 1
-            # First preflight call gets a stale bearer; reject. (We
-            # don't expect a second preflight — auto-recovery updates
-            # the in-memory headers and the upload loop is what runs
-            # next.)
+            # The preflight presents the STALE bearer (reject); the
+            # post-recovery round-trip presents the FRESH minted bearer
+            # (accept). Differentiate by the token actually sent.
+            if request.headers.get("Authorization") == "Bearer mvt_live_fresh_keyid_secret":
+                seen["verify_gets"] += 1
+                return httpx.Response(200, json={"agents": []})
+            seen["stale_gets"] += 1
             return httpx.Response(401, json={"detail": "stale"})
         # Skill and agent POSTs.
         return httpx.Response(201, json={"ok": True})
@@ -415,13 +434,15 @@ def test_preflight_401_with_auto_recovery_silently_refreshes_then_succeeds(
 
     combined = result.stdout + result.stderr
     assert result.exit_code == 0, combined
-    assert seen["preflight_calls"] == 1, "expected exactly one preflight GET"
+    assert seen["stale_gets"] == 1, "expected exactly one preflight GET with the stale bearer"
+    assert seen["verify_gets"] == 1, "expected one post-recovery verify GET with the fresh bearer"
     assert seen["refresh_calls"] == 1, "expected exactly one auto-refresh"
     # The preflight is responsible for the user-visible recovery hint;
     # the upload loop never logs its own 401 retry banner. Friendly
-    # wording: "Minting fresh bearer key" + "bearer key ready".
-    assert "Minting fresh bearer key" in combined
+    # wording: "Recovering a runtime bearer" + "bearer key ready".
+    assert "Recovering a runtime bearer" in combined
     assert "bearer key ready" in combined
+    assert "verified against the runtime" in combined
     assert "ok=true" in combined
 
 
@@ -523,7 +544,7 @@ def test_preflight_200_proceeds_silently(tmp_path: Path, monkeypatch: pytest.Mon
     assert seen["preflight_calls"] == 1
     assert seen["agent_posts"] >= 1, "upload loop must run after a green preflight"
     # No recovery banner on the happy path.
-    assert "Minting fresh bearer key" not in combined
+    assert "Recovering a runtime bearer" not in combined
     assert "ok=true" in combined
 
 
@@ -568,8 +589,9 @@ def test_empty_env_var_auto_recovers_then_completes_deploy(
     assert refresh_calls["n"] == 1, "expected exactly one refresh call"
     # Friendly wording — no "env var is empty" or "rejected" jargon
     # surfaces to operators on the happy recovery path.
-    assert "Minting fresh bearer key" in combined
+    assert "Recovering a runtime bearer" in combined
     assert "bearer key ready" in combined
+    assert "verified against the runtime" in combined
     assert "ok=true" in combined
 
 
@@ -622,10 +644,9 @@ def test_empty_env_var_recovery_failure_falls_through_to_error(
 
     combined = result.stdout + result.stderr
     assert result.exit_code == 2, combined
-    # Recovery was attempted (the user sees the "Minting fresh
-    # bearer key" line) before falling through to the actionable
-    # error.
-    assert "Minting fresh bearer key" in combined
+    # Recovery was attempted (the user sees the "Recovering a runtime
+    # bearer" line) before falling through to the actionable error.
+    assert "Recovering a runtime bearer" in combined
     assert "$FAKE_KEY is empty" in combined
     assert "refresh-runtime-key" in combined
 
@@ -653,6 +674,12 @@ def _capture_post_deploy_block(
     config in production — they're test-tunable so we can pin both
     the URL and the env-var-name rendering in the curl example."""
     buf = io.StringIO()
+    # The block only emits a raw curl when a bearer resolves (otherwise it
+    # prints a key-bootstrap hint). Pin a resolvable key via the env var so
+    # these curl-rendering tests are hermetic — without it they'd depend on
+    # whether the developer's real ~/.movate/credentials happens to hold an
+    # entry for key_env.
+    monkeypatch.setenv(key_env, "mvt_test_resolvable_key")
     monkeypatch.setattr(deploy_mod, "err", Console(file=buf, force_terminal=False))
     deploy_mod._render_post_deploy_next_steps(
         target_name=target_name,
@@ -672,7 +699,8 @@ def test_post_deploy_block_renders_curl_per_uploaded_agent(
     alphabetically) so operators can copy-paste against the deployed
     runtime without needing a working ``mdk`` install on the box doing
     the inference. Each curl targets ``POST <base_url>/run`` with the
-    canonical ``{"agent": "<name>", "input": {...}}`` body shape."""
+    canonical RunSubmission ``{"kind": "agent", "target": "<name>",
+    "input": {...}}`` body shape."""
     (tmp_path / "agents" / "zebra").mkdir(parents=True)
     (tmp_path / "agents" / "alpha").mkdir(parents=True)
 
@@ -689,8 +717,11 @@ def test_post_deploy_block_renders_curl_per_uploaded_agent(
     assert "# alpha" in out
     assert "# zebra" in out
     assert "curl -sS -X POST https://api.example.com/run" in out
-    assert '"agent": "alpha"' in out
-    assert '"agent": "zebra"' in out
+    # RunSubmission shape: the agent name is the `target`, not a bare `agent`.
+    assert '"kind": "agent"' in out
+    assert '"target": "alpha"' in out
+    assert '"target": "zebra"' in out
+    assert '"agent": "alpha"' not in out
 
 
 @pytest.mark.unit
@@ -940,9 +971,13 @@ def test_post_deploy_block_apostrophes_in_dataset_input_survive_heredoc(
     # New form: heredoc + --data-binary @-, NOT single-quoted -d.
     assert "--data-binary @-" in out
     assert "<<'JSON'" in out
-    # The old shell-escape gymnastics shouldn't appear — heredoc
-    # makes them unnecessary.
-    assert "'\"'\"'" not in out, (
+    # The old shell-escape gymnastics shouldn't appear in the raw-curl
+    # heredoc body — that's the whole point of the heredoc. (Scope to the
+    # curl section: the recommended `mdk run` line above legitimately uses
+    # shlex quoting, which IS correct shell escaping for a CLI argument and
+    # is outside this guarantee.)
+    curl_section = out.split("raw curl", 1)[-1]
+    assert "'\"'\"'" not in curl_section, (
         "heredoc body should not contain shell-quote-escape gymnastics; "
         "apostrophes pass through verbatim"
     )
@@ -996,7 +1031,9 @@ def test_post_deploy_block_diff_input_parses_as_json_after_shell_roundtrip(
 
     # The body must parse as JSON (the whole point of the heredoc form).
     parsed = json.loads(body)
-    assert parsed["agent"] == "code-reviewer"
+    # RunSubmission shape: {kind, target, input}, not the legacy {agent, input}.
+    assert parsed["kind"] == "agent"
+    assert parsed["target"] == "code-reviewer"
     # And the diff value round-trips with newlines intact.
     assert parsed["input"]["diff"] == diff_value
     # The body must NOT contain raw 0x0A inside a JSON string value —
@@ -1043,7 +1080,7 @@ def test_post_deploy_block_renders_on_successful_e2e_deploy(
     # curl with the target's base_url + key_env both surfaced.
     assert "curl -sS -X POST https://fake.example.com/run" in combined
     assert "Authorization: Bearer ${FAKE_KEY:-$(grep -m1 '^FAKE_KEY=' " in combined
-    assert '"agent": "faq"' in combined
+    assert '"target": "faq"' in combined
     # The old mdk-submit / mdk-jobs lines must NOT appear.
     assert "mdk submit" not in combined
     assert "mdk jobs" not in combined

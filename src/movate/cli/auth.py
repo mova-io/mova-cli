@@ -2675,6 +2675,125 @@ def bootstrap_seed(
     )
 
 
+class PullRuntimeKeyError(Exception):
+    """Raised by :func:`pull_runtime_key_inline` on any failure.
+
+    Carries a single operator-actionable message in ``args[0]``. Callers
+    that want to treat a failed pull as a soft fall-through (e.g. ``mdk
+    deploy``'s auto-recovery, which falls back to in-pod minting) catch
+    this rather than ``typer.Exit``; the interactive ``pull-runtime-key``
+    command surfaces it as a fatal error.
+    """
+
+
+def pull_runtime_key_inline(
+    target: str,
+    *,
+    keyvault: str,
+    secret_name: str = "bootstrap-api-key",
+) -> tuple[str, str]:
+    """Pull the seeded bootstrap key from Key Vault + save it locally.
+
+    Same mechanics as the ``mdk auth pull-runtime-key`` command, but
+    returns ``(key, env_var)`` and raises :class:`PullRuntimeKeyError`
+    instead of printing + ``typer.Exit``. Callers in non-interactive
+    contexts (``mdk deploy``'s bearer auto-recovery) use this to fetch a
+    key the running runtime is GUARANTEED to trust: the runtime seeds the
+    matching ``ApiKeyRecord`` from ``MOVATE_SEED_API_KEY`` (the same secret
+    this reads) on every cold start, so — unlike an in-pod mint into a
+    non-durable / per-replica store — a pulled bootstrap key always
+    verifies.
+
+    Returns:
+        ``(secret_value, env_var)`` — the ``mvt_*`` bearer read from
+        ``{keyvault}/{secret_name}`` and the credentials-store env var
+        name it was saved under.
+
+    Raises:
+        PullRuntimeKeyError: on any failure, with an operator-actionable
+            message in ``args[0]``.
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError as exc:
+        raise PullRuntimeKeyError(str(exc)) from None
+    if target not in cfg.targets:
+        registered = sorted(cfg.targets) or ["<none>"]
+        raise PullRuntimeKeyError(
+            f"unknown target {target!r}. Registered: "
+            f"{', '.join(registered)}. Add one with `mdk config add-target`."
+        )
+    target_cfg = cfg.targets[target]
+    env_var = target_cfg.key_env
+    if not env_var:
+        raise PullRuntimeKeyError(
+            f"target {target!r} has no `key_env` configured. Re-register "
+            f"with `--key-env MDK_{target.upper()}_KEY`."
+        )
+
+    if shutil.which("az") is None:
+        raise PullRuntimeKeyError(
+            "`az` (Azure CLI) not found on PATH. Install it from "
+            "https://learn.microsoft.com/cli/azure/install-azure-cli."
+        )
+
+    # `--query value -o tsv` returns the bare secret on stdout. Capture
+    # to a Python str rather than letting it land in shell scope.
+    result = subprocess.run(
+        [
+            "az",
+            "keyvault",
+            "secret",
+            "show",
+            "--vault-name",
+            keyvault,
+            "--name",
+            secret_name,
+            "--query",
+            "value",
+            "-o",
+            "tsv",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # `SecretNotFound` from KV vs other failures — surface the
+        # underlying stderr so the operator can tell whether the
+        # secret name is wrong, the vault is wrong, or RBAC is wrong.
+        raise PullRuntimeKeyError(
+            f"az keyvault secret show failed (exit {result.returncode}): "
+            f"{result.stderr.strip()[:400]}. Confirm `{secret_name}` exists "
+            f"in {keyvault!r} (run `mdk auth bootstrap-seed {target} "
+            f"--keyvault {keyvault}` first) and that you have `Key Vault "
+            f"Secrets User` on the vault."
+        )
+
+    secret_value = result.stdout.strip()
+    if not secret_value.startswith("mvt_"):
+        raise PullRuntimeKeyError(
+            f"value pulled from {keyvault}/{secret_name} doesn't look like "
+            f"a movate bearer (expected `mvt_<env>_<tenant>_<keyid>_<secret>`). "
+            f"Did `bootstrap-seed` actually populate this secret? Read the "
+            f"value manually with `az keyvault secret show --vault-name "
+            f"{keyvault} --name {secret_name} --query value -o tsv` to debug."
+        )
+
+    store = CredentialsStore()
+    store.set(env_var, secret_value)
+    return secret_value, env_var
+
+
 @auth_app.command("pull-runtime-key")
 def pull_runtime_key(
     target: str = typer.Argument(
@@ -2716,96 +2835,25 @@ def pull_runtime_key(
       [dim]# New laptop, dev already provisioned:[/dim]
       $ mdk auth pull-runtime-key dev --keyvault movate-dev-kv-mvt
     """
-    import shutil  # noqa: PLC0415
-    import subprocess  # noqa: PLC0415
-
-    from movate.core.user_config import (  # noqa: PLC0415
-        UserConfigError,
-        load_user_config,
-    )
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
     try:
-        cfg = load_user_config()
-    except UserConfigError as exc:
+        _secret_value, env_var = pull_runtime_key_inline(
+            target,
+            keyvault=keyvault,
+            secret_name=secret_name,
+        )
+    except PullRuntimeKeyError as exc:
         error(str(exc))
         raise typer.Exit(code=2) from None
-    if target not in cfg.targets:
-        registered = sorted(cfg.targets) or ["<none>"]
-        error(
-            f"unknown target {target!r}. Registered: "
-            f"{', '.join(registered)}. Add one with `mdk config add-target`."
-        )
-        raise typer.Exit(code=2)
-    target_cfg = cfg.targets[target]
-    env_var = target_cfg.key_env
-    if not env_var:
-        error(
-            f"target {target!r} has no `key_env` configured. Re-register "
-            f"with `--key-env MDK_{target.upper()}_KEY`."
-        )
-        raise typer.Exit(code=2)
 
-    if shutil.which("az") is None:
-        error(
-            "`az` (Azure CLI) not found on PATH. Install it from "
-            "https://learn.microsoft.com/cli/azure/install-azure-cli."
-        )
-        raise typer.Exit(code=2)
-
-    # `--query value -o tsv` returns the bare secret on stdout. Capture
-    # to a Python str rather than letting it land in shell scope.
-    result = subprocess.run(
-        [
-            "az",
-            "keyvault",
-            "secret",
-            "show",
-            "--vault-name",
-            keyvault,
-            "--name",
-            secret_name,
-            "--query",
-            "value",
-            "-o",
-            "tsv",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        # `SecretNotFound` from KV vs other failures — surface the
-        # underlying stderr so the operator can tell whether the
-        # secret name is wrong, the vault is wrong, or RBAC is wrong.
-        error(
-            f"az keyvault secret show failed (exit {result.returncode}): "
-            f"{result.stderr.strip()[:400]}. Confirm `{secret_name}` exists "
-            f"in {keyvault!r} (run `mdk auth bootstrap-seed {target} "
-            f"--keyvault {keyvault}` first) and that you have `Key Vault "
-            f"Secrets User` on the vault."
-        )
-        raise typer.Exit(code=2)
-
-    secret_value = result.stdout.strip()
-    if not secret_value.startswith("mvt_"):
-        error(
-            f"value pulled from {keyvault}/{secret_name} doesn't look like "
-            f"a movate bearer (expected `mvt_<env>_<tenant>_<keyid>_<secret>`). "
-            f"Did `bootstrap-seed` actually populate this secret? Read the "
-            f"value manually with `az keyvault secret show --vault-name "
-            f"{keyvault} --name {secret_name} --query value -o tsv` to debug."
-        )
-        raise typer.Exit(code=2)
-
-    store = CredentialsStore()
-    store.set(env_var, secret_value)
+    store_path = CredentialsStore().path
     success(
         f"pulled [cyan]{keyvault}/{secret_name}[/cyan] → saved as "
-        f"[cyan]{env_var}[/cyan] in [cyan]{store.path}[/cyan]."
+        f"[cyan]{env_var}[/cyan] in [cyan]{store_path}[/cyan]."
     )
     hint(
         f"[dim]For the current shell, run: [bold]export {env_var}=$(grep "
-        f"'^{env_var}=' {store.path} | cut -d= -f2-)[/bold] or open a new "
+        f"'^{env_var}=' {store_path} | cut -d= -f2-)[/bold] or open a new "
         f"terminal.[/dim]"
     )
