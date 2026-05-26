@@ -215,25 +215,41 @@ _EXAMPLE_CLASSIFIER = """\
 
 # ---------------------------------------------------------------------------
 # Meta-prompt — instructs the LLM how to map description → GeneratedAgent.
+#
+# STRUCTURE: a fully-static PREFIX followed by a short VARIABLE SUFFIX. The
+# prefix (role/intro, schema, hard constraints, both few-shot examples) is
+# byte-identical on every call — no interpolation — so it forms a stable
+# cacheable prompt prefix (OpenAI auto-caches stable prefixes; this also
+# sets up an explicit Anthropic ``cache_control`` breakpoint later). The
+# per-call variables (description, name, target model) appear ONLY in the
+# trailing suffix, so nothing before the suffix diverges between calls.
+#
 # Constraints live ABOVE the few-shot so the model anchors on rules first
 # and examples second; reversing this in pilot runs produced more
 # hallucinated JSON Schema types ("datetime", "uuid").
+#
+# The constraints reference name / model.provider GENERICALLY ("given
+# below") rather than embedding the literal values — the literals live in
+# the suffix. This is safe because the CLI coerces ``agent_yaml.name`` and
+# ``agent_yaml.model.provider`` post-generation, so the exact strings need
+# not appear mid-constraints. Keeping them out is what makes the prefix
+# static (and therefore cacheable).
 # ---------------------------------------------------------------------------
 
-_META_PROMPT = """\
+# Static, interpolation-free preamble. ``{example_faq}`` / ``{example_classifier}``
+# are the only placeholders and they expand to byte-identical literals on
+# every call, so the formatted prefix is itself constant. The detection
+# markers the mock keys on ("scaffolding a movate AI agent",
+# "GENERATEDAGENT SCHEMA") live here in the prefix.
+_META_PROMPT_PREFIX = """\
 You are scaffolding a movate AI agent from a natural-language description.
-
-USER DESCRIPTION:
-\"\"\"
-{description}
-\"\"\"
-
-AGENT NAME: {name}
 
 Your job is to generate a complete, runnable agent as a single JSON object
 matching the GeneratedAgent schema below. The CLI will write the four files
 (agent.yaml, prompt.md, schema/input.json, schema/output.json) plus an
-evals/dataset.jsonl to disk and then validate the result by loading it.
+evals/dataset.jsonl to disk and then validate the result by loading it. The
+user description, agent name, and target model are given at the END of this
+prompt.
 
 GENERATEDAGENT SCHEMA:
 {{
@@ -251,9 +267,9 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
 1. agent_yaml MUST include:
    - api_version: "movate/v1"
    - kind: "Agent"
-   - name: "{name}"  (exactly this value)
+   - name: the exact agent name given below  (use it verbatim)
    - version: "0.1.0"
-   - model.provider: "{target_model}"  (use exactly this provider string)
+   - model.provider: the model id given below  (use that exact provider string)
    - model.params: {{"temperature": 0.0, "max_tokens": <256-2048>}}
    - prompt: "./prompt.md"
    - schema.input: "./schema/input.json"
@@ -291,10 +307,32 @@ EXAMPLE 1 (FAQ agent):
 
 EXAMPLE 2 (Classifier agent):
 {example_classifier}
+"""
 
-Now generate the GeneratedAgent JSON for: \"{description}\" (name: {name}).
+# Variable suffix — the ONLY part that changes per call. Appended after the
+# static prefix so the model sees the rules + examples first, then the
+# concrete task. The ``AGENT NAME:`` line is preserved verbatim because the
+# mock parses the requested name out of it (``_parse_scaffold_name``).
+_META_PROMPT_SUFFIX = """\
+
+USER DESCRIPTION:
+\"\"\"
+{description}
+\"\"\"
+
+AGENT NAME: {name}
+
+TARGET MODEL (write this exact string into agent_yaml.model.provider): {target_model}
+
+Now generate the GeneratedAgent JSON for the description above (name: {name}).
 Respond with the JSON object only.
 """
+
+# Full meta-prompt = static prefix + variable suffix. ``.format(...)`` only
+# substitutes the suffix's placeholders (description/name/target_model) plus
+# the prefix's example literals; every byte before USER DESCRIPTION is the
+# same on every call.
+_META_PROMPT = _META_PROMPT_PREFIX + _META_PROMPT_SUFFIX
 
 
 # Retry prompt — used when validation fails. Feeds the error + the

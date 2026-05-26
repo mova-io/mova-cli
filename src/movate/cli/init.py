@@ -1247,6 +1247,13 @@ _DEBUG_ARTIFACT_REL = ".mdk/llm-init-failed-{name}.json"
 # Rich Panel rendering stays compact.
 _DRY_RUN_PROMPT_PREVIEW_CHARS = 600
 
+# Thin-description thresholds for the soft scaffold-quality nudge. A
+# description below EITHER bar (too few words OR too short overall) gets
+# an advisory hint — it still proceeds. Deliberately lenient so a normal
+# one-line description clears both bars and stays quiet.
+_THIN_DESC_MIN_WORDS = 6
+_THIN_DESC_MIN_CHARS = 25
+
 
 def _init_agent_from_llm(
     *,
@@ -1286,6 +1293,20 @@ def _init_agent_from_llm(
             "Pass a non-empty natural-language description of the agent."
         )
         raise typer.Exit(code=2)
+
+    # Soft nudge on a thin/vague description: a one-word or near-empty
+    # description scaffolds a generic agent the operator then has to
+    # rework. Warn and PROCEED — advisory only, never blocking. The
+    # thresholds are deliberately lenient (a normal one-line description
+    # clears both): fewer than 6 words OR under 25 non-space characters.
+    stripped_desc = description.strip()
+    word_count = len(stripped_desc.split())
+    non_space_chars = len(stripped_desc.replace(" ", ""))
+    if word_count < _THIN_DESC_MIN_WORDS or non_space_chars < _THIN_DESC_MIN_CHARS:
+        err_console.print(
+            "[yellow]⚠[/yellow] short description — for a better scaffold, "
+            "mention the agent's inputs, outputs, and tone."
+        )
 
     # Destination check before the LLM call — operators get the error
     # immediately, not after spending tokens.
@@ -1411,10 +1432,15 @@ async def _run_llm_scaffold(
             if is_retry:
                 retried = True
 
+            # Name the model that will run the scaffold so the operator
+            # sees what's being called, and flag the offline mock path
+            # so a hung-looking spinner isn't mistaken for a real (paid)
+            # provider call.
+            model_label = f"{llm_model} (mock, offline)" if mock else llm_model
             spin_msg = (
-                f"retrying scaffold for '{name}'..."
+                f"retrying '{name}' with {model_label}…"
                 if is_retry
-                else f"scaffolding agent '{name}' from description..."
+                else f"scaffolding '{name}' with {model_label}…"
             )
             try:
                 with spinner(spin_msg):
@@ -1917,17 +1943,20 @@ def init(
         False,
         "--dry-run",
         help=(
-            "Preview the generated files without writing to disk. Only "
-            "meaningful with [bold]--llm[/bold] today; ignored otherwise."
+            "Still calls the model (needs a provider key) and previews the "
+            "generated agent without writing any files. For offline previews "
+            "with no key, add [bold]--mock[/bold]. Only meaningful with "
+            "[bold]--llm[/bold]; ignored otherwise."
         ),
     ),
     mock: bool = typer.Option(
         False,
         "--mock",
         help=(
-            "Use the deterministic [bold]MockProvider[/bold] for the LLM call. "
-            "Hermetic CI mode — no API keys required. Only meaningful with "
-            "[bold]--llm[/bold]; ignored otherwise."
+            "Offline path: uses the deterministic mock provider (no API key) "
+            "to write a generic scaffold — no real model is called. For "
+            "hermetic CI. Only meaningful with [bold]--llm[/bold]; ignored "
+            "otherwise."
         ),
     ),
     open_editor: bool = typer.Option(
@@ -1970,7 +1999,7 @@ def init(
       [dim]$ mdk init --project        # bootstrap current directory[/dim]
       [dim]$ mdk init faq               # add one agent from the faq template[/dim]
       [dim]$ mdk init my-bot --template chatbot[/dim]
-      [dim]$ mdk init faq-agent --llm "FAQ agent for our SaaS pricing"  # Phase 2[/dim]
+      [dim]$ mdk init faq-agent --llm "FAQ agent for our SaaS pricing"[/dim]
 
     [bold]See also:[/bold] [bold]mdk dev <name>[/bold] is the guided front
     door — it scaffolds (if needed), then drops you into a live
@@ -2096,8 +2125,7 @@ def init(
     # Agent mode: dispatch to LLM-scaffold or template-scaffold path.
     # --llm + --template is allowed (the description guides which
     # template to start from); a warning surfaces so operators don't
-    # silently get a mismatched starting point. Phase 2's generator
-    # will honor the template as a few-shot exemplar.
+    # silently get a mismatched starting point.
     #
     # Template default in agent mode is "default" (the echo template).
     # We use that fallback here rather than at parse time so the
@@ -2109,10 +2137,9 @@ def init(
         if effective_template != "default":
             err_console.print(
                 f"[yellow]⚠[/yellow] [bold]--llm[/bold] + "
-                f"[bold]--template {effective_template}[/bold] — the template will "
-                f"seed the few-shot prompt as a starting structure. "
-                f"[dim](Phase 2 will honor this; Phase 1 just acknowledges "
-                f"the combination.)[/dim]"
+                f"[bold]--template {effective_template}[/bold] — the description "
+                f"drives generation; the template is acknowledged as a starting "
+                f"reference."
             )
         _init_agent_from_llm(
             name=name,
