@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -34,6 +35,31 @@ from movate.cli.auth import _extract_mvt_key
 from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)
+
+
+def _patch_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: int = 200,
+) -> dict[str, list[str]]:
+    """Route the lazily-imported ``httpx.Client`` (used by the adopt-verify
+    round-trip the command runs after minting) through a MockTransport so the
+    suite stays hermetic. ``200`` → verified; ``401``/``403`` → failed."""
+    captures: dict[str, list[str]] = {"bearers": []}
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captures["bearers"].append(request.headers.get("authorization", ""))
+        return httpx.Response(status, json={"keys": []} if status < 400 else {"detail": "no"})
+
+    transport = httpx.MockTransport(handler)
+
+    def factory(*args: object, **kwargs: object) -> httpx.Client:
+        kwargs["transport"] = transport  # type: ignore[assignment]
+        return real_client(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("httpx.Client", factory)
+    return captures
 
 
 def _write_user_config(home: Path) -> None:
@@ -162,6 +188,7 @@ def test_refresh_happy_path_writes_credentials(
         exec_stdout="key_id: kid_abc\n",
         exec_stderr="secret: mvt_live_demo_kid_abc_S3CRET\nsave this now — never shown again\n",
     )
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(app, ["auth", "refresh-runtime-key", "dev"])
     assert result.exit_code == 0, result.stdout + result.stderr
@@ -200,6 +227,7 @@ def test_refresh_container_app_override_skips_derive(
     _isolate_credentials(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
     captures = _patch_subprocess(monkeypatch, exec_stderr="secret: mvt_live_demo_K_X\n")
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -218,6 +246,7 @@ def test_refresh_custom_tenant_and_label(tmp_path: Path, monkeypatch: pytest.Mon
     _isolate_credentials(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
     captures = _patch_subprocess(monkeypatch, exec_stderr="secret: mvt_test_acme_K_S\n")
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -342,3 +371,71 @@ def test_refresh_no_mvt_key_in_output_exits_2(
     assert "some random non-key output" in result.stderr
     # And the manual fallback is suggested.
     assert "save-runtime-key" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Adopt-verify (item #89): after minting, round-trip the key against the
+# deployed runtime + warn on a shell shadow, masking the secret.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_refresh_verifies_minted_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful verify round-trips the minted bearer; no failure warning."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_subprocess(monkeypatch, exec_stderr="secret: mvt_live_demo_kid_abc_S3CRET\n")
+    verify = _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(app, ["auth", "refresh-runtime-key", "dev"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert verify["bearers"] == ["Bearer mvt_live_demo_kid_abc_S3CRET"]
+    assert "FAILED to authenticate" not in result.stderr
+
+
+@pytest.mark.unit
+def test_refresh_warns_when_verify_fails_but_keeps_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify 401 (mint landed in a store the serving replica never reads) →
+    loud warning naming URL + reason, key still saved + masked."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_subprocess(monkeypatch, exec_stderr="secret: mvt_live_demo_kid_abc_S3CRET\n")
+    verify = _patch_verify(monkeypatch, status=401)
+
+    result = runner.invoke(app, ["auth", "refresh-runtime-key", "dev"])
+
+    assert verify["bearers"] == ["Bearer mvt_live_demo_kid_abc_S3CRET"]
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Rich soft-wraps the warning; collapse all whitespace runs so a wrap
+    # boundary mid-phrase doesn't break the substring match.
+    stderr = " ".join(result.stderr.split())
+    assert "FAILED to authenticate" in stderr
+    assert "movate-dev-api.example.azurecontainerapps.io" in stderr
+    assert "HTTP 401" in stderr
+    # Key still saved.
+    creds = (tmp_path / ".movate" / "credentials").read_text()
+    assert "MDK_DEV_KEY=mvt_live_demo_kid_abc_S3CRET" in creds
+    # Full key never printed; masked tail is.
+    combined = result.stdout + result.stderr
+    assert "mvt_live_demo_kid_abc_S3CRET" not in combined
+    assert "…CRET" in combined.replace("\n", "")
+
+
+@pytest.mark.unit
+def test_refresh_warns_on_shell_shadow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale exported MDK_DEV_KEY shadows the just-minted key — warn."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_demo_stale_OLDSHELL")
+    _patch_subprocess(monkeypatch, exec_stderr="secret: mvt_live_demo_kid_abc_S3CRET\n")
+    _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(app, ["auth", "refresh-runtime-key", "dev"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    stderr = " ".join(result.stderr.split())
+    assert "stale" in stderr and "MDK_DEV_KEY" in stderr
+    assert "unset MDK_DEV_KEY" in stderr

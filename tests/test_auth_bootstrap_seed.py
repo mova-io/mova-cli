@@ -17,12 +17,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)
+
+
+def _patch_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: int = 200,
+) -> dict[str, list[str]]:
+    """Route the lazily-imported ``httpx.Client`` (used by the adopt-verify
+    round-trip the command runs after seeding) through a MockTransport so the
+    suite stays hermetic. ``200`` → verified; ``401``/``403`` → failed."""
+    captures: dict[str, list[str]] = {"bearers": []}
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captures["bearers"].append(request.headers.get("authorization", ""))
+        return httpx.Response(status, json={"keys": []} if status < 400 else {"detail": "no"})
+
+    transport = httpx.MockTransport(handler)
+
+    def factory(*args: object, **kwargs: object) -> httpx.Client:
+        kwargs["transport"] = transport  # type: ignore[assignment]
+        return real_client(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("httpx.Client", factory)
+    return captures
 
 
 def _write_user_config(home: Path) -> None:
@@ -110,6 +136,7 @@ def test_bootstrap_seed_mints_uploads_and_saves(
     _isolate_credentials(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
     captures = _patch_az(monkeypatch)
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -179,6 +206,7 @@ def test_bootstrap_seed_force_overwrites_existing(
     _isolate_credentials(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
     captures = _patch_az(monkeypatch, probe_finds_existing=True)
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -277,3 +305,108 @@ def test_bootstrap_seed_invalid_env_value_exits_2(
 
     assert result.exit_code == 2
     assert "--env" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Adopt-verify (item #89): after seeding, the command round-trips the key
+# against the deployed runtime + warns on a shell shadow — without ever
+# printing the full secret.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_bootstrap_seed_verifies_seeded_key_after_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful verify round-trips the seeded key (the verify transport
+    saw a Bearer call) and emits no failure warning."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch)
+    verify = _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(
+        app,
+        ["auth", "bootstrap-seed", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(verify["bearers"]) == 1
+    assert verify["bearers"][0].startswith("Bearer mvt_live_demotena_")
+    assert "FAILED to authenticate" not in result.stderr
+
+
+@pytest.mark.unit
+def test_bootstrap_seed_warns_when_verify_fails_but_keeps_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify 401 (e.g. the runtime hasn't re-seeded the ApiKeyRecord yet on a
+    fresh env) → loud warning naming the URL + reason, key still saved."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch)
+    _patch_verify(monkeypatch, status=401)
+
+    result = runner.invoke(
+        app,
+        ["auth", "bootstrap-seed", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Rich soft-wraps the warning; collapse whitespace runs so a wrap boundary
+    # mid-phrase doesn't break the substring match.
+    stderr = " ".join(result.stderr.split())
+    assert "FAILED to authenticate" in stderr
+    assert "movate-dev-api.example.azurecontainerapps.io" in stderr
+    assert "HTTP 401" in stderr
+    # The key is still saved locally.
+    creds = (tmp_path / ".movate" / "credentials").read_text()
+    assert "MDK_DEV_KEY=mvt_live_demotena_" in creds
+
+
+@pytest.mark.unit
+def test_bootstrap_seed_warning_never_prints_full_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify-failure warning masks the bearer (`…last4`) — the full
+    minted secret never appears in command output."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    captures = _patch_az(monkeypatch)
+    _patch_verify(monkeypatch, status=403)
+
+    result = runner.invoke(
+        app,
+        ["auth", "bootstrap-seed", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0
+    # The minted key from argv (the subprocess boundary) must NOT appear in
+    # the human-facing stdout/stderr.
+    set_call = next(c for c in captures["calls"] if c[:4] == ["az", "keyvault", "secret", "set"])
+    minted_key = set_call[set_call.index("--value") + 1]
+    assert minted_key not in (result.stdout + result.stderr)
+    # The masked tail is present in the warning.
+    assert f"…{minted_key[-4:]}" in (result.stdout + result.stderr).replace("\n", "")
+
+
+@pytest.mark.unit
+def test_bootstrap_seed_warns_when_shell_export_shadows_saved_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale exported `MDK_DEV_KEY` shadows the just-saved seed key — warn."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_demotena_stale_OLDSHELLVALUE")
+    _patch_az(monkeypatch)
+    _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(
+        app,
+        ["auth", "bootstrap-seed", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    stderr = " ".join(result.stderr.split())
+    assert "stale" in stderr and "MDK_DEV_KEY" in stderr
+    assert "unset MDK_DEV_KEY" in stderr
