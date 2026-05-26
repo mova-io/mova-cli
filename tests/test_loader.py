@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from movate.core.config import AgentDefaults
 from movate.core.loader import AgentLoadError, load_agent
+
+# Empty defaults → bypass any project policy.yaml so these loader tests run
+# pristine regardless of the invoking cwd (same escape hatch the layered-
+# defaults tests use).
+_NO_DEFAULTS = AgentDefaults()
 
 _TEMPLATE = Path(__file__).parent.parent / "src" / "movate" / "templates" / "agent_init"
 
@@ -75,6 +81,94 @@ def test_load_validation_error_surfaces(tmp_path: Path) -> None:
     yaml_path.write_text(yaml_path.read_text().replace("0.1.0", "not-a-version"))
     with pytest.raises(AgentLoadError, match=r"agent\.yaml validation failed"):
         load_agent(agent_dir)
+
+
+# ---------------------------------------------------------------------------
+# Friendly validation errors (PR: name unknown fields + allowed set +
+# did-you-mean). The schema stays strict-by-design (extra="forbid"); only
+# the MESSAGE improves so a human / LLM can self-correct.
+# ---------------------------------------------------------------------------
+
+
+def _write_agent_yaml(agent_dir: Path, *, extra_block: str) -> Path:
+    """Minimal valid agent.yaml + an injected `extra_block` (raw YAML)."""
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "agent.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Agent\n"
+        "name: friendly-errors\n"
+        "version: 0.1.0\n"
+        "model:\n"
+        "  provider: openai/gpt-4o-mini-2024-07-18\n"
+        "prompt: ./prompt.md\n"
+        "schema:\n"
+        "  input:\n"
+        "    message: string\n"
+        "  output:\n"
+        "    response: string\n"
+        f"{extra_block}"
+    )
+    (agent_dir / "prompt.md").write_text("p\n\n{{ input.message }}")
+    return agent_dir
+
+
+@pytest.mark.unit
+def test_unknown_nested_field_lists_allowed(tmp_path: Path) -> None:
+    """An unknown key under `metadata:` names the key + lists AgentMetadata's
+    allowed fields (the reported `category` case)."""
+    agent_dir = _write_agent_yaml(tmp_path / "demo", extra_block="metadata:\n  category: x\n")
+    with pytest.raises(AgentLoadError) as exc:
+        load_agent(agent_dir, defaults=_NO_DEFAULTS)
+    msg = str(exc.value)
+    assert "unknown field 'category'" in msg
+    assert "in 'metadata'" in msg
+    assert "allowed fields here:" in msg
+    # AgentMetadata's full field set must be listed so the user can self-correct.
+    for field_name in ("persona", "role", "capabilities", "tags", "examples", "owner"):
+        assert field_name in msg
+
+
+@pytest.mark.unit
+def test_unknown_nested_field_did_you_mean(tmp_path: Path) -> None:
+    """A near-miss typo gets a difflib did-you-mean suggestion."""
+    agent_dir = _write_agent_yaml(tmp_path / "demo", extra_block="metadata:\n  capabilites: []\n")
+    with pytest.raises(AgentLoadError) as exc:
+        load_agent(agent_dir, defaults=_NO_DEFAULTS)
+    msg = str(exc.value)
+    assert "unknown field 'capabilites'" in msg
+    assert "Did you mean 'capabilities'?" in msg
+
+
+@pytest.mark.unit
+def test_unknown_top_level_field_names_top_level(tmp_path: Path) -> None:
+    """A top-level extra key is reported as 'agent.yaml top level' and lists
+    AgentSpec's allowed fields."""
+    agent_dir = _write_agent_yaml(tmp_path / "demo", extra_block="foo: bar\n")
+    with pytest.raises(AgentLoadError) as exc:
+        load_agent(agent_dir, defaults=_NO_DEFAULTS)
+    msg = str(exc.value)
+    assert "unknown field 'foo'" in msg
+    assert "agent.yaml top level" in msg
+    # A couple of AgentSpec fields prove the allowed list is the top-level one.
+    assert "model" in msg
+    assert "prompt" in msg
+
+
+@pytest.mark.unit
+def test_non_extra_error_renders_clean_line(tmp_path: Path) -> None:
+    """A non-extra error (wrong type) still renders a clean `<loc>: <msg>`
+    line — no crash, no pydantic URL noise."""
+    agent_dir = _write_agent_yaml(
+        tmp_path / "demo", extra_block="timeouts:\n  call_ms: not-an-int\n"
+    )
+    with pytest.raises(AgentLoadError) as exc:
+        load_agent(agent_dir, defaults=_NO_DEFAULTS)
+    msg = str(exc.value)
+    assert "agent.yaml validation failed" in msg
+    assert "timeouts.call_ms:" in msg
+    # The friendly formatter strips the "For further information visit
+    # https://errors.pydantic.dev/..." trailer.
+    assert "errors.pydantic.dev" not in msg
 
 
 @pytest.mark.unit

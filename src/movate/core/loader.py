@@ -6,16 +6,18 @@ of the prompt template body for run-record traceability.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, get_args, get_origin
 
 import yaml
 from jinja2 import Environment, StrictUndefined, select_autoescape
 from jsonschema import Draft202012Validator
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from movate.core.canonical_schema import (
     CanonicalSchemaError,
@@ -141,6 +143,138 @@ class AgentBundle:
         return prefix + rendered
 
 
+def _unwrap_to_model(annotation: Any) -> type[BaseModel] | None:
+    """Reduce a field annotation to a nested :class:`BaseModel` subclass.
+
+    Field annotations in the agent.yaml schema are wrapped in a handful
+    of containers we want to see through to reach the model that holds
+    the *next* path segment's fields:
+
+    * ``Optional[X]`` / ``X | None`` / ``Union[A, B]`` — try each arm.
+    * ``list[X]`` / ``dict[K, V]`` — recurse into the element / value type
+      (the list/dict-index loc segment is itself an int we skip, but the
+      element type is where the nested model's fields live).
+
+    Returns the first :class:`BaseModel` subclass found, or ``None`` when
+    the annotation resolves to a scalar / unknown / forward-ref shape —
+    in which case the caller degrades gracefully. Never raises.
+    """
+    # Direct hit: the annotation already *is* a BaseModel subclass.
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+
+    origin = get_origin(annotation)
+
+    # Union / Optional (typing.Union and PEP 604 `X | None` both reported
+    # by get_origin as Union / types.UnionType respectively).
+    if origin in (Union, types.UnionType):
+        for arm in get_args(annotation):
+            if arm is type(None):
+                continue
+            resolved = _unwrap_to_model(arm)
+            if resolved is not None:
+                return resolved
+        return None
+
+    # list[X] / set[X] / tuple[X, ...] — recurse into element type(s).
+    # dict[K, V] — recurse into the value type (V), the last arg.
+    if origin in (list, set, frozenset, tuple):
+        for arg in get_args(annotation):
+            if arg is Ellipsis:
+                continue
+            resolved = _unwrap_to_model(arg)
+            if resolved is not None:
+                return resolved
+        return None
+    if origin is dict:
+        args = get_args(annotation)
+        if args:
+            return _unwrap_to_model(args[-1])
+        return None
+
+    return None
+
+
+def format_agent_validation_error(exc: ValidationError, root_model: type[BaseModel]) -> str:
+    """Render a pydantic :class:`ValidationError` as friendly, self-correcting lines.
+
+    The agent.yaml schema is strict (``extra="forbid"``) on purpose so a
+    typo'd key is caught, but pydantic's raw message only says *that* a
+    key is rejected, not *what's allowed*. This formatter walks the model
+    tree along each error's ``loc`` to recover the set of valid fields at
+    the offending container, names the bad key, and offers a did-you-mean.
+
+    ``root_model`` is the model ``.model_validate(...)`` was called on
+    (``AgentSpec`` at the loader seam). It MUST NEVER raise — any failure
+    to resolve a container model degrades to a plain "not part of the
+    schema" line so the user still gets a readable diagnostic.
+    """
+    lines: list[str] = []
+    for err in exc.errors():
+        loc = err.get("loc", ())
+        etype = err.get("type", "")
+        msg = err.get("msg", "")
+
+        if etype == "extra_forbidden" and loc:
+            lines.append(_format_extra_forbidden(loc, root_model))
+        else:
+            dotted = ".".join(str(seg) for seg in loc) if loc else "(root)"
+            lines.append(f"✗ {dotted}: {msg}")
+    return "\n".join(lines)
+
+
+def _format_extra_forbidden(loc: tuple[Any, ...], root_model: type[BaseModel]) -> str:
+    """Build the friendly line for a single ``extra_forbidden`` error.
+
+    Walks ``root_model`` along ``loc[:-1]`` (the path to the *container*
+    that holds the bad key, ``loc[-1]``), skipping integer segments (list
+    indices). When the container model is resolved we list its allowed
+    fields and add a difflib did-you-mean; when resolution fails for any
+    reason we degrade to a no-allowed-list line. Never raises.
+    """
+    bad_key = str(loc[-1])
+    container_path = loc[:-1]
+
+    try:
+        container: type[BaseModel] | None = root_model
+        for seg in container_path:
+            if isinstance(seg, int):
+                # List / tuple index — the element type is unchanged, so
+                # the container model stays the same.
+                continue
+            if container is None:
+                break
+            field_info = container.model_fields.get(str(seg))
+            if field_info is None:
+                container = None
+                break
+            container = _unwrap_to_model(field_info.annotation)
+
+        if container is not None:
+            allowed = sorted(container.model_fields.keys())
+            where = (
+                "agent.yaml top level"
+                if len(loc) == 1
+                else "'" + ".".join(str(s) for s in container_path) + "'"
+            )
+            line = (
+                f"✗ unknown field '{bad_key}' in {where} "
+                f"— allowed fields here: {', '.join(allowed)}"
+            )
+            suggestion = difflib.get_close_matches(bad_key, allowed, n=1, cutoff=0.6)
+            if suggestion:
+                line += f"\n  Did you mean '{suggestion[0]}'?"
+            return line
+    except Exception:
+        # The formatter must never raise — a malformed/complex annotation
+        # tree degrades to the plain "not part of the schema" line below.
+        pass
+
+    # Graceful degradation: complex Union / forward-ref / unexpected shape.
+    dotted = ".".join(str(s) for s in loc)
+    return f"✗ unknown field '{bad_key}' in '{dotted}' — not part of the agent.yaml schema"
+
+
 def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
     path: str | Path,
     *,
@@ -192,10 +326,15 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
     except ValidationError as exc:
         # Include the file path so the error reads like a compiler
         # diagnostic ("file: reason") rather than a bare stack-style
-        # message. Pydantic's exc carries field-level loc info; we
-        # prefix it with the file so editors can at least open the
-        # right document.
-        raise AgentLoadError(f"agent.yaml validation failed in {yaml_path}:\n{exc}") from exc
+        # message. Then render the per-field errors in a friendly,
+        # self-correcting form: name the unknown key, list the allowed
+        # fields at that container, and offer a did-you-mean — so a
+        # human (or an LLM helping author the file) can fix it without
+        # decoding pydantic's raw `extra_forbidden` string. Schema
+        # behavior is unchanged (still strict-by-design); only the
+        # MESSAGE improves. See `format_agent_validation_error`.
+        friendly = format_agent_validation_error(exc, AgentSpec)
+        raise AgentLoadError(f"agent.yaml validation failed in {yaml_path}:\n{friendly}") from exc
 
     prompt_path = (agent_dir / spec.prompt).resolve()
     if not prompt_path.exists():
