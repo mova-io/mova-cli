@@ -26,7 +26,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from movate.cli._console import error, get_global_target, hint
+from movate.cli._console import echo_remote_context, error, get_global_target, hint
 from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
@@ -73,7 +73,11 @@ def runs(
       $ mdk workflow runs -o json | jq '.workflow_runs[].workflow_run_id'
     """
     status = WorkflowStatus.PAUSED if paused else None
-    listing = asyncio.run(_fetch_runs(target=target, status=status, limit=limit))
+    listing = asyncio.run(
+        _fetch_runs(
+            target=target, status=status, limit=limit, suppress=output_format == TableJson.JSON
+        )
+    )
     if output_format == TableJson.JSON:
         stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
         return
@@ -148,7 +152,12 @@ def signal(
         raise typer.Exit(code=2) from None
 
     accepted = asyncio.run(
-        _signal(target=target, workflow_run_id=workflow_run_id, decision=payload)
+        _signal(
+            target=target,
+            workflow_run_id=workflow_run_id,
+            decision=payload,
+            suppress=output_format == TableJson.JSON,
+        )
     )
     if output_format == TableJson.JSON:
         stdout.print(accepted.model_dump_json(indent=2), soft_wrap=True, highlight=False)
@@ -204,9 +213,9 @@ def _ensure_dict(value: Any) -> dict[str, Any]:
 
 
 async def _fetch_runs(
-    *, target: str | None, status: WorkflowStatus | None, limit: int
+    *, target: str | None, status: WorkflowStatus | None, limit: int, suppress: bool = False
 ) -> WorkflowRunListView:
-    client = _build_client(target)
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner("fetching workflow runs..."):
@@ -217,9 +226,9 @@ async def _fetch_runs(
 
 
 async def _signal(
-    *, target: str | None, workflow_run_id: str, decision: dict[str, Any]
+    *, target: str | None, workflow_run_id: str, decision: dict[str, Any], suppress: bool = False
 ) -> RunAccepted:
-    client = _build_client(target)
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner("signalling..."):
@@ -229,18 +238,23 @@ async def _signal(
         raise typer.Exit(code=exc.status_code // 100) from None
 
 
-def _build_client(target: str | None) -> MovateClient:
+def _build_client(target: str | None, *, suppress: bool = False) -> MovateClient:
     """Resolve target name → MovateClient. Exits cleanly on config errors.
 
     Mirrors ``mdk jobs`` target precedence: per-command ``--target`` >
     top-level ``-t`` / ``MOVATE_TARGET`` > active config target.
+
+    Echoes the resolved target + URL + credential source (masked) on
+    stderr before returning, so a 401/403 is self-diagnosing.
+    ``suppress`` (passed by ``-o json`` callers) silences the echo.
     """
     try:
-        _, target_cfg = resolve_target(target or get_global_target())
+        target_name, target_cfg = resolve_target(target or get_global_target())
         token = resolve_bearer_token(target_cfg)
     except UserConfigError as exc:
         error(str(exc))
         raise typer.Exit(code=2) from None
+    echo_remote_context(target_name, target_cfg, suppress=suppress)
     return MovateClient(base_url=target_cfg.url, api_key=token)
 
 

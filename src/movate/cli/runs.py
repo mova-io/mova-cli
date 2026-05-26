@@ -31,7 +31,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from movate.cli._console import error, get_global_target
+from movate.cli._console import echo_remote_context, error, get_global_target
 from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
@@ -79,7 +79,9 @@ def show(
       [dim]# Pipe-friendly — grab just the output[/dim]
       $ mdk runs show 4f8a1c2e -t dev -o json | jq '.output'
     """
-    view = asyncio.run(_fetch_run(run_id=run_id, target=target))
+    view = asyncio.run(
+        _fetch_run(run_id=run_id, target=target, suppress=output_format == TableJson.JSON)
+    )
     _emit(view, output_format=output_format)
     # Exit 1 for terminal-but-failed; 0 for success. Mirrors `jobs show`
     # so bash branches can distinguish a failed run from a clean one.
@@ -93,8 +95,8 @@ def show(
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_run(*, run_id: str, target: str | None) -> RunView:
-    client = _build_client(target)
+async def _fetch_run(*, run_id: str, target: str | None, suppress: bool = False) -> RunView:
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner("fetching run..."):
@@ -104,17 +106,22 @@ async def _fetch_run(*, run_id: str, target: str | None) -> RunView:
         raise typer.Exit(code=exc.status_code // 100) from None
 
 
-def _build_client(target: str | None) -> MovateClient:
+def _build_client(target: str | None, *, suppress: bool = False) -> MovateClient:
     """Resolve target name → MovateClient. Exits cleanly on config errors.
 
     Same precedence as ``movate jobs`` (per-command ``--target`` →
-    top-level ``-t`` / ``MOVATE_TARGET`` → active config target)."""
+    top-level ``-t`` / ``MOVATE_TARGET`` → active config target).
+
+    Echoes the resolved target + URL + credential source (masked) on
+    stderr before returning, so a 401/403 is self-diagnosing.
+    ``suppress`` (passed by ``-o json`` callers) silences the echo."""
     try:
-        _, target_cfg = resolve_target(target or get_global_target())
+        target_name, target_cfg = resolve_target(target or get_global_target())
         token = resolve_bearer_token(target_cfg)
     except UserConfigError as exc:
         error(str(exc))
         raise typer.Exit(code=2) from None
+    echo_remote_context(target_name, target_cfg, suppress=suppress)
     return MovateClient(base_url=target_cfg.url, api_key=token)
 
 

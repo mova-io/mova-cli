@@ -38,7 +38,7 @@ import typer
 from rich.console import Console
 
 import movate
-from movate.cli._console import error, hint, success
+from movate.cli._console import echo_remote_context, error, hint, success
 from movate.cli._progress import spinner
 from movate.core.user_config import (
     TargetConfig,
@@ -901,6 +901,11 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
 
     base_url = target_cfg.url.rstrip("/")
     headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Echo the target + URL + credential source (masked) at the remote
+    # preflight, so a 401 from the upload below is self-diagnosing
+    # (which key, which URL). stderr-only, honors --quiet.
+    echo_remote_context(target_name, target_cfg, action="deploy")
 
     # Pre-deploy bearer validation. Catching a stale bearer with a
     # single cheap GET is way better than failing mid-multipart-upload

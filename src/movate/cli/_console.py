@@ -124,6 +124,90 @@ def warn(message: str, *, icon: str = "⚠") -> None:
     stderr.print(f"[yellow]{icon}[/yellow] {message}")
 
 
+def _mask_key(value: str) -> str:
+    """Render a non-leaking fingerprint of a bearer/key value.
+
+    Hard rule (CLAUDE.md security posture): NEVER print a secret in
+    full. We show only the last 4 characters, prefixed with ``…``, so
+    an operator can eyeball *which* key is in play (e.g. distinguish a
+    stale shell export from the freshly-saved one) without the value
+    ever appearing in logs / terminal scrollback / CI output.
+
+    * Unset / empty → ``"unset"`` (the source attribution will already
+      say ``unset``; this keeps the fingerprint column honest).
+    * 1-4 chars → ``…<value>`` (too short to mask meaningfully, but
+      still tagged so it's clearly a fingerprint, not the whole key).
+    * 5+ chars → ``…<last4>``.
+    """
+    v = value.strip()
+    if not v:
+        return "unset"
+    return f"…{v[-4:]}"
+
+
+def echo_remote_context(
+    target_name: str,
+    target_cfg: object,
+    *,
+    action: str | None = None,
+    suppress: bool = False,
+) -> None:
+    """Echo one stderr line naming the remote target + credential source.
+
+    Operators kept hitting 401/403 against a deployed runtime with no
+    idea WHICH credential or WHICH URL was actually in play — a stale
+    shell key shadowing a saved one, the wrong target, etc. Before every
+    operator-facing remote (runtime) call we print a single concise
+    self-diagnosing line::
+
+        → dev  https://movate-dev….azurecontainerapps.io  key: credentials_file …a1b2
+
+    so a subsequent failure explains itself ("oh — it used my shell key,
+    not the saved one").
+
+    Contents (all four are load-bearing): the target NAME, its resolved
+    base URL, the credential SOURCE (``shell`` / ``dotenv`` /
+    ``credentials_file`` / ``unset`` via :func:`credentials.key_source`),
+    and a MASKED key fingerprint (last 4 chars only — see
+    :func:`_mask_key`; the full key is NEVER printed).
+
+    Goes to **stderr** (machine-readable stdout stays clean) and is
+    suppressed when:
+
+    * ``--quiet`` is set (honors the module quiet flag, same as
+      :func:`hint`), or
+    * ``suppress=True`` — the caller passes this for ``--json`` /
+      machine-output modes so scripted use sees nothing extra. The line
+      is on stderr regardless, but suppressing it under ``--json`` keeps
+      parity with how the rest of the CLI gates human chatter.
+
+    Layer note (CLAUDE.md rule 6): this is a CLI-only concern — the
+    echo lives here, NOT in :class:`movate.core.client.MovateClient`,
+    so the core/control-plane boundary stays intact.
+
+    Distinct from the shell-shadow 401 hint in ``run.py`` (which fires
+    only on an actual rejection): this is the pre-call announcement, not
+    the post-failure diagnosis.
+    """
+    if suppress or _quiet:
+        return
+
+    import os  # noqa: PLC0415
+
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    key_env = getattr(target_cfg, "key_env", "") or ""
+    url = (getattr(target_cfg, "url", "") or "").rstrip("/")
+    source = key_source(key_env) if key_env else "unset"
+    fingerprint = _mask_key(os.environ.get(key_env, "")) if key_env else "unset"
+
+    verb = f"{action} " if action else ""
+    stderr.print(
+        f"[dim]→ {verb}[bold]{target_name}[/bold]  {url}  "
+        f"key: {source.replace('_', ' ')} {fingerprint}[/dim]"
+    )
+
+
 def confirm_destructive(prompt: str, *, yes: bool) -> None:
     """Gate a destructive operation behind an interactive confirm.
 
@@ -155,6 +239,7 @@ def success(message: str) -> None:
 
 __all__ = [
     "confirm_destructive",
+    "echo_remote_context",
     "error",
     "get_global_target",
     "hint",
