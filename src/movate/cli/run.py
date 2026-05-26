@@ -1100,7 +1100,7 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
         )
         raise typer.Exit(code=1) from None
 
-    _render_remote_run(run_view, output_format=output_format)
+    _render_remote_run(run_view, output_format=output_format, target_name=target_name)
 
     status = (run_view.get("status") or "").lower()
     ok = status == "success"
@@ -1183,7 +1183,9 @@ def _coerce_remote_agent_input(raw: str, agent_name: str) -> dict[str, Any]:
     )
 
 
-def _render_remote_run(run_view: dict[str, Any], *, output_format: Run) -> None:
+def _render_remote_run(
+    run_view: dict[str, Any], *, output_format: Run, target_name: str | None = None
+) -> None:
     """Render the RunView the runtime returned.
 
     Mirrors the local _run_local_agent rendering:
@@ -1210,10 +1212,23 @@ def _render_remote_run(run_view: dict[str, Any], *, output_format: Run) -> None:
     run_id = run_view.get("run_id")
     if run_id:
         short = str(run_id)[:8]
-        _console.hint(
-            f"[dim]→ remote run_id [bold]{short}[/bold] "
-            f"(persisted on the runtime, not locally)[/dim]"
-        )
+        # An inline (`wait=true`) remote run persists a RunRecord but does
+        # NOT enqueue a queryable JobRecord — so `mdk jobs list` won't show
+        # it. Point at `mdk runs show <run_id>` so the operator can look the
+        # result back up by id later (closes the "how do I check results?"
+        # gap). The hint carries the full id (not the short prefix) so it's
+        # copy-pasteable.
+        if target_name:
+            _console.hint(
+                f"[dim]→ remote run_id [bold]{short}[/bold] (persisted on the "
+                f"runtime, not locally) · inspect: "
+                f"[cyan]mdk runs show {run_id} --target {target_name}[/cyan][/dim]"
+            )
+        else:
+            _console.hint(
+                f"[dim]→ remote run_id [bold]{short}[/bold] "
+                f"(persisted on the runtime, not locally)[/dim]"
+            )
 
 
 def _handle_remote_async_submission(
