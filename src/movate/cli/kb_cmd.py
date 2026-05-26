@@ -601,6 +601,17 @@ def _remote_request(
     upload list (only one of ``json`` / ``files`` should be set).
     """
     target_name, target_cfg, base_url, api_key = _resolve_target_bearer(target)
+
+    # Echo target + URL + credential source (masked) before the call so
+    # a 401/403 below is self-diagnosing. Only for key-auth targets —
+    # the helper attributes the source via the target's ``key_env``,
+    # which is meaningless for OIDC (short-lived JWT) targets. Honors
+    # --quiet; stderr-only (kb has no machine-JSON stdout to protect).
+    if getattr(target_cfg, "auth", "key") != "oidc":
+        from movate.cli._console import echo_remote_context  # noqa: PLC0415
+
+        echo_remote_context(target_name, target_cfg)
+
     endpoint = f"{base_url}{path}"
 
     # Drop None-valued query params so an unset ``--source`` doesn't

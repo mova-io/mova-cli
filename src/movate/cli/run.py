@@ -950,6 +950,14 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
         console.print(f"[red]✗[/red] {exc}")
         raise typer.Exit(code=2) from None
 
+    # Echo which target + URL + credential source (masked) we're about
+    # to hit, so a subsequent 401/403 is self-diagnosing. Suppressed
+    # under --json (machine output) and --quiet; stderr-only so it
+    # never corrupts the JSON run view on stdout.
+    _console.echo_remote_context(
+        target_name, target_cfg, action="run", suppress=output_format != Run.TEXT
+    )
+
     # Read bearer from env. Matches the deploy preflight — separate
     # error from "target not configured" so the operator sees exactly
     # which knob to turn.

@@ -20,7 +20,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from movate.cli._console import error, get_global_target, hint, warn
+from movate.cli._console import echo_remote_context, error, get_global_target, hint, warn
 from movate.cli._output import TableJson
 from movate.cli._progress import spinner
 from movate.core.client import MovateClient, MovateClientError
@@ -52,7 +52,9 @@ def show(
     ),
 ) -> None:
     """Show the current state of one job."""
-    view = asyncio.run(_fetch_one(job_id=job_id, target=target))
+    view = asyncio.run(
+        _fetch_one(job_id=job_id, target=target, suppress=output_format == TableJson.JSON)
+    )
     _emit(view, output_format=output_format)
     # Exit 1 for terminal-but-failed; 0 for queued (still in-flight) and
     # for success. Lets bash branches distinguish in-flight vs failed.
@@ -79,7 +81,13 @@ def wait(
       $ movate jobs wait "$JOB_ID" --timeout 600
     """
     view = asyncio.run(
-        _wait_terminal(job_id=job_id, target=target, timeout=timeout, poll_interval=poll_interval)
+        _wait_terminal(
+            job_id=job_id,
+            target=target,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            suppress=output_format == TableJson.JSON,
+        )
     )
     _emit(view, output_format=output_format)
     if view.status != JobStatus.SUCCESS:
@@ -106,7 +114,9 @@ def cancel(
 
       $ movate jobs cancel "$JOB_ID"
     """
-    view = asyncio.run(_cancel_one(job_id=job_id, target=target))
+    view = asyncio.run(
+        _cancel_one(job_id=job_id, target=target, suppress=output_format == TableJson.JSON)
+    )
     if output_format == TableJson.JSON:
         stdout.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
         return
@@ -153,7 +163,11 @@ def list_jobs(
       [dim]# In-flight jobs only, pipe-friendly[/dim]
       $ movate jobs list -s running -o json | jq '.jobs[].job_id'
     """
-    listing = asyncio.run(_fetch_list(target=target, status=status, limit=limit))
+    listing = asyncio.run(
+        _fetch_list(
+            target=target, status=status, limit=limit, suppress=output_format == TableJson.JSON
+        )
+    )
     if output_format == TableJson.JSON:
         stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
         return
@@ -194,7 +208,7 @@ def list_agents(
     ),
 ) -> None:
     """List agents registered on the target runtime."""
-    listing = asyncio.run(_fetch_agents(target=target))
+    listing = asyncio.run(_fetch_agents(target=target, suppress=output_format == TableJson.JSON))
     if output_format == TableJson.JSON:
         stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
         return
@@ -255,8 +269,8 @@ def reap(
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_one(*, job_id: str, target: str | None) -> JobView:
-    client = _build_client(target)
+async def _fetch_one(*, job_id: str, target: str | None, suppress: bool = False) -> JobView:
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner("fetching job state..."):
@@ -266,8 +280,8 @@ async def _fetch_one(*, job_id: str, target: str | None) -> JobView:
         raise typer.Exit(code=exc.status_code // 100) from None
 
 
-async def _cancel_one(*, job_id: str, target: str | None) -> JobCancelView:
-    client = _build_client(target)
+async def _cancel_one(*, job_id: str, target: str | None, suppress: bool = False) -> JobCancelView:
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner("requesting cancellation..."):
@@ -278,9 +292,9 @@ async def _cancel_one(*, job_id: str, target: str | None) -> JobCancelView:
 
 
 async def _wait_terminal(
-    *, job_id: str, target: str | None, timeout: float, poll_interval: float
+    *, job_id: str, target: str | None, timeout: float, poll_interval: float, suppress: bool = False
 ) -> JobView:
-    client = _build_client(target)
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner(f"waiting on {job_id[:8]}..."):
@@ -297,8 +311,8 @@ async def _wait_terminal(
         raise typer.Exit(code=exc.status_code // 100) from None
 
 
-async def _fetch_agents(*, target: str | None) -> AgentListView:
-    client = _build_client(target)
+async def _fetch_agents(*, target: str | None, suppress: bool = False) -> AgentListView:
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             return await client.list_agents()
@@ -307,8 +321,10 @@ async def _fetch_agents(*, target: str | None) -> AgentListView:
         raise typer.Exit(code=exc.status_code // 100) from None
 
 
-async def _fetch_list(*, target: str | None, status: JobStatus | None, limit: int) -> JobListView:
-    client = _build_client(target)
+async def _fetch_list(
+    *, target: str | None, status: JobStatus | None, limit: int, suppress: bool = False
+) -> JobListView:
+    client = _build_client(target, suppress=suppress)
     try:
         async with client:
             with spinner("fetching jobs..."):
@@ -347,20 +363,26 @@ async def _reap(*, visibility_timeout: float | None) -> tuple[int, int]:
         await shutdown_runtime(runtime.storage, runtime.tracer)
 
 
-def _build_client(target: str | None) -> MovateClient:
+def _build_client(target: str | None, *, suppress: bool = False) -> MovateClient:
     """Resolve target name → MovateClient. Exits cleanly on config errors.
 
     Precedence (highest wins):
       1. Per-command ``--target`` flag (the ``target`` arg here).
       2. Top-level ``movate -t <name>`` / ``MOVATE_TARGET`` env var
          (via :func:`get_global_target`).
-      3. Active config target (``resolve_target(None)`` default)."""
+      3. Active config target (``resolve_target(None)`` default).
+
+    Echoes the resolved target + URL + credential source (masked) on
+    stderr before returning the client, so a 401/403 from the runtime
+    is self-diagnosing. ``suppress`` (passed by ``-o json`` callers)
+    silences the echo for machine-clean output."""
     try:
-        _, target_cfg = resolve_target(target or get_global_target())
+        target_name, target_cfg = resolve_target(target or get_global_target())
         token = resolve_bearer_token(target_cfg)
     except UserConfigError as exc:
         error(str(exc))
         raise typer.Exit(code=2) from None
+    echo_remote_context(target_name, target_cfg, suppress=suppress)
     return MovateClient(base_url=target_cfg.url, api_key=token)
 
 
