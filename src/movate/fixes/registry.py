@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -29,10 +30,25 @@ from enum import StrEnum
 from pathlib import Path
 
 from movate.core.paths import LEGACY_STATE_DIR_NAME, STATE_DIR_NAME
+from movate.credentials.loader import PROVIDER_KEY_ENV_VARS, _looks_like_runtime_key_env
+from movate.credentials.store import CredentialsStore
 
 # Canonical "tight" mode for secrets files. Lifted to a constant so the
 # perms-check logic doesn't sprinkle 0o600 magic numbers all over.
 _SECRETS_FILE_MODE = 0o600
+
+# Shell profile files we scan for stale key exports. Order = display
+# order in messages; we touch ALL that match (an export can be
+# duplicated across several profiles).
+_SHELL_PROFILE_NAMES: tuple[str, ...] = (".zshrc", ".bashrc", ".bash_profile", ".profile")
+
+# Self-documenting marker prefixed onto any line we comment out, so the
+# operator knows WHY it's disabled and our re-run comment-detection
+# skips it (it starts with ``#``, so it's no longer an active export).
+_DISABLED_MARKER = "# disabled by mdk fix (shadowed ~/.movate/credentials):"
+
+# Suffix for the one-time backup we write before editing a profile.
+_PROFILE_BACKUP_SUFFIX = ".mdk-bak"
 
 
 class FixStatus(StrEnum):
@@ -260,6 +276,194 @@ def _apply_agents_dir(root: Path, dry_run: bool) -> FixResult:
 
 
 # ---------------------------------------------------------------------------
+# Shell-shadow fix: stale `export <VAR>=...` in a shell profile shadows a
+# freshly-saved key in ~/.movate/credentials.
+#
+# Credential precedence is shell env > project .env > ~/.movate/credentials
+# (see ``movate.credentials.loader.autoload_credentials``, which never
+# clobbers an already-set env var). A leftover ``export MDK_DEV_KEY=...``
+# (or ``export OPENAI_API_KEY=...``) in ~/.zshrc therefore SILENTLY wins
+# over a rotated key in the credentials file → 401s the operator can't
+# explain. The canonical home for these is ~/.movate/credentials, not the
+# shell profile.
+#
+# A child process can't unset an env var in its parent shell, so the fix
+# keys on the PERSISTENT, remediable source — the uncommented profile
+# export line — and prints ``unset <VAR>`` as a manual follow-up for the
+# live session.
+# ---------------------------------------------------------------------------
+
+
+def _tracked_shadow_vars() -> tuple[str, ...]:
+    """Env vars whose presence in BOTH the credentials file and a shell
+    profile constitutes a shadow.
+
+    The runtime-bearer pattern ``MDK_<X>_KEY`` (matched by shape so we
+    pick up every target the operator has saved, not a hardcoded list)
+    plus the known LLM provider keys. We read the saved set from the
+    credentials store so we only ever track vars the operator actually
+    has a canonical value for — a benign lone export with no saved cred
+    is never flagged.
+    """
+    saved = CredentialsStore().read()
+    runtime_keys = tuple(name for name in saved if _looks_like_runtime_key_env(name))
+    # De-dupe while preserving a stable order: provider keys first, then
+    # any saved runtime-bearer keys.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in (*PROVIDER_KEY_ENV_VARS, *runtime_keys):
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return tuple(ordered)
+
+
+def _profile_paths() -> list[Path]:
+    """The user's shell profile files that currently exist.
+
+    ``Path.home()`` honors ``$HOME`` (tests monkeypatch it) — we never
+    hardcode an absolute home. Only existing files are returned; we
+    don't create profiles that aren't there.
+    """
+    home = Path.home()
+    return [home / name for name in _SHELL_PROFILE_NAMES if (home / name).is_file()]
+
+
+def _active_export_pattern(var: str) -> re.Pattern[str]:
+    """Match an *uncommented* ``export <VAR>=...`` or bare ``<VAR>=...`` line.
+
+    Leading whitespace is tolerated; a leading ``#`` is NOT — already-
+    commented lines (including ones we previously disabled) must not
+    match, which is what makes the fix idempotent.
+    """
+    return re.compile(rf"^\s*(?:export\s+)?{re.escape(var)}=")
+
+
+def _profiles_shadowing(var: str) -> list[Path]:
+    """Profile files containing at least one active export of ``var``."""
+    pattern = _active_export_pattern(var)
+    hits: list[Path] = []
+    for path in _profile_paths():
+        for raw in path.read_text().splitlines():
+            if pattern.match(raw):
+                hits.append(path)
+                break
+    return hits
+
+
+def _check_unshadow_runtime_keys(root: Path) -> bool:
+    """Fix needed when a tracked var is BOTH saved in ~/.movate/credentials
+    AND actively exported (uncommented) in at least one shell profile.
+
+    ``root`` is ignored — shell profiles are operator-wide, not project-
+    wide — but we keep the signature consistent with every other fix.
+    The dual condition (saved cred + active export) is deliberate: it
+    flags a genuine shadow and never a benign lone export of a var the
+    operator never saved.
+    """
+    _ = root
+    return any(_profiles_shadowing(var) for var in _tracked_shadow_vars())
+
+
+def _apply_unshadow_runtime_keys(root: Path, dry_run: bool) -> FixResult:
+    """Comment out stale profile exports that shadow ~/.movate/credentials.
+
+    Dry-run names each offending var + the profile file(s) and active
+    line(s) that would be commented (VAR names only — never the secret
+    value). Apply mode writes a one-time ``<profile>.mdk-bak`` before
+    editing, then prefixes each matching active export with the
+    self-documenting :data:`_DISABLED_MARKER` so it's inert + skipped on
+    re-run. Idempotent: a second run finds no active export → NOT_NEEDED.
+    """
+    _ = root
+    fix_id = "unshadow-runtime-keys"
+
+    # Map of var -> profile paths that actively export it. Drives both
+    # the dry-run message and the apply edits.
+    shadows: dict[str, list[Path]] = {}
+    for var in _tracked_shadow_vars():
+        hits = _profiles_shadowing(var)
+        if hits:
+            shadows[var] = hits
+
+    if dry_run:
+        lines = [f"{var} in {', '.join(str(p) for p in paths)}" for var, paths in shadows.items()]
+        return FixResult(
+            fix_id=fix_id,
+            status=FixStatus.WOULD_APPLY,
+            message=(
+                "would comment out shadowing export line(s): "
+                + "; ".join(lines)
+                + " (these shadow ~/.movate/credentials)"
+            ),
+        )
+
+    # Apply: edit each affected profile once. A profile may shadow more
+    # than one var, so collect the set of profiles + the vars each one
+    # carries, edit it a single time, and back it up once.
+    profiles_to_vars: dict[Path, list[str]] = {}
+    for var, paths in shadows.items():
+        for path in paths:
+            profiles_to_vars.setdefault(path, []).append(var)
+
+    commented: list[str] = []
+    touched_vars: set[str] = set()
+    for path, profile_vars in profiles_to_vars.items():
+        _backup_profile_once(path)
+        for var in _comment_active_exports(path, profile_vars):
+            commented.append(f"{var} in {path}")
+            touched_vars.add(var)
+
+    follow_ups = " ".join(f"`unset {var}`" for var in sorted(touched_vars))
+    return FixResult(
+        fix_id=fix_id,
+        status=FixStatus.APPLIED,
+        message=(
+            "commented out shadowing export line(s): "
+            + "; ".join(commented)
+            + ". Now run "
+            + follow_ups
+            + " in your current shell (or open a new shell) for the saved key to take effect."
+        ),
+    )
+
+
+def _backup_profile_once(path: Path) -> None:
+    """Write a one-time ``<profile>.mdk-bak`` before first edit.
+
+    Skipped if a backup already exists — we never clobber an earlier
+    backup (which would lose the pristine pre-mdk content).
+    """
+    backup = path.with_name(path.name + _PROFILE_BACKUP_SUFFIX)
+    if backup.exists():
+        return
+    backup.write_text(path.read_text())
+
+
+def _comment_active_exports(path: Path, vars_: list[str]) -> list[str]:
+    """Comment out every active export of any var in ``vars_`` in ``path``.
+
+    Returns the list of VAR names whose active export(s) were commented
+    (names only — never values). Already-commented lines are skipped
+    (their leading ``#`` means the active-export pattern won't match),
+    keeping the operation idempotent.
+    """
+    patterns = {var: _active_export_pattern(var) for var in vars_}
+    out: list[str] = []
+    touched: list[str] = []
+    for raw in path.read_text().splitlines():
+        matched_var = next((var for var, pat in patterns.items() if pat.match(raw)), None)
+        if matched_var is None:
+            out.append(raw)
+            continue
+        out.append(f"{_DISABLED_MARKER} {raw}")
+        touched.append(matched_var)
+    path.write_text("\n".join(out) + "\n")
+    return touched
+
+
+# ---------------------------------------------------------------------------
 # OCR optional-package fix helpers
 # ---------------------------------------------------------------------------
 
@@ -396,6 +600,23 @@ def available_fixes() -> list[Fix]:
             ),
             check=_check_secrets_permissions,
             apply_fn=_apply_secrets_permissions,
+        ),
+        Fix(
+            id="unshadow-runtime-keys",
+            label="Comment stale shell-profile key exports",
+            description=(
+                "Comment out a stale `export MDK_<X>_KEY=...` / "
+                "`export OPENAI_API_KEY=...` (etc.) line in a shell profile "
+                "(~/.zshrc, ~/.bashrc, ~/.bash_profile, ~/.profile) that "
+                "shadows a freshly-saved key in ~/.movate/credentials, "
+                "causing silent 401s. Fires only when the SAME var is both "
+                "saved in the credentials file and actively exported in a "
+                "profile. Writes a one-time <profile>.mdk-bak, then prints "
+                "the `unset <VAR>` you must run in your current shell. Never "
+                "prints or touches secret values; only edits profile files."
+            ),
+            check=_check_unshadow_runtime_keys,
+            apply_fn=_apply_unshadow_runtime_keys,
         ),
         Fix(
             id="install-ocr-extra",
