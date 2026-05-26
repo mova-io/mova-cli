@@ -20,7 +20,7 @@ import asyncio
 import contextlib
 import os
 from collections.abc import Iterable
-from typing import Literal
+from typing import Any, Literal
 
 import typer
 from rich.console import Console
@@ -1373,12 +1373,29 @@ def _migrate_backend(*, src_name: str, dst_name: str, remove_source: bool) -> No
 
 
 @auth_app.command("status")
-def status() -> None:
+def status(
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help=(
+            "Round-trip each key-auth runtime target's saved bearer against its "
+            "deployed runtime (one authenticated call per target) and show ✓/✗ + "
+            "reason. Off by default — this makes network calls. OIDC targets are "
+            "skipped (their auth model differs)."
+        ),
+    ),
+) -> None:
     """Show which provider keys are configured and where they came from.
 
     Renders a table per provider showing the resolved value's source
     (shell / dotenv / credentials_file / unset). Operators see at a
     glance which keys are wired and where to fix gaps.
+
+    With ``--verify``, additionally round-trips each key-auth runtime
+    target's saved bearer against its deployed runtime (reusing the same
+    admin-scoped probe ``mdk deploy`` / adopt-time verification use) so the
+    operator learns whether a saved key *actually authenticates*, not just
+    that it's set. This is opt-in because it makes network calls.
     """
     from movate.credentials import (  # noqa: PLC0415
         PROVIDER_KEY_ENV_VARS,
@@ -1507,7 +1524,7 @@ def status() -> None:
     # constantly grep for them. Show them HERE so `mdk auth status`
     # is the one command that answers "am I wired up?".
     # ------------------------------------------------------------------
-    _render_runtime_targets_section(counts)
+    _render_runtime_targets_section(counts, verify=verify)
 
     stdout.print()
     # Backend-aware: shows the file path for the default file backend, or
@@ -1527,7 +1544,7 @@ def status() -> None:
     )
 
 
-def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PLR0912 — per-target state-machine reads clearer flat than refactored
+def _render_runtime_targets_section(counts: dict[str, int], *, verify: bool = False) -> None:  # noqa: PLR0912 — per-target state-machine reads clearer flat than refactored
     """Append the Runtime Targets table to `mdk auth status` output.
 
     For each target in ~/.movate/config.yaml shows:
@@ -1540,6 +1557,13 @@ def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PL
     operator isn't logged in, we skip the drift detection and don't
     fail the whole `status` command — the LLM-keys part still works
     offline.
+
+    When ``verify`` is ``True``, a "Round-trip" column is added and each
+    ``auth='key'`` target with a resolvable URL + bearer gets a real
+    authenticated call (``_verify_bearer_roundtrip``) rendering ✓ / ✗ +
+    reason. ``auth='oidc'`` targets show ``n/a`` (their auth model
+    differs). With ``verify`` ``False`` (the default) NO network calls are
+    made and the column is omitted — behavior is unchanged.
     """
     from movate.core.user_config import (  # noqa: PLC0415
         UserConfigError,
@@ -1577,6 +1601,10 @@ def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PL
     table.add_column("Bearer", no_wrap=True)
     table.add_column("URL", style="dim", no_wrap=False)
     table.add_column("Azure subscription", style="dim", no_wrap=False)
+    # The round-trip column only exists under --verify so the default,
+    # offline render is byte-for-byte unchanged (compat: additive only).
+    if verify:
+        table.add_column("Round-trip", no_wrap=False)
 
     for name in sorted(cfg.targets):
         target = cfg.targets[name]
@@ -1618,7 +1646,11 @@ def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PL
         else:
             azure_cell = "[dim]—[/dim]"
 
-        table.add_row(name_cell, bearer_cell, target.url, azure_cell)
+        if verify:
+            verify_cell = _verify_target_roundtrip_cell(target)
+            table.add_row(name_cell, bearer_cell, target.url, azure_cell, verify_cell)
+        else:
+            table.add_row(name_cell, bearer_cell, target.url, azure_cell)
 
     stdout.print(table)
 
@@ -1628,6 +1660,56 @@ def _render_runtime_targets_section(counts: dict[str, int]) -> None:  # noqa: PL
             "[dim]→ Azure drift detection skipped (`az` not installed or "
             "not logged in). Run [bold]az login[/bold] to enable.[/dim]"
         )
+
+
+def _verify_target_roundtrip_cell(target: Any) -> str:
+    """Render the ``--verify`` round-trip cell for one runtime target.
+
+    Resolution per target:
+
+    * ``auth='oidc'`` → ``n/a``. OIDC bearers are short-lived JWTs minted
+      from a token provider, not a saved opaque key; verifying them is a
+      different flow, so we skip rather than mislead.
+    * URL comes from the target's ``url``; the bearer is the resolved
+      ``os.environ[key_env]`` (the autoloaded / shell-exported value),
+      falling back to the saved credentials-store value — the same
+      precedence the rest of ``status`` reads. If either the URL or a
+      bearer is missing we show a quiet skip — there's nothing to check.
+    * Otherwise we make ONE authenticated call via deploy's
+      ``_verify_bearer_roundtrip`` (imported lazily to dodge the module-load
+      circular dependency between the auth + deploy CLI modules) and render
+      ✓ on success or ✗ + the reason on failure.
+
+    The key is NEVER printed — only the round-trip outcome. Best-effort:
+    never raises, so a single unreachable target can't fail ``status``.
+    """
+    if getattr(target, "auth", "key") != "key":
+        return "[dim]n/a (oidc)[/dim]"
+
+    base_url = (getattr(target, "url", "") or "").strip().rstrip("/")
+    key_env = getattr(target, "key_env", "") or ""
+    # Prefer the resolved env value (autoloaded / shell-exported), but fall
+    # back to the saved credentials-store value so a saved-but-not-yet-
+    # autoloaded key (e.g. saved this session) still verifies.
+    key = os.environ.get(key_env, "").strip() if key_env else ""
+    if not key and key_env:
+        from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+        key = (CredentialsStore().get(key_env) or "").strip()
+
+    if not base_url:
+        return "[dim]— (no url)[/dim]"
+    if not key:
+        return "[dim]— (no key)[/dim]"
+
+    # Lazy import: deploy.py imports from auth.py at module load, so a
+    # top-level import here would form a circular dependency.
+    from movate.cli.deploy import _verify_bearer_roundtrip  # noqa: PLC0415
+
+    ok, reason = _verify_bearer_roundtrip(base_url=base_url, key=key)
+    if ok:
+        return "[green]✓ authenticates[/green]"
+    return f"[red]✗ {reason}[/red]"
 
 
 def _current_az_subscription() -> str | None:

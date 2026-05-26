@@ -258,6 +258,202 @@ def test_status_skips_drift_when_az_unavailable(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# --verify: opt-in round-trip auth check (extends #448 to the status view)
+# ---------------------------------------------------------------------------
+
+
+def _patch_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    result: tuple[bool, str],
+) -> list[dict[str, str]]:
+    """Patch deploy's `_verify_bearer_roundtrip` (the fn auth.py imports
+    lazily under --verify) to a canned result, and record every call so
+    tests can assert WHICH url/key it was invoked with — and, crucially,
+    that it was NOT called at all without --verify.
+
+    Returns the calls list (mutated in place as the fn is invoked)."""
+    import movate.cli.deploy as deploy_mod  # noqa: PLC0415
+
+    calls: list[dict[str, str]] = []
+
+    def _fake(*, base_url: str, key: str) -> tuple[bool, str]:
+        calls.append({"base_url": base_url, "key": key})
+        return result
+
+    monkeypatch.setattr(deploy_mod, "_verify_bearer_roundtrip", _fake)
+    return calls
+
+
+@pytest.mark.unit
+def test_status_verify_ok_renders_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--verify` on a key-auth target whose bearer authenticates →
+    ✓ round-trip cell. The fn is called with the target's url + the
+    resolved bearer."""
+    _isolate_auth_state(tmp_path, monkeypatch)
+    _write_user_config(
+        tmp_path,
+        "active: dev\n"
+        "targets:\n"
+        "  dev:\n"
+        "    url: https://movate-dev-api.example.azurecontainerapps.io\n"
+        "    key_env: MDK_DEV_KEY\n",
+    )
+    creds = tmp_path / ".movate" / "credentials"
+    creds.write_text("MDK_DEV_KEY=mvt_live_demo_KIDABCDEF12_secretXYZ\n")
+    _patch_az(monkeypatch, current_subscription=None, az_available=False)
+    calls = _patch_roundtrip(monkeypatch, result=(True, ""))
+
+    result = runner.invoke(app, ["auth", "status", "--verify"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "Round-trip" in combined  # column header only present under --verify
+    assert "authenticates" in combined
+    # Called exactly once, with the right url + resolved bearer.
+    assert len(calls) == 1
+    assert calls[0]["base_url"] == "https://movate-dev-api.example.azurecontainerapps.io"
+    assert calls[0]["key"] == "mvt_live_demo_KIDABCDEF12_secretXYZ"
+
+
+@pytest.mark.unit
+def test_status_verify_failure_renders_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--verify` on a target whose bearer is rejected → ✗ + the reason
+    surfaced (here a 403/scope failure), so the operator knows the saved
+    key is set-but-broken."""
+    _isolate_auth_state(tmp_path, monkeypatch)
+    _write_user_config(
+        tmp_path,
+        "active: dev\n"
+        "targets:\n"
+        "  dev:\n"
+        "    url: https://dev.example.com\n"
+        "    key_env: MDK_DEV_KEY\n",
+    )
+    creds = tmp_path / ".movate" / "credentials"
+    creds.write_text("MDK_DEV_KEY=mvt_live_demo_KIDABCDEF12_secretXYZ\n")
+    _patch_az(monkeypatch, current_subscription=None, az_available=False)
+    _patch_roundtrip(
+        monkeypatch,
+        result=(False, "HTTP 403 (key lacks admin scope; uploads need admin)"),
+    )
+
+    result = runner.invoke(app, ["auth", "status", "--verify"], env={"COLUMNS": "300"})
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    # ✗ marker + the reason surface. Rich may word-wrap the long reason
+    # across lines in the narrow cell, so assert on individual tokens
+    # (wrapping never splits inside a word) rather than the whole phrase.
+    assert "✗" in combined
+    assert "403" in combined
+    assert "scope" in combined
+
+
+@pytest.mark.unit
+def test_status_without_verify_makes_no_network_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default (no --verify) must stay offline: the round-trip fn is
+    never invoked and no Round-trip column appears."""
+    _isolate_auth_state(tmp_path, monkeypatch)
+    _write_user_config(
+        tmp_path,
+        "active: dev\n"
+        "targets:\n"
+        "  dev:\n"
+        "    url: https://dev.example.com\n"
+        "    key_env: MDK_DEV_KEY\n",
+    )
+    creds = tmp_path / ".movate" / "credentials"
+    creds.write_text("MDK_DEV_KEY=mvt_live_demo_KIDABCDEF12_secretXYZ\n")
+    _patch_az(monkeypatch, current_subscription=None, az_available=False)
+    calls = _patch_roundtrip(monkeypatch, result=(True, ""))
+
+    result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    # No network call, no column.
+    assert calls == []
+    assert "Round-trip" not in (result.stdout + result.stderr)
+
+
+@pytest.mark.unit
+def test_status_verify_skips_oidc_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """OIDC targets show n/a and are NOT round-tripped (their auth model
+    differs — a saved opaque key isn't what authenticates them)."""
+    _isolate_auth_state(tmp_path, monkeypatch)
+    _write_user_config(
+        tmp_path,
+        "active: oidc-prod\n"
+        "targets:\n"
+        "  oidc-prod:\n"
+        "    url: https://oidc.example.com\n"
+        "    key_env: MDK_PROD_KEY\n"
+        "    auth: oidc\n"
+        "    oidc_resource: api://movate\n",
+    )
+    # Even if a key happens to be saved, an oidc target must not be probed.
+    creds = tmp_path / ".movate" / "credentials"
+    creds.write_text("MDK_PROD_KEY=mvt_live_demo_KIDABCDEF12_secretXYZ\n")
+    _patch_az(monkeypatch, current_subscription=None, az_available=False)
+    calls = _patch_roundtrip(monkeypatch, result=(True, ""))
+
+    result = runner.invoke(app, ["auth", "status", "--verify"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert "n/a" in combined
+    # OIDC target never round-tripped.
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_status_verify_never_prints_full_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full bearer must never appear in --verify output — neither on
+    success nor failure (the round-trip cell shows only the outcome)."""
+    _isolate_auth_state(tmp_path, monkeypatch)
+    secret = "mvt_live_demo_KIDABCDEF12_secretXYZ"
+    _write_user_config(
+        tmp_path,
+        "active: dev\n"
+        "targets:\n"
+        "  dev:\n"
+        "    url: https://dev.example.com\n"
+        "    key_env: MDK_DEV_KEY\n",
+    )
+    creds = tmp_path / ".movate" / "credentials"
+    creds.write_text(f"MDK_DEV_KEY={secret}\n")
+    _patch_az(monkeypatch, current_subscription=None, az_available=False)
+    _patch_roundtrip(monkeypatch, result=(False, "HTTP 401"))
+
+    result = runner.invoke(app, ["auth", "status", "--verify"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    combined = result.stdout + result.stderr
+    assert secret not in combined
+
+
+@pytest.mark.unit
+def test_status_verify_skips_target_without_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key-auth target whose bearer is unset can't be round-tripped —
+    show a quiet skip, don't call the fn (nothing to verify)."""
+    _isolate_auth_state(tmp_path, monkeypatch)
+    _write_user_config(
+        tmp_path,
+        "targets:\n  prod:\n    url: https://prod.example.com\n    key_env: MDK_PROD_KEY\n",
+    )
+    # No credentials → key unset.
+    _patch_az(monkeypatch, current_subscription=None, az_available=False)
+    calls = _patch_roundtrip(monkeypatch, result=(True, ""))
+
+    result = runner.invoke(app, ["auth", "status", "--verify"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    assert calls == []
+
+
 @pytest.mark.unit
 def test_status_summary_includes_runtime_bearer_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
