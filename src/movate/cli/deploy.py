@@ -599,6 +599,7 @@ _HTTP_OK = 200
 _HTTP_CREATED = 201
 _HTTP_BAD_REQUEST = 400
 _HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
 _HTTP_CONFLICT = 409
 _HTTP_SERVICE_UNAVAILABLE = 503
 
@@ -1463,26 +1464,103 @@ def _resolve_keyvault_name(target_cfg: Any) -> str | None:
     return None
 
 
-def _verify_bearer_roundtrip(*, base_url: str, key: str) -> tuple[bool, str]:
-    """One ``GET /api/v1/agents`` round-trip to confirm a candidate bearer works.
+def _discover_keyvault_in_resource_group(target_cfg: Any) -> str | None:
+    """Best-effort: find the runtime's Key Vault in the target's resource group.
 
-    Returns ``(verified, reason)``. ``verified`` is ``True`` only on a 2xx;
-    any non-2xx (notably ``401``) or transport error returns ``False`` with a
-    short human-readable reason. The recovery path uses this so it never
-    declares "bearer key ready" — nor overwrites a previously-working saved
-    key — for a candidate that hasn't actually authenticated against the
-    deployed runtime.
+    The vault name is ``movate-{env}-kv{suffix}`` where ``suffix`` is an
+    operator-chosen value (see the infra Bicep ``nameSuffix`` param), so it
+    can't be reconstructed from config alone — but it CAN be discovered by
+    listing the vaults in the target's resource group and picking the one
+    whose name matches the ``movate-{env}-kv`` prefix. This lets deploy's
+    auto-recovery prefer the guaranteed-trusted bootstrap key even when the
+    target never set ``azure_keyvault`` explicitly (the live regression
+    skipped the KV path for exactly this reason and fell straight to an
+    under-scoped in-pod mint).
+
+    Returns the discovered vault name, or ``None`` when ``az`` is missing,
+    the resource group / env aren't configured, the list call fails, or no
+    name matches. Never raises — discovery is purely an optimization on top
+    of the in-pod mint fallback.
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    resource_group = getattr(target_cfg, "azure_resource_group", None)
+    azure_env = getattr(target_cfg, "azure_env", None)
+    if not resource_group or not azure_env or shutil.which("az") is None:
+        return None
+
+    prefix = f"movate-{azure_env}-kv"
+    try:
+        result = subprocess.run(
+            [
+                "az",
+                "keyvault",
+                "list",
+                "-g",
+                resource_group,
+                "--query",
+                "[].name",
+                "-o",
+                "tsv",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    # Exact ``movate-{env}-kv`` (empty suffix) wins; otherwise the first
+    # prefixed vault (``movate-{env}-kv-mvt`` etc.). Deterministic ordering
+    # keeps recovery reproducible when a resource group holds several.
+    for name in sorted(names):
+        if name == prefix:
+            return name
+    for name in sorted(names):
+        if name.startswith(prefix):
+            return name
+    return None
+
+
+def _verify_bearer_roundtrip(*, base_url: str, key: str) -> tuple[bool, str]:
+    """Confirm a candidate bearer is ADMIN-capable — the capability a deploy needs.
+
+    The deploy bearer performs admin uploads (``POST/PUT /api/v1/agents``,
+    both gated on the ``admin`` scope). A bearer that merely authenticates
+    (``read``) is NOT good enough: it sails through a ``GET /api/v1/agents``
+    probe yet 403s on the very first agent upload. So this probes the
+    admin-scoped, read-only ``GET /api/v1/auth/keys`` endpoint instead and
+    only declares the bearer ready when the runtime grants admin.
+
+    Returns ``(verified, reason)``:
+
+    * **2xx** — authenticated AND admin-capable → ``(True, "")``.
+    * **403** — authenticated but the key lacks the ``admin`` scope (the
+      live regression: an in-pod mint defaulted to ``read,run,eval``) →
+      ``(False, "HTTP 403 (key lacks admin scope; uploads need admin)")``.
+    * **401** — bad/unknown bearer → ``(False, "HTTP 401")``.
+    * transport error → ``(False, "runtime unreachable (...)")``.
+
+    The recovery path uses this so it never declares "bearer key ready" — nor
+    overwrites a previously-working saved key — for a candidate that can't
+    actually deploy.
     """
     try:
         with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
             resp = client.get(
-                f"{base_url}/api/v1/agents",
+                f"{base_url}/api/v1/auth/keys",
                 headers={"Authorization": f"Bearer {key}"},
             )
     except httpx.HTTPError as exc:
         return False, f"runtime unreachable ({type(exc).__name__})"
     if resp.status_code < _HTTP_BAD_REQUEST:
         return True, ""
+    if resp.status_code == _HTTP_FORBIDDEN:
+        return False, "HTTP 403 (key lacks admin scope; uploads need admin)"
     return False, f"HTTP {resp.status_code}"
 
 
@@ -1540,9 +1618,15 @@ def _obtain_recovery_key(*, target_name: str, keyvault: str | None) -> tuple[str
         RefreshRuntimeKeyError,
         refresh_runtime_key_inline,
     )
+    from movate.core.auth import SCOPE_FLEET_ADMIN  # noqa: PLC0415
 
     try:
-        key, _env_var = refresh_runtime_key_inline(target_name)
+        # The deploy bearer performs admin uploads (POST/PUT /api/v1/agents),
+        # so the in-pod mint MUST carry an admin grant — a default-scoped
+        # (read,run,eval) key authenticates but 403s on the first upload.
+        # fleet-admin expands to the full scope set at the runtime, covering
+        # admin + everything the rest of the deploy touches.
+        key, _env_var = refresh_runtime_key_inline(target_name, scopes=[SCOPE_FLEET_ADMIN])
     except RefreshRuntimeKeyError as exc:
         err.print(
             f"  [red]✗[/red] auto-recovery failed: {exc}. "
@@ -1550,28 +1634,31 @@ def _obtain_recovery_key(*, target_name: str, keyvault: str | None) -> tuple[str
             "manually to debug."
         )
         return None, ""
-    return key, "minted in-pod"
+    return key, "minted in-pod (fleet-admin)"
 
 
 def _attempt_auto_recovery(*, target_name: str, base_url: str, target_cfg: Any) -> str | None:
-    """Recover a working runtime bearer for ``target_name``, verified end-to-end.
+    """Recover a working, ADMIN-CAPABLE runtime bearer for ``target_name``.
 
-    Prefers PULLING the seeded bootstrap key from Key Vault (when the target
-    names one) — it's the key the running runtime is guaranteed to trust —
-    and otherwise mints one inside the Container App. EITHER way the candidate
-    is round-trip verified (``GET /api/v1/agents``) before it's declared
-    ready: an in-pod mint can land in a store the serving replica never reads
-    (non-durable SQLite, multi-replica), so "minting succeeded" does not imply
-    "the runtime trusts it".
+    Prefers PULLING the seeded ``fleet-admin`` bootstrap key from Key Vault
+    (when the target names one, or when one can be DISCOVERED in the target's
+    resource group) — it's the key the running runtime is guaranteed to trust
+    AND it carries admin reach — and otherwise mints a ``fleet-admin`` key
+    inside the Container App. EITHER way the candidate is verified for the
+    capability the deploy NEEDS (``GET /api/v1/auth/keys``, an admin-scoped
+    read) before it's declared ready: an in-pod mint can land in a store the
+    serving replica never reads (non-durable SQLite, multi-replica) AND a
+    read-only key authenticates but 403s on the admin uploads — so neither
+    "minting succeeded" nor "it can authenticate" implies "it can deploy".
 
     On success: keeps the candidate saved, prints a verified-ready line, warns
     about a shell var that would shadow it, and returns the bearer.
 
-    On failure (candidate rejected, or no candidate obtainable): RESTORES the
-    previously-saved key — never clobbering a working bearer with one that
-    401s — points the operator at ``mdk auth pull-runtime-key`` (the
-    guaranteed-trusted path), and returns ``None``. Never raises — recovery is
-    best-effort.
+    On failure (candidate rejected as non-admin-capable, or none obtainable):
+    RESTORES the previously-saved key — never clobbering a working bearer with
+    one that 401s/403s — points the operator at ``mdk auth pull-runtime-key``
+    (the guaranteed-trusted path), and returns ``None``. Never raises —
+    recovery is best-effort.
     """
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
@@ -1582,6 +1669,16 @@ def _attempt_auto_recovery(*, target_name: str, base_url: str, target_cfg: Any) 
     # leaving a 401ing value where a working key used to be.
     prior_saved = store.get(env_var)
     keyvault = _resolve_keyvault_name(target_cfg)
+    if keyvault is None:
+        # The target didn't name a vault, but the bootstrap key (fleet-admin,
+        # guaranteed-trusted) beats an in-pod mint — try to DISCOVER the
+        # runtime's vault in the resource group before falling back.
+        keyvault = _discover_keyvault_in_resource_group(target_cfg)
+        if keyvault is not None:
+            err.print(
+                f"  [dim]Discovered Key Vault [bold]{keyvault}[/bold] in the "
+                f"resource group; pulling the bootstrap key.[/dim]"
+            )
 
     candidate, source = _obtain_recovery_key(target_name=target_name, keyvault=keyvault)
     if candidate is None:

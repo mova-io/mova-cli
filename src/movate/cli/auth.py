@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from collections.abc import Iterable
 from typing import Literal
 
 import typer
@@ -1812,6 +1813,7 @@ def refresh_runtime_key_inline(  # noqa: PLR0912 — orchestrator; az shell-out 
     env: str = "live",
     label: str | None = None,
     container_app: str | None = None,
+    scopes: Iterable[str] | None = None,
 ) -> tuple[str, str]:
     """Mint + save a fresh runtime bearer programmatically.
 
@@ -1820,6 +1822,14 @@ def refresh_runtime_key_inline(  # noqa: PLR0912 — orchestrator; az shell-out 
     nothing. Callers in non-interactive contexts (auto-recovery from
     ``mdk deploy``'s 401 handler) use this to avoid shelling out to
     another ``mdk`` process.
+
+    ``scopes`` (ADR 013 L2) is forwarded to the in-pod ``mdk auth
+    create-key`` as ``--scope`` flags. ``None``/empty preserves the legacy
+    behaviour (the minted key resolves to ``read,run,eval``) — the default
+    for interactive ``refresh-runtime-key`` callers, who mint a tenant key.
+    The deploy 401 auto-recovery passes ``["fleet-admin"]`` (or ``admin``)
+    because the deploy bearer performs ADMIN uploads (``POST/PUT
+    /api/v1/agents``); a default-scoped key would 403 on the first upload.
 
     Returns:
         ``(minted_key, env_var)`` — the new ``mvt_*`` bearer and the
@@ -1895,6 +1905,13 @@ def refresh_runtime_key_inline(  # noqa: PLR0912 — orchestrator; az shell-out 
         "--env",
         env,
     ]
+    # Forward the requested least-privilege scopes (ADR 013 L2) as repeated
+    # `--scope` flags. Omitting them keeps the inner create-key on its legacy
+    # default (read,run,eval) — which is correct for an interactive tenant
+    # key but would 403 on the admin uploads the deploy bearer performs, so
+    # the deploy recovery path passes admin/fleet-admin explicitly.
+    for scope in normalize_scopes(scopes):
+        inner_cmd_parts.extend(["--scope", scope])
     if label:
         inner_cmd_parts.extend(["--label", label])
     inner_cmd_parts.append("--quiet")
