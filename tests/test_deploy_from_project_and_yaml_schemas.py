@@ -300,13 +300,13 @@ def test_deploy_agents_401_in_upload_loop_triggers_auto_recovery_and_retries(
 
     def fake_upload_agent(
         *, client: Any, base_url: str, headers: dict[str, str], agent_dir: Path, project_root: Any
-    ) -> str | None:
+    ) -> deploy_mod.AgentUploadOutcome:
         call_count["agent"] += 1
         if call_count["agent"] == 1:
-            return deploy_mod._REASON_UNAUTHORIZED
+            return deploy_mod.AgentUploadOutcome(error=deploy_mod._REASON_UNAUTHORIZED)
         # Bearer must have rotated by the second call — assert it.
         assert headers["Authorization"] == "Bearer mvt_live_fresh_keyid_secret"
-        return None
+        return deploy_mod.AgentUploadOutcome(error=None, published_version="0.1.0")
 
     def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
         call_count["refresh"] += 1
@@ -353,9 +353,9 @@ def test_deploy_agents_401_with_no_auto_recover_skips_refresh_and_fails(
 
     call_count = {"agent": 0, "refresh": 0}
 
-    def fake_upload_agent(**_: Any) -> str | None:
+    def fake_upload_agent(**_: Any) -> deploy_mod.AgentUploadOutcome:
         call_count["agent"] += 1
-        return deploy_mod._REASON_UNAUTHORIZED
+        return deploy_mod.AgentUploadOutcome(error=deploy_mod._REASON_UNAUTHORIZED)
 
     def fake_refresh(target: str, **_: Any) -> tuple[str, str]:
         call_count["refresh"] += 1

@@ -36,6 +36,7 @@ from movate.runtime.agent_resolver import (
     content_hash,
     import_filesystem_agents,
     materialize_bundle,
+    publish_agent_bundle,
     resolve_agent_bundle,
 )
 from movate.runtime.dispatch import WorkerDispatch
@@ -308,6 +309,215 @@ async def test_put_agents_dual_writes_new_version(
     assert {"0.1.0", "0.2.0"} <= seen
     latest = await storage.get_agent_bundle("registry-bot", tenant_id=tenant_id)
     assert latest is not None and latest.version == "0.2.0"
+
+
+# ---------------------------------------------------------------------------
+# ADR 021 — publish-on-content-change (re-deploy updates the served agent)
+# ---------------------------------------------------------------------------
+
+
+def _put_agent(client: TestClient, headers: dict[str, str], *, prompt: bytes) -> object:
+    """Re-deploy ``registry-bot`` via PUT with the SAME declared version
+    (0.1.0) but a possibly-different prompt — the iterate-without-bumping
+    case ADR 021 fixes."""
+    return client.put(
+        "/api/v1/agents/registry-bot",
+        files=[
+            ("agent_yaml", ("agent.yaml", _AGENT_YAML, "application/x-yaml")),
+            ("prompt", ("prompt.md", prompt, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers=headers,
+    )
+
+
+@pytest.mark.unit
+async def test_publish_no_op_when_content_unchanged(storage: InMemoryStorage) -> None:
+    """publish_agent_bundle is a no-op when the content_hash matches the
+    latest version — no new row, ``published=False`` (ADR 021 D2)."""
+    files = _make_record(name="pub", tenant_id="t1").files
+    first = await publish_agent_bundle(
+        storage, name="pub", tenant_id="t1", version="0.1.0", files=files
+    )
+    assert first.published is True
+    assert first.version == "0.1.0"
+
+    again = await publish_agent_bundle(
+        storage, name="pub", tenant_id="t1", version="0.1.0", files=files
+    )
+    assert again.published is False
+    assert again.version == "0.1.0"
+    # No duplicate history row written.
+    versions = await storage.list_agent_versions("pub", tenant_id="t1")
+    assert len(versions) == 1
+
+
+@pytest.mark.unit
+async def test_publish_changed_content_same_version_derives_hash_suffix(
+    storage: InMemoryStorage,
+) -> None:
+    """Content changed but the declared version didn't → a derived
+    ``<version>+<hash8>`` registry version becomes the new latest, and the
+    old (name, version) row is never mutated (ADR 021 D2 + ADR 014)."""
+    files_v1 = _make_record(name="pub", tenant_id="t1").files
+    await publish_agent_bundle(storage, name="pub", tenant_id="t1", version="0.1.0", files=files_v1)
+
+    files_v2 = dict(files_v1)
+    files_v2["prompt.md"] = "A WHOLLY DIFFERENT PROMPT {{ input.text }}\n"
+    new_hash = content_hash(files_v2)
+
+    result = await publish_agent_bundle(
+        storage, name="pub", tenant_id="t1", version="0.1.0", files=files_v2
+    )
+    assert result.published is True
+    # Declared 0.1.0 collided → derived a distinct PEP-440 local version.
+    assert result.version == f"0.1.0+{new_hash[:8]}"
+    assert result.previous_version == "0.1.0"
+
+    # latest now serves the NEW content...
+    latest = await storage.get_agent_bundle("pub", tenant_id="t1")
+    assert latest is not None
+    assert latest.content_hash == new_hash
+    assert latest.version == f"0.1.0+{new_hash[:8]}"
+    # ...and the original immutable 0.1.0 row is untouched (its content
+    # is still the v1 hash — never mutated).
+    original = await storage.get_agent_bundle("pub", tenant_id="t1", version="0.1.0")
+    assert original is not None
+    assert original.content_hash == content_hash(files_v1)
+
+
+@pytest.mark.unit
+async def test_publish_changed_content_bumped_version_uses_declared(
+    storage: InMemoryStorage,
+) -> None:
+    """Content changed AND the declared version is new → the declared
+    version is used verbatim (clean history, no derived suffix)."""
+    files_v1 = _make_record(name="pub", tenant_id="t1").files
+    await publish_agent_bundle(storage, name="pub", tenant_id="t1", version="0.1.0", files=files_v1)
+
+    files_v2 = dict(files_v1)
+    files_v2["prompt.md"] = "bumped prompt {{ input.text }}\n"
+    result = await publish_agent_bundle(
+        storage, name="pub", tenant_id="t1", version="0.2.0", files=files_v2
+    )
+    assert result.published is True
+    assert result.version == "0.2.0"
+    latest = await storage.get_agent_bundle("pub", tenant_id="t1")
+    assert latest is not None and latest.version == "0.2.0"
+
+
+@pytest.mark.unit
+async def test_redeploy_changed_prompt_updates_served_bundle(
+    storage: InMemoryStorage, auth_setup, tmp_path: Path
+) -> None:
+    """THE ADR 021 regression (headline).
+
+    Re-deploy ``registry-bot`` via PUT with a CHANGED prompt but the SAME
+    declared version 0.1.0. The durable registry's latest must serve the
+    NEW content (new content_hash), and a resolve/run picks up the new
+    bundle — proving the served agent actually updates on re-deploy. The
+    immutable original 0.1.0 row is preserved."""
+    headers, tenant_id = auth_setup
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    app = build_app(storage, agents_path=agents_path, rate_limit_per_minute=None)
+    client = TestClient(app)
+
+    _publish_agent(client, headers)
+    original = await storage.get_agent_bundle("registry-bot", tenant_id=tenant_id)
+    assert original is not None
+    original_hash = original.content_hash
+
+    new_prompt = b"COMPLETELY NEW BEHAVIOR: {{ input.text }}\n"
+    r = _put_agent(client, headers, prompt=new_prompt)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["changed"] is True
+    # The published version is a derived <version>+<hash8> (version not bumped).
+    assert body["published_version"].startswith("0.1.0+")
+
+    # latest now serves the changed content...
+    latest = await storage.get_agent_bundle("registry-bot", tenant_id=tenant_id)
+    assert latest is not None
+    assert latest.content_hash != original_hash
+    assert latest.files["prompt.md"] == new_prompt.decode()
+
+    # ...and a resolve (the run-resolution path) returns the NEW bundle.
+    resolved = await resolve_agent_bundle(storage, "registry-bot", tenant_id=tenant_id)
+    assert resolved is not None
+    assert (resolved.agent_dir / "prompt.md").read_text() == new_prompt.decode()
+
+    # Immutability: the first 0.1.0 row still has the original content.
+    first_row = await storage.get_agent_bundle("registry-bot", tenant_id=tenant_id, version="0.1.0")
+    assert first_row is not None
+    assert first_row.content_hash == original_hash
+
+
+@pytest.mark.unit
+async def test_redeploy_unchanged_content_reports_no_change(
+    storage: InMemoryStorage, auth_setup, tmp_path: Path
+) -> None:
+    """A re-deploy with byte-identical content writes NO new registry row
+    and the runtime reports ``changed=false`` (ADR 021 D2/D4)."""
+    headers, tenant_id = auth_setup
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    app = build_app(storage, agents_path=agents_path, rate_limit_per_minute=None)
+    client = TestClient(app)
+
+    _publish_agent(client, headers)
+    before = await storage.list_agent_versions("registry-bot", tenant_id=tenant_id)
+
+    # Re-deploy the SAME bundle (same prompt bytes).
+    r = _put_agent(client, headers, prompt=_PROMPT)
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] is False
+
+    after = await storage.list_agent_versions("registry-bot", tenant_id=tenant_id)
+    assert len(after) == len(before)  # no new row
+
+
+@pytest.mark.unit
+async def test_get_agent_honors_exact_version(
+    storage: InMemoryStorage, auth_setup, tmp_path: Path
+) -> None:
+    """GET /api/v1/agents/{name}?version=X returns that exact version;
+    an unknown version 404s (does NOT fall back to latest) — ADR 021 D3."""
+    headers, _tenant_id = auth_setup
+    agents_path = tmp_path / "agents"
+    agents_path.mkdir()
+    app = build_app(storage, agents_path=agents_path, rate_limit_per_minute=None)
+    client = TestClient(app)
+
+    _publish_agent(client, headers)
+    # Bump to a real second version via PUT.
+    bumped = _AGENT_YAML.replace(b"version: 0.1.0", b"version: 0.2.0")
+    r = client.put(
+        "/api/v1/agents/registry-bot",
+        files=[
+            ("agent_yaml", ("agent.yaml", bumped, "application/x-yaml")),
+            ("prompt", ("prompt.md", b"v2 prompt {{ input.text }}\n", "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+    # Exact older version resolves to that version.
+    r1 = client.get("/api/v1/agents/registry-bot?version=0.1.0", headers=headers)
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["version"] == "0.1.0"
+
+    # Exact newer version resolves to that version.
+    r2 = client.get("/api/v1/agents/registry-bot?version=0.2.0", headers=headers)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["version"] == "0.2.0"
+
+    # Unknown version 404s — no silent fall-back to latest.
+    r3 = client.get("/api/v1/agents/registry-bot?version=9.9.9", headers=headers)
+    assert r3.status_code == 404, r3.text
 
 
 # ---------------------------------------------------------------------------

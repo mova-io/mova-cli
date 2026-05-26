@@ -409,6 +409,15 @@ class AgentUpdatedView(BaseModel):
     files_persisted: list[str]
     previous_version: str
     """Version of the bundle that was replaced."""
+    published_version: str | None = None
+    """The registry version now serving as ``latest`` (ADR 021 D2). Equals
+    ``version`` when the declared ``agent.yaml`` version was unique, or a
+    derived ``<version>+<hash8>`` when the content changed without a version
+    bump. ``None`` only if the durable registry write was unavailable."""
+    changed: bool = True
+    """Whether this re-deploy actually published new content (ADR 021 D2).
+    ``False`` for a no-op re-deploy whose bundle bytes were unchanged — the
+    served agent already matches, so no new registry row was written."""
 
 
 class AgentCreatedView(BaseModel):
@@ -435,6 +444,15 @@ class AgentCreatedView(BaseModel):
     """Sorted list of files written, relative to ``agent_dir``.
     E.g. ``["agent.yaml", "evals/dataset.jsonl", "prompt.md",
     "schema/input.json", "schema/output.json"]``."""
+    published_version: str | None = None
+    """The registry version now serving as ``latest`` (ADR 021 D2). Equals
+    ``version`` when the declared ``agent.yaml`` version was unique, or a
+    derived ``<version>+<hash8>`` when content changed without a version
+    bump. ``None`` only if the durable registry write was unavailable."""
+    changed: bool = True
+    """Whether this publish wrote new content to the registry (ADR 021 D2).
+    ``False`` for a no-op (the bundle bytes already match the latest
+    published version) — no new registry row was written."""
 
 
 class AgentVersionView(BaseModel):

@@ -611,6 +611,28 @@ _HTTP_SERVICE_UNAVAILABLE = 503
 _REASON_UNAUTHORIZED = "__unauthorized__"
 
 
+@dataclass(frozen=True)
+class AgentUploadOutcome:
+    """Per-agent result of :func:`_upload_one_agent_bundle` (ADR 021 D4).
+
+    ``error`` is ``None`` on success, or a failure reason string (which may
+    be the :data:`_REASON_UNAUTHORIZED` sentinel the auto-recovery loop
+    watches for). On success, ``changed`` reports whether the re-deploy
+    actually published new content to the durable registry (``False`` for a
+    no-op whose bundle bytes were unchanged), and ``published_version`` is
+    the registry version now serving as ``latest`` (the runtime derives a
+    ``<version>+<hash8>`` label when content changed without a version bump).
+    """
+
+    error: str | None
+    changed: bool = True
+    published_version: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
 def _deploy_status(*, target: str | None) -> None:
     """List live agents on the target runtime via GET /api/v1/agents."""
     import os  # noqa: PLC0415
@@ -906,6 +928,9 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
         )
 
         uploaded: list[str] = []
+        # Per-agent success outcome (changed flag + published version) so
+        # the summary can report "published (v)" vs "no change" (ADR 021 D4).
+        outcomes: dict[str, AgentUploadOutcome] = {}
         failed: list[tuple[str, str]] = []  # (name, reason)
 
         with httpx.Client(timeout=httpx.Timeout(60.0)) as client:
@@ -917,10 +942,11 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
                     agent_dir=agent_dir,
                     project_root=project_root,
                 )
-                if result is None:
+                if result.ok:
                     uploaded.append(agent_dir.name)
+                    outcomes[agent_dir.name] = result
                 else:
-                    failed.append((agent_dir.name, result))
+                    failed.append((agent_dir.name, result.error or "unknown error"))
 
             # Auto-recovery: if anything 401'd, try minting a fresh key
             # inside the Container App + retry the failing items once.
@@ -968,10 +994,11 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
                             agent_dir=agent_dir,
                             project_root=project_root,
                         )
-                        if result is None:
+                        if result.ok:
                             retry_uploaded.append(agent_dir.name)
+                            outcomes[agent_dir.name] = result
                         else:
-                            retry_failures.append((agent_dir.name, result))
+                            retry_failures.append((agent_dir.name, result.error or "unknown error"))
                     # Splice retry results into the original lists,
                     # dropping the prior unauthorized entries.
                     failed = [
@@ -1000,7 +1027,15 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     for name, reason in skill_failed:
         err.print(f"  [red]✗[/red] skill [bold]{name}[/bold] — {reason}")
     for name in uploaded:
-        err.print(f"  [green]✓[/green] uploaded agent [bold]{name}[/bold]")
+        outcome = outcomes.get(name)
+        pub = outcome.published_version if outcome is not None else None
+        ver = f" ([cyan]{pub}[/cyan])" if pub else ""
+        # ADR 021 D4: report what was actually published. A no-op re-deploy
+        # (content unchanged) is "no change", NOT a misleading "uploaded".
+        if outcome is not None and not outcome.changed:
+            err.print(f"  [dim]•[/dim] agent [bold]{name}[/bold]{ver} — no change")
+        else:
+            err.print(f"  [green]✓[/green] published agent [bold]{name}[/bold]{ver}")
     for name, reason in failed:
         err.print(f"  [red]✗[/red] agent [bold]{name}[/bold] — {reason}")
     err.print()
@@ -1032,9 +1067,15 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             target_name=target_name,
         )
 
+    # ADR 021 D4: distinguish agents that actually published new content
+    # from no-op re-deploys (content unchanged), additive to the existing
+    # ``uploaded`` count so the line stays back-compatible.
+    published_count = sum(1 for n in uploaded if outcomes.get(n, AgentUploadOutcome(None)).changed)
+    unchanged_count = len(uploaded) - published_count
     err.print(
         f"[dim]mdk_deploy_summary: target={target_name} mode=agents "
         f"agents={len(agent_dirs)} uploaded={len(uploaded)} "
+        f"published={published_count} unchanged={unchanged_count} "
         f"failed={len(failed)} "
         f"skills_uploaded={len(skill_uploaded)} skills_failed={len(skill_failed)} "
         f"ok={'true' if ok else 'false'}[/dim]"
@@ -1813,16 +1854,21 @@ def _upload_one_agent_bundle(
     headers: dict[str, str],
     agent_dir: Path,
     project_root: Path | None = None,
-) -> str | None:
+) -> AgentUploadOutcome:
     """Upload a single agent bundle via multipart POST /api/v1/agents.
 
-    Tries ``POST /api/v1/agents`` first (creates the agent). On 409
-    (already-exists), falls back to the runtime's PUT endpoint to
-    replace the on-disk bundle — agents-mode deploy is idempotent.
+    Tries ``POST /api/v1/agents`` first (creates the agent). On **409**
+    (already-exists), falls back to ``PUT /api/v1/agents/{name}`` to
+    re-publish the bundle — so a re-deploy of CHANGED content actually
+    updates what runs (ADR 021). The runtime is content-addressed: an
+    unchanged re-deploy is a no-op it reports as ``changed=false`` (we
+    surface that as "no change" rather than a misleading "uploaded").
 
-    Returns ``None`` on success, or a string reason on failure.
-    Caller renders the reason; we don't print here so the loop can
-    aggregate.
+    Returns an :class:`AgentUploadOutcome`: ``error=None`` on success
+    (with ``changed`` + ``published_version`` from the runtime's
+    response), or a failure reason on ``error`` (possibly the
+    :data:`_REASON_UNAUTHORIZED` sentinel). Caller renders the result; we
+    don't print here so the loop can aggregate.
     """
     import httpx  # noqa: PLC0415
 
@@ -1847,9 +1893,9 @@ def _upload_one_agent_bundle(
 
     files: list[tuple[str, tuple[str, bytes, str]]] = []
     if not agent_yaml.is_file():
-        return f"missing {agent_yaml.relative_to(agent_dir)}"
+        return AgentUploadOutcome(error=f"missing {agent_yaml.relative_to(agent_dir)}")
     if not prompt_md.is_file():
-        return f"missing {prompt_md.relative_to(agent_dir)}"
+        return AgentUploadOutcome(error=f"missing {prompt_md.relative_to(agent_dir)}")
 
     # YAML-schema accommodation. The deployed runtime's multipart
     # endpoint hard-codes the persistence paths as schema/input.json
@@ -1921,17 +1967,35 @@ def _upload_one_agent_bundle(
             headers=headers,
         )
     except httpx.HTTPError as exc:
-        return f"network error: {exc}"
+        return AgentUploadOutcome(error=f"network error: {exc}")
 
     if response.status_code == _HTTP_CREATED:
-        return None
+        return _agent_upload_success(response)
     if response.status_code == _HTTP_CONFLICT:
-        # Already exists — replace via PUT for idempotency. PR #95
-        # ships POST-only; PUT support is gated on the runtime's
-        # PUT /api/v1/agents/{name} endpoint (item 76 in BACKLOG).
-        # For now, treat 409 as a soft success (agent IS deployed,
-        # just not from this exact bundle) so the demo keeps moving.
-        return None
+        # Already exists — re-publish via PUT so a re-deploy of CHANGED
+        # content actually updates what runs (ADR 021). The runtime is
+        # content-addressed: PUT writes a new immutable registry version
+        # only when the bundle bytes changed, and reports ``changed=false``
+        # for an unchanged re-deploy (which we surface as "no change"
+        # rather than the misleading "✓ uploaded" this used to print).
+        name = agent_dir.name
+        try:
+            put_response = client.put(
+                f"{base_url}/api/v1/agents/{name}",
+                files=files,
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            return AgentUploadOutcome(error=f"network error: {exc}")
+        if put_response.status_code == _HTTP_OK:
+            return _agent_upload_success(put_response)
+        if put_response.status_code == _HTTP_UNAUTHORIZED:
+            return AgentUploadOutcome(error=_REASON_UNAUTHORIZED)
+        try:
+            put_body = put_response.json()
+        except Exception:
+            put_body = {"raw": put_response.text[:200]}
+        return AgentUploadOutcome(error=f"HTTP {put_response.status_code}: {put_body!r}")
     # 401 from the runtime means our bearer token was rejected. The
     # bearer was set (we passed the env-var-empty preflight) but the
     # runtime has no matching ApiKeyRecord. The auth path is opaque
@@ -1941,14 +2005,37 @@ def _upload_one_agent_bundle(
     # (SQLite-in-pod fallback). Return the sentinel so the outer
     # loop can decide between auto-recovery and reporting.
     if response.status_code == _HTTP_UNAUTHORIZED:
-        return _REASON_UNAUTHORIZED
+        return AgentUploadOutcome(error=_REASON_UNAUTHORIZED)
     # Try to surface the runtime's error body verbatim so the
     # operator sees the actual validation failure.
     try:
         body = response.json()
     except Exception:
         body = {"raw": response.text[:200]}
-    return f"HTTP {response.status_code}: {body!r}"
+    return AgentUploadOutcome(error=f"HTTP {response.status_code}: {body!r}")
+
+
+def _agent_upload_success(response: object) -> AgentUploadOutcome:
+    """Build a success :class:`AgentUploadOutcome` from a 200/201 response.
+
+    Parses the runtime's ``published_version`` + ``changed`` fields (ADR
+    021 D4) so the deploy summary reports what was actually published.
+    Tolerates an older runtime that doesn't send those fields — defaults to
+    ``changed=True`` (the pre-ADR-021 assumption) so the output stays
+    forward-compatible.
+    """
+    import httpx  # noqa: PLC0415
+
+    assert isinstance(response, httpx.Response)
+    try:
+        body = response.json()
+    except Exception:
+        body = {}
+    changed = bool(body.get("changed", True)) if isinstance(body, dict) else True
+    published_version = (
+        body.get("published_version") or body.get("version") if isinstance(body, dict) else None
+    )
+    return AgentUploadOutcome(error=None, changed=changed, published_version=published_version)
 
 
 def _schema_bytes_for_upload(path: Path, *, label: str) -> tuple[bytes, str]:
