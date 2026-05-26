@@ -63,6 +63,24 @@ def _pg_test_url() -> str | None:
     return os.environ.get("MOVATE_PG_TEST_URL")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_credentials_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Hard safety guard: redirect the credentials store to a per-test tmp
+    file so NO test can ever read or clobber the developer's (or CI's) real
+    ``~/.movate/credentials``.
+
+    Why this exists: the store's default path was frozen at import time, so a
+    test that only monkeypatched ``HOME`` did NOT get isolated — it truncated
+    the real credentials file and wrote a stub key (``sk-test-12345``),
+    silently destroying a developer's saved OpenAI/Anthropic keys on every
+    ``pytest`` run. Setting ``MOVATE_CREDENTIALS_PATH`` here uses the store's
+    dynamic env-override branch, so isolation holds regardless of import
+    order or per-test HOME patching. A test that needs a specific location
+    can still override ``MOVATE_CREDENTIALS_PATH`` itself.
+    """
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "credentials"))
+
+
 @pytest.fixture(
     params=[
         "memory",
