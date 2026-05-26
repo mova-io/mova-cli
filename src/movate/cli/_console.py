@@ -169,7 +169,11 @@ def echo_remote_context(
     base URL, the credential SOURCE (``shell`` / ``dotenv`` /
     ``credentials_file`` / ``unset`` via :func:`credentials.key_source`),
     and a MASKED key fingerprint (last 4 chars only — see
-    :func:`_mask_key`; the full key is NEVER printed).
+    :func:`_mask_key`; the full key is NEVER printed). When the saved
+    runtime-bearer value overrode a stale shell export (ADR 022, surfaced
+    via :func:`credentials.runtime_key_shadowed`) the source is suffixed
+    with ``(shell value overridden)`` so the override is transparent at the
+    point of use — not silent.
 
     Goes to **stderr** (machine-readable stdout stays clean) and is
     suppressed when:
@@ -194,18 +198,39 @@ def echo_remote_context(
 
     import os  # noqa: PLC0415
 
-    from movate.credentials import key_source  # noqa: PLC0415
+    from movate.credentials import key_source, runtime_key_shadowed  # noqa: PLC0415
 
     key_env = getattr(target_cfg, "key_env", "") or ""
     url = (getattr(target_cfg, "url", "") or "").rstrip("/")
+    # Source is derived from the SAME `key_source` primitive `mdk auth status`
+    # uses — never hardcoded. After ADR 022 a file-authoritative runtime key
+    # resolves to `credentials_file`, so this label is honest (it used to
+    # mislabel a shell-sourced key as "credentials file"). When the saved
+    # value overrode a stale shell export we append a short, transparent note
+    # so the operator sees WHY the masked key isn't their shell value.
     source = key_source(key_env) if key_env else "unset"
+    shadow_note = " (shell value overridden)" if key_env and runtime_key_shadowed(key_env) else ""
     fingerprint = _mask_key(os.environ.get(key_env, "")) if key_env else "unset"
 
     verb = f"{action} " if action else ""
     stderr.print(
         f"[dim]→ {verb}[bold]{target_name}[/bold]  {url}  "
-        f"key: {source.replace('_', ' ')} {fingerprint}[/dim]"
+        f"key: {source.replace('_', ' ')} {fingerprint}{shadow_note}[/dim]"
     )
+    # ADR 022 D2: when the saved key overrode a stale shell export, emit ONE
+    # actionable, self-explaining line (never a silent 401). Fires only at
+    # this point of use (a remote call is imminent) — NOT on every CLI
+    # invocation from autoload — so it stays low-noise. Reconcile paths: make
+    # the shell value durable by persisting it, or fall back to it by
+    # clearing the saved key (no override env var — ADR 022 D3).
+    if shadow_note:
+        stderr.print(
+            f"[yellow]⚠[/yellow] ignoring stale [bold]${key_env}[/bold] in your shell — "
+            f"using the key saved in [cyan]~/.movate/credentials[/cyan]. "
+            f"To make the shell value win, persist it "
+            f"([bold]mdk auth save-runtime-key {target_name} -[/bold]), "
+            f"or clear the saved key to fall back to the shell."
+        )
 
 
 def confirm_destructive(prompt: str, *, yes: bool) -> None:

@@ -35,6 +35,7 @@ from movate.credentials.loader import (
     PROVIDER_KEY_ENV_VARS,
     autoload_credentials,
     key_source,
+    runtime_key_shadowed,
 )
 from movate.credentials.store import (
     CREDENTIALS_PATH,
@@ -62,5 +63,6 @@ __all__ = [
     "autoload_credentials",
     "build_backend",
     "key_source",
+    "runtime_key_shadowed",
     "verify_provider_key",
 ]

@@ -39,6 +39,7 @@ from movate.cli import _console
 from movate.cli._console import _mask_key, echo_remote_context
 from movate.cli.main import app
 from movate.core.user_config import TargetConfig
+from movate.credentials.loader import _reset_shadow_state, autoload_credentials
 
 runner = CliRunner(mix_stderr=False)
 
@@ -46,6 +47,16 @@ runner = CliRunner(mix_stderr=False)
 # ever appear in output. Anything else leaking is a security failure.
 _FULL_KEY = "mvt_dev_t1_k1_supersecret_value_a1b2"
 _LAST4 = "a1b2"
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_key_shadow() -> object:
+    """The ADR-022 shadow ledger is process-global module state. Reset it
+    before AND after each test so the override note in one test never bleeds
+    into another that sets env directly (without re-running autoload)."""
+    _reset_shadow_state()
+    yield
+    _reset_shadow_state()
 
 
 def _hermetic_creds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, contents: str = "") -> None:
@@ -172,6 +183,62 @@ def test_echo_source_attribution_credentials_file(
     out = capsys.readouterr()
     assert "credentials file" in out.err
     assert f"…{_LAST4}" in out.err
+
+
+@pytest.mark.unit
+def test_echo_shows_shell_override_note_when_file_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 022: when the saved runtime key overrode a stale shell export,
+    the echo derives the source from key_source (now ``credentials file``,
+    NOT a misleading ``shell``) AND appends ``(shell value overridden)`` plus
+    one actionable reconcile line — so the override is transparent, never a
+    silent 401. The full key never appears."""
+    _hermetic_creds(monkeypatch, tmp_path, contents=f"MDK_DEV_KEY={_FULL_KEY}\n")
+    monkeypatch.chdir(tmp_path)  # no .env here → not dotenv
+    # Stale shell export differs from the saved value → autoload makes the
+    # FILE authoritative and records the shadow.
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value_zzzz")
+    autoload_credentials()
+    cfg = TargetConfig(url="https://x.example.com", key_env="MDK_DEV_KEY")
+
+    echo_remote_context("dev", cfg, action="deploy")
+
+    # Rich wraps to the console width; collapse whitespace so phrase
+    # assertions don't depend on where the wrap landed.
+    err = " ".join(capsys.readouterr().err.split())
+    # Honest source attribution: the file won, so it reads "credentials file".
+    assert "credentials file" in err
+    assert "(shell value overridden)" in err
+    # The masked key is the FILE value's last-4, not the stale shell value's.
+    assert f"…{_LAST4}" in err
+    assert "…zzzz" not in err
+    # One actionable reconcile line points at the escape hatches.
+    assert "ignoring stale" in err
+    assert "save-runtime-key" in err
+    # No secret leaks.
+    assert "supersecret" not in err
+    assert _FULL_KEY not in err
+
+
+@pytest.mark.unit
+def test_echo_no_override_note_when_not_shadowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file-only runtime key (no stale shell export) resolves to the file
+    silently — no ``(shell value overridden)`` note and no reconcile line."""
+    _hermetic_creds(monkeypatch, tmp_path, contents=f"MDK_DEV_KEY={_FULL_KEY}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+    autoload_credentials()
+    cfg = TargetConfig(url="https://x.example.com", key_env="MDK_DEV_KEY")
+
+    echo_remote_context("dev", cfg)
+
+    out = capsys.readouterr()
+    assert "credentials file" in out.err
+    assert "(shell value overridden)" not in out.err
+    assert "ignoring stale" not in out.err
 
 
 @pytest.mark.unit
