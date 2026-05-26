@@ -395,6 +395,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             url=target_cfg.url,
             expected_version=plan.version,
             timeout=wait_timeout,
+            plan=plan,
         )
     )
     success(f"{target_name} is now serving {plan.image_tag}")
@@ -2697,10 +2698,105 @@ def _run_az(cmd: list[str], *, what: str) -> str:
     return result.stdout
 
 
-async def _wait_for_healthz(*, url: str, expected_version: str, timeout: float) -> None:
+def _diagnose_failed_revision(*, resource_group: str, app_name: str) -> str | None:
+    """Inspect the latest ACA revision and return a root-cause string when
+    it's unhealthy, else ``None``.
+
+    The ``/healthz`` gate can only ever observe the OLD revision: when the new
+    revision fails to start (image needs an unprovisioned dependency, container
+    crashes/OOMs, bad env, image-pull failure, non-zero exit) ACA marks it
+    ``ActivationFailed`` (or leaves a failed running-state) and *silently keeps
+    the old revision serving*. The poll then just spins until it times out,
+    telling the operator nothing. This queries the latest revision directly so
+    the timeout can surface the actual cause.
+
+    Returns a concise human-readable cause (e.g.
+    ``revision movate-prod-api--abc123 ActivationFailed: <detail>`` or
+    ``container exited (code 1) — likely a startup/config error``) when the
+    revision looks broken; returns ``None`` when it looks healthy or still
+    in-progress, so the caller falls back to the generic timeout message.
+
+    This runs at *failure* time on the critical exit path, so it must never
+    raise: ``az`` missing, a non-zero exit, non-JSON output, a network error,
+    or an unexpected shape all degrade to ``None``.
+    """
+    if shutil.which("az") is None:
+        return None
+    # Sort newest-first and take the latest revision. ``revision list`` is more
+    # robust than ``revision show`` (which needs the exact revision name, which
+    # we don't always know here). Suppress all output noise — we only want JSON.
+    cmd = [
+        "az",
+        "containerapp",
+        "revision",
+        "list",
+        "--resource-group",
+        resource_group,
+        "--name",
+        app_name,
+        "--query",
+        # Newest revision's health-relevant fields. createdTime sorts it.
+        "sort_by([].{name:name, created:properties.createdTime, "
+        "active:properties.active, provisioningState:properties.provisioningState, "
+        "runningState:properties.runningState, "
+        "healthState:properties.healthState}, &created)[-1]",
+        "-o",
+        "json",
+    ]
+    try:
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except (OSError, ValueError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        rev = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(rev, dict):
+        return None
+
+    name = rev.get("name") or "?"
+    provisioning = (rev.get("provisioningState") or "").strip()
+    running = (rev.get("runningState") or "").strip()
+    health = (rev.get("healthState") or "").strip()
+
+    # Provisioning-level failure: the revision never came up. This is the
+    # pgvector-incident signature (ActivationFailed) and image-pull / bad-env
+    # failures.
+    if provisioning in {"Failed", "ActivationFailed"}:
+        detail = provisioning
+        if running and running.lower() not in {"running", "processing", ""}:
+            detail += f", runningState={running}"
+        return f"revision {name} {detail}"
+
+    # Running-state failure: provisioned but the container is crash-looping /
+    # degraded / stopped (OOM, non-zero exit, failing startup probe).
+    running_lc = running.lower()
+    if running_lc and running_lc not in {"running", "processing", "activating", "unknown"}:
+        cause = f"revision {name} runningState={running}"
+        if health and health.lower() not in {"healthy", "none", "unknown", ""}:
+            cause += f" (healthState={health})"
+        cause += " — container did not stay up (likely a startup/config error or crash)"
+        return cause
+
+    # Healthy / still-provisioning / indeterminate → let the caller fall back
+    # to the generic timeout message.
+    return None
+
+
+async def _wait_for_healthz(
+    *, url: str, expected_version: str, timeout: float, plan: DeployPlan | None = None
+) -> None:
     """Poll ``GET /healthz`` until the response's ``version`` matches the
     new deploy. ACA's rolling restart can take 30s-2min; we give it
-    ``timeout`` seconds, then bail with exit 124."""
+    ``timeout`` seconds, then bail with exit 124.
+
+    On timeout, if ``plan`` is supplied, query the latest ACA revision and
+    surface its actual failure reason (ActivationFailed / crash / image-pull)
+    instead of the bare "rollout may still be in progress" message — the
+    common case when the new revision never started and ACA silently kept the
+    old one serving."""
     deadline = asyncio.get_event_loop().time() + timeout
     poll_interval = 5.0
     hint(f"[dim]waiting for /healthz to report version {expected_version}...[/dim]")
@@ -2717,12 +2813,47 @@ async def _wait_for_healthz(*, url: str, expected_version: str, timeout: float) 
             except (httpx.HTTPError, ValueError):
                 hint("[dim]  /healthz unreachable, retrying...[/dim]")
             if asyncio.get_event_loop().time() >= deadline:
-                err.print(
-                    f"[yellow]⏱[/yellow] timed out after {timeout:.0f}s waiting "
-                    f"for version {expected_version}; ACA rollout may still be "
-                    "in progress. Check manually with `az containerapp revision list`."
+                await _emit_healthz_timeout(
+                    expected_version=expected_version, timeout=timeout, plan=plan
                 )
                 # 124 is the conventional `timeout` exit code so bash
                 # scripts can branch on it.
                 sys.exit(124)
             await asyncio.sleep(poll_interval)
+
+
+async def _emit_healthz_timeout(
+    *, expected_version: str, timeout: float, plan: DeployPlan | None
+) -> None:
+    """Print the health-gate timeout message — with the ACA revision's root
+    cause when we can determine one, else the generic fallback. Never raises."""
+    cause: str | None = None
+    app_name = plan.apps_to_update[0] if plan and plan.apps_to_update else None
+    if plan is not None and app_name is not None:
+        # Blocking subprocess off the event loop. _diagnose_failed_revision is
+        # contracted never to raise, but guard the thread hop too.
+        try:
+            cause = await asyncio.to_thread(
+                _diagnose_failed_revision,
+                resource_group=plan.resource_group,
+                app_name=app_name,
+            )
+        except Exception:
+            # diagnosis is best-effort — never let it sink the timeout path
+            cause = None
+
+    if cause and plan is not None and app_name is not None:
+        err.print(
+            f"[red]✗[/red] new revision failed to start after {timeout:.0f}s — "
+            "the OLD revision is still serving (ACA kept it running).\n"
+            f"  [bold]cause:[/bold] {cause}\n"
+            f"  [bold]logs:[/bold]  [cyan]az containerapp logs show "
+            f"-g {plan.resource_group} -n {app_name} --tail 50[/cyan]"
+        )
+        return
+
+    err.print(
+        f"[yellow]⏱[/yellow] timed out after {timeout:.0f}s waiting "
+        f"for version {expected_version}; ACA rollout may still be "
+        "in progress. Check manually with `az containerapp revision list`."
+    )

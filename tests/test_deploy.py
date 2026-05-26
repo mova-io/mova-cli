@@ -33,6 +33,7 @@ from movate.cli.deploy import (
     DeployPlan,
     _attempt_auto_recovery,
     _build_plan,
+    _diagnose_failed_revision,
     _ingest_bundled_kb,
     _preflight_pgvector,
     _print_next_steps,
@@ -747,7 +748,8 @@ def test_wait_for_healthz_returns_when_version_matches(monkeypatch) -> None:
 @pytest.mark.unit
 def test_wait_for_healthz_times_out_with_exit_124(monkeypatch) -> None:
     """If the new version never appears, sys.exit(124) fires (timeout
-    convention so bash scripts can branch on it)."""
+    convention so bash scripts can branch on it). With no ``plan`` there's
+    nothing to diagnose, so the generic message is shown."""
 
     def stale_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"status": "ok", "version": "0.4.9"})
@@ -803,6 +805,246 @@ async def _no_sleep(_seconds: float) -> None:
     """Patched-in replacement for ``asyncio.sleep`` so the poll loop
     doesn't actually wait between iterations."""
     return None
+
+
+# ---------------------------------------------------------------------------
+# _diagnose_failed_revision + timeout-branch root-cause surfacing (item 87)
+# ---------------------------------------------------------------------------
+
+
+def _flat(text: str) -> str:
+    """Collapse all runs of whitespace to single spaces.
+
+    The deploy console (rich) hard-wraps long lines at the terminal width,
+    so substrings like ``rollout may still be in progress`` can land split
+    across a newline in captured output. Flattening makes assertions robust
+    to wrapping without weakening them."""
+    return " ".join(text.split())
+
+
+def _patch_revision_az(monkeypatch, *, returncode: int, stdout: str) -> None:
+    """Patch deploy.py's ``subprocess.run`` (used by the revision diagnosis)
+    and make ``az`` resolvable so the helper actually shells out."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "movate.cli.deploy.shutil.which",
+        lambda name: "/usr/bin/az" if name == "az" else None,
+    )
+
+
+@pytest.mark.unit
+def test_diagnose_failed_revision_surfaces_activation_failed(monkeypatch) -> None:
+    """A revision in ``ActivationFailed`` → a cause string naming it."""
+    blob = json.dumps(
+        {
+            "name": "movate-prod-api--abc123",
+            "provisioningState": "ActivationFailed",
+            "runningState": "Stopped",
+            "healthState": "Unhealthy",
+        }
+    )
+    _patch_revision_az(monkeypatch, returncode=0, stdout=blob)
+
+    cause = _diagnose_failed_revision(resource_group="movate-prod-rg", app_name="movate-prod-api")
+    assert cause is not None
+    assert "movate-prod-api--abc123" in cause
+    assert "ActivationFailed" in cause
+
+
+@pytest.mark.unit
+def test_diagnose_failed_revision_surfaces_crash_running_state(monkeypatch) -> None:
+    """Provisioned OK but the container won't stay up (crash/OOM) → cause."""
+    blob = json.dumps(
+        {
+            "name": "movate-prod-api--def456",
+            "provisioningState": "Succeeded",
+            "runningState": "Degraded",
+            "healthState": "Unhealthy",
+        }
+    )
+    _patch_revision_az(monkeypatch, returncode=0, stdout=blob)
+
+    cause = _diagnose_failed_revision(resource_group="movate-prod-rg", app_name="movate-prod-api")
+    assert cause is not None
+    assert "Degraded" in cause
+
+
+@pytest.mark.unit
+def test_diagnose_failed_revision_returns_none_when_healthy(monkeypatch) -> None:
+    """A healthy, running, succeeded revision → None (caller falls back to the
+    generic in-progress message)."""
+    blob = json.dumps(
+        {
+            "name": "movate-prod-api--ok000",
+            "provisioningState": "Succeeded",
+            "runningState": "Running",
+            "healthState": "Healthy",
+        }
+    )
+    _patch_revision_az(monkeypatch, returncode=0, stdout=blob)
+
+    assert (
+        _diagnose_failed_revision(resource_group="movate-prod-rg", app_name="movate-prod-api")
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_diagnose_failed_revision_degrades_on_az_error(monkeypatch) -> None:
+    """Non-zero ``az`` exit → None (never raise)."""
+    _patch_revision_az(monkeypatch, returncode=1, stdout="")
+    assert (
+        _diagnose_failed_revision(resource_group="movate-prod-rg", app_name="movate-prod-api")
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_diagnose_failed_revision_degrades_on_garbage_json(monkeypatch) -> None:
+    """Non-JSON / garbage output → None (never raise)."""
+    _patch_revision_az(monkeypatch, returncode=0, stdout="not json at all {{{")
+    assert (
+        _diagnose_failed_revision(resource_group="movate-prod-rg", app_name="movate-prod-api")
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_diagnose_failed_revision_returns_none_when_az_missing(monkeypatch) -> None:
+    """``az`` not on PATH → None, and no subprocess attempted."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: None)
+
+    def explode(*args, **kwargs):  # pragma: no cover — must not be reached
+        raise AssertionError("subprocess.run should not be called when az is missing")
+
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", explode)
+    assert (
+        _diagnose_failed_revision(resource_group="movate-prod-rg", app_name="movate-prod-api")
+        is None
+    )
+
+
+def _diag_plan() -> DeployPlan:
+    """A minimal plan carrying the resource group + app name the diagnosis
+    needs."""
+    return DeployPlan(
+        target_name="prod",
+        subscription="00000000-0000-0000-0000-000000000000",
+        resource_group="movate-prod-rg",
+        acr_name="movateprodacr",
+        env="prod",
+        image_tag="movate:0.5.0-abc1234",
+        skip_build=False,
+        apps_to_update=["movate-prod-api", "movate-prod-worker"],
+        version="0.5.0",
+    )
+
+
+@pytest.mark.unit
+def test_wait_for_healthz_timeout_surfaces_revision_root_cause(monkeypatch, capsys) -> None:
+    """When the gate times out AND the latest revision is ActivationFailed,
+    the root cause + old-revision note are surfaced — and exit is still 124."""
+
+    def stale_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "version": "0.4.9"})
+
+    _make_healthz_client_factory(httpx.MockTransport(stale_handler), monkeypatch)
+    monkeypatch.setattr("movate.cli.deploy.asyncio.sleep", _no_sleep)
+    blob = json.dumps(
+        {
+            "name": "movate-prod-api--abc123",
+            "provisioningState": "ActivationFailed",
+            "runningState": "Stopped",
+            "healthState": "Unhealthy",
+        }
+    )
+    _patch_revision_az(monkeypatch, returncode=0, stdout=blob)
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(
+            _wait_for_healthz(
+                url="https://example.test",
+                expected_version="0.5.0",
+                timeout=0.05,
+                plan=_diag_plan(),
+            )
+        )
+    assert exc_info.value.code == 124
+    out = _flat(capsys.readouterr().err)
+    assert "ActivationFailed" in out
+    assert "movate-prod-api--abc123" in out
+    assert "OLD revision is still serving" in out
+    # The logs hint reuses the existing wording style.
+    assert "az containerapp logs show" in out
+    # The generic fallback line must NOT be shown when we have a cause.
+    assert "rollout may still be in progress" not in out
+
+
+@pytest.mark.unit
+def test_wait_for_healthz_timeout_generic_when_revision_healthy(monkeypatch, capsys) -> None:
+    """Timeout but the latest revision looks healthy/in-progress → the generic
+    timeout message, exit 124, no spurious root cause."""
+
+    def stale_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "version": "0.4.9"})
+
+    _make_healthz_client_factory(httpx.MockTransport(stale_handler), monkeypatch)
+    monkeypatch.setattr("movate.cli.deploy.asyncio.sleep", _no_sleep)
+    blob = json.dumps(
+        {
+            "name": "movate-prod-api--ok000",
+            "provisioningState": "Succeeded",
+            "runningState": "Running",
+            "healthState": "Healthy",
+        }
+    )
+    _patch_revision_az(monkeypatch, returncode=0, stdout=blob)
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(
+            _wait_for_healthz(
+                url="https://example.test",
+                expected_version="0.5.0",
+                timeout=0.05,
+                plan=_diag_plan(),
+            )
+        )
+    assert exc_info.value.code == 124
+    out = _flat(capsys.readouterr().err)
+    assert "rollout may still be in progress" in out
+    assert "ActivationFailed" not in out
+
+
+@pytest.mark.unit
+def test_wait_for_healthz_timeout_generic_when_az_errors(monkeypatch, capsys) -> None:
+    """Timeout and the diagnosis az call errors/garbles → degrade to the
+    generic message (no crash), exit 124."""
+
+    def stale_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "version": "0.4.9"})
+
+    _make_healthz_client_factory(httpx.MockTransport(stale_handler), monkeypatch)
+    monkeypatch.setattr("movate.cli.deploy.asyncio.sleep", _no_sleep)
+    _patch_revision_az(monkeypatch, returncode=2, stdout="garbage {{{")
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(
+            _wait_for_healthz(
+                url="https://example.test",
+                expected_version="0.5.0",
+                timeout=0.05,
+                plan=_diag_plan(),
+            )
+        )
+    assert exc_info.value.code == 124
+    out = _flat(capsys.readouterr().err)
+    assert "rollout may still be in progress" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +1350,7 @@ def test_cli_deploy_verified_prints_deployed_next_steps(
     the test stays sync, then assert the verified-phase next-steps block is
     printed (✓ deployed + the doctor health line)."""
 
-    async def _instant_healthz(*, url, expected_version, timeout):
+    async def _instant_healthz(*, url, expected_version, timeout, plan=None):
         return None
 
     monkeypatch.setattr("movate.cli.deploy._wait_for_healthz", _instant_healthz)
