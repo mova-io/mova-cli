@@ -216,6 +216,7 @@ from movate.cli.models_cmd import models_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
+from movate.cli.runs import runs_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.schema_cmd import schema_app  # noqa: E402
 from movate.cli.secrets_cmd import secrets_app  # noqa: E402
@@ -517,6 +518,11 @@ app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 app.command("submit", rich_help_panel=PANEL_RUN)(submit_cmd.submit)
 app.add_typer(batch_app, name="batch", rich_help_panel=PANEL_RUN)
 app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
+# `runs` is the read-only sibling of `jobs`: look up a PAST run's result by
+# id (the run_id a synchronous `mdk run --target` prints). Inline runs persist
+# a RunRecord without a queryable JobRecord, so `jobs list` can't surface them
+# — `runs show <run_id>` closes that gap via the existing GET /runs/{id}.
+app.add_typer(runs_app, name="runs", rich_help_panel=PANEL_RUN)
 app.add_typer(workflow_app, name="workflow", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------

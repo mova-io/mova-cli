@@ -648,6 +648,140 @@ def test_cli_jobs_list_agents(cli_env) -> None:
     assert "agents" in payload
 
 
+# ---------------------------------------------------------------------------
+# CLI: `runs show` — look up a PAST run's result by id (the gap an inline
+# `mdk run --target` left: it persists a RunRecord without a queryable
+# JobRecord, so `jobs list` shows nothing).
+# ---------------------------------------------------------------------------
+
+
+def _save_run_sync(storage, *, run_id: str, tenant_id: str, status, output) -> None:
+    """Persist a RunRecord via a one-shot asyncio.run (avoids nested loops
+    inside the sync CLI tests — see test_cli_submit_wait_returns_terminal)."""
+    import asyncio  # noqa: PLC0415
+
+    from movate.core.models import Metrics, RunRecord, TokenUsage  # noqa: PLC0415
+
+    run = RunRecord(
+        run_id=run_id,
+        job_id="j-inline",
+        tenant_id=tenant_id,
+        agent="alpha",
+        agent_version="0.1.0",
+        prompt_hash="sha256:cafebabe",
+        provider="openai/gpt-4o-mini",
+        provider_version="v1",
+        pricing_version="2024-09",
+        status=status,
+        input={"q": "hi"},
+        output=output,
+        metrics=Metrics(
+            latency_ms=42,
+            tokens=TokenUsage(input=5, output=3),
+            cost_usd=0.00042,
+            provider="openai/gpt-4o-mini",
+            pricing_version="2024-09",
+        ),
+    )
+    asyncio.run(storage.save_run(run))
+
+
+@pytest.mark.unit
+def test_cli_runs_show_for_known_id(cli_env) -> None:
+    """`mdk runs show <run_id>` fetches a persisted run and surfaces its
+    output — the result of an inline `mdk run --target` that `jobs list`
+    can't see."""
+    import json  # noqa: PLC0415
+
+    _save_run_sync(
+        cli_env.storage,
+        run_id="r-inline-1",
+        tenant_id=cli_env.tenant_id,
+        status=JobStatus.SUCCESS,
+        output={"answer": "hello"},
+    )
+
+    result = runner.invoke(cli_app, ["runs", "show", "r-inline-1", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["run_id"] == "r-inline-1"
+    assert payload["status"] == "success"
+    assert payload["output"] == {"answer": "hello"}
+
+
+@pytest.mark.unit
+def test_cli_runs_show_table_includes_output(cli_env) -> None:
+    """Table mode renders the run summary + an output panel so the
+    operator sees the agent's response without a second command."""
+    _save_run_sync(
+        cli_env.storage,
+        run_id="r-inline-2",
+        tenant_id=cli_env.tenant_id,
+        status=JobStatus.SUCCESS,
+        output={"headline": "Approved"},
+    )
+
+    result = runner.invoke(cli_app, ["runs", "show", "r-inline-2"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "output" in out
+    assert "Approved" in out
+    assert "openai/gpt-4o-mini" in out
+
+
+@pytest.mark.unit
+def test_cli_runs_show_errored_run_exits_1(cli_env) -> None:
+    """A terminal-but-failed run exits 1 (mirrors `jobs show`) so bash
+    branches can distinguish a failed run from a clean one."""
+    _save_run_sync(
+        cli_env.storage,
+        run_id="r-inline-err",
+        tenant_id=cli_env.tenant_id,
+        status=JobStatus.ERROR,
+        output=None,
+    )
+
+    result = runner.invoke(cli_app, ["runs", "show", "r-inline-err", "--output", "json"])
+    assert result.exit_code == 1
+    import json  # noqa: PLC0415
+
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+
+
+@pytest.mark.unit
+def test_cli_runs_show_unknown_id_404(cli_env) -> None:
+    """Unknown run id → CLI surfaces the runtime's 404 cleanly (exit 4,
+    following the HTTP class), not a crash."""
+    result = runner.invoke(cli_app, ["runs", "show", "no-such-run"])
+    assert result.exit_code == 4
+    assert "fetch failed" in result.stderr
+
+
+@pytest.mark.unit
+def test_render_remote_run_prints_runs_show_inspect_hint(capsys) -> None:
+    """An inline `mdk run --target` success prints a `mdk runs show <run_id>`
+    inspect hint so the operator can look the result back up later (closes
+    the "no jobs found" gap — inline runs aren't queryable via `jobs list`)."""
+    from movate.cli._output import Run  # noqa: PLC0415
+    from movate.cli.run import _render_remote_run  # noqa: PLC0415
+
+    run_view = {"run_id": "r-deadbeef-1234", "status": "success", "output": {"ok": True}}
+    _render_remote_run(run_view, output_format=Run.JSON, target_name="dev")
+
+    captured = capsys.readouterr()
+    # Hint lands on stderr (stdout stays pipe-clean for jq). Rich may wrap
+    # the line, so assert on the load-bearing tokens (command + full id +
+    # target) rather than exact whitespace.
+    stderr_flat = " ".join(captured.err.split())
+    assert "mdk runs show" in stderr_flat
+    assert "r-deadbeef-1234" in stderr_flat
+    assert "--target dev" in stderr_flat
+    # The full (copy-pasteable) run id must reach stdout's JSON, not just
+    # the truncated prefix shown in the hint.
+    assert "r-deadbeef-1234" in captured.out
+
+
 @pytest.mark.unit
 def test_emit_terminal_json_wraps_job_and_run() -> None:
     """``submit --wait --output json`` returns a single ``{job, run}``
