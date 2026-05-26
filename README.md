@@ -977,19 +977,95 @@ strict object schemas — anything else uses the path form.
 | `summarizer` | Text + max_words → summary + word_count | ships `judge.yaml.example` |
 | `classifier` | Text + label list → chosen label | exact-match (finite labels) |
 
-## CLI shape
+## Command reference
 
-```
-Develop          init, validate, show
-Run & evaluate   run, bench, eval, logs, trace
-Diagnose         doctor, pricing
-Deploy & operate serve, worker, deploy
-Manage           auth
-```
+The CLI is organized into five panels (see `mdk --help`). Run
+`mdk <command> --help` for full flags; every command also works under the
+transitional `movate` alias.
 
-`mdk doctor` reports environment status, configured providers, the
-local DB path, and which optional extras are installed (`langfuse`,
-`otel`, `runtime`).
+### Develop — author agents, workflows, skills, contexts
+
+| command | what it does |
+|---|---|
+| `mdk menu` | Workspace status + a contextual list of next steps |
+| `mdk dev <agent>` | Guided authoring loop: scaffold → edit → live-test → deploy |
+| `mdk init [name]` | Scaffold an agent (`-t <template>` / `--llm "<desc>"`) or bootstrap a project (`--project`) |
+| `mdk add <ref>` | Add role-based agents from the catalog (`--list`, `--search`, `--name`) |
+| `mdk demo` | Generate a complete runnable demo project (FAQ agent + dataset) |
+| `mdk compose` | Scaffold a multi-agent `workflow.yaml` |
+| `mdk plan` | Generate a project plan from a natural-language description |
+| `mdk validate [path]` | Validate `agent.yaml`/`workflow.yaml` + all references |
+| `mdk show` / `mdk inspect` | Raw spec fields / fully-resolved spec (defaults, compiled schemas, prepended contexts) |
+| `mdk fmt` | Normalize YAML / prompt / JSONL style |
+| `mdk watch` | Re-run `validate` on file change |
+| `mdk skills` | Inspect / scaffold / test the skill registry (Python · HTTP · MCP) |
+| `mdk contexts` | List / inspect / attach shared prompt-context files |
+| `mdk kb` / `mdk knowledge` | Knowledge-base ingest + hybrid search; corpus validation |
+| `mdk schema` | Author / compile schema files (shorthand ↔ JSON Schema) |
+| `mdk templates` | Discover the agent + skill templates `mdk init -t` / `mdk add` accept |
+| `mdk import` | Import agents from other frameworks (Lyzr today) |
+| `mdk scaffold` / `mdk docs` | Boilerplate for tools/artifacts · auto-generated ops runbook |
+
+### Run & evaluate — execute, score, observe
+
+| command | what it does |
+|---|---|
+| `mdk run <agent> <input>` | Run an agent/workflow (`--mock`, `--stream`, `--target <env>` for remote) |
+| `mdk replay <run-id>` | Re-execute a past run's input against current code |
+| `mdk chat <agent>` | Interactive REPL bound to one agent |
+| `mdk tune` / `mdk simulate` | Sweep one knob across values · multi-turn chatbot stress test |
+| `mdk bench` / `mdk benchmark` | Multi-model cost/latency/quality comparison · shadow-replay vs a candidate model |
+| `mdk eval <agent>` | Eval suite + threshold gate (bare `mdk eval` = guided wizard) |
+| `mdk eval-scorecard` | 10-category LLM-judged scorecard (`--runs N` for distribution) |
+| `mdk eval-gen` / `mdk eval-harvest` | Generate eval cases via LLM · harvest prod runs into proposed cases |
+| `mdk eval-schedule` / `mdk schedule` / `mdk trigger` | Continuous-eval cadences · cron jobs · inbound event/webhook triggers |
+| `mdk canary` | Champion/challenger canary rollouts |
+| `mdk batch` | Bulk async inference — one job per dataset row |
+| `mdk submit <agent>` | Queue a job at a deployed runtime (`--wait`, `--notify`) |
+| `mdk jobs` | Inspect queued/running jobs on a deployed runtime (`show`/`wait`/`list`/`cancel`) |
+| `mdk runs show <run-id>` | Look up a completed run's full record by id |
+| `mdk logs` / `mdk monitor` / `mdk trace` | Run record (input/output/cost) · live dashboard · trace inspect + replay |
+| `mdk ci` | CI pre-flight gates wrapping multi-agent invocations |
+
+### Diagnose — environment + cost
+
+| command | what it does |
+|---|---|
+| `mdk doctor` | Environment + config sanity check; `--target <env>` adds an Azure preflight (KV, pgvector, /healthz, auth round-trip) |
+| `mdk fix` | Auto-remediate common diagnostic findings (`--apply`) |
+| `mdk explain <run-id>` | Render the decision chain behind a completed run |
+| `mdk pricing` / `mdk models` | Price-per-1k-tokens table · model catalog (context windows, capabilities) |
+| `mdk costs report` | Historical spend per agent / provider from recorded runs |
+
+### Deploy & operate — ship to Azure
+
+| command | what it does |
+|---|---|
+| `mdk serve` | Start the FastAPI runtime (`/run`, `/api/v1`, `/healthz`) |
+| `mdk worker` | Drain the job queue, dispatch each job, persist the result |
+| `mdk deploy --target <env>` | Build the image in ACR + roll out both Container Apps + poll `/healthz` (`--mode agents\|runtime`, `--skip-build`, `--image-tag`, `--dry-run`) |
+| `mdk infra` | Provision Azure infra (Bicep: ACA + Postgres Flex + ACR + Key Vault) + auto-chain `auth bootstrap-seed` |
+| `mdk export` | Package an agent as a portable OCI artifact (any container registry) |
+| `mdk teams-bot` / `mdk playground` | Microsoft Teams front door · Chainlit browser UI (with 👍/👎 feedback capture) |
+
+### Manage — keys, targets, policy, state
+
+| command | what it does |
+|---|---|
+| `mdk auth` | Runtime API keys + provider login: `login`, `status`, `create-key`, `pull-runtime-key`, `bootstrap-seed`, `rotate-key`, `revoke-key`, `whoami` |
+| `mdk keys` | Per-tenant BYOK provider keys, encrypted at rest (ADR 018) |
+| `mdk config` | Deployment targets + active target (`add-target`, `use`, `list-targets`) |
+| `mdk fleet` | Read-only cross-target view of deployed runtimes |
+| `mdk profiles` / `mdk secrets` / `mdk env` | Named env contexts (dev/staging/prod) + per-profile secrets/vars |
+| `mdk policy` | Export / import / diff project `policy.yaml` across environments |
+| `mdk guardrails` | Manage + test Safe-AI guardrails (PII / topic / content) |
+| `mdk snapshot` · `diff` · `rollback` · `promote` · `migrate` | Immutable content-addressed state snapshots: capture, compare, restore, promote |
+| `mdk audit` | Production-readiness scanners over the project or a snapshot |
+| `mdk export state` / `mdk import state` | DR escape hatch — JSON backup/restore of control-plane state |
+
+> `mdk doctor` reports environment status, configured providers, the local DB
+> path, and which optional extras are installed (`langfuse`, `otel`,
+> `asyncpg`, `fastapi`). Add `--target <env>` for the live Azure preflight.
 
 ## Configuration
 
