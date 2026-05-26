@@ -180,6 +180,21 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "under --dry-run / --diff."
         ),
     ),
+    smoke_test: bool | None = typer.Option(
+        None,
+        "--smoke-test/--no-smoke-test",
+        help=(
+            "Agents-mode only. After a successful deploy, dispatch ONE remote "
+            "run of each just-deployed agent against the target and show "
+            "pass/fail + response + run_id + cost — proving the new behavior "
+            "is live, not just that /healthz answers. Input comes from the "
+            "first row of [bold]evals/dataset.jsonl[/bold] (or, interactively, "
+            "a one-time prompt). Default: OFFER interactively in a terminal; "
+            "SKIP non-interactively unless [bold]--smoke-test[/bold] is passed. "
+            "[bold]--no-smoke-test[/bold] always skips. A failed smoke test "
+            "warns but never fails the (already-succeeded) deploy."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -237,6 +252,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             diff=diff,
             auto_recover=not no_auto_recover,
             with_kb=with_kb,
+            smoke_test=smoke_test,
         )
         return
 
@@ -705,6 +721,7 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     diff: bool = False,
     auto_recover: bool = True,
     with_kb: bool = False,
+    smoke_test: bool | None = None,
 ) -> None:
     """Upload every agent under ``<project>/agents/*/`` to the deployed
     runtime via ``POST /api/v1/agents``.
@@ -1059,6 +1076,18 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             base_url=target_cfg.url.rstrip("/"),
             key_env=target_cfg.key_env,
         )
+        # Offer to RUN a smoke test — the copy-pasteable commands above tell
+        # the operator how; this dispatches one real remote run per agent so
+        # they can confirm the just-deployed behavior is live (closes the
+        # loop with the iterate fix: a redeploy now propagates edits, and a
+        # smoke test proves the NEW behavior answers). A failed smoke test
+        # warns but never unwinds the (already-succeeded) deploy.
+        _maybe_run_smoke_test(
+            target_name=target_name,
+            uploaded=uploaded,
+            project_root=project_root,
+            smoke_test=smoke_test,
+        )
 
     # --with-kb: sync each uploaded agent's bundled kb/ directory to the
     # target. Deploy ships the prompt + contexts; the knowledge base is
@@ -1329,6 +1358,151 @@ def _sample_input_for_agent(project_root: Path, agent_name: str) -> str:
     except (OSError, ValueError):
         return fallback
     return fallback
+
+
+def _first_dataset_input(project_root: Path, agent_name: str) -> dict[str, Any] | None:
+    """Return the first ``evals/dataset.jsonl`` row's ``input`` dict for an
+    agent, or ``None`` when there's no dataset / no usable first row.
+
+    Distinct from :func:`_sample_input_for_agent` (which returns a
+    ``{"text":"..."}`` *placeholder* string for the copy-pasteable curl
+    examples): a smoke test needs a REAL input to dispatch, so the absence
+    of a dataset must be distinguishable from a present-but-trivial one.
+    Returns the parsed dict so the caller can decide whether to prompt
+    (interactive) or skip with a hint (non-interactive).
+    """
+    dataset_path = project_root / "agents" / agent_name / "evals" / "dataset.jsonl"
+    if not dataset_path.is_file():
+        return None
+    try:
+        first_line = next(
+            (line for line in dataset_path.read_text().splitlines() if line.strip()),
+            "",
+        )
+        if not first_line:
+            return None
+        row = json.loads(first_line)
+    except (OSError, ValueError):
+        return None
+    if isinstance(row, dict):
+        candidate = row.get("input")
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _smoke_test_is_interactive() -> bool:
+    """Whether the smoke-test offer/prompt may block on the operator.
+
+    Same TTY scheme the rest of the deploy / next-steps UX uses
+    (:func:`movate.cli._next_steps.prompt_next_step`): both stdin AND
+    stdout must be a terminal. Factored to a single seam so tests can
+    flip interactivity without fighting ``CliRunner``'s stdin swap.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _maybe_run_smoke_test(  # noqa: PLR0912 — gating + per-agent input-resolution state machine
+    *,
+    target_name: str,
+    uploaded: list[str],
+    project_root: Path,
+    smoke_test: bool | None,
+) -> None:
+    """Optionally dispatch ONE remote run per just-deployed agent.
+
+    Gating (matches the TTY scheme used by the rest of the deploy /
+    next-steps UX — :func:`movate.cli._next_steps.prompt_next_step`):
+
+    * ``smoke_test is False`` (``--no-smoke-test``) → always skip.
+    * ``smoke_test is True`` (``--smoke-test``) → always run.
+    * ``smoke_test is None`` (default) → OFFER interactively when stdin AND
+      stdout are a TTY; SKIP silently otherwise (CI / pipes / pytest).
+
+    Input resolution per agent: prefer the first ``evals/dataset.jsonl``
+    row's ``input``; if there's no dataset and we're interactive, prompt
+    once for the JSON; if there's no dataset and we're non-interactive,
+    skip THAT agent with a copy-pasteable hint.
+
+    A failed smoke run is surfaced loudly (the ``✗`` + run view come from
+    :func:`_dispatch_remote_agent`) but NEVER changes the deploy's exit
+    code — the upload already succeeded, and a flaky first inference
+    shouldn't unwind a live rollout. ``_dispatch_remote_agent`` signals a
+    bad run by raising :class:`typer.Exit`; we catch it, warn, and move on.
+    """
+    interactive = _smoke_test_is_interactive()
+
+    if smoke_test is False:
+        return
+    if smoke_test is None:
+        if not interactive:
+            return
+        err.print()
+        try:
+            if not typer.confirm("Run a smoke test against the deployed runtime now?"):
+                return
+        except (KeyboardInterrupt, EOFError, typer.Abort):
+            return
+
+    # Reuse the remote-run machinery — do NOT rebuild the HTTP/render path.
+    # Function-local import dodges the run.py ↔ deploy.py circular import at
+    # module load (both pull from movate.cli.*).
+    from movate.cli._output import Run  # noqa: PLC0415
+    from movate.cli.run import _dispatch_remote_agent  # noqa: PLC0415
+
+    err.print()
+    err.print("[bold]Smoke test:[/bold] dispatching one remote run per agent…")
+    for agent_name in sorted(uploaded):
+        sample_input = _first_dataset_input(project_root, agent_name)
+        if sample_input is None:
+            if interactive:
+                try:
+                    raw = typer.prompt(
+                        f"  no evals/dataset.jsonl for {agent_name!r} — paste input JSON",
+                        default="",
+                    ).strip()
+                except (KeyboardInterrupt, EOFError, typer.Abort):
+                    raw = ""
+                if not raw:
+                    err.print(
+                        f"  [yellow]⚠[/yellow] no input for [bold]{agent_name}[/bold] — "
+                        "skipping its smoke test."
+                    )
+                    continue
+            else:
+                # Non-interactive + no dataset: skip with a copy-pasteable hint.
+                err.print(
+                    f"  [yellow]⚠[/yellow] no evals/dataset.jsonl for "
+                    f"[bold]{agent_name}[/bold] — skipping smoke test; run "
+                    f"[cyan]mdk run {agent_name} --target {target_name} "
+                    f"-i '<json>'[/cyan]"
+                )
+                continue
+        else:
+            raw = json.dumps(sample_input)
+
+        err.print(f"  [dim]→ smoke test [bold]{agent_name}[/bold][/dim]")
+        try:
+            # output_format=Run.TEXT so the human-readable ✓/✗ + run_id +
+            # cost render to the operator's terminal (this path only runs
+            # interactively-or-explicitly, never under machine output).
+            _dispatch_remote_agent(
+                agent_name=agent_name,
+                raw=raw,
+                target=target_name,
+                mock=False,
+                output_format=Run.TEXT,
+            )
+        except typer.Exit as exc:
+            # A non-zero smoke run (bad HTTP, run errored, etc.) must NOT
+            # fail the deploy — it already succeeded. Warn clearly and keep
+            # going; the failure detail was already printed by the dispatch.
+            code = getattr(exc, "exit_code", 1)
+            if code != 0:
+                err.print(
+                    f"  [yellow]⚠[/yellow] smoke test for [bold]{agent_name}[/bold] "
+                    f"did not pass (deploy itself succeeded)."
+                )
 
 
 def _append_context_files(
