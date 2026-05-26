@@ -22,6 +22,7 @@ Tested here:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -260,6 +261,307 @@ def test_target_401_shell_shadows_saved_key_leads_with_unset(
     assert "save-runtime-key" not in result.stderr
     assert "mdk_run_summary:" in result.stderr
     assert "ok=false" in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_shell_shadow_auto_retries_with_saved_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The friction-killer: when a STALE shell ``$MDK_DEV_KEY`` 401's but the
+    credentials FILE holds a DIFFERENT, good key, the dispatch replays the SAME
+    request ONCE with the saved key, succeeds, and prints a one-line note to
+    stderr (stdout stays the rendered RunView). No more ``env -u`` dance."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    # Stale shell export …
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    # … good key saved in the file.
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_GOOD_file_value\n")
+
+    calls: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization")
+        calls.append(auth)
+        # Stale shell bearer → 401; saved file bearer → 200.
+        if auth == "Bearer mvt_dev_GOOD_file_value":
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "r1",
+                    "job_id": "j",
+                    "agent": "faq",
+                    "agent_version": "0.1.0",
+                    "prompt_hash": "x",
+                    "provider": "mock",
+                    "provider_version": "1.0",
+                    "pricing_version": "2024.05",
+                    "status": "success",
+                    "input": {"question": "hi"},
+                    "output": {"answer": "saved-key-worked"},
+                    "metrics": {
+                        "cost_usd": 0.0,
+                        "latency_ms": 10,
+                        "tokens": {"input": 1, "output": 1, "total": 2},
+                    },
+                    "error": None,
+                    "created_at": "2026-05-15T12:00:00Z",
+                    "workflow_run_id": None,
+                    "node_id": None,
+                },
+            )
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(app, ["run", "faq", "hi", "--target", "dev"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Exactly two calls: the stale-shell 401, then the saved-key retry.
+    assert calls == [
+        "Bearer mvt_dev_STALE_shell_value",
+        "Bearer mvt_dev_GOOD_file_value",
+    ]
+    # The run rendered from the saved-key response.
+    assert "saved-key-worked" in result.stdout
+    # One-line note on stderr; never on stdout.
+    assert "used your saved key instead" in result.stderr
+    assert "unset $MDK_DEV_KEY" in result.stderr
+    assert "used your saved key instead" not in result.stdout
+    # Success summary still emitted.
+    assert "mdk_run_summary:" in result.stderr
+    assert "ok=true" in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_auto_retry_json_keeps_stdout_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--json`` (the non-tty default): the auto-retry note goes to stderr
+    only; stdout stays valid JSON the caller can pipe to ``jq``."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_GOOD_file_value\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") == "Bearer mvt_dev_GOOD_file_value":
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "r1",
+                    "job_id": "j",
+                    "agent": "faq",
+                    "agent_version": "0.1.0",
+                    "prompt_hash": "x",
+                    "provider": "mock",
+                    "provider_version": "1.0",
+                    "pricing_version": "2024.05",
+                    "status": "success",
+                    "input": {"question": "hi"},
+                    "output": {"answer": "ok"},
+                    "metrics": {
+                        "cost_usd": 0.0,
+                        "latency_ms": 10,
+                        "tokens": {"input": 1, "output": 1, "total": 2},
+                    },
+                    "error": None,
+                    "created_at": "2026-05-15T12:00:00Z",
+                    "workflow_run_id": None,
+                    "node_id": None,
+                },
+            )
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(
+        app, ["run", "faq", "hi", "--target", "dev", "--output", "json"], env={"COLUMNS": "200"}
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # stdout is parseable JSON — the note didn't leak into it.
+    parsed = json.loads(result.stdout)
+    assert parsed["output"]["answer"] == "ok"
+    assert "used your saved key instead" in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_auto_retry_honors_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--quiet`` suppresses the auto-retry note (it's a hint, not an error)
+    while the retry still happens and the run succeeds."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_GOOD_file_value\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") == "Bearer mvt_dev_GOOD_file_value":
+            return httpx.Response(
+                200,
+                json={
+                    "run_id": "r1",
+                    "job_id": "j",
+                    "agent": "faq",
+                    "agent_version": "0.1.0",
+                    "prompt_hash": "x",
+                    "provider": "mock",
+                    "provider_version": "1.0",
+                    "pricing_version": "2024.05",
+                    "status": "success",
+                    "input": {"question": "hi"},
+                    "output": {"answer": "ok"},
+                    "metrics": {
+                        "cost_usd": 0.0,
+                        "latency_ms": 10,
+                        "tokens": {"input": 1, "output": 1, "total": 2},
+                    },
+                    "error": None,
+                    "created_at": "2026-05-15T12:00:00Z",
+                    "workflow_run_id": None,
+                    "node_id": None,
+                },
+            )
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    # ``--quiet`` is a top-level flag (it flips _console quiet state in the
+    # root callback), so it precedes the subcommand.
+    result = runner.invoke(
+        app, ["--quiet", "run", "faq", "hi", "--target", "dev"], env={"COLUMNS": "200"}
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Note suppressed under --quiet …
+    assert "used your saved key instead" not in result.stderr
+    # … but the retry still succeeded.
+    assert '"answer": "ok"' in result.stdout
+
+
+@pytest.mark.unit
+def test_target_401_file_equals_shell_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """File value == shell value → nothing to fall back to. One call only;
+    the existing 401 hint fires (here: save/pull, since file==shell is not a
+    shadow case)."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_SAME_value")
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_SAME_value\n")
+
+    calls: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("authorization"))
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(app, ["run", "faq", "hi", "--target", "dev"], env={"COLUMNS": "200"})
+    assert result.exit_code == 1
+    # No retry — single request.
+    assert calls == ["Bearer mvt_dev_SAME_value"]
+    assert "rejected the bearer token" in result.stderr
+    assert "used your saved key instead" not in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_no_file_entry_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No saved entry (shell is the sole source) → no retry; the existing
+    save/pull hint fires. Single request."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    _hermetic_creds(monkeypatch, tmp_path)  # empty file
+
+    calls: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("authorization"))
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(app, ["run", "faq", "hi", "--target", "dev"], env={"COLUMNS": "200"})
+    assert result.exit_code == 1
+    assert calls == ["Bearer mvt_dev_STALE_shell_value"]
+    assert "mdk auth save-runtime-key dev" in result.stderr
+    assert "used your saved key instead" not in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_retry_also_fails_falls_through_to_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the saved key ALSO 401's, fall through to the existing unset hint
+    unchanged — and never retry more than once (exactly two calls)."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_ALSO_BAD_file_value\n")
+
+    calls: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("authorization"))
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(app, ["run", "faq", "hi", "--target", "dev"], env={"COLUMNS": "200"})
+    assert result.exit_code == 1
+    # At most once: shell try + one file retry = two calls, no more.
+    assert calls == [
+        "Bearer mvt_dev_STALE_shell_value",
+        "Bearer mvt_dev_ALSO_BAD_file_value",
+    ]
+    # Existing shell-shadow hint (file differs from shell) — unchanged.
+    assert "unset MDK_DEV_KEY" in result.stderr
+    assert "used your saved key instead" not in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_bearer_from_file_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the bearer was sourced from the FILE (no shell export), a 401
+    must NOT trigger a retry — there's no stale shell value to fall back from,
+    and re-sending the same file key would be pointless. Single request.
+
+    After autoload folds the file value into ``os.environ`` (its precedence
+    job), the dispatch sees ``os.environ[key_env] == file_value`` — i.e. the
+    sent bearer already IS the saved key, so ``file_value != api_key`` is
+    false and the retry is correctly skipped. We model that post-autoload
+    state directly (the value in the env equals the value in the file)."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    # Post-autoload state: env var == file value (file was the source).
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_FILE_only_value")
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_FILE_only_value\n")
+
+    calls: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("authorization"))
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(app, ["run", "faq", "hi", "--target", "dev"], env={"COLUMNS": "200"})
+    assert result.exit_code == 1
+    # The file value was the bearer; no retry (file == sent api_key).
+    assert calls == ["Bearer mvt_dev_FILE_only_value"]
+    assert "used your saved key instead" not in result.stderr
 
 
 @pytest.mark.unit
