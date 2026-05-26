@@ -46,7 +46,13 @@ _STEP_TRACER_HINT = (
 def explain(
     run_id: Annotated[
         str | None,
-        typer.Argument(help="Run ID to explain.  Omit with --last to explain the most-recent run."),
+        typer.Argument(
+            help=(
+                "Run ID to explain (full id or a unique short prefix, e.g. the "
+                "8-char id `mdk run` prints). Omit with --last to explain the "
+                "most-recent run."
+            )
+        ),
     ] = None,
     last: Annotated[
         bool,
@@ -80,7 +86,7 @@ def explain(
 
     Examples::
 
-        mdk explain abc123               # explain run abc123
+        mdk explain abc123               # explain run abc123 (full id or unique prefix)
         mdk explain --last               # explain the most-recent run
         mdk explain abc123 --json        # machine-readable JSON
         mdk explain --last --steps       # include per-skill step breakdown
@@ -99,7 +105,16 @@ async def _cmd(*, run_id: str | None, last: bool, as_json: bool, steps: bool = F
     storage = build_storage()
     await storage.init()
 
-    record = await _resolve(storage, run_id=run_id, last=last)
+    try:
+        record = await _resolve(storage, run_id=run_id, last=last)
+    except _AmbiguousPrefixError as exc:
+        err.print(
+            f"[red]✗[/red] run-id prefix [bold]{exc.prefix}[/bold] is ambiguous "
+            f"({len(exc.matches)} matches). Use a longer prefix or the full id:"
+        )
+        for match in exc.matches:
+            err.print(f"  [dim]·[/dim] {match}")
+        raise typer.Exit(code=1) from None
     if record is None:
         err.print("[red]✗[/red] run not found")
         raise typer.Exit(code=1)
@@ -111,11 +126,59 @@ async def _cmd(*, run_id: str | None, last: bool, as_json: bool, steps: bool = F
     _render_chain(record, show_steps=steps)
 
 
+class _AmbiguousPrefixError(Exception):
+    """Raised when a short run-id prefix matches more than one recent run.
+
+    Carries the matching run ids so the caller can render a helpful
+    "did you mean" list instead of a bare error.
+    """
+
+    def __init__(self, prefix: str, matches: list[str]) -> None:
+        self.prefix = prefix
+        self.matches = matches
+        super().__init__(f"run-id prefix {prefix!r} is ambiguous ({len(matches)} matches)")
+
+
+# How many recent local runs to scan when resolving a short-id prefix.
+# Generous enough to catch the just-printed run hint without an unbounded
+# scan; the `mdk run` footer hint refers to a very recent run.
+_PREFIX_SCAN_LIMIT = 200
+
+
 async def _resolve(storage: Any, *, run_id: str | None, last: bool) -> RunRecord | None:
     if last or run_id is None:
         runs = await storage.list_runs(limit=1)
         return runs[0] if runs else None
-    return await storage.get_run(run_id, tenant_id="local")
+
+    # Exact-match first — preserves the original semantics for full ids and
+    # is the cheap, common path.
+    record = await storage.get_run(run_id, tenant_id="local")
+    if record is not None:
+        return record
+
+    # No exact hit — fall back to short-id PREFIX resolution so the friendly
+    # 8-char hint `mdk run` prints (`mdk explain <run_short>`) actually works.
+    # List recent local runs and match on the run_id prefix:
+    #   * exactly one match → use it
+    #   * zero matches      → keep the "not found" path (return None)
+    #   * many matches      → raise _AmbiguousPrefixError with the candidates
+    return await _resolve_prefix(storage, prefix=run_id)
+
+
+async def _resolve_prefix(storage: Any, *, prefix: str) -> RunRecord | None:
+    """Resolve a unique short-id *prefix* against recent local runs.
+
+    Returns the single matching :class:`RunRecord`, ``None`` when nothing
+    matches, or raises :class:`_AmbiguousPrefixError` when more than one
+    recent run shares the prefix.
+    """
+    recent = await storage.list_runs(tenant_id="local", limit=_PREFIX_SCAN_LIMIT)
+    matches = [r for r in recent if r.run_id.startswith(prefix)]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise _AmbiguousPrefixError(prefix, [r.run_id for r in matches])
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------

@@ -396,21 +396,35 @@ def _maybe_mock_schema_hint(*, error_type: str | None, mock: bool) -> None:
         console.print(f"[yellow]{_MOCK_SCHEMA_HINT}[/yellow]")
 
 
-def _maybe_trace_line(trace_id: str | None, *, output_format: Run, target: str | None) -> None:
+def _maybe_trace_line(
+    trace_id: str | None,
+    *,
+    output_format: Run,
+    target: str | None,
+    run_id: str | None = None,
+) -> None:
     """P1 — surface the run's trace id (+ how to view it) on stderr.
 
     Skipped cleanly when there's no trace id or under ``--json`` (JSON stdout
     must stay machine-parseable; this human hint never goes to stdout). For a
-    deployed ``--target`` run we ALSO print a one-line pointer to view the
-    trace. Honors ``--quiet`` via ``_console.hint``."""
+    deployed ``--target`` run we ALSO print a one-line pointer to look the run
+    result back up — ``mdk runs show <run_id> --target <target>`` (the inline
+    remote run persists a RunRecord on the runtime, queryable by id). Honors
+    ``--quiet`` via ``_console.hint``.
+
+    NOTE: the view pointer references ``mdk runs show`` — NOT ``mdk trace``.
+    ``mdk trace`` is a local-only Typer group whose sole subcommand is
+    ``replay``; there is no ``mdk trace <id> --target`` command, so pointing a
+    remote run at it was a dead end (#125)."""
     if output_format != Run.TEXT:
         return
     tid = (trace_id or "").strip()
     if not tid:
         return
-    if target:
+    rid = (run_id or "").strip()
+    if target and rid:
         _console.hint(
-            f"[dim]trace: [bold]{tid}[/bold]  ·  view: [cyan]mdk trace {tid} "
+            f"[dim]trace: [bold]{tid}[/bold]  ·  view: [cyan]mdk runs show {rid} "
             f"--target {target}[/cyan]  (or App Insights → Transaction search "
             f"→ paste the id)[/dim]"
         )
@@ -1151,7 +1165,12 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
     run_id = run_view.get("run_id")
 
     # P1 — surface the trace id + a deployed-target view pointer.
-    _maybe_trace_line(metrics.get("trace_id"), output_format=output_format, target=target_name)
+    _maybe_trace_line(
+        metrics.get("trace_id"),
+        output_format=output_format,
+        target=target_name,
+        run_id=run_id,
+    )
 
     _emit_remote_summary(
         agent=name,
@@ -1569,7 +1588,12 @@ def _dispatch_remote_agent_stream(
                 f"(persisted on the runtime, not locally)[/dim]"
             )
         # P1 — surface the trace id + a deployed-target view pointer.
-        _maybe_trace_line(metrics.get("trace_id"), output_format=output_format, target=target_name)
+        _maybe_trace_line(
+            metrics.get("trace_id"),
+            output_format=output_format,
+            target=target_name,
+            run_id=run_id,
+        )
         _emit_remote_summary(
             agent=name,
             target=target_name,
