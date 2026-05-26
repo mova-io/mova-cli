@@ -188,6 +188,37 @@ def test_build_plan_image_tag_override_wins() -> None:
 
 
 @pytest.mark.unit
+def test_build_plan_bare_image_tag_is_normalized_to_default_repo() -> None:
+    """A bare ``--image-tag 0.8.2.5-ca0e04e`` (no repository segment) is
+    auto-prepended with the default ``movate`` repo so the fully-qualified
+    image stays ``<acr>/movate:<tag>`` instead of collapsing to a repo name
+    with no tag (which ACR would resolve to ``:latest`` → MANIFEST_UNKNOWN)."""
+    plan = _build_plan(
+        target_name="prod",
+        target_cfg=_full_target(),
+        image_tag="0.8.2.5-ca0e04e",
+        skip_build=True,
+        only=None,
+    )
+    assert plan.image_tag == "movate:0.8.2.5-ca0e04e"
+    assert plan.fq_image == "movateprodacr.azurecr.io/movate:0.8.2.5-ca0e04e"
+
+
+@pytest.mark.unit
+def test_build_plan_image_tag_with_repo_segment_is_left_untouched() -> None:
+    """An already repository-qualified ``--image-tag`` (has a ``:``) is honored
+    verbatim — normalization must not double-prepend the repo."""
+    plan = _build_plan(
+        target_name="prod",
+        target_cfg=_full_target(),
+        image_tag="movate:0.5.0-cafebab",
+        skip_build=True,
+        only=None,
+    )
+    assert plan.image_tag == "movate:0.5.0-cafebab"
+
+
+@pytest.mark.unit
 def test_build_plan_only_api_filters_apps() -> None:
     plan = _build_plan(
         target_name="prod",

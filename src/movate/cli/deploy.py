@@ -531,6 +531,17 @@ def _build_plan(
     if image_tag is None:
         sha = git_short_sha() or "unknown"
         image_tag = f"movate:{version}-{sha}"
+    elif ":" not in image_tag:
+        # A bare tag like '0.8.2.5-ca0e04e' (no repository segment) would
+        # otherwise become '<acr>/0.8.2.5-ca0e04e' — ACR reads that as a repo
+        # name with no tag, defaults to ':latest', and fails cryptically with
+        # MANIFEST_UNKNOWN. Normalize it to the default 'movate' repo.
+        bare = image_tag
+        image_tag = f"movate:{bare}"
+        err.print(
+            f"[dim]normalized bare --image-tag {bare!r} → {image_tag!r} "
+            f"(default 'movate' repo)[/dim]"
+        )
 
     apps = [f"movate-{target_cfg.azure_env}-api", f"movate-{target_cfg.azure_env}-worker"]
     if only == "api":
