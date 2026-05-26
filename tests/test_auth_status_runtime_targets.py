@@ -268,13 +268,14 @@ def _patch_roundtrip(
     *,
     result: tuple[bool, str],
 ) -> list[dict[str, str]]:
-    """Patch deploy's `_verify_bearer_roundtrip` (the fn auth.py imports
-    lazily under --verify) to a canned result, and record every call so
-    tests can assert WHICH url/key it was invoked with — and, crucially,
-    that it was NOT called at all without --verify.
+    """Patch the `_verify_bearer_roundtrip` name bound in `movate.cli.auth`
+    (imported from the shared `_runtime_key_checks` module and called under
+    --verify) to a canned result, and record every call so tests can assert
+    WHICH url/key it was invoked with — and, crucially, that it was NOT
+    called at all without --verify.
 
     Returns the calls list (mutated in place as the fn is invoked)."""
-    import movate.cli.deploy as deploy_mod  # noqa: PLC0415
+    import movate.cli.auth as auth_mod  # noqa: PLC0415
 
     calls: list[dict[str, str]] = []
 
@@ -282,7 +283,7 @@ def _patch_roundtrip(
         calls.append({"base_url": base_url, "key": key})
         return result
 
-    monkeypatch.setattr(deploy_mod, "_verify_bearer_roundtrip", _fake)
+    monkeypatch.setattr(auth_mod, "_verify_bearer_roundtrip", _fake)
     return calls
 
 
