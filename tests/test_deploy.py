@@ -1218,14 +1218,14 @@ def test_upload_inline_agent_materializes_compiled_schema_parts(
     _write_inline_agent(agent_dir)
     client = _CapturingClient()
 
-    reason = _upload_one_agent_bundle(
+    outcome = _upload_one_agent_bundle(
         client=client,
         base_url="https://rt.example",
         headers={"Authorization": "Bearer x"},
         agent_dir=agent_dir,
         project_root=tmp_path,
     )
-    assert reason is None  # 201 → success
+    assert outcome.ok  # 201 → success
 
     parts = _parts_by_field(client.captured_files)
     # The schema parts are NO LONGER omitted for an inline agent.
@@ -1267,14 +1267,14 @@ def test_upload_pathref_agent_still_uploads_on_disk_schema(
     _write_pathref_agent(agent_dir)
     client = _CapturingClient()
 
-    reason = _upload_one_agent_bundle(
+    outcome = _upload_one_agent_bundle(
         client=client,
         base_url="https://rt.example",
         headers={"Authorization": "Bearer x"},
         agent_dir=agent_dir,
         project_root=tmp_path,
     )
-    assert reason is None
+    assert outcome.ok
 
     parts = _parts_by_field(client.captured_files)
     assert "input_schema" in parts

@@ -40,6 +40,7 @@ import hashlib
 import json
 import logging
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from movate.core.config import AgentDefaults
@@ -285,6 +286,140 @@ async def import_filesystem_agents(
     return imported
 
 
+@dataclass(frozen=True)
+class PublishResult:
+    """Outcome of :func:`publish_agent_bundle` (ADR 021 D2).
+
+    ``published`` is ``True`` when a NEW registry row was written (the
+    bundle's content changed vs. the latest published version), ``False``
+    for a no-op (content unchanged — nothing was written, immutability +
+    audit stay clean). ``version`` is the version of the row that now
+    serves as ``latest`` — either the bundle's declared ``agent.yaml``
+    version, or a derived ``<version>+<hash8>`` PEP-440 local version when
+    the declared version collided with a different-content history entry.
+    ``content_hash`` is the bundle's content hash (the same value whether
+    published or skipped). ``previous_version`` is the version that WAS
+    latest before this publish (``None`` for a first publish).
+    """
+
+    published: bool
+    version: str
+    content_hash: str
+    previous_version: str | None = None
+
+
+async def publish_agent_bundle(
+    storage: StorageProvider,
+    *,
+    name: str,
+    tenant_id: str,
+    version: str,
+    files: dict[str, str],
+    created_by: str | None = None,
+) -> PublishResult:
+    """Publish a bundle to the durable registry IFF its content changed (ADR 021 D2).
+
+    The compare-and-publish that makes a re-deploy actually update what
+    runs, while preserving ADR 014's immutable ``(name, tenant, version)``
+    rows + audit history:
+
+    1. Look up the **latest** published bundle for ``(name, tenant_id)``.
+    2. If it exists and its ``content_hash`` equals this bundle's hash →
+       **no-op** (``published=False``). Nothing is written — an unchanged
+       re-deploy never adds a duplicate history row.
+    3. Otherwise the content changed (or it's a first publish): persist a
+       **new** :class:`AgentBundleRecord` so ``get_agent_bundle(version=
+       None)`` (the run-resolution source, ADR 014 D1) serves the new
+       content. Version selection:
+       * If ``version`` (the declared ``agent.yaml`` version) is **not**
+         already in this agent's history → use it verbatim.
+       * If it collides (the operator edited content without bumping the
+         version) → derive a distinct PEP-440 *local version*
+         ``<version>+<hash8>`` so the immutable ``(name, version)``
+         constraint holds and ``latest`` (newest ``created_at``) is the
+         new content. The derived label lives ONLY on the registry row;
+         the on-disk ``agent.yaml`` is untouched.
+
+    Uses only the existing ``StorageProvider`` surface
+    (``get_agent_bundle`` / ``list_agent_versions`` / ``save_agent_bundle``)
+    — no new backend method, no schema change. Tenant-scoped throughout.
+    """
+    new_hash = content_hash(files)
+    latest = await storage.get_agent_bundle(name, tenant_id=tenant_id)
+    if latest is not None and latest.content_hash == new_hash:
+        # Byte-identical to what's already serving — no-op. Don't write a
+        # duplicate history row (keeps the audit trail meaningful).
+        return PublishResult(
+            published=False,
+            version=latest.version,
+            content_hash=new_hash,
+            previous_version=latest.version,
+        )
+
+    previous_version = latest.version if latest is not None else None
+    resolved_version = await _resolve_publish_version(
+        storage, name, tenant_id=tenant_id, declared=version, content_hash_=new_hash
+    )
+    record = AgentBundleRecord(
+        name=name,
+        tenant_id=tenant_id,
+        version=resolved_version,
+        created_by=created_by,
+        content_hash=new_hash,
+        files=files,
+    )
+    await storage.save_agent_bundle(record)
+    logger.info(
+        "agent_published name=%s tenant_id=%s version=%s changed_from=%s",
+        name,
+        tenant_id,
+        resolved_version,
+        previous_version or "<new>",
+    )
+    return PublishResult(
+        published=True,
+        version=resolved_version,
+        content_hash=new_hash,
+        previous_version=previous_version,
+    )
+
+
+async def _resolve_publish_version(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+    declared: str,
+    content_hash_: str,
+) -> str:
+    """Pick a registry version for a changed bundle (ADR 021 D2).
+
+    Returns ``declared`` verbatim when it isn't already in the agent's
+    version history. When it collides (content changed but the
+    ``agent.yaml`` version stayed the same), returns a PEP-440 local
+    version ``<declared>+<hash8>`` derived from the content hash so the
+    immutable ``(name, version)`` constraint holds. A second
+    ``+<hash8>`` is never nested (the hash is stable per content), and an
+    already-stripped declared value is used as the base.
+    """
+    existing = {r.version for r in await storage.list_agent_versions(name, tenant_id=tenant_id)}
+    if declared not in existing:
+        return declared
+    # Strip any prior ``+<hash8>`` build tag so we don't nest local
+    # versions if a derived label is ever re-fed as the declared version.
+    base = declared.split("+", 1)[0]
+    candidate = f"{base}+{content_hash_[:8]}"
+    if candidate not in existing:
+        return candidate
+    # Extremely unlikely (same content already published under this
+    # derived label) — fall through to a counter so we still write a
+    # distinct, legible row rather than colliding on the PK.
+    n = 2
+    while f"{candidate}.{n}" in existing:
+        n += 1
+    return f"{candidate}.{n}"
+
+
 def _write_files(root: Path, files: dict[str, str]) -> None:
     """Write a ``{rel_path: contents}`` dict under ``root``.
 
@@ -301,9 +436,11 @@ def _write_files(root: Path, files: dict[str, str]) -> None:
 
 
 __all__ = [
+    "PublishResult",
     "bundle_files_from_dir",
     "content_hash",
     "import_filesystem_agents",
     "materialize_bundle",
+    "publish_agent_bundle",
     "resolve_agent_bundle",
 ]

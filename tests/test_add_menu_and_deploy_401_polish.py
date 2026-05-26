@@ -180,7 +180,7 @@ def test_deploy_401_returns_sentinel_for_outer_recovery() -> None:
             headers={"Authorization": "Bearer mvt_live_abcdef0123456789_DEADBEEF_secret"},
             agent_dir=agent_dir,
         )
-    assert result == _REASON_UNAUTHORIZED
+    assert result.error == _REASON_UNAUTHORIZED
 
 
 @pytest.mark.unit

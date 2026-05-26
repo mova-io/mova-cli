@@ -82,12 +82,11 @@ from movate.runtime.agent_creation import (
     wizard_to_bundle_files,
 )
 from movate.runtime.agent_resolver import (
+    PublishResult,
     bundle_files_from_dir,
     import_filesystem_agents,
+    publish_agent_bundle,
     resolve_agent_bundle,
-)
-from movate.runtime.agent_resolver import (
-    content_hash as _bundle_content_hash,
 )
 from movate.runtime.errors import ErrorCode, auth_required, conflict, http_error, not_found
 from movate.runtime.middleware import (
@@ -515,43 +514,54 @@ async def _dual_write_agent_to_registry(
     tenant_id: str,
     version: str,
     created_by: str | None,
-) -> None:
-    """Dual-write a freshly-persisted agent dir into the durable registry.
+) -> PublishResult | None:
+    """Publish a freshly-persisted agent dir into the durable registry.
 
-    ADR 014 D2/D5: ``POST/PUT /api/v1/agents`` keep writing to the
-    filesystem (``persist_bundle`` — the local-serve path + back-compat),
-    AND now also publish the bundle as a versioned, tenant-scoped row so
-    every pod (the async worker, other replicas) resolves it. The two
-    writes are additive; the FS write is the source of truth for local
-    ``mdk serve``, the registry row for the deployed multi-pod runtime.
+    ADR 014 D2/D5 + **ADR 021 D2**: ``POST/PUT /api/v1/agents`` keep
+    writing to the filesystem (``persist_bundle`` — the local-serve path
+    + back-compat), AND publish the bundle into the durable registry so
+    every pod (the async worker, other replicas) resolves it. The FS
+    write is the source of truth for local ``mdk serve``, the registry
+    row for the deployed multi-pod runtime.
 
-    Reads the bundle files back off disk (the files ``persist_bundle``
-    just wrote) into the ``files`` dict the registry stores. Best-effort:
-    a registry write failure must NOT fail the publish (the FS copy is
-    still live and the worker's filesystem-fallback / a later import
-    seed will pick it up) — so it's logged, not raised.
+    Delegates to :func:`publish_agent_bundle`, which is **content-aware**
+    (ADR 021): it writes a NEW immutable ``(name, tenant, version)`` row
+    only when the bundle's ``content_hash`` differs from the latest
+    published version — so a re-deploy of *changed* content updates what
+    runs, while an *unchanged* re-deploy is a no-op (no duplicate history
+    row, no swallowed duplicate-PK error). When the declared version
+    collides with a different-content history entry, a distinct
+    ``<version>+<hash8>`` registry version is derived so ``latest`` is the
+    new content.
+
+    Returns the :class:`PublishResult` (so the caller can report the
+    published version + whether anything changed), or ``None`` if the
+    registry write failed. Best-effort: a registry failure must NOT fail
+    the publish (the FS copy is still live and the worker's
+    filesystem-fallback / a later import seed picks it up) — it's logged,
+    not raised.
     """
     try:
         files = bundle_files_from_dir(agent_dir)
-        record = AgentBundleRecord(
+        return await publish_agent_bundle(
+            storage,
             name=agent_dir.name,
             tenant_id=tenant_id,
             version=version,
-            created_by=created_by,
-            content_hash=_bundle_content_hash(files),
             files=files,
+            created_by=created_by,
         )
-        await storage.save_agent_bundle(record)
     except Exception:
         import logging  # noqa: PLC0415
 
         logging.getLogger(__name__).warning(
-            "agent_registry_dual_write_failed name=%s tenant_id=%s version=%s",
+            "agent_registry_publish_failed name=%s tenant_id=%s version=%s",
             agent_dir.name,
             tenant_id,
             version,
             exc_info=True,
         )
+        return None
 
 
 def _normalize_if_match(raw: str) -> str:
@@ -1910,12 +1920,13 @@ def build_app(
         # one-level scan.
         request.app.state.agents = scan_agents(agents_path)
 
-        # Dual-write into the durable registry (ADR 014 D2): the FS write
-        # above keeps local `mdk serve` working; the registry row makes
-        # the agent resolvable by the async worker + other replicas
-        # (closes #109). Tenant-scoped from the auth context.
+        # Publish into the durable registry (ADR 014 D2 + ADR 021 D2): the
+        # FS write above keeps local `mdk serve` working; the registry row
+        # makes the agent resolvable by the async worker + other replicas
+        # (closes #109) AND content-addressed so a re-create of changed
+        # content updates what runs. Tenant-scoped from the auth context.
         store: StorageProvider = request.app.state.storage
-        await _dual_write_agent_to_registry(
+        published = await _dual_write_agent_to_registry(
             store,
             result.agent_dir,
             tenant_id=ctx.tenant_id,
@@ -1930,6 +1941,8 @@ def build_app(
             description=spec.description,
             agent_dir=result.agent_dir.name,
             files_persisted=result.files_persisted,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
         )
 
     @v1.post(
@@ -1992,10 +2005,12 @@ def build_app(
         # see the new bundle immediately.
         request.app.state.agents = scan_agents(agents_path)
 
-        # Dual-write into the durable registry (ADR 014 D2) — same as the
-        # multipart POST so wizard-created agents are worker-resolvable.
+        # Publish into the durable registry (ADR 014 D2 + ADR 021 D2) —
+        # same as the multipart POST so wizard-created agents are
+        # worker-resolvable and re-creates of changed content update what
+        # runs.
         store: StorageProvider = request.app.state.storage
-        await _dual_write_agent_to_registry(
+        published = await _dual_write_agent_to_registry(
             store,
             result.agent_dir,
             tenant_id=ctx.tenant_id,
@@ -2010,6 +2025,8 @@ def build_app(
             description=spec.description,
             agent_dir=result.agent_dir.name,
             files_persisted=result.files_persisted,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
         )
 
     @v1.post(
@@ -2094,6 +2111,7 @@ def build_app(
         name: str,
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
     ) -> AgentDetailView:
         """Return the full agent spec + bundle metadata for a single agent.
 
@@ -2103,20 +2121,37 @@ def build_app(
         config, marketplace metadata (role/persona/capabilities), and
         the list of canonical files on disk.
 
-        Source of truth is the in-memory registry populated at app
-        build + refreshed after every successful ``POST /api/v1/agents``.
-        Lookups are O(N) in registry size; for the typical tenant with
-        < 100 agents that's a non-issue. We could index by name in a
-        future revision if scan times start dominating.
+        **Versioning (ADR 021 D3).** ``?version=<v>`` returns that *exact*
+        published registry version (404 if no such version exists for this
+        agent in the caller's tenant) — it does NOT fall back to latest.
+        The materialized bundle is loaded from the durable registry so the
+        view reflects the published content of that version, not the API
+        pod's filesystem mirror. Omitting ``?version`` returns the current
+        agent from the in-memory registry (the FS mirror refreshed after
+        every successful ``POST/PUT /api/v1/agents``) — byte-for-byte the
+        pre-ADR-021 behavior.
 
         Errors:
 
         * **401** — missing / bad bearer token
-        * **404** — agent not in the registry (never registered, or
-          a different tenant's agent — today's runtime is global-
-          scoped, so 404 just means "not found")
+        * **404** — agent (or the requested ``?version``) not found, or a
+          different tenant's agent — today's runtime is global-scoped, so
+          404 just means "not found"
         """
-        # Tenant scoping — today's runtime is single-tenant per
+        # Versioned lookup → resolve the exact version from the durable
+        # registry (ADR 021 D3). A registry miss for the named version is
+        # a 404 — we deliberately do NOT silently fall back to latest, so
+        # ``?version=X`` means "X or nothing."
+        if version is not None:
+            store: StorageProvider = request.app.state.storage
+            bundle = await resolve_agent_bundle(
+                store, name, tenant_id=ctx.tenant_id, version=version
+            )
+            if bundle is None:
+                raise not_found("agent", f"{name}@{version}")
+            return _render_agent_detail(bundle)
+
+        # Versionless lookup — today's runtime is single-tenant per
         # agents_path; future per-tenant filesystem isolation reads
         # ctx.tenant_id and walks <agents_path>/<tenant_id>/. The
         # reference here keeps the audit trail honest and prevents
@@ -2336,14 +2371,17 @@ def build_app(
         result = persist_bundle(agent_files, agents_path=agents_path, on_conflict="replace")
         request.app.state.agents = scan_agents(agents_path)
 
-        # Dual-write the updated bundle into the durable registry (ADR
-        # 014 D2). Each publish writes a new immutable (name, version)
-        # row; if the version was bumped this is a fresh row that the
-        # worker resolves as the new latest, if not it's a no-op
-        # (save_agent_bundle is idempotent-ish via content_hash and the
-        # backends tolerate the re-publish). Best-effort — never fails
-        # the update. ``store`` was bound above for the If-Match check.
-        await _dual_write_agent_to_registry(
+        # Publish the updated bundle into the durable registry (ADR 014 D2
+        # + ADR 021 D2). Content-addressed: a re-deploy whose bundle bytes
+        # CHANGED writes a NEW immutable (name, version) row that the
+        # worker + every replica resolve as the new latest — so the served
+        # agent actually updates (the headline ADR 021 fix). An UNCHANGED
+        # re-deploy is a no-op (no duplicate history row). When the
+        # declared version collides with a different-content history entry,
+        # a derived <version>+<hash8> registry version keeps the immutable
+        # PK intact. Best-effort — never fails the update. ``store`` was
+        # bound above for the If-Match check.
+        published = await _dual_write_agent_to_registry(
             store,
             result.agent_dir,
             tenant_id=ctx.tenant_id,
@@ -2359,6 +2397,8 @@ def build_app(
             agent_dir=result.agent_dir.name,
             files_persisted=result.files_persisted,
             previous_version=previous_version,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
         )
 
     @v1.get(
