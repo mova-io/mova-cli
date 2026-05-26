@@ -13,12 +13,47 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)
+
+
+def _patch_verify(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: int = 200,
+    raise_error: bool = False,
+) -> dict[str, list[str]]:
+    """Route the lazily-imported ``httpx.Client`` (used by deploy's
+    ``_verify_bearer_roundtrip``, which the adopt-verify path reuses) through a
+    MockTransport so no real network call happens. ``200`` → verified;
+    ``401``/``403`` → failed; ``raise_error`` simulates an unreachable runtime.
+
+    Returns a captures dict recording the bearer each verify request carried,
+    so a test can assert the candidate key (never the full secret, since we
+    only record what the transport saw) was the one verified.
+    """
+    captures: dict[str, list[str]] = {"bearers": []}
+    real_client = httpx.Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captures["bearers"].append(request.headers.get("authorization", ""))
+        if raise_error:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(status, json={"keys": []} if status < 400 else {"detail": "no"})
+
+    transport = httpx.MockTransport(handler)
+
+    def factory(*args: object, **kwargs: object) -> httpx.Client:
+        kwargs["transport"] = transport  # type: ignore[assignment]
+        return real_client(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("httpx.Client", factory)
+    return captures
 
 
 def _write_user_config(home: Path) -> None:
@@ -89,6 +124,7 @@ def test_pull_runtime_key_reads_kv_and_writes_credentials(
     _isolate_credentials(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
     captures = _patch_az(monkeypatch)
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -121,6 +157,7 @@ def test_pull_runtime_key_strips_trailing_newline_from_tsv_output(
         monkeypatch,
         secret_value="mvt_live_demotena_kid123abc_secretdataXYZ\n\n",
     )
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -144,6 +181,7 @@ def test_pull_runtime_key_custom_secret_name(
     _isolate_credentials(tmp_path, monkeypatch)
     _write_user_config(tmp_path)
     captures = _patch_az(monkeypatch)
+    _patch_verify(monkeypatch, status=200)
 
     result = runner.invoke(
         app,
@@ -395,3 +433,137 @@ def test_refresh_runtime_key_inline_default_omits_scope(
     exec_call = next(c for c in captures["calls"] if c[:3] == ["az", "containerapp", "exec"])
     inner = next(part for part in exec_call if "mdk auth create-key" in part)
     assert "--scope" not in inner
+
+
+# ---------------------------------------------------------------------------
+# Adopt-verify (item #89): after pulling the KV value the command round-trips
+# it against the deployed runtime BEFORE the operator walks away, instead of
+# silently adopting a stale / wrong-tenant key that only 401s mid-task later.
+# The full secret is NEVER printed — warnings mask it as `…last4`.
+# ---------------------------------------------------------------------------
+
+_SECRET = "mvt_live_demotena_kid123abc_secretdataXYZ"
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_verifies_pulled_key_against_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a successful verify the key is saved AND the candidate is actually
+    round-tripped (the verify transport saw a Bearer call)."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch, secret_value=_SECRET)
+    verify = _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(
+        app,
+        ["auth", "pull-runtime-key", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # The verify call happened, carrying the pulled bearer.
+    assert verify["bearers"] == [f"Bearer {_SECRET}"]
+    # Saved as today.
+    creds = (tmp_path / ".movate" / "credentials").read_text()
+    assert f"MDK_DEV_KEY={_SECRET}" in creds
+    # No failure warning on the happy path.
+    assert "FAILED to authenticate" not in result.stderr
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_warns_when_verify_fails_but_still_saves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify 401 → loud warning naming the URL + reason, key still saved
+    (operator may be pulling for an env not reachable yet)."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch, secret_value=_SECRET)
+    _patch_verify(monkeypatch, status=401)
+
+    result = runner.invoke(
+        app,
+        ["auth", "pull-runtime-key", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    # Still adopts (no abort) — the warning is advisory.
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Rich soft-wraps the warning; collapse whitespace runs so a wrap boundary
+    # mid-phrase doesn't break the substring match.
+    stderr = " ".join(result.stderr.split())
+    assert "FAILED to authenticate" in stderr
+    assert "movate-dev-api.example.azurecontainerapps.io" in stderr
+    assert "HTTP 401" in stderr
+    creds = (tmp_path / ".movate" / "credentials").read_text()
+    assert f"MDK_DEV_KEY={_SECRET}" in creds
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_warning_masks_full_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify-failure warning must NEVER print the full bearer — only the
+    masked `…last4` form."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch, secret_value=_SECRET)
+    _patch_verify(monkeypatch, status=403)
+
+    result = runner.invoke(
+        app,
+        ["auth", "pull-runtime-key", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    combined = result.stdout + result.stderr
+    assert _SECRET not in combined
+    # The masked tail (last 4 chars) is present, the secret body is not.
+    # Rich may soft-wrap, so strip newlines before matching.
+    assert "…aXYZ" in combined.replace("\n", "")
+    assert "secretdataXYZ" not in combined
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_warns_when_shell_export_shadows_saved_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a successful verify, if a STALE `MDK_DEV_KEY` is exported in the
+    shell (differing from the saved value), warn that it'll shadow the
+    just-saved key (shell wins over the credentials file)."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    # A stale shell export different from the pulled value.
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_demotena_stale_OLDSHELLVALUE")
+    _patch_az(monkeypatch, secret_value=_SECRET)
+    _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(
+        app,
+        ["auth", "pull-runtime-key", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    stderr = " ".join(result.stderr.split())
+    assert "stale" in stderr and "MDK_DEV_KEY" in stderr
+    assert "unset MDK_DEV_KEY" in stderr
+    # The shell shadow warning must not leak either secret.
+    assert _SECRET not in (result.stdout + result.stderr)
+
+
+@pytest.mark.unit
+def test_pull_runtime_key_no_shadow_warning_when_no_shell_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No shell export → no shadow warning on the happy path."""
+    _isolate_credentials(tmp_path, monkeypatch)
+    _write_user_config(tmp_path)
+    _patch_az(monkeypatch, secret_value=_SECRET)
+    _patch_verify(monkeypatch, status=200)
+
+    result = runner.invoke(
+        app,
+        ["auth", "pull-runtime-key", "dev", "--keyvault", "movate-dev-kv-mvt"],
+    )
+
+    assert result.exit_code == 0
+    assert "will OVERRIDE" not in result.stderr

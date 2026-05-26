@@ -2045,7 +2045,7 @@ def refresh_runtime_key(
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
     try:
-        _minted_key, env_var = refresh_runtime_key_inline(
+        minted_key, env_var = refresh_runtime_key_inline(
             target,
             tenant=tenant,
             env=env,
@@ -2070,6 +2070,19 @@ def refresh_runtime_key(
         f"(tenant={tenant}, env={env}) → [cyan]{env_var}[/cyan] in "
         f"[cyan]{store_path}[/cyan]."
     )
+    # Round-trip-verify the freshly-minted key + warn on a shell shadow. A
+    # mint can land in a store the serving replica never reads (non-durable
+    # SQLite-in-pod, multi-replica) and still 401 — verifying here tells the
+    # operator immediately instead of at the next deploy.
+    base_url = _resolve_target_base_url(target)
+    if base_url is not None:
+        _verify_and_warn_adopted_key(
+            target=target,
+            env_var=env_var,
+            key=minted_key,
+            base_url=base_url,
+            source=f"minted runtime key for {target}",
+        )
     hint(
         f"[dim]Future shells autoload {env_var} automatically. For the "
         f"current shell, run: [bold]export {env_var}=$(grep '^{env_var}=' "
@@ -2664,7 +2677,7 @@ def bootstrap_seed(
         f"--name bootstrap-api-key --value <minted-key>[/dim]"
     )
     try:
-        _seed_key, env_var = bootstrap_seed_inline(
+        seed_key, env_var = bootstrap_seed_inline(
             target,
             keyvault=keyvault,
             tenant_id=tenant_id,
@@ -2680,6 +2693,21 @@ def bootstrap_seed(
         f"bootstrap key minted + uploaded to [cyan]{keyvault}/bootstrap-api-key[/cyan] "
         f"+ saved locally as [cyan]{env_var}[/cyan]."
     )
+    # Round-trip-verify the seeded key + warn on a shell shadow. Note: on a
+    # FRESH environment the runtime hasn't yet re-seeded the matching
+    # ApiKeyRecord from MOVATE_SEED_API_KEY (that happens on the next cold
+    # start, which the hint below prompts), so a failure here is often
+    # expected — the warning is worded to keep the key and steer the operator
+    # to deploy/restart, not to abort the seed.
+    base_url = _resolve_target_base_url(target)
+    if base_url is not None:
+        _verify_and_warn_adopted_key(
+            target=target,
+            env_var=env_var,
+            key=seed_key,
+            base_url=base_url,
+            source=f"seeded key to {keyvault}/bootstrap-api-key",
+        )
     hint(
         f"[dim]Next: run [bold]mdk deploy --target {target} --mode runtime[/bold] "
         f"(or restart the Container App) so the runtime picks up the "
@@ -2689,6 +2717,120 @@ def bootstrap_seed(
         f"[dim]For the current shell, run: [bold]export {env_var}=$(grep "
         f"'^{env_var}=' {store_path} | cut -d= -f2-)[/bold] or open a new "
         f"terminal.[/dim]"
+    )
+
+
+def _resolve_target_base_url(target: str) -> str | None:
+    """The target's runtime base URL (trailing slash trimmed), or ``None``.
+
+    Used by the adopt-verify paths to know WHERE to round-trip-verify a
+    freshly-saved bearer. Returns ``None`` — so the caller silently skips
+    verification rather than crashing — when the config can't load, the
+    target isn't registered, or it has no ``url`` (the obtain step already
+    validated the target exists; this is a soft re-read for the URL only).
+    """
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        load_user_config,
+    )
+
+    try:
+        cfg = load_user_config()
+    except UserConfigError:
+        return None
+    target_cfg = cfg.targets.get(target)
+    url = getattr(target_cfg, "url", None)
+    if isinstance(url, str) and url.strip():
+        return url.rstrip("/")
+    return None
+
+
+def _mask_key(key: str) -> str:
+    """Render a bearer as ``…last4`` so logs/warnings never leak the secret.
+
+    Matches the repo's masking convention (the deploy 401 message shows a
+    short prefix; ``list-keys`` truncates tenant ids). We surface only the
+    last four characters — enough for an operator to correlate "which key"
+    across a warning without exposing anything usable.
+    """
+    tail = key[-4:] if len(key) >= 4 else key  # noqa: PLR2004
+    return f"…{tail}"
+
+
+def _warn_if_shell_shadows_runtime_key(*, key_env: str, fresh_key: str) -> None:
+    """Warn when a stale ``$<key_env>`` in the shell will shadow the just-saved key.
+
+    Shell-exported env vars take precedence over ``~/.movate/credentials``
+    (autoload only fills a var that isn't already set; it never clobbers a
+    shell export). So a stale bearer left over from an earlier deploy would
+    OVERRIDE the fresh key this command just saved — and the next
+    ``mdk run --target`` would send the stale key and 401. Warn at save time,
+    on stderr, rather than letting the operator discover it through a
+    confusing 401 later. Only warns when a shell value is the *source* AND it
+    DIFFERS (a match is harmless), and never fails the command.
+
+    Mirrors ``deploy._warn_if_shell_shadows_runtime_key`` so the two adopt
+    paths warn identically. We re-derive the source via ``credentials.key_source``
+    (the same primitive ``mdk auth status`` uses) rather than importing
+    deploy's copy, to keep the lazy-import surface small.
+    """
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    shell_value = os.environ.get(key_env, "").strip()
+    if key_source(key_env) == "shell" and shell_value and shell_value != fresh_key:
+        err.print(
+            f"[yellow]⚠[/yellow] a stale [bold]{key_env}[/bold] is exported in your "
+            f"shell and will OVERRIDE the key just saved (shell wins) — run "
+            f"[bold]unset {key_env}[/bold] (and remove it from your profile) so the "
+            f"new key takes effect."
+        )
+
+
+def _verify_and_warn_adopted_key(
+    *,
+    target: str,
+    env_var: str,
+    key: str,
+    base_url: str,
+    source: str,
+) -> None:
+    """Round-trip-verify a just-adopted bearer + warn on a shell shadow.
+
+    Both the KV-pull (``pull-runtime-key``) and the mint/seed paths
+    (``bootstrap-seed`` / ``refresh-runtime-key``) historically adopted a
+    candidate key WITHOUT confirming it authenticates against the deployed
+    runtime — a stale / wrong-scoped / wrong-tenant value only surfaced as a
+    401 mid-task later. This makes one authenticated call (reusing deploy's
+    ``_verify_bearer_roundtrip``, via a function-local import to dodge the
+    module-load circular dependency) and:
+
+    * on success — emits the shell-shadow adopt warning if a stale shell
+      export would override the freshly-saved key;
+    * on failure — prints a loud, actionable warning naming the URL + reason
+      (with the key MASKED, never printed) and a next-step hint.
+
+    The key is left SAVED in either case: an operator may legitimately pull a
+    key for an environment that isn't reachable yet (no public ingress, behind
+    a VPN, not deployed). Verification is advisory, not a gate — matching the
+    surrounding commands' "save then advise" contract (the pull/seed commands
+    only ``typer.Exit`` on a failure to OBTAIN the key, not on its quality).
+    Never raises.
+    """
+    from movate.cli.deploy import _verify_bearer_roundtrip  # noqa: PLC0415
+
+    verified, reason = _verify_bearer_roundtrip(base_url=base_url, key=key)
+    if verified:
+        _warn_if_shell_shadows_runtime_key(key_env=env_var, fresh_key=key)
+        return
+
+    err.print(
+        f"[yellow]⚠[/yellow] {source} (saved as [cyan]{env_var}[/cyan] = "
+        f"[dim]{_mask_key(key)}[/dim]) but it FAILED to authenticate against "
+        f"[bold]{base_url}[/bold]: {reason}. The key was still saved — if the "
+        f"runtime isn't reachable yet this may be expected. Otherwise confirm "
+        f"the runtime is deployed and the Key Vault value is current "
+        f"(re-seed with [bold]mdk auth bootstrap-seed {target} --force[/bold]), "
+        f"then re-run."
     )
 
 
@@ -2855,7 +2997,7 @@ def pull_runtime_key(
     from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
     try:
-        _secret_value, env_var = pull_runtime_key_inline(
+        secret_value, env_var = pull_runtime_key_inline(
             target,
             keyvault=keyvault,
             secret_name=secret_name,
@@ -2869,6 +3011,19 @@ def pull_runtime_key(
         f"pulled [cyan]{keyvault}/{secret_name}[/cyan] → saved as "
         f"[cyan]{env_var}[/cyan] in [cyan]{store_path}[/cyan]."
     )
+    # Round-trip-verify the pulled key against the deployed runtime BEFORE the
+    # operator walks away thinking it works — a stale / wrong-tenant KV value
+    # would otherwise only surface as a 401 mid-task. Also warn if a stale
+    # shell export would shadow the value we just saved.
+    base_url = _resolve_target_base_url(target)
+    if base_url is not None:
+        _verify_and_warn_adopted_key(
+            target=target,
+            env_var=env_var,
+            key=secret_value,
+            base_url=base_url,
+            source=f"pulled key from {keyvault}/{secret_name}",
+        )
     hint(
         f"[dim]For the current shell, run: [bold]export {env_var}=$(grep "
         f"'^{env_var}=' {store_path} | cut -d= -f2-)[/bold] or open a new "
