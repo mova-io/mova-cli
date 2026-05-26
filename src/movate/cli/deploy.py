@@ -1667,6 +1667,11 @@ def _warn_if_shell_shadows_runtime_key(*, key_env: str, fresh_key: str) -> None:
             f"[bold]unset {key_env}[/bold] (and remove it from your profile) so the "
             f"new key takes effect."
         )
+        err.print(
+            f"  Fix it: [cyan]mdk fix unshadow-runtime-keys --apply[/cyan] "
+            f"(comments the stale export) — then [bold]unset {key_env}[/bold] in "
+            f"this shell."
+        )
 
 
 def _resolve_keyvault_name(target_cfg: Any) -> str | None:

@@ -1717,6 +1717,8 @@ def test_warn_fires_when_shell_value_differs_from_minted(capsys, monkeypatch) ->
     out = _collapsed(capsys.readouterr().err)
     assert "unset MDK_DEV_KEY" in out
     assert "OVERRIDE" in out
+    # Points at the one-command fix that auto-comments the stale export.
+    assert "mdk fix unshadow-runtime-keys --apply" in out
 
 
 @pytest.mark.unit
