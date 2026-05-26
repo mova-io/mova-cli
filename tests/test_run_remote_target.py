@@ -170,13 +170,110 @@ def test_target_happy_path_renders_run_view_and_summary(
     assert '"question":"hello"' in str(captured["body"])
     # mock flag default false threaded through.
     assert '"mock":false' in str(captured["body"])
-    # Output rendered to stdout (full RunView in JSON mode).
+    # Output rendered to stdout (full RunView in JSON mode — the default under
+    # CliRunner, whose stdout is not a tty).
     assert '"answer": "hi back"' in result.stdout
     # Summary line on stderr carries the target= field.
     assert "mdk_run_summary:" in result.stderr
     assert "target=dev" in result.stderr
     assert "ok=true" in result.stderr
     assert "cost_usd=0.0012" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Served-version surfacing (ADR 021 — which version answered after a redeploy)
+# ---------------------------------------------------------------------------
+
+
+def _run_view_response(*, agent_version: str) -> httpx.Response:
+    """A 200 + RunView body with a content-addressed ``agent_version`` —
+    the shape ADR 021 deploys produce (``<semver>+<short-sha>``)."""
+    return httpx.Response(
+        200,
+        json={
+            "run_id": "11111111-2222-3333-4444-555555555555",
+            "job_id": "job-xyz",
+            "agent": "faq",
+            "agent_version": agent_version,
+            "prompt_hash": "deadbeef",
+            "provider": "mock",
+            "provider_version": "1.0",
+            "pricing_version": "2024.05",
+            "status": "success",
+            "input": {"question": "hello"},
+            "output": {"answer": "hi back"},
+            "metrics": {
+                "cost_usd": 0.0012,
+                "latency_ms": 480,
+                "tokens": {"input": 12, "output": 4, "total": 16},
+            },
+            "error": None,
+            "created_at": "2026-05-15T12:00:00Z",
+            "workflow_run_id": None,
+            "node_id": None,
+        },
+    )
+
+
+@pytest.mark.unit
+def test_target_text_mode_surfaces_content_addressed_served_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TEXT mode: the content-addressed served version (e.g.
+    ``0.1.0+9f3a1c0d``) the runtime resolved is echoed on stderr so the
+    operator can confirm their just-deployed edit is the one that answered."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_t1_k1_secret")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return _run_view_response(agent_version="0.1.0+9f3a1c0d")
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    # Force TEXT mode — CliRunner's stdout is not a tty, so the default is
+    # JSON; the served-by line is a human (TEXT-mode) hint.
+    result = runner.invoke(
+        app, ["run", "faq", "hello", "--target", "dev", "-o", "text"], env={"COLUMNS": "200"}
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # The full content-addressed version appears on stderr …
+    assert "served by" in result.stderr
+    assert "faq 0.1.0+9f3a1c0d" in result.stderr
+    # … and never on stdout (the output-JSON stream stays clean).
+    assert "served by" not in result.stdout
+
+
+@pytest.mark.unit
+def test_target_json_mode_served_version_is_pure_passthrough(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``-o json``: stdout is the raw RunView (already carrying
+    ``agent_version``); we inject NOTHING and emit no served-by hint, so the
+    JSON shape is byte-identical to the API response (compat rule 5)."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_t1_k1_secret")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return _run_view_response(agent_version="0.1.0+9f3a1c0d")
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(
+        app, ["run", "faq", "hello", "--target", "dev", "-o", "json"], env={"COLUMNS": "200"}
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # stdout parses as the raw RunView; agent_version came straight from the
+    # API response (not injected by the CLI render).
+    parsed = json.loads(result.stdout)
+    assert parsed["agent_version"] == "0.1.0+9f3a1c0d"
+    assert parsed["run_id"] == "11111111-2222-3333-4444-555555555555"
+    # No human "served by" hint in JSON mode — neither on stdout nor stderr.
+    assert "served by" not in result.stdout
+    assert "served by" not in result.stderr
 
 
 # ---------------------------------------------------------------------------
