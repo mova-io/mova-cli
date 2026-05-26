@@ -1711,7 +1711,10 @@ def test_bearer_bootstrap_hint_names_both_recovery_commands(capsys) -> None:
 
 
 @pytest.mark.unit
-def test_warn_fires_when_shell_value_differs_from_minted(capsys, monkeypatch) -> None:
+def test_warn_fires_when_shell_value_differs_from_minted(capsys, monkeypatch, tmp_path) -> None:
+    # Hermetic store (no matching saved value) so `key_source` resolves the
+    # env var to "shell" — the gate the consolidated helper applies (ADR 022).
+    _hermetic_creds(monkeypatch, tmp_path)
     monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
     _warn_if_shell_shadows_runtime_key(key_env="MDK_DEV_KEY", fresh_key="mvt_dev_FRESH_minted")
     out = _collapsed(capsys.readouterr().err)
@@ -1722,14 +1725,16 @@ def test_warn_fires_when_shell_value_differs_from_minted(capsys, monkeypatch) ->
 
 
 @pytest.mark.unit
-def test_warn_silent_when_shell_value_matches_minted(capsys, monkeypatch) -> None:
+def test_warn_silent_when_shell_value_matches_minted(capsys, monkeypatch, tmp_path) -> None:
+    _hermetic_creds(monkeypatch, tmp_path)
     monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_same_value")
     _warn_if_shell_shadows_runtime_key(key_env="MDK_DEV_KEY", fresh_key="mvt_dev_same_value")
     assert _collapsed(capsys.readouterr().err) == ""
 
 
 @pytest.mark.unit
-def test_warn_silent_when_shell_unset(capsys, monkeypatch) -> None:
+def test_warn_silent_when_shell_unset(capsys, monkeypatch, tmp_path) -> None:
+    _hermetic_creds(monkeypatch, tmp_path)
     monkeypatch.delenv("MDK_DEV_KEY", raising=False)
     _warn_if_shell_shadows_runtime_key(key_env="MDK_DEV_KEY", fresh_key="mvt_dev_FRESH_minted")
     assert _collapsed(capsys.readouterr().err) == ""

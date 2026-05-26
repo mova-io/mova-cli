@@ -27,6 +27,10 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._console import confirm_destructive, error, hint, success
+from movate.cli._runtime_key_checks import (
+    _verify_bearer_roundtrip,
+    _warn_if_shell_shadows_runtime_key,
+)
 from movate.core.auth import (
     ALL_SCOPES,
     KEY_DEFAULT_ROTATION_GRACE_SECONDS,
@@ -1680,10 +1684,9 @@ def _verify_target_roundtrip_cell(target: Any) -> str:
       falling back to the saved credentials-store value — the same
       precedence the rest of ``status`` reads. If either the URL or a
       bearer is missing we show a quiet skip — there's nothing to check.
-    * Otherwise we make ONE authenticated call via deploy's
-      ``_verify_bearer_roundtrip`` (imported lazily to dodge the module-load
-      circular dependency between the auth + deploy CLI modules) and render
-      ✓ on success or ✗ + the reason on failure.
+    * Otherwise we make ONE authenticated call via the shared
+      ``_runtime_key_checks._verify_bearer_roundtrip`` and render ✓ on
+      success or ✗ + the reason on failure.
 
     The key is NEVER printed — only the round-trip outcome. Best-effort:
     never raises, so a single unreachable target can't fail ``status``.
@@ -1706,10 +1709,6 @@ def _verify_target_roundtrip_cell(target: Any) -> str:
         return "[dim]— (no url)[/dim]"
     if not key:
         return "[dim]— (no key)[/dim]"
-
-    # Lazy import: deploy.py imports from auth.py at module load, so a
-    # top-level import here would form a circular dependency.
-    from movate.cli.deploy import _verify_bearer_roundtrip  # noqa: PLC0415
 
     ok, reason = _verify_bearer_roundtrip(base_url=base_url, key=key)
     if ok:
@@ -2844,35 +2843,6 @@ def _mask_key(key: str) -> str:
     return f"…{tail}"
 
 
-def _warn_if_shell_shadows_runtime_key(*, key_env: str, fresh_key: str) -> None:
-    """Warn when a stale ``$<key_env>`` in the shell will shadow the just-saved key.
-
-    Shell-exported env vars take precedence over ``~/.movate/credentials``
-    (autoload only fills a var that isn't already set; it never clobbers a
-    shell export). So a stale bearer left over from an earlier deploy would
-    OVERRIDE the fresh key this command just saved — and the next
-    ``mdk run --target`` would send the stale key and 401. Warn at save time,
-    on stderr, rather than letting the operator discover it through a
-    confusing 401 later. Only warns when a shell value is the *source* AND it
-    DIFFERS (a match is harmless), and never fails the command.
-
-    Mirrors ``deploy._warn_if_shell_shadows_runtime_key`` so the two adopt
-    paths warn identically. We re-derive the source via ``credentials.key_source``
-    (the same primitive ``mdk auth status`` uses) rather than importing
-    deploy's copy, to keep the lazy-import surface small.
-    """
-    from movate.credentials import key_source  # noqa: PLC0415
-
-    shell_value = os.environ.get(key_env, "").strip()
-    if key_source(key_env) == "shell" and shell_value and shell_value != fresh_key:
-        err.print(
-            f"[yellow]⚠[/yellow] a stale [bold]{key_env}[/bold] is exported in your "
-            f"shell and will OVERRIDE the key just saved (shell wins) — run "
-            f"[bold]unset {key_env}[/bold] (and remove it from your profile) so the "
-            f"new key takes effect."
-        )
-
-
 def _verify_and_warn_adopted_key(
     *,
     target: str,
@@ -2887,9 +2857,8 @@ def _verify_and_warn_adopted_key(
     (``bootstrap-seed`` / ``refresh-runtime-key``) historically adopted a
     candidate key WITHOUT confirming it authenticates against the deployed
     runtime — a stale / wrong-scoped / wrong-tenant value only surfaced as a
-    401 mid-task later. This makes one authenticated call (reusing deploy's
-    ``_verify_bearer_roundtrip``, via a function-local import to dodge the
-    module-load circular dependency) and:
+    401 mid-task later. This makes one authenticated call (the shared
+    ``_runtime_key_checks._verify_bearer_roundtrip``) and:
 
     * on success — emits the shell-shadow adopt warning if a stale shell
       export would override the freshly-saved key;
@@ -2903,8 +2872,6 @@ def _verify_and_warn_adopted_key(
     only ``typer.Exit`` on a failure to OBTAIN the key, not on its quality).
     Never raises.
     """
-    from movate.cli.deploy import _verify_bearer_roundtrip  # noqa: PLC0415
-
     verified, reason = _verify_bearer_roundtrip(base_url=base_url, key=key)
     if verified:
         _warn_if_shell_shadows_runtime_key(key_env=env_var, fresh_key=key)

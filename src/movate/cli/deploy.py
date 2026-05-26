@@ -40,6 +40,10 @@ from rich.console import Console
 import movate
 from movate.cli._console import echo_remote_context, error, hint, success
 from movate.cli._progress import spinner
+from movate.cli._runtime_key_checks import (
+    _verify_bearer_roundtrip,
+    _warn_if_shell_shadows_runtime_key,
+)
 from movate.core.user_config import (
     TargetConfig,
     UserConfigError,
@@ -1647,33 +1651,6 @@ def _preflight_bearer(
     raise typer.Exit(code=2)
 
 
-def _warn_if_shell_shadows_runtime_key(*, key_env: str, fresh_key: str) -> None:
-    """Warn when a stale ``$<key_env>`` in the shell will shadow the just-saved key.
-
-    Shell-exported env vars take precedence over ``~/.movate/credentials``
-    (autoload only fills a var that isn't already set; it never clobbers a
-    shell export). So a stale bearer left over from an earlier deploy would
-    OVERRIDE the fresh key this deploy just minted + saved — and the next
-    ``mdk run --target`` would send the stale key and 401. Warn at save
-    time, on stderr, rather than letting the operator discover it through a
-    confusing 401 later. Only warns when the shell value DIFFERS (a match is
-    harmless) and never fails the deploy.
-    """
-    shell_value = os.environ.get(key_env, "").strip()
-    if shell_value and shell_value != fresh_key:
-        err.print(
-            f"[yellow]⚠[/yellow] a stale [bold]{key_env}[/bold] is exported in your "
-            f"shell and will OVERRIDE the key just saved (shell wins) — run "
-            f"[bold]unset {key_env}[/bold] (and remove it from your profile) so the "
-            f"new key takes effect."
-        )
-        err.print(
-            f"  Fix it: [cyan]mdk fix unshadow-runtime-keys --apply[/cyan] "
-            f"(comments the stale export) — then [bold]unset {key_env}[/bold] in "
-            f"this shell."
-        )
-
-
 def _resolve_keyvault_name(target_cfg: Any) -> str | None:
     """The Key Vault name to pull the seeded bootstrap key from, or ``None``.
 
@@ -1750,44 +1727,6 @@ def _discover_keyvault_in_resource_group(target_cfg: Any) -> str | None:
         if name.startswith(prefix):
             return name
     return None
-
-
-def _verify_bearer_roundtrip(*, base_url: str, key: str) -> tuple[bool, str]:
-    """Confirm a candidate bearer is ADMIN-capable — the capability a deploy needs.
-
-    The deploy bearer performs admin uploads (``POST/PUT /api/v1/agents``,
-    both gated on the ``admin`` scope). A bearer that merely authenticates
-    (``read``) is NOT good enough: it sails through a ``GET /api/v1/agents``
-    probe yet 403s on the very first agent upload. So this probes the
-    admin-scoped, read-only ``GET /api/v1/auth/keys`` endpoint instead and
-    only declares the bearer ready when the runtime grants admin.
-
-    Returns ``(verified, reason)``:
-
-    * **2xx** — authenticated AND admin-capable → ``(True, "")``.
-    * **403** — authenticated but the key lacks the ``admin`` scope (the
-      live regression: an in-pod mint defaulted to ``read,run,eval``) →
-      ``(False, "HTTP 403 (key lacks admin scope; uploads need admin)")``.
-    * **401** — bad/unknown bearer → ``(False, "HTTP 401")``.
-    * transport error → ``(False, "runtime unreachable (...)")``.
-
-    The recovery path uses this so it never declares "bearer key ready" — nor
-    overwrites a previously-working saved key — for a candidate that can't
-    actually deploy.
-    """
-    try:
-        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
-            resp = client.get(
-                f"{base_url}/api/v1/auth/keys",
-                headers={"Authorization": f"Bearer {key}"},
-            )
-    except httpx.HTTPError as exc:
-        return False, f"runtime unreachable ({type(exc).__name__})"
-    if resp.status_code < _HTTP_BAD_REQUEST:
-        return True, ""
-    if resp.status_code == _HTTP_FORBIDDEN:
-        return False, "HTTP 403 (key lacks admin scope; uploads need admin)"
-    return False, f"HTTP {resp.status_code}"
 
 
 def _restore_saved_key(store: Any, env_var: str, prior_saved: str | None) -> None:
