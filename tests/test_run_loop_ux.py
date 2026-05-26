@@ -3,9 +3,10 @@
 All four are additive, guarded hints that never change exit codes, the
 ``--json`` output shape, or run semantics:
 
-* **P1** — after a run, surface the ``trace_id`` (+ a ``mdk trace ... --target``
-  view pointer on the deployed path). Suppressed when there's no trace id or
-  under ``--json`` (JSON stdout must stay machine-parseable).
+* **P1** — after a run, surface the ``trace_id`` (+ a
+  ``mdk runs show <run_id> --target`` view pointer on the deployed path).
+  Suppressed when there's no trace id or under ``--json`` (JSON stdout must
+  stay machine-parseable).
 * **P4** — on (status=error + schema/output-validation error + ``--mock``),
   append an actionable hint that MockProvider output can't satisfy the agent's
   output_schema. A real-provider schema error keeps today's bare message.
@@ -50,24 +51,38 @@ class TestTraceLineHelper:
         assert "trace:" in err
         assert "tid-123" in err
         # No deployed view pointer for a local run.
-        assert "mdk trace" not in err
+        assert "mdk runs show" not in err
 
     def test_prints_view_pointer_for_target(self, capsys: pytest.CaptureFixture[str]) -> None:
-        _maybe_trace_line("tid-123", output_format=Run.TEXT, target="dev")
+        _maybe_trace_line("tid-123", output_format=Run.TEXT, target="dev", run_id="run-789")
         err = capsys.readouterr().err
         assert "tid-123" in err
         # Deployed runs get the actionable view command + App Insights pointer.
-        assert "mdk trace tid-123 --target dev" in err.replace("\n", "")
+        # The command must be a REAL one — `mdk runs show <run_id> --target` —
+        # not the dead-end `mdk trace <id> --target` (#125).
+        assert "mdk runs show run-789 --target dev" in err.replace("\n", "")
+        assert "mdk trace" not in err
         assert "App Insights" in err.replace("\n", "")
 
+    def test_falls_back_to_plain_line_without_run_id(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `mdk runs show` needs a run_id; with none, omit the dead-end pointer
+        # and just print the bare trace line.
+        _maybe_trace_line("tid-123", output_format=Run.TEXT, target="dev", run_id=None)
+        err = capsys.readouterr().err
+        assert "trace:" in err
+        assert "tid-123" in err
+        assert "mdk runs show" not in err
+
     def test_suppressed_under_json(self, capsys: pytest.CaptureFixture[str]) -> None:
-        _maybe_trace_line("tid-123", output_format=Run.JSON, target="dev")
+        _maybe_trace_line("tid-123", output_format=Run.JSON, target="dev", run_id="run-789")
         assert capsys.readouterr().err == ""
 
     def test_suppressed_when_trace_id_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
-        _maybe_trace_line("", output_format=Run.TEXT, target="dev")
-        _maybe_trace_line(None, output_format=Run.TEXT, target="dev")
-        _maybe_trace_line("   ", output_format=Run.TEXT, target="dev")
+        _maybe_trace_line("", output_format=Run.TEXT, target="dev", run_id="run-789")
+        _maybe_trace_line(None, output_format=Run.TEXT, target="dev", run_id="run-789")
+        _maybe_trace_line("   ", output_format=Run.TEXT, target="dev", run_id="run-789")
         assert capsys.readouterr().err == ""
 
 
@@ -178,8 +193,8 @@ def test_target_success_surfaces_trace_with_view_pointer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A successful deployed run with a trace_id prints the trace line +
-    the ``mdk trace ... --target`` view pointer on stderr; stdout stays the
-    machine-parseable RunView."""
+    the ``mdk runs show <run_id> --target`` view pointer on stderr; stdout
+    stays the machine-parseable RunView."""
     _configure(tmp_path, monkeypatch)
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -192,7 +207,10 @@ def test_target_success_surfaces_trace_with_view_pointer(
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "trace: tr-abc" in result.stderr
-    assert "mdk trace tr-abc --target dev" in result.stderr
+    # The view pointer references `mdk runs show <run_id> --target` (a real
+    # remote command), not the dead-end `mdk trace <id> --target` (#125).
+    stderr_flat = result.stderr.replace("\n", "")
+    assert "mdk runs show 11111111-2222-3333-4444-555555555555 --target dev" in stderr_flat
     assert "App Insights" in result.stderr
     # stdout untouched by the hint.
     assert "trace:" not in result.stdout
@@ -215,7 +233,7 @@ def test_target_trace_line_suppressed_under_json(
         app, ["run", "faq", "hello", "--target", "dev", "-o", "json"], env={"COLUMNS": "200"}
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert "view: mdk trace" not in result.stderr
+    assert "view: mdk runs show" not in result.stderr
     # The trace_id still rides along inside the JSON body on stdout (it's part
     # of the RunView the runtime returned) — we only suppressed the hint line.
     assert "tr-abc" in result.stdout
@@ -235,7 +253,7 @@ def test_target_no_trace_id_no_trace_line(tmp_path: Path, monkeypatch: pytest.Mo
         app, ["run", "faq", "hello", "--target", "dev", "-o", "text"], env={"COLUMNS": "200"}
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert "view: mdk trace" not in result.stderr
+    assert "view: mdk runs show" not in result.stderr
 
 
 # ---------------------------------------------------------------------------

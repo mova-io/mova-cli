@@ -493,3 +493,90 @@ def test_explain_steps_no_kb_chunks_no_extra_table(monkeypatch: pytest.MonkeyPat
     assert "send-email" in result.stdout
     # No chunk table should appear
     assert "chunk(s) retrieved" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# #125: short-id PREFIX resolution — makes the `mdk run` 8-char hint
+# (`mdk explain <run_short>`) actually resolve. Exact-id + --last unchanged.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_explain_resolves_unique_short_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mdk explain <8-char-prefix> resolves to the one matching run.
+
+    This is the exact UX the post-run hint relies on: `mdk run` prints
+    `mdk explain <run_id[:8]>`, and that short prefix must resolve.
+    """
+    rec = _make_run(
+        run_id="abcd1234-5678-90ab-cdef-1234567890ab",
+        output={"answer": "30 days"},
+    )
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    # The 8-char short id `mdk run` would print for this run.
+    result = runner.invoke(app, ["explain", "abcd1234"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # Resolved to the full run — header shows the full id + the output.
+    assert "abcd1234-5678-90ab-cdef-1234567890ab" in result.stdout
+    assert "return policy is 30 days" not in result.stdout  # sanity: this isn't that fixture
+    assert "30 days" in result.stdout
+
+
+@pytest.mark.unit
+def test_explain_ambiguous_prefix_lists_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prefix matching >1 recent run errors helpfully and lists the ids."""
+    rec_a = _make_run(run_id="abcd1111-aaaa", output={"answer": "a"})
+    rec_b = _make_run(run_id="abcd2222-bbbb", output={"answer": "b"})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec_a, rec_b]))
+
+    # `abcd` is a prefix of BOTH run ids → ambiguous (no exact match exists).
+    result = runner.invoke(app, ["explain", "abcd"])
+
+    assert result.exit_code == 1
+    assert "ambiguous" in result.stderr
+    # Both candidate ids are listed so the user can pick a longer prefix.
+    assert "abcd1111-aaaa" in result.stderr
+    assert "abcd2222-bbbb" in result.stderr
+
+
+@pytest.mark.unit
+def test_explain_unknown_prefix_still_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prefix matching no recent run keeps the existing 'not found' path."""
+    rec = _make_run(run_id="abcd1234-5678", output={"answer": "x"})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "zzzz9999"])
+
+    assert result.exit_code == 1
+    assert "not found" in result.stderr
+
+
+@pytest.mark.unit
+def test_explain_exact_full_id_does_not_trigger_prefix_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward-compat: an exact full-id match resolves directly via get_run,
+    even when other runs share its prefix — exact-match semantics unchanged."""
+    exact = _make_run(run_id="abcd1234-5678-90ab", output={"answer": "exact"})
+    sibling = _make_run(run_id="abcd1234-ffff-0000", output={"answer": "sibling"})
+
+    class _CountingStorage(_FakeStorage):
+        def __init__(self, records: list[RunRecord]) -> None:
+            super().__init__(records)
+            self.list_calls = 0
+
+        async def list_runs(self, **kwargs: Any) -> list[RunRecord]:
+            self.list_calls += 1
+            return await super().list_runs(**kwargs)
+
+    store = _CountingStorage([exact, sibling])
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: store)
+
+    result = runner.invoke(app, ["explain", "abcd1234-5678-90ab"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "exact" in result.stdout
+    # Exact match short-circuits before any prefix scan.
+    assert store.list_calls == 0
