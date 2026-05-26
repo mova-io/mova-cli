@@ -973,14 +973,25 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
 
     base_url = target_cfg.url.rstrip("/")
     body = {"input": payload, "mock": mock}
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
     # Long-ish timeout — inline mode blocks for the full agent run.
     # Typical LLM call is a few seconds; tool-use loops can stretch.
     # 120s gives us headroom without hanging forever on a stuck pod.
     timeout = httpx.Timeout(120.0, connect=10.0)
+
+    def _post(bearer: str) -> httpx.Response:
+        """Send the run request with the given bearer. Factored out so the
+        401 shell-shadow path can replay the SAME request once with the saved
+        file key (see below) without duplicating the POST."""
+        with httpx.Client(timeout=timeout) as client:
+            return client.post(
+                f"{base_url}/api/v1/agents/{name}/runs",
+                params={"wait": "true"},
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    "Content-Type": "application/json",
+                },
+            )
 
     console.print(
         f"[dim]→ running [bold]{name}[/bold] on [bold]{target_name}[/bold] "
@@ -988,13 +999,7 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
     )
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(
-                f"{base_url}/api/v1/agents/{name}/runs",
-                params={"wait": "true"},
-                json=body,
-                headers=headers,
-            )
+        response = _post(api_key)
     except httpx.HTTPError as exc:
         console.print(f"[red]✗ network error:[/red] {exc}")
         _emit_remote_summary(
@@ -1018,28 +1023,56 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
         from movate.credentials.store import CredentialsStore  # noqa: PLC0415
 
         file_value = (CredentialsStore().get(target_cfg.key_env) or "").strip()
-        if file_value and file_value != api_key:
-            console.print(
-                f"[red]✗ runtime rejected the bearer token[/red] "
-                f"(value starts with: '{prefix}…').\n"
-                f"  A stale [bold]{target_cfg.key_env}[/bold] exported in your shell is "
-                f"shadowing a different key saved in ~/.movate/credentials.\n"
-                f"  Fix: [bold]unset {target_cfg.key_env}[/bold] (and remove it from your "
-                f"profile) so the saved key is used."
+        # Auto-retry ONCE with the saved key. We get here only when the bearer
+        # we sent was the shell value (api_key == os.environ[key_env]); if the
+        # file holds a NON-EMPTY value that DIFFERS, the shell export is almost
+        # certainly stale and shadowing a good saved key. Replay the same
+        # request once with the file key so the user is spared the
+        # `env -u <KEY> mdk run …` / `unset` dance. Guards: shell was the sent
+        # bearer, file exists, file != shell. No file entry / file == shell /
+        # bearer-from-file → no retry. At most once; never recurse.
+        shell_value = os.environ.get(target_cfg.key_env, "").strip()
+        if shell_value == api_key and file_value and file_value != api_key:
+            try:
+                retry_response = _post(file_value)
+            except httpx.HTTPError:
+                retry_response = None
+            if retry_response is not None and retry_response.status_code != _HTTP_UNAUTHORIZED:
+                # Saved key worked. Swap in the good response, drop a one-line
+                # stderr note (honors --quiet via _console.hint; never touches
+                # stdout, so --json stays clean), and fall through to the
+                # normal success/error mapping below.
+                response = retry_response
+                _console.hint(
+                    f"[dim]note: your shell ${target_cfg.key_env} 401'd; used your saved "
+                    f"key instead — unset ${target_cfg.key_env} (it's shadowing the "
+                    f"saved one).[/dim]"
+                )
+        # Still a 401 — either no retry happened (guards failed) or the saved
+        # key 401'd too. Fall back to the existing hint + exit, unchanged.
+        if response.status_code == _HTTP_UNAUTHORIZED:
+            if file_value and file_value != api_key:
+                console.print(
+                    f"[red]✗ runtime rejected the bearer token[/red] "
+                    f"(value starts with: '{prefix}…').\n"
+                    f"  A stale [bold]{target_cfg.key_env}[/bold] exported in your shell is "
+                    f"shadowing a different key saved in ~/.movate/credentials.\n"
+                    f"  Fix: [bold]unset {target_cfg.key_env}[/bold] (and remove it from your "
+                    f"profile) so the saved key is used."
+                )
+            else:
+                console.print(
+                    f"[red]✗ runtime rejected the bearer token[/red] "
+                    f"(value starts with: '{prefix}…').\n"
+                    f"  Check your env: [bold]echo ${target_cfg.key_env}[/bold] — "
+                    f"likely stale from .zshrc or a prior tenant.\n"
+                    f"  Fix: [bold]mdk auth save-runtime-key {target_name} <new-key>[/bold] "
+                    f"to persist + autoload across shells."
+                )
+            _emit_remote_summary(
+                agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
             )
-        else:
-            console.print(
-                f"[red]✗ runtime rejected the bearer token[/red] "
-                f"(value starts with: '{prefix}…').\n"
-                f"  Check your env: [bold]echo ${target_cfg.key_env}[/bold] — "
-                f"likely stale from .zshrc or a prior tenant.\n"
-                f"  Fix: [bold]mdk auth save-runtime-key {target_name} <new-key>[/bold] "
-                f"to persist + autoload across shells."
-            )
-        _emit_remote_summary(
-            agent=name, target=target_name, run_id=None, cost=None, latency=None, ok=False
-        )
-        raise typer.Exit(code=1)
+            raise typer.Exit(code=1)
     if response.status_code == _HTTP_NOT_FOUND:
         console.print(
             f"[red]✗ agent [bold]{name}[/bold] not found on [bold]{target_name}[/bold].[/red]\n"
