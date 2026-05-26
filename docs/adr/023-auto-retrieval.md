@@ -1,7 +1,7 @@
 # ADR 023 — Declarative pre-retrieval: opt-in auto-RAG in the shared Executor
 
-**Status:** Proposed
-**Date:** 2026-05-26
+**Status:** Accepted
+**Date:** 2026-05-26 (proposed); 2026-05-26 (approved, status flipped to Accepted)
 **Deciders:** Engineering + Deva (Movate)
 **Context window:** v1.x inner loop — make grounding-by-default a first-class,
 deterministic agent capability so RAG agents work identically in local `mdk run`,
