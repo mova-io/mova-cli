@@ -1250,6 +1250,22 @@ def _render_remote_run(
         # the full RunResponse model.
         sys.stdout.write(json.dumps(run_view, indent=2, default=str) + "\n")
 
+    # Surface WHICH agent version served the run. ADR 021 made deploys
+    # publish content-addressed versions (e.g. ``0.1.0+9f3a1c0d``) and the
+    # runtime resolves "latest" by default, so after a redeploy the operator's
+    # first question is "did my edit take effect — which version answered?".
+    # The runtime's RunView already carries ``agent_version`` (resolved bundle
+    # for a success, ``bundle.spec.version`` on an error), so this is a pure
+    # render of a field that's in the response. TEXT mode only + stderr (via
+    # _console.hint): in JSON mode the version is already in the dumped RunView
+    # on stdout, so injecting nothing keeps --json a pure passthrough.
+    if output_format == Run.TEXT:
+        served_version = (run_view.get("agent_version") or "").strip()
+        served_agent = (run_view.get("agent") or "").strip()
+        if served_version:
+            who = f"{served_agent} " if served_agent else ""
+            _console.hint(f"[dim]→ served by [bold]{who}{served_version}[/bold][/dim]")
+
     run_id = run_view.get("run_id")
     if run_id:
         short = str(run_id)[:8]
