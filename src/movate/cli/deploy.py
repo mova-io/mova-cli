@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -394,12 +395,21 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
     err.print("[bold]Smoke-test the deployment:[/bold]")
     err.print(f"  [cyan]curl -sS {base_url}/healthz[/cyan]")
     if first_agent:
-        err.print(
-            f"  [cyan]curl -sS -X POST {base_url}/run "
-            f"-H 'content-type: application/json' "
-            f'-H "Authorization: Bearer {_bearer_shell_expr(target_cfg.key_env)}" '
-            f'-d \'{{"agent": "{first_agent}", "input": {{}}}}\'[/cyan]'
-        )
+        if _runtime_key_is_resolvable(target_cfg.key_env):
+            # POST /run takes a RunSubmission ({kind, target, input},
+            # extra="forbid") — the legacy {agent, input} shape 422s.
+            run_body = json.dumps({"kind": "agent", "target": first_agent, "input": {}})
+            err.print(
+                f"  [cyan]curl -sS -X POST {base_url}/run "
+                f"-H 'content-type: application/json' "
+                f'-H "Authorization: Bearer {_bearer_shell_expr(target_cfg.key_env)}" '
+                f"-d '{run_body}'[/cyan]"
+            )
+        else:
+            # No bearer resolves → a raw curl would send an empty token and
+            # the runtime returns auth_required. Hand over the one-shot
+            # bootstrap commands instead of a curl that silently 401s.
+            _render_bearer_bootstrap_hint(target_name=target_name, key_env=target_cfg.key_env)
     err.print(
         f"  [cyan]az containerapp logs show -g {plan.resource_group} "
         f"-n {plan.apps_to_update[0]} --tail 20[/cyan]"
@@ -816,9 +826,14 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
         azure_addressable = bool(target_cfg.azure_resource_group and target_cfg.azure_env)
         if auto_recover and azure_addressable:
             err.print(
-                f"  [dim]Minting fresh bearer key for [bold]{target_name}[/bold] (~10 sec.)…[/dim]"
+                f"  [dim]Recovering a runtime bearer for "
+                f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
             )
-            new_key = _attempt_auto_recovery(target_name=target_name)
+            new_key = _attempt_auto_recovery(
+                target_name=target_name,
+                base_url=target_cfg.url.rstrip("/"),
+                target_cfg=target_cfg,
+            )
             if new_key is not None:
                 api_key = new_key
         if not api_key:
@@ -906,10 +921,12 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             azure_addressable = bool(target_cfg.azure_resource_group and target_cfg.azure_env)
             if had_unauthorized and auto_recover and azure_addressable:
                 err.print(
-                    f"  [dim]Minting fresh bearer key for "
+                    f"  [dim]Recovering a runtime bearer for "
                     f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
                 )
-                new_key = _attempt_auto_recovery(target_name=target_name)
+                new_key = _attempt_auto_recovery(
+                    target_name=target_name, base_url=base_url, target_cfg=target_cfg
+                )
                 if new_key is not None:
                     headers["Authorization"] = f"Bearer {new_key}"
                     # Retry skills first if any 401'd, then retry agents.
@@ -1073,6 +1090,55 @@ def _bearer_shell_expr(key_env: str) -> str:
     return f"${{{key_env}:-$(grep -m1 '^{key_env}=' {display} | cut -d= -f2-)}}"
 
 
+def _runtime_key_is_resolvable(key_env: str) -> bool:
+    """Whether the bearer the printed curl resolves at run time is non-empty.
+
+    Mirrors :func:`_bearer_shell_expr`'s resolution order: an exported
+    ``$<key_env>``, else a saved entry in the credentials store. When
+    neither resolves, the curl's ``Authorization: Bearer`` header expands
+    to an empty token and the runtime answers ``auth_required`` — callers
+    use this to print a bootstrap hint instead of a curl that 401s.
+    """
+    if os.environ.get(key_env, "").strip():
+        return True
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    saved = CredentialsStore().get(key_env)
+    return bool(saved and saved.strip())
+
+
+def _render_bearer_bootstrap_hint(*, target_name: str, key_env: str) -> None:
+    """Tell the operator how to obtain a runtime bearer when none is saved.
+
+    The printed curl resolves its token from ``$<key_env>`` or the
+    credentials file; with neither present it would send ``Bearer`` (empty)
+    and the runtime returns ``auth_required``. Rather than hand over a curl
+    that silently 401s, point at the one-shot commands that pull/mint + save
+    a key so the next run resolves it automatically.
+    """
+    from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
+    err.print(
+        f"[yellow]⚠[/yellow] No runtime key for [bold]{target_name}[/bold] yet "
+        f"([cyan]${key_env}[/cyan] is unset and no entry in the credentials "
+        f"store) — a raw curl would send an empty bearer and get "
+        f"[bold]auth_required[/bold]. Bootstrap a key first:"
+    )
+    err.print(
+        f"  [cyan]{bin_name} auth pull-runtime-key {target_name} --keyvault <kv>[/cyan]"
+        f"   [dim]# if bootstrap-api-key is already in Key Vault[/dim]"
+    )
+    err.print(
+        f"  [cyan]{bin_name} auth refresh-runtime-key {target_name}[/cyan]"
+        f"              [dim]# mint + save a fresh key inside the deployed app[/dim]"
+    )
+    err.print(
+        f'[dim]Then [cyan]{bin_name} run <agent> "<input>" --target '
+        f"{target_name}[/cyan] (it reads the saved key automatically).[/dim]"
+    )
+
+
 def _render_post_deploy_next_steps(
     *,
     target_name: str,
@@ -1083,10 +1149,14 @@ def _render_post_deploy_next_steps(
 ) -> None:
     """Print a "Next: run inference" block after a successful deploy.
 
-    Emits one ``curl`` command per uploaded agent, copy-pasteable
-    against the operator's shell. The body of each request uses the
-    first row of the agent's ``evals/dataset.jsonl`` as the sample
-    input so the example actually exercises the agent's real schema
+    Leads with the recommended ``mdk run <agent> "<input>" --target``
+    line per uploaded agent — it resolves the saved bearer, hits the
+    correct route, and builds the ``RunSubmission`` body, so it sidesteps
+    the raw-curl footguns entirely. A raw ``curl`` against ``POST /run``
+    follows as the no-``mdk``-required fallback (skipped in favor of a
+    key-bootstrap hint when no bearer resolves). The body of each request
+    uses the first row of the agent's ``evals/dataset.jsonl`` as the
+    sample input so the example actually exercises the agent's real schema
     (falls back to ``{"text":"..."}`` if no dataset row is available).
 
     The curl block is intentionally emitted WITHOUT Rich markup
@@ -1126,13 +1196,42 @@ def _render_post_deploy_next_steps(
     (e.g. ``diff: "--- a/auth.py\\n+++..."``), and pretty-printing
     keeps each value on its own less-likely-to-wrap line.
     """
+    from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+    bin_name = mdk_bin_name()
     err.print("[bold]Next:[/bold] run inference against the deployed runtime")
     err.print()
 
+    # Primary, recommended path: `mdk run … --target` resolves the saved
+    # bearer, hits the correct route, and builds the RunSubmission body for
+    # the operator — none of the curl footguns (empty bearer, wrong body
+    # shape) can bite here.
     for agent_name in sorted(uploaded):
         sample_input_json = _sample_input_for_agent(project_root, agent_name)
+        err.print(
+            f"  [cyan]{bin_name} run {agent_name} {shlex.quote(sample_input_json)} "
+            f"--target {target_name}[/cyan]"
+        )
+    err.print()
+
+    # Lower-level alternative: a raw curl against POST /run, for boxes
+    # without `mdk` installed. The curl resolves its bearer from
+    # $<key_env> or the credentials file — if neither is present the token
+    # is empty and the runtime answers auth_required, so steer the operator
+    # to bootstrap a key instead of pasting a curl that silently 401s.
+    if not _runtime_key_is_resolvable(key_env):
+        _render_bearer_bootstrap_hint(target_name=target_name, key_env=key_env)
+        return
+
+    err.print("[dim]Or, without mdk, a raw curl:[/dim]")
+    err.print()
+    for agent_name in sorted(uploaded):
+        sample_input_json = _sample_input_for_agent(project_root, agent_name)
+        # POST /run takes a RunSubmission: {kind, target, input} with
+        # extra="forbid". The legacy {agent, input} shape 422s (extra
+        # `agent`, missing `kind`/`target`), so emit the wire shape.
         body = json.dumps(
-            {"agent": agent_name, "input": json.loads(sample_input_json)},
+            {"kind": "agent", "target": agent_name, "input": json.loads(sample_input_json)},
             indent=2,
         )
         # ``soft_wrap=True`` keeps Rich from inserting its own line
@@ -1289,9 +1388,12 @@ def _preflight_bearer(
         azure_addressable = bool(target_cfg.azure_resource_group and target_cfg.azure_env)
         if auto_recover and azure_addressable:
             err.print(
-                f"  [dim]Minting fresh bearer key for [bold]{target_name}[/bold] (~10 sec.)…[/dim]"
+                f"  [dim]Recovering a runtime bearer for "
+                f"[bold]{target_name}[/bold] (~10 sec.)…[/dim]"
             )
-            new_key = _attempt_auto_recovery(target_name=target_name)
+            new_key = _attempt_auto_recovery(
+                target_name=target_name, base_url=base_url, target_cfg=target_cfg
+            )
             if new_key is not None:
                 headers["Authorization"] = f"Bearer {new_key}"
                 return headers
@@ -1312,31 +1414,193 @@ def _preflight_bearer(
     raise typer.Exit(code=2)
 
 
-def _attempt_auto_recovery(*, target_name: str) -> str | None:
-    """Mint + save a fresh runtime key for ``target_name`` inside the pod.
+def _warn_if_shell_shadows_runtime_key(*, key_env: str, fresh_key: str) -> None:
+    """Warn when a stale ``$<key_env>`` in the shell will shadow the just-saved key.
 
-    Wraps :func:`movate.cli.auth.refresh_runtime_key_inline` so the
-    deploy 401 path can recover silently. Returns the new bearer on
-    success, ``None`` on any failure (prints the underlying reason to
-    stderr so the operator can act on it). Never raises — recovery is
-    best-effort.
+    Shell-exported env vars take precedence over ``~/.movate/credentials``
+    (autoload only fills a var that isn't already set; it never clobbers a
+    shell export). So a stale bearer left over from an earlier deploy would
+    OVERRIDE the fresh key this deploy just minted + saved — and the next
+    ``mdk run --target`` would send the stale key and 401. Warn at save
+    time, on stderr, rather than letting the operator discover it through a
+    confusing 401 later. Only warns when the shell value DIFFERS (a match is
+    harmless) and never fails the deploy.
     """
+    shell_value = os.environ.get(key_env, "").strip()
+    if shell_value and shell_value != fresh_key:
+        err.print(
+            f"[yellow]⚠[/yellow] a stale [bold]{key_env}[/bold] is exported in your "
+            f"shell and will OVERRIDE the key just saved (shell wins) — run "
+            f"[bold]unset {key_env}[/bold] (and remove it from your profile) so the "
+            f"new key takes effect."
+        )
+
+
+def _resolve_keyvault_name(target_cfg: Any) -> str | None:
+    """The Key Vault name to pull the seeded bootstrap key from, or ``None``.
+
+    Reads the target's ``azure_keyvault`` (a first-class optional field;
+    also resolvable from an operator-added extra of the same name, since
+    ``TargetConfig`` allows extras). The vault name embeds an
+    operator-chosen suffix (see the infra Bicep ``nameSuffix`` param), so it
+    can't be derived from ``azure_env`` alone — it must be configured
+    explicitly to enable deploy's auto-pull recovery.
+    """
+    value = getattr(target_cfg, "azure_keyvault", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _verify_bearer_roundtrip(*, base_url: str, key: str) -> tuple[bool, str]:
+    """One ``GET /api/v1/agents`` round-trip to confirm a candidate bearer works.
+
+    Returns ``(verified, reason)``. ``verified`` is ``True`` only on a 2xx;
+    any non-2xx (notably ``401``) or transport error returns ``False`` with a
+    short human-readable reason. The recovery path uses this so it never
+    declares "bearer key ready" — nor overwrites a previously-working saved
+    key — for a candidate that hasn't actually authenticated against the
+    deployed runtime.
+    """
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
+            resp = client.get(
+                f"{base_url}/api/v1/agents",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+    except httpx.HTTPError as exc:
+        return False, f"runtime unreachable ({type(exc).__name__})"
+    if resp.status_code < _HTTP_BAD_REQUEST:
+        return True, ""
+    return False, f"HTTP {resp.status_code}"
+
+
+def _restore_saved_key(store: Any, env_var: str, prior_saved: str | None) -> None:
+    """Roll the credentials store back to ``prior_saved`` after a failed recovery.
+
+    The obtain step (pull / mint) writes its candidate into the store before
+    we get to verify it. When verification fails we must not leave that
+    rejected value behind: restore the previously-saved working key if there
+    was one, otherwise delete the bad candidate so a later resolve doesn't
+    pick it up.
+    """
+    if prior_saved:
+        store.set(env_var, prior_saved)
+    else:
+        store.delete(env_var)
+
+
+def _obtain_recovery_key(*, target_name: str, keyvault: str | None) -> tuple[str | None, str]:
+    """Obtain a candidate runtime bearer for recovery, preferring a KV pull.
+
+    Returns ``(key_or_none, source_label)``. Tries, in order:
+
+    1. **Pull** the seeded ``bootstrap-api-key`` from Key Vault when the
+       target names one — guaranteed-trusted, because the runtime seeds the
+       matching ``ApiKeyRecord`` from that same secret on every cold start.
+    2. **Mint** a fresh key inside the Container App via ``az containerapp
+       exec`` — best-effort: a non-durable (SQLite-in-pod) or multi-replica
+       runtime may never read the store the exec wrote to, so this key can
+       still 401. The caller VERIFIES before keeping it.
+
+    Both steps SAVE the candidate to the credentials store as a side effect;
+    the caller snapshots the prior key first and rolls back on failure.
+    Prints the underlying reason on a failed step. Returns ``(None, "")`` when
+    every available step failed.
+    """
+    if keyvault:
+        from movate.cli.auth import (  # noqa: PLC0415
+            PullRuntimeKeyError,
+            pull_runtime_key_inline,
+        )
+
+        try:
+            key, _env_var = pull_runtime_key_inline(target_name, keyvault=keyvault)
+        except PullRuntimeKeyError as exc:
+            err.print(
+                f"  [yellow]⚠[/yellow] could not pull the bootstrap key from "
+                f"[bold]{keyvault}[/bold] ({exc}); falling back to minting one "
+                f"in-pod."
+            )
+        else:
+            return key, f"pulled from Key Vault ({keyvault})"
+
     from movate.cli.auth import (  # noqa: PLC0415
         RefreshRuntimeKeyError,
         refresh_runtime_key_inline,
     )
 
     try:
-        new_key, env_var = refresh_runtime_key_inline(target_name)
+        key, _env_var = refresh_runtime_key_inline(target_name)
     except RefreshRuntimeKeyError as exc:
         err.print(
             f"  [red]✗[/red] auto-recovery failed: {exc}. "
             f"Run [bold]mdk auth refresh-runtime-key {target_name}[/bold] "
             "manually to debug."
         )
-        return None
-    err.print(f"  [green]✓[/green] bearer key ready (saved as [cyan]{env_var}[/cyan]).")
-    return new_key
+        return None, ""
+    return key, "minted in-pod"
+
+
+def _attempt_auto_recovery(*, target_name: str, base_url: str, target_cfg: Any) -> str | None:
+    """Recover a working runtime bearer for ``target_name``, verified end-to-end.
+
+    Prefers PULLING the seeded bootstrap key from Key Vault (when the target
+    names one) — it's the key the running runtime is guaranteed to trust —
+    and otherwise mints one inside the Container App. EITHER way the candidate
+    is round-trip verified (``GET /api/v1/agents``) before it's declared
+    ready: an in-pod mint can land in a store the serving replica never reads
+    (non-durable SQLite, multi-replica), so "minting succeeded" does not imply
+    "the runtime trusts it".
+
+    On success: keeps the candidate saved, prints a verified-ready line, warns
+    about a shell var that would shadow it, and returns the bearer.
+
+    On failure (candidate rejected, or no candidate obtainable): RESTORES the
+    previously-saved key — never clobbering a working bearer with one that
+    401s — points the operator at ``mdk auth pull-runtime-key`` (the
+    guaranteed-trusted path), and returns ``None``. Never raises — recovery is
+    best-effort.
+    """
+    from movate.credentials.store import CredentialsStore  # noqa: PLC0415
+
+    env_var = target_cfg.key_env
+    store = CredentialsStore()
+    # Snapshot the previously-saved key BEFORE any obtain step clobbers it, so
+    # a candidate that fails verification can be rolled back rather than
+    # leaving a 401ing value where a working key used to be.
+    prior_saved = store.get(env_var)
+    keyvault = _resolve_keyvault_name(target_cfg)
+
+    candidate, source = _obtain_recovery_key(target_name=target_name, keyvault=keyvault)
+    if candidate is None:
+        return None  # the obtain step already explained why
+
+    verified, reason = _verify_bearer_roundtrip(base_url=base_url, key=candidate)
+    if verified:
+        store.set(env_var, candidate)
+        err.print(
+            f"  [green]✓[/green] bearer key ready (saved as [cyan]{env_var}[/cyan], "
+            f"verified against the runtime — {source})."
+        )
+        # A freshly-saved key only takes effect for `mdk run` if no stale
+        # shell export shadows it — warn now so the operator isn't surprised
+        # by a 401 on the next run against this target.
+        _warn_if_shell_shadows_runtime_key(key_env=env_var, fresh_key=candidate)
+        return candidate
+
+    # Candidate rejected — roll back so we never leave a 401ing key behind,
+    # then steer the operator to the guaranteed-trusted recovery path.
+    _restore_saved_key(store, env_var, prior_saved)
+    kept = f"Kept your previously-saved [cyan]{env_var}[/cyan]. " if prior_saved else ""
+    kv = f" {keyvault}" if keyvault else " <kv>"
+    err.print(
+        f"  [red]✗[/red] the key {source} was rejected by the runtime ({reason}) — "
+        f"NOT saving it. {kept}The seeded bootstrap key in Key Vault is the one the "
+        f"runtime trusts — recover with [bold]mdk auth pull-runtime-key "
+        f"{target_name} --keyvault{kv}[/bold]."
+    )
+    return None
 
 
 def _render_unauthorized_message(headers: dict[str, str], target_name: str) -> str:

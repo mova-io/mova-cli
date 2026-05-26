@@ -14,27 +14,38 @@ Testing strategy:
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pydantic
 import pytest
 import typer
 from typer.testing import CliRunner
 
 import movate
+from movate.cli.auth import PullRuntimeKeyError
 from movate.cli.deploy import (
     DeployConfigError,
     DeployPlan,
+    _attempt_auto_recovery,
     _build_plan,
     _ingest_bundled_kb,
     _preflight_pgvector,
     _print_next_steps,
     _print_plan,
+    _render_bearer_bootstrap_hint,
+    _render_post_deploy_next_steps,
+    _resolve_keyvault_name,
     _run_predeploy_validation,
+    _runtime_key_is_resolvable,
     _upload_one_agent_bundle,
+    _verify_bearer_roundtrip,
     _wait_for_healthz,
+    _warn_if_shell_shadows_runtime_key,
 )
 from movate.cli.main import app as cli_app
 from movate.core.user_config import (
@@ -42,6 +53,8 @@ from movate.core.user_config import (
     UserConfig,
     save_user_config,
 )
+from movate.credentials.store import CredentialsStore
+from movate.runtime.schemas import RunSubmission
 from movate.utils.git import git_short_sha
 
 runner = CliRunner(mix_stderr=False)
@@ -1244,3 +1257,507 @@ def test_upload_pathref_agent_still_uploads_on_disk_schema(
     # inline-fallback fields (text/message) — proves the file path won.
     assert "query" in in_schema["properties"]
     assert "answer" in out_schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Post-deploy next-steps: `mdk run` primary + a CORRECT raw curl
+#
+# Regression: the emitted curl POSTed {"agent", "input"} to /run and used a
+# bearer that silently expands to empty when no key is saved — so a copy-paste
+# hit auth_required, then 422. The block now (a) leads with `mdk run`, (b)
+# emits the RunSubmission {kind, target, input} body, and (c) prints a key
+# bootstrap hint instead of a blind curl when no bearer resolves.
+# ---------------------------------------------------------------------------
+
+
+def _hermetic_creds(monkeypatch, tmp_path: Path) -> None:
+    """Point the credentials store at an empty tmp file + force the file
+    backend, so key-resolution tests never read the developer's real
+    ``~/.movate/credentials`` (or their OS keychain)."""
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(tmp_path / "credentials"))
+    monkeypatch.setenv("MOVATE_CRED_BACKEND", "file")
+
+
+def _collapsed(text: str) -> str:
+    """Whitespace-collapsed view of rendered output.
+
+    Rich word-wraps markup lines at the (non-tty) 80-col default, turning a
+    single logical line into several. Collapsing runs of whitespace back to
+    single spaces lets substring assertions ignore where the wrap landed."""
+    return " ".join(text.split())
+
+
+def _extract_heredoc_bodies(rendered: str) -> list[dict]:
+    """Pull every ``--data-binary @- <<'JSON' … JSON`` body out of the
+    rendered next-steps output and JSON-parse it.
+
+    The curl is emitted with ``soft_wrap=True`` so the body bytes survive
+    verbatim — we can slice each heredoc and feed it straight to a parser
+    (and, in turn, to ``RunSubmission``)."""
+    bodies: list[dict] = []
+    for part in rendered.split("<<'JSON'")[1:]:
+        after_curl = part.split("\n", 1)[1]
+        body_lines: list[str] = []
+        for line in after_curl.splitlines():
+            if line.strip() == "JSON":
+                break
+            body_lines.append(line)
+        bodies.append(json.loads("\n".join(body_lines)))
+    return bodies
+
+
+@pytest.mark.unit
+def test_next_steps_leads_with_mdk_run(capsys, tmp_path: Path, monkeypatch) -> None:
+    """The recommended first step is `mdk run <agent> "<input>" --target` —
+    it handles auth + the correct route/body for the operator."""
+    monkeypatch.setenv("MOVATE_PROD_KEY", "mvt_prod_demotena_k_secret")
+    _hermetic_creds(monkeypatch, tmp_path)
+
+    _render_post_deploy_next_steps(
+        target_name="prod",
+        uploaded=["weather"],
+        project_root=tmp_path,
+        base_url="https://movate-prod-api.example.azurecontainerapps.io",
+        key_env="MOVATE_PROD_KEY",
+    )
+    out = _collapsed(capsys.readouterr().err)
+    assert "mdk run weather" in out
+    assert "--target prod" in out
+
+
+@pytest.mark.unit
+def test_next_steps_curl_body_is_run_submission_shape(capsys, tmp_path: Path, monkeypatch) -> None:
+    """When a key resolves, a raw curl IS emitted — but with the
+    ``{kind, target, input}`` RunSubmission body, never the legacy
+    ``{agent, input}`` shape that 422s."""
+    monkeypatch.setenv("MOVATE_PROD_KEY", "mvt_prod_demotena_k_secret")
+    _hermetic_creds(monkeypatch, tmp_path)
+
+    _render_post_deploy_next_steps(
+        target_name="prod",
+        uploaded=["weather"],
+        project_root=tmp_path,
+        base_url="https://movate-prod-api.example.azurecontainerapps.io",
+        key_env="MOVATE_PROD_KEY",
+    )
+    out = capsys.readouterr().err
+
+    # The legacy footgun shape must be gone; the wire shape must be present.
+    assert '"agent":' not in out
+    assert '"kind": "agent"' in out
+    assert '"target": "weather"' in out
+
+    # And the emitted bytes actually parse against the real wire model.
+    bodies = _extract_heredoc_bodies(out)
+    assert len(bodies) == 1
+    submission = RunSubmission.model_validate(bodies[0])
+    assert submission.kind == "agent"
+    assert submission.target == "weather"
+    assert isinstance(submission.input, dict)
+
+
+@pytest.mark.unit
+def test_legacy_agent_input_body_is_rejected_by_run_submission() -> None:
+    """Guards the regression: the OLD ``{agent, input}`` body the deploy
+    used to emit is rejected by RunSubmission (extra `agent`, missing
+    `kind`/`target`), confirming why the copy-pasted curl 422'd."""
+    with pytest.raises(pydantic.ValidationError):
+        RunSubmission.model_validate({"agent": "weather", "input": {}})
+
+
+@pytest.mark.unit
+def test_next_steps_prints_bootstrap_hint_when_no_key(capsys, tmp_path: Path, monkeypatch) -> None:
+    """No env var AND no credentials entry → print the key-bootstrap step
+    instead of a curl that would silently 401."""
+    monkeypatch.delenv("MOVATE_PROD_KEY", raising=False)
+    _hermetic_creds(monkeypatch, tmp_path)  # tmp creds file doesn't exist → empty store
+
+    _render_post_deploy_next_steps(
+        target_name="prod",
+        uploaded=["weather"],
+        project_root=tmp_path,
+        base_url="https://movate-prod-api.example.azurecontainerapps.io",
+        key_env="MOVATE_PROD_KEY",
+    )
+    raw = capsys.readouterr().err
+    out = _collapsed(raw)
+
+    # `mdk run` is still surfaced (it can pull/mint a key itself), but NO
+    # raw curl heredoc — the operator gets the bootstrap commands instead.
+    assert "mdk run weather" in out
+    assert "<<'JSON'" not in raw
+    assert "auth pull-runtime-key prod" in out
+    assert "auth refresh-runtime-key prod" in out
+
+
+@pytest.mark.unit
+def test_runtime_key_is_resolvable_via_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MOVATE_PROD_KEY", "mvt_prod_demotena_k_secret")
+    _hermetic_creds(monkeypatch, tmp_path)
+    assert _runtime_key_is_resolvable("MOVATE_PROD_KEY") is True
+
+
+@pytest.mark.unit
+def test_runtime_key_is_resolvable_via_credentials_file(monkeypatch, tmp_path: Path) -> None:
+    """A blank env var falls back to the saved credentials entry."""
+    monkeypatch.delenv("MOVATE_PROD_KEY", raising=False)
+    monkeypatch.setenv("MOVATE_CRED_BACKEND", "file")
+    creds = tmp_path / "credentials"
+    creds.write_text("MOVATE_PROD_KEY=mvt_prod_demotena_k_secret\n")
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(creds))
+    assert _runtime_key_is_resolvable("MOVATE_PROD_KEY") is True
+
+
+@pytest.mark.unit
+def test_runtime_key_unresolvable_when_unset_and_unsaved(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("MOVATE_PROD_KEY", raising=False)
+    _hermetic_creds(monkeypatch, tmp_path)  # empty tmp store
+    assert _runtime_key_is_resolvable("MOVATE_PROD_KEY") is False
+
+
+@pytest.mark.unit
+def test_bearer_bootstrap_hint_names_both_recovery_commands(capsys) -> None:
+    """The standalone hint points at both bootstrap paths so the operator
+    can pick whichever fits (Key Vault pull vs. mint-in-pod)."""
+    _render_bearer_bootstrap_hint(target_name="dev", key_env="MDK_DEV_KEY")
+    out = _collapsed(capsys.readouterr().err)
+    assert "auth pull-runtime-key dev --keyvault" in out
+    assert "auth refresh-runtime-key dev" in out
+    assert "MDK_DEV_KEY" in out
+
+
+# ---------------------------------------------------------------------------
+# Shell-shadow warning after a deploy mints + saves a fresh runtime key.
+#
+# Scenario: `mdk deploy --target dev` mints a fresh bearer + saves it to
+# ~/.movate/credentials, but the operator has a STALE MDK_DEV_KEY still
+# exported in their shell. Shell wins over the file (autoload never
+# clobbers an export), so the next `mdk run` would send the stale key and
+# 401. The deploy now warns at save time to `unset` the shell var.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_warn_fires_when_shell_value_differs_from_minted(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    _warn_if_shell_shadows_runtime_key(key_env="MDK_DEV_KEY", fresh_key="mvt_dev_FRESH_minted")
+    out = _collapsed(capsys.readouterr().err)
+    assert "unset MDK_DEV_KEY" in out
+    assert "OVERRIDE" in out
+
+
+@pytest.mark.unit
+def test_warn_silent_when_shell_value_matches_minted(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_same_value")
+    _warn_if_shell_shadows_runtime_key(key_env="MDK_DEV_KEY", fresh_key="mvt_dev_same_value")
+    assert _collapsed(capsys.readouterr().err) == ""
+
+
+@pytest.mark.unit
+def test_warn_silent_when_shell_unset(capsys, monkeypatch) -> None:
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+    _warn_if_shell_shadows_runtime_key(key_env="MDK_DEV_KEY", fresh_key="mvt_dev_FRESH_minted")
+    assert _collapsed(capsys.readouterr().err) == ""
+
+
+def _fake_target(*, key_env: str = "MDK_DEV_KEY", azure_keyvault: str | None = None) -> Any:
+    """A minimal stand-in for a resolved ``TargetConfig``.
+
+    `_attempt_auto_recovery` only reads ``.key_env`` + ``.azure_keyvault``
+    (via :func:`_resolve_keyvault_name`); ``base_url`` is passed separately.
+    A namespace keeps these recovery-logic tests free of YAML/config I/O."""
+    return SimpleNamespace(
+        key_env=key_env,
+        azure_keyvault=azure_keyvault,
+        url="https://movate-dev-api.example.azurecontainerapps.io",
+        azure_resource_group="movate-dev-rg",
+        azure_env="dev",
+    )
+
+
+def _always_verifies(monkeypatch, *, ok: bool = True, reason: str = "") -> None:
+    """Pin `_attempt_auto_recovery`'s round-trip verification result.
+
+    Lets the recovery-LOGIC tests (keep vs. restore) decide the verify
+    outcome without standing up an HTTP transport — the round-trip itself
+    is covered separately by the `_verify_bearer_roundtrip` unit tests."""
+    monkeypatch.setattr(
+        "movate.cli.deploy._verify_bearer_roundtrip",
+        lambda *, base_url, key: (ok, reason),
+    )
+
+
+@pytest.mark.unit
+def test_auto_recovery_warns_when_shell_shadows_minted_key(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """End-to-end through `_attempt_auto_recovery`: minting a fresh key
+    while a different MDK_DEV_KEY is exported surfaces the unset warning."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "movate.cli.auth.refresh_runtime_key_inline",
+        lambda target_name: ("mvt_dev_FRESH_minted", "MDK_DEV_KEY"),
+    )
+    _always_verifies(monkeypatch)
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    assert new_key == "mvt_dev_FRESH_minted"
+    out = _collapsed(capsys.readouterr().err)
+    assert "bearer key ready" in out
+    assert "unset MDK_DEV_KEY" in out
+
+
+@pytest.mark.unit
+def test_auto_recovery_no_warn_when_shell_unset(capsys, monkeypatch, tmp_path: Path) -> None:
+    """The common recovery path — shell var empty, key minted into the file
+    — must NOT print the shadow warning (there is nothing to override)."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "movate.cli.auth.refresh_runtime_key_inline",
+        lambda target_name: ("mvt_dev_FRESH_minted", "MDK_DEV_KEY"),
+    )
+    _always_verifies(monkeypatch)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+
+    _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    out = _collapsed(capsys.readouterr().err)
+    assert "bearer key ready" in out
+    assert "unset MDK_DEV_KEY" not in out
+    assert "OVERRIDE" not in out
+
+
+# ---------------------------------------------------------------------------
+# Round-trip bearer verification — the heart of the deploy-auth fix.
+#
+# Regression: deploy used to mint a fresh `demotenant` key inside the pod
+# and SAVE it as the runtime bearer, declaring "✓ bearer key ready" — but
+# an in-pod mint lands in a store the serving replica may never read
+# (non-durable SQLite / multi-replica), so the key 401'd on the very next
+# call and CLOBBERED whatever working key the operator already had. The fix:
+# round-trip-verify (GET /api/v1/agents) the candidate BEFORE keeping it,
+# prefer pulling the guaranteed-trusted bootstrap key from Key Vault, and
+# never overwrite a previously-working saved key with one that 401s.
+# ---------------------------------------------------------------------------
+
+
+def _verify_transport(monkeypatch, handler) -> None:
+    """Pin `movate.cli.deploy`'s `httpx.Client` to a MockTransport.
+
+    `_verify_bearer_roundtrip` does `httpx.Client(...)` off the module's
+    `httpx`, so this controls the round-trip's response without real
+    network."""
+    transport = httpx.MockTransport(handler)
+
+    class _MockClient(httpx.Client):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs.pop("transport", None)
+            super().__init__(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr("movate.cli.deploy.httpx.Client", _MockClient)
+
+
+@pytest.mark.unit
+def test_verify_bearer_roundtrip_true_on_2xx(monkeypatch) -> None:
+    _verify_transport(monkeypatch, lambda req: httpx.Response(200, json={"agents": []}))
+    ok, reason = _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_x")
+    assert ok is True
+    assert reason == ""
+
+
+@pytest.mark.unit
+def test_verify_bearer_roundtrip_false_on_401(monkeypatch) -> None:
+    _verify_transport(monkeypatch, lambda req: httpx.Response(401, json={"detail": "nope"}))
+    ok, reason = _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_x")
+    assert ok is False
+    assert reason == "HTTP 401"
+
+
+@pytest.mark.unit
+def test_verify_bearer_roundtrip_false_on_transport_error(monkeypatch) -> None:
+    def boom(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=req)
+
+    _verify_transport(monkeypatch, boom)
+    ok, reason = _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_x")
+    assert ok is False
+    assert "unreachable" in reason
+
+
+@pytest.mark.unit
+def test_verify_bearer_roundtrip_sends_candidate_as_bearer(monkeypatch) -> None:
+    """The round-trip must present the CANDIDATE key — not whatever is in the
+    environment — so it actually proves that key authenticates."""
+    seen: dict[str, str] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["auth"] = req.headers.get("Authorization", "")
+        return httpx.Response(200, json={"agents": []})
+
+    _verify_transport(monkeypatch, handler)
+    _verify_bearer_roundtrip(base_url="https://dev.example.com", key="mvt_live_candidate")
+    assert seen["auth"] == "Bearer mvt_live_candidate"
+
+
+@pytest.mark.unit
+def test_auto_recovery_keeps_and_saves_verified_minted_key(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """Happy mint path: candidate verifies (2xx) → it's saved + declared
+    ready, and the success line says it was verified against the runtime."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+    monkeypatch.setattr(
+        "movate.cli.auth.refresh_runtime_key_inline",
+        lambda target_name: ("mvt_live_demotena_FRESH_secret", "MDK_DEV_KEY"),
+    )
+    _always_verifies(monkeypatch, ok=True)
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    assert new_key == "mvt_live_demotena_FRESH_secret"
+    assert CredentialsStore().get("MDK_DEV_KEY") == "mvt_live_demotena_FRESH_secret"
+    out = _collapsed(capsys.readouterr().err)
+    assert "bearer key ready" in out
+    assert "verified against the runtime" in out
+    assert "minted in-pod" in out
+
+
+@pytest.mark.unit
+def test_auto_recovery_rejected_key_does_not_clobber_prior_working_key(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """THE headline regression: a minted key that 401s must NOT overwrite a
+    previously-working saved key, and must point at `pull-runtime-key`."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+    # Operator already has a working bearer saved.
+    CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_PRIOR_working")
+
+    # The real refresh_runtime_key_inline SAVES before returning; mirror that
+    # so the test proves the bad value is rolled back, not merely never-set.
+    def fake_refresh_saves_bad(target_name: str) -> tuple[str, str]:
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BAD_minted")
+        return "mvt_live_demotena_BAD_minted", "MDK_DEV_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh_saves_bad)
+    _always_verifies(monkeypatch, ok=False, reason="HTTP 401")
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    # Recovery reports failure...
+    assert new_key is None
+    # ...the previously-working key is intact (NOT clobbered by the 401 key)...
+    assert CredentialsStore().get("MDK_DEV_KEY") == "mvt_live_demotena_PRIOR_working"
+    out = _collapsed(capsys.readouterr().err)
+    assert "rejected by the runtime" in out
+    assert "NOT saving it" in out
+    assert "Kept your previously-saved" in out
+    assert "pull-runtime-key dev" in out
+
+
+@pytest.mark.unit
+def test_auto_recovery_rejected_key_with_no_prior_is_deleted(monkeypatch, tmp_path: Path) -> None:
+    """When there's no prior saved key and the candidate 401s, the bad
+    candidate is removed from the store rather than left behind to 401 again."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+
+    def fake_refresh_saves_bad(target_name: str) -> tuple[str, str]:
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BAD_minted")
+        return "mvt_live_demotena_BAD_minted", "MDK_DEV_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh_saves_bad)
+    _always_verifies(monkeypatch, ok=False, reason="HTTP 401")
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev", base_url="https://dev.example.com", target_cfg=_fake_target()
+    )
+
+    assert new_key is None
+    assert CredentialsStore().get("MDK_DEV_KEY") is None
+
+
+@pytest.mark.unit
+def test_auto_recovery_prefers_keyvault_pull_over_mint_when_known(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """When the target names a Key Vault, recovery PULLS the guaranteed-
+    trusted bootstrap key and never shells out to mint a fresh one."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+
+    def fake_pull(target: str, *, keyvault: str, secret_name: str = "bootstrap-api-key"):
+        assert keyvault == "movate-dev-kv-mvt"
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_BOOT_secret")
+        return "mvt_live_demotena_BOOT_secret", "MDK_DEV_KEY"
+
+    def fail_if_minted(target_name: str) -> tuple[str, str]:
+        raise AssertionError("must not mint when a Key Vault pull is available")
+
+    monkeypatch.setattr("movate.cli.auth.pull_runtime_key_inline", fake_pull)
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fail_if_minted)
+    _always_verifies(monkeypatch, ok=True)
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev",
+        base_url="https://dev.example.com",
+        target_cfg=_fake_target(azure_keyvault="movate-dev-kv-mvt"),
+    )
+
+    assert new_key == "mvt_live_demotena_BOOT_secret"
+    assert CredentialsStore().get("MDK_DEV_KEY") == "mvt_live_demotena_BOOT_secret"
+    out = _collapsed(capsys.readouterr().err)
+    assert "pulled from Key Vault" in out
+
+
+@pytest.mark.unit
+def test_auto_recovery_falls_back_to_mint_when_keyvault_pull_fails(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """A failed Key Vault pull (RBAC, missing secret) falls back to minting
+    in-pod — still round-trip verified before being kept."""
+    _hermetic_creds(monkeypatch, tmp_path)
+    monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+
+    def fake_pull_fails(target: str, *, keyvault: str, secret_name: str = "bootstrap-api-key"):
+        raise PullRuntimeKeyError("SecretNotFound")
+
+    def fake_refresh(target_name: str) -> tuple[str, str]:
+        CredentialsStore().set("MDK_DEV_KEY", "mvt_live_demotena_FRESH_secret")
+        return "mvt_live_demotena_FRESH_secret", "MDK_DEV_KEY"
+
+    monkeypatch.setattr("movate.cli.auth.pull_runtime_key_inline", fake_pull_fails)
+    monkeypatch.setattr("movate.cli.auth.refresh_runtime_key_inline", fake_refresh)
+    _always_verifies(monkeypatch, ok=True)
+
+    new_key = _attempt_auto_recovery(
+        target_name="dev",
+        base_url="https://dev.example.com",
+        target_cfg=_fake_target(azure_keyvault="movate-dev-kv-mvt"),
+    )
+
+    assert new_key == "mvt_live_demotena_FRESH_secret"
+    out = _collapsed(capsys.readouterr().err)
+    assert "falling back to minting" in out
+    assert "minted in-pod" in out
+
+
+@pytest.mark.unit
+def test_resolve_keyvault_name_reads_field_else_none() -> None:
+    assert _resolve_keyvault_name(_fake_target(azure_keyvault="movate-dev-kv-mvt")) == (
+        "movate-dev-kv-mvt"
+    )
+    assert _resolve_keyvault_name(_fake_target(azure_keyvault=None)) is None
+    # The vault name is NOT derived from azure_env — must be explicit.
+    assert _resolve_keyvault_name(SimpleNamespace(key_env="K", azure_env="dev")) is None

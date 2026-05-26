@@ -81,6 +81,17 @@ def _write_user_config(home: Path, target_name: str = "dev") -> None:
     )
 
 
+def _hermetic_creds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, contents: str = "") -> None:
+    """Point the credentials store at a tmp file + force the file backend so
+    the 401 hint's shell-vs-file comparison never reads the developer's real
+    ``~/.movate/credentials`` (or their OS keychain). ``contents`` seeds the
+    file; the empty default leaves the store with no entries."""
+    creds = tmp_path / "credentials"
+    creds.write_text(contents)
+    monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(creds))
+    monkeypatch.setenv("MOVATE_CRED_BACKEND", "file")
+
+
 def _bootstrap_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Init + add one agent so the local bundle can auto-wrap a plain
     string into ``{question: "..."}``."""
@@ -198,6 +209,8 @@ def test_target_401_renders_token_hint(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
     _write_user_config(tmp_path)
     monkeypatch.setenv("MDK_DEV_KEY", "mvt_stale_key_value_xxxxxxxx")
+    # No saved entry → shell is the sole source → keep the save/pull hint.
+    _hermetic_creds(monkeypatch, tmp_path)
 
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"detail": "unauthorized"})
@@ -213,6 +226,38 @@ def test_target_401_renders_token_hint(tmp_path: Path, monkeypatch: pytest.Monke
     # Recovery hint surfaces the autoload command.
     assert "mdk auth save-runtime-key dev" in result.stderr
     # Summary line still emitted on the failure path so CI can scrape.
+    assert "mdk_run_summary:" in result.stderr
+    assert "ok=false" in result.stderr
+
+
+@pytest.mark.unit
+def test_target_401_shell_shadows_saved_key_leads_with_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the rejected bearer came from a shell export that DIFFERS from a
+    (presumably fresher, e.g. just-deployed) key saved in the credentials
+    file, the 401 hint leads with ``unset <KEY_ENV>`` — not
+    ``save-runtime-key``, which would write to the file the shell shadows."""
+    _bootstrap_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("MOVATE_CONFIG_PATH", str(tmp_path / ".movate" / "config.yaml"))
+    _write_user_config(tmp_path)
+    # Stale value exported in the shell …
+    monkeypatch.setenv("MDK_DEV_KEY", "mvt_dev_STALE_shell_value")
+    # … and a DIFFERENT, fresher value saved in the credentials file.
+    _hermetic_creds(monkeypatch, tmp_path, contents="MDK_DEV_KEY=mvt_dev_FRESH_file_value\n")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    _make_client_factory(httpx.MockTransport(handler), monkeypatch)
+
+    result = runner.invoke(app, ["run", "faq", "hello", "--target", "dev"], env={"COLUMNS": "200"})
+    assert result.exit_code == 1
+    assert "rejected the bearer token" in result.stderr
+    # Leads with the real fix: unset the shadowing shell export.
+    assert "unset MDK_DEV_KEY" in result.stderr
+    # And does NOT push save-runtime-key (which writes the shadowed file).
+    assert "save-runtime-key" not in result.stderr
     assert "mdk_run_summary:" in result.stderr
     assert "ok=false" in result.stderr
 
