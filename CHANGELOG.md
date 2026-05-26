@@ -6,6 +6,39 @@ per commit). Releases prior to 2026-05 used SemVer (`v0.x`); those tags remain a
 
 ## [Unreleased]
 
+### Changed — runtime-bearer keys are file-authoritative (ADR 022)
+
+**Kills the #1 recurring auth failure: a stale `export MDK_<TARGET>_KEY=…`
+in your shell no longer shadows the key you just saved/rotated.** This is a
+*behavior change* to `MDK_<TARGET>_KEY` resolution (compat rule 5), scoped
+strictly to the runtime-bearer class.
+
+- **`MDK_<TARGET>_KEY` resolution inverts** (ADR 022): the saved value in
+  `~/.movate/credentials` (or keychain) is now **authoritative** and wins
+  over a plain shell-exported value. Precedence is: (1) explicit `--key` /
+  `--key-stdin` (unchanged), (2) **saved file/keychain value**, (3) shell
+  value **only when there is no saved value** — so CI / pure-shell setups
+  (which have no credentials file entry) are **unchanged**.
+- **Never silent.** When the saved value overrides a *differing* shell
+  export, `autoload_credentials()` records the var in a shadow ledger and
+  the pre-remote-call context echo (and `mdk auth status`) surface
+  `credentials file (shell value overridden)` plus one actionable reconcile
+  line. A *matching* value is a silent no-op.
+- **Provider keys are UNCHANGED.** `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  notification secrets (`TELEGRAM_*`, `MOVATE_DEPLOY_WEBHOOK`), and
+  observability vars (`LANGFUSE_*`) keep the universal env-overrides-config
+  convention: shell > `.env` > credentials file.
+- **Escape hatches (no new env var).** To make a shell value durable,
+  persist it (`mdk auth save-runtime-key <target> -`); to fall back to the
+  shell, clear the saved key.
+- **Honest source attribution in the remote echo.** `echo_remote_context`
+  now derives the credential source from `credentials.key_source(...)` (the
+  same primitive `mdk auth status` uses) instead of hardcoding "credentials
+  file" — fixing the prior mislabel where a shell-sourced key was announced
+  as the saved one.
+- New `credentials.runtime_key_shadowed(var)` helper exposes the override
+  fact to callers; `key_source` keeps its 4 backward-compatible states.
+
 ### Added — `movate watch` hot-reload for the dev inner loop (post-v1.0)
 
 **TDD-style feedback while iterating on a prompt.** Saves the file

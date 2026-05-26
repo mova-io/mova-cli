@@ -1569,7 +1569,7 @@ def _render_runtime_targets_section(counts: dict[str, int], *, verify: bool = Fa
         UserConfigError,
         load_user_config,
     )
-    from movate.credentials import key_source  # noqa: PLC0415
+    from movate.credentials import key_source, runtime_key_shadowed  # noqa: PLC0415
 
     try:
         cfg = load_user_config()
@@ -1619,9 +1619,14 @@ def _render_runtime_targets_section(counts: dict[str, int], *, verify: bool = Fa
                 bearer_cell = f"[yellow]⊘ {target.key_env} not set[/yellow]"
                 counts["unset"] += 1
             else:
-                bearer_cell = (
-                    f"[green]✓ {target.key_env}[/green] [dim]({src.replace('_', ' ')})[/dim]"
-                )
+                # ADR 022: when the saved runtime key overrode a stale shell
+                # export, key_source already reports `credentials_file` (the
+                # file won) — append the override note so the attribution is
+                # complete, not a misleading bare "credentials file".
+                src_label = src.replace("_", " ")
+                if runtime_key_shadowed(target.key_env):
+                    src_label += " (shell value overridden)"
+                bearer_cell = f"[green]✓ {target.key_env}[/green] [dim]({src_label})[/dim]"
                 counts["ok"] += 1
         else:
             bearer_cell = "[dim]—[/dim]"

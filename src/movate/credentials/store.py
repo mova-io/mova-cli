@@ -58,7 +58,13 @@ def _resolve_path() -> Path:
     override = os.environ.get("MOVATE_CREDENTIALS_PATH", "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    return _DEFAULT_PATH
+    # Compute fresh from $HOME on every call rather than returning the
+    # import-time ``_DEFAULT_PATH`` constant: freezing the path at import
+    # meant a monkeypatched ``HOME`` (the standard test-isolation move) was
+    # silently ignored, so the test suite wrote to a developer's REAL
+    # ~/.movate/credentials. Re-resolving here honors HOME and makes the
+    # default safe to isolate.
+    return Path.home() / ".movate" / "credentials"
 
 
 # Exposed for diagnostic surfaces (``mdk auth status``) that want to

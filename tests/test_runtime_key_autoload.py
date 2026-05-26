@@ -25,6 +25,8 @@ from movate.cli.main import app
 from movate.credentials.loader import (
     _looks_like_runtime_key_env,
     autoload_credentials,
+    key_source,
+    runtime_key_shadowed,
 )
 from movate.credentials.store import CredentialsStore
 
@@ -94,18 +96,22 @@ class TestAutoloadRuntimeKeys:
         autoload_credentials()
         assert os.environ.get("MDK_DEV_KEY") == "mvt_live_demo_KID_SECRET"
 
-    def test_shell_set_value_wins_over_credentials_file(
+    def test_saved_value_wins_over_differing_shell_export(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Same precedence as provider keys: if MDK_DEV_KEY is already
-        in the env (shell-exported), the credentials file must NOT
-        clobber it."""
+        """ADR 022 inversion: for a runtime-bearer key, the SAVED file
+        value is authoritative and OVERRIDES a differing shell export
+        (this was the #1 recurring 401 — a stale shell key shadowing
+        the freshly-saved one). The override is recorded so callers can
+        surface it (never silent)."""
         store = self._isolated_credentials(tmp_path, monkeypatch)
         store.set("MDK_DEV_KEY", "mvt_live_FILE_VERSION")
         monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_SHELL_VERSION")
         autoload_credentials()
-        # Shell-set value preserved.
-        assert os.environ.get("MDK_DEV_KEY") == "mvt_live_SHELL_VERSION"
+        # File value wins (the inversion).
+        assert os.environ.get("MDK_DEV_KEY") == "mvt_live_FILE_VERSION"
+        # …and the shadow is recorded for point-of-use surfacing.
+        assert runtime_key_shadowed("MDK_DEV_KEY") is True
 
     def test_non_runtime_keys_in_credentials_file_not_autoloaded(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -131,6 +137,143 @@ class TestAutoloadRuntimeKeys:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         autoload_credentials()
         assert os.environ.get("OPENAI_API_KEY") == "sk-test-12345"
+
+
+# ---------------------------------------------------------------------------
+# ADR 022 — file-authoritative runtime-bearer resolution (the full matrix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestRuntimeKeyFileAuthoritative:
+    """ADR 022 precedence matrix for the ``MDK_<TARGET>_KEY`` class.
+
+    The decision: runtime-bearer keys are file-authoritative (the saved
+    value beats a plain shell export) — but ONLY when a saved value
+    exists, and the override is always recorded so it's surfaced (never a
+    silent 401). Provider keys are deliberately UNCHANGED (shell wins) and
+    proven separately below to confirm the class split is intact.
+    """
+
+    def _isolated_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, contents: str = ""
+    ) -> CredentialsStore:
+        """Point the file backend at a tmp credentials file (never the
+        operator's real ~/.movate). Mirrors the hermetic setup the echo
+        tests use so the two suites isolate identically."""
+        creds = tmp_path / "credentials"
+        creds.write_text(contents)
+        monkeypatch.setenv("MOVATE_CREDENTIALS_PATH", str(creds))
+        monkeypatch.setenv("MOVATE_CRED_BACKEND", "file")
+        return CredentialsStore()
+
+    def test_file_only_uses_file_value_source_credentials_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """File-only (no shell value) → file value used, no shadow,
+        ``key_source`` reports ``credentials_file``."""
+        self._isolated_credentials(
+            tmp_path, monkeypatch, contents="MDK_DEV_KEY=mvt_live_FILEONLY\n"
+        )
+        monkeypatch.delenv("MDK_DEV_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)  # no .env → not dotenv
+        autoload_credentials()
+        assert os.environ.get("MDK_DEV_KEY") == "mvt_live_FILEONLY"
+        assert key_source("MDK_DEV_KEY") == "credentials_file"
+        assert runtime_key_shadowed("MDK_DEV_KEY") is False
+
+    def test_shell_only_no_file_value_keeps_shell_ci_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Shell-only, NO saved value → the shell value is used unchanged
+        (the CI / pure-shell path that must never break). No shadow."""
+        # File exists (so autoload runs the runtime-key loop) but has NO
+        # MDK_DEV_KEY entry — the rule-3 fallthrough.
+        self._isolated_credentials(tmp_path, monkeypatch, contents="OPENAI_API_KEY=sk-x\n")
+        monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_SHELLONLY")
+        monkeypatch.chdir(tmp_path)
+        autoload_credentials()
+        assert os.environ.get("MDK_DEV_KEY") == "mvt_live_SHELLONLY"
+        assert key_source("MDK_DEV_KEY") == "shell"
+        assert runtime_key_shadowed("MDK_DEV_KEY") is False
+
+    def test_file_equals_shell_is_silent_no_op(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """File == shell → file value used (a no-op), no shadow notice —
+        there's nothing to warn about when the values match."""
+        self._isolated_credentials(tmp_path, monkeypatch, contents="MDK_DEV_KEY=mvt_live_SAME\n")
+        monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_SAME")
+        autoload_credentials()
+        assert os.environ.get("MDK_DEV_KEY") == "mvt_live_SAME"
+        assert runtime_key_shadowed("MDK_DEV_KEY") is False
+
+    def test_file_differs_from_shell_file_wins_and_shadow_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """File != shell → FILE value wins, the override is recorded, and
+        ``key_source`` reports ``credentials_file`` (the truthful source
+        after the file won)."""
+        self._isolated_credentials(
+            tmp_path, monkeypatch, contents="MDK_DEV_KEY=mvt_live_FILEWINS\n"
+        )
+        monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_STALESHELL")
+        monkeypatch.chdir(tmp_path)
+        autoload_credentials()
+        assert os.environ.get("MDK_DEV_KEY") == "mvt_live_FILEWINS"
+        assert key_source("MDK_DEV_KEY") == "credentials_file"
+        assert runtime_key_shadowed("MDK_DEV_KEY") is True
+
+    def test_provider_key_shell_wins_class_split_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The class split: a PROVIDER key (OPENAI_API_KEY) with BOTH a
+        shell value and a file value → the SHELL value wins (unchanged
+        env-overrides-config convention). Proves ADR 022 is scoped to the
+        runtime-bearer class only."""
+        self._isolated_credentials(tmp_path, monkeypatch, contents="OPENAI_API_KEY=sk-FILE\n")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-SHELL")
+        monkeypatch.chdir(tmp_path)
+        autoload_credentials()
+        # Shell wins for provider keys — never clobbered.
+        assert os.environ.get("OPENAI_API_KEY") == "sk-SHELL"
+        assert key_source("OPENAI_API_KEY") == "shell"
+        # The shadow ledger is runtime-key-only; a provider key is never in it.
+        assert runtime_key_shadowed("OPENAI_API_KEY") is False
+
+    def test_key_source_states_for_provider_keys_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``key_source`` still returns the correct 4 states for provider
+        keys: unset / credentials_file / shell."""
+        self._isolated_credentials(tmp_path, monkeypatch, contents="OPENAI_API_KEY=sk-FILE\n")
+        monkeypatch.chdir(tmp_path)
+        # unset
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert key_source("ANTHROPIC_API_KEY") == "unset"
+        # credentials_file (autoload hydrates the unset env from file)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        autoload_credentials()
+        assert key_source("OPENAI_API_KEY") == "credentials_file"
+        # shell (an explicit export that matches neither file nor .env)
+        monkeypatch.setenv("GEMINI_API_KEY", "gm-shell")
+        assert key_source("GEMINI_API_KEY") == "shell"
+
+    def test_repeat_autoload_clears_stale_shadow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shadow ledger is rebuilt on every autoload — a prior run's
+        override never lingers into a later, no-longer-shadowing run."""
+        self._isolated_credentials(tmp_path, monkeypatch, contents="MDK_DEV_KEY=mvt_live_FILE\n")
+        monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_STALE")
+        autoload_credentials()
+        assert runtime_key_shadowed("MDK_DEV_KEY") is True
+        # Now the shell matches the file (operator unset the stale export and
+        # a fresh shell picked up the saved value) — a re-autoload must clear
+        # the shadow.
+        monkeypatch.setenv("MDK_DEV_KEY", "mvt_live_FILE")
+        autoload_credentials()
+        assert runtime_key_shadowed("MDK_DEV_KEY") is False
 
 
 # ---------------------------------------------------------------------------
