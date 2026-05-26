@@ -149,22 +149,23 @@ class TestFriendlyKeyMissing:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The --mock escape hatch must still work after the pre-flight
-        check — that's the whole point of --mock."""
+        check — that's the whole point of --mock.
+
+        Post-PR: the mock is now scaffold-aware, so bare ``--mock`` (no
+        MOVATE_MOCK_RESPONSE) synthesizes a valid GeneratedAgent and the
+        scaffold SUCCEEDS offline (exit 0)."""
         _strip_all_provider_keys(monkeypatch)
-        # MockProvider's default response is not a valid GeneratedAgent
-        # JSON, so we expect LLMScaffoldError → exit 2. The point of
-        # this test is: we get past the key check, not that scaffold
-        # actually succeeds.
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
             ["init", "test-agent", "--llm", "test", "--mock"],
             env={"COLUMNS": "200"},
         )
-        # The pre-flight key gate is bypassed; we now fail later when
-        # MockProvider's canned response doesn't match GeneratedAgent.
-        # Either way, the friendly "no key" hint should NOT appear.
+        # The pre-flight key gate is bypassed AND the scaffold-aware mock
+        # produces a runnable agent — exit 0, no "no key" hint.
+        assert result.exit_code == 0, result.stdout + result.stderr
         assert "OPENAI_API_KEY" not in result.stderr
+        assert (tmp_path / "test-agent" / "agent.yaml").is_file()
 
 
 # ---------------------------------------------------------------------------

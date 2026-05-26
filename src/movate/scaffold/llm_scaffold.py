@@ -253,7 +253,7 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
    - kind: "Agent"
    - name: "{name}"  (exactly this value)
    - version: "0.1.0"
-   - model.provider: "openai/gpt-4o-mini-2024-07-18"  (or another valid LiteLLM string)
+   - model.provider: "{target_model}"  (use exactly this provider string)
    - model.params: {{"temperature": 0.0, "max_tokens": <256-2048>}}
    - prompt: "./prompt.md"
    - schema.input: "./schema/input.json"
@@ -319,6 +319,7 @@ async def generate_agent_from_description(
     name: str,
     model: str,
     provider: BaseLLMProvider,
+    target_model: str | None = None,
     previous_attempt: GeneratedAgent | None = None,
     validation_error: str | None = None,
 ) -> GenerationResult:
@@ -332,6 +333,14 @@ async def generate_agent_from_description(
     * Wire error from the provider.
     * LLM returned non-JSON.
     * LLM returned JSON that doesn't match GeneratedAgent's schema.
+
+    ``model`` is the model used to DRIVE this scaffold call (the LLM
+    doing the generating). ``target_model`` is the model string the
+    GENERATED agent should declare in its ``agent_yaml.model.provider``
+    — it's injected into the meta-prompt's hard constraints so the
+    scaffolded agent runs with the key the operator actually has. When
+    ``target_model`` is ``None`` the prompt falls back to the
+    ``model`` value (back-compat: prior callers passed only ``model``).
 
     When ``previous_attempt`` and ``validation_error`` are both
     supplied, the meta-prompt switches to retry mode — the LLM is
@@ -348,6 +357,7 @@ async def generate_agent_from_description(
         user_prompt = _META_PROMPT.format(
             description=description,
             name=name,
+            target_model=target_model or model,
             example_faq=_EXAMPLE_FAQ,
             example_classifier=_EXAMPLE_CLASSIFIER,
         )

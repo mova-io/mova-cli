@@ -1182,6 +1182,60 @@ def _init_agent(
 # Same provider string format as ``agent.yaml: model.provider``.
 _DEFAULT_LLM_MODEL = "openai/gpt-4o-mini-2024-07-18"
 
+# Canonical model string to write into the GENERATED agent's
+# ``agent_yaml.model.provider`` for each provider whose key the operator
+# actually has. An Anthropic-only user must get an `anthropic/...` agent
+# (not the openai default) so the scaffolded agent runs with their key.
+# Values are the LiteLLM-style strings used elsewhere in the repo
+# (templates / pricing.yaml) so cost + run paths line up. Keyed by the
+# provider env-var name from :data:`_PROVIDER_KEY_ENV_VARS`; checked in
+# that order (first key present wins). Note: this is the model written
+# INTO the generated agent — separate from the model used to DRIVE the
+# scaffold call (``--llm-model`` / `_DEFAULT_LLM_MODEL`).
+_PROVIDER_KEY_TO_AGENT_MODEL: dict[str, str] = {
+    "OPENAI_API_KEY": "openai/gpt-4o-mini-2024-07-18",
+    "ANTHROPIC_API_KEY": "anthropic/claude-haiku-4-5-20251001",
+    "AZURE_OPENAI_API_KEY": "azure/gpt-4o-2024-08-06",
+    "GEMINI_API_KEY": "gemini/gemini-1.5-flash",
+    # LYZR has no canonical agent-model string in the templates; fall
+    # through to the default rather than emit a guess.
+}
+
+
+def _pick_target_model(*, llm_model: str, mock: bool) -> str:
+    """Choose the model string to write into the GENERATED agent.yaml.
+
+    Precedence:
+
+    1. If the operator explicitly passed ``--llm-model`` (i.e. it differs
+       from :data:`_DEFAULT_LLM_MODEL`), honor it verbatim — they asked
+       for a specific model, give them that in the generated agent too.
+    2. Otherwise, map from the FIRST provider key present in the
+       environment (in :data:`_PROVIDER_KEY_ENV_VARS` order) so the
+       scaffolded agent runs with the key the operator actually has.
+    3. Fall back to :data:`_DEFAULT_LLM_MODEL` when nothing matches —
+       which is also the right answer in ``--mock`` / no-key mode (the
+       synthesized/offline agent uses the openai default; the operator
+       swaps it when they wire a real key).
+
+    This is the model written INTO the generated agent. The model used to
+    *drive* the scaffold LLM call is the separate ``llm_model`` value.
+    """
+    import os  # noqa: PLC0415
+
+    if llm_model != _DEFAULT_LLM_MODEL:
+        # Operator overrode --llm-model: use it for the generated agent.
+        return llm_model
+    if not mock:
+        for env_var in _PROVIDER_KEY_ENV_VARS:
+            if os.environ.get(env_var, "").strip():
+                mapped = _PROVIDER_KEY_TO_AGENT_MODEL.get(env_var)
+                if mapped:
+                    return mapped
+                break
+    return _DEFAULT_LLM_MODEL
+
+
 # Where Phase 2 stashes a failed-second-attempt's raw payload for the
 # operator to inspect. Relative to the cwd at invocation time — the
 # project root in the normal flow. Operators are pointed at this path
@@ -1317,60 +1371,125 @@ async def _run_llm_scaffold(
     # so CI dashboards can flag "this scaffold needed correction" runs.
     retried = False
 
+    # The model written INTO the generated agent (key-matched), distinct
+    # from `llm_model` which DRIVES the scaffold call. See _pick_target_model.
+    target_model = _pick_target_model(llm_model=llm_model, mock=mock)
+
     rt = await build_local_runtime(mock=mock)
+    # `generated` is set once an attempt both generates AND validates.
+    generated: Any = None
     try:
-        # Attempt 1 — fresh generation from the description.
-        try:
-            with spinner(f"scaffolding agent '{name}' from description..."):
-                result = await generate_agent_from_description(
-                    description=description,
-                    name=name,
-                    model=llm_model,
-                    provider=rt.provider,
+        # ------------------------------------------------------------------
+        # Unified up-to-2-attempts loop. A single attempt can fail in two
+        # ways:
+        #   (a) generation fails (LLMScaffoldError): provider wire error,
+        #       non-JSON prose, or schema mismatch. The most common real
+        #       LLM failure — it now earns a retry just like (b).
+        #   (b) generation succeeds but load-validation fails: the retry
+        #       feeds the parsed attempt + error back so the model can
+        #       self-correct.
+        # Exit-code contract (preserved from the pre-refactor flow):
+        #   * exit 2 when the FINAL attempt failed at generation
+        #     (LLMScaffoldError) — "hard scaffold failure".
+        #   * exit 1 when the FINAL attempt generated but failed
+        #     load-validation — "retry-validation failure".
+        # ------------------------------------------------------------------
+        # Carry the parsed-but-invalid agent + its error from attempt 1
+        # into attempt 2's feedback retry. Only set when attempt 1
+        # *generated* something (a generation error leaves these None →
+        # attempt 2 re-rolls fresh).
+        feedback_attempt: Any = None
+        feedback_error: str | None = None
+        # The failure mode of the last attempt, so the final error
+        # handling picks the right exit code + message.
+        last_gen_error: str | None = None
+        last_validation_error: str | None = None
+
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            is_retry = attempt > 1
+            if is_retry:
+                retried = True
+
+            spin_msg = (
+                f"retrying scaffold for '{name}'..."
+                if is_retry
+                else f"scaffolding agent '{name}' from description..."
+            )
+            try:
+                with spinner(spin_msg):
+                    result = await generate_agent_from_description(
+                        description=description,
+                        name=name,
+                        model=llm_model,
+                        target_model=target_model,
+                        provider=rt.provider,
+                        # Feedback retry ONLY when attempt 1 parsed but
+                        # failed validation. A generation error leaves
+                        # both None → this is a fresh re-roll.
+                        previous_attempt=feedback_attempt,
+                        validation_error=feedback_error,
+                    )
+            except LLMScaffoldError as exc:
+                last_gen_error = str(exc)
+                last_validation_error = None
+                # A generation error yields no parsed object to feed back;
+                # the next attempt (if any) re-rolls fresh.
+                feedback_attempt = None
+                feedback_error = None
+                if is_retry:
+                    break  # both attempts exhausted; handle failure below
+                err_console.print(
+                    f"[yellow]⚠[/yellow] first attempt failed: "
+                    f"[dim]{last_gen_error}[/dim]\n"
+                    f"[dim]retrying once (the output was not a valid agent)...[/dim]"
                 )
+                continue
+
             total_tokens = _accumulate_tokens(total_tokens, result.tokens)
-            generated = result.agent
-        except LLMScaffoldError as exc:
-            err_console.print(f"[red]✗[/red] LLM scaffold failed: {exc}")
-            raise typer.Exit(code=2) from None
+            candidate = result.agent
 
-        # Enforce the name-constraint defensively. A forgetful LLM might
-        # echo the example's name ("faq-agent") instead of honoring the
-        # description's requested name. We override AFTER generation so
-        # the dir/file/agent-yaml correspondence is always preserved.
-        # If the LLM hallucinated a *different* name, that's a soft
-        # failure: we silently coerce. (Add a warning here if pilot data
-        # shows real LLMs ignoring this constraint at meaningful rates.)
-        generated.agent_yaml["name"] = name
+            # Defensive coercions, applied to EVERY generated candidate so
+            # the dir/file/agent-yaml correspondence + key-match hold
+            # regardless of what the LLM emitted:
+            #   * name → the CLI <name> argument (a forgetful LLM might
+            #     echo the few-shot exemplar's name).
+            #   * model.provider → the key-matched target_model so the
+            #     scaffolded agent runs with the operator's key.
+            candidate.agent_yaml["name"] = name
+            model_block = candidate.agent_yaml.get("model")
+            if isinstance(model_block, dict):
+                model_block["provider"] = target_model
 
-        # Validate by writing to a tempdir and loading.
-        validation_error = _try_validate(generated, name=name)
+            # Validate by writing to a tempdir and loading.
+            validation_error = _try_validate(candidate, name=name)
+            if validation_error is None:
+                generated = candidate
+                last_gen_error = None
+                last_validation_error = None
+                break  # success
 
-        # Retry once if validation failed.
-        if validation_error is not None:
-            retried = True
+            # Validation failed: stash for the feedback retry (or final fail).
+            last_validation_error = validation_error
+            last_gen_error = None
+            feedback_attempt = candidate
+            feedback_error = validation_error
+            if is_retry:
+                break  # both attempts exhausted; handle failure below
             err_console.print(
                 f"[yellow]⚠[/yellow] first attempt failed validation: "
                 f"[dim]{validation_error}[/dim]\n"
                 f"[dim]retrying once with the error fed back to the model...[/dim]"
             )
-            try:
-                with spinner(f"retrying scaffold for '{name}'..."):
-                    result = await generate_agent_from_description(
-                        description=description,
-                        name=name,
-                        model=llm_model,
-                        provider=rt.provider,
-                        previous_attempt=generated,
-                        validation_error=validation_error,
-                    )
-                total_tokens = _accumulate_tokens(total_tokens, result.tokens)
-                generated = result.agent
-                generated.agent_yaml["name"] = name
-            except LLMScaffoldError as exc:
-                _save_debug_artifact(name, payload=None, raw_error=str(exc))
+
+        # Final failure handling — only reached when both attempts failed.
+        if generated is None:
+            if last_gen_error is not None:
+                # Hard scaffold failure (generation never produced a valid
+                # parsed agent on the final attempt) → exit 2.
+                _save_debug_artifact(name, payload=None, raw_error=last_gen_error)
                 err_console.print(
-                    f"[red]✗[/red] retry also failed: {exc}\n"
+                    f"[red]✗[/red] LLM scaffold failed: {last_gen_error}\n"
                     f"[dim]raw error saved to "
                     f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]"
                 )
@@ -1380,30 +1499,31 @@ async def _run_llm_scaffold(
                     model=llm_model,
                     tokens=total_tokens,
                     ok=False,
-                    retried=True,
+                    retried=retried,
                 )
                 raise typer.Exit(code=2) from None
-
-            validation_error = _try_validate(generated, name=name)
-            if validation_error is not None:
-                _save_debug_artifact(name, payload=generated, raw_error=validation_error)
-                err_console.print(
-                    f"[red]✗[/red] retry attempt also failed validation:\n"
-                    f"[dim]{validation_error}[/dim]\n"
-                    f"[dim]raw LLM output saved to "
-                    f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]\n"
-                    f"[dim]inspect, fix manually, or re-run with a different "
-                    f"description.[/dim]"
-                )
-                _print_init_summary_line(
-                    name=name,
-                    llm=True,
-                    model=llm_model,
-                    tokens=total_tokens,
-                    ok=False,
-                    retried=True,
-                )
-                raise typer.Exit(code=1)
+            # Retry-validation failure (final attempt generated but failed
+            # load-validation) → exit 1.
+            _save_debug_artifact(
+                name, payload=feedback_attempt, raw_error=last_validation_error or "unknown"
+            )
+            err_console.print(
+                f"[red]✗[/red] scaffold failed validation after retry:\n"
+                f"[dim]{last_validation_error}[/dim]\n"
+                f"[dim]raw LLM output saved to "
+                f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]\n"
+                f"[dim]inspect, fix manually, or re-run with a different "
+                f"description.[/dim]"
+            )
+            _print_init_summary_line(
+                name=name,
+                llm=True,
+                model=llm_model,
+                tokens=total_tokens,
+                ok=False,
+                retried=retried,
+            )
+            raise typer.Exit(code=1)
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 
@@ -1453,10 +1573,22 @@ async def _run_llm_scaffold(
 
 
 def _try_validate(generated: Any, *, name: str) -> str | None:
-    """Write ``generated`` to a tempdir and run :func:`load_agent`.
+    """Write ``generated`` to a tempdir and run :func:`load_agent`, then
+    cross-check each ``sample_evals`` row against the generated schemas.
 
     Returns ``None`` on success, or the error string on failure. The
     string is fed back to the retry prompt so the LLM can self-correct.
+
+    Two layers of validation:
+
+    1. ``load_agent`` — proves the agent.yaml + prompt + schemas form a
+       loadable, runnable bundle (the existing contract).
+    2. ``sample_evals`` rows — each present row's ``input`` is checked
+       against ``input_schema`` and ``expected`` against ``output_schema``
+       (the same JSON-Schema 2020-12 validator the runtime uses). Without
+       this, a non-conforming eval row silently produces a dataset that
+       fails on the first ``mdk eval``. Empty ``sample_evals`` is LEGAL —
+       we only validate rows that are present, never force evals to exist.
     """
     import tempfile  # noqa: PLC0415
 
@@ -1473,6 +1605,56 @@ def _try_validate(generated: Any, *, name: str) -> str | None:
             load_agent(tmp_agent_dir)
         except AgentLoadError as exc:
             return str(exc)
+
+    # Cross-check sample_evals rows against the generated I/O schemas.
+    # Reuse the runtime's JSON-Schema validator (no new dep). Empty list
+    # is legal — the loop simply doesn't run.
+    eval_error = _validate_sample_evals(generated)
+    if eval_error is not None:
+        return eval_error
+    return None
+
+
+def _validate_sample_evals(generated: Any) -> str | None:
+    """Validate each present ``sample_evals`` row against the generated
+    input/output schemas.
+
+    Returns ``None`` when every row conforms (or there are no rows), or a
+    descriptive error string naming the offending row + field so the
+    retry prompt can steer the model to a fix. Uses
+    :class:`jsonschema.Draft202012Validator` — the same validator
+    :mod:`movate.core.loader` wires for runtime I/O validation.
+    """
+    sample_evals = getattr(generated, "sample_evals", None) or []
+    if not sample_evals:
+        return None
+
+    from jsonschema import Draft202012Validator  # noqa: PLC0415
+    from jsonschema import ValidationError as JSONSchemaValidationError  # noqa: PLC0415
+
+    try:
+        input_validator = Draft202012Validator(generated.input_schema)
+        output_validator = Draft202012Validator(generated.output_schema)
+    except Exception as exc:
+        # A malformed schema is a retry-able error, not a crash — broad
+        # except so the retry loop can re-prompt the model to fix it.
+        return f"sample_evals validation could not build schema validators: {exc}"
+
+    for index, row in enumerate(sample_evals):
+        if not isinstance(row, dict):
+            return f"sample_evals[{index}] is not an object with 'input'/'expected' keys"
+        if "input" not in row:
+            return f"sample_evals[{index}] is missing the 'input' key"
+        if "expected" not in row:
+            return f"sample_evals[{index}] is missing the 'expected' key"
+        try:
+            input_validator.validate(row["input"])
+        except JSONSchemaValidationError as exc:
+            return f"sample_evals[{index}].input does not match input_schema: {exc.message}"
+        try:
+            output_validator.validate(row["expected"])
+        except JSONSchemaValidationError as exc:
+            return f"sample_evals[{index}].expected does not match output_schema: {exc.message}"
     return None
 
 

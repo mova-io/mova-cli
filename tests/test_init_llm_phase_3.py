@@ -345,14 +345,16 @@ def test_summary_line_marks_retry(
     isolated_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When attempt 1 fails validation and the retry succeeds, the
-    summary line should carry ``retried=true``. We force attempt-1
-    failure by setting MOCK_RESPONSE to a schema-violating payload,
-    then verify retried=true fires."""
-    # Both attempts return the same wrong response (MockProvider is
-    # stateless across calls), so retry hits the same failure and we
-    # exit non-zero. That's fine — we just need to verify the retry
-    # logic ran (which is what retried=true asserts).
+    """When attempt 1 fails (here: a schema-violating payload that fails
+    generation), the unified retry loop now fires a second attempt and
+    the summary line carries ``retried=true``.
+
+    Post-PR (retry on transport/JSON/schema errors): a first-attempt
+    ``LLMScaffoldError`` no longer exits immediately — it earns a retry.
+    Both attempts return the same wrong response (explicit
+    MOVATE_MOCK_RESPONSE is stateless across calls), so the retry hits
+    the same failure → exit 2, BUT now with a summary line marked
+    retried=true."""
     monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"not": "the right shape"}')
     monkeypatch.chdir(tmp_path)
     result = runner.invoke(
@@ -367,14 +369,13 @@ def test_summary_line_marks_retry(
             str(tmp_path),
         ],
     )
-    # First-attempt LLMScaffoldError exits 2 BEFORE the retry path —
-    # the schema-mismatch fails generation, not validation. So this
-    # test exits 2 without retried=true. Verify that path explicitly.
+    # Both attempts fail at generation (schema mismatch) → exit 2 (hard
+    # scaffold failure), and the retry path DID run.
     assert result.exit_code == 2
-    # No summary line on first-attempt provider failure (we exit before
-    # _print_init_summary_line is called).
-    # If pilot data later shows operators want a summary even on
-    # first-attempt provider errors, move the print BEFORE the exit.
+    line = result.stdout
+    assert "mdk_init_summary:" in line
+    assert "retried=true" in line
+    assert "ok=false" in line
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,14 @@ Special case: when the prompt looks like an LLM-as-judge prompt (contains
 ``movate bench`` without a second env var. The judge-response path is
 NOT subject to the dataset-cycle — judge prompts are independent of
 the agent's own dataset rows.
+
+**Scaffold-aware mode**: when the prompt is the ``mdk init --llm``
+scaffold meta-prompt (or its retry variant), the mock synthesizes a
+valid :class:`movate.scaffold.GeneratedAgent` JSON payload for a
+minimal generic agent so ``mdk init --llm --mock`` produces a runnable
+agent offline (no API key). Like dataset-aware mode, this fires ONLY
+when no explicit ``MOVATE_MOCK_RESPONSE`` / ``response=`` was set — an
+explicit override always wins.
 """
 
 from __future__ import annotations
@@ -42,6 +50,123 @@ _DEFAULT_RESPONSE = '{"message": "mock response"}'
 _DEFAULT_JUDGE_RESPONSE = '{"score": 0.5, "rationale": "mock judge"}'
 _RESPONSE_ENV = "MOVATE_MOCK_RESPONSE"
 _JUDGE_RESPONSE_ENV = "MOVATE_MOCK_JUDGE_RESPONSE"
+
+# --- Scaffold-aware mode (offline `mdk init --llm --mock`) ----------------
+#
+# `mdk init <name> --llm "<desc>" --mock` is advertised as the no-key /
+# hermetic-CI path, but the canned `{"message": "mock response"}` fails
+# `GeneratedAgent` validation (Extra inputs not permitted / agent_yaml
+# required) → hard exit. To make `--mock` actually produce a runnable
+# agent offline, the mock detects the scaffold meta-prompt (and its retry
+# variant) and synthesizes a minimal but valid `GeneratedAgent` JSON
+# payload: a generic text-in → message-out agent, mirroring the default
+# template. The synthesized payload is engineered to pass BOTH
+# `GeneratedAgent.model_validate` AND `load_agent()`.
+#
+# Detection markers are stable substrings of the scaffold prompts (see
+# `movate.scaffold.llm_scaffold._META_PROMPT` / `_RETRY_PROMPT`). We key
+# on phrases that no judge/dataset/user prompt would contain, so this
+# never mis-fires on the existing judge (`Rubric:`) or dataset paths.
+#
+# CRITICAL: this synthesis ONLY fires when `self._response_is_default`
+# (no explicit `MOVATE_MOCK_RESPONSE` / `response=`). An operator who set
+# an explicit response — including the phase-3 tests that force-feed a
+# valid `GeneratedAgent` — always wins, exactly like dataset-aware mode.
+_SCAFFOLD_PROMPT_MARKERS = (
+    "scaffolding a movate AI agent",
+    "GENERATEDAGENT SCHEMA",
+)
+_SCAFFOLD_RETRY_MARKERS = (
+    "failed validation",
+    "GeneratedAgent JSON",
+)
+# The agent-name line the meta-prompt emits — we parse the requested name
+# back out so the synthesized agent.yaml carries it (the CLI also coerces
+# the name post-generation, so a parse miss is harmless).
+_SCAFFOLD_NAME_PREFIX = "AGENT NAME:"
+
+
+def _looks_like_scaffold_prompt(body: str) -> bool:
+    """True if ``body`` is the LLM-scaffold meta-prompt or its retry form.
+
+    Matches either: ALL of the meta-prompt markers, OR all of the retry
+    markers. Both groups use phrases unique to the scaffold prompts so
+    this never collides with judge (``Rubric:``) or agent-run prompts.
+    """
+    if all(marker in body for marker in _SCAFFOLD_PROMPT_MARKERS):
+        return True
+    return all(marker in body for marker in _SCAFFOLD_RETRY_MARKERS)
+
+
+def _parse_scaffold_name(body: str, *, default: str = "mock-agent") -> str:
+    """Pull the requested agent name out of the scaffold prompt.
+
+    The meta-prompt emits an ``AGENT NAME: <name>`` line. Best-effort:
+    on any parse miss we return ``default`` — the CLI coerces the
+    generated ``agent_yaml.name`` to the real ``<name>`` argument anyway.
+    """
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_SCAFFOLD_NAME_PREFIX):
+            candidate = stripped[len(_SCAFFOLD_NAME_PREFIX) :].strip()
+            if candidate:
+                return candidate
+    return default
+
+
+def _build_scaffold_response(name: str) -> str:
+    """Return a valid ``GeneratedAgent`` JSON payload for a generic agent.
+
+    A minimal text-in → message-out agent (same shape as the default
+    template). Engineered to satisfy every HARD CONSTRAINT in the
+    scaffold meta-prompt so the result passes both
+    ``GeneratedAgent.model_validate`` and ``load_agent()`` — i.e.
+    ``mdk init --llm --mock`` yields a runnable agent offline.
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": {
+            "api_version": "movate/v1",
+            "kind": "Agent",
+            "name": name,
+            "version": "0.1.0",
+            "description": "A generic agent scaffolded offline by the mock provider.",
+            "owner": "",
+            "model": {
+                "provider": "openai/gpt-4o-mini-2024-07-18",
+                "params": {"temperature": 0.0, "max_tokens": 512},
+            },
+            "prompt": "./prompt.md",
+            "schema": {
+                "input": "./schema/input.json",
+                "output": "./schema/output.json",
+            },
+            "evals": {"dataset": "./evals/dataset.jsonl"},
+        },
+        "prompt_md": (
+            "You are a helpful assistant. Respond to the user's input.\n\n"
+            "Input:\n{{ input.text }}\n\n"
+            'Respond with a single JSON object on one line: {"message": "<your reply>"}'
+        ),
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["text"],
+            "properties": {"text": {"type": "string", "minLength": 1}},
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["message"],
+            "properties": {"message": {"type": "string"}},
+        },
+        "sample_evals": [
+            {"input": {"text": "Hello!"}, "expected": {"message": "Hi there, how can I help?"}},
+            {"input": {"text": "What can you do?"}, "expected": {"message": "I answer questions."}},
+        ],
+    }
+    return json.dumps(payload)
 
 
 class MockProvider(BaseLLMProvider):
@@ -134,13 +259,20 @@ class MockProvider(BaseLLMProvider):
                 tool_input=args,
             )
 
-        # Three-way choice for the response text:
+        # Four-way choice for the response text:
         # 1. Judge prompt → canned judge-response (rubric-aware)
-        # 2. Dataset-aware mode (PR #104) → next expected from dataset
-        # 3. Default → canned _response
+        # 2. Scaffold prompt → synthesized valid GeneratedAgent JSON
+        #    (offline `mdk init --llm --mock`); default-response only
+        # 3. Dataset-aware mode (PR #104) → next expected from dataset
+        # 4. Default → canned _response
         is_judge_prompt = "Rubric:" in body
         if is_judge_prompt:
             text = self._judge_response
+        elif self._response_is_default and _looks_like_scaffold_prompt(body):
+            # Offline scaffold path. Only when the response wasn't
+            # explicitly overridden — phase-3 tests that force-feed a
+            # GeneratedAgent via MOVATE_MOCK_RESPONSE must still win.
+            text = _build_scaffold_response(_parse_scaffold_name(body))
         elif self._dataset_expecteds and self._response_is_default:
             # Cycle through dataset rows in order. Wraps at the end so
             # callers that exceed dataset length still get valid output
