@@ -33,16 +33,8 @@ model:
 prompt: ./prompt.md
 
 schema:
-  input:
-    text: string
-    summary_style: brief|detailed|action_items_only?  # default: detailed
-    max_words: integer?                                # cap on summary length; default 200
-    audience: string?                                  # who's reading (e.g. "executive", "engineer")
-  output:
-    summary: string              # the main summary, length governed by summary_style + max_words
-    key_points: [string]         # 3-7 bulleted highlights
-    action_items: [string]       # concrete next steps (with owners when named in the source)
-    open_questions: [string]     # things the document leaves unanswered
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
 
 evals:
   dataset: ./evals/dataset.jsonl

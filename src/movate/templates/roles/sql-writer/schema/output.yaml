@@ -1,0 +1,28 @@
+# ============================================================================
+# MDK Canonical Schema — SQL Writer role (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Generated SQL
+
+fields:
+
+  sql:
+    type: string
+    description: The generated query.
+
+  explanation:
+    type: string
+    description: Plain-English description of what the query does.
+
+  warnings:
+    type: list[string]
+    description: >
+      Populated when the query has destructive ops or ambiguity.
+
+required:
+  - sql
+  - explanation
+  - warnings

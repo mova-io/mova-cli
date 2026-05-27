@@ -1,0 +1,28 @@
+# LLM-as-judge config for the rag-qa template. Rename to ``judge.yaml`` to enable.
+#
+# The grounded answer is free-text prose, so its wording varies run to run —
+# exact-match scoring is wrong. This rubric scores factual correctness,
+# grounding, and the citation indices.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for a grounded RAG-QA agent.
+    * Correctness — same key facts as the expected answer?
+    * Grounding — claims supported by the cited context, no invented facts;
+      `grounded` flag agrees with the expected value.
+    * Citations — do the `citations` indices point at the supporting context?
+
+    1.0 = same facts, correctly grounded, citations support the claims
+    0.5 = mostly correct but misses a fact or over/under-cites
+    0.0 = wrong facts, ungrounded claims, or fabricated citations
+
+threshold: 0.7

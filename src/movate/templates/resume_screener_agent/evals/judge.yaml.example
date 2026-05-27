@@ -1,0 +1,28 @@
+# LLM-as-judge config for the resume-screener template. Rename to ``judge.yaml`` to enable.
+#
+# Strengths, gaps, and the rationale are free-text — wording varies every run,
+# so exact-match scoring is wrong. This rubric scores whether the screen reaches
+# the right recommendation for grounded reasons.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual screen against the expected one for a resume-screener.
+    * Recommendation — does `recommendation` match (advance / reject / etc.)?
+    * Match score — within ~10 points of the expected `match_score`?
+    * Strengths + gaps — grounded in the resume vs the job description, with
+      no fabricated experience and no missed disqualifying gap?
+
+    1.0 = same recommendation, score in range, grounded strengths/gaps
+    0.5 = same recommendation but score off or a strength/gap missed
+    0.0 = wrong recommendation or fabricated qualifications
+
+threshold: 0.7

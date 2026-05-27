@@ -1,0 +1,51 @@
+# ============================================================================
+# MDK Canonical Schema — Reply Drafter (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Reply Drafter Input
+description: >
+  An incoming message to respond to, plus the intent of the reply and
+  optional tone / context / signature controls.
+
+fields:
+
+  incoming_message:
+    type: string
+    description: The incoming message to draft a reply to.
+
+  intent:
+    type: enum
+    description: What the reply is meant to do.
+    values:
+      - acknowledge
+      - answer
+      - escalate
+      - decline
+      - propose-solution
+      - gather-info
+      - apologize
+
+  tone:
+    type: enum
+    description: "Voice of the reply. Default: friendly."
+    values:
+      - formal
+      - friendly
+      - apologetic
+      - firm
+      - casual
+
+  context:
+    type: string
+    description: Optional background the agent should know.
+
+  sign_off_as:
+    type: string
+    description: Optional signature name (e.g. "Sarah from Support").
+
+required:
+  - incoming_message
+  - intent

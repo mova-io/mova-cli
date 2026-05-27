@@ -1,0 +1,34 @@
+# ============================================================================
+# MDK Canonical Schema — SQL Writer role (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: SQL Writer Input
+description: >
+  A natural-language question to turn into SQL, plus optional schema
+  context and a SQL dialect.
+
+fields:
+
+  question:
+    type: string
+    description: The natural-language question to answer with SQL.
+
+  schema_hint:
+    type: string
+    description: Optional CREATE TABLE statements or schema summary.
+
+  dialect:
+    type: enum
+    description: SQL dialect to target.
+    values:
+      - postgres
+      - mysql
+      - sqlite
+      - bigquery
+      - snowflake
+
+required:
+  - question

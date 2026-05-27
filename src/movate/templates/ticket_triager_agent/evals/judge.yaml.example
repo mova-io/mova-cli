@@ -1,0 +1,28 @@
+# LLM-as-judge config for the ticket-triager template. Rename to ``judge.yaml`` to enable.
+#
+# The category / priority / routing fields are enums (exact-match-friendly), but
+# `draft_reply` is free-text — wording varies every run. This rubric scores the
+# routing decision AND the appropriateness of the drafted reply.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual triage against the expected one for a support-ticket triager.
+    * Routing — do `category`, `priority`, and `routing_queue` match the
+      expected routing decision?
+    * Draft reply — does the reply acknowledge the issue appropriately for the
+      priority, with the right tone and no false promises?
+
+    1.0 = routing matches AND the draft reply is appropriate
+    0.5 = routing matches but the reply is off-tone / over- or under-promises
+    0.0 = wrong routing (esp. mis-prioritizing an outage) or an unsafe reply
+
+threshold: 0.7

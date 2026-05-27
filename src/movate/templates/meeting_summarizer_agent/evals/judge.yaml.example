@@ -1,0 +1,27 @@
+# LLM-as-judge config for the meeting-summarizer template. Rename to ``judge.yaml`` to enable.
+#
+# Summaries, decisions, and action items are free-text — wording varies every
+# run, so exact-match scoring is wrong. This rubric scores whether the summary
+# captures the real decisions, owners, and blockers.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual summary against the expected one for a meeting-summarizer.
+    * TLDR + decisions — does it capture the same decisions made?
+    * Action items — same tasks, with correct owners and due dates when stated?
+    * Blockers / follow-ups — are the real blockers surfaced, none invented?
+
+    1.0 = same decisions, action items (owners/dues), and blockers
+    0.5 = mostly right but misses an action item, owner, or a decision
+    0.0 = wrong decisions, fabricated action items, or missed the key blocker
+
+threshold: 0.7

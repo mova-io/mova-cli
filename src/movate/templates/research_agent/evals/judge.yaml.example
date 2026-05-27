@@ -1,0 +1,29 @@
+# LLM-as-judge config for the research-agent template. Rename to ``judge.yaml`` to enable.
+#
+# The executive summary, key points, and open questions are free-text — wording
+# varies every run, so exact-match scoring is wrong. This rubric scores whether
+# the synthesis is faithful to the sources and correctly cited.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual synthesis against the expected one for a research agent.
+    * Coverage — does the executive summary + key points cover the same main
+      claims as the expected output?
+    * Grounding + citations — is every claim backed by a cited source index,
+      with no invented facts?
+    * Disagreements / open questions — are real source conflicts surfaced?
+
+    1.0 = same main claims, correctly cited, real disagreements surfaced
+    0.5 = mostly faithful but misses a claim, mis-cites, or omits a conflict
+    0.0 = hallucinated claims, wrong citations, or missed the core finding
+
+threshold: 0.7

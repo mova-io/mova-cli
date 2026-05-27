@@ -1,0 +1,29 @@
+# LLM-as-judge config for the email-responder template. Rename to ``judge.yaml`` to enable.
+#
+# A drafted reply is free-text — wording varies every run, so exact-match
+# scoring is wrong. This rubric scores whether the draft serves the intent
+# in the requested tone, with the right review flags.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual draft against the expected draft for an email-responder.
+    * Intent — does the body accomplish the requested intent?
+    * Tone + length — does it match the requested tone and length?
+    * Review flags — is `needs_review` set appropriately and do the `flags`
+      capture the real risks (placeholders, unconfirmed facts)?
+    * Send-ready — no placeholders, no hallucinated commitments.
+
+    1.0 = correct intent, right tone/length, sensible review flags
+    0.5 = on-intent but off-tone, wrong length, or missing a review flag
+    0.0 = wrong intent, hallucinated commitments, or leaves placeholders
+
+threshold: 0.7

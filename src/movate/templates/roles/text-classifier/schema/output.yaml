@@ -1,0 +1,30 @@
+# ============================================================================
+# MDK Canonical Schema — Text Classifier (output)
+# ============================================================================
+# `label` is intentionally a plain `string` (not an enum) because the
+# taxonomy is caller-provided per call. The prompt enforces "label must
+# be from the taxonomy"; the eval dataset catches drift.
+
+version: 1
+type: object
+
+title: Classification Result
+
+fields:
+
+  label:
+    type: string
+    description: One of the values in the input taxonomy.
+
+  confidence:
+    type: number
+    description: Confidence in the chosen label (0.0-1.0).
+
+  reasoning:
+    type: string
+    description: One-sentence justification.
+
+required:
+  - label
+  - confidence
+  - reasoning

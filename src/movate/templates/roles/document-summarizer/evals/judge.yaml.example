@@ -1,0 +1,28 @@
+# LLM-as-judge config for the document-summarizer role. Rename to ``judge.yaml`` to enable.
+#
+# Summaries, key points, and action items are free-text — wording varies every
+# run, so exact-match scoring is wrong. This rubric scores faithfulness and
+# coverage against the source document.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual summary against the expected one for a document-summarizer.
+    * Faithfulness — does it stay within the source (no hallucinations)?
+    * Coverage — does the summary + key_points preserve the main points?
+    * Structure — are action_items concrete (with owners when named) and are
+      open_questions genuinely left unanswered by the source?
+
+    1.0 = faithful, covers the main points, structured fields are accurate
+    0.5 = mostly faithful but misses a key point or fabricates an action item
+    0.0 = hallucinated content or misses the core of the document
+
+threshold: 0.7

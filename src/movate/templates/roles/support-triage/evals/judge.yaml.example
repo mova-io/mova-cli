@@ -1,0 +1,27 @@
+# LLM-as-judge config for the support-triage role. Rename to ``judge.yaml`` to enable.
+#
+# The priority / category / assigned_team fields are enums (exact-match-friendly),
+# but `summary` is free-text — wording varies every run. This rubric scores the
+# routing decision AND the summary.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual triage against the expected one for a support-triage agent.
+    * Routing — do `priority`, `category`, and `assigned_team` match?
+    * Escalation — does `escalate` agree for urgent/security cases?
+    * Summary — is the 1-line summary an accurate queue label?
+
+    1.0 = routing + escalation match AND the summary is accurate
+    0.5 = routing matches but escalation flag wrong or summary off
+    0.0 = wrong routing (esp. mis-prioritizing an outage / security incident)
+
+threshold: 0.7

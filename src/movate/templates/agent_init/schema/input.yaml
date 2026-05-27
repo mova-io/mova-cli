@@ -1,0 +1,21 @@
+# ============================================================================
+# MDK Canonical Schema — Default Agent (input)
+# ============================================================================
+# Business-readable schema. Compiles to JSON Schema Draft 2020-12 at
+# agent-load time. Edit this file directly — no codegen needed.
+# See docs/agent-layout.md for the full canonical-schema reference.
+
+version: 1
+type: object
+
+title: Agent Input
+
+fields:
+
+  text:
+    type: string
+    description: The user-facing message or question the agent receives.
+    example: Hello, what can you do?
+
+required:
+  - text

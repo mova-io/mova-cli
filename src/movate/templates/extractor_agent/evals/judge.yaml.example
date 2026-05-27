@@ -1,0 +1,13 @@
+# Eval config for the extractor template. Rename to ``judge.yaml`` to enable.
+#
+# The extractor returns fixed-shape typed fields (name / email / enum / null),
+# so exact-match scoring is exactly right — a correct extraction equals the
+# expected dict. No LLM judge needed (and no extra API cost). This is the
+# default scoring mode; this file just makes the choice explicit.
+#
+# Switch to ``method: llm_judge`` only if you add a free-text field whose
+# wording can't be matched literally.
+
+method: exact
+
+threshold: 1.0

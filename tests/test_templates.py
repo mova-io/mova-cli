@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from movate.core.eval import (
     EvalEngine,
@@ -13,11 +14,16 @@ from movate.core.eval import (
     load_judge_config,
 )
 from movate.core.executor import Executor
-from movate.core.loader import load_agent
-from movate.core.models import JudgeMethod, RunRequest
+from movate.core.loader import _load_schema_doc, load_agent
+from movate.core.models import JudgeConfig, JudgeMethod, RunRequest
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import PricingTable, load_pricing
-from movate.templates import TEMPLATES, get_template_path, list_templates
+from movate.templates import (
+    TEMPLATES,
+    TEMPLATES_DIR,
+    get_template_path,
+    list_templates,
+)
 from movate.testing import (
     InMemoryStorage,
     JudgeStubProvider,
@@ -228,36 +234,57 @@ def test_template_registry_exposes_all_known() -> None:
 @pytest.mark.unit
 @pytest.mark.parametrize("name", list(TEMPLATES.keys()))
 def test_template_dir_is_present_and_complete(name: str) -> None:
-    """Every template ships with the files a loader expects.
+    """Every bundled template conforms to the canonical agent layout (#127).
 
-    Schemas may live in two forms:
+    The canonical layout standardizes ALL bundled templates on one shape,
+    so ``mdk init``, ``mdk add``, and ``mdk init --llm`` all produce
+    identical directories::
 
-    * **External files** — ``schema/input.json`` + ``schema/output.json``.
-      The classic shape for templates with complex contracts.
-    * **Inline shorthand** — schemas defined in-place in
-      ``agent.yaml`` under the ``schema:`` key. The default init
-      template uses this form (more human-readable; no separate
-      JSON files to maintain for tiny contracts).
+        <name>/
+          agent.yaml      # schema refs are FILE paths: ./schema/{input,output}.yaml
+          prompt.md
+          evals/
+            dataset.jsonl
+            judge.yaml.example
+          schema/
+            input.yaml    # canonical YAML (never inline, never .json)
+            output.yaml
 
-    We accept either shape — what matters is the template loads
-    successfully end-to-end, which is the test below this one.
+    The loader still accepts inline shorthand and ``schema/*.json`` for
+    hand-authored user agents (back-compat); this assertion governs only
+    what the SHIPPED templates look like. See ``docs/agent-layout.md``.
     """
     path = get_template_path(name)
     assert (path / "agent.yaml").is_file()
     assert (path / "prompt.md").is_file()
     assert (path / "evals" / "dataset.jsonl").is_file()
 
-    yaml_text = (path / "agent.yaml").read_text()
-    has_inline_schemas = "schema:\n  input:\n" in yaml_text or (
-        "schema:" in yaml_text
-        and "./schema/input.json" not in yaml_text
-        and "./schema/output.json" not in yaml_text
+    # Schemas live in canonical YAML files, referenced by file path.
+    assert (path / "schema" / "input.yaml").is_file(), f"{name}: missing schema/input.yaml"
+    assert (path / "schema" / "output.yaml").is_file(), f"{name}: missing schema/output.yaml"
+    # No leftover JSON schema files — templates standardized on YAML.
+    assert not (path / "schema" / "input.json").exists(), f"{name}: schema/input.json not converted"
+    assert not (path / "schema" / "output.json").exists(), (
+        f"{name}: schema/output.json not converted"
     )
-    if not has_inline_schemas:
-        # Path-form templates must ship the JSON Schema files they
-        # reference; inline-form templates skip the schema/ subdir.
-        assert (path / "schema" / "input.json").is_file()
-        assert (path / "schema" / "output.json").is_file()
+
+    spec = yaml.safe_load((path / "agent.yaml").read_text())
+    schema_block = spec.get("schema", {})
+    assert schema_block.get("input") == "./schema/input.yaml", (
+        f"{name}: agent.yaml schema.input must reference ./schema/input.yaml "
+        f"(got {schema_block.get('input')!r})"
+    )
+    assert schema_block.get("output") == "./schema/output.yaml", (
+        f"{name}: agent.yaml schema.output must reference ./schema/output.yaml "
+        f"(got {schema_block.get('output')!r})"
+    )
+
+    # Every template ships a judge.yaml.example (canonical layout). Its
+    # `method` matches the template's eval nature — see the dedicated
+    # tests below for the exact-match vs llm_judge split.
+    assert (path / "evals" / "judge.yaml.example").is_file(), (
+        f"{name}: missing evals/judge.yaml.example"
+    )
 
 
 @pytest.mark.unit
@@ -343,30 +370,51 @@ async def test_template_runs_end_to_end_with_mock(
 
 
 # ---------------------------------------------------------------------------
-# Optional judge.yaml.example presence
+# judge.yaml.example presence + method matches the template's eval nature
 # ---------------------------------------------------------------------------
+#
+# Canonical layout (#127): EVERY template ships an ``evals/judge.yaml.example``.
+# The example's ``method`` is the honest scoring mode for that template:
+#   * free-text output (prose answer, drafted reply, summary) → ``llm_judge``
+#     (exact-match can never pass wording that varies run to run), and
+#   * fixed-shape typed output (finite-label classifier, structured-field
+#     extractor) → ``exact`` (a correct output string-equals the expected one,
+#     no LLM judge / API cost needed).
+
+
+def _load_judge_example_method(dst: Path) -> JudgeMethod:
+    """Parse a scaffolded template's judge.yaml.example into its method."""
+    doc = yaml.safe_load((dst / "evals" / "judge.yaml.example").read_text())
+    return JudgeConfig(**doc).method
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("template", ["faq", "summarizer", "chatbot"])
-def test_subjective_templates_ship_judge_example(template: str, tmp_path: Path) -> None:
+def test_subjective_templates_ship_llm_judge_example(template: str, tmp_path: Path) -> None:
     """Templates whose output is open-ended natural language ship a
-    judge.yaml.example — exact-match won't score them. Chatbot joined
-    the list with the chatbot template (Tier-1 #1 follow-up)."""
+    judge.yaml.example configured for LLM-as-judge — exact-match won't
+    score them. Chatbot joined the list with the chatbot template
+    (Tier-1 #1 follow-up)."""
     dst = tmp_path / template
     scaffold_agent(dst, name="demo", template=template)
     assert (dst / "evals" / "judge.yaml.example").is_file()
+    assert _load_judge_example_method(dst) is JudgeMethod.LLM_JUDGE
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("template", ["classifier", "extractor"])
-def test_deterministic_templates_skip_judge_example(template: str, tmp_path: Path) -> None:
+def test_deterministic_templates_ship_exact_match_judge_example(
+    template: str, tmp_path: Path
+) -> None:
     """Templates whose output is a fixed-shape typed value (finite-label
     classifier, structured-field extractor) work fine with exact-match
-    scoring; no judge.yaml.example needed."""
+    scoring. Under the canonical layout (#127) they still ship a
+    judge.yaml.example — but one configured for ``method: exact`` rather
+    than an LLM judge, so the example matches what the dataset implies."""
     dst = tmp_path / template
     scaffold_agent(dst, name="demo", template=template)
-    assert not (dst / "evals" / "judge.yaml.example").exists()
+    assert (dst / "evals" / "judge.yaml.example").is_file()
+    assert _load_judge_example_method(dst) is JudgeMethod.EXACT
 
 
 # ---------------------------------------------------------------------------
@@ -478,3 +526,103 @@ async def test_hr_policy_eval_scores_non_zero_with_correct_answer(
     # Both the agent (openai) and judge (anthropic) providers were exercised.
     assert any(c.startswith("openai/") for c in provider.calls)
     assert any(c.startswith("anthropic/") for c in provider.calls)
+
+
+# ---------------------------------------------------------------------------
+# Conformance guard — EVERY bundled agent template (not just the registered
+# ones) must match the canonical layout (#127). This walks the templates dir
+# on disk so a future template that ships inline / JSON schema, or forgets a
+# judge.yaml.example, fails CI here rather than drifting silently.
+# ---------------------------------------------------------------------------
+
+
+def _bundled_agent_template_dirs() -> list[Path]:
+    """Every directory under ``src/movate/templates`` that ships an
+    ``agent.yaml`` — registered shapes, role templates, and any
+    reference-only dirs (e.g. ``roles/sql-writer``). Skill (``skill.yaml``)
+    and tool (``tool.yaml``) templates are deliberately excluded: the
+    canonical AGENT layout doesn't apply to them."""
+    return sorted(
+        (p.parent for p in TEMPLATES_DIR.rglob("agent.yaml")),
+        key=lambda d: d.relative_to(TEMPLATES_DIR).as_posix(),
+    )
+
+
+def test_bundled_agent_template_dirs_are_discovered() -> None:
+    """Sanity: the on-disk walk finds the agent templates we expect. Guards
+    the guard — if the glob silently matched nothing, the conformance test
+    below would vacuously pass."""
+    dirs = _bundled_agent_template_dirs()
+    names = {d.relative_to(TEMPLATES_DIR).as_posix() for d in dirs}
+    # Registered shapes resolve to these dirs; roles/* + the reference-only
+    # roles/sql-writer ship agent.yaml too.
+    assert "agent_init" in names
+    assert "faq_agent" in names
+    assert "roles/support-triage" in names
+    assert "roles/sql-writer" in names  # reference-only, still must conform
+    # ~24 agent templates today; lower bound keeps the assertion stable as
+    # new templates land.
+    assert len(dirs) >= 20
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "template_dir",
+    _bundled_agent_template_dirs(),
+    ids=lambda d: d.relative_to(TEMPLATES_DIR).as_posix(),
+)
+def test_bundled_agent_template_conforms_to_canonical_layout(template_dir: Path) -> None:
+    """Every bundled agent template ships the canonical layout (#127):
+
+        agent.yaml  — schema refs are FILE paths to ./schema/{input,output}.yaml
+        prompt.md
+        evals/dataset.jsonl
+        evals/judge.yaml.example
+        schema/input.yaml   (canonical YAML — never inline, never .json)
+        schema/output.yaml
+
+    This is the regression guard the unification PR adds so future
+    templates can't reintroduce inline / JSON schema or drop the
+    judge.yaml.example.
+    """
+    name = template_dir.relative_to(TEMPLATES_DIR).as_posix()
+
+    assert (template_dir / "agent.yaml").is_file(), f"{name}: missing agent.yaml"
+    assert (template_dir / "prompt.md").is_file(), f"{name}: missing prompt.md"
+    assert (template_dir / "evals" / "dataset.jsonl").is_file(), f"{name}: missing dataset"
+    assert (template_dir / "evals" / "judge.yaml.example").is_file(), (
+        f"{name}: missing evals/judge.yaml.example"
+    )
+
+    assert (template_dir / "schema" / "input.yaml").is_file(), f"{name}: missing schema/input.yaml"
+    assert (template_dir / "schema" / "output.yaml").is_file(), (
+        f"{name}: missing schema/output.yaml"
+    )
+    assert not (template_dir / "schema" / "input.json").exists(), f"{name}: stray schema/input.json"
+    assert not (template_dir / "schema" / "output.json").exists(), (
+        f"{name}: stray schema/output.json"
+    )
+
+    spec = yaml.safe_load((template_dir / "agent.yaml").read_text())
+    schema_block = spec.get("schema", {})
+    assert schema_block.get("input") == "./schema/input.yaml", (
+        f"{name}: schema.input must be the file ref ./schema/input.yaml "
+        f"(got {schema_block.get('input')!r} — inline or JSON schema is not canonical)"
+    )
+    assert schema_block.get("output") == "./schema/output.yaml", (
+        f"{name}: schema.output must be the file ref ./schema/output.yaml "
+        f"(got {schema_block.get('output')!r} — inline or JSON schema is not canonical)"
+    )
+
+    # Both canonical YAML schema files compile to valid JSON Schema. (Full
+    # end-to-end `load_agent` — incl. skill/context/kb resolution — is
+    # covered by test_scaffold_each_template_loads / the role-template
+    # tests, which run the proper project-scaffold flow; here we only
+    # assert the schema-location convention + that the files are valid.)
+    for label in ("input", "output"):
+        compiled = _load_schema_doc(template_dir / "schema" / f"{label}.yaml", label=label)
+        assert compiled.get("type") == "object", f"{name}: {label} schema is not an object schema"
+
+    # The judge example parses and is a recognized scoring method.
+    judge_doc = yaml.safe_load((template_dir / "evals" / "judge.yaml.example").read_text())
+    JudgeConfig(**judge_doc)

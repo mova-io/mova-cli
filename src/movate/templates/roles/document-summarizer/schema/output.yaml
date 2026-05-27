@@ -1,0 +1,33 @@
+# ============================================================================
+# MDK Canonical Schema — Document Summarizer (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Document Summary
+
+fields:
+
+  summary:
+    type: string
+    description: >
+      The main summary, length governed by summary_style + max_words.
+
+  key_points:
+    type: list[string]
+    description: 3-7 bulleted highlights.
+
+  action_items:
+    type: list[string]
+    description: Concrete next steps (with owners when named in the source).
+
+  open_questions:
+    type: list[string]
+    description: Things the document leaves unanswered.
+
+required:
+  - summary
+  - key_points
+  - action_items
+  - open_questions

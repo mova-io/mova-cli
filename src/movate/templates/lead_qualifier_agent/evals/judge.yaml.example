@@ -1,0 +1,28 @@
+# LLM-as-judge config for the lead-qualifier template. Rename to ``judge.yaml`` to enable.
+#
+# BANT rationales and the next-action narrative are free-text — exact-match
+# would penalize correct reasoning phrased differently. This rubric scores
+# the scoring decision and its justification.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual qualification against the expected one for a lead-qualifier.
+    * BANT scores — are budget / authority / need / timeline scored within
+      ~1 point of the expected scores, with rationales grounded in the lead?
+    * Next action — does `next_action` match the expected routing decision?
+    * Objections — are the surfaced objections real (present in the lead)?
+
+    1.0 = BANT in range, correct next_action, grounded rationales
+    0.5 = next_action correct but a BANT dimension is off, or weak rationale
+    0.0 = wrong next_action or fabricated scores / objections
+
+threshold: 0.7

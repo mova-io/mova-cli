@@ -1,0 +1,29 @@
+# ============================================================================
+# MDK Canonical Schema — Reply Drafter (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Drafted Reply
+
+fields:
+
+  draft_subject:
+    type: string
+    description: >
+      One-line subject; for non-email replies this is the topic header.
+
+  draft_body:
+    type: string
+    description: The full draft, ready to send (no placeholders).
+
+  suggested_next_actions:
+    type: list[string]
+    description: >
+      Things the responder should do alongside sending the reply.
+
+required:
+  - draft_subject
+  - draft_body
+  - suggested_next_actions

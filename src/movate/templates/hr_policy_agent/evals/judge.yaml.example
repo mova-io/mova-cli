@@ -1,0 +1,42 @@
+# LLM-as-judge config for the hr-policy template.
+#
+# NOTE: unlike most templates, hr-policy ships an ACTIVE ``judge.yaml`` next
+# to this file — the eval is wired to a semantic judge out of the box (a
+# free-text HR answer can never pass exact-match). This ``.example`` is the
+# canonical-layout reference copy; edit ``judge.yaml`` to change scoring.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+# An anthropic judge keeps the scoring independent.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for an HR-policy
+  question-answering agent. The agent must answer ONLY from the provided
+  policy context and may also flag when a question needs human HR judgment.
+
+  Judge on three things:
+    * Correctness — does the actual answer convey the same key policy
+      facts (numbers, eligibility, deadlines) as the expected answer?
+    * Grounding — are the claims supported by the cited context, with no
+      invented facts? The `grounded` flag and `citations` should match
+      the expected ones, and `needs_escalation` should agree with the
+      expected value for judgment-call situations (e.g. harassment,
+      retaliation).
+    * Faithful "not documented" handling — when the expected answer says
+      the policy isn't covered, the actual answer should also decline and
+      point to HR rather than fabricate a policy.
+
+    1.0 = same key facts, correctly grounded, escalation flag agrees
+    0.5 = mostly correct but misses a fact, over/under-cites, or gets the
+          escalation flag wrong
+    0.0 = wrong facts, hallucinated policy, or answers a "not documented"
+          case as if it were covered
+
+threshold: 0.7

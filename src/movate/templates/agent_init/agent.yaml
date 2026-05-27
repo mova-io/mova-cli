@@ -41,35 +41,12 @@ model:
 
 prompt: ./prompt.md
 
-# I/O schemas — inline shorthand (compiled to JSON Schema at load time).
-#
-# Why inline: avoids hopping between agent.yaml and a separate
-# schema/*.json file for tiny contracts. YAML lets you add comments
-# (which JSON doesn't) and reads top-to-bottom like the rest of the
-# agent.yaml. Strict-by-default: every field listed below is
-# required; unknown fields at runtime fail validation.
-#
-# Shorthand syntax:
-#   field: string              -> required string
-#   field: string?             -> optional string ('?' suffix on the type)
-#   field: integer             -> required integer
-#   field: number              -> required number (int or float)
-#   field: boolean             -> required boolean
-#   status: pending|done|failed  -> required string enum
-#   tags: [string]             -> array of strings
-#   user: { name: string, age: integer }   -> nested object
-#
-# For genuinely complex contracts (regex, oneOf, $refs, $defs) keep
-# the path form: `input: ./schema/input.json` pointing at a full
-# JSON Schema file. Both forms work first-class.
+# I/O schemas live in ./schema/*.yaml (canonical YAML — business-readable,
+# compiled to JSON Schema at load time). Edit those files directly; see
+# docs/agent-layout.md for the layout + schema-authoring reference.
 schema:
-  input:
-    # The user-facing message or question the agent receives.
-    text: string
-  output:
-    # The agent's user-facing reply. Must be a string per the prompt
-    # template's "Output Schema" section.
-    message: string
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
 
 # Skills — declare here to give the model access to callable tools at
 # inference time (Python functions, HTTP endpoints, MCP tools). The

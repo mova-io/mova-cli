@@ -1,0 +1,20 @@
+# ============================================================================
+# MDK Canonical Schema — Default Agent (output)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Agent Output
+
+fields:
+
+  message:
+    type: string
+    description: >
+      The agent's user-facing reply. Must be a string per the prompt
+      template's "Output Schema" section.
+    example: I can answer questions and help with simple tasks.
+
+required:
+  - message
