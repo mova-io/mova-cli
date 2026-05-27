@@ -172,6 +172,7 @@ async def _run_worker(
     poll_interval: float,
     mock: bool,
 ) -> None:
+    from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
     from movate.tracing import init_metrics  # noqa: PLC0415
 
     # Initialize OTel metrics once at worker startup (R3 / item 33), after
@@ -181,6 +182,10 @@ async def _run_worker(
     init_metrics()
 
     rt = await build_local_runtime(mock=mock)
+    # ADR 034 D3 — wire the asyncpg pool's saturation gauges. build_local_runtime
+    # already ran storage.init(), so the pool exists. No-op on SQLite / metrics
+    # off. Never raises.
+    register_pool_observability(rt.storage)
 
     agents = scan_agents(agents_path)
     workflows = scan_workflows(workflows_path)

@@ -61,6 +61,7 @@ from movate.tracing.metrics import (
     init_metrics,
     record_job_completed,
     record_run_usage,
+    register_pool_metrics,
 )
 from movate.tracing.null import SilentTracer
 from movate.tracing.propagation import (
@@ -98,6 +99,7 @@ __all__ = [
     "record_audit_event",
     "record_job_completed",
     "record_run_usage",
+    "register_pool_metrics",
 ]
 
 # Valid values for the ADR-015 deployment sink selector.

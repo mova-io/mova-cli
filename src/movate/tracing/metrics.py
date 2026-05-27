@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable
 from typing import Any
 
 # Import the OTel metrics API + SDK lazily so this module loads even when the
@@ -82,6 +83,21 @@ METRIC_JOBS_IN_FLIGHT = "mdk.jobs.in_flight"
 METRIC_RUN_TOKENS = "mdk.run.tokens"
 METRIC_RUN_COST_USD = "mdk.run.cost_usd"
 
+# ADR 034 D3 — Postgres connection-pool saturation. Observable gauges sampled
+# from the LIVE per-pod asyncpg pool at collection time (see
+# :func:`register_pool_metrics`), not recorded at a hot edge. The scale risk
+# they surface: under KEDA autoscale ``N_pods x pool.max_size`` can exceed Azure
+# Postgres ``max_connections`` → connection exhaustion (invisible until load).
+# ``in_use`` rising toward ``max`` (per pod) and a sustained non-zero ``waiting``
+# are the early-warning signals; the ``mdk doctor`` capacity check (ADR 034 D1)
+# does the static ceiling math. Postgres-only — the SQLite local backend has no
+# pool, so these stay flat/zero there.
+METRIC_DB_POOL_SIZE = "mdk.db.pool.size"
+METRIC_DB_POOL_IDLE = "mdk.db.pool.idle"
+METRIC_DB_POOL_IN_USE = "mdk.db.pool.in_use"
+METRIC_DB_POOL_WAITING = "mdk.db.pool.waiting"
+METRIC_DB_POOL_MAX = "mdk.db.pool.max"
+
 #: Every OTel instrument name this module emits. The single source of truth the
 #: dashboards-as-code drift guard cross-checks against (a dashboard may only
 #: reference a metric that appears here).
@@ -92,6 +108,11 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_JOBS_IN_FLIGHT,
         METRIC_RUN_TOKENS,
         METRIC_RUN_COST_USD,
+        METRIC_DB_POOL_SIZE,
+        METRIC_DB_POOL_IDLE,
+        METRIC_DB_POOL_IN_USE,
+        METRIC_DB_POOL_WAITING,
+        METRIC_DB_POOL_MAX,
     }
 )
 
@@ -117,6 +138,12 @@ class _State:
     jobs_in_flight: Any = None  # UpDownCounter[int]
     run_tokens: Any = None  # Counter[int]
     run_cost_usd: Any = None  # Counter[float]
+
+    # ADR 034 D3 — DB pool observable gauges are registered lazily by
+    # ``register_pool_metrics`` (after storage.init at the edge), not in
+    # ``init_metrics``, because they need a callback that reads the live pool.
+    # The flag makes that registration idempotent (a re-register is a no-op).
+    pool_gauges_registered: bool = False
 
 
 _state = _State()
@@ -301,6 +328,99 @@ def _otlp_metric_exporter_class() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# ADR 034 D3 — DB connection-pool observable gauges
+# ---------------------------------------------------------------------------
+#: Callback signature: returns a snapshot of the live pool's counts, or ``None``
+#: when no pool exists this cycle (SQLite backend, or before ``storage.init``).
+#: Keys: ``size`` / ``idle`` / ``in_use`` / ``waiting`` / ``max``. Kept a plain
+#: ``dict[str, int]`` so ``tracing`` never imports ``storage`` (boundary rule 6)
+#: — the edge converts its backend-specific ``PoolStats`` into this mapping.
+PoolStatsCallback = Callable[[], "dict[str, int] | None"]
+
+
+def register_pool_metrics(stats_callback: PoolStatsCallback) -> None:
+    """Register the DB pool observable gauges (ADR 034 D3). Idempotent, fail-soft.
+
+    Called once at the runtime edge (``mdk serve`` / ``mdk worker``) AFTER
+    ``storage.init()`` and ``init_metrics()``, passing a zero-arg callback that
+    returns a ``{"size","idle","in_use","waiting","max": int}`` snapshot of the
+    live asyncpg pool (or ``None`` when there's no pool — SQLite, or
+    not-yet-initialised). OTel invokes the callback on each metric collection
+    cycle, so the gauges always reflect the *current* pool, never a stale value.
+
+    Wiring it at the edge (not inside ``init_metrics``) keeps tracing decoupled
+    from storage: ``init_metrics`` has no storage handle, and ``storage`` never
+    imports ``tracing``. A complete no-op when metrics aren't initialised (OTel
+    absent / sink off / ``init_metrics`` never ran) or already registered. Never
+    raises — observability must not break the runtime.
+    """
+    if _state.pool_gauges_registered:
+        return
+    meter = _state.meter
+    if meter is None:
+        # init_metrics didn't build a meter (OTel absent / sink off). Mark
+        # registered so a retry from the other edge is also a clean no-op.
+        _state.pool_gauges_registered = True
+        return
+
+    try:
+        from opentelemetry.metrics import Observation  # noqa: PLC0415
+    except Exception:  # pragma: no cover - OTel present if meter is not None
+        _state.pool_gauges_registered = True
+        return
+
+    def _make_observer(key: str) -> Any:
+        """Build the per-metric callback OTel polls each collection cycle."""
+
+        def _observe(_options: Any) -> list[Any]:
+            try:
+                snapshot = stats_callback()
+            except Exception:  # pragma: no cover - defensive; never break collect
+                return []
+            if not snapshot or key not in snapshot:
+                return []
+            return [Observation(snapshot[key])]
+
+        return _observe
+
+    # One observable gauge per pool dimension. No attributes: a pod emits one
+    # pool, and the per-pod identity comes from the OTel ``Resource``
+    # (service.instance / pod name) the collector already stamps — keeping
+    # cardinality at zero on the instrument itself.
+    meter.create_observable_gauge(
+        METRIC_DB_POOL_SIZE,
+        callbacks=[_make_observer("size")],
+        unit="1",
+        description="Connections currently held (open) by the per-pod asyncpg pool.",
+    )
+    meter.create_observable_gauge(
+        METRIC_DB_POOL_IDLE,
+        callbacks=[_make_observer("idle")],
+        unit="1",
+        description="Idle (checked-in, available) connections in the per-pod asyncpg pool.",
+    )
+    meter.create_observable_gauge(
+        METRIC_DB_POOL_IN_USE,
+        callbacks=[_make_observer("in_use")],
+        unit="1",
+        description="Checked-out connections in the per-pod asyncpg pool (size - idle).",
+    )
+    meter.create_observable_gauge(
+        METRIC_DB_POOL_WAITING,
+        callbacks=[_make_observer("waiting")],
+        unit="1",
+        description="Callers blocked waiting for a free connection (pool acquire queue).",
+    )
+    meter.create_observable_gauge(
+        METRIC_DB_POOL_MAX,
+        callbacks=[_make_observer("max")],
+        unit="1",
+        description="Configured per-pod pool ceiling (create_pool max_size); saturation denom.",
+    )
+    _state.pool_gauges_registered = True
+
+
+# ---------------------------------------------------------------------------
 # Public record helpers — each a cheap no-op when its instrument is None
 # (uninitialized, OTel absent, or sink off). None ever raises.
 # ---------------------------------------------------------------------------
@@ -368,15 +488,22 @@ def dec_in_flight(*, tenant_id: str) -> None:
 
 
 __all__ = [
+    "METRIC_DB_POOL_IDLE",
+    "METRIC_DB_POOL_IN_USE",
+    "METRIC_DB_POOL_MAX",
+    "METRIC_DB_POOL_SIZE",
+    "METRIC_DB_POOL_WAITING",
     "METRIC_JOBS_COMPLETED",
     "METRIC_JOBS_IN_FLIGHT",
     "METRIC_JOB_DURATION_MS",
     "METRIC_NAMES",
     "METRIC_RUN_COST_USD",
     "METRIC_RUN_TOKENS",
+    "PoolStatsCallback",
     "dec_in_flight",
     "inc_in_flight",
     "init_metrics",
     "record_job_completed",
     "record_run_usage",
+    "register_pool_metrics",
 ]

@@ -27,8 +27,23 @@ The instrument names are defined **once** in
 | `mdk.jobs.in_flight` | up-down counter | `tenant` | saturation (in-flight proxy) |
 | `mdk.run.tokens` | counter | `tenant` | token volume |
 | `mdk.run.cost_usd` | counter (usd) | `tenant` | per-run + cumulative cost |
+| `mdk.db.pool.size` | observable gauge | — | DB pool: open connections (per pod) |
+| `mdk.db.pool.idle` | observable gauge | — | DB pool: idle (checked-in) connections |
+| `mdk.db.pool.in_use` | observable gauge | — | DB pool: checked-out connections (`size - idle`) |
+| `mdk.db.pool.waiting` | observable gauge | — | DB pool: callers blocked on the acquire queue |
+| `mdk.db.pool.max` | observable gauge | — | DB pool: configured per-pod ceiling (saturation denom) |
 
 `status` values: `success` / `error` / `safety_blocked` / `dead_letter`.
+
+The `mdk.db.pool.*` gauges (ADR 034 D3) are sampled from the **live per-pod
+asyncpg pool** at metric-collection time (Postgres backend only; flat/zero on the
+local SQLite backend). Under KEDA autoscale `N_pods x pool_max` can exceed Azure
+Postgres `max_connections` → connection exhaustion; `in_use` rising toward `max`
+and a sustained non-zero `waiting` are the early-warning signals. The
+`mdk doctor` connection-ceiling check (ADR 034 D1) does the static capacity math
+(`pods x pool_max <= max_connections - headroom`). These gauges carry **no**
+Prometheus unit/`_total` suffix (`mdk_db_pool_in_use`, not `..._total`). They are
+currently panelled on the **Grafana** dashboard only.
 
 > **Queue depth** (`mdk.queue.depth`) and **eval pass-rate / drift** are golden
 > signals too, but mdk does not yet export them as OTel *metrics*: queue depth is

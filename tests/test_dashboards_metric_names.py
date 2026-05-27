@@ -128,8 +128,20 @@ _ALL_FIVE = {
     "mdk.run.cost_usd",
 }
 
+# ADR 034 D3 — DB connection-pool observable gauges. Currently surfaced on the
+# Grafana dashboard only (the Prometheus rules + Azure workbook stay on the five
+# golden signals). When a pool panel/rule is added to those surfaces, extend
+# their expected sets here too.
+_POOL_METRICS = {
+    "mdk.db.pool.size",
+    "mdk.db.pool.idle",
+    "mdk.db.pool.in_use",
+    "mdk.db.pool.waiting",
+    "mdk.db.pool.max",
+}
+
 _CASES = [
-    pytest.param(_GRAFANA, "json", _ALL_FIVE, id="grafana"),
+    pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),
     pytest.param(_PROM_RULES, "yaml", _ALL_FIVE, id="prometheus-rules"),
     pytest.param(_AZURE_WORKBOOK, "json", _ALL_FIVE, id="azure-workbook"),
 ]

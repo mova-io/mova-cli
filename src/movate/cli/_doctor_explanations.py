@@ -278,6 +278,12 @@ _STORAGE_AND_PROJECT_EXPLANATIONS: dict[str, CheckExplanation] = {
         failure_impact="Cost reporting reads as $0.00 for unknown models. Doesn't block runs.",
         fix="The pricing table ships with the CLI — failure means a broken install.",
     ),
+    "db pool capacity": CheckExplanation(
+        what="Connection-ceiling capacity check (ADR 034 D1): does pods x pool_max fit under Postgres max_connections with headroom? Formula: pods x pool_max <= max_connections - headroom.",
+        why="Each KEDA-autoscaled pod opens its own per-pod asyncpg pool (up to pool_max). With N pods that's N x pool_max connections against one Postgres — exceed max_connections and new connections fail with 'too many clients', a cliff that's invisible until load. This check does the static math before that happens.",
+        failure_impact="A yellow ⚠ means the worst-case fleet would exhaust the connection ceiling under autoscale. An informational > means the inputs were assumed (couldn't observe the live DB) — confirm the real values.",
+        fix="Lower MOVATE_DB_POOL_MAX_SIZE (per-pod pool_max), cap KEDA maxReplicas (MOVATE_KEDA_MAX_REPLICAS), or front Postgres with PgBouncer / Azure built-in pooling (ADR 034 D1 infra). Set MOVATE_DB_MAX_CONNECTIONS / MOVATE_DB_CONNECTION_HEADROOM to feed the check real values when running doctor outside the cluster.",
+    ),
     "project.yaml": CheckExplanation(
         what="Project-level config file — canonical filename (May 2026+). Carries layered defaults, policy, runtime gates, skills allowlist, eval/bench config.",
         why="Loaded by every `mdk` command via `load_project_config`. Per-agent `agent.yaml` always wins per-key; entries here only fill gaps. Absent = permissive defaults.",
