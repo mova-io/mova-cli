@@ -42,6 +42,7 @@ from movate.scaffold.llm_scaffold import (
     _EXAMPLE_FAQ,
     _EXAMPLE_RAG,
     _EXAMPLE_SUMMARIZER,
+    _EXAMPLE_TOOL_USE,
     _META_PROMPT,
 )
 
@@ -135,6 +136,7 @@ class TestGroundingDetection:
             example_summarizer=_EXAMPLE_SUMMARIZER,
             example_extraction=_EXAMPLE_EXTRACTION,
             example_rag=_EXAMPLE_RAG,
+            example_tool_use=_EXAMPLE_TOOL_USE,
         )
         assert _parse_scaffold_description(prompt) == "answer questions about our help docs"
 

@@ -402,6 +402,65 @@ _EXAMPLE_RAG = """\
   ]
 }"""
 
+# Tool-use / action exemplar (F1', #137). The shape every "create a ticket /
+# look up an order / send a Slack message / query the CRM / book a meeting"
+# description must collapse to: a `{request}` input, a `{answer, confidence}`
+# output, and `skills: [<verb-derived-name>]` naming the tool the agent
+# calls. NO retrieval block (that's grounding-only). The CLI provisions the
+# named skill as a fill-in STUB (skill.yaml + a TODO handler), so the
+# scaffolded agent is a runnable starting point for tool use rather than a
+# bare prompt the operator has to wire by hand. The skill name is a
+# hyphenated slug of the action, NOT the built-in `kb-vector-lookup`.
+_EXAMPLE_TOOL_USE = """\
+{
+  "agent_yaml": {
+    "api_version": "movate/v1",
+    "kind": "Agent",
+    "name": "ticket-creator",
+    "version": "0.1.0",
+    "description": "Creates support tickets on the user's behalf by calling a tool, then reports the outcome.",
+    "owner": "",
+    "model": {
+      "provider": "openai/gpt-4o-mini-2024-07-18",
+      "params": {"temperature": 0.0, "max_tokens": 512}
+    },
+    "prompt": "./prompt.md",
+    "schema": {
+      "input": "./schema/input.yaml",
+      "output": "./schema/output.yaml"
+    },
+    "evals": {"dataset": "./evals/dataset.jsonl"},
+    "timeouts": {"call_ms": 30000, "total_ms": 60000},
+    "budget": {"max_cost_usd_per_run": 0.10},
+    "tags": ["tool-use", "action"],
+    "skills": ["create-ticket"]
+  },
+  "prompt_md": "You are an action-taking assistant. You have a tool available to fulfil the user's request — use it when the request needs an external action, then summarize what happened.\\n\\n# Request\\n{{ input.request }}\\n\\nCall the tool with the right arguments, wait for its result, and report the outcome to the user. If you cannot complete the action, explain why.\\n\\nRespond with a single JSON object on one line:\\n{\\"answer\\": \\"<what you did / the outcome>\\", \\"confidence\\": <0.0-1.0>}",
+  "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["request"],
+    "properties": {
+      "request": {"type": "string", "minLength": 1}
+    }
+  },
+  "output_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["answer", "confidence"],
+    "properties": {
+      "answer": {"type": "string", "minLength": 1},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+  },
+  "sample_evals": [
+    {"input": {"request": "Create a ticket for the broken login button."}, "expected": {"answer": "Created a ticket for the broken login button.", "confidence": 0.9}},
+    {"input": {"request": "Open a ticket about slow page loads on the dashboard."}, "expected": {"answer": "Opened a ticket about slow dashboard page loads.", "confidence": 0.85}}
+  ]
+}"""
+
 
 # ---------------------------------------------------------------------------
 # Meta-prompt — instructs the LLM how to map description → GeneratedAgent.
@@ -514,15 +573,32 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
           Never answer from outside knowledge.
         * output {{answer, citations, grounded, confidence}}.
 
-   b. CLASSIFIER — "classify / categorize / label / route / triage / detect
+   b. TOOL-USE / ACTION — the agent must TAKE AN ACTION through an external
+      tool: "create a ticket", "look up an order", "send a Slack message",
+      "query the CRM", "book a meeting", "open a Jira issue". The action
+      targets an external SYSTEM (ticket / order / Slack / CRM / calendar /
+      database / API), not just text transformation. → EXAMPLE 6. It MUST
+      have:
+        * agent_yaml.skills: ["<verb-derived-skill-name>"] — a single
+          hyphenated skill name describing the action (e.g. "create-ticket",
+          "lookup-order", "send-slack-message"). NOT "kb-vector-lookup" (that
+          is grounding only). The CLI scaffolds a fill-in stub for it.
+        * NO retrieval block (that key is exclusive to the grounded shape).
+        * an input_schema with a "request" field (the user's natural-language
+          ask) and output {{answer, confidence}} — the action happens inside
+          the tool call, the output reports the outcome.
+        * a prompt that tells the model to use the available tool to fulfil
+          the request, then summarize what happened.
+
+   c. CLASSIFIER — "classify / categorize / label / route / triage / detect
       sentiment / tag" into a fixed set of categories. → EXAMPLE 2. Output
       {{label, confidence}}.
 
-   c. SUMMARIZER — "summarize / condense / tl;dr / digest / shorten / brief".
+   d. SUMMARIZER — "summarize / condense / tl;dr / digest / shorten / brief".
       → EXAMPLE 3. Output {{summary, key_points}} (key_points is an array of
       strings).
 
-   d. EXTRACTION — "extract / pull out / parse / capture NAMED FIELDS"
+   e. EXTRACTION — "extract / pull out / parse / capture NAMED FIELDS"
       (entities, contact info, line items, dates, etc.) from text. → EXAMPLE
       4. The output_schema's properties ARE the named fields. Fields the
       source may omit get a nullable type ("type": ["string", "null"]) and
@@ -530,13 +606,15 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
       still appears in "required" (a present key with a null VALUE). NEVER
       append "?" to a property key — that is not JSON Schema.
 
-   e. QA / FAQ (the default) — a free-text question answered from the model's
-      own knowledge or the provided input, NOT from a retrieved corpus, and
-      not any shape above. → EXAMPLE 1. Output {{answer, confidence}}.
+   f. QA / FAQ (the default) — a free-text question answered from the model's
+      own knowledge or the provided input, NOT from a retrieved corpus, NOT
+      taking any external action, and not any shape above. → EXAMPLE 1.
+      Output {{answer, confidence}}.
 
-   Shapes (b)-(e) are single-turn agents: they operate purely on their input.
+   Shapes (c)-(f) are single-turn agents: they operate purely on their input.
    Do NOT add a skills or retrieval block to them — those keys must be ABSENT
-   for every non-grounding shape.
+   for every non-grounding, non-tool-use shape. Only the GROUNDED (a) and
+   TOOL-USE (b) shapes carry a skills list.
 
 EXAMPLE 1 (FAQ / QA agent) — single-turn, NOT grounding; {{answer, confidence}}:
 {example_faq}
@@ -552,6 +630,9 @@ EXAMPLE 4 (Extraction agent) — single-turn; structured named fields:
 
 EXAMPLE 5 (Grounded RAG agent) — answers from a knowledge source:
 {example_rag}
+
+EXAMPLE 6 (Tool-use / action agent) — calls a tool to take an action:
+{example_tool_use}
 """
 
 # Variable suffix — the ONLY part that changes per call. Appended after the
@@ -646,6 +727,7 @@ async def generate_agent_from_description(
             example_summarizer=_EXAMPLE_SUMMARIZER,
             example_extraction=_EXAMPLE_EXTRACTION,
             example_rag=_EXAMPLE_RAG,
+            example_tool_use=_EXAMPLE_TOOL_USE,
         )
 
     request = CompletionRequest(
