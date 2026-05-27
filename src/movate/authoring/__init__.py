@@ -56,6 +56,15 @@ from movate.authoring.models import (
     SideEffect,
     VerifyReport,
 )
+from movate.authoring.planner import (
+    LLMPlanner,
+    MockPlanner,
+    Planner,
+    PlannerError,
+    PlannerOutcome,
+    ProposedAction,
+    project_state_summary,
+)
 
 __all__ = [
     "ActionLogEntry",
@@ -67,6 +76,12 @@ __all__ = [
     "AuthoringContext",
     "AuthoringDriver",
     "ConfirmationRequiredError",
+    "LLMPlanner",
+    "MockPlanner",
+    "Planner",
+    "PlannerError",
+    "PlannerOutcome",
+    "ProposedAction",
     "SideEffect",
     "UnknownActionError",
     "VerifyReport",
@@ -74,6 +89,7 @@ __all__ = [
     "describe_catalog",
     "get_action",
     "list_actions",
+    "project_state_summary",
     "register",
     "self_description",
 ]
