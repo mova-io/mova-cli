@@ -307,6 +307,11 @@ class TestLlmUrlRagSliceAcceptance:
                     name,
                     "--llm",
                     f"answer questions about {_START_URL}",
+                    # --bare: this acceptance test asserts the standalone
+                    # single-dir layout at <tmp>/<name>/. ADR 026 D1's
+                    # non-bare default wraps the agent in a project under
+                    # agents/<name>/; --bare keeps the slice this test checks.
+                    "--bare",
                     "--target",
                     str(tmp_path),
                 ],
