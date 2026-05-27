@@ -207,7 +207,7 @@ class TestPerAgentResolutionDetail:
         # template-shipped contexts/, so we control the tier.
         runner.invoke(
             app,
-            ["init", "faq", "-t", "faq", "--target", str(proj / "agents")],
+            ["init", "--bare", "faq", "-t", "faq", "--target", str(proj / "agents")],
             env={"COLUMNS": "300"},
         )
         # Project-level shared context.

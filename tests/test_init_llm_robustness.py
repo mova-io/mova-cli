@@ -122,6 +122,7 @@ class TestScaffoldAwareMock:
             app,
             [
                 "init",
+                "--bare",
                 "dry-mock-agent",
                 "--llm",
                 "an offline test agent",
@@ -148,6 +149,7 @@ class TestScaffoldAwareMock:
             app,
             [
                 "init",
+                "--bare",
                 "write-mock-agent",
                 "--llm",
                 "an offline test agent",
@@ -184,6 +186,7 @@ class TestScaffoldAwareMock:
             app,
             [
                 "init",
+                "--bare",
                 "explicit-agent",
                 "--llm",
                 "ignored description",
@@ -316,6 +319,7 @@ class TestRetryOnTransportError:
             app,
             [
                 "init",
+                "--bare",
                 "recovered-agent",
                 "--llm",
                 "a description",
@@ -349,6 +353,7 @@ class TestRetryOnTransportError:
             app,
             [
                 "init",
+                "--bare",
                 "doomed-agent",
                 "--llm",
                 "a description",
@@ -386,6 +391,7 @@ class TestRetryOnTransportError:
             app,
             [
                 "init",
+                "--bare",
                 "schema-fix-agent",
                 "--llm",
                 "a description",
@@ -463,6 +469,7 @@ class TestGeneratedModelCoercion:
             app,
             [
                 "init",
+                "--bare",
                 "anthro-agent",
                 "--llm",
                 "a description",
@@ -493,6 +500,7 @@ class TestGeneratedModelCoercion:
             app,
             [
                 "init",
+                "--bare",
                 "explicit-model-agent",
                 "--llm",
                 "a description",
@@ -517,6 +525,7 @@ class TestGeneratedModelCoercion:
             app,
             [
                 "init",
+                "--bare",
                 "mock-default-agent",
                 "--llm",
                 "a description",
@@ -605,6 +614,7 @@ class TestValidateSampleEvals:
             app,
             [
                 "init",
+                "--bare",
                 "eval-retry-agent",
                 "--llm",
                 "a description",

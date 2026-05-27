@@ -82,7 +82,7 @@ def scaffolded_agent(tmp_path: Path) -> Path:
     """Real on-disk agent named ``alpha`` so the registry can load it."""
     cli_runner.invoke(
         cli_app,
-        ["init", "alpha", "-t", "default", "--target", str(tmp_path)],
+        ["init", "--bare", "alpha", "-t", "default", "--target", str(tmp_path)],
         catch_exceptions=False,
     )
     return tmp_path
@@ -214,7 +214,7 @@ async def test_dispatch_workflow_dispatches_to_runner(
     # Scaffold ONE agent the workflow node will reference.
     cli_runner.invoke(
         cli_app,
-        ["init", "alpha", "-t", "default", "--target", str(tmp_path / "agents")],
+        ["init", "--bare", "alpha", "-t", "default", "--target", str(tmp_path / "agents")],
         catch_exceptions=False,
     )
 

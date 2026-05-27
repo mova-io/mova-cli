@@ -38,7 +38,7 @@ runner = CliRunner(mix_stderr=False)
 
 def _make_default_agent(parent: Path, name: str = "demo-agent") -> Path:
     """Scaffold a minimal default-template agent under ``parent/<name>``."""
-    result = runner.invoke(app, ["init", name, "-t", "default", "--target", str(parent)])
+    result = runner.invoke(app, ["init", "--bare", name, "-t", "default", "--target", str(parent)])
     assert result.exit_code == 0, result.stdout
     return parent / name
 

@@ -219,7 +219,9 @@ def test_regression_summary_strings() -> None:
 
 
 def _scaffold_default_agent(parent: Path) -> Path:
-    result = runner.invoke(app, ["init", "demo-agent", "-t", "default", "--target", str(parent)])
+    result = runner.invoke(
+        app, ["init", "--bare", "demo-agent", "-t", "default", "--target", str(parent)]
+    )
     assert result.exit_code == 0, result.stdout
     return parent / "demo-agent"
 

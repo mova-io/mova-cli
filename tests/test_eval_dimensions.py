@@ -648,7 +648,9 @@ def test_cli_eval_json_includes_dimensional_means(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "price warranty"}')
     runner = CliRunner(mix_stderr=False)
-    result = runner.invoke(app, ["init", "dim-agent", "-t", "default", "--target", str(tmp_path)])
+    result = runner.invoke(
+        app, ["init", "--bare", "dim-agent", "-t", "default", "--target", str(tmp_path)]
+    )
     assert result.exit_code == 0, result.stdout
     agent_dir = tmp_path / "dim-agent"
 

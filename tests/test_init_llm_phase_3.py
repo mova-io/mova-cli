@@ -120,6 +120,7 @@ def test_name_constraint_forces_agent_yaml_name_to_cli_arg(
         app,
         [
             "init",
+            "--bare",
             "expected-name",
             "--llm",
             "a description",
@@ -198,6 +199,7 @@ def test_success_panel_includes_cost_line(
         app,
         [
             "init",
+            "--bare",
             "cost-test-agent",
             "--llm",
             "a description",
@@ -230,6 +232,7 @@ def test_post_success_hint_appears_on_stderr(
         app,
         [
             "init",
+            "--bare",
             "hint-test-agent",
             "--llm",
             "a description",
@@ -258,6 +261,7 @@ def test_post_success_hint_suppressed_under_quiet(
         [
             "--quiet",
             "init",
+            "--bare",
             "quiet-test-agent",
             "--llm",
             "a description",
@@ -285,6 +289,7 @@ def test_dry_run_hint_points_at_rerun(
         app,
         [
             "init",
+            "--bare",
             "dry-hint-agent",
             "--llm",
             "a description",
@@ -317,6 +322,7 @@ def test_greppable_summary_line_on_success(
         app,
         [
             "init",
+            "--bare",
             "summary-agent",
             "--llm",
             "a description",
@@ -361,6 +367,7 @@ def test_summary_line_marks_retry(
         app,
         [
             "init",
+            "--bare",
             "retry-agent",
             "--llm",
             "a description",

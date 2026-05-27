@@ -307,6 +307,11 @@ class TestLlmUrlRagSliceAcceptance:
                     name,
                     "--llm",
                     f"answer questions about {_START_URL}",
+                    # --bare: this acceptance test asserts the standalone
+                    # single-dir layout at <tmp>/<name>/. ADR 026 D1's
+                    # non-bare default wraps the agent in a project under
+                    # agents/<name>/; --bare keeps the slice this test checks.
+                    "--bare",
                     "--target",
                     str(tmp_path),
                 ],
@@ -380,4 +385,88 @@ class TestLlmUrlRagSliceAcceptance:
         assert match, result.stdout
         # >= 1 retrieved chunk proves the seeded KB was queried by the
         # probe's pre-retrieval phase — the end-to-end RAG actually works.
+        assert int(match.group(1)) >= 1
+
+    def test_url_to_rag_slice_end_to_end_project_mode(
+        self,
+        tmp_path: Path,
+        isolated_home: Path,
+        cli_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ADR 026: the SAME URL→RAG slice on the NEW DEFAULT (project mode).
+
+        Identical chain to the bare slice above but WITHOUT ``--bare`` — so
+        ADR 026 D1 wraps the agent in a project (``project.yaml`` +
+        ``agents/<name>/``). This guards the journey a user *actually* runs
+        now: ``mdk init <name> --llm "answer questions about <url>"`` still
+        crawls (F6), auto-ingests (F7), and grounded-verifies (F8) end to
+        end THROUGH the project-resolved agent — not only the standalone
+        ``--bare`` path. Without this, the default front door's grounding
+        could silently regress while the bare acceptance test stays green.
+        """
+        name = "site-bot"
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(httpx, "get", _fake_get)
+        _patch_scaffolder(monkeypatch, name)
+        _patch_verify_provider(monkeypatch, response=_GROUNDED_ANSWER)
+
+        with _stub_embeds():
+            result = runner.invoke(
+                app,
+                [
+                    "init",
+                    name,
+                    "--llm",
+                    f"answer questions about {_START_URL}",
+                    # NO --bare: exercise ADR 026's project-mode default.
+                    "--no-open-editor",
+                ],
+            )
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        # ADR 026 D1: <tmp>/<name>/ is the PROJECT; the agent lands under
+        # agents/<name>/ (not a standalone single dir).
+        project_root = tmp_path / name
+        agent_dir = project_root / "agents" / name
+        assert (project_root / "project.yaml").is_file()
+        assert (project_root / "AGENTS.md").is_file()
+
+        # -- Canonical layout #127 under agents/<name>/. ----------------
+        assert (agent_dir / "agent.yaml").is_file()
+        assert (agent_dir / "prompt.md").is_file()
+        assert (agent_dir / "schema" / "input.yaml").is_file()
+        assert (agent_dir / "schema" / "output.yaml").is_file()
+        assert (agent_dir / "evals" / "dataset.jsonl").is_file()
+
+        spec = yaml.safe_load((agent_dir / "agent.yaml").read_text())
+        assert spec["skills"] == ["kb-vector-lookup"]
+        assert spec["retrieval"]["auto_into"] == "context"
+
+        # The built-in skill was provisioned into the PROJECT's skills/ dir.
+        assert (project_root / "skills" / "kb-vector-lookup").is_dir()
+
+        # -- load + validate BY NAME from the project root (D2). --------
+        bundle = load_agent(agent_dir)
+        assert bundle.spec.retrieval.auto_retrieval_enabled is True
+        assert {s.spec.name for s in bundle.skills} == {"kb-vector-lookup"}
+        monkeypatch.chdir(project_root)
+        validate_result = runner.invoke(app, ["validate", name])
+        assert validate_result.exit_code == 0, validate_result.stdout + validate_result.stderr
+
+        # -- F5/F6/F7: crawl followed a same-site link + auto-ingested. --
+        chunks = _read_chunks(name)
+        assert chunks, "expected chunks auto-ingested from the crawled URL"
+        sources = {c.source for c in chunks}
+        assert sources <= {_START_URL, _SUB_URL}, sources
+        assert _START_URL in sources
+        assert _SUB_URL in sources, "crawl did not follow the same-site link (F6 regression)"
+        assert not any("external.example" in s for s in sources)
+
+        # -- F8: grounded verify ran THROUGH the project-resolved agent. -
+        assert "grounded on" in result.stdout
+        assert _START_URL in result.stdout
+        assert "verified" in result.stdout
+        match = re.search(r"grounded from\s+(\d+)\s+retrieved", result.stdout)
+        assert match, result.stdout
         assert int(match.group(1)) >= 1

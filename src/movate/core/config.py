@@ -48,6 +48,39 @@ class EvalDefaults(BaseModel):
     gate: float | None = None
 
 
+class ScaffoldConfig(BaseModel):
+    """Project-level defaults for ``mdk init --llm`` scaffolding (ADR 026 D6).
+
+    Today only ``model`` — the LLM that POWERS ``--llm`` agent generation
+    (distinct from the generated agent's RUNTIME model). Lets a project pin
+    one scaffold model so teammates needn't repeat ``--llm-model`` every time.
+
+    Precedence (ADR 022-style layering, resolved in
+    :func:`movate.cli.init._resolve_scaffold_model`):
+
+      1. ``--llm-model`` flag (per-invocation)
+      2. ``MDK_LLM_MODEL`` env var
+      3. project ``project.yaml: scaffold.model``  ← this field
+      4. user ``~/.movate/config.yaml: scaffold.model``
+      5. built-in key-matched default (#108)
+
+    Empty/absent = fall through to the next layer; no behavior change for
+    projects that don't set it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str | None = Field(
+        default=None,
+        description=(
+            "LiteLLM-style model string used to DRIVE `mdk init --llm` "
+            "generation (e.g. openai/gpt-4o-mini-2024-07-18). Distinct from "
+            "the generated agent's runtime model. None = use the user-config "
+            "or built-in key-matched default."
+        ),
+    )
+
+
 class ModelPolicy(BaseModel):
     """Project-wide model policy.
 
@@ -604,6 +637,14 @@ class ProjectConfig(BaseModel):
     )
     bench: BenchConfig = Field(default_factory=BenchConfig)
     eval: EvalDefaults = Field(default_factory=EvalDefaults)
+    scaffold: ScaffoldConfig = Field(
+        default_factory=ScaffoldConfig,
+        description=(
+            "Defaults for `mdk init --llm` agent scaffolding (ADR 026 D6). "
+            "Pin `scaffold.model` once so teammates don't repeat --llm-model. "
+            "Empty/absent = fall through to user-config / key-matched default."
+        ),
+    )
     defaults: AgentDefaults = Field(
         default_factory=AgentDefaults,
         description=(

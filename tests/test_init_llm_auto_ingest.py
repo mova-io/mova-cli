@@ -217,6 +217,7 @@ class TestAutoIngestHappyPath:
                 app,
                 [
                     "init",
+                    "--bare",
                     "site-bot",
                     "--llm",
                     f"answer questions about {url}",
@@ -278,7 +279,17 @@ class TestAutoIngestNeverBreaksInit:
 
         result = runner.invoke(
             app,
-            ["init", "kb-bot", "--llm", f"answer questions about {url}", "--target", str(tmp_path)],
+            # --bare keeps the standalone <tmp>/kb-bot/ layout this assertion
+            # targets (ADR 026 D1 default would wrap it in a project).
+            [
+                "init",
+                "kb-bot",
+                "--llm",
+                f"answer questions about {url}",
+                "--bare",
+                "--target",
+                str(tmp_path),
+            ],
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         # Scaffold is intact.
@@ -332,6 +343,7 @@ class TestAutoIngestNeverBreaksInit:
                 app,
                 [
                     "init",
+                    "--bare",
                     "empty-bot",
                     "--llm",
                     f"answer questions about {url}",
@@ -369,6 +381,7 @@ class TestAutoIngestNeverBreaksInit:
                 app,
                 [
                     "init",
+                    "--bare",
                     "down-bot",
                     "--llm",
                     f"answer questions about {url}",
@@ -415,6 +428,7 @@ class TestAutoIngestOptOuts:
                 app,
                 [
                     "init",
+                    "--bare",
                     "scaffold-only",
                     "--llm",
                     f"answer questions about {url}",
@@ -450,6 +464,7 @@ class TestAutoIngestOptOuts:
             app,
             [
                 "init",
+                "--bare",
                 "mock-bot",
                 "--llm",
                 f"answer questions about {url}",
@@ -489,6 +504,7 @@ class TestAutoIngestOptOuts:
                 app,
                 [
                     "init",
+                    "--bare",
                     "docs-bot",
                     "--llm",
                     "answer questions about our help docs",
@@ -525,6 +541,7 @@ class TestAutoIngestOptOuts:
             app,
             [
                 "init",
+                "--bare",
                 "sentiment",
                 "--llm",
                 "classify short text into sentiment labels",

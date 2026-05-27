@@ -102,6 +102,7 @@ class TestThinDescriptionNudge:
             app,
             [
                 "init",
+                "--bare",
                 "thin-agent",
                 "--llm",
                 "chatbot",  # 1 word / 7 chars → below both thresholds
@@ -127,6 +128,7 @@ class TestThinDescriptionNudge:
             app,
             [
                 "init",
+                "--bare",
                 "normal-agent",
                 "--llm",
                 "An FAQ assistant that answers SaaS pricing questions concisely",
@@ -260,6 +262,7 @@ class TestCacheableMetaPromptPrefix:
             app,
             [
                 "init",
+                "--bare",
                 "reordered-mock-agent",
                 "--llm",
                 "An assistant that summarizes incoming support tickets briefly",
@@ -314,6 +317,7 @@ class TestSpinnerModelLabel:
             app,
             [
                 "init",
+                "--bare",
                 "spinner-agent",
                 "--llm",
                 "An assistant that answers product questions for customers",
