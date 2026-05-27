@@ -26,7 +26,12 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app as cli_app
-from movate.cli.watch import _compute_watched_paths, dispatch_once
+from movate.cli.watch import (
+    _compute_watched_paths,
+    _resolve_test_input,
+    dispatch_once,
+    dispatch_run_once,
+)
 from movate.testing import scaffold_agent
 
 runner = CliRunner(mix_stderr=False)
@@ -247,7 +252,130 @@ def test_dispatch_handles_invalid_yaml_gracefully(tmp_path: Path) -> None:
     assert rc == 2
 
 
-# Suppress an unused-import warning for ``json`` — the import is in
-# place to keep the module imports stable if future tests need it for
-# dataset round-trips.
-_ = json
+# ---------------------------------------------------------------------------
+# ADR 027 — the --run live-reload loop
+# ---------------------------------------------------------------------------
+#
+# The loop body (run_loop) polls between interactive prompts and isn't
+# unit-tested directly (it needs a tty + a real edit cadence; the validate
+# poll loop above already proves the mtime-poll wiring). Here we assert the
+# pieces the loop is built from: re-run reflects an edited watched file, the
+# half-saved-file guard, the D3 test-input precedence, and the non-TTY gate.
+
+
+@pytest.mark.unit
+def test_dispatch_run_once_reflects_edited_watched_file(tmp_path: Path) -> None:
+    """Re-running after editing a watched file reflects the edit — proving the
+    loop reloads fresh from disk on every dispatch (no cache/daemon to
+    invalidate), which is the whole architectural premise of ADR 027.
+
+    Hermetic via ``--mock``: the MockProvider ignores the prompt body and
+    answers from the dataset's ``expected`` rows, so the dataset (also a
+    watched file) is the deterministic lever for "did the re-run pick up my
+    edit?". Editing ``prompt.md`` exercises the same reload path; its effect
+    just isn't observable through the mock.
+    """
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    test_input = '{"text": "hello"}'
+
+    rc1, out1 = dispatch_run_once(agent_dir, test_input, mock=True)
+    assert rc1 == 0
+    assert out1
+
+    # Edit the first dataset row's expected output, then re-run. A fresh
+    # dispatch re-reads the dataset → the mock returns the new answer.
+    dataset = agent_dir / "evals" / "dataset.jsonl"
+    lines = dataset.read_text().splitlines()
+    row0 = json.loads(lines[0])
+    row0["expected"] = {"message": "EDITED ANSWER"}
+    lines[0] = json.dumps(row0)
+    dataset.write_text("\n".join(lines) + "\n")
+
+    rc2, out2 = dispatch_run_once(agent_dir, test_input, mock=True)
+    assert rc2 == 0
+    assert out2 == "EDITED ANSWER"
+    assert out2 != out1
+
+
+@pytest.mark.unit
+def test_dispatch_run_once_survives_half_saved_file(tmp_path: Path) -> None:
+    """A half-saved / invalid agent file must not crash the loop: dispatch
+    returns ``(2, None)`` and does not raise, so ``run_loop`` keeps polling
+    (mirrors the ``contextlib.suppress(AgentLoadError)`` guard)."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    (agent_dir / "agent.yaml").write_text("this is not: valid: : yaml")
+    rc, output = dispatch_run_once(agent_dir, '{"text": "hello"}', mock=True)
+    assert rc == 2
+    assert output is None
+
+
+@pytest.mark.unit
+def test_resolve_test_input_prefers_explicit_flag(tmp_path: Path) -> None:
+    """D3 precedence #1: an explicit --input wins over the dataset row."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    assert _resolve_test_input('{"text": "explicit"}', agent_dir) == '{"text": "explicit"}'
+
+
+@pytest.mark.unit
+def test_resolve_test_input_falls_back_to_dataset_row(tmp_path: Path) -> None:
+    """D3 precedence #2: no --input → the first evals/dataset.jsonl row's input."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    resolved = _resolve_test_input(None, agent_dir)
+    assert resolved is not None
+    # The scaffold's first row is {"input": {"text": "hello"}, ...}.
+    assert json.loads(resolved) == {"text": "hello"}
+
+
+@pytest.mark.unit
+def test_resolve_test_input_none_when_no_dataset(tmp_path: Path) -> None:
+    """D3 precedence #3: no --input and no dataset → None (caller prompts)."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    # Drop the dataset declaration so there's nothing to fall back to.
+    dataset = agent_dir / "evals" / "dataset.jsonl"
+    if dataset.exists():
+        dataset.unlink()
+    assert _resolve_test_input(None, agent_dir) is None
+
+
+@pytest.mark.unit
+def test_watched_paths_includes_project_level_contexts(tmp_path: Path) -> None:
+    """D1: a project-level ``<root>/contexts/*.md`` is in the watched set, so
+    editing or attaching a shared context re-fires the loop. (The agent-local
+    case is covered in test_dev.)"""
+    project_root = tmp_path / "proj"
+    agents_dir = project_root / "agents"
+    agent_dir = scaffold_agent(agents_dir / "demo", name="demo")
+    # The canonical layout marks the PROJECT root, not agents/. scaffold_agent
+    # drops a marker in agents/ for its own convenience; remove it so
+    # _resolve_project_root walks up to proj/ as it would in a real project.
+    (agents_dir / "movate.yaml").unlink(missing_ok=True)
+    (project_root / "movate.yaml").write_text("name: proj\n")
+    ctx_dir = project_root / "contexts"
+    ctx_dir.mkdir(parents=True)
+    (ctx_dir / "shared-policy.md").write_text("# shared policy")
+
+    watched = _compute_watched_paths(agent_dir)
+    names = {p.name for p in watched.paths}
+    assert "shared-policy.md" in names
+
+
+@pytest.mark.unit
+def test_cli_watch_run_non_tty_prints_guide_and_exits(tmp_path: Path) -> None:
+    """Non-TTY ``--run`` degrades to a documentation-only print and exits 0 —
+    it must never hang waiting for an interactive input (CliRunner stdin is
+    not a tty)."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    r = runner.invoke(cli_app, ["watch", str(agent_dir), "--run", "--mock"])
+    assert r.exit_code == 0
+    combined = _strip_for_help_check(r.stdout + r.stderr).lower()
+    assert "non-interactive" in combined
+
+
+@pytest.mark.unit
+def test_cli_watch_help_advertises_run_flag() -> None:
+    """The ``--run`` opt-in surfaces in --help so operators can discover the
+    live-reload loop. Width/ANSI-robust (strip escapes + collapse whitespace)."""
+    r = runner.invoke(cli_app, ["watch", "--help"])
+    assert r.exit_code == 0
+    clean = _strip_for_help_check(r.stdout)
+    assert "--run" in clean

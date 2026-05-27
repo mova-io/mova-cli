@@ -34,18 +34,14 @@ the :func:`_copilot_action` planner↔driver glue.
 from __future__ import annotations
 
 import contextlib
-import difflib
-import json
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import typer
 import yaml
 from rich.console import Console
-from rich.markup import escape
 from rich.prompt import Prompt
 
 from movate.cli import _console
@@ -53,8 +49,8 @@ from movate.cli._completion import complete_agent_path
 from movate.cli._next_steps import mdk_bin_name
 from movate.cli._resolve import resolve_agent_arg, walk_up_for_project_root
 from movate.cli.contexts_cmd import _CONTEXT_TEMPLATE, attach_context_to_agent
-from movate.cli.watch import _compute_watched_paths, _snapshot_mtimes, dispatch_run_once
-from movate.core.loader import AgentLoadError, load_agent
+from movate.cli.watch import _prompt_for_input, _resolve_test_input, run_loop
+from movate.core.loader import load_agent
 
 if TYPE_CHECKING:
     from movate.authoring import AuthoringDriver, EvalSnapshot, SessionCostTracker
@@ -167,9 +163,12 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
 
     while True:
         if test_input is not None:
-            # Ctrl-C breaks the live loop and opens the actions menu.
+            # Ctrl-C breaks the live loop and opens the actions menu. The loop
+            # itself lives in watch.py (ADR 027 D1 — one home, shared with
+            # `mdk watch --run`); dev drives it as a phase.
+            err.print(f"[bold]live[/bold] {agent_dir}")
             with contextlib.suppress(KeyboardInterrupt):
-                _live_loop(agent_dir, test_input, mock=mock, poll_interval=poll_interval)
+                run_loop(agent_dir, test_input, mock=mock, poll_interval=poll_interval)
 
         action = _actions_menu()
         if action == "quit":
@@ -287,122 +286,14 @@ def _resolve_or_scaffold(
 
 
 # ---------------------------------------------------------------------------
-# Test input
+# Test input + live loop
 # ---------------------------------------------------------------------------
-
-
-def _resolve_test_input(input_flag: str | None, agent_dir: Path) -> str | None:
-    """Pick the input the live loop runs on: explicit flag, else the first
-    row of ``evals/dataset.jsonl``, else ``None`` (caller prompts)."""
-    if input_flag:
-        return input_flag
-    try:
-        bundle = load_agent(agent_dir)
-        dataset = bundle.spec.evals.dataset
-        if not dataset:
-            return None
-        ds_path = (bundle.agent_dir / dataset).resolve()
-        if ds_path.is_file():
-            text = ds_path.read_text().strip()
-            if text:
-                row = json.loads(text.splitlines()[0])
-                if isinstance(row, dict) and "input" in row:
-                    return json.dumps(row["input"])
-    except (AgentLoadError, OSError, json.JSONDecodeError, AttributeError, TypeError):
-        pass
-    return None
-
-
-def _prompt_for_input(agent_dir: Path) -> str | None:
-    """Ask the operator for a test input (plain string or JSON)."""
-    with contextlib.suppress(AgentLoadError):
-        bundle = load_agent(agent_dir)
-        required = bundle.input_schema.get("required", [])
-        if required:
-            err.print(f"[dim]input schema requires: {required}[/dim]")
-    try:
-        value = Prompt.ask("[bold]Test input[/bold] (plain string or JSON)").strip()
-    except (KeyboardInterrupt, EOFError):
-        return None
-    return value or None
-
-
-# ---------------------------------------------------------------------------
-# Live loop
-# ---------------------------------------------------------------------------
-
-
-def _live_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: float) -> None:
-    """Re-run the agent on every change to its files until Ctrl-C.
-
-    Mirrors the poll loop in :func:`movate.cli.watch.watch`, but dispatches
-    a run (via :func:`dispatch_run_once`) instead of a validate. Lets
-    ``KeyboardInterrupt`` propagate so the caller can open the actions menu.
-    """
-    try:
-        watched = _compute_watched_paths(agent_dir)
-        paths = watched.paths
-    except AgentLoadError as exc:
-        _console.warn(f"couldn't read agent: {exc}")
-        paths = ()
-
-    err.print(
-        f"[bold]live[/bold] {agent_dir}\n"
-        f"[dim]  edit prompt.md or a context — re-runs on save. Ctrl-C for the menu.[/dim]"
-    )
-    _, previous = dispatch_run_once(agent_dir, test_input, mock=mock)
-
-    snapshot = _snapshot_mtimes(paths)
-    while True:
-        time.sleep(poll_interval)
-        with contextlib.suppress(AgentLoadError):
-            paths = _compute_watched_paths(agent_dir).paths
-        new_snapshot = _snapshot_mtimes(paths)
-        if new_snapshot != snapshot:
-            time.sleep(0.2)  # debounce write-then-rename saves.
-            with contextlib.suppress(AgentLoadError):
-                paths = _compute_watched_paths(agent_dir).paths
-            snapshot = _snapshot_mtimes(paths)
-            _, current = dispatch_run_once(agent_dir, test_input, mock=mock)
-            _print_output_diff(previous, current)
-            # Keep the last GOOD output as the baseline so a failed run
-            # (current is None) doesn't reset the diff reference.
-            if current is not None:
-                previous = current
-
-
-def _print_output_diff(previous: str | None, current: str | None) -> None:
-    """Show whether the output changed since the last run, and if so, how.
-
-    Answers "did my edit change anything?" at a glance: a one-line marker
-    when unchanged, a colorized unified diff when it changed. Skipped when
-    there's no baseline yet or the current run failed.
-    """
-    if previous is None or current is None:
-        return
-    if previous == current:
-        err.print("[dim]· output unchanged since last run[/dim]")
-        return
-    err.print("[yellow]✎ output changed:[/yellow]")
-    diff = difflib.unified_diff(
-        previous.splitlines(),
-        current.splitlines(),
-        fromfile="previous",
-        tofile="current",
-        lineterm="",
-    )
-    for line in diff:
-        # escape() keeps brackets / markup in the agent's own output from
-        # being interpreted as Rich tags; style is applied out-of-band.
-        text = escape(line)
-        if line.startswith("+") and not line.startswith("+++"):
-            err.print(text, style="green")
-        elif line.startswith("-") and not line.startswith("---"):
-            err.print(text, style="red")
-        elif line.startswith("@@"):
-            err.print(text, style="cyan")
-        else:
-            err.print(text, style="dim")
+#
+# The test-input resolution (``_resolve_test_input`` / ``_prompt_for_input``),
+# the live-reload loop (``run_loop``), and its output diff (``_print_output_diff``)
+# all live in :mod:`movate.cli.watch` (ADR 027 D1 — one home, shared with
+# ``mdk watch --run``). ``dev`` imports them at the top and drives ``run_loop``
+# as a phase.
 
 
 # ---------------------------------------------------------------------------

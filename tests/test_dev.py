@@ -23,9 +23,8 @@ import pytest
 from typer.testing import CliRunner
 
 import movate.cli.dev_cmd as dc
-from movate.cli.dev_cmd import _print_output_diff
 from movate.cli.main import app as cli_app
-from movate.cli.watch import _compute_watched_paths, dispatch_run_once
+from movate.cli.watch import _compute_watched_paths, _print_output_diff, dispatch_run_once
 from movate.testing import scaffold_agent
 
 runner = CliRunner(mix_stderr=False)
