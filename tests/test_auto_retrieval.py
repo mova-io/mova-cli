@@ -547,12 +547,15 @@ async def test_retrieval_error_fail_raises_typed_error_directly(
     ex = _make_executor(storage, pricing, rec)
     req = RunRequest(agent="rag", input={"question": "q"})
     with pytest.raises(ToolError) as excinfo:
+        # ADR 024: the helper now appends a turn-0 SkillCallRecord to the
+        # caller-owned ``skill_calls`` list and returns the retrieval cost.
         await ex._maybe_pre_retrieve(
             bundle=bundle,
             request=req,
             span=rec.start_span("t", {}),
             run_id="r1",
             tenant_id="local",
+            skill_calls=[],
         )
     assert excinfo.value.retryable is False
     assert "kb-lookup" in str(excinfo.value)
