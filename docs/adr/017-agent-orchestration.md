@@ -1,9 +1,27 @@
 # ADR 017 — Agent orchestration on Azure: extend the native engine, adapt (don't adopt) external orchestrators
 
-**Status:** Proposed
-**Date:** 2026-05-23
+**Status:** Accepted
+**Date:** 2026-05-23 (proposed); 2026-05-27 (accepted — D1/D2/D5 shipped; D3 remaining)
 **Deciders:** Engineering (orchestration/runtime — Deva sign-off for any external-orchestrator dependency, per ADR 001)
 **Context window:** v1.0 Azure operability — scheduled + multi-step agent orchestration
+
+> **Reconcile note (2026-05-27).** Accepted retroactively now that most of the
+> plan has shipped:
+> - **D1 (reject Airflow-as-core; native engine is the orchestrator)** — held.
+> - **D2 (native scheduler + event/webhook triggers)** — SHIPPED: scheduler
+>   (generalized from the ADR-016 continuous-eval primitive), event/webhook
+>   triggers, and trigger replay/idempotency.
+> - **D5 (durable + HITL on the native runner)** — SHIPPED: the `HUMAN`
+>   pause/persist/resume node is implemented (no longer a stub).
+> - **D3 (external-orchestrator adapter pack)** — REMAINING: the thin opt-in
+>   `mdk[prefect]` task + Airflow `MovateAgentOperator` + generic webhook/CLI
+>   contract (over the existing `MovateClient` async API), in
+>   `src/movate/integrations/` behind `pyproject.toml` extras. No core dep.
+> - **D4 (Temporal/Prefect as an execution *backend*)** — DEFERRED, opt-in +
+>   Deva sign-off, only if a deployment genuinely needs it.
+>
+> Workflow *authoring* DX (composing/testing workflows through the ADR 025
+> copilot) is covered separately by **ADR 029**.
 **Builds on / related:** ADR 001 (cloud-portability + minimal-deps), ADR 008 (workflow-level evals), ADR 016 (the continuous-eval scheduler — same scheduler primitive), ADR 014 (durable agent registry — what gets orchestrated),
 `src/movate/core/workflow/` (`WorkflowRunner`, `NodeType`, the `HUMAN`/HITL stub), `JobKind` + the Postgres job queue + the KEDA worker (`infra/azure/modules/containerapp-worker.bicep`)
 
