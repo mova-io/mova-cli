@@ -1265,6 +1265,7 @@ def _init_agent_from_llm(
     dry_run: bool,
     starting_template: str,
     mock: bool = False,
+    no_ingest: bool = False,
 ) -> None:
     """Scaffold an agent from a natural-language description.
 
@@ -1345,6 +1346,7 @@ def _init_agent_from_llm(
             dry_run=dry_run,
             starting_template=starting_template,
             mock=mock,
+            no_ingest=no_ingest,
             dest=dest,
         )
     )
@@ -1363,6 +1365,7 @@ async def _run_llm_scaffold(
     dry_run: bool,
     starting_template: str,
     mock: bool,
+    no_ingest: bool,
     dest: Path,
 ) -> None:
     """Async body of the LLM-scaffold flow.
@@ -1598,6 +1601,22 @@ async def _run_llm_scaffold(
     _provision_declared_skills(generated, project_root=scaffold_project_root)
 
     _render_success_panel(name=name, dest=dest, generated=generated, cost_usd=cost_usd)
+
+    # F7 (#116): close the loop — if the description carried a URL and we
+    # scaffolded a grounded (RAG) agent, auto-ingest that URL into the new
+    # agent's KB so it can answer immediately. Best-effort + never breaks
+    # init: the agent is already on disk and valid. Skipped entirely under
+    # --mock (offline) / --no-ingest, for a non-grounding scaffold, or when
+    # the description has no URL — each case prints the manual hint instead.
+    await _maybe_auto_ingest(
+        name=name,
+        description=description,
+        generated=generated,
+        project_root=scaffold_project_root,
+        mock=mock,
+        no_ingest=no_ingest,
+    )
+
     _emit_post_success_hint(_console, dry_run=False)
     _print_init_summary_line(
         name=name,
@@ -1768,6 +1787,134 @@ def _provision_declared_skills(generated: Any, *, project_root: Path) -> None:
             # a skill-resolution AgentLoadError with a clear message.
             # Don't mask that with a less-specific error here.
             continue
+
+
+# F7 (#116): bounded auto-ingest defaults. A fresh agent's KB only needs
+# enough of the site to be useful out of the box; the operator can run a
+# wider `mdk kb ingest --crawl --max-pages N` later. Keeps the post-init
+# network action short + predictable. Mirrors the kb command's own
+# DEFAULT_MAX_PAGES / DEFAULT_MAX_DEPTH (re-exported via kb_cmd).
+_AUTO_INGEST_MAX_PAGES = 10
+_AUTO_INGEST_MAX_DEPTH = 1
+
+
+def _is_rag_shaped(generated: Any) -> bool:
+    """True iff the generated agent is the F3 grounded/RAG shape.
+
+    The grounded scaffold declares ``retrieval.auto_into`` (ADR 023
+    pre-retrieval) — the signal the Executor uses to know it should
+    auto-fill ``input.context`` from the KB. Auto-ingest (F7) only fires
+    for this shape: a non-grounding agent has no KB to populate, so
+    ingesting a URL into it would be meaningless. A plain dict ``agent_yaml``
+    without a ``retrieval`` block → ``False`` (the non-grounding path).
+    """
+    agent_yaml = getattr(generated, "agent_yaml", {})
+    retrieval = agent_yaml.get("retrieval") if isinstance(agent_yaml, dict) else None
+    if not isinstance(retrieval, dict):
+        return False
+    return bool(retrieval.get("auto_into"))
+
+
+async def _maybe_auto_ingest(
+    *,
+    name: str,
+    description: str,
+    generated: Any,
+    project_root: Path,
+    mock: bool,
+    no_ingest: bool,
+) -> None:
+    """Auto-ingest the description's URL into the new RAG agent's KB (F7, #116).
+
+    The loop-closer for ``mdk init <name> "answer questions about <url>"
+    --llm``: after the RAG agent is scaffolded, crawl the URL into its KB
+    so it can actually answer. Reuses the EXISTING crawl+ingest path
+    (:func:`movate.cli.kb_cmd.auto_ingest_url` → ``crawl_site`` →
+    ``ingest_text``) rather than reimplementing fetch / extract / chunk.
+
+    All short-circuits print the exact manual command + return WITHOUT
+    touching the network — the scaffold is already complete:
+
+    * ``--no-ingest`` → scaffold-only by operator request.
+    * ``--mock`` (offline) → never hits the network, mirroring how the
+      scaffold itself short-circuits the LLM call.
+    * non-grounding scaffold → no KB to populate.
+    * no URL in the description → nothing to ingest (just a manual hint).
+
+    The ingest itself is best-effort: :func:`auto_ingest_url` raises
+    :class:`AutoIngestSkippedError` (no embedding key, unreachable URL, empty
+    crawl, embed failure), which is caught here and turned into a warning
+    + the manual command. ``mdk init`` always exits success.
+    """
+    from movate.cli import _console  # noqa: PLC0415
+    from movate.kb.web import first_url  # noqa: PLC0415
+
+    url = first_url(description)
+
+    def _manual_hint(extra: str = "") -> None:
+        # Stderr-only (respects --quiet) — the success Panel already went
+        # to stdout. The exact command is copy-paste-ready.
+        cmd = f"mdk kb ingest {name} {url} --crawl" if url else f"mdk kb ingest {name} <url>"
+        prefix = f"{extra} " if extra else ""
+        _console.hint(f"[dim]{prefix}→ ingest into the KB later: [bold]{cmd}[/bold][/dim]")
+
+    if not _is_rag_shaped(generated):
+        # Non-grounding agent — no retrieval-backed KB to populate. Nothing
+        # to ingest, no hint needed (a classifier has no use for one).
+        return
+
+    if no_ingest:
+        _manual_hint("[dim]--no-ingest: skipped auto-ingest.[/dim]")
+        return
+
+    if url is None:
+        # Grounded scaffold but no URL to seed from — point at the manual
+        # ingest so the operator knows the KB starts empty.
+        err_console.print(
+            f"[yellow]⚠[/yellow] [bold]{name}[/bold] is grounded but its KB is empty "
+            "(no URL in the description to auto-ingest from)."
+        )
+        _manual_hint()
+        return
+
+    if mock:
+        # Offline path: never hit the network. Mirrors how --mock
+        # short-circuits the real LLM scaffold call.
+        err_console.print(
+            f"[yellow]⚠[/yellow] [bold]--mock[/bold]: skipped auto-ingest of "
+            f"[bold]{url}[/bold] (offline). The agent's KB starts empty."
+        )
+        _manual_hint()
+        return
+
+    from movate.cli.kb_cmd import AutoIngestSkippedError, auto_ingest_url  # noqa: PLC0415
+
+    try:
+        ingested = await auto_ingest_url(
+            agent=name,
+            url=url,
+            project_root=project_root,
+            max_pages=_AUTO_INGEST_MAX_PAGES,
+            max_depth=_AUTO_INGEST_MAX_DEPTH,
+            crawl=True,
+        )
+    except AutoIngestSkippedError as exc:
+        err_console.print(f"[yellow]⚠[/yellow] auto-ingest skipped: {exc}")
+        _manual_hint()
+        return
+    except Exception as exc:
+        # Defensive belt: any unexpected error (an import-time issue, a
+        # storage backend problem) must not turn a successful scaffold
+        # into a non-zero exit. Warn + manual hint, scaffold stands.
+        err_console.print(f"[yellow]⚠[/yellow] auto-ingest skipped: {exc}")
+        _manual_hint()
+        return
+
+    page_word = "page" if ingested == 1 else "pages"
+    console.print(
+        f"[green]✓[/green] your agent is ready and grounded on "
+        f"[bold]{ingested}[/bold] {page_word} from [bold]{url}[/bold]."
+    )
 
 
 def _check_adr023_retrieval(bundle: Any) -> str | None:
@@ -2106,6 +2253,19 @@ def init(
             "otherwise."
         ),
     ),
+    no_ingest: bool = typer.Option(
+        False,
+        "--no-ingest",
+        help=(
+            "Skip the auto-ingest step. By default, when an [bold]--llm[/bold] "
+            "description contains a URL and scaffolds a grounded (RAG) agent, "
+            "[bold]mdk init[/bold] crawls that URL into the new agent's KB so "
+            "it can answer immediately. Pass [bold]--no-ingest[/bold] for a "
+            "scaffold-only run (you can ingest later with "
+            "[bold]mdk kb ingest[/bold]). Auto-ingest is always skipped under "
+            "[bold]--mock[/bold] / [bold]--dry-run[/bold] (no network)."
+        ),
+    ),
     open_editor: bool = typer.Option(
         True,
         "--open-editor/--no-open-editor",
@@ -2297,6 +2457,7 @@ def init(
             dry_run=dry_run,
             starting_template=effective_template,
             mock=mock,
+            no_ingest=no_ingest,
         )
         return
 
