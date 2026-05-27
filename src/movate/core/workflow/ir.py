@@ -150,3 +150,50 @@ class WorkflowGraph:
         if len(order) != len(self.nodes):
             raise ValueError(f"graph has a cycle: {len(self.nodes) - len(order)} nodes unreachable")
         return order
+
+    def find_back_edges(self) -> list[WorkflowEdge]:
+        """Return the edges whose removal would make the graph acyclic.
+
+        Cycle detection via DFS: an edge to a node currently on the DFS
+        stack (a "grey" node) is a back-edge — it closes a loop. The set of
+        back-edges is the minimal set the LangGraph compiler must treat as
+        loop-back transitions (each needs a recursion guard so it can never
+        run away — ADR 030 D2 / CLAUDE.md failure-mode rule).
+
+        Deterministic: nodes are visited in insertion order and successors
+        in declaration order, so the same graph always yields the same
+        back-edge set. Pure read-only; does not mutate the graph.
+        """
+        white, grey, black = 0, 1, 2
+        color: dict[str, int] = {nid: white for nid in self.nodes}
+        back_edges: list[WorkflowEdge] = []
+
+        # Iterative DFS so deep graphs don't blow the Python stack. We push
+        # (node, successor-index) frames and resume where we left off.
+        for root in self.nodes:
+            if color[root] != white:
+                continue
+            stack: list[tuple[str, int]] = [(root, 0)]
+            color[root] = grey
+            while stack:
+                nid, idx = stack[-1]
+                succ = self.successors(nid)
+                if idx < len(succ):
+                    stack[-1] = (nid, idx + 1)
+                    edge = succ[idx]
+                    target = edge.to_id
+                    if target not in color:  # dangling edge — ignore here
+                        continue
+                    if color[target] == grey:
+                        back_edges.append(edge)
+                    elif color[target] == white:
+                        color[target] = grey
+                        stack.append((target, 0))
+                else:
+                    color[nid] = black
+                    stack.pop()
+        return back_edges
+
+    def has_cycle(self) -> bool:
+        """True iff the graph contains at least one cycle."""
+        return bool(self.find_back_edges())
