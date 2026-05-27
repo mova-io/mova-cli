@@ -161,6 +161,7 @@ from movate.cli import (  # noqa: E402
     plan_cmd,
     promote_cmd,
     replay_cmd,
+    report_cmd,
     rollback_cmd,
     schedule_cmd,
     simulate_cmd,
@@ -563,6 +564,11 @@ app.add_typer(models_app, name="models", rich_help_panel=PANEL_DIAGNOSE)
 # answer adjacent operator questions ("what does this cost?" vs
 # "what HAVE we spent?").
 app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
+# `report` is the offline rollup (ADR 031 D3) — pass-rate / cost / latency /
+# top-failure aggregates from the LOCAL store. Sits with `costs` + `explain`
+# since all three answer "how are my agents doing?" without remote infra
+# (rich dashboards live in Langfuse / Grafana — ADR 031 D1/D2).
+app.command("report", rich_help_panel=PANEL_DIAGNOSE)(report_cmd.report)
 
 # ----- Deploy & operate -----------------------------------------------------
 
