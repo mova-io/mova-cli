@@ -9,17 +9,26 @@ The front door for authoring an agent. It ties the scattered dev verbs
   re-runs against your test input automatically, no restart. The loader
   reads the prompt + contexts fresh from disk on every run, so there's
   no cache to invalidate.
-* **Actions menu** (Ctrl-C out of the live loop) to change the test
-  input, create-and-attach a context, run evals, open the prompt in an
-  editor, or deploy to Azure.
+* **Actions menu** (Ctrl-C out of the live loop) to ask the conversational
+  copilot, change the test input, create-and-attach a context, run evals,
+  open the prompt in an editor, or deploy to Azure.
+* **Ask the copilot** (the ``a`` key, ADR 025 S1 — absorbs F9): type a
+  natural-language request ("add a returns-policy context", "make the tone
+  formal", "ingest https://…", "add a calculator skill"); a provider-pluggable
+  planner maps it to typed authoring **catalog** action(s), and the existing
+  :class:`movate.authoring.AuthoringDriver` runs plan → preview → confirm →
+  apply → verify for each. The planner never edits files; the driver does,
+  through the catalog's validated/reversible/confirm-gated spine. An ambiguous
+  request asks one clarifying question and changes nothing.
 
 Non-TTY (CI / piped stdout) degrades to printing the recommended command
 sequence and exiting — the same gating :mod:`movate.cli._next_steps` uses
 so scripts never block on a prompt.
 
-This command is pure orchestration: scaffolding, execution, eval, and
-deploy all reuse the existing primitives. The only command-specific
-logic is the watch⇄menu loop and :func:`_attach_context_to_agent`.
+This command is pure orchestration: scaffolding, execution, eval, deploy, and
+the copilot all reuse the existing primitives + the authoring catalog. The only
+command-specific logic is the watch⇄menu loop, :func:`_add_context_action`, and
+the :func:`_copilot_action` planner↔driver glue.
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 import yaml
@@ -47,6 +57,10 @@ from movate.cli._resolve import resolve_agent_or_workflow_arg, walk_up_for_proje
 from movate.cli.contexts_cmd import _CONTEXT_TEMPLATE, attach_context_to_agent
 from movate.cli.watch import _compute_watched_paths, _snapshot_mtimes, dispatch_run_once
 from movate.core.loader import AgentLoadError, load_agent
+
+if TYPE_CHECKING:
+    from movate.authoring import AuthoringDriver
+    from movate.authoring.planner import Planner, ProposedAction
 
 stdout = Console()
 err = Console(stderr=True)
@@ -138,6 +152,8 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             continue
         if action == "input":
             test_input = _prompt_for_input(agent_dir)
+        elif action == "ask":
+            _copilot_action(agent_dir, mock=mock)
         elif action == "context":
             _add_context_action(agent_dir)
         elif action == "edit":
@@ -358,31 +374,32 @@ def _actions_menu() -> str:
     stdout.print()
     stdout.print("[bold]Actions:[/bold]")
     stdout.print(
-        "  [bold cyan]r[/bold cyan] resume live test    "
-        "[bold cyan]i[/bold cyan] change test input    "
-        "[bold cyan]c[/bold cyan] add a context"
+        "  [bold cyan]a[/bold cyan] ask the copilot     "
+        "[bold cyan]r[/bold cyan] resume live test      "
+        "[bold cyan]i[/bold cyan] change test input"
     )
     stdout.print(
-        "  [bold cyan]e[/bold cyan] run evals           "
-        "[bold cyan]g[/bold cyan] grounding check       "
-        "[bold cyan]o[/bold cyan] open prompt in editor"
+        "  [bold cyan]c[/bold cyan] add a context        "
+        "[bold cyan]e[/bold cyan] run evals             "
+        "[bold cyan]g[/bold cyan] grounding check"
     )
     stdout.print(
-        "  [bold cyan]d[/bold cyan] deploy to Azure      "
-        "[bold cyan]k[/bold cyan] ingest knowledge base "
-        "[bold cyan]x[/bold cyan] test deployed agent"
+        "  [bold cyan]o[/bold cyan] open prompt in editor "
+        "[bold cyan]d[/bold cyan] deploy to Azure       "
+        "[bold cyan]k[/bold cyan] ingest knowledge base"
     )
-    stdout.print("  [bold cyan]q[/bold cyan] quit")
+    stdout.print("  [bold cyan]x[/bold cyan] test deployed agent  [bold cyan]q[/bold cyan] quit")
     try:
         choice = Prompt.ask(
             "[bold]Pick[/bold]",
-            choices=["r", "i", "c", "e", "g", "d", "k", "x", "o", "q"],
+            choices=["a", "r", "i", "c", "e", "g", "d", "k", "x", "o", "q"],
             default="r",
             show_choices=False,
         )
     except (KeyboardInterrupt, EOFError):
         return "quit"
     return {
+        "a": "ask",
         "r": "resume",
         "i": "input",
         "c": "context",
@@ -426,6 +443,164 @@ def _add_context_action(agent_dir: Path) -> None:
     else:
         _console.hint(f"[dim]'{name}' was already listed in contexts[/dim]")
     err.print(f"[dim]edit {dest}, then resume the live loop to see it take effect[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Copilot (the `a` key) — NL → catalog action(s) via the planner (ADR 025 S1)
+# ---------------------------------------------------------------------------
+
+
+def _project_root_for_agent(agent_dir: Path) -> Path:
+    """Resolve the project root the authoring driver should operate against.
+
+    The catalog driver resolves an agent at ``<project>/agents/<name>``, so the
+    project root must be the dir two levels above a canonical agent dir. We
+    derive it from the agent path (``agents/<name>`` → its grandparent) rather
+    than the CWD walk-up, so the copilot works regardless of where ``mdk dev``
+    was launched from. Falls back to the CWD project marker, then the agent's
+    grandparent, for non-canonical layouts.
+    """
+    agent_dir = agent_dir.resolve()
+    if agent_dir.parent.name == "agents":
+        return agent_dir.parent.parent
+    return walk_up_for_project_root() or agent_dir.parent
+
+
+def _build_planner(agent_dir: Path, project_root: Path, *, mock: bool) -> Planner:
+    """Construct the NL→catalog planner backing the copilot (ADR 025 D6).
+
+    Under ``--mock`` (or any non-keyed/offline run) this returns the
+    deterministic :class:`MockPlanner` so the copilot works with no API keys —
+    the same hermetic path the tests drive. Otherwise it wraps a real
+    :class:`BaseLLMProvider` (the existing model seam) in an
+    :class:`LLMPlanner`. No new dependency: the provider is the one ``mdk
+    init --llm`` already uses.
+    """
+    from movate.authoring.planner import LLMPlanner, MockPlanner  # noqa: PLC0415
+
+    if mock:
+        return MockPlanner()
+    from movate.cli.init import _DEFAULT_LLM_MODEL  # noqa: PLC0415
+    from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+    return LLMPlanner(LiteLLMProvider(), project=project_root, model=_DEFAULT_LLM_MODEL)
+
+
+def _copilot_action(agent_dir: Path, *, mock: bool) -> None:
+    """Ask the copilot: NL request → catalog action(s) → preview → confirm → apply.
+
+    The native conversational surface (ADR 025 S1, F9). Maps the operator's
+    free-text request to typed catalog action(s) via the planner, then drives
+    each through the **existing** :class:`AuthoringDriver` spine — plan →
+    preview (diff + cost/side-effects) → confirm → apply → verify. The planner
+    never edits files; the driver does, behind the catalog's D8 boundaries and
+    the D2 confirmation gates. An ambiguous request yields a single clarifying
+    question and mutates nothing (D6).
+    """
+    from movate.authoring import AuthoringContext, AuthoringDriver  # noqa: PLC0415
+    from movate.authoring.planner import PlannerError  # noqa: PLC0415
+
+    try:
+        request = Prompt.ask("[bold]Ask the copilot[/bold] (what should change?)").strip()
+    except (KeyboardInterrupt, EOFError):
+        return
+    if not request:
+        return
+
+    project_root = _project_root_for_agent(agent_dir)
+    planner = _build_planner(agent_dir, project_root, mock=mock)
+
+    try:
+        outcome = planner.plan(request, agent=agent_dir.name)
+    except PlannerError as exc:
+        _console.warn(f"copilot couldn't plan that: {exc}")
+        return
+
+    # Ambiguous request → ask ONE clarifying question, mutate nothing (D6).
+    if outcome.is_clarification:
+        stdout.print(f"\n[bold yellow]?[/bold yellow] {outcome.needs_clarification}")
+        err.print("[dim]nothing changed — re-run 'a' with more detail.[/dim]")
+        return
+
+    if outcome.message:
+        stdout.print(f"\n[dim]{outcome.message}[/dim]")
+
+    driver = AuthoringDriver(AuthoringContext(project=project_root))
+    for proposed in outcome.actions:
+        if not _drive_proposed_action(driver, proposed):
+            return  # user aborted (Ctrl-C at a confirm prompt)
+
+    err.print("[dim]resume the live loop ('r') to see changes take effect.[/dim]")
+
+
+def _drive_proposed_action(driver: AuthoringDriver, proposed: ProposedAction) -> bool:
+    """Plan → preview → confirm → apply → verify one proposed catalog action.
+
+    Returns ``True`` to continue to the next proposed action (applied, skipped,
+    or failed-soft), ``False`` to abort the whole turn (the user Ctrl-C'd the
+    confirm prompt). All writes go through the catalog :class:`AuthoringDriver`
+    — the D2 confirmation gate + D3 verify (revert-on-failure) hold here too.
+    """
+    from movate.authoring import ConfirmationRequiredError  # noqa: PLC0415
+    from movate.authoring.base import AuthoringActionError  # noqa: PLC0415
+    from movate.authoring.catalog import UnknownActionError  # noqa: PLC0415
+
+    try:
+        plan = driver.plan(proposed.name, proposed.args)
+    except (UnknownActionError, AuthoringActionError, ValueError) as exc:
+        _console.warn(f"couldn't plan '{proposed.name}': {exc}")
+        return True
+
+    # Preview: diff + cost/side-effect estimate (D2).
+    stdout.print(f"\n[bold]plan:[/bold] {plan.summary}")
+    stdout.print(
+        f"  side effects: {', '.join(s.value for s in plan.side_effects) or '—'}"
+        f"   reversible: {'yes' if plan.reversible else '[red]no[/red]'}"
+    )
+    if plan.estimated_cost_usd is not None:
+        stdout.print(f"  estimated cost: ~${plan.estimated_cost_usd:.4f}")
+    if plan.diff:
+        stdout.print(plan.diff)
+
+    # Confirmation gate (D2): cost/networked/destructive actions default to a NO
+    # so the user must explicitly opt in; additive+reversible+free default YES.
+    try:
+        confirmed = typer.confirm("Apply this change?", default=not plan.requires_confirmation)
+    except (KeyboardInterrupt, EOFError):
+        err.print("[yellow]aborted[/yellow]")
+        return False
+    if not confirmed:
+        err.print("[dim]skipped.[/dim]")
+        return True
+
+    try:
+        applied = driver.apply(
+            proposed.name,
+            proposed.args,
+            confirmed=True,
+            # Networked actions (ingest-kb) have no meaningful mock-run; the
+            # rest run the D3 verify loop (validate → run --mock).
+            verify="network" not in [s.value for s in plan.side_effects],
+        )
+    except ConfirmationRequiredError as exc:
+        _console.warn(str(exc))
+        return True
+    except (AuthoringActionError, ValueError) as exc:
+        _console.warn(f"apply failed: {exc}")
+        return True
+
+    if applied.verify is not None and not applied.verify.ok:
+        if applied.verify.reverted:
+            _console.warn(f"verify failed → reverted (project unchanged): {applied.verify.error}")
+            return True
+        _console.warn(f"applied, but verify warning: {applied.verify.error}")
+
+    result = applied.result
+    if result is not None:
+        _console.success(result.summary)
+        for path in result.changed_paths:
+            err.print(f"[dim]  • {path}[/dim]")
+    return True
 
 
 def _ensure_target(target: str | None, *, purpose: str) -> str | None:
