@@ -409,6 +409,136 @@ class LangfuseTracer(Tracer):
         # v3 returns None; tolerate a stub/future SDK that returns an object.
         return getattr(result, "id", None)
 
+    # ----- eval-summary scores (ADR 031 D1) ---------------------------------
+
+    async def score_eval_summary(
+        self,
+        *,
+        trace_id: str,
+        pass_rate: float,
+        mean_score: float,
+        dimension_means: dict[str, float] | None = None,
+        drift_deltas: dict[str, float] | None = None,
+    ) -> None:
+        """Push an eval run's aggregate quality as Langfuse scores (ADR 031 D1).
+
+        Records, on the run's trace:
+
+        * ``eval_pass_rate`` — fraction of cases that passed the gate.
+        * ``eval_mean_score`` — mean aggregated score across cases.
+        * ``eval_dim_<dimension>`` — one score per scored dimension
+          (faithfulness, coverage, …) from the run's dimensional means.
+        * ``eval_drift_<metric>`` — one score per drift delta
+          (``mean_score`` / ``pass_rate`` / a dimension), each
+          ``current - baseline`` so a negative value reads as a regression.
+
+        These render in Langfuse natively so pass-rate, per-dimension quality,
+        and drift trends are visible alongside the run's traces. Best-effort:
+        a missing ``trace_id`` is a no-op, and any SDK error is swallowed so
+        an eval never fails because Langfuse is down (mirrors
+        :meth:`score_trace`). Not part of the :class:`Tracer` Protocol — a
+        Langfuse-specific extension callers reach via ``getattr``.
+        """
+        if not trace_id:
+            return
+        scores: list[tuple[str, float, str | None]] = [
+            ("eval_pass_rate", pass_rate, None),
+            ("eval_mean_score", mean_score, None),
+        ]
+        for dim, value in (dimension_means or {}).items():
+            scores.append((f"eval_dim_{dim}", value, None))
+        for metric, delta in (drift_deltas or {}).items():
+            # Comment makes the sign legible in the Langfuse UI.
+            drift_comment = f"drift delta {delta:+.4f} (current minus baseline)"
+            scores.append((f"eval_drift_{metric}", delta, drift_comment))
+
+        import asyncio  # noqa: PLC0415
+
+        for name, value, comment in scores:
+            try:
+                await asyncio.to_thread(
+                    self._create_score,
+                    trace_id=trace_id,
+                    name=name,
+                    value=float(value),
+                    comment=comment,
+                )
+            except Exception:
+                # Last-resort guard; the eval result stays the source of truth.
+                continue
+
+    # ----- dataset sync (ADR 031 D1) ----------------------------------------
+
+    async def sync_dataset(
+        self,
+        *,
+        name: str,
+        items: list[dict[str, Any]],
+        description: str | None = None,
+    ) -> int:
+        """Idempotent upsert of eval cases into a Langfuse dataset (ADR 031 D1).
+
+        Creates the dataset (if absent) then upserts each item so the agent's
+        ``evals/dataset.jsonl`` (+ harvested cases, ADR 016 D1) lives alongside
+        its traces in Langfuse. Idempotent: re-running re-upserts the same
+        items (Langfuse keys dataset items by ``id`` — we pass a stable id per
+        case — so a second sync updates rather than duplicates).
+
+        Each ``items`` entry is ``{"id": <stable str>, "input": <obj>,
+        "expected_output": <obj | None>, "metadata": <obj | None>}``.
+
+        Returns the number of items successfully upserted (``0`` when Langfuse
+        rejects the dataset or every item, or when there's nothing to sync).
+        Best-effort: any SDK error is swallowed — syncing must never break an
+        eval. Langfuse v3 SDK surface used: ``client.create_dataset(name=,
+        description=)`` and ``client.create_dataset_item(dataset_name=, id=,
+        input=, expected_output=, metadata=)`` (create_dataset_item is an
+        upsert keyed on ``id``). Not part of the :class:`Tracer` Protocol.
+        """
+        if not name or not items:
+            return 0
+
+        import asyncio  # noqa: PLC0415
+
+        return await asyncio.to_thread(
+            self._sync_dataset_sync,
+            name=name,
+            items=items,
+            description=description,
+        )
+
+    def _sync_dataset_sync(
+        self,
+        *,
+        name: str,
+        items: list[dict[str, Any]],
+        description: str | None,
+    ) -> int:
+        """Synchronous dataset upsert; fail-soft. See :meth:`sync_dataset`."""
+        create_dataset = getattr(self._client, "create_dataset", None)
+        if callable(create_dataset):
+            with contextlib.suppress(Exception):
+                # create_dataset is itself an upsert (no-op if the dataset
+                # already exists), so a second sync doesn't error.
+                create_dataset(name=name, description=description)
+        create_item = getattr(self._client, "create_dataset_item", None)
+        if not callable(create_item):
+            return 0
+        synced = 0
+        for item in items:
+            try:
+                create_item(
+                    dataset_name=name,
+                    id=item.get("id"),
+                    input=item.get("input"),
+                    expected_output=item.get("expected_output"),
+                    metadata=item.get("metadata"),
+                )
+                synced += 1
+            except Exception:
+                continue
+        return synced
+
 
 # ---------------------------------------------------------------------------
 # Helpers

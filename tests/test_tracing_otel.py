@@ -328,6 +328,61 @@ def test_composite_tracer_flush_propagates() -> None:
     assert b.flushes == 1
 
 
+class _ScoringTracer(_RecordingTracer):
+    """Adds the Langfuse eval-score / dataset extension surface (ADR 031 D1)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.eval_scores: list[dict[str, Any]] = []
+        self.datasets: list[dict[str, Any]] = []
+
+    async def score_eval_summary(self, **kwargs: Any) -> None:
+        self.eval_scores.append(kwargs)
+
+    async def sync_dataset(self, **kwargs: Any) -> int:
+        self.datasets.append(kwargs)
+        return len(kwargs.get("items", []))
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_composite_score_eval_summary_fans_out() -> None:
+    """score_eval_summary reaches every delegate that supports it; a plain
+    delegate (no method) is skipped without error."""
+    a, b, plain = _ScoringTracer(), _ScoringTracer(), _RecordingTracer()
+    t = CompositeTracer([a, b, plain])
+    await t.score_eval_summary(trace_id="t1", pass_rate=0.9, mean_score=0.8)
+    assert len(a.eval_scores) == 1
+    assert len(b.eval_scores) == 1
+    assert a.eval_scores[0]["trace_id"] == "t1"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_composite_sync_dataset_fans_out() -> None:
+    a, b = _ScoringTracer(), _ScoringTracer()
+    t = CompositeTracer([a, b])
+    synced = await t.sync_dataset(name="mdk-eval-demo", items=[{"id": "x"}])
+    assert synced == 1
+    assert a.datasets[0]["name"] == "mdk-eval-demo"
+    assert b.datasets[0]["name"] == "mdk-eval-demo"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_composite_eval_extensions_best_effort() -> None:
+    """A raising delegate doesn't stop the others or surface an error."""
+
+    class _Raising(_ScoringTracer):
+        async def score_eval_summary(self, **kwargs: Any) -> None:
+            raise RuntimeError("down")
+
+    good = _ScoringTracer()
+    t = CompositeTracer([_Raising(), good])
+    await t.score_eval_summary(trace_id="t1", pass_rate=1.0, mean_score=1.0)
+    assert len(good.eval_scores) == 1
+
+
 # ---------------------------------------------------------------------------
 # build_tracer dispatch — otel + composite + auto
 # ---------------------------------------------------------------------------

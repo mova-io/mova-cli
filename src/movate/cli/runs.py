@@ -42,6 +42,7 @@ from movate.core.user_config import (
     resolve_target,
 )
 from movate.runtime.schemas import RunView
+from movate.tracing.langfuse_link import langfuse_trace_url
 
 stdout = Console()
 err = Console(stderr=True)
@@ -159,6 +160,11 @@ def _emit(view: RunView, *, output_format: TableJson) -> None:
     table.add_row("latency", f"{view.metrics.latency_ms}ms")
     if view.thread_id:
         table.add_row("thread_id", view.thread_id)
+    # ADR 031 D1 — one-click Langfuse deep link when the run was traced
+    # there + Langfuse is configured locally. Omitted (no row) otherwise.
+    lf_url = langfuse_trace_url(view.metrics.trace_id)
+    if lf_url:
+        table.add_row("langfuse", lf_url)
     if view.error:
         table.add_row("error", f"{view.error.type}: {view.error.message}")
     table.add_row("created_at", view.created_at.isoformat())

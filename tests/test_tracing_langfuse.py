@@ -90,11 +90,44 @@ class _FakeClient:
         self.flushed = 0
         self.shutdowns = 0
         self.scores: list[dict[str, Any]] = []
+        # ADR 031 D1 — dataset upsert surface.
+        self.datasets: list[dict[str, Any]] = []
+        self.dataset_items: list[dict[str, Any]] = []
 
     def start_span(self, *, name: str, metadata: dict[str, Any]) -> _FakeObservation:
         root = _FakeObservation("span", name, metadata)
         self.roots.append(root)
         return root
+
+    def create_dataset(self, *, name: str, description: str | None = None) -> None:
+        # Upsert semantics: only the first create registers the dataset.
+        if not any(d["name"] == name for d in self.datasets):
+            self.datasets.append({"name": name, "description": description})
+
+    def create_dataset_item(
+        self,
+        *,
+        dataset_name: str,
+        id: str | None = None,  # mirrors the Langfuse SDK kwarg
+        input: Any = None,  # mirrors the Langfuse SDK kwarg
+        expected_output: Any = None,
+        metadata: Any = None,
+    ) -> None:
+        # Upsert keyed on (dataset_name, id): a re-sync replaces the row.
+        self.dataset_items = [
+            it
+            for it in self.dataset_items
+            if not (it["dataset_name"] == dataset_name and it["id"] == id)
+        ]
+        self.dataset_items.append(
+            {
+                "dataset_name": dataset_name,
+                "id": id,
+                "input": input,
+                "expected_output": expected_output,
+                "metadata": metadata,
+            }
+        )
 
     def create_score(
         self,
@@ -497,6 +530,125 @@ async def test_langfuse_tracer_push_run_feedback_score_skips_without_trace() -> 
     t = LangfuseTracer(client=fake)
     assert await t.push_run_feedback_score(_Run(), _Feedback()) is None
     assert fake.scores == []
+
+
+# ---------------------------------------------------------------------------
+# score_eval_summary / sync_dataset (ADR 031 D1 extensions)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_score_eval_summary_pushes_passrate_and_dims() -> None:
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    await t.score_eval_summary(
+        trace_id="trace-eval",
+        pass_rate=0.8,
+        mean_score=0.75,
+        dimension_means={"Accuracy": 0.9, "Faithfulness": 0.6},
+    )
+    by_name = {s["name"]: s for s in fake.scores}
+    assert by_name["eval_pass_rate"]["value"] == 0.8
+    assert by_name["eval_pass_rate"]["trace_id"] == "trace-eval"
+    assert by_name["eval_mean_score"]["value"] == 0.75
+    assert by_name["eval_dim_Accuracy"]["value"] == 0.9
+    assert by_name["eval_dim_Faithfulness"]["value"] == 0.6
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_score_eval_summary_pushes_drift_deltas() -> None:
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    await t.score_eval_summary(
+        trace_id="trace-eval",
+        pass_rate=0.5,
+        mean_score=0.5,
+        drift_deltas={"mean_score": -0.2, "pass_rate": -0.1},
+    )
+    by_name = {s["name"]: s for s in fake.scores}
+    assert by_name["eval_drift_mean_score"]["value"] == -0.2
+    assert "drift" in by_name["eval_drift_mean_score"]["comment"]
+    assert by_name["eval_drift_pass_rate"]["value"] == -0.1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_score_eval_summary_noop_without_trace_id() -> None:
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    await t.score_eval_summary(trace_id="", pass_rate=1.0, mean_score=1.0)
+    assert fake.scores == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_score_eval_summary_best_effort_on_raising_client() -> None:
+    """A raising create_score must not surface — the eval result is canonical."""
+
+    class _Raising(_FakeClient):
+        def create_score(self, **kwargs: Any) -> None:  # type: ignore[override]
+            raise RuntimeError("langfuse down")
+
+    t = LangfuseTracer(client=_Raising())
+    # Does not raise.
+    await t.score_eval_summary(trace_id="trace-x", pass_rate=1.0, mean_score=1.0)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sync_dataset_upserts_items() -> None:
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    items = [
+        {"id": "a", "input": {"q": "1"}, "expected_output": {"a": "x"}, "metadata": None},
+        {"id": "b", "input": {"q": "2"}, "expected_output": None, "metadata": {"tag": "t"}},
+    ]
+    synced = await t.sync_dataset(name="mdk-eval-demo", items=items)
+    assert synced == 2
+    assert fake.datasets == [{"name": "mdk-eval-demo", "description": None}]
+    assert {it["id"] for it in fake.dataset_items} == {"a", "b"}
+    assert fake.dataset_items[0]["dataset_name"] == "mdk-eval-demo"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sync_dataset_idempotent_on_rerun() -> None:
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    items = [{"id": "a", "input": {"q": "1"}, "expected_output": None, "metadata": None}]
+    await t.sync_dataset(name="mdk-eval-demo", items=items)
+    await t.sync_dataset(name="mdk-eval-demo", items=items)
+    # Dataset created once; the item upserted (not duplicated).
+    assert len(fake.datasets) == 1
+    assert len(fake.dataset_items) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sync_dataset_noop_without_items_or_name() -> None:
+    fake = _FakeClient()
+    t = LangfuseTracer(client=fake)
+    assert await t.sync_dataset(name="d", items=[]) == 0
+    assert await t.sync_dataset(name="", items=[{"id": "a"}]) == 0
+    assert fake.datasets == []
+    assert fake.dataset_items == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_sync_dataset_best_effort_on_raising_client() -> None:
+    class _Raising(_FakeClient):
+        def create_dataset_item(self, **kwargs: Any) -> None:  # type: ignore[override]
+            raise RuntimeError("langfuse down")
+
+    t = LangfuseTracer(client=_Raising())
+    # Per-item failure is swallowed; nothing synced, no raise.
+    synced = await t.sync_dataset(
+        name="d", items=[{"id": "a", "input": {}, "expected_output": None, "metadata": None}]
+    )
+    assert synced == 0
 
 
 # ---------------------------------------------------------------------------
