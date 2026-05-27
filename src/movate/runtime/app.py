@@ -89,12 +89,21 @@ from movate.runtime.agent_resolver import (
     resolve_agent_bundle,
 )
 from movate.runtime.errors import ErrorCode, auth_required, conflict, http_error, not_found
+from movate.runtime.hardening import (
+    PayloadSizeLimitMiddleware,
+    RequestIdMiddleware,
+    resolve_max_request_bytes,
+)
 from movate.runtime.middleware import (
     AuthContext,
     make_auth_dependency,
     require_scope,
 )
 from movate.runtime.registry import scan_agents
+from movate.runtime.request_context import (
+    REQUEST_ID_HEADER,
+    install_request_id_logging,
+)
 from movate.runtime.schemas import (
     AgentCatalogItemView,
     AgentCatalogView,
@@ -1108,6 +1117,7 @@ def build_app(
     cors_allowed_origins: list[str] | None = None,
     github_client: object | None = None,
     import_tenant_id: str | None = None,
+    max_request_bytes: int | None = None,
 ) -> FastAPI:
     """Build the FastAPI app bound to ``storage`` + ``agents``.
 
@@ -1134,6 +1144,12 @@ def build_app(
     the per-key limiter, per-tenant state is in-process per replica
     (effective tenant limit ≈ ``limit * replica_count`` in v1.x);
     Redis-backed shared state is the documented future seam.
+
+    ``max_request_bytes`` (ADR 033 D6) caps the request body size; an
+    over-large body is rejected with a ``413`` envelope before any
+    handler reads it. ``None`` (the default) → resolved from
+    ``MDK_MAX_REQUEST_BYTES`` else the 25 MiB default; pass ``0`` to
+    disable the guard. Additive — only introduces the new 413 path.
 
     The app's ``state`` carries collaborators so handlers can read
     them without closing over the factory's locals — keeps
@@ -1248,6 +1264,25 @@ def build_app(
     else:
         app.state.github_client = None
 
+    # ------------------------------------------------------------------
+    # Layer-1 API hardening middlewares (ADR 033). Starlette applies
+    # middlewares in REVERSE registration order (last added = outermost),
+    # so the desired wrapping outer→inner is:
+    #     RequestId  →  CORS  →  PayloadSizeLimit  →  app
+    # Register accordingly: payload guard FIRST (innermost), CORS next,
+    # request-id LAST (outermost) so it wraps everything — including the
+    # CORS layer, a 413 from the payload guard, a 429 from the limiter, and
+    # any 5xx — meaning EVERY response carries ``X-Request-Id``.
+    #
+    # D6 — payload size guard (innermost of the three). Rejects an
+    # over-large body with the 413 envelope before any handler reads it.
+    # Mounted unconditionally; a resolved ``0`` (disabled, via
+    # ``MDK_MAX_REQUEST_BYTES=0`` or an explicit ``max_request_bytes=0``)
+    # makes the middleware a pure pass-through (no body buffering).
+    max_body = resolve_max_request_bytes(max_request_bytes)
+    app.state.max_request_bytes = max_body
+    app.add_middleware(PayloadSizeLimitMiddleware, max_bytes=max_body)
+
     # CORS — required for browser-side callers (the Mova iO Angular
     # app). Allow-list resolved from the explicit kwarg, then env vars,
     # then empty (= middleware not mounted). The wildcard ``"*"`` is
@@ -1278,8 +1313,19 @@ def build_app(
                 "X-RateLimit-Tenant-Remaining",
                 "X-RateLimit-Tenant-Reset",
                 "Retry-After",
+                # Per-request correlation id (ADR 033 D2) — let browser JS
+                # read it so a client can surface / report it on errors.
+                REQUEST_ID_HEADER,
             ],
         )
+
+    # D2 — request correlation (OUTERMOST). Added last so it wraps the CORS
+    # layer and the payload guard: binds the per-request id to the logging /
+    # error-envelope context and stamps ``X-Request-Id`` on every response.
+    # Install the matching logging filter so log lines carry the same id (a
+    # no-op-safe, idempotent attach mirroring ADR 024's trace correlation).
+    install_request_id_logging()
+    app.add_middleware(RequestIdMiddleware)
 
     # Build the rate limiter once at app construction so bucket state
     # persists across requests. NoOp when disabled, but the middleware
