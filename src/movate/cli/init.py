@@ -40,6 +40,7 @@ project (project + working agent + dataset).
 
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -1904,18 +1905,31 @@ async def _run_llm_scaffold(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(tmp_dir, dest)
 
-    # F3 (#112): a RAG-shaped scaffold declares the built-in
-    # `kb-vector-lookup` skill. Provision it into the committed project's
-    # `skills/` dir so the written agent loads + validates (its skill +
-    # ADR 023 retrieval.skill resolve) — same as `mdk add` does for an
-    # agent's declared skills. Project root = the nearest project marker
-    # above `dest`, else `dest.parent` (matching the loader's
-    # `_resolve_project_root` fallback). A non-grounding scaffold
-    # declares no skills → this is a no-op.
+    # F3 (#112) + F1' (#137): provision the agent's declared skills into the
+    # committed project's `skills/` dir so the written agent loads + validates
+    # (skill resolution + the ADR 023 retrieval.skill cross-link) — same as
+    # `mdk add` does. The RAG shape declares the built-in `kb-vector-lookup`;
+    # a tool-use shape declares a verb-derived skill that gets a fill-in STUB.
+    # Project root = the nearest project marker above `dest` (project mode →
+    # `<project>/skills/`), else `dest.parent` (`--bare` → beside the agent),
+    # matching the loader's `_resolve_project_root` fallback. A QA /
+    # classifier / summarizer / extraction scaffold declares no skills →
+    # this is a no-op.
     scaffold_project_root = _find_project_root(dest) or dest.parent
     _provision_declared_skills(generated, project_root=scaffold_project_root)
+    # Tool-use stubs the operator must implement — surfaced in the success
+    # panel + next-steps hint (computed after provisioning so a reused skill
+    # isn't reported as a fresh stub).
+    stubbed_skills = _stubbed_skill_names(generated, project_root=scaffold_project_root)
 
-    _render_success_panel(name=name, dest=dest, generated=generated, cost_usd=cost_usd)
+    _render_success_panel(
+        name=name,
+        dest=dest,
+        generated=generated,
+        cost_usd=cost_usd,
+        stubbed_skills=stubbed_skills,
+        project_root=scaffold_project_root,
+    )
 
     # F7 (#116): close the loop — if the description carried a URL and we
     # scaffolded a grounded (RAG) agent, auto-ingest that URL into the new
@@ -2072,16 +2086,30 @@ def _validate_sample_evals(generated: Any) -> str | None:
 # the retrieval.skill cross-link check resolve. Keyed by the skill name
 # the agent declares; value is informational (the actual template lookup
 # happens in `_scaffold_one_skill` via `SKILL_TEMPLATES`).
+#
+# F1' (#137) generalizes this: a TOOL-USE scaffold declares a NON-built-in
+# skill (a verb-derived name like `create-ticket`). That skill won't match a
+# curated template, so `_scaffold_one_skill` falls back to the `skill_init`
+# echo stub — a `skill.yaml` + TODO handler the operator fills in. We
+# provision EVERY declared skill that has no curated template AND looks like
+# a fresh tool-use stub, so the scaffolded agent loads + validates + runs
+# offline instead of failing skill resolution.
 _SCAFFOLDABLE_BUILTIN_SKILLS = frozenset({"kb-vector-lookup"})
+
+# A declared skill name we'll auto-stub must look like a valid skill slug
+# (lowercase, leading letter, hyphen-separated) — the same charset
+# `mdk add skill` enforces. An LLM that emits a malformed name is left to
+# fail loudly at skill resolution rather than scaffolding a junk directory.
+_SKILL_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 
 
 def _declared_skills(generated: Any) -> list[str]:
     """Return the agent's declared ``skills:`` list (empty if absent).
 
-    The generated ``agent_yaml`` is a plain dict; a non-grounding
-    scaffold has no ``skills`` key, so this returns ``[]`` and the
-    provisioning / RAG paths below are all no-ops (the non-grounding
-    shape stays byte-for-byte unchanged).
+    The generated ``agent_yaml`` is a plain dict; a non-grounding,
+    non-tool-use scaffold has no ``skills`` key, so this returns ``[]``
+    and the provisioning paths below are all no-ops (those shapes stay
+    byte-for-byte unchanged).
     """
     skills = getattr(generated, "agent_yaml", {}).get("skills")
     if not isinstance(skills, list):
@@ -2089,27 +2117,62 @@ def _declared_skills(generated: Any) -> list[str]:
     return [s for s in skills if isinstance(s, str)]
 
 
+def _stubbed_skill_names(generated: Any, *, project_root: Path) -> list[str]:
+    """Declared skills that WOULD be auto-stubbed as fresh tool-use stubs.
+
+    A declared skill is stubbed when it is NOT a curated built-in
+    (:data:`_SCAFFOLDABLE_BUILTIN_SKILLS`), has a valid slug name, and
+    isn't already present under ``<project_root>/skills/``. Used by the
+    success panel to point the operator at the TODO they must implement —
+    computed AFTER provisioning so an already-present skill (reused across
+    agents) isn't reported as a new stub.
+
+    Returns names in declaration order; empty for the RAG / non-tool-use
+    shapes (no fresh stub to flag).
+    """
+    return [
+        name
+        for name in _declared_skills(generated)
+        if name not in _SCAFFOLDABLE_BUILTIN_SKILLS
+        and _SKILL_NAME_RE.fullmatch(name) is not None
+        and (project_root / "skills" / name).is_dir()
+    ]
+
+
 def _provision_declared_skills(generated: Any, *, project_root: Path) -> None:
-    """Scaffold any declared built-in skills into ``<project_root>/skills/``.
+    """Scaffold declared skills into ``<project_root>/skills/``.
 
-    F3 (#112): a RAG-shaped scaffold declares the built-in
-    ``kb-vector-lookup`` skill. The skill registry is built from
-    ``<project_root>/skills/`` — so the skill must physically exist there
-    for ``load_agent`` to resolve it (both in the validation tempdir and
-    in the committed project). Reuses the same ``_scaffold_one_skill``
-    code path ``mdk add`` uses to auto-scaffold declared skills, so the
-    on-disk skill is identical to what an operator would get.
+    Two kinds of declared skill get provisioned:
 
-    Only provisions skills in :data:`_SCAFFOLDABLE_BUILTIN_SKILLS` that
-    aren't already present — an ad-hoc skill name the LLM invents is left
-    to fail loudly at skill resolution (a real misconfiguration), and an
-    existing project skill is never clobbered (idempotent). A
-    non-grounding scaffold declares no skills → this is a no-op.
+    * **Curated built-ins** (:data:`_SCAFFOLDABLE_BUILTIN_SKILLS`) — F3
+      (#112): a RAG-shaped scaffold declares ``kb-vector-lookup`` (the ADR
+      023 retrieval skill). ``_scaffold_one_skill`` copies its REAL packaged
+      template so the retrieval.skill cross-link resolves.
+    * **Tool-use stubs** (F1', #137) — a tool-use scaffold declares a
+      verb-derived skill (e.g. ``create-ticket``) that has no curated
+      template. ``_scaffold_one_skill`` falls back to the ``skill_init`` echo
+      template: a valid ``skill.yaml`` + a TODO handler the operator fills
+      in, so the agent loads + validates + ``mdk run --mock`` works.
+
+    The skill registry is built from ``<project_root>/skills/`` — so the
+    skill must physically exist there for ``load_agent`` to resolve it (both
+    in the validation tempdir and in the committed project). Reuses the same
+    ``_scaffold_one_skill`` code path ``mdk add`` uses, so the on-disk skill
+    is identical to what an operator would get.
+
+    Idempotent: an existing project skill is never clobbered. A malformed
+    skill name (not a valid slug) is left to fail loudly at skill resolution
+    rather than scaffolding a junk directory. A QA / classifier / summarizer
+    / extraction scaffold declares no skills → this is a no-op.
     """
     from movate.cli.add_cmd import _scaffold_one_skill  # noqa: PLC0415
 
     for skill_name in _declared_skills(generated):
-        if skill_name not in _SCAFFOLDABLE_BUILTIN_SKILLS:
+        is_builtin = skill_name in _SCAFFOLDABLE_BUILTIN_SKILLS
+        # Skip ad-hoc names that aren't valid skill slugs (other than the
+        # curated built-ins, which are always allowed). Such a name is a
+        # real misconfiguration — surface it at skill resolution, not here.
+        if not is_builtin and _SKILL_NAME_RE.fullmatch(skill_name) is None:
             continue
         if (project_root / "skills" / skill_name).exists():
             continue
@@ -2670,8 +2733,24 @@ def _render_dry_run_preview(generated: Any, *, name: str, dest: Path) -> None:
     )
 
 
-def _render_success_panel(*, name: str, dest: Path, generated: Any, cost_usd: float | None) -> None:
-    """Print the success Panel — mirrors the template-copy success path."""
+def _render_success_panel(
+    *,
+    name: str,
+    dest: Path,
+    generated: Any,
+    cost_usd: float | None,
+    stubbed_skills: list[str] | None = None,
+    project_root: Path | None = None,
+) -> None:
+    """Print the success Panel — mirrors the template-copy success path.
+
+    ``stubbed_skills`` (F1', #137) names any tool-use skill STUBS scaffolded
+    alongside the agent; when present the panel lists each stub's location +
+    a TODO line so the operator knows it's a runnable starting point they
+    must finish, not a finished integration. ``project_root`` is where the
+    ``skills/`` dir lives (the project root in project mode, the agent's
+    parent in ``--bare``) — used to print the stub's exact path.
+    """
     body = (
         f"[bold]Agent:[/bold]    [cyan]{name}[/cyan]\n"
         f"[bold]Path:[/bold]     [cyan]{dest}[/cyan]\n"
@@ -2688,6 +2767,18 @@ def _render_success_panel(*, name: str, dest: Path, generated: Any, cost_usd: fl
             f"  • [cyan]evals/judge.yaml.example[/cyan] "
             f"[dim](rename to judge.yaml to enable LLM-as-judge)[/dim]\n"
         )
+    # F1' (#137): tool-use skill stubs. List each stub's skill.yaml + handler
+    # so the operator can find the TODO to implement.
+    if stubbed_skills:
+        skills_base = (project_root / "skills") if project_root is not None else Path("skills")
+        body += "[bold]Skill stubs[/bold] [dim](implement the TODO):[/dim]\n"
+        for skill in stubbed_skills:
+            skill_dir = skills_base / skill
+            body += (
+                f"  • [cyan]{skill_dir / 'skill.yaml'}[/cyan]\n"
+                f"  • [cyan]{skill_dir / 'impl.py'}[/cyan] "
+                f"[dim](TODO: wire up the real call)[/dim]\n"
+            )
     if cost_usd is not None:
         # Cost line — typical scaffold runs are <$0.01; format with
         # enough decimals to read meaningfully at that scale.
@@ -2697,9 +2788,19 @@ def _render_success_panel(*, name: str, dest: Path, generated: Any, cost_usd: fl
         f"  [dim]$[/dim] [bold]mdk validate {dest}[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk run {dest} --mock '{{...}}'[/bold]\n"
         f"  [dim]$[/dim] [bold]mdk eval {dest} --mock --gate 0.7[/bold]\n\n"
-        f"[dim]scaffolded by --llm · review prompt.md and the schemas "
-        f"before first real run.[/dim]"
     )
+    if stubbed_skills:
+        stub_word = "stub" if len(stubbed_skills) == 1 else "stubs"
+        names = ", ".join(stubbed_skills)
+        body += (
+            f"[dim]scaffolded by --llm · this agent uses a tool: implement the "
+            f"skill {stub_word} ([bold]{names}[/bold]) before first real run.[/dim]"
+        )
+    else:
+        body += (
+            "[dim]scaffolded by --llm · review prompt.md and the schemas "
+            "before first real run.[/dim]"
+        )
     console.print(
         Panel(
             body,

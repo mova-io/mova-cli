@@ -156,6 +156,7 @@ class TestCacheableMetaPromptPrefix:
             _EXAMPLE_FAQ,
             _EXAMPLE_RAG,
             _EXAMPLE_SUMMARIZER,
+            _EXAMPLE_TOOL_USE,
             _META_PROMPT,
         )
 
@@ -168,6 +169,7 @@ class TestCacheableMetaPromptPrefix:
             example_summarizer=_EXAMPLE_SUMMARIZER,
             example_extraction=_EXAMPLE_EXTRACTION,
             example_rag=_EXAMPLE_RAG,
+            example_tool_use=_EXAMPLE_TOOL_USE,
         )
 
     def test_static_block_precedes_variable_suffix(self) -> None:

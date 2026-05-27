@@ -222,6 +222,170 @@ def _detect_shape(description: str) -> str:
     return "qa"
 
 
+# --- Tool-use intent detection (F1', #137) --------------------------------
+#
+# Symmetric to grounding/RAG (F3): when the description implies the agent
+# must TAKE AN ACTION through an external tool — "create a ticket", "look up
+# an order", "send a Slack message", "query the CRM", "book a meeting" — the
+# offline `--mock` path emits a TOOL-USE scaffold (a `{answer, confidence}`
+# agent wired to a SKILL STUB the operator fills in). Mirrors the
+# meta-prompt's TOOL-USE shape so the real LLM and the mock agree.
+#
+# Each marker is an (action-verb, object-cue) pair so we only fire on a verb
+# that's clearly about doing something to an external system — NOT on a pure
+# Q&A / classify / summarize / extract description. Deliberately
+# CONSERVATIVE: a false-positive scaffolds a stub the user doesn't want,
+# which is worse than missing one (they can `mdk add skill` by hand). Phrases
+# like "answer questions" / "look things up in our docs" must NOT match —
+# those are grounding (checked first) or QA.
+_TOOL_USE_VERB_PHRASES = (
+    "create a ",
+    "create an ",
+    "open a ",
+    "open an ",
+    "file a ",
+    "raise a ",
+    "look up ",
+    "look up an ",
+    "look up the ",
+    "fetch the ",
+    "send a ",
+    "send an ",
+    "send the ",
+    "post a ",
+    "post to ",
+    "book a ",
+    "book an ",
+    "schedule a ",
+    "schedule an ",
+    "place an order",
+    "update the ",
+    "update a ",
+    "query the ",
+    "search the ",
+    "cancel the ",
+    "cancel an ",
+    "trigger a ",
+    "call the ",
+)
+
+# Object cues that confirm an EXTERNAL SYSTEM is the action target. A
+# tool-use match requires BOTH a verb phrase AND a system cue so "create a
+# summary" (a verb phrase, but no external system) stays a non-tool shape.
+_TOOL_USE_SYSTEM_CUES = (
+    "ticket",
+    "order",
+    "slack",
+    "email",
+    "message",
+    "crm",
+    "calendar",
+    "meeting",
+    "jira",
+    "salesforce",
+    "github",
+    "issue",
+    "pull request",
+    "invoice",
+    "payment",
+    "api",
+    "webhook",
+    "database",
+    "record",
+    "appointment",
+    "reservation",
+    "shipment",
+    "refund",
+)
+
+
+def _looks_like_tool_use_description(description: str) -> bool:
+    """True when ``description`` implies the agent must CALL A TOOL (F1', #137).
+
+    The agent needs to take an action against an external system —
+    create a ticket, look up an order, send a Slack message, book a
+    meeting. Requires BOTH an action-verb phrase AND an external-system
+    cue, so a pure Q&A / classify / summarize / extract description never
+    matches. Used by the offline ``--mock`` scaffold path to emit a
+    tool-use scaffold (a `{answer, confidence}` agent wired to a skill
+    stub) deterministically — mirroring the meta-prompt's TOOL-USE shape.
+
+    Conservative by design: grounding/RAG is decided FIRST elsewhere (see
+    :func:`_looks_like_grounding_description`), so a "answer questions
+    about our docs" description is grounding, not tool-use. Substring
+    match on a lowercased description.
+    """
+    haystack = description.lower()
+    has_verb = any(phrase in haystack for phrase in _TOOL_USE_VERB_PHRASES)
+    has_system = any(cue in haystack for cue in _TOOL_USE_SYSTEM_CUES)
+    return has_verb and has_system
+
+
+# Stop-words dropped when deriving a skill name from the description so the
+# slug is the verb+object, not a sentence. Kept tiny — just the connective
+# words that show up between "create" and "ticket".
+_SKILL_NAME_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "our",
+        "their",
+        "with",
+        "and",
+        "that",
+        "this",
+        "agent",
+        "please",
+        "can",
+        "should",
+        "new",
+    }
+)
+
+
+def _derive_skill_name(description: str, *, default: str = "external-action") -> str:
+    """Derive a hyphenated skill-stub name from a tool-use ``description``.
+
+    Picks the first matching action-verb phrase and the first system cue,
+    stitching them into a slug like ``create-ticket`` / ``lookup-order`` /
+    ``send-slack-message``. Deterministic + offline. Falls back to
+    ``default`` when nothing useful can be slugged (the caller still
+    scaffolds a valid stub — only the name is generic).
+
+    The slug obeys the skill-name rule (lowercase, starts with a letter,
+    hyphen-separated) so it scaffolds + loads without coercion.
+    """
+    import re as _re  # noqa: PLC0415
+
+    haystack = description.lower()
+    verb = ""
+    for phrase in _TOOL_USE_VERB_PHRASES:
+        if phrase in haystack:
+            # First token of the phrase is the verb ("create", "look", …).
+            verb = phrase.strip().split()[0]
+            break
+    system = ""
+    for cue in _TOOL_USE_SYSTEM_CUES:
+        if cue in haystack:
+            system = cue
+            break
+
+    parts = [p for p in (verb, *system.split()) if p and p not in _SKILL_NAME_STOPWORDS]
+    slug = "-".join(parts)
+    # Sanitize to the skill-name charset and collapse repeats.
+    slug = _re.sub(r"[^a-z0-9-]+", "-", slug).strip("-")
+    slug = _re.sub(r"-{2,}", "-", slug)
+    if not slug or not slug[0].isalpha():
+        return default
+    return slug
+
+
 def _parse_scaffold_description(body: str) -> str:
     """Pull the operator's description out of the scaffold meta-prompt.
 
@@ -717,6 +881,107 @@ def _build_extraction_scaffold_response(name: str) -> str:
     return json.dumps(payload)
 
 
+def _build_tool_use_scaffold_response(name: str, *, skill_name: str) -> str:
+    """Return a valid TOOL-USE ``GeneratedAgent`` JSON payload (F1', #137).
+
+    Emitted by the offline ``--mock`` path when the description implies the
+    agent must CALL A TOOL (see :func:`_looks_like_tool_use_description`).
+    Symmetric to the RAG shape (F3): instead of pre-retrieval into context,
+    it declares a NON-built-in ``skills: [<skill_name>]`` entry that the CLI
+    materializes as a skill STUB the operator fills in. The agent answers in
+    a generic ``{answer, confidence}`` shape — the action happens inside the
+    tool call, not the output schema.
+
+    Shape:
+
+    * ``agent_yaml.skills = [skill_name]`` — the stubbed tool the Executor
+      exposes to the model. Provisioned by ``_provision_declared_skills`` in
+      the CLI (default echo template → a clearly-TODO handler stub).
+    * NO ``retrieval`` block — that key is exclusive to the RAG shape.
+    * a ``{request}`` input field (the user's natural-language ask) and a
+      ``{answer, confidence}`` output — the conversational result after the
+      tool runs.
+    * a prompt that tells the model to use the available tool to fulfil the
+      request, then summarize the outcome.
+
+    Engineered to pass ``GeneratedAgent.model_validate`` AND ``load_agent()``
+    once the declared skill stub is provisioned alongside the agent (the CLI
+    does this for both the validation tempdir and the committed scaffold).
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": {
+            "api_version": "movate/v1",
+            "kind": "Agent",
+            "name": name,
+            "version": "0.1.0",
+            "description": (
+                "Takes an action on the user's behalf by calling a tool, then "
+                "reports the outcome. The tool is a scaffolded stub — implement "
+                "its handler to wire up the real integration."
+            ),
+            "owner": "",
+            "model": {
+                "provider": "openai/gpt-4o-mini-2024-07-18",
+                "params": {"temperature": 0.0, "max_tokens": 512},
+            },
+            "prompt": "./prompt.md",
+            "schema": {
+                "input": "./schema/input.yaml",
+                "output": "./schema/output.yaml",
+            },
+            "evals": {"dataset": "./evals/dataset.jsonl"},
+            "tags": ["tool-use", "action"],
+            "skills": [skill_name],
+        },
+        "prompt_md": (
+            "You are an action-taking assistant. You have a tool available to "
+            "fulfil the user's request — use it when the request needs an "
+            "external action, then summarize what happened.\n\n"
+            "# Request\n"
+            "{{ input.request }}\n\n"
+            "Call the tool with the right arguments, wait for its result, and "
+            "report the outcome to the user. If you cannot complete the action, "
+            "explain why.\n\n"
+            "Respond with a single JSON object on one line:\n"
+            '{"answer": "<what you did / the outcome>", "confidence": <0.0-1.0>}'
+        ),
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["request"],
+            "properties": {"request": {"type": "string", "minLength": 1}},
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer", "confidence"],
+            "properties": {
+                "answer": {"type": "string", "minLength": 1},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        "sample_evals": [
+            {
+                "input": {"request": "Create a ticket for the broken login button."},
+                "expected": {
+                    "answer": "Created a ticket for the broken login button.",
+                    "confidence": 0.9,
+                },
+            },
+            {
+                "input": {"request": "Look up the status of order 12345."},
+                "expected": {
+                    "answer": "Order 12345 is in transit, expected to arrive tomorrow.",
+                    "confidence": 0.85,
+                },
+            },
+        ],
+    }
+    return json.dumps(payload)
+
+
 # Dispatch table for the non-grounding shapes (F2, #111). Keyed by the shape
 # name :func:`_detect_shape` returns; grounding/RAG is handled separately in
 # :func:`_build_scaffold_response` (it has its own detector + builder).
@@ -729,7 +994,11 @@ _SHAPE_BUILDERS = {
 
 
 def _build_scaffold_response(
-    name: str, *, grounding: bool = False, shape: str | None = None
+    name: str,
+    *,
+    grounding: bool = False,
+    tool_use_skill: str | None = None,
+    shape: str | None = None,
 ) -> str:
     """Return a valid ``GeneratedAgent`` JSON payload for the right SHAPE.
 
@@ -737,6 +1006,9 @@ def _build_scaffold_response(
 
     * ``grounding=True`` (F3, #112) → the RAG-shaped scaffold
       (:func:`_build_rag_scaffold_response`). Checked FIRST and unchanged.
+    * ``tool_use_skill`` set (F1', #137) → the TOOL-USE scaffold
+      (:func:`_build_tool_use_scaffold_response`) wired to that skill stub.
+      Checked after grounding (a grounded description never tool-uses).
     * otherwise (F2, #111) the ``shape`` arg picks a single-turn shape:
       ``"classifier"`` → ``{label, confidence}``, ``"summarizer"`` →
       ``{summary, key_points}``, ``"extraction"`` → structured named
@@ -754,6 +1026,8 @@ def _build_scaffold_response(
     """
     if grounding:
         return _build_rag_scaffold_response(name)
+    if tool_use_skill:
+        return _build_tool_use_scaffold_response(name, skill_name=tool_use_skill)
     builder = _SHAPE_BUILDERS.get(shape or "qa", _build_qa_scaffold_response)
     return builder(name)
 
@@ -873,7 +1147,22 @@ class MockProvider(BaseLLMProvider):
             if _looks_like_grounding_description(description):
                 text = _build_scaffold_response(scaffold_name, grounding=True)
             else:
-                text = _build_scaffold_response(scaffold_name, shape=_detect_shape(description))
+                # F2 (#111) shape FIRST: a clear transformation shape
+                # (classifier / summarizer / extraction) wins outright, so a
+                # "create a summary of the meeting" description stays a
+                # summarizer rather than being mistaken for tool-use.
+                shape = _detect_shape(description)
+                if shape == "qa" and _looks_like_tool_use_description(description):
+                    # F1' (#137): no transformation shape matched but the
+                    # description implies an external action → tool-use
+                    # scaffold wired to a skill stub. Conservative: only
+                    # fires when the description would otherwise fall through
+                    # to the generic QA shape.
+                    text = _build_scaffold_response(
+                        scaffold_name, tool_use_skill=_derive_skill_name(description)
+                    )
+                else:
+                    text = _build_scaffold_response(scaffold_name, shape=shape)
         elif self._dataset_expecteds and self._response_is_default:
             # Cycle through dataset rows in order. Wraps at the end so
             # callers that exceed dataset length still get valid output
