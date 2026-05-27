@@ -6,6 +6,34 @@ per commit). Releases prior to 2026-05 used SemVer (`v0.x`); those tags remain a
 
 ## [Unreleased]
 
+### Added — Per-step execution tree in `mdk explain` / `mdk trace replay` (ADR 024, PR 2 of 3)
+
+**The retained per-step shape (PR 1) now renders as a tree, so "where did the
+time/cost/tokens go in this run?" is answerable at a glance — offline, with no
+Langfuse / OTel backend.** This is D3 (CLI tree rendering); it reads the
+`turns` + `skill_calls` PR 1 retained, changes no executor / model / storage
+code, and leaves every fallback intact.
+
+- **Turn → skill/retrieval tree (D3).** `mdk explain --steps` now leads with a
+  Rich `Tree`: `run <short-id> <status> <total cost · latency>` → `turn N`
+  (model · in/out tokens · cost · latency · finish_reason) → `retrieval.<skill>`
+  / `skill.<name>` children (ok|err · cost · latency), grouped under the turn
+  that dispatched them (via `SkillCallRecord.turn`). `mdk trace replay <id>`
+  renders the same tree for the replayed agent run.
+- **Flat table preserved.** The existing flat skill-call table still renders
+  beneath the tree under `--steps` (kept for narrow terminals / scripts); the
+  default (no `--steps`) output and its one-line hint are unchanged.
+- **`--json` is additive only.** `mdk explain --json` gains a `turns` array
+  (`[]` for legacy / single-shot runs); no pre-existing key is renamed or
+  removed. The `/api/v1/runs/{id}/explain` endpoint shape is unchanged — it
+  reads named keys, so the new key never reaches its `extra="forbid"` view.
+- **Legacy / single-node back-compat.** A record with empty `turns` (old
+  record, or a single completion predating the field) degrades to one
+  synthesized node built from run-level `Metrics`; any orphan / pre-retrieval
+  (turn 0) skill calls hang under it so nothing is dropped. A single-turn,
+  no-skill run renders as a one-turn tree. The renderer never crashes on a
+  sparse record.
+
 ### Added — Per-step execution observability backbone (ADR 024, PR 1 of 3)
 
 **Every run now retains its internal shape — each LLM turn, each skill/tool

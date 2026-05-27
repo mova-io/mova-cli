@@ -9,6 +9,12 @@ The shape is the machine-readable decision chain: the run's identity +
 status, its input, the single LLM-call summary (model, tokens, latency,
 cost), the output (or error), and either the full per-step ``skill_calls``
 (when ``steps=True``) or a one-line hint about how many there are.
+
+ADR 024 (PR 2) adds an additive ``turns`` key — the retained per-turn LLM
+round-trips that back the ``mdk explain`` / ``mdk trace replay`` execution
+tree. It is **additive only**: every pre-existing key keeps its name and
+shape, so existing ``--json`` consumers and the runtime endpoint are
+unaffected. Legacy records (no ``turns``) emit ``turns: []``.
 """
 
 from __future__ import annotations
@@ -42,6 +48,10 @@ def explain_run(record: RunRecord, *, steps: bool = False) -> dict[str, Any]:
         },
         "output": record.output,
         "error": record.error.model_dump() if record.error else None,
+        # Additive (ADR 024 D2/D3): the retained per-turn breakdown backing the
+        # execution tree. Always present (``[]`` for legacy / single-shot runs)
+        # so consumers can read it unconditionally; no pre-existing key changed.
+        "turns": [t.model_dump() for t in (record.turns or [])],
     }
     if steps:
         chain["skill_calls"] = [s.model_dump() for s in (record.skill_calls or [])]
