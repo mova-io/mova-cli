@@ -30,15 +30,28 @@ class ErrorCode(StrEnum):
     CONFLICT = "conflict"
     INTERNAL = "internal"
     RATE_LIMITED = "rate_limited"
+    # ADR 033 D6 — request body exceeded the configured size limit (413).
+    # Additive: a NEW stable code, distinct from BAD_REQUEST so a client can
+    # special-case "shrink the payload" without string-matching the message.
+    PAYLOAD_TOO_LARGE = "payload_too_large"
 
 
 class ErrorBody(BaseModel):
-    """Inner payload of every error response."""
+    """Inner payload of every error response.
+
+    ``request_id`` (ADR 033 D2) is the per-request correlation id, set to the
+    same value as the ``X-Request-Id`` response header so a caller can quote
+    one id when reporting a 4xx/5xx. It's ``None`` only when an error is built
+    entirely outside a request scope (e.g. a unit test calling a helper
+    directly); inside the runtime the request-id middleware always has a value
+    bound. Additive + optional → existing consumers that read only ``code`` /
+    ``message`` are unaffected."""
 
     model_config = ConfigDict(extra="forbid")
 
     code: ErrorCode
     message: str
+    request_id: str | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -61,11 +74,24 @@ def http_error(
     Default ``message`` is the code's human form; pass ``message`` to
     override (e.g. ``message="job 'xyz' not found"``). Auth-related
     callers should NEVER pass a discriminating message.
+
+    ``error.request_id`` (ADR 033 D2) is stamped from the active request-id
+    context (set by ``RequestIdMiddleware``), so the body's id matches the
+    ``X-Request-Id`` response header for the same request. Outside a request
+    scope the context default is ``""`` → serialized as ``None`` so the field
+    stays cleanly absent of a fake id.
     """
+    # Read lazily to avoid a hard import cycle at module import time and to
+    # keep this stdlib-only module decoupled from the contextvar machinery's
+    # eager init.
+    from movate.runtime.request_context import get_request_id  # noqa: PLC0415
+
+    request_id = get_request_id() or None
     body = ErrorResponse(
         error=ErrorBody(
             code=code,
             message=message or code.value.replace("_", " "),
+            request_id=request_id,
         )
     )
     return HTTPException(
