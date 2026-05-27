@@ -910,45 +910,57 @@ def _check_kb_corpus(bundle: AgentBundle) -> None:
 
 
 def _check_vector_kb_empty(bundle: AgentBundle, con: Console) -> None:
-    """Warn when a kb-vector-lookup skill is declared but the vector KB has 0 chunks.
+    """Warn when an agent is RAG-shaped but its vector KB has 0 chunks (D7c / #134).
 
-    The #1 silent RAG failure: operator adds ``kb-vector-lookup`` to skills
-    but never ran ``mdk kb ingest``, so every retrieval call returns empty.
-    This check probes the local vector KB and warns if no chunks are indexed.
+    The #1 silent RAG failure: an agent retrieves from a knowledge base —
+    because it declares a ``kb-vector-lookup`` skill and/or opts into ADR-023
+    pre-retrieval (``retrieval.auto_into``) — but ``mdk kb ingest`` was never
+    run, so every retrieval call returns empty and answers come back
+    ungrounded. This check probes the local vector KB and warns (never errors)
+    if no chunks are indexed, naming the exact ingest command to fix it.
+
+    RAG-shape detection is shared with ``mdk dev``'s proactive offer
+    (:func:`movate.kb.grounding_gap.is_rag_shaped`) so the two surfaces agree
+    on what counts as RAG-shaped.
 
     Wrapped in a broad ``except Exception`` so a missing or uninitialized
     database never causes validate to fail.
     """
-    # Fast path: skip entirely if no KB-vector skill is declared.
-    if not any("kb-vector" in s.spec.name.lower() for s in bundle.skills):
+    from movate.kb.grounding_gap import kb_is_empty  # noqa: PLC0415
+
+    # Fast path: skip entirely unless the agent is RAG-shaped. We use the
+    # resolved skills (or the ADR-023 retrieval flag) so a kb-vector skill
+    # wired by name OR an auto_into-only RAG agent both trigger the check.
+    spec = bundle.spec
+    rag_shaped = (
+        any("kb-vector" in s.spec.name.lower() for s in bundle.skills)
+        or spec.retrieval.auto_retrieval_enabled
+    )
+    if not rag_shaped:
         return
 
     async def _probe() -> bool:
-        """Return True if >=1 chunk exists, False if 0.  Raise on any error."""
+        """Return True if the KB is empty (0 chunks).  Raise on any error."""
         from movate.storage import build_storage  # noqa: PLC0415
 
         s = build_storage()
         await s.init()
         try:
-            chunks = await s.list_kb_chunks(agent=bundle.spec.name, tenant_id="local", limit=1)
-            return len(chunks) > 0
+            return await kb_is_empty(s, agent=spec.name)
         finally:
             await s.close()
 
     try:
-        has_chunks = asyncio.run(_probe())
+        empty = asyncio.run(_probe())
     except Exception:
         return  # storage not ready / DB missing — skip silently
 
-    if not has_chunks:
+    if empty:
         con.print(
-            "  [yellow]![/yellow] skill [bold]'kb-vector-lookup'[/bold] is wired "
-            "but the vector KB has 0 chunks."
+            "  [yellow]![/yellow] agent [bold]is RAG-shaped[/bold] (retrieves from a "
+            "knowledge base) but the vector KB has 0 chunks — answers will be ungrounded."
         )
-        con.print(
-            f"    hint: run [bold]mdk kb ingest {bundle.spec.name} "
-            f"./agents/{bundle.spec.name}/kb/[/bold]"
-        )
+        con.print(f"    hint: run [bold]mdk kb ingest {spec.name} ./agents/{spec.name}/kb/[/bold]")
         con.print("          or   [bold]mdk kb ingest-all[/bold] to scan the whole project.")
 
 
