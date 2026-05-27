@@ -36,8 +36,6 @@ from __future__ import annotations
 import contextlib
 import difflib
 import json
-import os
-import shutil
 import subprocess
 import sys
 import time
@@ -53,7 +51,7 @@ from rich.prompt import Prompt
 from movate.cli import _console
 from movate.cli._completion import complete_agent_path
 from movate.cli._next_steps import mdk_bin_name
-from movate.cli._resolve import resolve_agent_or_workflow_arg, walk_up_for_project_root
+from movate.cli._resolve import resolve_agent_arg, walk_up_for_project_root
 from movate.cli.contexts_cmd import _CONTEXT_TEMPLATE, attach_context_to_agent
 from movate.cli.watch import _compute_watched_paths, _snapshot_mtimes, dispatch_run_once
 from movate.core.loader import AgentLoadError, load_agent
@@ -205,9 +203,17 @@ def _resolve_or_scaffold(
             _console.error("no agent name given")
             return None
 
-    resolved = Path(resolve_agent_or_workflow_arg(agent))
-    if (resolved / "agent.yaml").is_file():
-        return resolved.resolve()
+    # Name/path resolution (ADR 026 D2): the shared resolver backs run /
+    # validate / dev. `dev` differs in the not-found case — instead of a
+    # friendly error it falls through to SCAFFOLDING the agent (the whole
+    # point of `mdk dev <new-name>`). `mdk dev .` + a standalone agent dir
+    # are first-class via the resolver's existing-path-wins rule.
+    try:
+        resolved = resolve_agent_arg(agent)
+        if (resolved / "agent.yaml").is_file():
+            return resolved.resolve()
+    except FileNotFoundError:
+        pass
 
     # Doesn't exist — scaffold it. We need a project to scaffold into.
     project_root = walk_up_for_project_root()
@@ -925,24 +931,17 @@ def _grounding_action(agent_dir: Path) -> None:
 
 
 def _open_in_editor(path: Path) -> None:
-    """Best-effort: open ``path`` in $EDITOR / VS Code / Cursor, else print it."""
-    editor = os.environ.get("EDITOR")
-    argv: list[str] | None = None
-    if editor:
-        argv = [*editor.split(), str(path)]
-    elif shutil.which("code"):
-        argv = ["code", str(path)]
-    elif shutil.which("cursor"):
-        argv = ["cursor", str(path)]
+    """Best-effort: open ``path`` in $EDITOR / VS Code / Cursor, else print it.
 
-    if argv is None:
-        err.print(f"[dim]no $EDITOR set — open it manually: {path}[/dim]")
-        return
-    try:
-        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        err.print(f"[dim]opening {path} in your editor…[/dim]")
-    except OSError as exc:
-        err.print(f"[yellow]⚠[/yellow] couldn't launch editor: {exc} — open {path} manually")
+    Delegates to the ONE shared launcher (:func:`movate.cli.init._launch_editor`,
+    ADR 026 D3) so init + dev share identical gating (TTY-only, best-effort,
+    $EDITOR → code → cursor → open). Called from the interactive `edit` menu
+    action (already TTY-gated), so ``open_editor=True`` here; a launch miss
+    prints the manual hint."""
+    from movate.cli.init import _launch_editor  # noqa: PLC0415
+
+    if not _launch_editor(path, open_editor=True):
+        err.print(f"[dim]no editor available — open it manually: {path}[/dim]")
 
 
 def _run_subcommand(argv: list[str]) -> None:

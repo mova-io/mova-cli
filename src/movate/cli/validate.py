@@ -157,11 +157,17 @@ def validate(
         )
         raise typer.Exit(code=2)
 
-    # Bare-name resolution: `mdk validate rag-qa` → `./agents/rag-qa`
-    # when inside a project. Full paths pass through unchanged.
-    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+    # Name/path resolution (ADR 026 D2): existing path wins, else a bare
+    # name resolves under the project's ``agents/`` / ``workflows/``, else a
+    # friendly not-found error. `mdk validate .` + a standalone agent dir
+    # are first-class. The shared resolver backs run / validate / dev.
+    from movate.cli._resolve import resolve_agent_arg  # noqa: PLC0415
 
-    path = Path(resolve_agent_or_workflow_arg(str(path)))
+    try:
+        path = resolve_agent_arg(str(path))
+    except FileNotFoundError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
 
     if is_workflow_path(path):
         if json_output:

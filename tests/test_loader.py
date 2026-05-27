@@ -55,7 +55,10 @@ def test_render_prompt_undefined_variable_fails(tmp_path: Path) -> None:
 
 @pytest.mark.unit
 def test_load_missing_directory(tmp_path: Path) -> None:
-    with pytest.raises(AgentLoadError, match="not a directory"):
+    # ADR 026 D2: the loader's missing-dir message reads as a clear
+    # diagnostic; CLI commands intercept the bare-name case earlier with a
+    # command-aware hint (see movate.cli._resolve.resolve_agent_arg).
+    with pytest.raises(AgentLoadError, match="no agent directory at"):
         load_agent(tmp_path / "does-not-exist")
 
 

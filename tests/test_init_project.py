@@ -200,11 +200,20 @@ def test_init_project_named_force_wipes_and_recreates(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_agent_mode_still_works(tmp_path: Path) -> None:
-    """mdk init <name> without --project still scaffolds an agent."""
-    result = runner.invoke(app, ["init", "my-agent", "-t", "default", "--target", str(tmp_path)])
+def test_agent_mode_still_works(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`mdk init <name> -t <tmpl> --bare` still scaffolds a STANDALONE
+    agent dir (ADR 026 D1: --bare is the escape hatch for the legacy
+    single-dir output; the non-bare default now yields a project)."""
+    # chdir to a project-free tmp dir so the in-project ADD path doesn't
+    # fire (the repo root itself is an mdk project when tests run from it).
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app, ["init", "my-agent", "-t", "default", "--bare", "--target", str(tmp_path)]
+    )
     assert result.exit_code == 0, result.stdout + result.stderr
     assert (tmp_path / "my-agent" / "agent.yaml").is_file()
+    # --bare → no project wrapper.
+    assert not (tmp_path / "my-agent" / "project.yaml").exists()
 
 
 @pytest.mark.unit

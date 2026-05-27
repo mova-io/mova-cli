@@ -41,6 +41,7 @@ project (project + working agent + dataset).
 from __future__ import annotations
 
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -715,6 +716,73 @@ def _is_in_project() -> bool:
         current = current.parent
 
 
+def _launch_editor(path: Path, *, open_editor: bool, mock: bool = False) -> bool:
+    """Best-effort, TTY-gated launch of an editor on ``path`` (ADR 026 D3).
+
+    The single editor-launch implementation shared by project mode, the
+    ``--llm`` / ``-t`` init paths, and ``mdk dev`` (which previously had its
+    own ``_open_in_editor``). Identical gating in one place:
+
+    * Honors ``--no-open`` via ``open_editor=False`` (operator opt-out).
+    * TTY-ONLY — never launches a GUI under CI / piped stdout / ``--mock``
+      (a mock/hermetic run must stay headless).
+    * Editor pick: ``$EDITOR`` (if set) → VS Code (``code``) → Cursor
+      (``cursor``) → macOS Finder (``open``). The Finder fallback is the
+      "reveal it" last resort; we still launch it (the operator asked) but
+      report it as a reveal.
+    * BEST-EFFORT: a launch failure (no editor, OSError) is swallowed —
+      it NEVER fails the calling command. The caller falls back to its
+      printed next-steps.
+
+    Returns ``True`` when an editor process was actually spawned, so the
+    caller can suppress a redundant "open it manually" menu pick. Returns
+    ``False`` for every skip / failure path.
+    """
+    import os as _os  # noqa: PLC0415
+    import shutil as _shutil  # noqa: PLC0415
+    import subprocess as _subprocess  # noqa: PLC0415
+    import sys as _sys  # noqa: PLC0415
+
+    # Opt-out + headless gates. --mock implies a hermetic run (CI / offline),
+    # so never launch even on a TTY; same for a non-tty stdout (piped / CI).
+    if not open_editor or mock or not _sys.stdout.isatty():
+        return False
+
+    argv: list[str] | None = None
+    label: str | None = None
+    editor_env = _os.environ.get("EDITOR", "").strip()
+    if editor_env:
+        # An explicit $EDITOR (vim, nvim, emacs, a wrapper) wins over the
+        # GUI auto-detect — the operator's chosen tool is authoritative.
+        argv, label = [*editor_env.split(), str(path)], editor_env.split()[0]
+    elif _shutil.which("code"):
+        argv, label = ["code", str(path)], "VS Code"
+    elif _shutil.which("cursor"):
+        argv, label = ["cursor", str(path)], "Cursor"
+    elif _shutil.which("open"):  # macOS Finder fallback
+        argv, label = ["open", str(path)], "Finder"
+
+    if argv is None:
+        return False
+
+    try:
+        # Detach from the CLI's lifecycle (closing the terminal must not
+        # close the editor) via DEVNULL on all three streams.
+        _subprocess.Popen(
+            argv,
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            stdin=_subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        # Best-effort: a failed launch must never break init / dev.
+        return False
+
+    verb = "revealed" if argv[0] == "open" else "opened"
+    console.print(f"\n[green]✓[/green] {verb} [cyan]{path}[/cyan] in [bold]{label}[/bold]")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Project mode
 # ---------------------------------------------------------------------------
@@ -940,13 +1008,16 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
     from movate.cli._next_steps import NextStep, mdk_bin_name, prompt_next_step  # noqa: PLC0415
 
     bin_name = mdk_bin_name()
-    # Pick an editor command best-effort. Most operators on macOS/Linux
-    # have `code` (VS Code); we fall back to `open` (macOS Finder) so
-    # the action always runs even without VS Code installed. Windows
-    # operators can pick option [2]/[3] instead.
+    # Pick an editor command best-effort for the post-init MENU pick (the
+    # numbered "open it" action the operator can still trigger if the
+    # auto-launch was skipped). Most operators on macOS/Linux have `code`
+    # (VS Code); we fall back to `open` (macOS Finder) so the menu action
+    # always runs even without VS Code installed.
     import shutil as _shutil  # noqa: PLC0415
 
     editor_cmd: str | None = None
+    editor_argv: list[str] | None = None
+    editor_label = ""
     if _shutil.which("code"):
         editor_cmd = f"code {project_root}"
         editor_argv = ["code", str(project_root)]
@@ -960,41 +1031,12 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
         editor_argv = ["open", str(project_root)]
         editor_label = "Reveal project in Finder"
 
-    # Auto-launch the detected editor on the new project — operators
-    # almost always want this as the immediate next step. Gated on
-    # ``open_editor`` (CLI flag) AND on stdout being a tty (CI never
-    # wants a GUI launched). We use Popen-with-DEVNULL so the editor
-    # stays detached from the CLI's lifecycle — closing the terminal
-    # doesn't close VS Code.
-    import sys as _sys  # noqa: PLC0415
-
-    editor_auto_launched = False
-    # `open` on macOS opens Finder, not an editor — skip the
-    # auto-launch path in that case so the operator's terminal
-    # doesn't get displaced by a Finder window.
-    if (
-        open_editor
-        and editor_argv is not None
-        and editor_argv[0] != "open"
-        and _sys.stdout.isatty()
-    ):
-        import subprocess as _subprocess  # noqa: PLC0415
-
-        try:
-            _subprocess.Popen(
-                editor_argv,
-                stdout=_subprocess.DEVNULL,
-                stderr=_subprocess.DEVNULL,
-                stdin=_subprocess.DEVNULL,
-            )
-            console.print(
-                f"\n[green]✓[/green] launched [bold]{editor_label}[/bold] "
-                f"on [cyan]{project_root}[/cyan]"
-            )
-            editor_auto_launched = True
-        except (OSError, ValueError):
-            # Best-effort — fall through to the menu pick if launch fails.
-            editor_auto_launched = False
+    # Auto-launch via the ONE shared launcher (ADR 026 D3) — same gating as
+    # the --llm / -t init paths and `mdk dev`: TTY-only, --no-open opt-out,
+    # best-effort. Operators almost always want the new project open as the
+    # immediate next step; on a skip / failure the menu pick below still
+    # offers it manually.
+    editor_auto_launched = _launch_editor(project_root, open_editor=open_editor)
 
     # `cd <project>` reminder. We can't change the parent shell's cwd
     # from a child process, but printing the command prominently makes
@@ -1006,7 +1048,9 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
 
     next_steps = []
     # Only offer the manual editor-launch step when we DIDN'T auto-launch.
-    if editor_cmd is not None and not editor_auto_launched:
+    # editor_cmd + editor_argv are set together, so guarding on argv (the
+    # non-None one mypy can narrow) covers both.
+    if editor_cmd is not None and editor_argv is not None and not editor_auto_launched:
         next_steps.append(NextStep(label=editor_label, command=editor_cmd, argv=editor_argv))
     # Replaces the old fixed `[3] Add FAQ` / `[4] Add rag-qa+ticket-triager`
     # shortcuts with a single dynamic picker — same numbered role table
@@ -1319,6 +1363,67 @@ def _init_agent(
 # bumped via ``--llm-model`` if an operator wants a different trade-off.
 # Same provider string format as ``agent.yaml: model.provider``.
 _DEFAULT_LLM_MODEL = "openai/gpt-4o-mini-2024-07-18"
+
+# Env var that pins the scaffold model without a flag (ADR 026 D6, layer 2).
+# Mirrors the MDK_*/MOVATE_* env-var convention.
+_SCAFFOLD_MODEL_ENV_VAR = "MDK_LLM_MODEL"
+
+
+def _resolve_scaffold_model(*, llm_model: str, llm_model_explicit: bool) -> str:
+    """Resolve the LLM that POWERS ``--llm`` by layered precedence (ADR 026 D6).
+
+    Distinct from the GENERATED agent's runtime model (see
+    :func:`_pick_target_model`, which is unchanged). Precedence, highest first:
+
+      1. ``--llm-model <model>`` (per-invocation) — when explicitly passed.
+      2. ``MDK_LLM_MODEL`` env var.
+      3. project ``project.yaml: scaffold.model``.
+      4. user ``~/.movate/config.yaml: scaffold.model`` (``mdk config set``).
+      5. built-in default (:data:`_DEFAULT_LLM_MODEL`) — also the key-matched
+         fallback the generated-agent model derives from (#108).
+
+    ``llm_model_explicit`` distinguishes "operator typed ``--llm-model``" from
+    "Typer filled in the default": only when the flag was explicitly given does
+    layer 1 win. This mirrors ADR 022's runtime-key precedence resolution.
+    Each lower layer is consulted only when the higher ones are unset, so a
+    project/user default needn't be repeated on every invocation. No new auth
+    surface — provider keys are still handled by BYOK / credential autoload.
+    """
+    import os  # noqa: PLC0415
+
+    # 1. Explicit flag wins outright.
+    if llm_model_explicit:
+        return llm_model
+
+    # 2. Env var.
+    env_model = os.environ.get(_SCAFFOLD_MODEL_ENV_VAR, "").strip()
+    if env_model:
+        return env_model
+
+    # 3. Project-level scaffold.model. Best-effort: a malformed/absent
+    # project.yaml must never break init — fall through to the next layer.
+    try:
+        from movate.core.config import load_project_config  # noqa: PLC0415
+
+        project_model = load_project_config().scaffold.model
+        if project_model and project_model.strip():
+            return project_model.strip()
+    except Exception:
+        pass
+
+    # 4. User-level scaffold.model (`mdk config set scaffold.model …`).
+    try:
+        from movate.core.user_config import load_user_config  # noqa: PLC0415
+
+        user_model = load_user_config().scaffold.model
+        if user_model and user_model.strip():
+            return user_model.strip()
+    except Exception:
+        pass
+
+    # 5. Built-in default.
+    return _DEFAULT_LLM_MODEL
+
 
 # Canonical model string to write into the GENERATED agent's
 # ``agent_yaml.model.provider`` for each provider whose key the operator
@@ -2686,11 +2791,246 @@ def _print_init_summary_line(
 
 
 # ---------------------------------------------------------------------------
+# ADR 026 D1 — context-aware agent layout + D4 exact next-steps
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _AgentLayout:
+    """Where an agent-intent ``mdk init`` lands on disk (ADR 026 D1).
+
+    Resolved by :func:`_resolve_agent_layout` from the (name, target, bare,
+    in-project) context. The agent-scaffold paths (``-t`` / ``--llm``) read
+    this to decide their write target and whether to wrap a fresh project.
+
+    Fields:
+
+    * ``agent_parent`` — the directory the agent dir is created UNDER (so the
+      agent lands at ``agent_parent / name``). For a project layout this is
+      ``<project>/agents``; for ``--bare`` it's the raw ``target``.
+    * ``agent_dir`` — the resolved agent directory (``agent_parent / name``).
+    * ``project_root`` — the project the agent belongs to, or ``None`` for a
+      ``--bare`` standalone agent.
+    * ``created_project`` — True when this invocation bootstrapped a NEW
+      project to hold the agent (outside-a-project, non-bare). Drives the
+      success/next-steps rendering + the post-create editor launch.
+    * ``snapshot_short`` — short hash of the initial snapshot when a project
+      was created (else None).
+    """
+
+    agent_parent: Path
+    agent_dir: Path
+    project_root: Path | None
+    created_project: bool
+    snapshot_short: str | None = None
+
+
+def _resolve_agent_layout(
+    *,
+    name: str,
+    target: Path,
+    bare: bool,
+    force: bool,
+    skip_snapshot: bool,
+    open_editor: bool,
+) -> _AgentLayout:
+    """Decide where an agent-intent ``mdk init`` writes (ADR 026 D1).
+
+    Three context-aware layouts:
+
+    1. ``--bare`` → STANDALONE single-dir agent at ``target/<name>/`` (the
+       pre-ADR-026 output). No project wrapper. The documented escape hatch.
+    2. INSIDE a project (``project.yaml`` up the tree from cwd) → ADD the
+       agent under ``<project>/agents/<name>/`` (like ``mdk add``). No nested
+       project.
+    3. OUTSIDE a project, not bare → bootstrap a PROJECT at ``target/<name>/``
+       (project.yaml + AGENTS.md + .env.example + .gitignore + initial
+       snapshot, reusing :func:`_init_project`) and put the agent under
+       ``<project>/agents/<name>/`` so ``mdk run <name>`` works from the root.
+
+    The project bootstrap (case 3) runs in ``quiet=True`` mode so the
+    agent-scaffold path renders ONE combined success surface afterward
+    rather than two stacked panels.
+    """
+    if bare:
+        # Legacy standalone agent — no project, agent lands at target/<name>.
+        return _AgentLayout(
+            agent_parent=target,
+            agent_dir=(target / name).resolve(),
+            project_root=None,
+            created_project=False,
+        )
+
+    existing_root = _enclosing_project_root()
+    if existing_root is not None:
+        # In a project → add the agent under <project>/agents/.
+        agents_dir = existing_root / "agents"
+        return _AgentLayout(
+            agent_parent=agents_dir,
+            agent_dir=(agents_dir / name).resolve(),
+            project_root=existing_root,
+            created_project=False,
+        )
+
+    # Outside a project → bootstrap one to hold the agent, then place the
+    # agent under <project>/agents/. The editor launch is DEFERRED to after
+    # the agent is scaffolded (open_editor handled by the caller) so the
+    # operator opens a project that already contains the agent.
+    _project_name, project_root, snapshot_short = _init_project(
+        name=name,
+        target=target,
+        force=force,
+        skip_snapshot=skip_snapshot,
+        with_agents=None,
+        quiet=True,
+        open_editor=False,
+    )
+    agents_dir = project_root / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    return _AgentLayout(
+        agent_parent=agents_dir,
+        agent_dir=(agents_dir / name).resolve(),
+        project_root=project_root,
+        created_project=True,
+        snapshot_short=snapshot_short,
+    )
+
+
+def _enclosing_project_root() -> Path | None:
+    """Project root at or above cwd, or ``None`` outside any project.
+
+    Thin wrapper over :func:`movate.cli._resolve.walk_up_for_project_root`
+    so the init dispatch reads in terms of "am I in a project?" — the same
+    upward marker search the loader + ``mdk add`` use.
+    """
+    from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
+
+    return walk_up_for_project_root()
+
+
+def _run_input_example(agent_dir: Path) -> str:
+    """Build a copy-pasteable run-input snippet from the agent's dataset.
+
+    Reads the first row of ``evals/dataset.jsonl`` (the same source
+    ``mdk run`` suggests on a missing-input error) so the D4 next-steps
+    command is runnable first try. Falls back to ``'{…}'`` when no dataset
+    sample is available — best-effort, never raises.
+    """
+    try:
+        from movate.core.loader import load_agent  # noqa: PLC0415
+
+        bundle = load_agent(agent_dir)
+        dataset = bundle.spec.evals.dataset
+        if not dataset:
+            return "{…}"
+        dataset_path = (bundle.agent_dir / dataset).resolve()
+        if dataset_path.is_file():
+            text = dataset_path.read_text().strip()
+            if text:
+                import json as _json  # noqa: PLC0415
+
+                row = _json.loads(text.splitlines()[0])
+                if isinstance(row, dict) and isinstance(row.get("input"), dict):
+                    return _json.dumps(row["input"], separators=(", ", ": "))
+    except Exception:
+        pass
+    return "{…}"
+
+
+def _render_agent_next_steps(layout: _AgentLayout, *, name: str) -> None:
+    """Print the EXACT runnable command for what landed on disk (ADR 026 D4).
+
+    Built from the real on-disk ``_AgentLayout`` so copy-paste works first
+    try, regardless of which D1 layout produced the agent:
+
+    * created a project → ``cd <project> && mdk run <name> '<input>'``
+    * added to a project → ``mdk run <name> '<input>'`` (already at/with root)
+    * ``--bare`` standalone → ``cd <dir> && mdk run . '<input>'`` (ADR 026
+      makes the standalone agent first-class via ``mdk run .``).
+
+    The ``<input>`` is a real dataset sample when one exists. Rendered to
+    stdout as a compact panel beneath the scaffold's own success output.
+    """
+    bin_name = "mdk"
+    example = _run_input_example(layout.agent_dir)
+    lines: list[str] = []
+
+    if layout.created_project and layout.project_root is not None:
+        cd_to = _cd_target(layout.project_root)
+        lines.append(f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]")
+        lines.append(
+            f"  [dim]$[/dim] [bold]{bin_name} run {name} '{example}'[/bold]"
+            "   [dim]# run it (mock-free; add --mock for offline)[/dim]"
+        )
+        lines.append(
+            f"  [dim]$[/dim] [bold]{bin_name} validate {name}[/bold]   [dim]# static-check it[/dim]"
+        )
+    elif layout.project_root is not None:
+        # Added to the existing project — resolve by name from the root.
+        cd_to = _cd_target(layout.project_root)
+        same_dir = layout.project_root.resolve() == Path.cwd().resolve()
+        prefix = "" if same_dir else f"cd {cd_to} && "
+        lines.append(
+            f"  [dim]$[/dim] [bold]{prefix}{bin_name} run {name} '{example}'[/bold]"
+            "   [dim]# run it[/dim]"
+        )
+        lines.append(
+            f"  [dim]$[/dim] [bold]{prefix}{bin_name} validate {name}[/bold]"
+            "   [dim]# static-check it[/dim]"
+        )
+    else:
+        # --bare standalone agent → mdk run . from inside the dir.
+        cd_to = _cd_target(layout.agent_dir)
+        lines.append(f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]")
+        lines.append(
+            f"  [dim]$[/dim] [bold]{bin_name} run . '{example}'[/bold]"
+            "   [dim]# standalone agent — run it by path[/dim]"
+        )
+        lines.append(
+            f"  [dim]$[/dim] [bold]{bin_name} validate .[/bold]   [dim]# static-check it[/dim]"
+        )
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="[green]✓[/green] Next steps",
+            title_align="left",
+            border_style="green",
+        )
+    )
+
+
+def _finish_agent_init(
+    layout: _AgentLayout,
+    *,
+    name: str,
+    open_editor: bool,
+    mock: bool,
+) -> None:
+    """Common post-scaffold tail for the agent-intent ``mdk init`` paths.
+
+    Renders the D4 exact-command next-steps panel, then (best-effort,
+    TTY-gated, --no-open / --mock aware via :func:`_launch_editor`) opens
+    the right surface: the PROJECT root when one was created / joined, or
+    the standalone agent dir for ``--bare``. The editor launch is deferred
+    to here (not inside the project bootstrap) so the operator opens a
+    workspace that already contains the freshly-scaffolded agent.
+    """
+    _render_agent_next_steps(layout, name=name)
+    open_path = layout.project_root if layout.project_root is not None else layout.agent_dir
+    # Only auto-launch on a freshly-created project or a bare standalone
+    # agent; adding to an EXISTING project shouldn't re-open the editor
+    # (the operator is presumably already working in it).
+    if layout.created_project or layout.project_root is None:
+        _launch_editor(open_path, open_editor=open_editor, mock=mock)
+
+
+# ---------------------------------------------------------------------------
 # Entry point — dispatches between project + agent modes
 # ---------------------------------------------------------------------------
 
 
-def init(
+def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer flat
     name: str = typer.Argument(
         None,
         help=(
@@ -2838,6 +3178,20 @@ def init(
             "headless environments. The same option is offered as a "
             "menu pick afterwards so the operator can still launch it "
             "manually if auto-launch was skipped."
+        ),
+    ),
+    bare: bool = typer.Option(
+        False,
+        "--bare",
+        help=(
+            "Escape hatch (ADR 026 D1): scaffold a STANDALONE single-dir agent "
+            "at [bold]<target>/<name>/[/bold] — no [bold]project.yaml[/bold], no "
+            "[bold]agents/[/bold] wrapper. The pre-ADR-026 [bold]-t[/bold] / "
+            "[bold]--llm[/bold] output. Use it to drop an agent into a non-mdk "
+            "repo or for a quick throwaway experiment; run it with "
+            "[bold]mdk run .[/bold] from inside the dir. Without [bold]--bare[/bold], "
+            "[bold]mdk init <name> -t/--llm[/bold] yields a runnable PROJECT "
+            "(or adds to the current one when inside a project)."
         ),
     ),
 ) -> None:
@@ -3001,6 +3355,29 @@ def init(
     # passed -t" (agent intent) from "operator didn't pass -t"
     # (project intent).
     effective_template = template or "default"
+
+    # ADR 026 D1: route the agent-scaffold paths through the context-aware
+    # layout. OUTSIDE a project → bootstrap a runnable project that holds
+    # the agent; INSIDE a project → add the agent to it; `--bare` → the
+    # legacy standalone single-dir output. The scaffolders below write into
+    # `layout.agent_parent` (so the agent lands at `layout.agent_dir`).
+    #
+    # --dry-run (LLM only) is a no-write preview: skip the project wrapper /
+    # editor entirely so a preview doesn't materialize a project on disk.
+    layout: _AgentLayout | None = None
+    if not dry_run:
+        layout = _resolve_agent_layout(
+            name=name,
+            target=target,
+            bare=bare,
+            force=force,
+            skip_snapshot=skip_snapshot,
+            open_editor=open_editor,
+        )
+        scaffold_target = layout.agent_parent
+    else:
+        scaffold_target = target
+
     if llm is not None:
         if effective_template != "default":
             err_console.print(
@@ -3009,11 +3386,17 @@ def init(
                 f"drives generation; the template is acknowledged as a starting "
                 f"reference."
             )
+        # ADR 026 D6: resolve the scaffold (driver) model by layered
+        # precedence — flag > MDK_LLM_MODEL > project > user-config > default.
+        resolved_llm_model = _resolve_scaffold_model(
+            llm_model=llm_model,
+            llm_model_explicit=(llm_model != _DEFAULT_LLM_MODEL),
+        )
         _init_agent_from_llm(
             name=name,
             description=llm,
-            llm_model=llm_model,
-            target=target,
+            llm_model=resolved_llm_model,
+            target=scaffold_target,
             force=force,
             dry_run=dry_run,
             starting_template=effective_template,
@@ -3021,6 +3404,8 @@ def init(
             no_ingest=no_ingest,
             no_verify=no_verify,
         )
+        if layout is not None:
+            _finish_agent_init(layout, name=name, open_editor=open_editor, mock=mock)
         return
 
     # No --llm: original template-copy path. --dry-run is meaningless
@@ -3032,4 +3417,18 @@ def init(
             "with [bold]--llm[/bold]; ignored for template scaffold."
         )
 
-    _init_agent(name=name, template=effective_template, target=target, force=force)
+    # Quiet the legacy plain-text scaffold output: the D4 next-steps panel
+    # below renders the EXACT runnable command for the resolved layout.
+    _init_agent(
+        name=name,
+        template=effective_template,
+        target=scaffold_target,
+        force=force,
+        quiet=True,
+    )
+    if layout is not None:
+        console.print(
+            f"[green]✓[/green] scaffolded [bold]{effective_template}[/bold] agent "
+            f"at [bold]{layout.agent_dir}[/bold]"
+        )
+        _finish_agent_init(layout, name=name, open_editor=open_editor, mock=mock)

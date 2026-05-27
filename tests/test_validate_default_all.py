@@ -163,13 +163,16 @@ class TestOutsideProject:
     ) -> None:
         """Passing an explicit path WORKS outside a project — the path
         carries everything `_validate_agent` needs."""
-        # Scaffold an agent at tmp_path (NO project root).
+        # Scaffold a STANDALONE agent at tmp_path (NO project root).
         agent_dir = tmp_path / "standalone-agent"
         monkeypatch.chdir(tmp_path)
-        # Post-PR #87, bare `mdk init <name>` defaults to PROJECT mode;
-        # force AGENT mode with -t to keep this "standalone agent dir
-        # outside a project" path exercised.
-        runner.invoke(app, ["init", "standalone-agent", "-t", "default", "--target", str(tmp_path)])
+        # ADR 026 D1: `--bare` is the escape hatch that keeps the legacy
+        # single-dir output (no project.yaml / agents/ wrapper) — exactly
+        # the "standalone agent dir outside a project" this test exercises.
+        runner.invoke(
+            app,
+            ["init", "standalone-agent", "-t", "default", "--bare", "--target", str(tmp_path)],
+        )
         assert (agent_dir / "agent.yaml").is_file()
 
         # Validate it by path; no project required.

@@ -6,6 +6,50 @@ per commit). Releases prior to 2026-05 used SemVer (`v0.x`); those tags remain a
 
 ## [Unreleased]
 
+### Changed — `mdk init` front-door UX (ADR 026)
+
+**`mdk init <name>` now yields a *runnable* project, not a bare agent.** The
+front-door command is context-aware and the next-steps it prints are
+copy-paste-ready. Six decisions:
+
+- **`mdk init` yields/extends a project (D1).** ⚠️ **CLI behavior change:**
+  `mdk init <name> -t <template>` and `mdk init <name> --llm "<desc>"` no longer
+  emit a bare standalone agent dir. OUTSIDE a project they now scaffold a full
+  PROJECT (`project.yaml` + `AGENTS.md` + `.env.example` + `.gitignore` + the
+  agent under `agents/<name>/` + an initial snapshot); INSIDE a project they ADD
+  the agent under the current project's `agents/<name>/` (like `mdk add`, which
+  is itself unchanged). **`--bare` is the escape hatch** that restores the old
+  single-dir output (`agent.yaml` + `prompt.md` + schemas, no `project.yaml` /
+  `agents/`) — use it to drop an agent into a non-mdk repo or for a quick
+  throwaway experiment. The bare-name `mdk init <name>` (no `-t` / `--llm`)
+  already scaffolded a project and is unchanged.
+- **Name-based agent resolution in `run` / `validate` / `dev` (D2).** All three
+  accept an agent NAME that resolves to `agents/<name>/` in the discovered
+  project, IN ADDITION to an explicit path (path behavior unchanged), via one
+  shared resolver. Deterministic order: existing path wins → name in the
+  project → friendly error. A standalone agent dir is first-class: `mdk run .` /
+  `validate .` / `dev .` work WITHOUT a `project.yaml` marker. The raw
+  `agent path is not a directory` failure is replaced with an actionable
+  message ("no agent 'X' here — did you mean …?").
+- **One shared editor launcher (D3).** Project mode, the `--llm` / `-t` init
+  paths, and `mdk dev` now share a single `$EDITOR`→`code`→`cursor`→`open`
+  launcher with identical gating: TTY-only, `--no-open-editor` opt-out, never
+  under CI / `--mock`, best-effort (never fails the command).
+- **Next-steps print the EXACT runnable command (D4).** The success panel
+  renders the precise command for what landed on disk — `cd <project> &&
+  mdk run <name> '<dataset-sample>'`, or `mdk run .` for `--bare` — so
+  copy-paste works first try.
+- **`mdk doctor` staleness check (D5).** `mdk doctor` compares the installed
+  `mdk` against its source of truth — a co-located editable repo checkout's
+  version, else "last updated N days ago" from the installed CalVer — and warns
+  when behind with the reinstall command (`uv tool install --force .`).
+- **`--llm` scaffold model is layered-configurable (D6).** The model that
+  POWERS `--llm` (distinct from the generated agent's runtime model) now
+  resolves by precedence: `--llm-model` > `MDK_LLM_MODEL` env >
+  `project.yaml: scaffold.model` > `~/.movate/config.yaml: scaffold.model`
+  (settable via the new `mdk config set scaffold.model …`) > built-in
+  key-matched default. Adds a persistent default only — no new auth surface.
+
 ### Added — Per-step execution tree in `mdk explain` / `mdk trace replay` (ADR 024, PR 2 of 3)
 
 **The retained per-step shape (PR 1) now renders as a tree, so "where did the

@@ -150,7 +150,9 @@ def faq_bundle(tmp_path: Path):
     """
     from movate.cli.main import app  # noqa: PLC0415
 
-    result = runner.invoke(app, ["init", "demo-agent", "-t", "default", "--target", str(tmp_path)])
+    result = runner.invoke(
+        app, ["init", "--bare", "demo-agent", "-t", "default", "--target", str(tmp_path)]
+    )
     assert result.exit_code == 0
     return load_agent(tmp_path / "demo-agent")
 
@@ -294,7 +296,9 @@ def test_render_replay_json_shape() -> None:
 
 
 def _scaffold_default_agent(parent: Path) -> Path:
-    result = runner.invoke(app, ["init", "demo-agent", "-t", "default", "--target", str(parent)])
+    result = runner.invoke(
+        app, ["init", "--bare", "demo-agent", "-t", "default", "--target", str(parent)]
+    )
     assert result.exit_code == 0, result.stdout
     return parent / "demo-agent"
 

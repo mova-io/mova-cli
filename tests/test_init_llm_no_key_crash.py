@@ -158,7 +158,10 @@ class TestFriendlyKeyMissing:
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
-            ["init", "test-agent", "--llm", "test", "--mock"],
+            # --bare keeps the standalone <tmp>/test-agent/ layout this
+            # assertion targets (ADR 026 D1's non-bare default would wrap it
+            # in a project at <tmp>/test-agent/agents/test-agent/).
+            ["init", "test-agent", "--llm", "test", "--mock", "--bare"],
             env={"COLUMNS": "200"},
         )
         # The pre-flight key gate is bypassed AND the scaffold-aware mock
@@ -208,10 +211,10 @@ class TestPositionalDescription:
         _strip_all_provider_keys(monkeypatch)
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
-            app, ["init", "plain-agent", "-t", "default"], env={"COLUMNS": "200"}
+            app, ["init", "plain-agent", "-t", "default", "--bare"], env={"COLUMNS": "200"}
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        # Template scaffold ran — agent.yaml exists.
+        # Template scaffold ran — agent.yaml exists (--bare → standalone dir).
         assert (tmp_path / "plain-agent" / "agent.yaml").is_file()
 
     def test_positional_description_and_llm_both_set_warns_llm_wins(

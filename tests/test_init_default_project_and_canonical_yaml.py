@@ -52,29 +52,35 @@ class TestInitDefaultsToProject:
         # And NOT an agent (no agent.yaml at the root).
         assert not (proj / "agent.yaml").exists()
 
-    def test_init_with_template_still_scaffolds_agent(
+    def test_init_with_template_yields_project_with_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`mdk init my-agent -t faq` keeps the agent-scaffold behavior."""
+        """ADR 026 D1: `mdk init my-agent -t default` OUTSIDE a project now
+        yields a PROJECT that holds the agent under `agents/<name>/` — not
+        a bare standalone agent dir (which is now `--bare`)."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
-            ["init", "my-agent", "-t", "default", "--target", str(tmp_path)],
+            ["init", "my-agent", "-t", "default", "--no-open-editor", "--skip-snapshot"],
             env={"COLUMNS": "200"},
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        # Agent markers present.
-        agent_dir = tmp_path / "my-agent"
+        proj = tmp_path / "my-agent"
+        # Project markers present at the project root.
+        assert (proj / "project.yaml").is_file()
+        assert (proj / "AGENTS.md").is_file()
+        # The agent lives under agents/<name>/, NOT at the project root.
+        agent_dir = proj / "agents" / "my-agent"
         assert (agent_dir / "agent.yaml").is_file()
         assert (agent_dir / "prompt.md").is_file()
-        # And NOT a project (no project.yaml at the agent dir level).
-        assert not (agent_dir / "project.yaml").exists()
+        assert not (proj / "agent.yaml").exists()
 
-    def test_init_with_llm_still_scaffolds_agent(
+    def test_init_with_llm_yields_project_with_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`mdk init my-bot --llm "..." --mock` runs the LLM-scaffold
-        path (agent mode, not project mode)."""
+        """ADR 026 D1: `mdk init my-bot --llm "..." --mock` OUTSIDE a
+        project routes through the project scaffold — a project.yaml +
+        agents/ wrapper, with the agent under agents/<name>/."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
@@ -84,29 +90,25 @@ class TestInitDefaultsToProject:
                 "--llm",
                 "A simple chatbot agent",
                 "--mock",
-                "--target",
-                str(tmp_path),
+                "--no-open-editor",
+                "--skip-snapshot",
             ],
             env={"COLUMNS": "200"},
         )
-        # MockProvider may or may not produce a valid LLM scaffold —
-        # what we care about is the dispatch went to AGENT mode, not
-        # project mode. So: no project.yaml at the dir level.
-        agent_dir = tmp_path / "my-bot"
-        # The agent dir might not have been finalized if mock scaffold
-        # validation failed, but the dispatch can't have produced a
-        # project.yaml here.
-        assert not (agent_dir / "project.yaml").exists()
-        # And `agents/` definitely shouldn't exist (would mean project mode).
-        assert not (agent_dir / "agents").is_dir()
+        proj = tmp_path / "my-bot"
+        # The project wrapper is created before the (mock) LLM scaffold, so
+        # it exists regardless of whether mock validation finalized the
+        # agent. project.yaml lands at the PROJECT root, agents/ exists.
+        assert (proj / "project.yaml").is_file()
+        assert (proj / "agents").is_dir()
         _ = result  # exit code varies on mock-LLM JSON content
 
-    def test_positional_description_still_routes_to_agent_mode(
+    def test_positional_description_routes_through_project_scaffold(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The positional-description shorthand (`mdk init <name>
-        "<desc>"`) treats the second positional as `--llm` and routes
-        to agent mode, not project mode."""
+        """ADR 026 D1: the positional-description shorthand (`mdk init
+        <name> "<desc>"`) is `--llm` shorthand and routes through the same
+        context-aware project scaffold."""
         monkeypatch.chdir(tmp_path)
         result = runner.invoke(
             app,
@@ -115,14 +117,14 @@ class TestInitDefaultsToProject:
                 "my-bot",
                 "A simple agent for testing",
                 "--mock",
-                "--target",
-                str(tmp_path),
+                "--no-open-editor",
+                "--skip-snapshot",
             ],
             env={"COLUMNS": "200"},
         )
-        # Same as above — no project.yaml at the dir level.
-        assert not (tmp_path / "my-bot" / "project.yaml").exists()
-        assert not (tmp_path / "my-bot" / "agents").is_dir()
+        proj = tmp_path / "my-bot"
+        assert (proj / "project.yaml").is_file()
+        assert (proj / "agents").is_dir()
         _ = result
 
     def test_init_inside_existing_project_warns(

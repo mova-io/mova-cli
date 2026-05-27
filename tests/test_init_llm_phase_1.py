@@ -73,6 +73,7 @@ def test_llm_with_project_errors_with_pointer(tmp_path: Path) -> None:
         app,
         [
             "init",
+            "--bare",
             "--project",
             "myproj",
             "--llm",
@@ -102,6 +103,7 @@ def test_empty_llm_description_errors_early(tmp_path: Path) -> None:
         app,
         [
             "init",
+            "--bare",
             "my-agent",
             "--llm",
             "   ",
@@ -131,6 +133,7 @@ def test_dry_run_without_llm_warns_but_succeeds(tmp_path: Path) -> None:
         app,
         [
             "init",
+            "--bare",
             "my-agent",
             "-t",
             "default",
@@ -160,6 +163,7 @@ def test_init_without_llm_unchanged(tmp_path: Path) -> None:
         app,
         [
             "init",
+            "--bare",
             "my-agent",
             "-t",
             "default",
@@ -182,6 +186,7 @@ def test_init_project_without_llm_unchanged(tmp_path: Path) -> None:
         app,
         [
             "init",
+            "--bare",
             "--project",
             "myproj",
             "--target",

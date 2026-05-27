@@ -312,6 +312,7 @@ def test_llm_mock_end_to_end_writes_agent(
         app,
         [
             "init",
+            "--bare",
             "test-agent",
             "--llm",
             "an echo agent for unit tests",
@@ -355,6 +356,7 @@ def test_llm_dry_run_does_not_write(
         app,
         [
             "init",
+            "--bare",
             "preview-agent",
             "--llm",
             "an agent we just want to preview",
@@ -390,6 +392,7 @@ def test_llm_invalid_response_fails_with_debug_artifact(
         app,
         [
             "init",
+            "--bare",
             "fails-agent",
             "--llm",
             "a description",
@@ -425,6 +428,7 @@ def test_llm_dest_exists_without_force_errors_early(
         app,
         [
             "init",
+            "--bare",
             "occupied",
             "--llm",
             "any description",
@@ -456,6 +460,7 @@ def test_llm_force_overwrites_existing(
         app,
         [
             "init",
+            "--bare",
             "overwriteme",
             "--llm",
             "fresh agent",
@@ -484,6 +489,7 @@ def test_llm_with_non_default_template_warns(
         app,
         [
             "init",
+            "--bare",
             "combo-agent",
             "--llm",
             "a chatbot",
@@ -518,6 +524,7 @@ def test_llm_scaffolded_agent_passes_mdk_validate(
         app,
         [
             "init",
+            "--bare",
             "validated-agent",
             "--llm",
             "a test agent",
@@ -551,6 +558,7 @@ def test_written_agent_yaml_parses_as_yaml(
         app,
         [
             "init",
+            "--bare",
             "yaml-agent",
             "--llm",
             "yaml test",

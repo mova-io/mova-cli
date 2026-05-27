@@ -159,6 +159,28 @@ class TargetConfig(BaseModel):
     )
 
 
+class ScaffoldUserConfig(BaseModel):
+    """User-level defaults for ``mdk init --llm`` scaffolding (ADR 026 D6).
+
+    Lowest persistent layer of the scaffold-model precedence — settable via
+    ``mdk config set scaffold.model <model>``. A project's
+    ``project.yaml: scaffold.model`` overrides this; both override the
+    built-in key-matched default. ``extra="allow"`` leaves room for future
+    scaffold knobs without a breaking schema bump.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = Field(
+        default=None,
+        description=(
+            "LiteLLM-style model string that drives `mdk init --llm` "
+            "generation when neither --llm-model, MDK_LLM_MODEL, nor a "
+            "project-level scaffold.model is set."
+        ),
+    )
+
+
 class UserConfig(BaseModel):
     """The contents of ``~/.movate/config.yaml``."""
 
@@ -169,6 +191,13 @@ class UserConfig(BaseModel):
         default=None,
         description=(
             "Name of the default target. CLI commands default to this when --target is omitted."
+        ),
+    )
+    scaffold: ScaffoldUserConfig = Field(
+        default_factory=ScaffoldUserConfig,
+        description=(
+            "User-level defaults for `mdk init --llm` scaffolding (ADR 026 D6). "
+            "Set via `mdk config set scaffold.model <model>`."
         ),
     )
 
@@ -212,7 +241,13 @@ def save_user_config(cfg: UserConfig) -> Path:
     """Write the config file, creating ``~/.movate/`` if needed."""
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(cfg.model_dump(exclude_none=True), sort_keys=True))
+    data = cfg.model_dump(exclude_none=True)
+    # Don't emit an empty ``scaffold: {}`` block (ADR 026 D6) — the field
+    # is opt-in, so a default-empty config stays byte-clean for the common
+    # deploy-only case. A populated scaffold (model set) still round-trips.
+    if not data.get("scaffold"):
+        data.pop("scaffold", None)
+    path.write_text(yaml.safe_dump(data, sort_keys=True))
     return path
 
 
@@ -252,6 +287,7 @@ def resolve_bearer_token(target: TargetConfig) -> str:
 
 
 __all__ = [
+    "ScaffoldUserConfig",
     "TargetConfig",
     "UserConfig",
     "UserConfigError",

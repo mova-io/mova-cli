@@ -254,6 +254,10 @@ def _read_chunks(agent: str) -> list[object]:
 
 
 def _invoke_init(tmp_path: Path, name: str, url: str, *extra: str) -> Any:
+    # --bare: these tests exercise LLM-scaffold MECHANICS (ingest, grounded
+    # verify) against a standalone agent dir at <tmp>/<name>/. ADR 026 D1
+    # makes the non-bare default yield a project wrapper; --bare keeps the
+    # legacy single-dir layout these assertions target.
     return runner.invoke(
         app,
         [
@@ -261,6 +265,7 @@ def _invoke_init(tmp_path: Path, name: str, url: str, *extra: str) -> Any:
             name,
             "--llm",
             f"answer questions about {url}",
+            "--bare",
             "--target",
             str(tmp_path),
             *extra,
@@ -508,6 +513,7 @@ class TestGroundedVerifyModes:
                 "--llm",
                 "classify short text into sentiment labels",
                 "--mock",
+                "--bare",
                 "--target",
                 str(tmp_path),
             ],

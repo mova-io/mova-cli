@@ -25,7 +25,7 @@ def _scaffold(parent: Path, name: str, template: str = "default") -> Path:
     Reusing init keeps the fixture honest — we test the same shape
     the registry will see in production.
     """
-    result = runner.invoke(app, ["init", name, "-t", template, "--target", str(parent)])
+    result = runner.invoke(app, ["init", "--bare", name, "-t", template, "--target", str(parent)])
     assert result.exit_code == 0, result.stdout
     return parent / name
 

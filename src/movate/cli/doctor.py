@@ -328,6 +328,13 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
 
     _add("Python", sys.version.split()[0], "", "")
     _add("movate", __version__, "", "")
+    # Staleness check (ADR 026 D5): compare the INSTALLED mdk against its
+    # source of truth — a co-located editable repo checkout's version when
+    # present, else how many days old the installed CalVer is. Warns (not
+    # errors) when behind, with the reinstall command. Converts the silent
+    # day-stale-install class of bug into a self-fixing prompt.
+    stale_result, stale_purpose = _check_version_staleness()
+    _add("mdk up-to-date", stale_result, stale_purpose, "")
     _add("", "", "", "")
 
     # Required deps — Purpose + SPDX license columns. Every entry in
@@ -833,6 +840,111 @@ def _maybe_offer_fix(*, no_prompt: bool) -> None:
     if failed:
         for r in failed:
             console.print(f"[red]✗[/red] {r.fix_id} failed: {r.message or 'no detail'}")
+
+
+# CalVer staleness thresholds (ADR 026 D5). An install N days behind today
+# is "getting stale" (advisory); past STALE_DAYS it's flagged as a warning.
+_VERSION_STALE_DAYS = 14
+
+
+def _parse_calver_date(version: str) -> Any:
+    """Parse the ``YYYY.M.D`` date prefix of a CalVer ``YYYY.M.D.N`` string.
+
+    Returns a :class:`datetime.date`, or ``None`` when the string isn't
+    CalVer-shaped (e.g. a legacy ``v0.x`` SemVer tag) — the caller then
+    skips the day-based staleness path.
+    """
+    import datetime as _dt  # noqa: PLC0415
+
+    parts = version.split(".")
+    # CalVer is YYYY.M.D.N — need at least the three date segments.
+    calver_date_segments = 3
+    if len(parts) < calver_date_segments:
+        return None
+    try:
+        return _dt.date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except (ValueError, TypeError):
+        return None
+
+
+def _editable_repo_version() -> str | None:
+    """Version string of a co-located editable repo checkout, or ``None``.
+
+    The installed ``mdk`` source-of-truth (ADR 026 D5): when ``mdk`` runs
+    FROM (or alongside) an editable ``movate-cli`` checkout, the repo's
+    ``src/movate/__init__.py`` carries the latest hand-bumped version. We
+    locate it from this module's own file path (``movate/cli/doctor.py`` →
+    repo root two levels up from ``movate/``) and confirm the repo manifest
+    is movate-cli's (not some other project that happens to vendor a copy).
+
+    Returns the repo ``__version__`` only when it differs from the
+    INSTALLED ``__version__`` — when they match (the common case: the repo
+    IS what's installed), there's nothing to compare, so ``None``.
+    """
+    import re as _re  # noqa: PLC0415
+
+    try:
+        # doctor.py → cli/ → movate/ → src/ → <repo root>
+        module_file = Path(__file__).resolve()
+        src_movate = module_file.parent.parent  # .../src/movate
+        repo_root = src_movate.parent.parent  # .../<repo>
+        pyproject = repo_root / "pyproject.toml"
+        init_py = src_movate / "__init__.py"
+        if not (pyproject.is_file() and init_py.is_file()):
+            return None
+        if 'name = "movate-cli"' not in pyproject.read_text():
+            return None
+        match = _re.search(r'^__version__\s*=\s*"([^"]+)"', init_py.read_text(), _re.MULTILINE)
+        if not match:
+            return None
+        repo_version = match.group(1)
+        return repo_version if repo_version != __version__ else None
+    except OSError:
+        return None
+
+
+def _check_version_staleness() -> tuple[str, str]:
+    """Compare the installed ``mdk`` against its source of truth (ADR 026 D5).
+
+    Returns ``(result_markup, purpose)`` for a doctor table row:
+
+    * Editable repo checkout present AND newer than the installed build →
+      WARN with the reinstall command (``uv tool install --force .``). This
+      is the "I edited the repo / pulled main but forgot to reinstall the
+      tool" footgun — the installed binary silently lags the source.
+    * No newer repo → fall back to "last-updated N days ago" from the
+      installed CalVer date. Past :data:`_VERSION_STALE_DAYS` it warns with
+      the upgrade command; within the window it's a green "current" note.
+    * Non-CalVer / unknown date → a neutral note (never errors).
+
+    Cheap + best-effort; any failure degrades to a neutral note rather than
+    breaking ``mdk doctor``.
+    """
+    import datetime as _dt  # noqa: PLC0415
+
+    repo_version = _editable_repo_version()
+    if repo_version is not None:
+        return (
+            f"[yellow]behind repo ({repo_version})[/yellow] — reinstall: uv tool install --force .",
+            "installed build lags the editable checkout",
+        )
+
+    installed_date = _parse_calver_date(__version__)
+    if installed_date is None:
+        return ("[dim]version not date-based[/dim]", "staleness check needs a CalVer build")
+
+    days = (_dt.date.today() - installed_date).days
+    if days < 0:
+        # Clock skew / future-dated build — don't cry wolf.
+        return (_ok("current"), "installed build is up to date")
+    if days >= _VERSION_STALE_DAYS:
+        return (
+            f"[yellow]last updated {days}d ago[/yellow] — "
+            f"upgrade: uv tool install --force movate-cli",
+            "installed build is getting old",
+        )
+    label = "today" if days == 0 else f"{days}d ago"
+    return (_ok(f"current (built {label})"), "installed build is up to date")
 
 
 def _classify_result(check: str, result: str) -> str | None:

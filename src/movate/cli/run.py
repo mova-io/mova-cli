@@ -188,11 +188,17 @@ def run(
         )
         return
 
-    # Bare-name resolution: inside a project, `mdk run rag-qa` resolves
-    # to ./agents/rag-qa. Full paths + URLs pass through unchanged.
-    from movate.cli._resolve import resolve_agent_or_workflow_arg  # noqa: PLC0415
+    # Name/path resolution (ADR 026 D2): existing path wins, else a bare
+    # name resolves under the project's ``agents/`` / ``workflows/``, else a
+    # friendly not-found error. `mdk run .` + a standalone agent dir are
+    # first-class. The shared resolver backs run / validate / dev.
+    from movate.cli._resolve import resolve_agent_arg  # noqa: PLC0415
 
-    path = Path(resolve_agent_or_workflow_arg(str(path)))
+    try:
+        path = resolve_agent_arg(str(path))
+    except FileNotFoundError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
 
     if replay_id is not None:
         if input_arg is not None or input_flag is not None:

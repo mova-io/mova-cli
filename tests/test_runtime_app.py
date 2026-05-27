@@ -603,7 +603,7 @@ async def test_agents_returns_metadata_only(minted_key, storage: InMemoryStorage
     # Scaffold a real agent to get a real AgentBundle.
     cli_runner.invoke(
         cli_app,
-        ["init", "alpha", "-t", "default", "--target", str(tmp_path)],
+        ["init", "--bare", "alpha", "-t", "default", "--target", str(tmp_path)],
         catch_exceptions=False,
     )
     bundles = scan_agents(tmp_path)

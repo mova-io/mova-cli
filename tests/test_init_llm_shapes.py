@@ -57,11 +57,16 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _scaffold(*, name: str, description: str, target: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Run `mdk init <name> --llm <description> --mock --target <target>`."""
+    """Run `mdk init <name> --llm <description> --mock --bare --target <target>`.
+
+    --bare keeps the standalone single-dir layout these shape-detection
+    assertions target; ADR 026 D1 makes the non-bare default yield a
+    project wrapper, which would move agent.yaml under agents/<name>/.
+    """
     monkeypatch.chdir(target)
     return runner.invoke(
         app,
-        ["init", name, "--llm", description, "--mock", "--target", str(target)],
+        ["init", name, "--llm", description, "--mock", "--bare", "--target", str(target)],
     )
 
 

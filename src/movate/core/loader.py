@@ -293,7 +293,13 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
     """
     agent_dir = Path(path).resolve()
     if not agent_dir.is_dir():
-        raise AgentLoadError(f"agent path is not a directory: {agent_dir}")
+        # CLI commands (run / validate / dev) intercept the bare-name case
+        # before reaching here and render a friendlier, command-aware
+        # message (ADR 026 D2, see movate.cli._resolve.resolve_agent_arg).
+        # This stays the loader-level fallback for direct library callers.
+        raise AgentLoadError(
+            f"no agent directory at: {agent_dir} (expected a folder containing agent.yaml)"
+        )
 
     yaml_path = agent_dir / "agent.yaml"
     if not yaml_path.exists():

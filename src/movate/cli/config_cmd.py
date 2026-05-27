@@ -5,6 +5,7 @@ Subcommands:
 * ``movate config add-target`` — register a deployment + bearer-token env var
 * ``movate config list-targets`` — show what's registered
 * ``movate config use`` — pick the default target
+* ``movate config set`` — set a scalar config key (e.g. ``scaffold.model``)
 * ``movate config show`` — dump the current config (for debugging)
 * ``movate config remove-target`` — delete a target
 
@@ -201,6 +202,53 @@ def use_target(
     cfg.active = name
     save_user_config(cfg)
     success(f"active target → {name!r}")
+
+
+# Settable scalar keys for `mdk config set`. Dotted ``section.field``
+# names map to a nested field on :class:`UserConfig`. Kept as an explicit
+# allow-list (not reflection) so `mdk config set` can't poke arbitrary
+# internal fields (targets, OIDC, etc.) — those have dedicated commands.
+# ADR 026 D6: scaffold.model is the user-level scaffold-model default.
+_SETTABLE_KEYS: tuple[str, ...] = ("scaffold.model",)
+
+
+@config_app.command("set")
+def set_key(
+    key: str = typer.Argument(
+        ...,
+        help="Config key in [bold]section.field[/bold] form, e.g. [bold]scaffold.model[/bold].",
+    ),
+    value: str = typer.Argument(..., help="Value to set."),
+) -> None:
+    """Set a user-level config key (writes ``~/.movate/config.yaml``).
+
+    Mirrors the layered-config pattern (ADR 022): this writes the
+    persistent USER layer; a project's ``project.yaml`` and per-invocation
+    flags still override it.
+
+    [bold]Supported keys:[/bold]
+
+      [bold]scaffold.model[/bold]  — default LLM that powers ``mdk init --llm``
+                       (e.g. [dim]anthropic/claude-haiku-4-5-20251001[/dim]).
+                       Distinct from the generated agent's runtime model.
+
+    [bold]Example:[/bold]
+
+      [dim]$ mdk config set scaffold.model anthropic/claude-haiku-4-5-20251001[/dim]
+    """
+    if key not in _SETTABLE_KEYS:
+        error(f"unknown config key {key!r}. Settable keys: {', '.join(_SETTABLE_KEYS)}.")
+        raise typer.Exit(code=2)
+
+    cfg = load_user_config()
+    section, field = key.split(".", 1)
+    # Only `scaffold.*` is in the allow-list today; the structure below
+    # generalizes to future sections without re-plumbing the command.
+    if section == "scaffold":
+        setattr(cfg.scaffold, field, value)
+    path = save_user_config(cfg)
+    success(f"set [bold]{key}[/bold] → {value}")
+    hint(f"[dim]config: {path}[/dim]")
 
 
 @config_app.command("show")
