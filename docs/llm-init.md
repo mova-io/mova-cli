@@ -6,6 +6,11 @@ This is the internal companion to the [user-facing section in USER_GUIDE.md](../
 - **Maintainers** changing the meta-prompt or the `GeneratedAgent` schema
 - **Anyone wondering** why we picked the structure we did
 
+The on-disk shape every scaffold emits (schema as `schema/*.yaml`, a
+`judge.yaml.example`, the full `agent.yaml` field set) is documented in
+[`agent-layout.md`](agent-layout.md) — the canonical layout shared across
+`mdk init`, `mdk add`, and `mdk init --llm`.
+
 ## Module map
 
 | File | Responsibility |

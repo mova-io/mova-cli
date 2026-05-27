@@ -210,10 +210,12 @@ class TestGroundingScaffoldEndToEnd:
         assert spec["retrieval"]["auto_into"] == "context"
         assert spec["retrieval"]["query_from"] == "question"
 
-        # Optional-context input schema.
-        input_schema = (tmp_path / "docs-qa" / "schema" / "input.json").read_text()
-        assert '"context"' in input_schema
-        assert "question" in input_schema
+        # Optional-context input schema (canonical layout: YAML file, #127).
+        input_schema = yaml.safe_load((tmp_path / "docs-qa" / "schema" / "input.yaml").read_text())
+        assert "context" in input_schema["properties"]
+        assert "question" in input_schema["properties"]
+        # `context` is auto-filled by pre-retrieval → NOT required.
+        assert "context" not in input_schema["required"]
 
         # Grounded prompt mentions context + grounding.
         prompt = (tmp_path / "docs-qa" / "prompt.md").read_text()

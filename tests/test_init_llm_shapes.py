@@ -293,18 +293,34 @@ class TestShapeScaffoldEndToEnd:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
 
-        out_schema = json.loads((tmp_path / name / "schema" / "output.json").read_text())
+        # Canonical layout (#127): schema lives in YAML files (not JSON).
+        out_schema = yaml.safe_load((tmp_path / name / "schema" / "output.yaml").read_text())
         assert set(out_schema["required"]) == required
         _assert_no_key_suffix_question_marks(out_schema)
-        in_schema = json.loads((tmp_path / name / "schema" / "input.json").read_text())
+        in_schema = yaml.safe_load((tmp_path / name / "schema" / "input.yaml").read_text())
         _assert_no_key_suffix_question_marks(in_schema)
+        # The legacy JSON schema files are NOT emitted, and a
+        # judge.yaml.example ships alongside the dataset.
+        assert not (tmp_path / name / "schema" / "output.json").exists()
+        assert (tmp_path / name / "evals" / "judge.yaml.example").is_file()
 
         # Non-grounding shapes carry NO skills / retrieval block, and no
-        # skills/ dir is provisioned for them.
+        # skills/ dir is provisioned for them. agent.yaml references the
+        # YAML schema files and carries the fuller field set.
         spec = yaml.safe_load((tmp_path / name / "agent.yaml").read_text())
         assert "skills" not in spec
         assert "retrieval" not in spec
         assert not (tmp_path / "skills").exists()
+        assert spec["schema"] == {
+            "input": "./schema/input.yaml",
+            "output": "./schema/output.yaml",
+        }
+        assert spec["timeouts"] == {"call_ms": 30000, "total_ms": 60000}
+        assert spec["budget"] == {"max_cost_usd_per_run": 0.50}
+        assert "tags" in spec
+        # Fallback defaults to a DIFFERENT family from the openai primary.
+        fallback = spec["model"]["fallback"]
+        assert fallback and not fallback[0]["provider"].startswith(("openai/", "azure/"))
 
     @pytest.mark.parametrize(
         ("name", "description"),
@@ -357,8 +373,8 @@ class TestShapeScaffoldEndToEnd:
             monkeypatch=monkeypatch,
         )
         assert r1.exit_code == 0 and r2.exit_code == 0
-        a = json.loads((tmp_path / "det-1" / "schema" / "output.json").read_text())
-        b = json.loads((tmp_path / "det-2" / "schema" / "output.json").read_text())
+        a = yaml.safe_load((tmp_path / "det-1" / "schema" / "output.yaml").read_text())
+        b = yaml.safe_load((tmp_path / "det-2" / "schema" / "output.yaml").read_text())
         assert set(a["required"]) == set(b["required"]) == {"label", "confidence"}
 
 
@@ -429,3 +445,33 @@ class TestF3RagRegression:
         bundle = load_agent(tmp_path / "rag-bot")
         assert bundle.spec.retrieval.auto_retrieval_enabled is True
         assert {s.spec.name for s in bundle.skills} == {"kb-vector-lookup"}
+
+    def test_grounding_scaffold_canonical_layout(
+        self, tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The RAG shape also emits the canonical layout (#127): YAML schema
+        files + judge.yaml.example + the fuller agent.yaml field set — without
+        regressing its skills + retrieval block or its own tags."""
+        result = _scaffold(
+            name="rag-layout",
+            description="answer questions about our HR policies",
+            target=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        agent_dir = tmp_path / "rag-layout"
+        assert (agent_dir / "schema" / "input.yaml").is_file()
+        assert (agent_dir / "schema" / "output.yaml").is_file()
+        assert not (agent_dir / "schema" / "input.json").exists()
+        assert (agent_dir / "evals" / "judge.yaml.example").is_file()
+        spec = yaml.safe_load((agent_dir / "agent.yaml").read_text())
+        assert spec["schema"]["input"] == "./schema/input.yaml"
+        # F3 content preserved.
+        assert spec["skills"] == ["kb-vector-lookup"]
+        assert spec["retrieval"]["auto_into"] == "context"
+        # The RAG shape sets its own tags — post-processing must NOT clobber.
+        assert spec["tags"] == ["rag", "qa", "grounded"]
+        # Fuller field set added.
+        assert spec["timeouts"] == {"call_ms": 30000, "total_ms": 60000}
+        assert spec["budget"] == {"max_cost_usd_per_run": 0.50}
+        assert spec["model"]["fallback"]

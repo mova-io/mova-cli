@@ -71,7 +71,7 @@ def _valid_agent_payload(name: str = "robust-agent") -> dict[str, Any]:
                 "params": {"temperature": 0.0, "max_tokens": 512},
             },
             "prompt": "./prompt.md",
-            "schema": {"input": "./schema/input.json", "output": "./schema/output.json"},
+            "schema": {"input": "./schema/input.yaml", "output": "./schema/output.yaml"},
             "evals": {"dataset": "./evals/dataset.jsonl"},
         },
         "prompt_md": "Reply: {{ input.text }}",
@@ -160,8 +160,8 @@ class TestScaffoldAwareMock:
         target = tmp_path / "write-mock-agent"
         assert (target / "agent.yaml").is_file()
         assert (target / "prompt.md").is_file()
-        assert (target / "schema" / "input.json").is_file()
-        assert (target / "schema" / "output.json").is_file()
+        assert (target / "schema" / "input.yaml").is_file()
+        assert (target / "schema" / "output.yaml").is_file()
         # load_agent accepts it (validate command exercises the same path).
         from movate.core.loader import load_agent  # noqa: PLC0415
 

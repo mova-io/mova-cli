@@ -1160,7 +1160,7 @@ def _init_agent(
     # Use `mdk` (the canonical command name) — `movate` still works as an
     # alias but mixing names in user-facing strings is confusing.
     console.print(f"  mdk validate {dest}")
-    console.print(f"  mdk run {dest} --mock '{{}}'   # provide input matching schema/input.json")
+    console.print(f"  mdk run {dest} --mock '{{}}'   # provide input matching schema/input.yaml")
     if (dest / "skills" / "example-skill").is_dir():
         # The default template ships a reference skill folder. Surface
         # it here so users know it exists + know where to look for the
@@ -1200,6 +1200,64 @@ _PROVIDER_KEY_TO_AGENT_MODEL: dict[str, str] = {
     # LYZR has no canonical agent-model string in the templates; fall
     # through to the default rather than emit a guess.
 }
+
+
+# Sensible per-provider fallback target for the scaffolded agent.yaml's
+# `model.fallback` (#127, PR1). Keyed by the PRIMARY model's provider prefix
+# (before the `/`); value is a different-family model so a primary outage has
+# somewhere to go. Mirrors the `agent_init` template's openai→anthropic
+# default. A primary whose provider isn't listed falls back to the anthropic
+# default (still a valid, different family for the common openai/azure case).
+_FALLBACK_BY_PROVIDER: dict[str, str] = {
+    "openai": "anthropic/claude-haiku-4-5-20251001",
+    "azure": "anthropic/claude-haiku-4-5-20251001",
+    "anthropic": "openai/gpt-4o-mini-2024-07-18",
+    "gemini": "anthropic/claude-haiku-4-5-20251001",
+}
+_DEFAULT_FALLBACK_MODEL = "anthropic/claude-haiku-4-5-20251001"
+
+# Operational defaults written into every scaffolded agent.yaml so a --llm
+# agent matches the hand-init'd field set (`templates/agent_init/agent.yaml`).
+_SCAFFOLD_DEFAULT_TIMEOUTS = {"call_ms": 30000, "total_ms": 60000}
+_SCAFFOLD_DEFAULT_BUDGET = {"max_cost_usd_per_run": 0.50}
+
+
+def _apply_canonical_agent_defaults(agent_yaml: dict[str, Any], *, target_model: str) -> None:
+    """Fill the canonical operational fields into a generated ``agent_yaml``.
+
+    Aligns a ``--llm`` scaffold with a hand-init'd agent
+    (``templates/agent_init/agent.yaml``) by ensuring ``model.fallback``,
+    ``timeouts``, ``budget``, and ``tags`` are present. Mutates ``agent_yaml``
+    in place. GAP-FILL only — never clobbers a field the model already
+    emitted (the RAG shape's ``tags``, an exemplar's ``budget``), so F2/F3
+    shape-specific content is preserved.
+
+    ``model.fallback`` is derived from the PRIMARY ``target_model``'s provider
+    family so the fallback is a different family (a same-family fallback is
+    pointless against a provider outage and trips the eval/judge family
+    rules elsewhere). Skipped when the LLM already declared a fallback.
+    """
+    # model.fallback — only when absent. Pick a different-family target.
+    model_block = agent_yaml.get("model")
+    if isinstance(model_block, dict) and not model_block.get("fallback"):
+        provider_prefix = target_model.split("/", 1)[0] if "/" in target_model else target_model
+        fallback_model = _FALLBACK_BY_PROVIDER.get(provider_prefix, _DEFAULT_FALLBACK_MODEL)
+        # Guard the degenerate case where the lookup somehow returns the
+        # primary itself — drop the fallback rather than emit a useless
+        # same-model entry.
+        if fallback_model != target_model:
+            model_block["fallback"] = [{"provider": fallback_model}]
+
+    # timeouts / budget — gap-fill the standard caps.
+    if "timeouts" not in agent_yaml:
+        agent_yaml["timeouts"] = dict(_SCAFFOLD_DEFAULT_TIMEOUTS)
+    if "budget" not in agent_yaml:
+        agent_yaml["budget"] = dict(_SCAFFOLD_DEFAULT_BUDGET)
+
+    # tags — ensure the key exists (empty list is the agent_init default).
+    # A shape that already set tags (RAG: ["rag", "qa", "grounded"]) keeps them.
+    if "tags" not in agent_yaml:
+        agent_yaml["tags"] = []
 
 
 def _pick_target_model(*, llm_model: str, mock: bool) -> str:
@@ -1492,6 +1550,17 @@ async def _run_llm_scaffold(
             model_block = candidate.agent_yaml.get("model")
             if isinstance(model_block, dict):
                 model_block["provider"] = target_model
+
+            # #127 (PR1): align the emitted agent.yaml field set with a
+            # hand-init'd agent (`templates/agent_init/agent.yaml`) so a
+            # --llm scaffold isn't a thinner artifact than `mdk init`.
+            # Adds sensible defaults for `model.fallback`, `timeouts`,
+            # `budget`, and `tags` HERE (post-generation) rather than asking
+            # the model to invent them — keeps the meta-prompt focused on the
+            # behavioral fields (prompt + schemas + evals) and the operational
+            # knobs consistent across every scaffold. Only fills gaps: a field
+            # the LLM already emitted (e.g. the RAG shape's `tags`) is kept.
+            _apply_canonical_agent_defaults(candidate.agent_yaml, target_model=target_model)
 
             # Validate by writing to a tempdir and loading.
             validation_error = _try_validate(candidate, name=name)
@@ -2329,10 +2398,10 @@ def _save_debug_artifact(name: str, *, payload: Any, raw_error: str) -> None:
 
 def _render_dry_run_preview(generated: Any, *, name: str, dest: Path) -> None:
     """Render the generated agent as a Rich tree to stdout (no file writes)."""
-    import json as _json  # noqa: PLC0415
-
     import yaml as _yaml  # noqa: PLC0415
 
+    # Preview the schema as YAML so the dry-run mirrors what `write_agent_files`
+    # commits (#127): `schema/input.yaml` + `schema/output.yaml`, not JSON.
     body = (
         f"[bold]Agent:[/bold]   [cyan]{name}[/cyan]\n"
         f"[bold]Target:[/bold]  [dim]{dest}[/dim] [yellow](dry-run; not written)[/yellow]\n\n"
@@ -2341,10 +2410,10 @@ def _render_dry_run_preview(generated: Any, *, name: str, dest: Path) -> None:
         f"[bold]prompt.md:[/bold]\n"
         f"[dim]{generated.prompt_md.strip()[:_DRY_RUN_PROMPT_PREVIEW_CHARS]}"
         f"{'…' if len(generated.prompt_md) > _DRY_RUN_PROMPT_PREVIEW_CHARS else ''}[/dim]\n\n"
-        f"[bold]schema/input.json:[/bold]\n"
-        f"[dim]{_json.dumps(generated.input_schema, indent=2)}[/dim]\n\n"
-        f"[bold]schema/output.json:[/bold]\n"
-        f"[dim]{_json.dumps(generated.output_schema, indent=2)}[/dim]\n\n"
+        f"[bold]schema/input.yaml:[/bold]\n"
+        f"[dim]{_yaml.safe_dump(generated.input_schema, sort_keys=False).strip()}[/dim]\n\n"
+        f"[bold]schema/output.yaml:[/bold]\n"
+        f"[dim]{_yaml.safe_dump(generated.output_schema, sort_keys=False).strip()}[/dim]\n\n"
         f"[bold]evals/dataset.jsonl:[/bold] "
         f"[dim]{len(generated.sample_evals)} entries[/dim]"
     )
@@ -2366,13 +2435,15 @@ def _render_success_panel(*, name: str, dest: Path, generated: Any, cost_usd: fl
         f"[bold]Files:[/bold]\n"
         f"  • [cyan]agent.yaml[/cyan]\n"
         f"  • [cyan]prompt.md[/cyan]\n"
-        f"  • [cyan]schema/input.json[/cyan]\n"
-        f"  • [cyan]schema/output.json[/cyan]\n"
+        f"  • [cyan]schema/input.yaml[/cyan]\n"
+        f"  • [cyan]schema/output.yaml[/cyan]\n"
     )
     if generated.sample_evals:
         body += (
             f"  • [cyan]evals/dataset.jsonl[/cyan] "
             f"[dim]({len(generated.sample_evals)} seed cases)[/dim]\n"
+            f"  • [cyan]evals/judge.yaml.example[/cyan] "
+            f"[dim](rename to judge.yaml to enable LLM-as-judge)[/dim]\n"
         )
     if cost_usd is not None:
         # Cost line — typical scaffold runs are <$0.01; format with

@@ -61,7 +61,7 @@ def _valid_agent_payload(name: str = "canned-name") -> dict:
                 "params": {"temperature": 0.0, "max_tokens": 512},
             },
             "prompt": "./prompt.md",
-            "schema": {"input": "./schema/input.json", "output": "./schema/output.json"},
+            "schema": {"input": "./schema/input.yaml", "output": "./schema/output.yaml"},
             "evals": {"dataset": "./evals/dataset.jsonl"},
         },
         "prompt_md": "Reply: {{ input.text }}",
