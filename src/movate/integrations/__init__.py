@@ -15,8 +15,19 @@ convention:
   ``MDK_SLACK_ENABLED``, ...). Disabled state should return a
   structured "not configured" error rather than crashing.
 
-The current entry is :mod:`movate.integrations.github` — version-
-controlling agent bundles in a per-tenant GitHub repo per ADR 007.
+Entries:
+
+* :mod:`movate.integrations.github` — version-controlling agent bundles
+  in a per-tenant GitHub repo per ADR 007.
+* :mod:`movate.integrations.orchestration` — the shared ``submit → poll →
+  fetch`` engine the external-orchestrator adapters (ADR 017 D3) drive.
+* :mod:`movate.integrations.prefect` / :mod:`movate.integrations.airflow`
+  — OPT-IN adapters (``mdk[prefect]`` / ``mdk[airflow]``) that let a team
+  run a movate agent/workflow as a task in an orchestrator they already
+  run. movate stays the *callable*, never the *dependent* — these import
+  Prefect/Airflow lazily and take no core dependency. See
+  ``docs/orchestrator-interop.md`` for the generic webhook/CLI contract
+  (Dagster / Azure Data Factory / Logic Apps / raw curl).
 """
 
 __all__: list[str] = []
