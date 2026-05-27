@@ -11,7 +11,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import typer
 from rich.console import Console
@@ -511,6 +511,13 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
             )
             raise typer.Exit(code=2)
 
+    # ADR 023 — opt-in pre-retrieval cross-link checks. Only fire when
+    # the agent opted in (`retrieval.auto_into` set); a plain
+    # `retrieval:` pipeline block (hybrid/rewrite/...) doesn't trigger
+    # these. Mirrors the agent→skill cross-link discipline above:
+    # fail-loud at validate time rather than a confusing run-time no-op.
+    _validate_auto_retrieval(bundle)
+
     _check_kb_corpus(bundle)
     _check_vector_kb_empty(bundle, console)
     _check_marketplace_metadata(spec)
@@ -682,6 +689,119 @@ def _find_project_root_from_bundle(bundle: AgentBundle) -> Path | None:
         if any((parent / m).is_file() for m in PROJECT_MARKER_FILES):
             return parent
     return None
+
+
+def _validate_auto_retrieval(bundle: AgentBundle) -> None:
+    """ADR 023 — load-time checks for the opt-in pre-retrieval block.
+
+    Fires only when the agent opted in (``retrieval.auto_into`` set).
+    Fail-loud (exit 2) on the three misconfigurations that would
+    otherwise become a confusing run-time no-op or schema failure:
+
+    1. ``retrieval.skill`` doesn't resolve in the agent's declared
+       skills (the skill the Executor would pre-invoke is missing).
+    2. ``retrieval.auto_into`` names a field whose schema can't hold
+       the chunk shape (must accept ``list[string]``).
+    3. ``query_from`` is unset AND the primary text input field is
+       ambiguous (the Executor can't pick a query deterministically).
+
+    Mirrors the existing agent→skill cross-link discipline (ADR 002 §5).
+    """
+    cfg = bundle.spec.retrieval
+    if not cfg.auto_retrieval_enabled:
+        return
+
+    auto_into = cfg.auto_into
+    assert auto_into is not None  # guaranteed by auto_retrieval_enabled
+
+    # (1) The retrieval skill must be wired on the agent + resolvable.
+    declared = {s.spec.name for s in bundle.skills}
+    if cfg.auto_skill not in declared:
+        console.print(
+            f"  [red]✗[/red] retrieval.skill [bold]{cfg.auto_skill!r}[/bold] is not "
+            f"declared in this agent's [bold]skills:[/bold] "
+            f"({sorted(declared) or 'none'}). The pre-retrieval phase cannot "
+            "invoke a skill the agent doesn't wire."
+        )
+        console.print(
+            f"    [dim]fix: add [bold]{cfg.auto_skill}[/bold] to the agent's "
+            "[bold]skills:[/bold] list (and scaffold it with "
+            "[bold]mdk add skill[/bold] if needed).[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    # (2) auto_into must name an input field that accepts list[string].
+    props = bundle.input_schema.get("properties", {})
+    field_schema = props.get(auto_into)
+    if field_schema is None:
+        console.print(
+            f"  [red]✗[/red] retrieval.auto_into [bold]{auto_into!r}[/bold] is not a "
+            "field in this agent's input schema — pre-retrieval has nowhere to "
+            "write the retrieved chunks."
+        )
+        console.print(
+            f"    [dim]fix: add a [bold]{auto_into}[/bold] field of type "
+            "[bold]list[string][/bold] to the input schema, or point "
+            "[bold]retrieval.auto_into[/bold] at an existing one.[/dim]"
+        )
+        raise typer.Exit(code=2)
+    if not _field_accepts_string_list(field_schema):
+        console.print(
+            f"  [red]✗[/red] retrieval.auto_into [bold]{auto_into!r}[/bold] must accept a "
+            "[bold]list[string][/bold] (the chunk shape pre-retrieval writes), but its "
+            f"schema is [dim]{json.dumps(field_schema)[:200]}[/dim]."
+        )
+        console.print(
+            f"    [dim]fix: declare [bold]{auto_into}: list[string][/bold] in the "
+            "input schema.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    # (3) query_from must be unambiguous when left to the default.
+    if not cfg.query_from:
+        candidates = _primary_string_input_fields(bundle.input_schema)
+        # The default resolver picks a canonical name first; if none of
+        # those are present AND there's not exactly one string field, the
+        # default is ambiguous.
+        canonical = [c for c in ("query", "question", "text", "message") if c in candidates]
+        if not canonical and len(candidates) != 1:
+            console.print(
+                "  [red]✗[/red] retrieval.query_from is unset and the primary text "
+                f"input field is ambiguous (string fields: {candidates or 'none'}). "
+                "Pre-retrieval can't pick a query deterministically."
+            )
+            console.print(
+                "    [dim]fix: set [bold]retrieval.query_from[/bold] to the input "
+                "field whose value seeds the retrieval query.[/dim]"
+            )
+            raise typer.Exit(code=2)
+
+
+def _field_accepts_string_list(field_schema: dict[str, Any]) -> bool:
+    """True when ``field_schema`` (a compiled JSON Schema fragment) can
+    hold a ``list[string]`` — i.e. ``type: array`` with string items
+    (or unconstrained / string items)."""
+    if not isinstance(field_schema, dict):
+        return False
+    if field_schema.get("type") != "array":
+        return False
+    items = field_schema.get("items")
+    # No item constraint → accepts anything incl. strings.
+    if items is None:
+        return True
+    if isinstance(items, dict):
+        itype = items.get("type")
+        return itype is None or itype == "string"
+    return False
+
+
+def _primary_string_input_fields(input_schema: dict[str, Any]) -> list[str]:
+    """Names of top-level string-typed input fields, for the
+    query_from ambiguity check."""
+    props = input_schema.get("properties", {})
+    return [
+        name for name, sub in props.items() if isinstance(sub, dict) and sub.get("type") == "string"
+    ]
 
 
 def _check_kb_corpus(bundle: AgentBundle) -> None:

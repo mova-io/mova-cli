@@ -6,6 +6,45 @@ per commit). Releases prior to 2026-05 used SemVer (`v0.x`); those tags remain a
 
 ## [Unreleased]
 
+### Added — Opt-in declarative pre-retrieval (auto-RAG) in the shared Executor (ADR 023)
+
+**Grounding-by-default as a first-class, deterministic agent capability.** An
+agent can now declare a `retrieval:` block in `agent.yaml` to have the engine
+fetch grounding *for* it — after input-schema validation and before the prompt
+is rendered — so a RAG agent behaves **identically** across local `mdk run`, the
+runtime inline path, and the worker (it's one shared phase, not three).
+
+- **New optional `agent.yaml` field — additive, off by default (compat rule 5).**
+  The feature is enabled *only* when `retrieval.auto_into` is set. With no
+  `retrieval:` block (the dominant non-RAG path), `Executor.execute` runs
+  **byte-for-byte unchanged** — no extra embedding call, no behavior change.
+
+  ```yaml
+  retrieval:
+    auto_into: context        # REQUIRED to enable: the input field that receives chunks
+    query_from: question      # optional; default = the agent's primary text input field
+    skill: kb-vector-lookup   # optional; default = kb-vector-lookup
+    top_k: 8                  # optional; passed to the retrieval skill
+    when: if_empty            # optional; if_empty (default) | always
+    on_error: warn            # optional; warn (default → proceed ungrounded) | fail
+  ```
+
+- **Reuses existing seams, no new code path.** The phase invokes the configured
+  retrieval skill through the existing `SkillBackend` dispatch → `StorageProvider`
+  Protocols; `core` never imports a concrete backend. After merge the input is
+  re-validated against the schema.
+- **`when: if_empty` (default)** retrieves only when `auto_into` is absent/empty,
+  so an explicitly-passed value (e.g. an eval dataset's `context`) is respected —
+  preserving eval determinism. `when: always` re-retrieves unconditionally.
+- **Failure modes are graceful (ADR 023 D4).** No retriever / empty KB → no-op
+  with one notice, the run proceeds; empty results → field set to `[]`; a
+  retrieval error honours `on_error` (`warn` → ungrounded + notice; `fail` →
+  typed `ToolError`).
+- **`mdk validate` fails loud** on an unresolved `retrieval.skill`, an `auto_into`
+  field that can't hold the `list[string]` chunk shape, or an ambiguous default
+  `query_from`.
+- `Metrics` / `--json` shapes are unchanged.
+
 ### Changed — runtime-bearer keys are file-authoritative (ADR 022)
 
 **Kills the #1 recurring auth failure: a stale `export MDK_<TARGET>_KEY=…`
