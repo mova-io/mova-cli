@@ -1,0 +1,157 @@
+{
+  "version": "Notebook/1.0",
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# mdk — golden signals (Azure-native)\n\nOps dashboard for the **mdk (movate-cli)** runtime/worker over the **OTLP → Azure Monitor** stream (ADR 015 / ADR 020). The OTel Collector's `azuremonitor` exporter lands telemetry in the **workspace-based App Insights** `App*` tables:\n\n| OTel signal | Azure table | Key columns |\n| --- | --- | --- |\n| metrics (`mdk.*` instrument names, dot-form preserved) | `AppMetrics` | `Name`, `Sum`, `Properties[...]` |\n| spans (e.g. `agent.execute`) | `AppDependencies` | `Name`, `DurationMs`, `Success`, `AppRoleName` |\n| HTTP server spans (`/api/v1`, `/healthz`) | `AppRequests` | `Success`, `AppRoleName` |\n\nMetrics covered: `mdk.jobs.completed`, `mdk.job.duration_ms`, `mdk.jobs.in_flight`, `mdk.run.tokens`, `mdk.run.cost_usd` (defined in `src/movate/tracing/metrics.py`). The thresholds match the **item-27 SLO alerts** (`infra/azure/modules/monitor-alerts.bicep`); jump to the Alerts blade from the link below to see them firing."
+      },
+      "name": "title"
+    },
+    {
+      "type": 11,
+      "content": {
+        "version": "LinkItem/1.0",
+        "style": "list",
+        "links": [
+          {
+            "id": "alerts-link",
+            "linkTarget": "Resource",
+            "linkLabel": "Open Azure Monitor Alerts (item-27 SLO rules: dead-letter / error-rate / latency-p95 / availability)",
+            "subTarget": "alertsManagementSummary",
+            "style": "link"
+          }
+        ]
+      },
+      "name": "slo-alerts-links"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Latency — mdk.job.duration_ms\n\nJob wall-clock duration (claim → terminal). The histogram instrument is reported by the exporter as `AppMetrics` rows; `agent.execute` span `DurationMs` (`AppDependencies`) gives a span-level percentile cross-check that matches the latency SLO alert."
+      },
+      "name": "latency-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| summarize p50 = percentile(DurationMs, 50), p95 = percentile(DurationMs, 95), p99 = percentile(DurationMs, 99) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "agent.execute duration percentiles (p50 / p95 / p99, ms)",
+        "timeContext": {
+          "durationMs": 21600000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "latency-percentiles"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Throughput & errors — mdk.jobs.completed\n\nTerminal-job counts by `status` (success / error / safety_blocked / dead_letter). The `status` attribute is in `AppMetrics` `Properties[\"status\"]`; the counter value is the `Sum` column."
+      },
+      "name": "throughput-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend status = tostring(Properties[\"status\"])\n| summarize Jobs = sum(Sum) by status, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Job completions by status (mdk.jobs.completed)",
+        "timeContext": {
+          "durationMs": 21600000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "throughput-by-status"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend status = tostring(Properties[\"status\"])\n| summarize Total = sum(Sum), NonSuccess = sumif(Sum, status != \"success\"), DeadLetters = sumif(Sum, status == \"dead_letter\") by bin(TimeGenerated, 15m)\n| extend ErrorPct = iff(Total == 0, 0.0, round(100.0 * NonSuccess / Total, 2))\n| project TimeGenerated, ErrorPct, DeadLetters\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Error rate (%) and dead-letters — thresholds: error >10%, dead-letter >1 (item-27 SLO)",
+        "timeContext": {
+          "durationMs": 21600000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "error-rate"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Saturation — mdk.jobs.in_flight\n\nJobs currently claimed by workers (not yet terminal). Up-down counter, so the latest `Sum` per scrape is the live depth. (A true queue-depth instrument is deferred to item #27 and not yet emitted.)"
+      },
+      "name": "saturation-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.in_flight\"\n| summarize InFlight = avg(Sum) by bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Jobs in flight (mdk.jobs.in_flight)",
+        "timeContext": {
+          "durationMs": 21600000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "in-flight"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Cost & tokens — mdk.run.cost_usd, mdk.run.tokens\n\nLLM spend and token volume from executed runs, by `tenant` (`Properties[\"tenant\"]`)."
+      },
+      "name": "cost-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.run.cost_usd\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| summarize CostUsd = sum(Sum) by tenant, bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "LLM cost (USD) per hour by tenant (mdk.run.cost_usd)",
+        "timeContext": {
+          "durationMs": 86400000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "cost-by-tenant"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name in (\"mdk.run.cost_usd\", \"mdk.run.tokens\")\n| summarize Value = sum(Sum) by Name\n| extend Metric = iff(Name == \"mdk.run.cost_usd\", \"Cumulative cost (USD)\", \"Cumulative tokens\")\n| project Metric, Value",
+        "size": 3,
+        "title": "Cumulative cost & tokens (selected range)",
+        "timeContext": {
+          "durationMs": 86400000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "cost-tokens-cumulative"
+    }
+  ],
+  "fallbackResourceIds": [],
+  "fromTemplateId": "movate/mdk-golden-signals",
+  "$comment": "ADR 031 D2 Azure Monitor workbook for mdk golden signals. Metric instrument names referenced: mdk.jobs.completed, mdk.job.duration_ms, mdk.jobs.in_flight, mdk.run.tokens, mdk.run.cost_usd (src/movate/tracing/metrics.py). Span name agent.execute (AppDependencies). Scope to the Log Analytics workspace the workspace-based App Insights writes its App* tables to (logs.outputs.workspaceId in infra/azure/main.bicep). See dashboards/README.md."
+}
