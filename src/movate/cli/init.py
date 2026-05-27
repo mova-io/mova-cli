@@ -1,41 +1,49 @@
-"""``movate init`` — scaffold a new agent OR bootstrap a fresh project.
+"""``movate init`` — the front door: always leave a runnable project.
 
-Three modes:
+``mdk init`` is **context-aware** (ADR 026). What it produces depends on
+where you run it and whether you describe an agent to scaffold:
 
-* **Agent mode** (default): ``movate init <name>`` scaffolds one agent
-  directory under ``<target>/<name>/`` from a packaged template. Same
-  behavior shipped pre-Sprint P.
+* **Outside a project** → bootstrap a runnable PROJECT: ``project.yaml`` +
+  ``AGENTS.md`` + ``.env.example`` + ``.gitignore`` + ``agents/`` + an
+  initial ``.mdk/snapshots/`` baseline. With a template (``-t``), an
+  ``--llm "<description>"``, or a positional description, the agent is
+  scaffolded under ``agents/<name>/`` so ``mdk run <name>`` works from the
+  project root immediately. Bare ``mdk init <name>`` (no template / no
+  description) leaves the project with an empty ``agents/`` ready for
+  ``mdk add``. ``AGENTS.md`` is the cross-agent onboarding file (ADR 025) —
+  it teaches a coding agent (Claude Code, Cursor, …) how to evolve THIS
+  project. The snapshot is the baseline for ``mdk diff`` / ``mdk rollback``.
 
-* **Project mode** (``--project``): bootstrap a fresh movate workspace
-  with ``project.yaml`` + ``AGENTS.md`` + ``.env.example`` +
-  ``.gitignore`` + empty ``agents/``. ``AGENTS.md`` is the cross-agent
-  onboarding file (ADR 025) — it teaches a coding agent (Claude Code,
-  Cursor, …) how to evolve THIS project. Auto-creates an initial
-  snapshot so the operator has a baseline for ``mdk diff`` /
-  ``mdk rollback`` immediately.
+* **Inside a project** → ADD the agent under ``agents/<name>/`` of the
+  current project (the same place ``mdk add`` targets). No nested project.
 
-* **LLM-scaffold mode** (``--llm "<description>"``): generate the
-  agent from a natural-language description using an LLM. The
-  generator (in :mod:`movate.scaffold`) calls the configured provider
-  with a meta-prompt + two few-shot exemplars, parses the response
-  into a :class:`GeneratedAgent`, writes it to a tempdir, and
-  validates by loading it back through :func:`load_agent`. On
-  validation failure the error is fed back to the LLM for one retry;
-  a second failure stashes the raw payload at
-  ``.mdk/llm-init-failed-<name>.json`` and exits 1. Successful
-  scaffolds emit a Rich Panel with the file list + cost + next-step
-  commands, an ``_console.hint`` line pointing at ``prompt.md``, and a
-  greppable ``mdk_init_summary:`` line for CI parity with
-  ``mdk_audit_summary`` / ``mdk_eval_summary`` / ``mdk_doctor_summary``.
+* ``--bare`` → a STANDALONE single-dir agent at ``<target>/<name>/`` (no
+  ``project.yaml`` / ``agents/`` wrapper) — the escape hatch for dropping an
+  agent into a non-mdk repo or a quick throwaway. First-class, not a
+  degraded mode: ``mdk run .`` / ``validate .`` / ``dev .`` all work on it.
 
-  Pair with ``--mock`` for hermetic CI (no API keys); ``--dry-run``
-  renders a preview Panel without writing files; ``--llm-model``
-  overrides the default (``openai/gpt-4o-mini-2024-07-18``).
+* ``--project`` → explicitly bootstrap just the project workspace (back-compat
+  flag; the same workspace the outside-a-project default produces).
 
-Project mode is the "step 0" before any agents exist. Agent and
-LLM-scaffold modes are the "step 1+" inside an existing project.
-``mdk demo`` is the fourth sibling: a fully populated reference
-project (project + working agent + dataset).
+**``--llm "<description>"``** generates the agent from a natural-language
+description. The generator (in :mod:`movate.scaffold`) calls the configured
+provider, parses the response into a :class:`GeneratedAgent`, writes it to a
+tempdir, and validates by loading it back through :func:`load_agent`; on
+validation failure the error is fed back to the LLM for one retry, a second
+failure stashes the raw payload at ``.mdk/llm-init-failed-<name>.json`` and
+exits 1. It is **shape-aware** (Q&A / classifier / extractor / RAG / tool-use)
+and emits ``agent.yaml`` + ``prompt.md`` + schemas + seed eval cases. When the
+description contains a URL it auto-crawls + ingests that source into the new
+agent's KB then runs a grounded verify; a tool-use intent scaffolds a runnable
+skill STUB; and under ``--mock`` it runs a post-scaffold eval baseline. Pair
+with ``--mock`` for hermetic CI (no API keys); ``--dry-run`` previews without
+writing; the scaffolder model is layered-configurable (``--llm-model`` >
+``MDK_LLM_MODEL`` > project ``scaffold.model`` > ``mdk config set
+scaffold.model`` > a key-matched default). Successful scaffolds emit a Rich
+Panel + a greppable ``mdk_init_summary:`` line for CI parity.
+
+``mdk dev <name>`` is the guided edit→test→deploy loop that pairs with this;
+``mdk demo`` is a fully populated reference project (project + agent + dataset).
 """
 
 from __future__ import annotations
@@ -3307,7 +3315,8 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
     name: str = typer.Argument(
         None,
         help=(
-            "Agent name (default mode) OR project name (with [bold]--project[/bold]). "
+            "Name for the project (outside a project) or the agent (inside a "
+            "project, or with [bold]-t[/bold]/[bold]--llm[/bold]/[bold]--bare[/bold]). "
             "Lowercase, hyphenated. Omit with [bold]--project[/bold] to bootstrap "
             "the current directory in place."
         ),
@@ -3316,7 +3325,7 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
         None,
         help=(
             "Optional natural-language description. When set, treated as "
-            "shorthand for [bold]--llm[/bold]: "
+            "shorthand for [bold]--llm[/bold] (LLM-generates the agent): "
             '[bold]mdk init faq-agent "FAQ agent for our SaaS pricing"[/bold].'
         ),
     ),
@@ -3324,9 +3333,11 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
         False,
         "--project",
         help=(
-            "Bootstrap a fresh movate project workspace instead of scaffolding "
-            "an agent. Creates [bold]movate.yaml[/bold] + [bold].env.example[/bold] + "
-            "[bold].gitignore[/bold] + empty [bold]agents/[/bold] + an initial snapshot."
+            "Explicitly bootstrap just the project workspace (back-compat flag — "
+            "outside a project this is already the default). Creates "
+            "[bold]project.yaml[/bold] + [bold]AGENTS.md[/bold] + "
+            "[bold].env.example[/bold] + [bold].gitignore[/bold] + an empty "
+            "[bold]agents/[/bold] + an initial snapshot."
         ),
     ),
     template: str | None = typer.Option(
@@ -3334,11 +3345,12 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
         "--template",
         "-t",
         help=(
-            f"Template to scaffold from. One of: {', '.join(list_templates())}. "
-            "When set (explicitly), runs in AGENT mode and produces "
-            "an agent scaffold rather than a project. Without "
-            "[bold]-t[/bold] (and without [bold]--llm[/bold]), "
-            "[bold]mdk init <name>[/bold] defaults to PROJECT mode."
+            f"Template to scaffold the agent from. One of: {', '.join(list_templates())}. "
+            "Setting it scaffolds an agent (under [bold]agents/<name>/[/bold] in the "
+            "project, or standalone with [bold]--bare[/bold]). Bare "
+            "[bold]mdk init <name>[/bold] (no [bold]-t[/bold], no [bold]--llm[/bold]) "
+            "outside a project just bootstraps the project with an empty "
+            "[bold]agents/[/bold]."
         ),
     ),
     target: Path = typer.Option(
@@ -3484,16 +3496,29 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
         ),
     ),
 ) -> None:
-    """Scaffold a new agent, or bootstrap a fresh project workspace.
+    """Scaffold a new agent or project — always leaving a runnable result.
 
-    [bold]Project mode:[/bold] [bold]mdk init --project [my-proj][/bold]
-    creates a fresh movate workspace with project config + .gitignore +
-    empty agents/ + an initial snapshot. Omit the name to bootstrap the
-    current directory in place.
+    [bold]mdk init[/bold] is context-aware (ADR 026). The DEFAULT does the
+    intuitive thing for where you are:
 
-    [bold]Agent mode:[/bold] [bold]mdk init <name>[/bold] scaffolds one
-    agent inside an existing project. Pick a template with
-    [bold]--template[/bold].
+      [bold]Outside a project[/bold] → bootstrap a runnable PROJECT
+        (project.yaml + AGENTS.md + .env.example + .gitignore + agents/ +
+        an initial snapshot baseline). Add [bold]-t[/bold] / [bold]--llm[/bold]
+        / a description and the agent lands under [bold]agents/<name>/[/bold]
+        so [bold]mdk run <name>[/bold] works from the project root.
+      [bold]Inside a project[/bold] → ADD the agent under
+        [bold]agents/<name>/[/bold] (same as [bold]mdk add[/bold]).
+      [bold]--bare[/bold] → a STANDALONE single-dir agent (no project) — run
+        it with [bold]mdk run .[/bold] from inside the folder.
+
+    [bold]--llm "<description>"[/bold] LLM-generates the agent: a shape-aware
+    (Q&A / classifier / extractor / RAG / tool-use) [bold]agent.yaml[/bold] +
+    [bold]prompt.md[/bold] + schemas + seed eval cases. If the description
+    contains a URL it auto-crawls + ingests that page into the agent's KB
+    then runs a grounded verify; a tool-use intent scaffolds a runnable skill
+    STUB; under [bold]--mock[/bold] it also runs a post-scaffold eval baseline.
+    Set a persistent scaffolder model with
+    [bold]mdk config set scaffold.model <model>[/bold].
 
     [bold]Available agent templates:[/bold]
 
@@ -3503,19 +3528,31 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
       [bold]classifier[/bold] — text + labels → chosen label
       [bold]chatbot[/bold]    — message → reply (designed for `mdk chat`)
       [bold]extractor[/bold]  — text → strict typed fields
+      [dim](more role templates available — see `mdk add --list`)[/dim]
 
     [bold]Examples:[/bold]
 
-      [dim]$ mdk init --project my-proj[/dim]
-      [dim]$ mdk init --project        # bootstrap current directory[/dim]
-      [dim]$ mdk init faq               # add one agent from the faq template[/dim]
-      [dim]$ mdk init my-bot --template chatbot[/dim]
-      [dim]$ mdk init faq-agent --llm "FAQ agent for our SaaS pricing"[/dim]
+      [dim]$ mdk init my-proj                          # new project (empty agents/)[/dim]
+      [dim]$ mdk init faq-agent -t faq                 # new project + the faq agent[/dim]
+      [dim]$ mdk init faq-agent --llm "FAQ bot for our SaaS pricing"  # LLM-generated[/dim]
+      [dim]$ mdk init sitebot "answer questions about https://example.com"  # crawl + ground[/dim]
+      [dim]$ mdk init triager -t ticket-triager        # (run inside a project → adds it)[/dim]
+      [dim]$ mdk init scratch --bare                   # standalone agent (mdk run .)[/dim]
+      [dim]$ mdk init --project                        # bootstrap current dir in place[/dim]
 
-    [bold]See also:[/bold] [bold]mdk dev <name>[/bold] is the guided front
-    door — it scaffolds (if needed), then drops you into a live
-    edit → test → deploy loop. [bold]mdk add <template>[/bold] is the
-    quick "drop another role agent into this project" command.
+    [bold]See also:[/bold]
+      [bold]mdk dev <name>[/bold] — the guided front door: scaffolds (if
+        needed) then drops you into a live edit → test → deploy loop.
+      [bold]mdk run <name>[/bold] / [bold]validate <name>[/bold] — resolve an
+        agent by name from the project root; use [bold]mdk run .[/bold] for a
+        standalone agent.
+      [bold]mdk add <template>[/bold] — drop another role agent into this
+        project ([bold]mdk add --list[/bold] for the catalog).
+      [bold]mdk kb ingest <agent> <url|path>[/bold] — populate a grounded
+        agent's KB (e.g. when [bold]--llm[/bold] had no URL to crawl).
+      [bold]mdk report[/bold] — offline rollup of how your agents are doing.
+      [bold]mdk authoring audit[/bold] / [bold]replay[/bold] — the copilot's
+        reversible-action audit log.
     """
     # Mutual-exclusion guard: --llm only makes sense in agent mode.
     # Project mode is just a movate.yaml + .gitignore + empty agents/ —

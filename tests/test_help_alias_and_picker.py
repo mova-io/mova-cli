@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -20,6 +21,18 @@ from typer.testing import CliRunner
 from movate.cli.main import _expand_help_alias, app
 
 runner = CliRunner(mix_stderr=False)
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _plain(text: str) -> str:
+    """ANSI-stripped, whitespace-collapsed help output for robust matching.
+
+    Rich styles the help body (CI sets FORCE_COLOR=1) and wraps it under a
+    narrow non-TTY terminal, so a raw substring match on the styled output is
+    fragile. Strip ANSI + collapse whitespace before asserting.
+    """
+    return " ".join(_ANSI_RE.sub("", text).split())
 
 
 # ---------------------------------------------------------------------------
@@ -97,15 +110,17 @@ class TestHelpAliasEndToEnd:
     def test_mdk_init_help_renders_usage(self) -> None:
         result = runner.invoke(app, ["init", "--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
-        assert "Usage: " in result.stdout
-        assert "init" in result.stdout
+        plain = _plain(result.stdout)
+        assert "Usage:" in plain
+        assert "init" in plain
 
     def test_mdk_auth_help_lists_subcommands(self) -> None:
         result = runner.invoke(app, ["auth", "--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # Help table includes the create-key / login / status subcommands.
+        plain = _plain(result.stdout)
         for sub in ("create-key", "list-keys", "revoke-key", "login", "status"):
-            assert sub in result.stdout
+            assert sub in plain
 
 
 # ---------------------------------------------------------------------------
