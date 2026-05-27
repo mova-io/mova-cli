@@ -37,6 +37,12 @@ from rich.table import Table
 from movate.cli._next_steps import mdk_bin_name
 from movate.cli._progress import progress_bar
 from movate.kb.embed import DEFAULT_EMBEDDING_MODEL
+from movate.kb.web import (
+    DEFAULT_MAX_DEPTH as WEB_DEFAULT_MAX_DEPTH,
+)
+from movate.kb.web import (
+    DEFAULT_MAX_PAGES as WEB_DEFAULT_MAX_PAGES,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -893,6 +899,149 @@ def _ingest_url(
     asyncio.run(_run())
 
 
+def _ingest_crawl(
+    *,
+    agent: str,
+    start_url: str,
+    tenant_id: str,
+    model: str,
+    api_key_env: str,
+    clean_source: bool,
+    build_graph: bool,
+    max_pages: int,
+    max_depth: int,
+) -> None:
+    """``mdk kb ingest <agent> <url> --crawl`` — bounded same-site crawl (F6 / #115).
+
+    Builds on F5: from ``start_url`` it does a breadth-first, same-host
+    walk (:func:`movate.kb.web.crawl_site`), fetching a bounded set of
+    pages (``--max-pages`` / ``--max-depth`` hard caps) and routing EACH
+    page through the SAME chunk → embed → store pipeline a single URL /
+    local file uses (:func:`movate.kb.ingest.ingest_text`), recording the
+    source as that page's OWN URL.
+
+    Failure isolation (CLAUDE.md §10): one page 404/timeout/parse-error is
+    skipped + warned (stderr) and the crawl continues. Human progress goes
+    to stderr; the only stdout is the final summary table. A start-page
+    fetch that yields zero ingestible pages exits 2 with a clean message.
+    """
+    import os  # noqa: PLC0415
+
+    from movate.kb.ingest import ingest_text  # noqa: PLC0415
+    from movate.kb.web import crawl_site  # noqa: PLC0415
+
+    api_key = os.environ.get(api_key_env, "").strip()
+    if not api_key:
+        err_console.print(
+            f"[red]✗[/red] no API key found in [bold]${api_key_env}[/bold]. "
+            "Set the env var or pass [bold]--api-key-env[/bold] to point at "
+            "the correct env var for your embedding provider."
+        )
+        raise typer.Exit(code=2)
+
+    err_console.print(
+        f"[bold cyan]Crawling[/bold cyan] {start_url} -> agent [bold]{agent}[/bold] "
+        f"[dim](max {max_pages} pages, depth {max_depth}, same site only)[/dim]…"
+    )
+
+    def _on_page(url: str, fetched: int, cap: int) -> None:
+        err_console.print(f"  [green]✓[/green] [{fetched}/{cap}] fetched {url}")
+
+    def _on_skip(url: str, reason: str) -> None:
+        err_console.print(f"  [yellow]⚠[/yellow] skipped {url} — {reason}")
+
+    # Crawl first (network only — no storage writes yet), so a total
+    # failure leaves the KB untouched.
+    crawl = crawl_site(
+        start_url,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        on_page=_on_page,
+        on_skip=_on_skip,
+    )
+
+    if not crawl.pages:
+        err_console.print(
+            f"[red]✗[/red] crawl of [bold]{start_url}[/bold] ingested nothing — "
+            f"{crawl.skipped_count} page(s) skipped (fetch errors, non-HTML, or "
+            "no extractable text). Check the start URL is reachable and HTML."
+        )
+        raise typer.Exit(code=2)
+
+    async def _run() -> None:
+        storage = await _build_storage()
+        summaries: list[object] = []
+        ingest_failed: list[tuple[str, str]] = []
+        try:
+            for page in crawl.pages:
+                page_url = page.url
+                if clean_source:
+                    await storage.delete_kb_chunks(  # type: ignore[attr-defined]
+                        agent=agent, tenant_id=tenant_id, source=page_url
+                    )
+                    if build_graph:
+                        await storage.delete_graph(  # type: ignore[attr-defined]
+                            agent=agent, tenant_id=tenant_id, source=page_url
+                        )
+                try:
+                    summary = await ingest_text(
+                        storage=storage,  # type: ignore[arg-type]
+                        text=page.text,
+                        source=page_url,
+                        agent=agent,
+                        tenant_id=tenant_id,
+                        embedding_model=model,
+                        api_key=api_key,
+                        build_graph=build_graph,
+                    )
+                except Exception as exc:
+                    # Per-page failure isolation extends to the
+                    # embed/store step: a bad embedding call on one page
+                    # must not abort ingesting the rest of the crawl.
+                    ingest_failed.append((page_url, str(exc)))
+                    err_console.print(f"  [yellow]⚠[/yellow] failed to ingest {page_url} — {exc}")
+                    continue
+                if summary is not None:
+                    summaries.append(summary)
+        finally:
+            await storage.close()  # type: ignore[attr-defined]
+
+        total_chunks = sum(getattr(s, "chunks_saved", 0) for s in summaries)
+
+        table = Table(title=f"[bold]Crawl ingest summary[/bold] — agent [bold]{agent}[/bold]")
+        table.add_column("source", overflow="fold")
+        table.add_column("chunks", justify="right")
+        table.add_column("embedding model")
+        for s in summaries:
+            table.add_row(
+                getattr(s, "source", "?"),
+                str(getattr(s, "chunks_saved", 0)),
+                getattr(s, "embedding_model", ""),
+            )
+        console.print(table)
+        console.print(
+            f"[green]✓[/green] crawled [bold]{start_url}[/bold]: "
+            f"{crawl.fetched_count} page(s) fetched, "
+            f"{crawl.skipped_count} skipped, "
+            f"{len(summaries)} ingested, {total_chunks} chunk(s) saved."
+        )
+        if ingest_failed:
+            console.print(
+                f"[yellow]⚠[/yellow] {len(ingest_failed)} page(s) fetched but "
+                "failed to embed/store."
+            )
+        if build_graph:
+            total_entities = sum(getattr(s, "entities_saved", 0) for s in summaries)
+            total_relations = sum(getattr(s, "relations_saved", 0) for s in summaries)
+            console.print(
+                f"[green]✓[/green] knowledge graph: {total_entities} entities, "
+                f"{total_relations} relations."
+            )
+        console.print(f'[dim]Try it: [bold]mdk kb search {agent} "your question here"[/bold][/dim]')
+
+    asyncio.run(_run())
+
+
 def _list_remote(*, agent: str, target: str, source: str | None, limit: int) -> None:
     """``mdk kb list --target`` — list a deployed agent's KB chunks.
 
@@ -1284,6 +1433,35 @@ def ingest(
             "--changed-only, --ocr-*) don't apply — the runtime owns those."
         ),
     ),
+    crawl: bool = typer.Option(
+        False,
+        "--crawl",
+        help=(
+            "Only meaningful when the source is a URL: follow same-site "
+            "<a href> links from the start page and ingest a BOUNDED set of "
+            "pages (each chunk's source = its own page URL). Stays on the "
+            "start URL's host, skips non-HTML/mailto/external links, dedups "
+            "visited URLs, and isolates per-page failures (a 404/timeout is "
+            "skipped, not fatal). Bound it with --max-pages / --max-depth. "
+            "Passing --crawl with a filesystem path is an error."
+        ),
+    ),
+    max_pages: int = typer.Option(
+        WEB_DEFAULT_MAX_PAGES,
+        "--max-pages",
+        help=(
+            "Hard cap on the number of pages a --crawl ingests "
+            f"(default {WEB_DEFAULT_MAX_PAGES}). Keeps the crawl bounded."
+        ),
+    ),
+    max_depth: int = typer.Option(
+        WEB_DEFAULT_MAX_DEPTH,
+        "--max-depth",
+        help=(
+            "Hard cap on --crawl link-follow depth: the start page is depth "
+            f"0, its links depth 1, etc. (default {WEB_DEFAULT_MAX_DEPTH})."
+        ),
+    ),
 ) -> None:
     """Ingest a knowledge-base file, directory, or web page into ``agent``'s KB.
 
@@ -1340,6 +1518,20 @@ def ingest(
                 "(it previews local files). Run without --dry-run to fetch + ingest the page."
             )
             raise typer.Exit(code=2)
+        if crawl:
+            # F6 (#115): bounded same-site BFS crawl from the start URL.
+            _ingest_crawl(
+                agent=agent,
+                start_url=source,
+                tenant_id=tenant_id,
+                model=model,
+                api_key_env=api_key_env,
+                clean_source=clean_source,
+                build_graph=build_graph,
+                max_pages=max_pages,
+                max_depth=max_depth,
+            )
+            return
         _ingest_url(
             agent=agent,
             url=source,
@@ -1350,6 +1542,18 @@ def ingest(
             build_graph=build_graph,
         )
         return
+
+    # ── --crawl only applies to URLs ───────────────────────────────────────
+    # Reached only when the source is NOT a URL (filesystem path, or the
+    # omitted-argument interactive path). --crawl on a path is meaningless
+    # — fail clearly rather than silently ignoring it.
+    if crawl:
+        err_console.print(
+            "[red]✗[/red] [bold]--crawl[/bold] only applies to a URL source "
+            "(http:// or https://). It can't be used with a filesystem path — "
+            "drop --crawl to ingest local files, or pass a start URL to crawl a site."
+        )
+        raise typer.Exit(code=2)
 
     path = Path(source) if source is not None else None
 
