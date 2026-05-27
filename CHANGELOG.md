@@ -6,6 +6,46 @@ per commit). Releases prior to 2026-05 used SemVer (`v0.x`); those tags remain a
 
 ## [Unreleased]
 
+### Added — Per-step execution observability backbone (ADR 024, PR 1 of 3)
+
+**Every run now retains its internal shape — each LLM turn, each skill/tool
+call, each KB retrieval — so "where did the time/cost/tokens go?" is answerable
+per step, both in the trace backend and offline.** This is the backbone (D1
+nested spans + D2 retention + D5 cost sum); the `mdk explain` / `mdk trace
+replay` tree rendering (PR 2) and workflow root-span nesting (PR 3) build on it.
+
+- **Nested execution spans (D1, additive — no Tracer Protocol change).** The
+  Executor now builds a span *tree* on the existing `SpanCtx.parent` seam:
+  `agent.execute` → `agent.turn[i]` (one child per LLM round-trip) →
+  `skill.<name>` / `retrieval.<skill>` (one child per dispatched tool call and
+  per ADR 023 pre-retrieval). Each carries `cost_usd` / `latency_ms` / token
+  attributes. Tracing stays wired at the edges — only the Executor touches the
+  tracer — and Null/Silent tracers no-op the child spans (zero cost when tracing
+  is off).
+- **Per-step retention on `RunRecord` (D2, additive + backward-compatible).**
+  `SkillCallRecord` gains `cost_usd` and a `turn` linkage; a new `TurnRecord`
+  (model, tokens, cost, latency, finish_reason) is retained on the new
+  `RunRecord.turns` list. Old records (no `turns`) load as an empty list and
+  render as a single node. `--json` gains keys additively; no existing key is
+  removed or renamed. The DB providers (`SqliteProvider` / `PostgresProvider`)
+  now persist `turns` (and `skill_calls`) via additive, idempotent JSON columns
+  so the breakdown reconstructs **offline**, with no Langfuse / OTel backend.
+
+- **⚠️ `Metrics.cost_usd` is now a true per-step SUM (D5 — value-semantics
+  change, compat rule 5; field SHAPE is unchanged).** Run cost is now
+  Σ(per-turn LLM costs) + Σ(skill `cost.per_call_usd`) + pre-retrieval cost,
+  computed where each completion happens, rather than a single pricing-table
+  lookup over the accumulated tokens of the final completion.
+  - **No change for the dominant path:** a single-turn, no-skill, no-retrieval
+    run reports the **same** `cost_usd` as before (one turn, same tokens, same
+    pricing key) — guarded by an explicit regression test.
+  - **More accurate (and larger) for multi-turn / tool-using / RAG runs:** these
+    previously under-reported by counting only the final completion. Budget
+    enforcement and `--json` consumers keep working — only the value is more
+    honest. A run that errors mid-loop now also persists a partial `ERROR`
+    `RunRecord` carrying the turns/skills captured so far (its aggregate
+    `metrics.cost_usd` stays `0` so the tenant-budget total is unaffected).
+
 ### Added — Opt-in declarative pre-retrieval (auto-RAG) in the shared Executor (ADR 023)
 
 **Grounding-by-default as a first-class, deterministic agent capability.** An

@@ -1594,6 +1594,56 @@ class SkillCallRecord(BaseModel):
     """Short error description when the skill raised a ``SkillError``."""
     latency_ms: float = 0.0
     """Wall-clock time from dispatch to result, in milliseconds."""
+    cost_usd: float = 0.0
+    """Per-call skill cost (ADR 002 ``cost.per_call_usd``) for THIS invocation.
+
+    Additive (ADR 024 D2 / D5). Defaults to ``0.0`` so older persisted
+    records — and free / errored skill calls — load and render unchanged.
+    Summed into ``Metrics.cost_usd`` alongside the per-turn LLM costs."""
+    turn: int = 0
+    """1-based index of the LLM turn that requested this skill call.
+
+    Ties each tool call back to the :class:`TurnRecord` whose
+    ``index`` matches, so ``mdk explain`` can nest ``skill.*`` under the
+    turn that dispatched it (ADR 024 D1/D2). The tool-use loop derives
+    this from the same per-turn counter that drives the nested
+    ``agent.turn[i]`` spans — i.e. it equals the historical ``step``
+    value. ``0`` on legacy records / the pre-retrieval phase (turn 0)."""
+
+
+class TurnRecord(BaseModel):
+    """One LLM round-trip ("turn") inside a run's tool-use loop (ADR 024 D2).
+
+    A run is a sequence of turns; each turn may dispatch zero or more
+    :class:`SkillCallRecord` tool calls (linked by ``turn`` == ``index``).
+    Persisted as a JSON array on :attr:`RunRecord.turns` so ``mdk explain``
+    can reconstruct the per-step cost / latency / token breakdown **offline**
+    — no Langfuse / OTel backend required (the same offline-first rationale
+    that already justifies persisting ``skill_calls``).
+
+    Additive + backward-compatible: a run with no turns (legacy record, or
+    an agent whose single completion predates this field) leaves
+    ``RunRecord.turns`` an empty list and renders as a single node.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    """1-based position of this turn in the tool-use loop (turn 1 = first
+    LLM round-trip)."""
+    model: str
+    """The provider string that produced this turn (the chosen fallback)."""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    """LLM cost for THIS turn's completion (Σ over turns + Σ skill costs =
+    ``Metrics.cost_usd``). ``0.0`` for an LLM-cache-hit turn or a runtime
+    with no pricing key — matching the run-level cost semantics."""
+    latency_ms: int = 0
+    """Wall-clock time of this turn's ``provider.complete`` round-trip."""
+    finish_reason: str | None = None
+    """Optional model-reported stop reason (``"final"`` / ``"tool_use"`` in
+    the executor's vocabulary). ``None`` when not captured."""
 
 
 class RunRecord(BaseModel):
@@ -1636,6 +1686,17 @@ class RunRecord(BaseModel):
             "Empty for single-shot agents (no skills). Populated by the executor "
             "and persisted as a JSON blob so `mdk explain --steps` can render the "
             "decision chain without a Langfuse backend."
+        ),
+    )
+    turns: list[TurnRecord] = Field(
+        default_factory=list,
+        description=(
+            "Per-turn LLM round-trips captured during the tool-use loop (ADR 024 "
+            "D2). One entry per `provider.complete` call, carrying that turn's "
+            "model / tokens / cost / latency. Empty on legacy records and renders "
+            "as a single node — additive, backward-compatible. Persisted as a JSON "
+            "blob so `mdk explain` can reconstruct the per-step breakdown offline, "
+            "without a Langfuse / OTel backend."
         ),
     )
 

@@ -61,6 +61,7 @@ from movate.core.models import (
     RunResponse,
     SkillCallRecord,
     TokenUsage,
+    TurnRecord,
 )
 from movate.core.provider_keys import ProviderKeyResolver
 from movate.core.reflection import build_revision_prompt, call_judge
@@ -262,6 +263,14 @@ class Executor:
         )
 
         started = time.monotonic()
+        # Per-step trail (ADR 024 D1/D2), declared BEFORE the try so it is
+        # always in scope for the failure handler — a run that errors mid-loop
+        # still persists the partial turns/skills captured so far (offline-first
+        # partial record; test-matrix case 7). The tool-use loop and the ADR 023
+        # pre-retrieval phase append into these in place.
+        pre_retrieval_calls: list[SkillCallRecord] = []
+        skill_calls: list[SkillCallRecord] = []
+        turns: list[TurnRecord] = []
         try:
             # Runtime POLICY check first — if the project bans this
             # runtime (e.g. movate.yaml: runtime.allowed: [litellm]),
@@ -345,6 +354,12 @@ class Executor:
             except JsonSchemaError as exc:
                 raise SchemaError(f"input failed schema: {exc.message}") from exc
 
+            # Pre-retrieval (ADR 023, "turn 0") cost, accounted into the run
+            # total below. The retrieval SkillCallRecord goes into the
+            # ``pre_retrieval_calls`` list declared above — kept SEPARATE from
+            # the tool-use loop's records so a fallback reset can't wipe it.
+            pre_retrieval_cost_usd = 0.0
+
             # ADR 023 — opt-in declarative pre-retrieval (auto-RAG).
             # Runs AFTER input validation and BEFORE prompt render, in
             # this ONE shared Executor, so grounding is identical across
@@ -356,12 +371,16 @@ class Executor:
             # ``request.input[auto_into]`` and RE-VALIDATES the input
             # against the schema so the populated field still conforms.
             if bundle.spec.retrieval.auto_retrieval_enabled:
-                await self._maybe_pre_retrieve(
+                # ADR 024 D1/D5 — pre-retrieval is "turn 0": its cost is
+                # accounted into the run total and it emits a ``retrieval.*``
+                # child span + a turn-0 SkillCallRecord (offline-first).
+                pre_retrieval_cost_usd = await self._maybe_pre_retrieve(
                     bundle=bundle,
                     request=request,
                     span=span,
                     run_id=run_id,
                     tenant_id=tenant_id,
+                    skill_calls=pre_retrieval_calls,
                 )
                 try:
                     bundle.input_validator.validate(request.input)
@@ -450,9 +469,20 @@ class Executor:
             # in the tool-use loop. Added to the total run cost below
             # so existing budget enforcement covers skills without
             # extra plumbing. ADR 002 — cost participates in budget.
+            # (Pre-retrieval cost is tracked separately above.)
             skill_cost_usd = 0.0
-            # Per-step skill call records threaded back from the loop.
-            skill_calls: list[SkillCallRecord] = []
+            # ``skill_calls`` / ``turns`` (declared before the try) carry the
+            # tool-use loop's per-step records. ``_run_with_tool_use`` APPENDS
+            # to them in place so a mid-loop failure still persists the partial
+            # trail; on a fallback attempt they are RESET (cleared) at the top
+            # of each chain iteration so only the successful (or final-failing)
+            # provider's steps survive. The pre-retrieval (turn-0) records live
+            # in ``pre_retrieval_calls`` and are prepended at persist time —
+            # fallback resets don't touch them.
+            # Σ of per-turn LLM costs from the loop (ADR 024 D5). Computed
+            # where each completion happens so multi-turn / tool runs report
+            # the honest sum, not just the final completion's cost.
+            turn_cost_usd = 0.0
             # Pre-compute tool specs from the agent's resolved skills.
             # Empty list = no tool-use loop, single-shot path runs
             # identically to v0.5. The provider's to_tool_spec
@@ -475,11 +505,16 @@ class Executor:
                     *(history or []),
                     Message(role="user", content=rendered),
                 ]
+                # Reset the per-attempt step records. If a prior chain entry
+                # failed and we fell back, its partial turns/skills must not
+                # leak into the successful (or final-failing) provider's trail.
+                skill_calls.clear()
+                turns.clear()
                 try:
                     (
                         completion,
                         skill_cost_usd,
-                        skill_calls,
+                        turn_cost_usd,
                     ) = await self._run_with_tool_use(
                         provider_for_run=provider_for_run,
                         bundle=bundle,
@@ -492,6 +527,8 @@ class Executor:
                         run_id=run_id,
                         tenant_id=tenant_id,
                         skill_fixture=skill_fixture,
+                        turns=turns,
+                        skill_calls=skill_calls,
                     )
                     chosen_provider = provider_str
                     break
@@ -514,54 +551,31 @@ class Executor:
                 assert last_error is not None
                 raise last_error
 
-            # Cache-hit short-circuit: a response served from the LLM
-            # cache cost us no provider call, so the run pays $0 for it
-            # (the whole point of the cache). The ``llm_cache_hit`` flag
-            # is stamped on ``raw`` by ``_complete_cached`` and survives
-            # into the accumulated raw of the final completion. Skipping
-            # the pricing lookup keeps the win honest and observable.
-            llm_cache_hit = bool(completion.raw.get("llm_cache_hit"))
-            if llm_cache_hit:
-                cost = 0.0
-                self._tracer.log_event(
-                    span,
-                    {"cost_skipped": True, "reason": "llm cache hit ($0)"},
-                )
-            # Pricing-key dance: each adapter knows the canonical key for
-            # its provider strings (LiteLLM passes the agent's
-            # ``model.provider`` through unchanged; native_anthropic /
-            # native_openai prepend the family prefix; langchain returns
-            # None because the model is opaque). When None or the lookup
-            # misses we record cost=0 with an event — better than
-            # crashing on a runtime where pricing isn't applicable.
-            elif (pricing_key := provider_for_run.pricing_key(chosen_provider)) is None:
-                cost = 0.0
-                self._tracer.log_event(
-                    span,
-                    {"cost_skipped": True, "reason": "runtime has no pricing key"},
-                )
-            else:
-                try:
-                    cost = self._pricing.cost_for(provider=pricing_key, tokens=completion.tokens)
-                except KeyError:
-                    cost = 0.0
-                    self._tracer.log_event(
-                        span,
-                        {"cost_skipped": True, "reason": f"no pricing for {pricing_key!r}"},
-                    )
+            # ADR 024 D5 — run-level LLM cost is now the SUM of per-turn
+            # costs computed inside the tool-use loop (one ``provider.complete``
+            # per turn), not a single pricing-table lookup over the accumulated
+            # tokens. For the single-turn / no-skill path the sum equals the
+            # historical figure exactly (one turn, same tokens, same pricing
+            # key) — a value-preserving refactor guarded by the regression
+            # test. For multi-turn / tool runs it is the honest, larger total.
+            # The per-turn cache-hit / no-pricing-key ``cost_skipped`` events
+            # are emitted in the loop where each completion happens.
+            cost = turn_cost_usd
             self._check_cost_drift(span, completion, cost)
 
-            # Add the skill-cost accumulator from the tool-use loop.
-            # Skill cost is a flat per-call USD figure declared in each
-            # skill.yaml; it doesn't go through pricing-table lookup
-            # because skills can be anything (a free Python function, a
-            # paid HTTP API, an internal MCP server). Drift check above
-            # is still on the LLM cost only.
-            if skill_cost_usd > 0:
-                cost += skill_cost_usd
+            # Add the skill-cost accumulators (tool-use loop + ADR 023
+            # pre-retrieval "turn 0"). Skill cost is a flat per-call USD figure
+            # declared in each skill.yaml; it doesn't go through the
+            # pricing-table lookup because skills can be anything (a free Python
+            # function, a paid HTTP API, an internal MCP server). Drift check
+            # above is still on the LLM cost only. ADR 024 D5: the run cost is
+            # the honest Σ(turn costs) + Σ(skill costs).
+            total_skill_cost = skill_cost_usd + pre_retrieval_cost_usd
+            if total_skill_cost > 0:
+                cost += total_skill_cost
                 self._tracer.log_event(
                     span,
-                    {"skill_cost_added": skill_cost_usd},
+                    {"skill_cost_added": total_skill_cost},
                 )
 
             # The effective ceiling is the MIN of the agent's declared
@@ -738,7 +752,9 @@ class Executor:
                 workflow_run_id=workflow_run_id,
                 node_id=node_id,
                 thread_id=thread_id,
-                skill_calls=skill_calls,
+                # Pre-retrieval (turn-0) calls first, then the tool-use loop's.
+                skill_calls=[*pre_retrieval_calls, *skill_calls],
+                turns=turns,
             )
 
             # Persist the run's input + output to the memory store so
@@ -775,6 +791,8 @@ class Executor:
                 tenant_id=tenant_id,
                 started=started,
                 err=exc,
+                skill_calls=[*pre_retrieval_calls, *skill_calls],
+                turns=turns,
             )
         except RetryExhaustedError as exc:
             return await self._handle_failure(
@@ -785,6 +803,8 @@ class Executor:
                 tenant_id=tenant_id,
                 started=started,
                 err=exc.last_error,
+                skill_calls=[*pre_retrieval_calls, *skill_calls],
+                turns=turns,
             )
 
     async def _maybe_pre_retrieve(
@@ -795,7 +815,8 @@ class Executor:
         span: SpanCtx,
         run_id: str,
         tenant_id: str,
-    ) -> None:
+        skill_calls: list[SkillCallRecord],
+    ) -> float:
         """ADR 023 pre-retrieval phase — invoked only when
         ``retrieval.auto_into`` is set (gated by the caller).
 
@@ -806,6 +827,12 @@ class Executor:
         writes the returned chunk texts into ``request.input[auto_into]``
         as a ``list[string]``. Mutates ``request.input`` in place; the
         caller re-validates against the schema afterwards.
+
+        ADR 024 D1/D2/D5: emits a ``retrieval.<skill>`` child span under the
+        run's root span (no-op when tracing is off), appends a turn-0
+        :class:`SkillCallRecord` to ``skill_calls``, and RETURNS the
+        retrieval skill's ``cost.per_call_usd`` so the caller folds it into
+        the run cost sum. Returns ``0.0`` on every no-op / skip / warn path.
 
         Failure modes (ADR 023 D4):
 
@@ -848,7 +875,7 @@ class Executor:
                     span,
                     {"pre_retrieval_skipped": "field_non_empty", "auto_into": auto_into},
                 )
-                return
+                return 0.0
 
         # Resolve the retrieval skill from the agent's declared skills.
         # `mdk validate` enforces this resolves; at run time a missing
@@ -866,7 +893,7 @@ class Executor:
                 f"{bundle.spec.name!r}; proceeding ungrounded",
             )
             request.input.setdefault(auto_into, [])
-            return
+            return 0.0
 
         # Build the retrieval query from `query_from` (or the resolved
         # primary text field). An empty/missing query is a no-op notice.
@@ -878,12 +905,20 @@ class Executor:
                 "no retrieval query resolved from input; proceeding ungrounded",
             )
             request.input.setdefault(auto_into, [])
-            return
+            return 0.0
 
         skill_input: dict[str, Any] = {"question": query}
         if cfg.top_k is not None:
             skill_input["k"] = cfg.top_k
 
+        # ADR 024 D1 — pre-retrieval ("turn 0") gets a ``retrieval.<skill>``
+        # child span under the run root. No-op on Null/Silent tracers. The
+        # skill backend's own sub-spans nest under it via ``ctx.parent_span``.
+        retrieval_span = self._tracer.start_span(
+            f"retrieval.{cfg.auto_skill}",
+            {"skill": cfg.auto_skill, "turn": 0, "auto_into": auto_into},
+            parent=span,
+        )
         ctx = SkillExecutionContext(
             trace_id=span.trace_id,
             tenant_id=tenant_id,
@@ -893,12 +928,30 @@ class Executor:
             storage=self._storage,
             retrieval=cfg,
             tracer=self._tracer,
-            parent_span=span,
+            parent_span=retrieval_span,
         )
+        cost = float(skill.spec.cost.per_call_usd)
 
+        _t0 = time.monotonic()
         try:
             output = await dispatch_skill(skill, skill_input, ctx)
         except SkillError as exc:
+            lat = (time.monotonic() - _t0) * 1000
+            self._tracer.set_attribute(retrieval_span, "latency_ms", round(lat, 1))
+            self._tracer.end_span(retrieval_span, status="error")
+            # Retain the failed turn-0 retrieval as a SkillCallRecord so the
+            # offline trail shows the grounding attempt + its failure.
+            skill_calls.append(
+                SkillCallRecord(
+                    step=0,
+                    turn=0,
+                    skill=cfg.auto_skill or "",
+                    input=skill_input,
+                    error=f"{exc.type.value}: {exc.message}",
+                    latency_ms=round(lat, 1),
+                    cost_usd=0.0,
+                )
+            )
             # No retriever / empty KB surfaces as a benign skill outcome
             # (the kb-vector-lookup skill returns empty rather than
             # raising) — so a SkillError here is a genuine failure
@@ -931,7 +984,9 @@ class Executor:
                 error_type=exc.type.value,
             )
             request.input.setdefault(auto_into, [])
-            return
+            # warn path: no cost charged for a failed retrieval.
+            return 0.0
+        lat = (time.monotonic() - _t0) * 1000
 
         # Extract the chunk texts → `list[string]` (the shape the
         # `auto_into` field is validated to accept). The kb-vector-lookup
@@ -948,6 +1003,22 @@ class Executor:
                     texts.append(c)
 
         request.input[auto_into] = texts
+        self._tracer.set_attribute(retrieval_span, "cost_usd", cost)
+        self._tracer.set_attribute(retrieval_span, "latency_ms", round(lat, 1))
+        self._tracer.set_attribute(retrieval_span, "chunks_merged", len(texts))
+        self._tracer.end_span(retrieval_span, status="ok")
+        # Retain the turn-0 retrieval as a SkillCallRecord (offline-first).
+        skill_calls.append(
+            SkillCallRecord(
+                step=0,
+                turn=0,
+                skill=cfg.auto_skill or "",
+                input=skill_input,
+                output=output if isinstance(output, dict) else None,
+                latency_ms=round(lat, 1),
+                cost_usd=cost,
+            )
+        )
         self._tracer.log_event(
             span,
             {
@@ -967,6 +1038,7 @@ class Executor:
                 bundle.spec.name,
                 auto_into,
             )
+        return cost
 
     def _resolve_retrieval_query(
         self,
@@ -1016,6 +1088,40 @@ class Executor:
             event["pre_retrieval_error"] = error_type
         self._tracer.log_event(span, event)
 
+    def _turn_cost(
+        self,
+        *,
+        provider_for_run: BaseLLMProvider,
+        provider_str: str,
+        completion: CompletionResponse,
+        span: SpanCtx,
+    ) -> float:
+        """Cost of ONE turn's completion (ADR 024 D5).
+
+        Mirrors the historical run-level pricing logic, applied per turn:
+        an LLM-cache hit is $0; a runtime with no pricing key (or a missing
+        pricing entry) is $0 with an observable ``cost_skipped`` event;
+        otherwise the pricing-table lookup over THIS turn's tokens. Summing
+        these across turns reproduces the legacy single-turn figure exactly
+        (one turn, same tokens, same key) while giving multi-turn / tool runs
+        the honest total."""
+        if completion.raw.get("llm_cache_hit"):
+            self._tracer.log_event(span, {"cost_skipped": True, "reason": "llm cache hit ($0)"})
+            return 0.0
+        pricing_key = provider_for_run.pricing_key(provider_str)
+        if pricing_key is None:
+            self._tracer.log_event(
+                span, {"cost_skipped": True, "reason": "runtime has no pricing key"}
+            )
+            return 0.0
+        try:
+            return self._pricing.cost_for(provider=pricing_key, tokens=completion.tokens)
+        except KeyError:
+            self._tracer.log_event(
+                span, {"cost_skipped": True, "reason": f"no pricing for {pricing_key!r}"}
+            )
+            return 0.0
+
     async def _run_with_tool_use(
         self,
         *,
@@ -1030,11 +1136,26 @@ class Executor:
         run_id: str,
         tenant_id: str,
         skill_fixture: dict[str, Any] | None = None,
-    ) -> tuple[CompletionResponse, float, list[SkillCallRecord]]:
+        turns: list[TurnRecord],
+        skill_calls: list[SkillCallRecord],
+    ) -> tuple[CompletionResponse, float, float]:
         """Drive the tool-use loop for one provider in the fallback chain.
 
-        Returns ``(final_completion, accumulated_skill_cost_usd, skill_calls)``. The
-        final completion has ``kind == "final"`` and its ``text`` is
+        Returns ``(final_completion, accumulated_skill_cost_usd,
+        accumulated_turn_cost_usd)``. The per-turn :class:`TurnRecord`s and
+        per-skill :class:`SkillCallRecord`s are APPENDED to the caller-owned
+        ``turns`` / ``skill_calls`` lists in place — so when a turn raises
+        mid-loop the partial trail survives for ``_handle_failure`` to persist
+        (ADR 024 D2, offline-first partial record).
+
+        ADR 024 D1 — each LLM round-trip opens a child ``agent.turn[i]`` span
+        under the run's root ``agent.execute`` span; each dispatched skill
+        opens a ``skill.<name>`` span under that turn. Tracing stays wired at
+        the edges (CLAUDE.md §6): only the executor touches the tracer, and
+        non-Langfuse/Null tracers no-op the child spans (zero cost when
+        tracing is off).
+
+        The final completion has ``kind == "final"`` and its ``text`` is
         the model's answer; its ``tokens`` field is the SUM across
         every turn the loop took, so downstream cost accounting reads
         the full token usage without changing.
@@ -1084,9 +1205,14 @@ class Executor:
         accumulated_tokens = TokenUsage()
         accumulated_raw: dict[str, Any] = {}
         accumulated_skill_cost = 0.0
+        accumulated_turn_cost = 0.0
         turns_taken = 0
+        # 1-based index over EVERY completion (LLM round-trip), including the
+        # final-answer turn — drives both the ``agent.turn[i]`` span name and
+        # ``TurnRecord.index`` so each ``skill.*`` child links to the exact
+        # turn that requested it (ADR 024 D1/D2).
+        turn_index = 0
         agent_call_ms = bundle.spec.timeouts.call_ms
-        skill_call_records: list[SkillCallRecord] = []
 
         while True:
             req = CompletionRequest(
@@ -1107,7 +1233,25 @@ class Executor:
                 # than a cost-of-repeat one. Always calls the provider.
                 return await self._invoke_streaming(provider_for_run, req, on_token)
 
-            completion = await run_with_retries(_invoke)
+            # ADR 024 D1 — one child span per LLM round-trip, under the run's
+            # root span. No-op on Null/Silent tracers (child spans are free
+            # when tracing is off). The span carries the turn's model / tokens
+            # / cost so the trace UI shows the per-turn breakdown.
+            turn_index += 1
+            turn_span = self._tracer.start_span(
+                f"agent.turn[{turn_index}]",
+                {"turn": turn_index, "model": provider_str},
+                parent=span,
+            )
+            turn_t0 = time.monotonic()
+            try:
+                completion = await run_with_retries(_invoke)
+            except BaseException:
+                # End the turn span on the way out (e.g. RetryExhaustedError
+                # → fallback / failure) so it never dangles unclosed.
+                self._tracer.end_span(turn_span, status="error")
+                raise
+            turn_latency_ms = int((time.monotonic() - turn_t0) * 1000)
             # Aggregate tokens + raw so the post-loop cost path sees
             # the full picture even when multiple turns happened.
             accumulated_tokens = TokenUsage(
@@ -1118,7 +1262,33 @@ class Executor:
             if completion.raw:
                 accumulated_raw.update(completion.raw)
 
+            # ADR 024 D5 — cost of THIS turn's completion, recorded on the
+            # span + retained in the TurnRecord; summed for the run total.
+            this_turn_cost = self._turn_cost(
+                provider_for_run=provider_for_run,
+                provider_str=provider_str,
+                completion=completion,
+                span=turn_span,
+            )
+            accumulated_turn_cost += this_turn_cost
+            self._tracer.set_attribute(turn_span, "cost_usd", this_turn_cost)
+            self._tracer.set_attribute(turn_span, "latency_ms", turn_latency_ms)
+            self._tracer.set_attribute(turn_span, "input_tokens", completion.tokens.input)
+            self._tracer.set_attribute(turn_span, "output_tokens", completion.tokens.output)
+            turns.append(
+                TurnRecord(
+                    index=turn_index,
+                    model=provider_str,
+                    input_tokens=completion.tokens.input,
+                    output_tokens=completion.tokens.output,
+                    cost_usd=this_turn_cost,
+                    latency_ms=turn_latency_ms,
+                    finish_reason=completion.kind,
+                )
+            )
+
             if completion.kind == "final":
+                self._tracer.end_span(turn_span, status="ok")
                 # Inject the accumulated tokens + raw into the final
                 # response so the downstream cost calc reads the
                 # full-loop total, not just the last turn.
@@ -1127,7 +1297,7 @@ class Executor:
                         update={"tokens": accumulated_tokens, "raw": accumulated_raw},
                     ),
                     accumulated_skill_cost,
-                    skill_call_records,
+                    accumulated_turn_cost,
                 )
 
             # Tool-use turn. Resolve, dispatch, append to history.
@@ -1145,6 +1315,7 @@ class Executor:
                         "max_turns": _MAX_TOOL_TURNS_DEFAULT,
                     },
                 )
+                self._tracer.end_span(turn_span, status="ok")
                 final = completion.model_copy(
                     update={
                         "kind": "final",
@@ -1152,7 +1323,7 @@ class Executor:
                         "raw": accumulated_raw,
                     },
                 )
-                return final, accumulated_skill_cost, skill_call_records
+                return final, accumulated_skill_cost, accumulated_turn_cost
 
             # Collect all tool calls for this turn.  parallel_tool_calls
             # is always populated for kind="tool_use" turns (all three
@@ -1169,6 +1340,8 @@ class Executor:
             async def _dispatch_one_call(
                 call: ToolCallSpec,
                 _turn: int = turns_taken,
+                _turn_index: int = turn_index,
+                _turn_span: SpanCtx = turn_span,
             ) -> tuple[str, str, float, SkillCallRecord | None]:
                 """Dispatch one tool call. Returns (call_id, result_json, cost_usd, record).
 
@@ -1191,11 +1364,22 @@ class Executor:
                     err_result = json.dumps({"error": err.type.value, "message": err.message})
                     return call.call_id, err_result, 0.0, None
 
+                # ADR 024 D1 — one ``skill.<name>`` child span per dispatched
+                # tool call, nested under THIS turn's span. No-op on Null/Silent
+                # tracers. The skill backend's own sub-spans (e.g. a KB lookup)
+                # parent under this span via ``ctx.parent_span``.
+                skill_span = self._tracer.start_span(
+                    f"skill.{_name}",
+                    {"skill": _name, "turn": _turn_index},
+                    parent=_turn_span,
+                )
+
                 if skill_fixture is not None and _name in skill_fixture:
                     # Fixture short-circuit: eval provided a canned response.
                     # Cost stays zero — fixtures are deterministic stand-ins.
                     result = json.dumps(skill_fixture[_name])
                     self._tracer.log_event(span, {"skill_fixture_used": _name, "turn": _turn})
+                    self._tracer.end_span(skill_span, status="ok")
                     return call.call_id, result, 0.0, None
 
                 # Real dispatch.  Per-call budget = skill override OR agent default.
@@ -1209,7 +1393,7 @@ class Executor:
                     storage=self._storage,
                     retrieval=bundle.spec.retrieval,
                     tracer=self._tracer,
-                    parent_span=span,
+                    parent_span=skill_span,
                 )
                 _t0 = time.monotonic()
                 try:
@@ -1220,12 +1404,17 @@ class Executor:
                     self._tracer.log_event(
                         span, {"skill_invoked": _name, "skill_cost_usd": cost, "turn": _turn}
                     )
+                    self._tracer.set_attribute(skill_span, "cost_usd", cost)
+                    self._tracer.set_attribute(skill_span, "latency_ms", round(lat, 1))
+                    self._tracer.end_span(skill_span, status="ok")
                     rec = SkillCallRecord(
                         step=_turn,
                         skill=_name,
                         input=_input,
                         output=output,
                         latency_ms=round(lat, 1),
+                        cost_usd=cost,
+                        turn=_turn_index,
                     )
                     return call.call_id, result, cost, rec
                 except SkillError as exc:
@@ -1235,12 +1424,16 @@ class Executor:
                         span,
                         {"skill_error": _name, "skill_error_type": exc.type.value, "turn": _turn},
                     )
+                    self._tracer.set_attribute(skill_span, "latency_ms", round(lat, 1))
+                    self._tracer.end_span(skill_span, status="error")
                     rec = SkillCallRecord(
                         step=_turn,
                         skill=_name,
                         input=_input,
                         error=f"{exc.type.value}: {exc.message}",
                         latency_ms=round(lat, 1),
+                        cost_usd=0.0,
+                        turn=_turn_index,
                     )
                     return call.call_id, result, 0.0, rec
 
@@ -1253,11 +1446,16 @@ class Executor:
                 )
             dispatch_results = list(await asyncio.gather(*[_dispatch_one_call(c) for c in calls]))
 
-            # Accumulate costs and records from all dispatched calls.
+            # Accumulate costs and records from all dispatched calls. The
+            # records are appended to the caller-owned ``skill_calls`` list so
+            # a later mid-loop failure still persists this turn's partial trail.
             for _cid, _res, _cost, _rec in dispatch_results:
                 accumulated_skill_cost += _cost
                 if _rec is not None:
-                    skill_call_records.append(_rec)
+                    skill_calls.append(_rec)
+
+            # This tool-use turn is complete (all its skills dispatched).
+            self._tracer.end_span(turn_span, status="ok")
 
             # Append one assistant turn carrying ALL tool calls, then one
             # tool result message per call.  The OpenAI / Anthropic spec
@@ -1709,6 +1907,7 @@ class Executor:
         node_id: str | None = None,
         thread_id: str | None = None,
         skill_calls: list[SkillCallRecord] | None = None,
+        turns: list[TurnRecord] | None = None,
     ) -> None:
         record = RunRecord(
             run_id=run_id,
@@ -1731,6 +1930,9 @@ class Executor:
             node_id=node_id,
             thread_id=thread_id,
             skill_calls=skill_calls or [],
+            # ADR 024 D2 — per-turn breakdown retained alongside skill_calls
+            # so `mdk explain` reconstructs the step tree without a backend.
+            turns=turns or [],
         )
         await self._storage.save_run(record)
 
@@ -1744,6 +1946,8 @@ class Executor:
         tenant_id: str,
         started: float,
         err: MovateError,
+        skill_calls: list[SkillCallRecord] | None = None,
+        turns: list[TurnRecord] | None = None,
     ) -> RunResponse:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _safety_types = {"content_filter", "grounding_violation"}
@@ -1753,6 +1957,8 @@ class Executor:
         info = ErrorInfo(type=err.failure_type.value, message=str(err), retryable=err.retryable)
         self._tracer.log_event(span, {"error": info.model_dump()})
         self._tracer.end_span(span, status="error")
+
+        metrics = Metrics(latency_ms=elapsed_ms, tokens=TokenUsage(), trace_id=span.trace_id)
 
         await self._storage.save_failure(
             FailureRecord(
@@ -1765,6 +1971,44 @@ class Executor:
                 retryable=err.retryable,
             )
         )
+
+        # ADR 024 D2 (test-matrix case 7) — when the run failed mid-loop AFTER
+        # capturing some turns / skill calls, persist a partial ERROR RunRecord
+        # so `mdk explain` can show the failure point and the steps taken so
+        # far. Only when there IS a partial trail — the common no-skill /
+        # pre-loop failure path stays unchanged (FailureRecord only, no
+        # RunRecord), preserving prior behavior + the tenant-budget aggregate
+        # (the partial record's ``metrics.cost_usd`` is left at 0; the per-step
+        # costs live on the retained turn/skill records, not the run aggregate).
+        skill_calls = skill_calls or []
+        turns = turns or []
+        if skill_calls or turns:
+            try:
+                await self._storage.save_run(
+                    RunRecord(
+                        run_id=run_id,
+                        job_id=job_id,
+                        tenant_id=tenant_id,
+                        agent=bundle.spec.name,
+                        agent_version=bundle.spec.version,
+                        prompt_hash=bundle.prompt_hash,
+                        provider=bundle.spec.model.provider,
+                        provider_version=self._registry.get(bundle.spec.runtime).version,
+                        pricing_version=self._pricing.version,
+                        status=JobStatus(status),
+                        input={},
+                        output=None,
+                        metrics=metrics,
+                        error=info,
+                        skill_calls=skill_calls,
+                        turns=turns,
+                    )
+                )
+            except Exception:  # broad-catch: persistence must not mask the real error
+                log.warning(
+                    "partial RunRecord persist failed for run %r — failure surfaced anyway",
+                    run_id,
+                )
         # job_id reserved for the workflow + server phases.
         _ = job_id
 
@@ -1774,7 +2018,7 @@ class Executor:
             data={},
             human_readable=f"**Error**: {err}",
             trace_id=span.trace_id,
-            metrics=Metrics(latency_ms=elapsed_ms, tokens=TokenUsage(), trace_id=span.trace_id),
+            metrics=metrics,
             error=info,
         )
 

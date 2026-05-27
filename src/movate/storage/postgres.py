@@ -56,10 +56,12 @@ from movate.core.models import (
     Metrics,
     Relation,
     RunRecord,
+    SkillCallRecord,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
     Trigger,
+    TurnRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -363,6 +365,17 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS thread_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_runs_thread
     ON runs(thread_id, created_at)
     WHERE thread_id IS NOT NULL;
+
+-- ADR 024 D2 — per-step observability retention. JSONB arrays (same strategy
+-- as runs.metrics): the executor populates them and they round-trip through
+-- save_run / _row_to_run so `mdk explain` reconstructs the turn → skill /
+-- retrieval tree OFFLINE (no Langfuse needed). Additive + idempotent
+-- (ADD COLUMN IF NOT EXISTS); NULL on pre-migration rows → empty list, so
+-- legacy records load fine. `skill_calls` was previously not persisted by the
+-- DB providers; retaining it alongside the new `turns` keeps the offline
+-- breakdown coherent.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS skill_calls JSONB;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS turns JSONB;
 
 -- PR-Q: jobs carry the thread linkage from queue time so the worker
 -- can propagate it onto the spawned run. NULL = standalone.
@@ -924,10 +937,10 @@ class PostgresProvider:
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id, thread_id
+                workflow_run_id, node_id, thread_id, skill_calls, turns
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
             )
             """,
             run.run_id,
@@ -948,6 +961,9 @@ class PostgresProvider:
             run.workflow_run_id,
             run.node_id,
             run.thread_id,
+            # ADR 024 D2 — per-step retention (JSONB codec wraps json.dumps).
+            [c.model_dump() for c in run.skill_calls],
+            [t.model_dump() for t in run.turns],
         )
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
@@ -3011,6 +3027,14 @@ class PostgresProvider:
 
 def _row_to_run(row: asyncpg.Record) -> RunRecord:
     metrics_data = dict(row["metrics"])
+    # ADR 024 D2 — per-step JSONB arrays. The jsonb codec already decoded them
+    # to Python lists; NULL on pre-migration rows → empty list, so legacy
+    # records load + render as a single node (no crash). ``row.get`` guards
+    # against a pre-migration column being absent entirely.
+    raw_skill_calls = row.get("skill_calls")
+    raw_turns = row.get("turns")
+    skill_calls = [SkillCallRecord.model_validate(c) for c in (raw_skill_calls or [])]
+    turns = [TurnRecord.model_validate(t) for t in (raw_turns or [])]
     return RunRecord(
         run_id=row["run_id"],
         job_id=row["job_id"],
@@ -3030,6 +3054,8 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         workflow_run_id=row["workflow_run_id"],
         node_id=row["node_id"],
         thread_id=row["thread_id"],
+        skill_calls=skill_calls,
+        turns=turns,
     )
 
 

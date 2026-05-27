@@ -42,10 +42,12 @@ from movate.core.models import (
     Metrics,
     Relation,
     RunRecord,
+    SkillCallRecord,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
     Trigger,
+    TurnRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -651,6 +653,17 @@ _MIGRATIONS = [
     # duplicate-column guard in init() keeps this idempotent on re-run (mirrors
     # the attempt_count additive-column pattern above).
     "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+    # ADR 024 D2 — per-step observability retention. Both are JSON-array TEXT
+    # columns (same strategy as runs.metrics): the executor populates them and
+    # they round-trip through save_run / _row_to_run so `mdk explain` can
+    # reconstruct the turn → skill/retrieval tree OFFLINE (no Langfuse needed).
+    # Additive + idempotent (duplicate-column guard in init() swallows re-runs);
+    # NULL on pre-migration rows → an empty list, so legacy records load fine.
+    # ``skill_calls`` was previously not persisted by the DB providers; this
+    # migration starts retaining it alongside the new ``turns`` so the offline
+    # breakdown is coherent (a turn's skill children are persisted too).
+    "ALTER TABLE runs ADD COLUMN skill_calls TEXT",
+    "ALTER TABLE runs ADD COLUMN turns TEXT",
 ]
 
 
@@ -770,8 +783,8 @@ class SqliteProvider:
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id, thread_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                workflow_run_id, node_id, thread_id, skill_calls, turns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
@@ -792,6 +805,9 @@ class SqliteProvider:
                 run.workflow_run_id,
                 run.node_id,
                 run.thread_id,
+                # ADR 024 D2 — per-step retention as JSON arrays.
+                json.dumps([c.model_dump() for c in run.skill_calls]),
+                json.dumps([t.model_dump() for t in run.turns]),
             ),
         )
         await self._db.commit()
@@ -3089,6 +3105,15 @@ def _row_to_tenant_provider_key(row: aiosqlite.Row) -> TenantProviderKey:
 
 def _row_to_run(row: aiosqlite.Row) -> RunRecord:
     keys = row.keys() if hasattr(row, "keys") else []
+    # ADR 024 D2 — per-step arrays. Columns absent on pre-migration rows (or
+    # NULL when this run predates the executor populating them) → empty lists,
+    # so legacy records load + render as a single node, no crash.
+    skill_calls: list[SkillCallRecord] = []
+    if "skill_calls" in keys and row["skill_calls"]:
+        skill_calls = [SkillCallRecord.model_validate(c) for c in json.loads(row["skill_calls"])]
+    turns: list[TurnRecord] = []
+    if "turns" in keys and row["turns"]:
+        turns = [TurnRecord.model_validate(t) for t in json.loads(row["turns"])]
     return RunRecord(
         run_id=row["run_id"],
         job_id=row["job_id"],
@@ -3108,6 +3133,8 @@ def _row_to_run(row: aiosqlite.Row) -> RunRecord:
         workflow_run_id=row["workflow_run_id"] if "workflow_run_id" in keys else None,
         node_id=row["node_id"] if "node_id" in keys else None,
         thread_id=row["thread_id"] if "thread_id" in keys else None,
+        skill_calls=skill_calls,
+        turns=turns,
     )
 
 
