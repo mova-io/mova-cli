@@ -85,6 +85,93 @@ _SCAFFOLD_RETRY_MARKERS = (
 # the name post-generation, so a parse miss is harmless).
 _SCAFFOLD_NAME_PREFIX = "AGENT NAME:"
 
+# The meta-prompt wraps the operator's description between these markers
+# (`USER DESCRIPTION:` then a triple-quote fence). The offline scaffold
+# path parses the description back out so it can classify grounding /
+# RAG intent (F3, #112) deterministically — mirroring the classification
+# the real LLM does via the meta-prompt's GROUNDING DETECTION constraint.
+_SCAFFOLD_DESC_PREFIX = "USER DESCRIPTION:"
+
+# Substrings that signal the agent should ANSWER FROM A KNOWLEDGE SOURCE
+# (grounding / RAG intent). Kept deliberately broad — false positives in
+# `--mock` just produce a grounded scaffold (still valid); the real LLM
+# path does the nuanced classification. Mirrors the phrasing the
+# meta-prompt's constraint #7 keys on (docs/FAQ/policies/"answer
+# questions about X"/URLs).
+_GROUNDING_MARKERS = (
+    "knowledge base",
+    "knowledge-base",
+    "documentation",
+    " docs",
+    "help center",
+    "help docs",
+    "help articles",
+    "faq",
+    "frequently asked",
+    "policy",
+    "policies",
+    "handbook",
+    "knowledge source",
+    "answer questions about",
+    "answer questions from",
+    "questions about our",
+    "based on our",
+    "based on the",
+    "grounded",
+    "retrieval",
+    "rag ",
+    "wiki",
+    "http://",
+    "https://",
+    "www.",
+)
+
+
+def _looks_like_grounding_description(description: str) -> bool:
+    """True when ``description`` implies a grounded / RAG agent (F3, #112).
+
+    The agent should answer from a knowledge source (docs, FAQ, policy
+    corpus, a website / URL, "answer questions about X"). Used by the
+    offline ``--mock`` scaffold path to deterministically emit a
+    RAG-shaped agent for grounding descriptions — matching the
+    classification the real LLM does from the meta-prompt. Substring
+    match on a lowercased description; deliberately lenient.
+    """
+    haystack = description.lower()
+    return any(marker in haystack for marker in _GROUNDING_MARKERS)
+
+
+def _parse_scaffold_description(body: str) -> str:
+    """Pull the operator's description out of the scaffold meta-prompt.
+
+    The meta-prompt emits::
+
+        USER DESCRIPTION:
+        \"\"\"
+        <description>
+        \"\"\"
+
+    Best-effort: returns the text between the triple-quote fences after
+    the ``USER DESCRIPTION:`` marker, or ``""`` on any parse miss (which
+    classifies as non-grounding → the generic scaffold, a safe default).
+    The retry prompt has no ``USER DESCRIPTION:`` block, so a retry of a
+    RAG scaffold falls back to generic — acceptable, since the offline
+    mock's first attempt already validates (no retry fires).
+    """
+    marker_idx = body.find(_SCAFFOLD_DESC_PREFIX)
+    if marker_idx == -1:
+        return ""
+    rest = body[marker_idx + len(_SCAFFOLD_DESC_PREFIX) :]
+    fence = '"""'
+    open_idx = rest.find(fence)
+    if open_idx == -1:
+        return ""
+    after_open = rest[open_idx + len(fence) :]
+    close_idx = after_open.find(fence)
+    if close_idx == -1:
+        return ""
+    return after_open[:close_idx].strip()
+
 
 def _looks_like_scaffold_prompt(body: str) -> bool:
     """True if ``body`` is the LLM-scaffold meta-prompt or its retry form.
@@ -114,15 +201,145 @@ def _parse_scaffold_name(body: str, *, default: str = "mock-agent") -> str:
     return default
 
 
-def _build_scaffold_response(name: str) -> str:
-    """Return a valid ``GeneratedAgent`` JSON payload for a generic agent.
+def _build_rag_scaffold_response(name: str) -> str:
+    """Return a valid RAG-shaped ``GeneratedAgent`` JSON payload (F3, #112).
 
-    A minimal text-in → message-out agent (same shape as the default
+    Emitted by the offline ``--mock`` path when the description implies
+    grounding (see :func:`_looks_like_grounding_description`). The shape
+    mirrors the meta-prompt's RAG exemplar + the packaged
+    ``rag_qa_agent`` template:
+
+    * ``agent_yaml.skills = ["kb-vector-lookup"]`` — the built-in
+      retrieval skill the Executor pre-invokes.
+    * ``agent_yaml.retrieval = {auto_into: context, query_from: question}``
+      — ADR 023 opt-in pre-retrieval. The Executor auto-fills
+      ``input.context`` before the prompt renders.
+    * an OPTIONAL ``context: list[string]`` input field (NOT required —
+      retrieval populates it) alongside the required ``question`` field.
+    * a grounded prompt that answers FROM ``input.context``, cites by
+      1-based index, and declines (``grounded: false``) on empty context.
+
+    Engineered to pass ``GeneratedAgent.model_validate`` AND
+    ``load_agent()`` once the ``kb-vector-lookup`` skill is provisioned
+    alongside the agent (the CLI does this for both the validation
+    tempdir and the committed scaffold).
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": {
+            "api_version": "movate/v1",
+            "kind": "Agent",
+            "name": name,
+            "version": "0.1.0",
+            "description": (
+                "Answers questions grounded in a retrieved knowledge source. "
+                "Cites the supporting context and declines when the source "
+                "does not cover the question."
+            ),
+            "owner": "",
+            "model": {
+                "provider": "openai/gpt-4o-mini-2024-07-18",
+                "params": {"temperature": 0.0, "max_tokens": 1024},
+            },
+            "prompt": "./prompt.md",
+            "schema": {
+                "input": "./schema/input.json",
+                "output": "./schema/output.json",
+            },
+            "evals": {"dataset": "./evals/dataset.jsonl"},
+            "tags": ["rag", "qa", "grounded"],
+            "skills": ["kb-vector-lookup"],
+            "retrieval": {"auto_into": "context", "query_from": "question"},
+        },
+        "prompt_md": (
+            "You are a grounded question-answering assistant. Answer ONLY "
+            "from the retrieved context below — never from outside "
+            "knowledge. Every claim must trace to a numbered context "
+            "chunk.\n\n"
+            "# Context\n"
+            "{% for chunk in input.context %}\n"
+            "[{{ loop.index }}] {{ chunk }}\n"
+            "{% endfor %}\n\n"
+            "# Question\n"
+            "{{ input.question }}\n\n"
+            "If the context is empty or does not support an answer, set "
+            '"grounded": false, return an empty "citations" list, and say '
+            "what information is missing — do NOT fabricate.\n\n"
+            "Respond with a single JSON object on one line:\n"
+            '{"answer": "<grounded answer>", "citations": [<1-based chunk '
+            'indices>], "grounded": <true|false>, "confidence": <0.0-1.0>}'
+        ),
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            # NB: `context` is intentionally NOT in `required` — ADR 023
+            # pre-retrieval auto-fills it before the prompt renders.
+            "required": ["question"],
+            "properties": {
+                "question": {"type": "string", "minLength": 1},
+                "context": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer", "citations", "grounded", "confidence"],
+            "properties": {
+                "answer": {"type": "string", "minLength": 1},
+                "citations": {"type": "array", "items": {"type": "integer"}},
+                "grounded": {"type": "boolean"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        "sample_evals": [
+            {
+                "input": {
+                    "question": "What is the refund window?",
+                    "context": [
+                        "Annual plans are refundable within 14 days of "
+                        "purchase, prorated by the unused portion."
+                    ],
+                },
+                "expected": {
+                    "answer": (
+                        "Annual plans are refundable within 14 days of "
+                        "purchase, prorated by the unused portion."
+                    ),
+                    "citations": [1],
+                    "grounded": True,
+                    "confidence": 0.95,
+                },
+            },
+            {
+                "input": {"question": "Do you support SAML SSO?", "context": []},
+                "expected": {
+                    "answer": "The provided context does not cover SAML SSO support.",
+                    "citations": [],
+                    "grounded": False,
+                    "confidence": 0.0,
+                },
+            },
+        ],
+    }
+    return json.dumps(payload)
+
+
+def _build_scaffold_response(name: str, *, grounding: bool = False) -> str:
+    """Return a valid ``GeneratedAgent`` JSON payload.
+
+    Dispatches on ``grounding`` (F3, #112): a grounding/RAG description
+    yields the RAG-shaped scaffold (:func:`_build_rag_scaffold_response`);
+    anything else yields the generic text-in → message-out agent below.
+
+    The generic branch is a minimal agent (same shape as the default
     template). Engineered to satisfy every HARD CONSTRAINT in the
     scaffold meta-prompt so the result passes both
     ``GeneratedAgent.model_validate`` and ``load_agent()`` — i.e.
     ``mdk init --llm --mock`` yields a runnable agent offline.
     """
+    if grounding:
+        return _build_rag_scaffold_response(name)
     payload: dict[str, Any] = {
         "agent_yaml": {
             "api_version": "movate/v1",
@@ -272,7 +489,15 @@ class MockProvider(BaseLLMProvider):
             # Offline scaffold path. Only when the response wasn't
             # explicitly overridden — phase-3 tests that force-feed a
             # GeneratedAgent via MOVATE_MOCK_RESPONSE must still win.
-            text = _build_scaffold_response(_parse_scaffold_name(body))
+            #
+            # F3 (#112): classify the description for grounding / RAG
+            # intent and emit a RAG-shaped scaffold (skills:
+            # [kb-vector-lookup] + retrieval.auto_into + optional-context
+            # schema + grounded prompt) when it matches; otherwise the
+            # generic single-turn scaffold. Deterministic + offline.
+            description = _parse_scaffold_description(body)
+            grounding = _looks_like_grounding_description(description)
+            text = _build_scaffold_response(_parse_scaffold_name(body), grounding=grounding)
         elif self._dataset_expecteds and self._response_is_default:
             # Cycle through dataset rows in order. Wraps at the end so
             # callers that exceed dataset length still get valid output

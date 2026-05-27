@@ -212,6 +212,69 @@ _EXAMPLE_CLASSIFIER = """\
   ]
 }"""
 
+# RAG / grounded-QA exemplar (F3, #112). The shape every "answer from a
+# knowledge source" description must collapse to: `skills:
+# [kb-vector-lookup]` + a `retrieval: {auto_into: context}` block (ADR
+# 023 opt-in pre-retrieval) + an OPTIONAL `context: list[string]` input
+# field + a grounded prompt that answers FROM input.context, cites by
+# index, and declines when context is empty. Mirrors the packaged
+# `rag_qa_agent` template (templates/rag_qa_agent/). The Executor
+# auto-retrieves into `input.context` before the prompt renders, so the
+# scaffolded agent is grounded end-to-end once a KB is ingested.
+_EXAMPLE_RAG = """\
+{
+  "agent_yaml": {
+    "api_version": "movate/v1",
+    "kind": "Agent",
+    "name": "docs-qa",
+    "version": "0.1.0",
+    "description": "Answers questions grounded in our product documentation. Cites the supporting chunks and declines when the docs don't cover the question.",
+    "owner": "",
+    "model": {
+      "provider": "openai/gpt-4o-mini-2024-07-18",
+      "params": {"temperature": 0.0, "max_tokens": 1024}
+    },
+    "prompt": "./prompt.md",
+    "schema": {
+      "input": "./schema/input.json",
+      "output": "./schema/output.json"
+    },
+    "evals": {"dataset": "./evals/dataset.jsonl"},
+    "timeouts": {"call_ms": 30000, "total_ms": 60000},
+    "budget": {"max_cost_usd_per_run": 0.10},
+    "tags": ["rag", "qa", "grounded"],
+    "skills": ["kb-vector-lookup"],
+    "retrieval": {"auto_into": "context", "query_from": "question"}
+  },
+  "prompt_md": "You are a grounded question-answering assistant. Answer ONLY from the retrieved context below — never from outside knowledge. Every claim must trace to a numbered context chunk.\\n\\n# Context\\n{% for chunk in input.context %}\\n[{{ loop.index }}] {{ chunk }}\\n{% endfor %}\\n\\n# Question\\n{{ input.question }}\\n\\nIf the context is empty or does not support an answer, set \\"grounded\\": false, return an empty \\"citations\\" list, and say what information is missing — do NOT fabricate.\\n\\nRespond with a single JSON object on one line:\\n{\\"answer\\": \\"<grounded answer>\\", \\"citations\\": [<1-based chunk indices>], \\"grounded\\": <true|false>, \\"confidence\\": <0.0-1.0>}",
+  "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["question"],
+    "properties": {
+      "question": {"type": "string", "minLength": 1},
+      "context": {"type": "array", "items": {"type": "string"}}
+    }
+  },
+  "output_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["answer", "citations", "grounded", "confidence"],
+    "properties": {
+      "answer": {"type": "string", "minLength": 1},
+      "citations": {"type": "array", "items": {"type": "integer"}},
+      "grounded": {"type": "boolean"},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+  },
+  "sample_evals": [
+    {"input": {"question": "What is our refund window?", "context": ["Annual plans are refundable within 14 days of purchase, prorated by the unused portion."]}, "expected": {"answer": "Annual plans are refundable within 14 days of purchase, prorated by the unused portion.", "citations": [1], "grounded": true, "confidence": 0.95}},
+    {"input": {"question": "Do you support SAML SSO?", "context": []}, "expected": {"answer": "The provided context does not cover SAML SSO support.", "citations": [], "grounded": false, "confidence": 0.0}}
+  ]
+}"""
+
 
 # ---------------------------------------------------------------------------
 # Meta-prompt — instructs the LLM how to map description → GeneratedAgent.
@@ -302,11 +365,34 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
 6. Output ONLY valid JSON. No markdown fences, no prose, no
    commentary before or after the JSON.
 
-EXAMPLE 1 (FAQ agent):
+7. GROUNDING / RAG DETECTION. First decide whether the description asks
+   the agent to ANSWER FROM A KNOWLEDGE SOURCE — e.g. "answer questions
+   about our docs / help center / FAQ / policies / handbook", "based on
+   our documentation", "from this website", a URL, or any "answer
+   questions about <corpus>" phrasing. This is grounding/RAG intent.
+   - If GROUNDING: emit a RAG-shaped agent (see EXAMPLE 3). It MUST have
+     * agent_yaml.skills: ["kb-vector-lookup"]
+     * agent_yaml.retrieval: {{"auto_into": "context", "query_from": "<the question/text input field>"}}
+     * an input_schema with the primary question field PLUS an OPTIONAL
+       "context" field of type array-of-string (do NOT put "context" in
+       "required" — it is auto-filled by retrieval before the prompt
+       renders).
+     * a prompt that answers ONLY from input.context, cites chunks by
+       1-based index, and DECLINES (sets a grounded=false signal) when
+       the context is empty. Never answer from outside knowledge.
+   - If NOT grounding (a classifier, summarizer, transformer, extractor,
+     generator, or any task that operates purely on its input): emit a
+     normal single-turn agent (EXAMPLE 1 or 2). Do NOT add skills or a
+     retrieval block — those keys must be ABSENT for non-grounding agents.
+
+EXAMPLE 1 (FAQ agent) — single-turn, NOT grounding:
 {example_faq}
 
-EXAMPLE 2 (Classifier agent):
+EXAMPLE 2 (Classifier agent) — single-turn, NOT grounding:
 {example_classifier}
+
+EXAMPLE 3 (Grounded RAG agent) — answers from a knowledge source:
+{example_rag}
 """
 
 # Variable suffix — the ONLY part that changes per call. Appended after the
@@ -398,6 +484,7 @@ async def generate_agent_from_description(
             target_model=target_model or model,
             example_faq=_EXAMPLE_FAQ,
             example_classifier=_EXAMPLE_CLASSIFIER,
+            example_rag=_EXAMPLE_RAG,
         )
 
     request = CompletionRequest(
