@@ -1,10 +1,13 @@
-"""Tests for _check_vector_kb_empty in mdk validate.
+"""Tests for _check_vector_kb_empty in mdk validate (D7c / #134).
 
 Covers:
 1. Agent with kb-vector skill + 0 chunks in storage → warning printed.
 2. Agent with kb-vector skill + >=1 chunk in storage → no warning.
-3. Agent without any kb-vector skill → no warning (storage never called).
+3. Agent without any kb-vector skill (and no auto-retrieval) → no warning
+   (storage never called).
 4. Storage error → no warning, no crash (silently swallowed).
+5. Agent RAG-shaped via ADR-023 ``retrieval.auto_into`` only (no kb-vector
+   skill) + 0 chunks → warning printed (the broadened D7c detection).
 """
 
 from __future__ import annotations
@@ -17,10 +20,16 @@ from movate.cli.validate import _check_vector_kb_empty
 from movate.core.models import KbChunk
 
 
-def _make_bundle(skill_names: list[str]) -> MagicMock:
-    """Create a minimal AgentBundle mock with the given skill names."""
+def _make_bundle(skill_names: list[str], *, auto_retrieval: bool = False) -> MagicMock:
+    """Create a minimal AgentBundle mock with the given skill names.
+
+    ``auto_retrieval`` controls the ADR-023 ``retrieval.auto_into`` marker —
+    explicitly set to a real bool so the detector's truthiness check isn't
+    fooled by a bare ``MagicMock`` attribute.
+    """
     bundle = MagicMock()
     bundle.spec.name = "test-agent"
+    bundle.spec.retrieval.auto_retrieval_enabled = auto_retrieval
     skills = []
     for name in skill_names:
         skill = MagicMock()
@@ -53,7 +62,7 @@ class TestCheckVectorKbEmpty:
 
         assert con.print.called
         printed = " ".join(str(call) for call in con.print.call_args_list)
-        assert "kb-vector-lookup" in printed
+        assert "RAG-shaped" in printed
         assert "0 chunks" in printed
 
     def test_silent_when_chunks_exist(self) -> None:
@@ -128,3 +137,22 @@ class TestCheckVectorKbEmpty:
         printed = " ".join(str(call) for call in con.print.call_args_list)
         assert "my-rag-agent" in printed
         assert "ingest" in printed.lower()
+
+    def test_warns_when_auto_retrieval_rag_and_empty(self) -> None:
+        """RAG-shaped via ADR-023 retrieval.auto_into (no kb-vector skill) + 0
+        chunks → warning. The broadened D7c detection: an agent can be
+        RAG-shaped through declarative pre-retrieval alone."""
+        bundle = _make_bundle(["some-other-skill"], auto_retrieval=True)
+        con = _make_console()
+
+        mock_storage = AsyncMock()
+        mock_storage.init = AsyncMock()
+        mock_storage.list_kb_chunks = AsyncMock(return_value=[])
+        mock_storage.close = AsyncMock()
+
+        with patch("movate.storage.build_storage", return_value=mock_storage):
+            _check_vector_kb_empty(bundle, con)
+
+        assert con.print.called
+        printed = " ".join(str(call) for call in con.print.call_args_list)
+        assert "RAG-shaped" in printed

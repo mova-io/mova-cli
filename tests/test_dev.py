@@ -243,3 +243,104 @@ def test_ingest_kb_action_skips_missing_path(
 
     assert out == "prod"
     assert calls == []
+
+
+@pytest.mark.unit
+def test_ingest_kb_action_accepts_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A URL source is passed straight to `kb ingest` (no path-exists gate)."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(dc, "_ensure_target", lambda target, *, purpose: None)
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    monkeypatch.setattr(dc.Prompt, "ask", staticmethod(lambda *a, **k: "https://example.test/docs"))
+
+    out = dc._ingest_kb_action("demo", agent_dir, None)
+
+    assert out is None
+    assert calls and calls[0][1:3] == ["kb", "ingest"]
+    assert "https://example.test/docs" in calls[0]
+
+
+# ---------------------------------------------------------------------------
+# D7c (#134): the proactive "RAG agent, empty KB" grounding-gap offer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_grounding_gap_offer_silent_when_no_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No gap (non-RAG agent or populated KB) → no prompt, no delegation,
+    no output. The regression guard for the dominant path."""
+
+    monkeypatch.setattr(dc, "_has_grounding_gap", lambda agent_dir: False)
+    # If the offer wrongly proceeded, these would fire — assert they don't.
+    confirmed: list[bool] = []
+    monkeypatch.setattr(dc.typer, "confirm", lambda *a, **k: confirmed.append(True) or True)
+    delegated: list[tuple] = []
+    monkeypatch.setattr(dc, "_ingest_kb_action", lambda *a, **k: delegated.append(a) or "prod")
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    out = dc._grounding_gap_offer("demo", agent_dir, "prod")
+
+    assert out == "prod"  # target unchanged
+    assert confirmed == []  # never prompted
+    assert delegated == []  # never delegated
+    captured = capsys.readouterr()
+    assert "knowledge base" not in (captured.out + captured.err)
+
+
+@pytest.mark.unit
+def test_grounding_gap_offer_delegates_to_ingest_when_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap present + operator confirms → delegates to the EXISTING ingest path
+    (`_ingest_kb_action` / `mdk kb ingest`), not a new ingest implementation."""
+
+    monkeypatch.setattr(dc, "_has_grounding_gap", lambda agent_dir: True)
+    monkeypatch.setattr(dc.typer, "confirm", lambda *a, **k: True)
+    delegated: list[tuple] = []
+    monkeypatch.setattr(dc, "_ingest_kb_action", lambda *a, **k: delegated.append(a) or "prod")
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    out = dc._grounding_gap_offer("demo", agent_dir, "prod")
+
+    assert out == "prod"  # target threaded back through the delegate
+    assert delegated, "expected delegation to the existing _ingest_kb_action"
+    assert delegated[0] == ("demo", agent_dir, "prod")
+
+
+@pytest.mark.unit
+def test_grounding_gap_offer_declined_skips_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gap present but operator declines → confirm-gated: no delegation,
+    target preserved."""
+
+    monkeypatch.setattr(dc, "_has_grounding_gap", lambda agent_dir: True)
+    monkeypatch.setattr(dc.typer, "confirm", lambda *a, **k: False)
+    delegated: list[tuple] = []
+    monkeypatch.setattr(dc, "_ingest_kb_action", lambda *a, **k: delegated.append(a) or "prod")
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    out = dc._grounding_gap_offer("demo", agent_dir, "prod")
+
+    assert out == "prod"  # target unchanged
+    assert delegated == []  # confirm-gated: nothing ingested
+
+
+@pytest.mark.unit
+def test_has_grounding_gap_swallows_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A storage / load failure in the detector returns False, never raises —
+    the offer must never crash or block the session."""
+
+    def _boom(*a: object, **k: object) -> object:
+        raise RuntimeError("no database here")
+
+    monkeypatch.setattr("movate.storage.build_storage", _boom)
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    # Must not raise; a non-RAG scaffold is False anyway, but the broad
+    # except also covers the storage explosion for a RAG-shaped agent.
+    assert dc._has_grounding_gap(agent_dir) is False

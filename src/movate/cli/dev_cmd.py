@@ -140,6 +140,15 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
 
     _print_intro(agent_dir)
 
+    # D7c (#134): proactively close the "RAG agent, empty KB" footgun. If the
+    # agent retrieves from a knowledge base but nothing's been ingested yet, it
+    # would silently answer ungrounded — so offer to ingest a source now. The
+    # offer is interactive-only (we're past the non-TTY return above) and
+    # skipped under --mock, mirroring the rest of dev's networked gating; a
+    # non-RAG agent or a populated KB produces no output at all.
+    if not mock:
+        target = _grounding_gap_offer(agent_name, agent_dir, target)
+
     while True:
         if test_input is not None:
             # Ctrl-C breaks the live loop and opens the actions menu.
@@ -855,36 +864,120 @@ def _ingest_kb_action(agent_name: str, agent_dir: Path, target: str | None) -> s
     knowledge base is a separate ingest step. This runs it without leaving the
     session, paralleling the ``c`` (add-context) action.
 
-    The KB path defaults to ``agents/<name>/kb/`` (the convention ``kb ingest``
-    itself uses). Target is optional: a remembered/entered target ingests to the
-    deployed runtime so the live agent can retrieve it; blank ingests into the
-    local store (handy for the grounding check before you ship). Returns the
-    (possibly newly-prompted) target so the caller remembers it.
+    The source can be a local file/dir OR a web-page URL (``mdk kb ingest``
+    accepts both); the path defaults to ``agents/<name>/kb/`` (the convention
+    ``kb ingest`` itself uses). Target is optional: a remembered/entered target
+    ingests to the deployed runtime so the live agent can retrieve it; blank
+    ingests into the local store (handy for the grounding check before you
+    ship). Returns the (possibly newly-prompted) target so the caller remembers
+    it.
     """
     default_kb = agent_dir / "kb"
     default_hint = str(default_kb) if default_kb.is_dir() else ""
     try:
         raw = Prompt.ask(
-            "[bold]KB path[/bold] to ingest (file or dir)",
+            "[bold]Source[/bold] to ingest (file, dir, or URL)",
             default=default_hint,
             show_default=bool(default_hint),
         ).strip()
     except (KeyboardInterrupt, EOFError):
         return target
     if not raw:
-        _console.warn("no path — skipping KB ingest")
+        _console.warn("no source — skipping KB ingest")
         return target
-    kb_path = Path(raw).expanduser()
-    if not kb_path.exists():
-        _console.warn(f"{kb_path} does not exist — skipping KB ingest")
-        return target
+    # A URL is passed straight through (`mdk kb ingest` fetches + ingests it);
+    # a local path must exist before we shell out.
+    if _looks_like_url(raw):
+        source = raw
+    else:
+        kb_path = Path(raw).expanduser()
+        if not kb_path.exists():
+            _console.warn(f"{kb_path} does not exist — skipping KB ingest")
+            return target
+        source = str(kb_path)
 
     target = _ensure_target(target, purpose="KB ingest (leave blank = local store)")
-    argv = [mdk_bin_name(), "kb", "ingest", agent_name, str(kb_path)]
+    argv = [mdk_bin_name(), "kb", "ingest", agent_name, source]
     if target:
         argv += ["--target", target]
     _run_subcommand(argv)
     return target
+
+
+def _looks_like_url(raw: str) -> bool:
+    """True when ``raw`` is a web URL (``mdk kb ingest`` fetches these directly)."""
+    return raw.startswith(("http://", "https://"))
+
+
+def _has_grounding_gap(agent_dir: Path) -> bool:
+    """True when the agent at ``agent_dir`` is RAG-shaped but its local KB is empty.
+
+    The D7c (#134) detection: reuses :func:`movate.kb.grounding_gap.has_grounding_gap`
+    against the loaded spec + the shared local storage seam. Best-effort — any
+    load / storage failure (broken agent, uninitialized DB) returns ``False`` so
+    the offer never blocks or crashes the session; the existing ``mdk validate``
+    / ``g`` grounding checks remain the loud surfaces.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from movate.kb.grounding_gap import has_grounding_gap  # noqa: PLC0415
+
+    async def _probe() -> bool:
+        from movate.storage import build_storage  # noqa: PLC0415
+
+        bundle = load_agent(agent_dir)
+        storage = build_storage()
+        await storage.init()
+        try:
+            return await has_grounding_gap(bundle.spec, storage)
+        finally:
+            await storage.close()
+
+    try:
+        return asyncio.run(_probe())
+    except Exception:
+        return False
+
+
+def _grounding_gap_offer(agent_name: str, agent_dir: Path, target: str | None) -> str | None:
+    """Proactively offer to ingest a source when the KB is empty (D7c / #134).
+
+    A RAG-shaped agent (declares ``kb-vector-lookup`` and/or opts into ADR-023
+    pre-retrieval) with an empty KB silently answers ungrounded. Rather than
+    leave the operator to discover that, surface a clear notice + a first-class
+    prompt to ingest a source right now, delegating to the **existing** in-session
+    ingest (:func:`_ingest_kb_action` / ``mdk kb ingest``) — D7c is detection +
+    offer + delegation, never a new ingest path.
+
+    Silent (no output, no prompt) for a non-RAG agent or a populated KB — the
+    regression guard that the dominant path is untouched. Returns the
+    (possibly newly-prompted) target so the caller remembers it.
+    """
+    if not _has_grounding_gap(agent_dir):
+        return target
+
+    stdout.print(
+        "\n[yellow]![/yellow] [bold]This agent retrieves from a knowledge base, "
+        "but it's empty.[/bold]"
+    )
+    err.print(
+        "[dim]  With no ingested chunks it will answer ungrounded. "
+        "Ingest a source now to fix that — or do it later with the 'k' action.[/dim]"
+    )
+    try:
+        if not typer.confirm("Ingest a source now?", default=True):
+            err.print(
+                f"[dim]skipped — run it anytime: "
+                f"{mdk_bin_name()} kb ingest {agent_name} <url|path>[/dim]"
+            )
+            return target
+    except (KeyboardInterrupt, EOFError):
+        return target
+
+    # Delegate to the existing ingest action: it prompts for a URL-or-path,
+    # resolves the agents/<name>/kb default, optionally targets a deployed
+    # runtime, and shells out to `mdk kb ingest`. No new ingest logic here.
+    return _ingest_kb_action(agent_name, agent_dir, target)
 
 
 def _test_deployed_action(
