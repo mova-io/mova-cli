@@ -10,8 +10,10 @@ Avoids touching the user's actual ``~/.movate/local.db``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,15 @@ import yaml
 from typer.testing import CliRunner
 
 from movate.cli.main import app
+from movate.core.models import (
+    JobStatus,
+    Metrics,
+    RunRecord,
+    SkillCallRecord,
+    TokenUsage,
+    TurnRecord,
+)
+from movate.storage.sqlite import SqliteProvider
 
 # mix_stderr=False keeps the stdout-tracer's NDJSON spans out of the JSON
 # we read for assertions.
@@ -174,3 +185,101 @@ def test_replay_table_output_renders(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "trace replay" in result.stdout
     assert "demo-agent" in result.stdout
     assert "✓ SUCCESS" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# ADR 024 PR 2 (#101): `mdk trace replay` renders the per-step execution tree
+# (turns → skill/retrieval children) for the replayed agent run.
+# ---------------------------------------------------------------------------
+
+
+def _seed_multi_turn_run(db_path: Path) -> str:
+    """Persist a multi-turn, tool-using RunRecord straight into a sandbox DB.
+
+    Returns the run_id. Bypasses a full `mdk run` so the test can exercise a
+    record that carries `turns` + per-turn `skill_calls` (a mock run is
+    single-turn / no-skill).
+    """
+    run_id = "11112222-3333-4444-5555-666677778888"
+    record = RunRecord(
+        run_id=run_id,
+        job_id="job-trace",
+        tenant_id="local",
+        agent="kb-agent",
+        agent_version="0.1.0",
+        prompt_hash="hash",
+        provider="openai/gpt-4o-mini-2024-07-18",
+        provider_version="1.0",
+        pricing_version="2026",
+        status=JobStatus.SUCCESS,
+        input={"question": "refund window?"},
+        output={"answer": "30 days"},
+        metrics=Metrics(
+            latency_ms=140,
+            cost_usd=0.000031,
+            tokens=TokenUsage(input=420, output=95),
+            provider="openai/gpt-4o-mini-2024-07-18",
+        ),
+        created_at=datetime(2026, 5, 26, 9, 0, 0, tzinfo=UTC),
+        turns=[
+            TurnRecord(
+                index=1,
+                model="openai/gpt-4o-mini-2024-07-18",
+                input_tokens=220,
+                output_tokens=30,
+                cost_usd=0.000012,
+                latency_ms=55,
+                finish_reason="tool_use",
+            ),
+            TurnRecord(
+                index=2,
+                model="openai/gpt-4o-mini-2024-07-18",
+                input_tokens=200,
+                output_tokens=65,
+                cost_usd=0.000019,
+                latency_ms=85,
+                finish_reason="final",
+            ),
+        ],
+        skill_calls=[
+            SkillCallRecord(
+                step=1,
+                skill="retrieval.kb-vector-lookup",
+                input={"query": "refund window"},
+                output={"chunks": []},
+                latency_ms=18.0,
+                cost_usd=0.0,
+                turn=1,
+            ),
+        ],
+    )
+
+    async def _persist() -> None:
+        store = SqliteProvider(db_path)
+        await store.init()
+        await store.save_run(record)
+        await store.close()
+
+    asyncio.run(_persist())
+    return run_id
+
+
+@pytest.mark.unit
+def test_replay_renders_execution_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`mdk trace replay <id>` renders the turn → skill/retrieval tree."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    db_path = tmp_path / ".movate" / "local.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    run_id = _seed_multi_turn_run(db_path)
+
+    result = runner.invoke(app, ["trace", "replay", run_id])
+
+    assert result.exit_code == 0, result.stdout
+    out = result.stdout
+    assert "Execution tree" in out
+    assert "turn 1" in out
+    assert "turn 2" in out
+    # Retrieval call nests under its turn as a retrieval node.
+    assert "retrieval.kb-vector-lookup" in out
+    # Per-node latency surfaced (turn 1 latency).
+    assert "55 ms" in out

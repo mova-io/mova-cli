@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from movate.cli._output import TableJson
+from movate.cli._run_tree import build_run_tree
 from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.models import RunRecord, WorkflowRunRecord
 from movate.core.replay import (
@@ -123,6 +124,12 @@ def _render_agent(replay_data: Replay, *, verbose: bool) -> None:
         err.add_row("message", r.error.message)
         err.add_row("retryable", str(r.error.retryable))
         console.print(err)
+
+    # Per-step execution tree (ADR 024 D3): the same turn → skill/retrieval
+    # breakdown `mdk explain --steps` renders, reconstructed offline from the
+    # replayed record. Degrades to a single node for legacy records (no turns).
+    console.print("\n[bold]Execution tree[/bold]")
+    console.print(build_run_tree(r))
 
     _print_body("input", r.input, verbose=verbose)
     _print_body("output", r.output, verbose=verbose)

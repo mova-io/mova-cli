@@ -24,6 +24,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from movate.cli._run_tree import build_run_tree
 from movate.cli._runtime import build_storage
 from movate.core.explain import explain_run
 from movate.core.models import JobStatus, RunRecord, SkillCallRecord
@@ -67,9 +68,11 @@ def explain(
         typer.Option(
             "--steps",
             help=(
-                "Render per-skill-call breakdown from the executor's tool-use loop. "
-                "Shows each skill invoked, its input, output (truncated), and latency. "
-                "No Langfuse backend required — data is captured by the executor itself."
+                "Render the per-step execution breakdown from the executor's tool-use "
+                "loop: a tree of LLM turns, each parenting the skill/retrieval calls it "
+                "made (with per-node cost, latency, and tokens), followed by the flat "
+                "skill-call table. No Langfuse backend required — data is captured by "
+                "the executor itself (ADR 024)."
             ),
         ),
     ] = False,
@@ -80,16 +83,17 @@ def explain(
     the final output in the order the executor processed them. When the run
     failed, the error is shown instead of an output section.
 
-    Add ``--steps`` to also see each skill/tool call made during the run:
-    which skill, what input the LLM passed, what it returned, and how long
-    it took.  No external tracing backend required.
+    Add ``--steps`` to also see the per-step execution breakdown: a tree of
+    LLM turns, each parenting the skill/retrieval calls it dispatched (with
+    per-node cost, latency, and tokens), followed by the flat skill-call
+    table. No external tracing backend required.
 
     Examples::
 
         mdk explain abc123               # explain run abc123 (full id or unique prefix)
         mdk explain --last               # explain the most-recent run
         mdk explain abc123 --json        # machine-readable JSON
-        mdk explain --last --steps       # include per-skill step breakdown
+        mdk explain --last --steps       # include the per-step turn/skill tree
     """
     import asyncio  # noqa: PLC0415
 
@@ -233,17 +237,25 @@ def _render_chain(record: RunRecord, *, show_steps: bool = False) -> None:
     console.print("[bold]Input[/bold]")
     _print_indented_json(record.input)
 
-    # ---- Skill calls (tool-use loop steps) ----
+    # ---- Per-step execution tree + flat skill-call table ----
+    # Under --steps we lead with the turn → skill/retrieval TREE (ADR 024 D3),
+    # then keep the existing flat table beneath it for narrow terminals /
+    # scripts. The tree renders from the retained record alone — offline-first,
+    # no Langfuse backend — and degrades to a single node for legacy records.
     skill_calls = record.skill_calls or []
-    if skill_calls and show_steps:
+    if show_steps:
         console.print()
-        console.print(f"[bold]Skill calls[/bold]  ({len(skill_calls)} step(s))")
-        _render_skill_calls(skill_calls)
+        console.print("[bold]Execution tree[/bold]")
+        console.print(build_run_tree(record))
+        if skill_calls:
+            console.print()
+            console.print(f"[bold]Skill calls[/bold]  ({len(skill_calls)} step(s))")
+            _render_skill_calls(skill_calls)
     elif skill_calls:
         console.print()
         console.print(
             f"  [dim]{len(skill_calls)} skill call(s) captured — "
-            "add [bold]--steps[/bold] to see details[/dim]"
+            "add [bold]--steps[/bold] to see the per-step tree[/dim]"
         )
 
     # ---- LLM call summary ----

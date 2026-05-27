@@ -10,7 +10,15 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
-from movate.core.models import ErrorInfo, JobStatus, Metrics, RunRecord, SkillCallRecord, TokenUsage
+from movate.core.models import (
+    ErrorInfo,
+    JobStatus,
+    Metrics,
+    RunRecord,
+    SkillCallRecord,
+    TokenUsage,
+    TurnRecord,
+)
 
 runner = CliRunner(mix_stderr=False)
 
@@ -580,3 +588,183 @@ def test_explain_exact_full_id_does_not_trigger_prefix_scan(
     assert "exact" in result.stdout
     # Exact match short-circuits before any prefix scan.
     assert store.list_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# ADR 024 PR 2 (#101): per-step execution TREE under `--steps` + additive
+# `turns` in `--json`. Tree = run → turn[i] → skill/retrieval children, with
+# per-node cost/latency/tokens. Legacy records (no turns) degrade to a single
+# node; the flat skill table and pre-existing `--json` keys stay intact.
+# ---------------------------------------------------------------------------
+
+
+def _make_turns() -> list[TurnRecord]:
+    """Two LLM turns: turn 1 dispatches the skills, turn 2 is the final answer."""
+    return [
+        TurnRecord(
+            index=1,
+            model="openai/gpt-4o-mini-2024-07-18",
+            input_tokens=200,
+            output_tokens=40,
+            cost_usd=0.000010,
+            latency_ms=60,
+            finish_reason="tool_use",
+        ),
+        TurnRecord(
+            index=2,
+            model="openai/gpt-4o-mini-2024-07-18",
+            input_tokens=112,
+            output_tokens=47,
+            cost_usd=0.000009,
+            latency_ms=82,
+            finish_reason="final",
+        ),
+    ]
+
+
+@pytest.mark.unit
+def test_explain_steps_renders_turn_tree_with_skill_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--steps renders turns as parents and their skills/retrieval as children.
+
+    A retrieval call and a tool call both made during turn 1 must nest under
+    `turn 1`, each showing per-node cost/latency.
+    """
+    turns = _make_turns()
+    skill_calls = [
+        SkillCallRecord(
+            step=1,
+            skill="retrieval.kb-vector-lookup",
+            input={"query": "return policy"},
+            output={"chunks": []},
+            latency_ms=12.0,
+            cost_usd=0.0,
+            turn=1,
+        ),
+        SkillCallRecord(
+            step=2,
+            skill="calculator",
+            input={"expression": "2 + 2"},
+            output={"result": 4},
+            latency_ms=3.0,
+            cost_usd=0.000020,
+            turn=1,
+        ),
+    ]
+    rec = _make_run(output={"answer": "30 days"})
+    rec = RunRecord(**{**rec.model_dump(), "turns": turns, "skill_calls": skill_calls})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    # Tree header + turn parents
+    assert "Execution tree" in out
+    assert "turn 1" in out
+    assert "turn 2" in out
+    # Retrieval renders as a retrieval node; the tool call as a skill node.
+    assert "retrieval.kb-vector-lookup" in out
+    assert "skill.calculator" in out
+    # Per-node cost/latency surfaced (turn 1 latency, skill latency).
+    assert "60 ms" in out  # turn 1 latency
+    assert "tool_use" in out  # turn 1 finish_reason
+    # The flat skill-call table is STILL rendered beneath the tree.
+    assert "Skill calls" in out
+
+
+@pytest.mark.unit
+def test_explain_steps_legacy_record_no_turns_renders_single_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy RunRecord with empty `turns` degrades to one node — no crash."""
+    rec = _make_run(output={"answer": "ok"})  # turns defaults to []
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "Execution tree" in out
+    # Single synthesized turn node from run-level metrics (one "turn 1").
+    assert "turn 1" in out
+    assert "turn 2" not in out
+    # Run-level model + tokens carried into the fallback node.
+    assert "gpt-4o-mini" in out
+
+
+@pytest.mark.unit
+def test_explain_steps_single_turn_no_skill_renders_one_turn_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-turn, no-skill run renders a one-turn tree (no children)."""
+    turns = [
+        TurnRecord(
+            index=1,
+            model="openai/gpt-4o-mini-2024-07-18",
+            input_tokens=312,
+            output_tokens=87,
+            cost_usd=0.000019,
+            latency_ms=42,
+            finish_reason="final",
+        )
+    ]
+    rec = _make_run(output={"answer": "yes"})
+    rec = RunRecord(**{**rec.model_dump(), "turns": turns})  # no skill_calls
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--steps"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "Execution tree" in out
+    assert "turn 1" in out
+    assert "turn 2" not in out
+    # No skill/retrieval children, and no flat skill table for a no-skill run.
+    assert "skill." not in out
+    assert "Skill calls" not in out
+
+
+@pytest.mark.unit
+def test_explain_json_includes_turns_additively(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--json gains a `turns` array WITHOUT dropping or renaming any prior key."""
+    turns = _make_turns()
+    rec = _make_run(output={"answer": "30 days"})
+    rec = RunRecord(**{**rec.model_dump(), "turns": turns})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    parsed = json.loads(result.stdout)
+    # New additive key.
+    assert "turns" in parsed
+    assert isinstance(parsed["turns"], list)
+    assert len(parsed["turns"]) == 2
+    assert parsed["turns"][0]["index"] == 1
+    assert parsed["turns"][0]["finish_reason"] == "tool_use"
+    assert parsed["turns"][0]["cost_usd"] == pytest.approx(0.000010)
+    # ALL pre-existing keys retained, unchanged.
+    assert parsed["run_id"] == "run-abc"
+    assert parsed["agent"] == "faq-agent"
+    assert parsed["status"] == JobStatus.SUCCESS
+    assert parsed["input"] == {"question": "What is the return policy?"}
+    assert parsed["output"] == {"answer": "30 days"}
+    assert parsed["llm_call"]["tokens_in"] == 312
+    assert parsed["llm_call"]["tokens_out"] == 87
+    assert parsed["llm_call"]["latency_ms"] == 42
+    assert "skill_calls_hint" in parsed  # default (no --steps) hint preserved
+
+
+@pytest.mark.unit
+def test_explain_json_legacy_record_emits_empty_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A legacy record (no turns) emits `turns: []` so consumers read it safely."""
+    rec = _make_run(output={"answer": "ok"})
+    monkeypatch.setattr("movate.cli.explain.build_storage", lambda: _FakeStorage([rec]))
+
+    result = runner.invoke(app, ["explain", "run-abc", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    parsed = json.loads(result.stdout)
+    assert parsed["turns"] == []
