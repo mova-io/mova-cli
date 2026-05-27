@@ -1,7 +1,7 @@
 # ADR 024 — Per-step execution observability: nested spans, retained per-step cost/latency, and a CLI tree
 
-**Status:** Proposed
-**Date:** 2026-05-26
+**Status:** Accepted
+**Date:** 2026-05-26 (proposed); 2026-05-26 (approved, status flipped to Accepted)
 **Deciders:** Engineering + Deva (Movate)
 **Context window:** v1.x observability inner loop — make a run's *internal* shape
 (every LLM turn, every skill/tool call, every KB retrieval) first-class and legible
