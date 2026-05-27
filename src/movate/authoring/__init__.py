@@ -30,6 +30,18 @@ Public surface:
 
 from __future__ import annotations
 
+from movate.authoring.autopilot import (
+    AppliedProposal,
+    Autopilot,
+    AutopilotResult,
+    EvalRunner,
+    EvalSnapshot,
+    FailingCase,
+    ImprovePass,
+    MockEvalRunner,
+    build_improve_request,
+    propose_improvements,
+)
 from movate.authoring.base import (
     AuthoringAction,
     AuthoringActionError,
@@ -70,13 +82,21 @@ __all__ = [
     "ActionLogEntry",
     "ActionPlan",
     "ActionResult",
+    "AppliedProposal",
     "ApplyOutcome",
     "AuthoringAction",
     "AuthoringActionError",
     "AuthoringContext",
     "AuthoringDriver",
+    "Autopilot",
+    "AutopilotResult",
     "ConfirmationRequiredError",
+    "EvalRunner",
+    "EvalSnapshot",
+    "FailingCase",
+    "ImprovePass",
     "LLMPlanner",
+    "MockEvalRunner",
     "MockPlanner",
     "Planner",
     "PlannerError",
@@ -86,10 +106,12 @@ __all__ = [
     "UnknownActionError",
     "VerifyReport",
     "action_names",
+    "build_improve_request",
     "describe_catalog",
     "get_action",
     "list_actions",
     "project_state_summary",
+    "propose_improvements",
     "register",
     "self_description",
 ]
