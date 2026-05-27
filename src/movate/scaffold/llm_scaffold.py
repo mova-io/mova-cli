@@ -21,10 +21,15 @@ Wire shape::
     )
     write_agent_files(generated, target_dir=Path("./agents/faq-agent"))
 
-The meta-prompt embeds two few-shot exemplars (FAQ + classifier) lifted
-verbatim from the packaged templates. Inlined as string literals — at
-1.5 KB each they don't justify a filesystem read at import time, and
-they're the kind of thing you want to read while reviewing the prompt.
+The meta-prompt embeds one few-shot exemplar per canonical shape (F2,
+#111): FAQ/QA, classifier, summarizer, extraction, and RAG/grounded
+(F3, #112). A SHAPE-SELECTION instruction tells the model to classify
+the description into exactly one shape and emit that shape's output
+schema + prompt — instead of collapsing every agent to a generic
+{answer, confidence}. Exemplars are lifted from the packaged templates
+and inlined as string literals — they don't justify a filesystem read
+at import time, and they're the kind of thing you want to read while
+reviewing the prompt.
 """
 
 from __future__ import annotations
@@ -188,7 +193,7 @@ _EXAMPLE_CLASSIFIER = """\
     "budget": {"max_cost_usd_per_run": 0.10},
     "tags": ["classifier"]
   },
-  "prompt_md": "You are a text classifier. Pick exactly one label from the provided list.\\n\\nText:\\n{{ input.text }}\\n\\nAvailable labels:\\n{% for label in input.labels %}- {{ label }}\\n{% endfor %}\\nRespond with a single JSON object: {\\"label\\": \\"<chosen label>\\"}",
+  "prompt_md": "You are a text classifier. Pick exactly one label from the provided list.\\n\\nText:\\n{{ input.text }}\\n\\nAvailable labels:\\n{% for label in input.labels %}- {{ label }}\\n{% endfor %}\\nRespond with a single JSON object on one line:\\n{\\"label\\": \\"<chosen label>\\", \\"confidence\\": <0.0-1.0>}",
   "input_schema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -203,12 +208,133 @@ _EXAMPLE_CLASSIFIER = """\
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": false,
-    "required": ["label"],
-    "properties": {"label": {"type": "string", "minLength": 1}}
+    "required": ["label", "confidence"],
+    "properties": {
+      "label": {"type": "string", "minLength": 1},
+      "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    }
   },
   "sample_evals": [
-    {"input": {"text": "I loved this!", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "positive"}},
-    {"input": {"text": "Worst experience ever.", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "negative"}}
+    {"input": {"text": "I loved this!", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "positive", "confidence": 0.97}},
+    {"input": {"text": "Worst experience ever.", "labels": ["positive", "negative", "neutral"]}, "expected": {"label": "negative", "confidence": 0.95}}
+  ]
+}"""
+
+# Summarizer exemplar (F2, #111). The shape every "summarize / condense /
+# tl;dr / digest this text" description must collapse to:
+# `{summary: string, key_points: array[string]}`. Lifted from the packaged
+# `summarizer_agent` template's intent (a summary + the salient points),
+# specialized to a list-of-bullets contract so the output is structured,
+# not a single opaque blob. `max_words` is an OPTIONAL input knob (omitted
+# from `required`) so callers can cap length without it being mandatory.
+_EXAMPLE_SUMMARIZER = """\
+{
+  "agent_yaml": {
+    "api_version": "movate/v1",
+    "kind": "Agent",
+    "name": "text-summarizer",
+    "version": "0.1.0",
+    "description": "Summarizes input text into a concise summary plus a list of key points.",
+    "owner": "",
+    "model": {
+      "provider": "openai/gpt-4o-mini-2024-07-18",
+      "params": {"temperature": 0.2, "max_tokens": 512}
+    },
+    "prompt": "./prompt.md",
+    "schema": {
+      "input": "./schema/input.json",
+      "output": "./schema/output.json"
+    },
+    "evals": {"dataset": "./evals/dataset.jsonl"},
+    "timeouts": {"call_ms": 30000, "total_ms": 60000},
+    "budget": {"max_cost_usd_per_run": 0.50},
+    "tags": ["summarizer"]
+  },
+  "prompt_md": "You are a summarization assistant. Read the text below and produce a concise summary plus the key points. Do not add facts that are not in the text.\\n\\nText:\\n{{ input.text }}\\n\\nRespond with a single JSON object on one line:\\n{\\"summary\\": \\"<concise summary>\\", \\"key_points\\": [\\"<point 1>\\", \\"<point 2>\\"]}",
+  "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["text"],
+    "properties": {
+      "text": {"type": "string", "minLength": 1},
+      "max_words": {"type": "integer", "minimum": 1}
+    }
+  },
+  "output_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["summary", "key_points"],
+    "properties": {
+      "summary": {"type": "string", "minLength": 1},
+      "key_points": {"type": "array", "items": {"type": "string"}}
+    }
+  },
+  "sample_evals": [
+    {"input": {"text": "Q3 revenue grew 18% YoY on enterprise renewals; operating margin expanded to 22% on cost optimization. Headcount held flat."}, "expected": {"summary": "Q3 revenue rose 18% YoY and margin expanded to 22%, with flat headcount.", "key_points": ["Revenue up 18% YoY on enterprise renewals", "Operating margin expanded to 22%", "Headcount held flat"]}},
+    {"input": {"text": "The release fixes a login bug, adds dark mode, and improves export speed by 30%."}, "expected": {"summary": "The release fixes a login bug, adds dark mode, and speeds up exports.", "key_points": ["Login bug fixed", "Dark mode added", "Export speed improved 30%"]}}
+  ]
+}"""
+
+# Extraction exemplar (F2, #111). The shape every "extract / pull out /
+# parse <named fields> from text" description must collapse to: a structured
+# output object whose properties ARE the named entities. Lifted from the
+# packaged `extractor_agent` template — extraction wants determinism, so
+# temperature 0.0 and a strict field contract. Fields the source may omit
+# are nullable (a union with "null") and the prompt instructs the model to
+# return null rather than fabricate; the field still appears in `required`
+# (its VALUE may be null, but the KEY must be present). This is the canonical
+# way to express "optional value" in a strict JSON Schema object — NEVER a
+# key-suffix `?`, which is not JSON Schema and is not a value-optional marker.
+_EXAMPLE_EXTRACTION = """\
+{
+  "agent_yaml": {
+    "api_version": "movate/v1",
+    "kind": "Agent",
+    "name": "contact-extractor",
+    "version": "0.1.0",
+    "description": "Extracts named fields (contact name, email, organization, intent) from unstructured text.",
+    "owner": "",
+    "model": {
+      "provider": "openai/gpt-4o-mini-2024-07-18",
+      "params": {"temperature": 0.0, "max_tokens": 512}
+    },
+    "prompt": "./prompt.md",
+    "schema": {
+      "input": "./schema/input.json",
+      "output": "./schema/output.json"
+    },
+    "evals": {"dataset": "./evals/dataset.jsonl"},
+    "timeouts": {"call_ms": 30000, "total_ms": 60000},
+    "budget": {"max_cost_usd_per_run": 0.05},
+    "tags": ["extraction", "structured-output"]
+  },
+  "prompt_md": "You are a strict structured-field extractor. Read the text and pull out the requested fields. If a field is not present in the text, return null — do NOT invent or infer.\\n\\nFields:\\n- contact_name: the person's full name, or null.\\n- email: a valid email address, or null.\\n- organization: the company / org name, or null.\\n- intent: a short label for what the writer wants, or null.\\n\\nText:\\n{{ input.text }}\\n\\nRespond with a single JSON object on one line:\\n{\\"contact_name\\": \\"...\\", \\"email\\": \\"...\\", \\"organization\\": \\"...\\", \\"intent\\": \\"...\\"}",
+  "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["text"],
+    "properties": {
+      "text": {"type": "string", "minLength": 1}
+    }
+  },
+  "output_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["contact_name", "email", "organization", "intent"],
+    "properties": {
+      "contact_name": {"type": ["string", "null"]},
+      "email": {"type": ["string", "null"], "format": "email"},
+      "organization": {"type": ["string", "null"]},
+      "intent": {"type": ["string", "null"]}
+    }
+  },
+  "sample_evals": [
+    {"input": {"text": "Hi, this is Sarah Chen from Acme Corp (sarah@acme.example). We'd like a demo of the Enterprise tier."}, "expected": {"contact_name": "Sarah Chen", "email": "sarah@acme.example", "organization": "Acme Corp", "intent": "demo_request"}},
+    {"input": {"text": "Please cancel my subscription."}, "expected": {"contact_name": null, "email": null, "organization": null, "intent": "cancellation"}}
   ]
 }"""
 
@@ -280,8 +406,8 @@ _EXAMPLE_RAG = """\
 # Meta-prompt — instructs the LLM how to map description → GeneratedAgent.
 #
 # STRUCTURE: a fully-static PREFIX followed by a short VARIABLE SUFFIX. The
-# prefix (role/intro, schema, hard constraints, both few-shot examples) is
-# byte-identical on every call — no interpolation — so it forms a stable
+# prefix (role/intro, schema, hard constraints, the per-shape few-shot
+# examples) is byte-identical on every call — no interpolation — so it forms a stable
 # cacheable prompt prefix (OpenAI auto-caches stable prefixes; this also
 # sets up an explicit Anthropic ``cache_control`` breakpoint later). The
 # per-call variables (description, name, target model) appear ONLY in the
@@ -299,11 +425,11 @@ _EXAMPLE_RAG = """\
 # static (and therefore cacheable).
 # ---------------------------------------------------------------------------
 
-# Static, interpolation-free preamble. ``{example_faq}`` / ``{example_classifier}``
-# are the only placeholders and they expand to byte-identical literals on
-# every call, so the formatted prefix is itself constant. The detection
-# markers the mock keys on ("scaffolding a movate AI agent",
-# "GENERATEDAGENT SCHEMA") live here in the prefix.
+# Static, interpolation-free preamble. The ``{example_*}`` placeholders
+# (faq, classifier, summarizer, extraction, rag) are the only ones and they
+# expand to byte-identical literals on every call, so the formatted prefix
+# is itself constant. The detection markers the mock keys on ("scaffolding a
+# movate AI agent", "GENERATEDAGENT SCHEMA") live here in the prefix.
 _META_PROMPT_PREFIX = """\
 You are scaffolding a movate AI agent from a natural-language description.
 
@@ -365,33 +491,65 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
 6. Output ONLY valid JSON. No markdown fences, no prose, no
    commentary before or after the JSON.
 
-7. GROUNDING / RAG DETECTION. First decide whether the description asks
-   the agent to ANSWER FROM A KNOWLEDGE SOURCE — e.g. "answer questions
-   about our docs / help center / FAQ / policies / handbook", "based on
-   our documentation", "from this website", a URL, or any "answer
-   questions about <corpus>" phrasing. This is grounding/RAG intent.
-   - If GROUNDING: emit a RAG-shaped agent (see EXAMPLE 3). It MUST have
-     * agent_yaml.skills: ["kb-vector-lookup"]
-     * agent_yaml.retrieval: {{"auto_into": "context", "query_from": "<the question/text input field>"}}
-     * an input_schema with the primary question field PLUS an OPTIONAL
-       "context" field of type array-of-string (do NOT put "context" in
-       "required" — it is auto-filled by retrieval before the prompt
-       renders).
-     * a prompt that answers ONLY from input.context, cites chunks by
-       1-based index, and DECLINES (sets a grounded=false signal) when
-       the context is empty. Never answer from outside knowledge.
-   - If NOT grounding (a classifier, summarizer, transformer, extractor,
-     generator, or any task that operates purely on its input): emit a
-     normal single-turn agent (EXAMPLE 1 or 2). Do NOT add skills or a
-     retrieval block — those keys must be ABSENT for non-grounding agents.
+7. SHAPE SELECTION (do this FIRST). The output schema + prompt MUST match
+   what the description ASKS FOR — do not collapse every agent to a generic
+   {{answer, confidence}}. Classify the description into exactly ONE of the
+   shapes below (check them top-to-bottom; the FIRST match wins) and emit
+   that shape's output_schema + prompt + sample_evals:
 
-EXAMPLE 1 (FAQ agent) — single-turn, NOT grounding:
+   a. GROUNDED / RAG — the agent must ANSWER FROM A KNOWLEDGE SOURCE: "answer
+      questions about our docs / help center / FAQ / policies / handbook",
+      "based on our documentation", "from this website", a URL, or any
+      "answer questions about <corpus>" phrasing. → EXAMPLE 5 (RAG). It MUST
+      have:
+        * agent_yaml.skills: ["kb-vector-lookup"]
+        * agent_yaml.retrieval: {{"auto_into": "context", "query_from": "<the question/text input field>"}}
+        * an input_schema with the primary question field PLUS an OPTIONAL
+          "context" field of type array-of-string (do NOT put "context" in
+          "required" — it is auto-filled by retrieval before the prompt
+          renders).
+        * a prompt that answers ONLY from input.context, cites chunks by
+          1-based index, and DECLINES (sets grounded=false) on empty context.
+          Never answer from outside knowledge.
+        * output {{answer, citations, grounded, confidence}}.
+
+   b. CLASSIFIER — "classify / categorize / label / route / triage / detect
+      sentiment / tag" into a fixed set of categories. → EXAMPLE 2. Output
+      {{label, confidence}}.
+
+   c. SUMMARIZER — "summarize / condense / tl;dr / digest / shorten / brief".
+      → EXAMPLE 3. Output {{summary, key_points}} (key_points is an array of
+      strings).
+
+   d. EXTRACTION — "extract / pull out / parse / capture NAMED FIELDS"
+      (entities, contact info, line items, dates, etc.) from text. → EXAMPLE
+      4. The output_schema's properties ARE the named fields. Fields the
+      source may omit get a nullable type ("type": ["string", "null"]) and
+      the prompt returns null rather than fabricating — but the field KEY
+      still appears in "required" (a present key with a null VALUE). NEVER
+      append "?" to a property key — that is not JSON Schema.
+
+   e. QA / FAQ (the default) — a free-text question answered from the model's
+      own knowledge or the provided input, NOT from a retrieved corpus, and
+      not any shape above. → EXAMPLE 1. Output {{answer, confidence}}.
+
+   Shapes (b)-(e) are single-turn agents: they operate purely on their input.
+   Do NOT add a skills or retrieval block to them — those keys must be ABSENT
+   for every non-grounding shape.
+
+EXAMPLE 1 (FAQ / QA agent) — single-turn, NOT grounding; {{answer, confidence}}:
 {example_faq}
 
-EXAMPLE 2 (Classifier agent) — single-turn, NOT grounding:
+EXAMPLE 2 (Classifier agent) — single-turn; {{label, confidence}}:
 {example_classifier}
 
-EXAMPLE 3 (Grounded RAG agent) — answers from a knowledge source:
+EXAMPLE 3 (Summarizer agent) — single-turn; {{summary, key_points}}:
+{example_summarizer}
+
+EXAMPLE 4 (Extraction agent) — single-turn; structured named fields:
+{example_extraction}
+
+EXAMPLE 5 (Grounded RAG agent) — answers from a knowledge source:
 {example_rag}
 """
 
@@ -484,6 +642,8 @@ async def generate_agent_from_description(
             target_model=target_model or model,
             example_faq=_EXAMPLE_FAQ,
             example_classifier=_EXAMPLE_CLASSIFIER,
+            example_summarizer=_EXAMPLE_SUMMARIZER,
+            example_extraction=_EXAMPLE_EXTRACTION,
             example_rag=_EXAMPLE_RAG,
         )
 

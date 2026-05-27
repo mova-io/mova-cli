@@ -24,9 +24,12 @@ the agent's own dataset rows.
 
 **Scaffold-aware mode**: when the prompt is the ``mdk init --llm``
 scaffold meta-prompt (or its retry variant), the mock synthesizes a
-valid :class:`movate.scaffold.GeneratedAgent` JSON payload for a
-minimal generic agent so ``mdk init --llm --mock`` produces a runnable
-agent offline (no API key). Like dataset-aware mode, this fires ONLY
+valid :class:`movate.scaffold.GeneratedAgent` JSON payload so ``mdk
+init --llm --mock`` produces a runnable agent offline (no API key). It
+classifies the operator's description into a canonical SHAPE (F2, #111
+— QA, classifier, summarizer, extraction; F3, #112 — grounded/RAG) and
+emits a shape-appropriate output schema + prompt, mirroring the
+meta-prompt's SHAPE-SELECTION. Like dataset-aware mode, this fires ONLY
 when no explicit ``MOVATE_MOCK_RESPONSE`` / ``response=`` was set — an
 explicit override always wins.
 """
@@ -139,6 +142,84 @@ def _looks_like_grounding_description(description: str) -> bool:
     """
     haystack = description.lower()
     return any(marker in haystack for marker in _GROUNDING_MARKERS)
+
+
+# --- Per-shape detection (F2, #111) ---------------------------------------
+#
+# The offline `--mock` scaffold path classifies a non-grounding description
+# into one of the canonical SHAPES so it can emit a shape-appropriate output
+# schema + prompt — mirroring the SHAPE-SELECTION instruction the real LLM
+# follows from the meta-prompt. Grounding/RAG is checked FIRST elsewhere
+# (`_looks_like_grounding_description`); these markers cover the remaining
+# shapes. Deliberately lenient substring matching: a `--mock` misfire just
+# yields a different (still valid) scaffold, and the real LLM does the
+# nuanced classification. The shape names match the meta-prompt's taxonomy.
+_CLASSIFIER_MARKERS = (
+    "classify",
+    "classifier",
+    "categorize",
+    "categorise",
+    "categorization",
+    "label ",
+    "labeling",
+    "labelling",
+    "route ",
+    "routing",
+    "triage",
+    "sentiment",
+    "tag ",
+    "tagging",
+    "detect ",
+)
+_SUMMARIZER_MARKERS = (
+    "summarize",
+    "summarise",
+    "summary",
+    "summarization",
+    "summarisation",
+    "condense",
+    "tl;dr",
+    "tldr",
+    "digest",
+    "shorten",
+    "brief ",
+    "briefing",
+    "recap",
+)
+_EXTRACTION_MARKERS = (
+    "extract",
+    "extraction",
+    "pull out",
+    "parse ",
+    "capture ",
+    "named field",
+    "named entit",
+    "structured field",
+    "line item",
+)
+
+
+def _detect_shape(description: str) -> str:
+    """Classify a NON-grounding ``description`` into a canonical shape (F2).
+
+    Returns one of ``"classifier"``, ``"summarizer"``, ``"extraction"``,
+    or ``"qa"`` (the default). Mirrors the meta-prompt's SHAPE-SELECTION
+    order for the non-grounding shapes — grounding/RAG is decided BEFORE
+    this is called (see :func:`_looks_like_grounding_description`), so it
+    is intentionally absent here. First marker group to match wins;
+    nothing matching falls through to ``"qa"`` (today's default shape).
+
+    Substring match on a lowercased description; deliberately lenient —
+    a misfire under ``--mock`` just produces a different valid scaffold.
+    """
+    haystack = description.lower()
+    if any(marker in haystack for marker in _CLASSIFIER_MARKERS):
+        return "classifier"
+    if any(marker in haystack for marker in _SUMMARIZER_MARKERS):
+        return "summarizer"
+    if any(marker in haystack for marker in _EXTRACTION_MARKERS):
+        return "extraction"
+    return "qa"
 
 
 def _parse_scaffold_description(body: str) -> str:
@@ -325,44 +406,265 @@ def _build_rag_scaffold_response(name: str) -> str:
     return json.dumps(payload)
 
 
-def _build_scaffold_response(name: str, *, grounding: bool = False) -> str:
-    """Return a valid ``GeneratedAgent`` JSON payload.
+def _agent_yaml_base(name: str, *, description: str, max_tokens: int = 512) -> dict[str, Any]:
+    """Shared ``agent_yaml`` skeleton for the single-turn shapes (F2, #111).
 
-    Dispatches on ``grounding`` (F3, #112): a grounding/RAG description
-    yields the RAG-shaped scaffold (:func:`_build_rag_scaffold_response`);
-    anything else yields the generic text-in → message-out agent below.
-
-    The generic branch is a minimal agent (same shape as the default
-    template). Engineered to satisfy every HARD CONSTRAINT in the
-    scaffold meta-prompt so the result passes both
-    ``GeneratedAgent.model_validate`` and ``load_agent()`` — i.e.
-    ``mdk init --llm --mock`` yields a runnable agent offline.
+    Every non-grounding shape shares the same required-key spine (api_version,
+    kind, name, version, model, prompt, schema, evals); only ``description``
+    and ``max_tokens`` vary. Factored out so each shape builder only declares
+    what makes it distinct (its output contract + prompt). Note: NO ``skills``
+    or ``retrieval`` keys — those are exclusive to the RAG shape.
     """
-    if grounding:
-        return _build_rag_scaffold_response(name)
-    payload: dict[str, Any] = {
-        "agent_yaml": {
-            "api_version": "movate/v1",
-            "kind": "Agent",
-            "name": name,
-            "version": "0.1.0",
-            "description": "A generic agent scaffolded offline by the mock provider.",
-            "owner": "",
-            "model": {
-                "provider": "openai/gpt-4o-mini-2024-07-18",
-                "params": {"temperature": 0.0, "max_tokens": 512},
-            },
-            "prompt": "./prompt.md",
-            "schema": {
-                "input": "./schema/input.json",
-                "output": "./schema/output.json",
-            },
-            "evals": {"dataset": "./evals/dataset.jsonl"},
+    return {
+        "api_version": "movate/v1",
+        "kind": "Agent",
+        "name": name,
+        "version": "0.1.0",
+        "description": description,
+        "owner": "",
+        "model": {
+            "provider": "openai/gpt-4o-mini-2024-07-18",
+            "params": {"temperature": 0.0, "max_tokens": max_tokens},
         },
+        "prompt": "./prompt.md",
+        "schema": {
+            "input": "./schema/input.json",
+            "output": "./schema/output.json",
+        },
+        "evals": {"dataset": "./evals/dataset.jsonl"},
+    }
+
+
+def _build_qa_scaffold_response(name: str) -> str:
+    """The QA / FAQ shape — ``{answer, confidence}`` (F2, #111).
+
+    Today's default shape: a free-text question answered from the model's
+    own knowledge, NOT from a retrieved corpus. Mirrors the meta-prompt's
+    FAQ exemplar + the packaged ``faq_agent`` template. Engineered to pass
+    ``GeneratedAgent.model_validate`` AND ``load_agent()`` offline.
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": _agent_yaml_base(
+            name,
+            description="Answers questions concisely with a confidence score.",
+        ),
         "prompt_md": (
-            "You are a helpful assistant. Respond to the user's input.\n\n"
-            "Input:\n{{ input.text }}\n\n"
-            'Respond with a single JSON object on one line: {"message": "<your reply>"}'
+            "You answer questions concisely.\n\n"
+            "Question:\n{{ input.question }}\n\n"
+            "Respond with a single JSON object on one line:\n"
+            '{"answer": "<your answer>", "confidence": <0.0-1.0>}'
+        ),
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["question"],
+            "properties": {"question": {"type": "string", "minLength": 1}},
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer", "confidence"],
+            "properties": {
+                "answer": {"type": "string", "minLength": 1},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        "sample_evals": [
+            {
+                "input": {"question": "What is your refund window?"},
+                "expected": {"answer": "30 days from purchase.", "confidence": 0.95},
+            },
+            {
+                "input": {"question": "Do you support SAML SSO?"},
+                "expected": {"answer": "Yes, on the Enterprise tier.", "confidence": 0.9},
+            },
+        ],
+    }
+    return json.dumps(payload)
+
+
+def _build_classifier_scaffold_response(name: str) -> str:
+    """The classifier shape — ``{label, confidence}`` (F2, #111).
+
+    For "classify / categorize / label / route / triage / sentiment"
+    descriptions. The input carries the text plus the candidate ``labels``;
+    the output is the chosen label with a confidence. Mirrors the
+    meta-prompt's classifier exemplar + the packaged ``classifier_agent``
+    template.
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": _agent_yaml_base(
+            name,
+            description="Classifies input text into one of a fixed list of labels.",
+            max_tokens=64,
+        ),
+        "prompt_md": (
+            "You are a text classifier. Pick exactly one label from the "
+            "provided list.\n\n"
+            "Text:\n{{ input.text }}\n\n"
+            "Available labels:\n"
+            "{% for label in input.labels %}- {{ label }}\n{% endfor %}\n"
+            "Respond with a single JSON object on one line:\n"
+            '{"label": "<chosen label>", "confidence": <0.0-1.0>}'
+        ),
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["text", "labels"],
+            "properties": {
+                "text": {"type": "string", "minLength": 1},
+                "labels": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+            },
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["label", "confidence"],
+            "properties": {
+                "label": {"type": "string", "minLength": 1},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        "sample_evals": [
+            {
+                "input": {"text": "I loved this!", "labels": ["positive", "negative", "neutral"]},
+                "expected": {"label": "positive", "confidence": 0.97},
+            },
+            {
+                "input": {
+                    "text": "Worst experience ever.",
+                    "labels": ["positive", "negative", "neutral"],
+                },
+                "expected": {"label": "negative", "confidence": 0.95},
+            },
+        ],
+    }
+    return json.dumps(payload)
+
+
+def _build_summarizer_scaffold_response(name: str) -> str:
+    """The summarizer shape — ``{summary, key_points}`` (F2, #111).
+
+    For "summarize / condense / tl;dr / digest / shorten" descriptions.
+    ``key_points`` is an array of strings (the salient bullets);
+    ``max_words`` is an OPTIONAL input knob (absent from ``required``).
+    Mirrors the meta-prompt's summarizer exemplar + the packaged
+    ``summarizer_agent`` template's intent.
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": _agent_yaml_base(
+            name,
+            description="Summarizes input text into a concise summary plus key points.",
+        ),
+        "prompt_md": (
+            "You are a summarization assistant. Read the text below and "
+            "produce a concise summary plus the key points. Do not add facts "
+            "that are not in the text.\n\n"
+            "Text:\n{{ input.text }}\n\n"
+            "Respond with a single JSON object on one line:\n"
+            '{"summary": "<concise summary>", "key_points": ["<point 1>", '
+            '"<point 2>"]}'
+        ),
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            # `max_words` is intentionally NOT required — an optional knob.
+            "required": ["text"],
+            "properties": {
+                "text": {"type": "string", "minLength": 1},
+                "max_words": {"type": "integer", "minimum": 1},
+            },
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary", "key_points"],
+            "properties": {
+                "summary": {"type": "string", "minLength": 1},
+                "key_points": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "sample_evals": [
+            {
+                "input": {
+                    "text": (
+                        "Q3 revenue grew 18% YoY on enterprise renewals; "
+                        "operating margin expanded to 22% on cost "
+                        "optimization. Headcount held flat."
+                    )
+                },
+                "expected": {
+                    "summary": (
+                        "Q3 revenue rose 18% YoY and margin expanded to 22%, with flat headcount."
+                    ),
+                    "key_points": [
+                        "Revenue up 18% YoY on enterprise renewals",
+                        "Operating margin expanded to 22%",
+                        "Headcount held flat",
+                    ],
+                },
+            },
+            {
+                "input": {
+                    "text": (
+                        "The release fixes a login bug, adds dark mode, and "
+                        "improves export speed by 30%."
+                    )
+                },
+                "expected": {
+                    "summary": (
+                        "The release fixes a login bug, adds dark mode, and speeds up exports."
+                    ),
+                    "key_points": [
+                        "Login bug fixed",
+                        "Dark mode added",
+                        "Export speed improved 30%",
+                    ],
+                },
+            },
+        ],
+    }
+    return json.dumps(payload)
+
+
+def _build_extraction_scaffold_response(name: str) -> str:
+    """The extraction shape — structured named fields (F2, #111).
+
+    For "extract / pull out / parse named fields" descriptions. The output
+    properties ARE the named entities; fields the source may omit get a
+    nullable type (``["string", "null"]``) and the prompt returns null
+    rather than fabricating — but the KEY stays in ``required`` (a present
+    key, possibly-null value). This is the validate-safe way to express
+    "optional value"; NEVER a key-suffix ``?``. Mirrors the meta-prompt's
+    extraction exemplar + the packaged ``extractor_agent`` template.
+    """
+    payload: dict[str, Any] = {
+        "agent_yaml": _agent_yaml_base(
+            name,
+            description=(
+                "Extracts named fields (contact name, email, organization, "
+                "intent) from unstructured text."
+            ),
+        ),
+        "prompt_md": (
+            "You are a strict structured-field extractor. Read the text and "
+            "pull out the requested fields. If a field is not present in the "
+            "text, return null — do NOT invent or infer.\n\n"
+            "Fields:\n"
+            "- contact_name: the person's full name, or null.\n"
+            "- email: a valid email address, or null.\n"
+            "- organization: the company / org name, or null.\n"
+            "- intent: a short label for what the writer wants, or null.\n\n"
+            "Text:\n{{ input.text }}\n\n"
+            "Respond with a single JSON object on one line:\n"
+            '{"contact_name": "...", "email": "...", "organization": "...", '
+            '"intent": "..."}'
         ),
         "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -375,15 +677,85 @@ def _build_scaffold_response(name: str, *, grounding: bool = False) -> str:
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "additionalProperties": False,
-            "required": ["message"],
-            "properties": {"message": {"type": "string"}},
+            # Every field is REQUIRED (the key must be present) but
+            # nullable (the VALUE may be null when the source omits it).
+            "required": ["contact_name", "email", "organization", "intent"],
+            "properties": {
+                "contact_name": {"type": ["string", "null"]},
+                "email": {"type": ["string", "null"], "format": "email"},
+                "organization": {"type": ["string", "null"]},
+                "intent": {"type": ["string", "null"]},
+            },
         },
         "sample_evals": [
-            {"input": {"text": "Hello!"}, "expected": {"message": "Hi there, how can I help?"}},
-            {"input": {"text": "What can you do?"}, "expected": {"message": "I answer questions."}},
+            {
+                "input": {
+                    "text": (
+                        "Hi, this is Sarah Chen from Acme Corp "
+                        "(sarah@acme.example). We'd like a demo of the "
+                        "Enterprise tier."
+                    )
+                },
+                "expected": {
+                    "contact_name": "Sarah Chen",
+                    "email": "sarah@acme.example",
+                    "organization": "Acme Corp",
+                    "intent": "demo_request",
+                },
+            },
+            {
+                "input": {"text": "Please cancel my subscription."},
+                "expected": {
+                    "contact_name": None,
+                    "email": None,
+                    "organization": None,
+                    "intent": "cancellation",
+                },
+            },
         ],
     }
     return json.dumps(payload)
+
+
+# Dispatch table for the non-grounding shapes (F2, #111). Keyed by the shape
+# name :func:`_detect_shape` returns; grounding/RAG is handled separately in
+# :func:`_build_scaffold_response` (it has its own detector + builder).
+_SHAPE_BUILDERS = {
+    "classifier": _build_classifier_scaffold_response,
+    "summarizer": _build_summarizer_scaffold_response,
+    "extraction": _build_extraction_scaffold_response,
+    "qa": _build_qa_scaffold_response,
+}
+
+
+def _build_scaffold_response(
+    name: str, *, grounding: bool = False, shape: str | None = None
+) -> str:
+    """Return a valid ``GeneratedAgent`` JSON payload for the right SHAPE.
+
+    Selection order (mirrors the meta-prompt's SHAPE-SELECTION):
+
+    * ``grounding=True`` (F3, #112) → the RAG-shaped scaffold
+      (:func:`_build_rag_scaffold_response`). Checked FIRST and unchanged.
+    * otherwise (F2, #111) the ``shape`` arg picks a single-turn shape:
+      ``"classifier"`` → ``{label, confidence}``, ``"summarizer"`` →
+      ``{summary, key_points}``, ``"extraction"`` → structured named
+      fields, ``"qa"`` (default) → ``{answer, confidence}``.
+
+    ``shape`` defaults to ``"qa"`` when unset, so a caller that passes
+    neither keyword gets today's QA shape — back-compat for any code that
+    called ``_build_scaffold_response(name)`` before F2. An unrecognized
+    ``shape`` likewise falls back to QA.
+
+    Every branch is engineered to satisfy the meta-prompt's HARD
+    CONSTRAINTS so the result passes both ``GeneratedAgent.model_validate``
+    and ``load_agent()`` — i.e. ``mdk init --llm --mock`` yields a runnable
+    agent offline regardless of shape.
+    """
+    if grounding:
+        return _build_rag_scaffold_response(name)
+    builder = _SHAPE_BUILDERS.get(shape or "qa", _build_qa_scaffold_response)
+    return builder(name)
 
 
 class MockProvider(BaseLLMProvider):
@@ -490,14 +862,18 @@ class MockProvider(BaseLLMProvider):
             # explicitly overridden — phase-3 tests that force-feed a
             # GeneratedAgent via MOVATE_MOCK_RESPONSE must still win.
             #
-            # F3 (#112): classify the description for grounding / RAG
-            # intent and emit a RAG-shaped scaffold (skills:
-            # [kb-vector-lookup] + retrieval.auto_into + optional-context
-            # schema + grounded prompt) when it matches; otherwise the
-            # generic single-turn scaffold. Deterministic + offline.
+            # Classify the description into a canonical SHAPE so the offline
+            # scaffold matches the described intent (mirrors the meta-prompt's
+            # SHAPE-SELECTION). Grounding/RAG (F3, #112) is checked FIRST; if
+            # it doesn't match, F2 (#111) picks a single-turn shape
+            # (classifier / summarizer / extraction / qa). Deterministic +
+            # offline.
             description = _parse_scaffold_description(body)
-            grounding = _looks_like_grounding_description(description)
-            text = _build_scaffold_response(_parse_scaffold_name(body), grounding=grounding)
+            scaffold_name = _parse_scaffold_name(body)
+            if _looks_like_grounding_description(description):
+                text = _build_scaffold_response(scaffold_name, grounding=True)
+            else:
+                text = _build_scaffold_response(scaffold_name, shape=_detect_shape(description))
         elif self._dataset_expecteds and self._response_is_default:
             # Cycle through dataset rows in order. Wraps at the end so
             # callers that exceed dataset length still get valid output
