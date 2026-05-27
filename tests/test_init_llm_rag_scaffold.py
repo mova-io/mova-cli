@@ -38,8 +38,10 @@ from movate.providers.mock import (
 )
 from movate.scaffold.llm_scaffold import (
     _EXAMPLE_CLASSIFIER,
+    _EXAMPLE_EXTRACTION,
     _EXAMPLE_FAQ,
     _EXAMPLE_RAG,
+    _EXAMPLE_SUMMARIZER,
     _META_PROMPT,
 )
 
@@ -124,6 +126,8 @@ class TestGroundingDetection:
             target_model="openai/gpt-4o-mini-2024-07-18",
             example_faq=_EXAMPLE_FAQ,
             example_classifier=_EXAMPLE_CLASSIFIER,
+            example_summarizer=_EXAMPLE_SUMMARIZER,
+            example_extraction=_EXAMPLE_EXTRACTION,
             example_rag=_EXAMPLE_RAG,
         )
         assert _parse_scaffold_description(prompt) == "answer questions about our help docs"

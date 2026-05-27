@@ -150,8 +150,10 @@ class TestCacheableMetaPromptPrefix:
     def _format(self, *, description: str, name: str, target_model: str) -> str:
         from movate.scaffold.llm_scaffold import (  # noqa: PLC0415
             _EXAMPLE_CLASSIFIER,
+            _EXAMPLE_EXTRACTION,
             _EXAMPLE_FAQ,
             _EXAMPLE_RAG,
+            _EXAMPLE_SUMMARIZER,
             _META_PROMPT,
         )
 
@@ -161,6 +163,8 @@ class TestCacheableMetaPromptPrefix:
             target_model=target_model,
             example_faq=_EXAMPLE_FAQ,
             example_classifier=_EXAMPLE_CLASSIFIER,
+            example_summarizer=_EXAMPLE_SUMMARIZER,
+            example_extraction=_EXAMPLE_EXTRACTION,
             example_rag=_EXAMPLE_RAG,
         )
 
@@ -174,12 +178,25 @@ class TestCacheableMetaPromptPrefix:
         )
         i_schema = prompt.index("GENERATEDAGENT SCHEMA")
         i_constraints = prompt.index("HARD CONSTRAINTS")
-        i_faq = prompt.index("EXAMPLE 1 (FAQ agent)")
+        i_faq = prompt.index("EXAMPLE 1 (FAQ")
         i_classifier = prompt.index("EXAMPLE 2 (Classifier agent)")
+        # F2 (#111): new shape exemplars slot in BETWEEN classifier and RAG.
+        i_summarizer = prompt.index("EXAMPLE 3 (Summarizer agent)")
+        i_extraction = prompt.index("EXAMPLE 4 (Extraction agent)")
+        i_rag = prompt.index("EXAMPLE 5 (Grounded RAG agent)")
         i_desc = prompt.index("USER DESCRIPTION:")
         i_name = prompt.index("AGENT NAME:")
         # Static blocks all come first; constraints ABOVE examples preserved.
-        assert i_schema < i_constraints < i_faq < i_classifier < i_desc
+        assert (
+            i_schema
+            < i_constraints
+            < i_faq
+            < i_classifier
+            < i_summarizer
+            < i_extraction
+            < i_rag
+            < i_desc
+        )
         # Variable suffix markers come last.
         assert i_desc < i_name
 
