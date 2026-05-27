@@ -1,0 +1,480 @@
+{
+  "info": {
+    "name": "Movate — Core Flow",
+    "_postman_id": "b9f0c1a2-3d4e-4f56-8a7b-0c1d2e3f4a5b",
+    "description": "A top-to-bottom live demo of the mdk (`movate-cli`) runtime `/api/v1` surface against a deployed Azure Container Apps runtime.\n\nEach request maps to an `mdk <verb>` and demonstrates one core feature: create (init/add), validate, KB, skills, deploy (publish), run, and monitor. Run the folder in order — `test` scripts capture `agent_name` and `run_id` into collection/environment variables so the chain flows without manual copy/paste.\n\n**Auth:** collection-level Bearer using `{{bearer_token}}` (set it in the environment — never hardcoded). The token needs `admin` + `read` (and `run` + `kb:write` for the run/KB steps). See `postman/README.md` for how to mint one with `mdk auth create-key`.\n\n**Source of truth:** request bodies and scopes mirror `src/movate/runtime/app.py` + `src/movate/runtime/schemas.py` and the audit in `docs/front-end-api.md`. You can also `Import → Link → {{runtime_url}}/api/v1/openapi.json` for the full typed API.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{bearer_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "agent_name",
+      "value": "faq-bot",
+      "type": "string"
+    },
+    {
+      "key": "run_id",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Movate — Core Flow",
+      "description": "The ordered demo. Run from top to bottom (Postman Runner or one-by-one).",
+      "item": [
+        {
+          "name": "0. Whoami — verify token + scopes",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/auth/me",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "auth", "me"]
+            },
+            "description": "The `mdk auth whoami` equivalent. Returns the calling key's `key_id`, `tenant_id`, `env`, `scopes`, and `expires_at`. Use it to confirm the token is valid and carries `admin` + `read` (the demo also exercises `run` and `kb:write`) before running the rest of the flow. No scope gate — only authentication is required."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const me = pm.response.json();",
+                  "console.log('Authenticated as', me.key_id, 'tenant', me.tenant_id, 'scopes', (me.scopes || []).join(','));",
+                  "pm.test('has scopes array', () => Array.isArray(me.scopes));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1a. Create agent (from wizard JSON) — mdk init",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{agent_name}}\",\n  \"agent_provider\": \"Movate\",\n  \"agent_type\": \"Task Agent\",\n  \"role\": \"Assistant\",\n  \"description\": \"An FAQ assistant. Answers questions concisely with a confidence score.\",\n  \"agent_role\": \"Concise, friendly support agent; cites sources when grounded.\",\n  \"agent_goal\": \"Answer product FAQs accurately and briefly.\",\n  \"agent_prompt\": \"You are an FAQ assistant. Answer the user's question concisely using the provided knowledge base context. If you are unsure, say so.\\n\\nQuestion: {{question}}\",\n  \"reference_output\": \"Our standard plan includes 5 seats and 100GB storage.\",\n  \"mcp_connectors\": [\"web-search\"],\n  \"knowledge_store\": [\"product-docs\"],\n  \"ai_model\": \"openai/gpt-4o-mini-2024-07-18\",\n  \"ai_foundation\": \"Azure\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/from-wizard",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "from-wizard"]
+            },
+            "description": "The `mdk init` (agent-authoring half) equivalent — create an agent in the runtime registry from the Mova iO \"Onboard Agent\" wizard JSON (`WizardAgentSubmission`). This is the simplest live create path: structured fields → canonical `agent.yaml` + `prompt.md`, no file upload.\n\n`mcp_connectors` → the agent's `skills` and `knowledge_store` → the agent's `contexts`, so this single request demonstrates skills + contexts wiring. **Both must already exist on the runtime** or the bundle 422s on `load_agent()`: register the skill first via request `4` (`POST /skills`) and ensure the named context exists (or remove those two arrays for a no-dependency create). Scope: `admin`. Returns `AgentCreatedView` (`name`, `version`, `agent_dir`, ...).\n\nNote on the CLI caveat: `mdk init` on disk *also* scaffolds a local project — that filesystem half is CLI/ops-only. This endpoint is the runtime \"make this agent exist on the server\" half."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created (or 409 if it already exists)', () => [201, 409].includes(pm.response.code));",
+                  "if (pm.response.code === 201) {",
+                  "  const created = pm.response.json();",
+                  "  pm.collectionVariables.set('agent_name', created.name);",
+                  "  pm.environment.set('agent_name', created.name);",
+                  "  console.log('Created agent', created.name, 'version', created.version);",
+                  "} else {",
+                  "  console.log('Agent already exists — reusing agent_name', pm.collectionVariables.get('agent_name'));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1b. Create agent (multipart bundle) — variant",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "bundle",
+                  "type": "file",
+                  "src": [],
+                  "description": "OPTION A — a single .zip of the canonical layout (agent.yaml, prompt.md, schema/, optionally skills/<name>/, contexts/<name>.md, kb/). Mutually exclusive with the individual-file fields below; supply EITHER bundle OR the four files, not both."
+                },
+                {
+                  "key": "agent_yaml",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTION B — agent.yaml (required in individual-files mode)."
+                },
+                {
+                  "key": "prompt",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTION B — prompt.md (required in individual-files mode)."
+                },
+                {
+                  "key": "input_schema",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTION B — schema/input.json (required in individual-files mode)."
+                },
+                {
+                  "key": "output_schema",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTION B — schema/output.json (required in individual-files mode)."
+                },
+                {
+                  "key": "dataset",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTIONAL — evals/dataset.jsonl."
+                },
+                {
+                  "key": "contexts",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTIONAL, repeating — each is a contexts/<name>.md the agent declares in `contexts:`."
+                },
+                {
+                  "key": "kb",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTIONAL, repeating — each is a kb/<name>.json corpus file."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents"]
+            },
+            "description": "The bundle/multipart variant of the same `mdk init` / `mdk deploy --mode agents` create — `POST /api/v1/agents`. Use this when you already have a pre-built canonical bundle (e.g. produced by `mdk init --llm` locally, since there is NO server-side LLM authoring endpoint — see `docs/front-end-api.md`).\n\nTwo mutually-exclusive modes: attach a single `bundle` .zip (Option A, enabled below), OR enable the four individual files `agent_yaml` + `prompt` + `input_schema` + `output_schema` (Option B). A bundle that ships `skills/<name>/` folders persists those skills into the registry first, then the agent — so the full skill + context wiring can ride in one upload. Scope: `admin`. Returns `AgentCreatedView`.\n\nThis request is illustrative — attach your own file(s) before sending. Disabled by default in the auto-run is the individual-file set; pick one mode."
+          }
+        },
+        {
+          "name": "2. Validate agent — mdk validate",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/validate",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "validate"]
+            },
+            "description": "The `mdk validate` equivalent — run the prompt linter + cost forecast against the already-stored agent. No request body. Returns `AgentValidationView` (`passed`, `errors[]`, `warnings[]`, `cost_forecast`). This is the soft \"is it shippable?\" gate; the hard structural validation already ran at create time (a malformed bundle 422s before it ever lands). Scope: `read` (read-only despite being a POST)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const v = pm.response.json();",
+                  "console.log('validate passed?', v.passed, 'errors', (v.errors||[]).length, 'warnings', (v.warnings||[]).length);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3a. KB ingest — mdk kb ingest",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "files",
+                  "type": "file",
+                  "src": [],
+                  "description": "One or more documents to ingest. Repeat the `files` key for multiple uploads. Supported: .md / .markdown / .txt / .pdf / .docx / .html / .htm. Attach a small doc (e.g. a product-FAQ.md) before sending."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "kb"]
+            },
+            "description": "The `mdk kb ingest` equivalent — upload one or more documents into the agent's knowledge base. `multipart/form-data` with a repeating `files` field; each doc is chunked, embedded, and persisted (deduped on content hash). Returns `KbIngestView` (`files[]` with per-file `status`, `total_chunks_saved`). Scope: `kb:write`.\n\nNote: this endpoint takes uploaded files only — there is no inline-text or URL body field. To ingest a URL, fetch it to an .html/.md file first and upload that. Attach your own small doc before sending (this request ships no file)."
+          }
+        },
+        {
+          "name": "3b. KB stats — mdk kb stats",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb/stats",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "kb", "stats"]
+            },
+            "description": "The `mdk kb stats` equivalent — server-side aggregate of the agent's KB. Returns `KbStatsView` (`total_chunks`, `total_chars`, `ocr_chunks`, per-`sources` breakdown, distinct embedding `models`). Confirms the ingest from 3a actually landed. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const s = pm.response.json();",
+                  "console.log('KB chunks', s.total_chunks, 'sources', (s.sources||[]).length);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3c. KB search — mdk kb search",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"question\": \"What does the standard plan include?\",\n  \"k\": 5,\n  \"hybrid\": false\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb/search",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "kb", "search"]
+            },
+            "description": "The `mdk kb search` equivalent — semantic search over the agent's KB (`KbSearchSubmission`: `question`, `k`, `hybrid`). Set `hybrid: true` to fuse vector + BM25 lexical results. Returns `KbSearchView` with scored `results[]`. Shows the retrieval that grounds the run in step 6. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const r = pm.response.json();",
+                  "console.log('KB search hits', r.count);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4. Register skill — mdk skills add",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "skill_yaml",
+                  "type": "file",
+                  "src": [],
+                  "description": "REQUIRED — the skill.yaml spec. Its `name:` field decides the on-disk skill directory and is the name an agent references in `skills: [...]`."
+                },
+                {
+                  "key": "impl",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTIONAL — impl.py, the Python implementation."
+                },
+                {
+                  "key": "corpus",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTIONAL — corpus.json shipped alongside the skill."
+                },
+                {
+                  "key": "readme",
+                  "type": "file",
+                  "src": [],
+                  "disabled": true,
+                  "description": "OPTIONAL — README.md human-facing notes."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/skills",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "skills"]
+            },
+            "description": "The `mdk skills add` (skill-registration) equivalent — create or replace a skill bundle in the runtime's skill registry (PUT semantics: re-uploading the same name overwrites). `multipart/form-data`: `skill_yaml` (required) + optional `impl` / `corpus` / `readme`. Returns `SkillCreatedView`. Scope: `admin`.\n\nRun this BEFORE request 1a if your wizard body references this skill in `mcp_connectors` — an agent declaring `skills: [<name>]` 422s if the skill isn't already registered. Attach your own skill.yaml before sending."
+          }
+        },
+        {
+          "name": "5. Publish agent (deploy) — mdk deploy --mode agents",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"commit_message\": \"Publish {{agent_name}} via Postman demo\",\n  \"author_name\": \"Mova iO\",\n  \"author_email\": \"bot@mova.io\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/publish",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "publish"]
+            },
+            "description": "The agent-level `mdk deploy` (publish/promote) equivalent — push the agent's canonical bundle to the per-tenant GitHub repo as one commit (ADR 007). `AgentPublishSubmission`: all fields optional (`commit_message`, `author_name`, `author_email`). Returns `AgentPublishedView` (commit SHA + URL). Scope: `admin`.\n\nRequires `MDK_GITHUB_ENABLED=1` + GitHub App config on the runtime, else 503 (the route is still advertised). CLI caveat: this is the *agent promotion* sense of deploy — the *infra* sense (build the runtime image, roll Azure Container Apps) stays CLI/ops-only via `mdk deploy --mode runtime`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200, or 503 when GitHub publishing is disabled on the runtime', () => [200, 503].includes(pm.response.code));",
+                  "if (pm.response.code === 200) { console.log('Published:', pm.response.json().commit_url || pm.response.json().sha); }",
+                  "else { console.log('Publish disabled (MDK_GITHUB_ENABLED off) — expected in many demo runtimes.'); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6. Run agent (inline) — mdk run",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"input\": {\n    \"question\": \"What does the standard plan include?\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+              "query": [
+                {
+                  "key": "wait",
+                  "value": "true",
+                  "description": "Inline (synchronous) mode — execute in-process and return the RunView (200). Omit or set false to queue an async job (202 + job_id) and poll GET /api/v1/jobs/{job_id}."
+                }
+              ]
+            },
+            "description": "The `mdk run` equivalent — submit an agent run. `AgentRunSubmission`: `input` (matches the agent's input schema — here `{question}`), optional `mock`, `notify_email`, `thread_id`. With `?wait=true` the runtime executes synchronously and returns a `RunView` with the grounded answer (200). Default (`wait=false`) queues a job and returns 202 + `{job_id}`. Scope: `run`.\n\nThe `test` script captures `run_id` into a collection/environment variable so the monitor steps (7a/7b) can fetch it. Tip: add `\"mock\": true` to the body to run against the deterministic MockProvider (no API key, sub-second) for a guaranteed-fast demo."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 (inline RunView) or 202 (async accepted)', () => [200, 202].includes(pm.response.code));",
+                  "const r = pm.response.json();",
+                  "const rid = r.run_id || r.id || r.job_id;",
+                  "if (rid) {",
+                  "  pm.collectionVariables.set('run_id', rid);",
+                  "  pm.environment.set('run_id', rid);",
+                  "  console.log('Captured run_id', rid);",
+                  "}",
+                  "if (r.output) { console.log('Answer:', JSON.stringify(r.output)); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7a. Monitor — get run — mdk runs get",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/runs/{{run_id}}",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "runs", "{{run_id}}"]
+            },
+            "description": "The `mdk runs get` equivalent — fetch a single run including its `output`, status, timing, and cost. Returns `RunView`. Uses the `{{run_id}}` captured in step 6. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const r = pm.response.json();",
+                  "console.log('Run status', r.status);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7b. Monitor — run trace — mdk runs trace",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/runs/{{run_id}}/trace",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "runs", "{{run_id}}", "trace"]
+            },
+            "description": "The trace-viewer / `mdk runs trace` equivalent — the reconstructed span tree for the run (prompt, model calls, tool/skill invocations, retrieval). Returns `RunTraceView`. This is the observability payoff of the demo. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
