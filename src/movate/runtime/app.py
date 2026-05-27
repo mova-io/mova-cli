@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, File, Header, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -65,6 +65,12 @@ from movate.core.provider_keys import (
     normalize_provider,
 )
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
+from movate.core.reporting import (
+    Report,
+    _filter_evals_by_since,
+    _filter_runs_by_since,
+    build_report,
+)
 from movate.core.triggers import (
     DELIVERY_ID_HEADER,
     DELIVERY_ID_MAX_LEN,
@@ -115,6 +121,7 @@ from movate.runtime.schemas import (
     AgentDetailView,
     AgentHistoryView,
     AgentListView,
+    AgentMetricsView,
     AgentPublishedView,
     AgentPublishSubmission,
     AgentRevertedView,
@@ -192,6 +199,7 @@ from movate.runtime.schemas import (
     ProviderKeySetRequest,
     ProviderKeyView,
     ReadyView,
+    ReportView,
     RunAccepted,
     RunExplainLlmCallView,
     RunExplainView,
@@ -929,6 +937,12 @@ def _batch_max_rows() -> int:
 
 
 _BATCH_MAX_ROWS_DEFAULT = 10_000
+
+# ADR 032 D2: hard cap on rows the aggregate monitor endpoints
+# (``GET /api/v1/report`` + ``/agents/{name}/metrics``) read per call. The
+# rollup is over the most-recent N runs/evals so a tenant with a huge history
+# can't make the read unbounded; mirrors the CLI's ``mdk report`` fetch cap.
+_REPORT_FETCH_CAP = 10_000
 
 # item 37: submission idempotency. The OPTIONAL header an async-submit caller
 # may send so a retry (network blip / timeout) returns the SAME job instead of
@@ -4367,6 +4381,150 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Aggregate monitor feed (ADR 032 D2). Two read-scoped endpoints that
+    # expose the SAME rollup ``mdk report`` computes (``core.reporting``) over
+    # the local store — the in-product "how are my agents doing?" feed the
+    # Mova iO front end renders. Tenant-scoped at the storage read; no remote
+    # calls (same path the CLI uses). The runtime never imports ``cli``; the
+    # shared aggregation lives in ``core`` (``cli ⊥ runtime``).
+    #
+    # Bounded reads: the store fetch is capped (``_REPORT_FETCH_CAP``) so a
+    # tenant with a huge history can't make the endpoint unbounded — the
+    # rollup is over the most recent N runs/evals. The ``window`` param
+    # narrows further (last N days; 0 = all-time).
+    # ------------------------------------------------------------------
+    async def _fetch_report(
+        store: StorageProvider,
+        *,
+        tenant_id: str | None,
+        agent: str | None,
+        window_days: int,
+        top_n: int,
+    ) -> Report:
+        """Fetch (tenant-scoped, bounded) + window + reduce — shared by both
+        endpoints. Empty store → a zeroed :class:`Report` (never a 500)."""
+        runs = await store.list_runs(
+            agent=agent,
+            tenant_id=tenant_id,
+            limit=_REPORT_FETCH_CAP,
+        )
+        evals = await store.list_evals(
+            agent=agent,
+            tenant_id=tenant_id,
+            limit=_REPORT_FETCH_CAP,
+        )
+        runs = _filter_runs_by_since(runs, window_days)
+        evals = _filter_evals_by_since(evals, window_days)
+        return build_report(
+            runs,
+            evals,
+            window_days=window_days,
+            agent_filter=agent,
+            top_n=top_n,
+        )
+
+    @v1.get(
+        "/report",
+        response_model=ReportView,
+        tags=["monitor"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_report(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        window: int = Query(
+            0,
+            ge=0,
+            le=3650,
+            description=(
+                "Only count runs / evals from the last N days. 0 (default) = "
+                "all-time. Mirrors ``mdk report --last N``."
+            ),
+        ),
+        top: int = Query(
+            5,
+            ge=1,
+            le=50,
+            description="How many failing cases to surface in ``top_failing_cases``.",
+        ),
+    ) -> ReportView:
+        """Cross-agent monitor feed (ADR 032 D2).
+
+        The tenant-scoped rollup the Mova iO front end renders as the
+        in-product monitor: pass-rate trends, cost-over-time, latency
+        p50/p95/p99, top failing cases, and a per-agent/workflow rollup over
+        the requested ``window``. Identical aggregation to ``mdk report``.
+
+        Tenant-scoped: only this tenant's runs/evals contribute. An empty
+        store returns a zeroed report (200), never a 500.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        report = await _fetch_report(
+            store,
+            tenant_id=ctx.tenant_id,
+            agent=None,
+            window_days=window,
+            top_n=top,
+        )
+        return ReportView.from_report(report)
+
+    @v1.get(
+        "/agents/{name}/metrics",
+        response_model=AgentMetricsView,
+        tags=["monitor"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_agent_metrics(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        window: int = Query(
+            0,
+            ge=0,
+            le=3650,
+            description=(
+                "Only count this agent's runs / evals from the last N days. 0 (default) = all-time."
+            ),
+        ),
+        top: int = Query(
+            5,
+            ge=1,
+            le=50,
+            description="How many failing cases to surface for this agent.",
+        ),
+    ) -> AgentMetricsView:
+        """Per-agent monitor slice (ADR 032 D2).
+
+        The named agent's (or workflow's) rollup row plus agent-scoped totals
+        and top-failing cases over ``window`` — powers the front-end
+        agent-profile health panel.
+
+        Tenant-scoped. An agent with no runs/evals in the window returns a
+        **zeroed** rollup (200), not a 404 — the monitor is a metrics view, so
+        an empty panel is the correct rendering, and we never leak whether an
+        id exists across tenants.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        report = await _fetch_report(
+            store,
+            tenant_id=ctx.tenant_id,
+            agent=name,
+            window_days=window,
+            top_n=top,
+        )
+        return AgentMetricsView.from_report(name, report)
 
     # ------------------------------------------------------------------
     # Continuous-eval schedules (ADR 016 D2). Additive + default-off.
