@@ -59,6 +59,18 @@ jobs:
       - name: Install mdk
         run: uv sync --frozen
 
+      # Hermetic slice guard (D7a, #132): the whole `mdk init --llm` URL→RAG
+      # chain (F3 scaffold → F5/F6 crawl → F7 auto-ingest → F8 grounded
+      # verify) in one offline pytest — NO keys, NO network. Runs before the
+      # secret-gated lifecycle so a regression in any stage fails fast and
+      # deterministically even when the optional Azure/real-model secrets are
+      # absent. `--group dev` pulls pytest from the frozen lockfile (no new
+      # dep); scoped to the module so collection needs no optional extras.
+      - name: Hermetic --llm URL→RAG slice guard
+        run: >-
+          uv run --frozen --group dev pytest
+          tests/test_init_llm_rag_acceptance.py -m acceptance -v
+
       - name: Run acceptance lifecycle
         env:
           MDK: "uv run mdk"
