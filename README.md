@@ -10,6 +10,16 @@ The CLI is installed as both **`mdk`** (canonical) and **`movate`** (transitiona
 dropped in a future major release). Every example in this README uses `mdk`; substitute
 `movate` if you prefer, both work today.
 
+## What's New
+
+_Auto-maintained daily by the [`daily-changelog`](.github/workflows/daily-changelog.yml) workflow — yesterday's merged PRs, newest first._
+
+### 2026-05-27
+
+**Docs**
+
+- daily "What's New" digest workflow + generator (this section bootstrap) @movate-bot
+
 ## Status
 
 **Current: `0.8.2.71`** (May 2026) — guardrails type-safety, CHANGELOG
