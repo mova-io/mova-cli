@@ -34,6 +34,7 @@ reviewing the prompt.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,8 +137,8 @@ _EXAMPLE_FAQ = """\
     },
     "prompt": "./prompt.md",
     "schema": {
-      "input": "./schema/input.json",
-      "output": "./schema/output.json"
+      "input": "./schema/input.yaml",
+      "output": "./schema/output.yaml"
     },
     "evals": {"dataset": "./evals/dataset.jsonl"},
     "timeouts": {"call_ms": 30000, "total_ms": 60000},
@@ -185,8 +186,8 @@ _EXAMPLE_CLASSIFIER = """\
     },
     "prompt": "./prompt.md",
     "schema": {
-      "input": "./schema/input.json",
-      "output": "./schema/output.json"
+      "input": "./schema/input.yaml",
+      "output": "./schema/output.yaml"
     },
     "evals": {"dataset": "./evals/dataset.jsonl"},
     "timeouts": {"call_ms": 30000, "total_ms": 60000},
@@ -242,8 +243,8 @@ _EXAMPLE_SUMMARIZER = """\
     },
     "prompt": "./prompt.md",
     "schema": {
-      "input": "./schema/input.json",
-      "output": "./schema/output.json"
+      "input": "./schema/input.yaml",
+      "output": "./schema/output.yaml"
     },
     "evals": {"dataset": "./evals/dataset.jsonl"},
     "timeouts": {"call_ms": 30000, "total_ms": 60000},
@@ -302,8 +303,8 @@ _EXAMPLE_EXTRACTION = """\
     },
     "prompt": "./prompt.md",
     "schema": {
-      "input": "./schema/input.json",
-      "output": "./schema/output.json"
+      "input": "./schema/input.yaml",
+      "output": "./schema/output.yaml"
     },
     "evals": {"dataset": "./evals/dataset.jsonl"},
     "timeouts": {"call_ms": 30000, "total_ms": 60000},
@@ -362,8 +363,8 @@ _EXAMPLE_RAG = """\
     },
     "prompt": "./prompt.md",
     "schema": {
-      "input": "./schema/input.json",
-      "output": "./schema/output.json"
+      "input": "./schema/input.yaml",
+      "output": "./schema/output.yaml"
     },
     "evals": {"dataset": "./evals/dataset.jsonl"},
     "timeouts": {"call_ms": 30000, "total_ms": 60000},
@@ -435,7 +436,7 @@ You are scaffolding a movate AI agent from a natural-language description.
 
 Your job is to generate a complete, runnable agent as a single JSON object
 matching the GeneratedAgent schema below. The CLI will write the four files
-(agent.yaml, prompt.md, schema/input.json, schema/output.json) plus an
+(agent.yaml, prompt.md, schema/input.yaml, schema/output.yaml) plus an
 evals/dataset.jsonl to disk and then validate the result by loading it. The
 user description, agent name, and target model are given at the END of this
 prompt.
@@ -461,8 +462,8 @@ HARD CONSTRAINTS — VIOLATIONS WILL FAIL VALIDATION:
    - model.provider: the model id given below  (use that exact provider string)
    - model.params: {{"temperature": 0.0, "max_tokens": <256-2048>}}
    - prompt: "./prompt.md"
-   - schema.input: "./schema/input.json"
-   - schema.output: "./schema/output.json"
+   - schema.input: "./schema/input.yaml"
+   - schema.output: "./schema/output.yaml"
    - evals.dataset: "./evals/dataset.jsonl"
    - description: <one-line summary of what the agent does>
    - owner: ""
@@ -691,19 +692,79 @@ async def generate_agent_from_description(
     return GenerationResult(agent=agent, tokens=response.tokens)
 
 
-def write_agent_files(generated: GeneratedAgent, *, target_dir: Path) -> None:
-    """Materialize a :class:`GeneratedAgent` to disk.
+# ---------------------------------------------------------------------------
+# Canonical scaffold layout (#127, PR1).
+#
+# EVERY scaffolded agent uses ONE layout: schema is written as YAML files
+# (`schema/input.yaml` + `schema/output.yaml`), and `agent.yaml` references
+# them by FILE path. This unifies what `mdk init --llm` emits with the
+# bundled-template layout (`schema/*.yaml` + a `judge.yaml.example`). The
+# loader still accepts inline schema + `schema/*.json` for back-compat — we
+# only standardize what NEW scaffolds emit. See `docs/agent-layout.md`.
+# ---------------------------------------------------------------------------
 
-    Writes the standard movate agent file layout::
+# The path references written into the generated agent.yaml's `schema:`
+# block. The writer FORCES these so the on-disk references always match the
+# on-disk files, regardless of what the LLM / mock payload declared (a real
+# LLM may still echo the exemplar's `./schema/input.json`).
+_SCHEMA_INPUT_REF = "./schema/input.yaml"
+_SCHEMA_OUTPUT_REF = "./schema/output.yaml"
+
+# `evals/judge.yaml.example` — the optional LLM-as-judge config every
+# bundled template ships (rename to `judge.yaml` to enable). Lifted from
+# `src/movate/templates/agent_init/evals/judge.yaml.example` so a `--llm`
+# scaffold looks like a hand-init'd one. Cross-family by default
+# (agent=openai/* → judge=anthropic/*) since the eval engine rejects a
+# same-family judge at parse time.
+_JUDGE_YAML_EXAMPLE = """\
+# Optional LLM-as-judge config. Rename to `judge.yaml` to enable.
+#
+# RULE: judge family MUST differ from agent family (e.g. agent=openai/* →
+# judge cannot be openai/* or azure/*). The eval engine rejects same-family
+# configs at parse time, not at run time, so misconfigs surface immediately.
+#
+# For variance defense, run `mdk eval` with --runs 3 (or 5) when using
+# llm_judge so the per-case score is the mean of N independent judgments.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for semantic
+  equivalence. Penalize hallucinations. A 1.0 = fully correct,
+  0.5 = partially correct, 0.0 = wrong or unsafe.
+
+threshold: 0.7
+"""
+
+
+def write_agent_files(generated: GeneratedAgent, *, target_dir: Path) -> None:
+    """Materialize a :class:`GeneratedAgent` to disk in the canonical layout.
+
+    Writes the ONE canonical movate agent layout (#127)::
 
         <target_dir>/
-          ├── agent.yaml
+          ├── agent.yaml          # schema refs point at ./schema/*.yaml
           ├── prompt.md
           ├── schema/
-          │     ├── input.json
-          │     └── output.json
+          │     ├── input.yaml     # YAML, not JSON
+          │     └── output.yaml
           └── evals/
-                └── dataset.jsonl   (only if sample_evals is non-empty)
+                ├── dataset.jsonl   (only if sample_evals is non-empty)
+                └── judge.yaml.example
+
+    Schema is written as **YAML** (``yaml.safe_dump``) — the loader
+    shape-sniffs a ``$schema``-bearing YAML doc as a verbatim JSON Schema,
+    so the generated 2020-12 schemas load identically to the old ``.json``
+    form. The ``agent.yaml`` ``schema:`` references are FORCED to
+    ``./schema/input.yaml`` / ``./schema/output.yaml`` here so the on-disk
+    references always match the on-disk files — the canonical writer is the
+    single source of truth, regardless of whether the LLM (or a mock
+    payload) declared ``./schema/input.json``.
 
     Creates parent directories as needed; overwrites existing files
     (the caller is responsible for the ``--force`` / pre-existence
@@ -711,21 +772,41 @@ def write_agent_files(generated: GeneratedAgent, *, target_dir: Path) -> None:
     """
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    # Deep-copy so forcing the schema references never mutates the caller's
+    # GeneratedAgent (the CLI re-uses the same object for the dry-run
+    # preview, the validation tempdir, and the committed write).
+    agent_yaml = copy.deepcopy(generated.agent_yaml)
+    schema_block = agent_yaml.get("schema")
+    if isinstance(schema_block, dict):
+        # Force the canonical YAML file references. The LLM/mock may have
+        # emitted `./schema/input.json`; we always write `.yaml` files, so
+        # the references must match.
+        schema_block["input"] = _SCHEMA_INPUT_REF
+        schema_block["output"] = _SCHEMA_OUTPUT_REF
+
     # agent.yaml — block-style YAML for readability, not flow-style.
     # sort_keys=False preserves the order the LLM chose (api_version,
     # kind, name first is the convention every template uses).
     (target_dir / "agent.yaml").write_text(
-        yaml.safe_dump(generated.agent_yaml, sort_keys=False, default_flow_style=False)
+        yaml.safe_dump(agent_yaml, sort_keys=False, default_flow_style=False)
     )
 
     # prompt.md — verbatim. The LLM is responsible for Jinja correctness;
     # load_agent will catch unrenderable templates downstream.
     (target_dir / "prompt.md").write_text(generated.prompt_md)
 
+    # schema/*.yaml — block-style YAML. The 2020-12 schemas carry a
+    # `$schema` key, so the loader uses them verbatim (no shorthand
+    # compilation). sort_keys=False keeps `$schema`/`type`/`required`/
+    # `properties` in a readable top-to-bottom order.
     schema_dir = target_dir / "schema"
     schema_dir.mkdir(exist_ok=True)
-    (schema_dir / "input.json").write_text(json.dumps(generated.input_schema, indent=2) + "\n")
-    (schema_dir / "output.json").write_text(json.dumps(generated.output_schema, indent=2) + "\n")
+    (schema_dir / "input.yaml").write_text(
+        yaml.safe_dump(generated.input_schema, sort_keys=False, default_flow_style=False)
+    )
+    (schema_dir / "output.yaml").write_text(
+        yaml.safe_dump(generated.output_schema, sort_keys=False, default_flow_style=False)
+    )
 
     if generated.sample_evals:
         evals_dir = target_dir / "evals"
@@ -734,3 +815,7 @@ def write_agent_files(generated: GeneratedAgent, *, target_dir: Path) -> None:
         (evals_dir / "dataset.jsonl").write_text(
             "\n".join(json.dumps(e) for e in generated.sample_evals) + "\n"
         )
+        # judge.yaml.example — the optional LLM-as-judge config bundled
+        # templates ship. Written alongside the dataset (an empty-evals
+        # scaffold has nothing to judge, so the example stays out of it).
+        (evals_dir / "judge.yaml.example").write_text(_JUDGE_YAML_EXAMPLE)

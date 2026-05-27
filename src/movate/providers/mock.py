@@ -323,8 +323,8 @@ def _build_rag_scaffold_response(name: str) -> str:
             },
             "prompt": "./prompt.md",
             "schema": {
-                "input": "./schema/input.json",
-                "output": "./schema/output.json",
+                "input": "./schema/input.yaml",
+                "output": "./schema/output.yaml",
             },
             "evals": {"dataset": "./evals/dataset.jsonl"},
             "tags": ["rag", "qa", "grounded"],
@@ -428,8 +428,8 @@ def _agent_yaml_base(name: str, *, description: str, max_tokens: int = 512) -> d
         },
         "prompt": "./prompt.md",
         "schema": {
-            "input": "./schema/input.json",
-            "output": "./schema/output.json",
+            "input": "./schema/input.yaml",
+            "output": "./schema/output.yaml",
         },
         "evals": {"dataset": "./evals/dataset.jsonl"},
     }

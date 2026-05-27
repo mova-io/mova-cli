@@ -67,8 +67,8 @@ def _valid_agent_payload(name: str = "test-agent") -> dict:
             },
             "prompt": "./prompt.md",
             "schema": {
-                "input": "./schema/input.json",
-                "output": "./schema/output.json",
+                "input": "./schema/input.yaml",
+                "output": "./schema/output.yaml",
             },
             "evals": {"dataset": "./evals/dataset.jsonl"},
         },
@@ -206,16 +206,56 @@ class TestGenerateFromDescription:
 
 @pytest.mark.unit
 class TestWriteAgentFiles:
-    def test_writes_standard_layout(self, tmp_path: Path) -> None:
+    def test_writes_canonical_layout(self, tmp_path: Path) -> None:
         agent = GeneratedAgent.model_validate(_valid_agent_payload())
         target = tmp_path / "test-agent"
         write_agent_files(agent, target_dir=target)
-        # Every file from the standard layout exists.
+        # Every file from the canonical layout exists (#127): schema is
+        # YAML, and a judge.yaml.example ships alongside the dataset.
         assert (target / "agent.yaml").is_file()
         assert (target / "prompt.md").is_file()
-        assert (target / "schema" / "input.json").is_file()
-        assert (target / "schema" / "output.json").is_file()
+        assert (target / "schema" / "input.yaml").is_file()
+        assert (target / "schema" / "output.yaml").is_file()
         assert (target / "evals" / "dataset.jsonl").is_file()
+        assert (target / "evals" / "judge.yaml.example").is_file()
+        # The old JSON schema files are NOT emitted.
+        assert not (target / "schema" / "input.json").exists()
+        assert not (target / "schema" / "output.json").exists()
+
+    def test_schema_files_are_yaml_and_agent_yaml_references_them(self, tmp_path: Path) -> None:
+        """The schema files are valid YAML JSON-Schema docs, and agent.yaml's
+        `schema:` block points at the `.yaml` files (the writer FORCES the
+        references so on-disk refs always match on-disk files, even if the
+        payload declared `./schema/input.json`)."""
+        payload = _valid_agent_payload()
+        # Simulate an LLM/exemplar that still emitted the legacy `.json` refs.
+        payload["agent_yaml"]["schema"] = {
+            "input": "./schema/input.json",
+            "output": "./schema/output.json",
+        }
+        agent = GeneratedAgent.model_validate(payload)
+        target = tmp_path / "ref-agent"
+        write_agent_files(agent, target_dir=target)
+
+        spec = yaml.safe_load((target / "agent.yaml").read_text())
+        assert spec["schema"]["input"] == "./schema/input.yaml"
+        assert spec["schema"]["output"] == "./schema/output.yaml"
+        # The schema files parse as YAML and carry the JSON Schema marker.
+        in_schema = yaml.safe_load((target / "schema" / "input.yaml").read_text())
+        out_schema = yaml.safe_load((target / "schema" / "output.yaml").read_text())
+        assert in_schema["type"] == "object"
+        assert "$schema" in out_schema
+
+    def test_judge_example_uses_cross_family_model(self, tmp_path: Path) -> None:
+        """The shipped judge.yaml.example is an llm_judge config with a model
+        in a DIFFERENT family from the default openai agent (the eval engine
+        rejects same-family judges)."""
+        agent = GeneratedAgent.model_validate(_valid_agent_payload())
+        target = tmp_path / "judge-agent"
+        write_agent_files(agent, target_dir=target)
+        judge = yaml.safe_load((target / "evals" / "judge.yaml.example").read_text())
+        assert judge["method"] == "llm_judge"
+        assert not judge["model"]["provider"].startswith(("openai/", "azure/"))
 
     def test_written_agent_loads_cleanly(self, tmp_path: Path) -> None:
         """End-to-end: GeneratedAgent → disk → load_agent → no error.
@@ -232,9 +272,10 @@ class TestWriteAgentFiles:
         agent = GeneratedAgent.model_validate(payload)
         target = tmp_path / "no-evals-agent"
         write_agent_files(agent, target_dir=target)
-        # evals/ directory shouldn't be created when there are no samples.
-        # (load_agent would still tolerate this — evals.dataset path
-        # is declarative, not enforced at load time.)
+        # evals/ directory shouldn't be created when there are no samples —
+        # neither the dataset nor the judge.yaml.example. (load_agent would
+        # still tolerate this — evals.dataset path is declarative, not
+        # enforced at load time.)
         assert not (target / "evals").exists()
 
 
@@ -280,12 +321,23 @@ def test_llm_mock_end_to_end_writes_agent(
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    # Standard layout was materialized.
+    # Canonical layout was materialized (#127): YAML schema + judge example,
+    # and the fuller agent.yaml field set.
     target = tmp_path / "test-agent"
     assert (target / "agent.yaml").is_file()
     assert (target / "prompt.md").is_file()
-    assert (target / "schema" / "input.json").is_file()
-    assert (target / "schema" / "output.json").is_file()
+    assert (target / "schema" / "input.yaml").is_file()
+    assert (target / "schema" / "output.yaml").is_file()
+    assert (target / "evals" / "judge.yaml.example").is_file()
+    assert not (target / "schema" / "input.json").exists()
+    spec = yaml.safe_load((target / "agent.yaml").read_text())
+    assert spec["schema"]["input"] == "./schema/input.yaml"
+    # Fuller agent.yaml: post-processing adds the operational knobs a
+    # hand-init'd agent carries.
+    assert spec["timeouts"] == {"call_ms": 30000, "total_ms": 60000}
+    assert spec["budget"] == {"max_cost_usd_per_run": 0.50}
+    assert "tags" in spec
+    assert spec["model"]["fallback"], "expected a model.fallback default"
     # Success Panel surfaced.
     assert "LLM-scaffolded agent" in result.stdout or "scaffolded" in result.stdout.lower()
 

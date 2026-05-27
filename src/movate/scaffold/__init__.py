@@ -9,8 +9,9 @@ Public surface:
 * :func:`generate_agent_from_description` — single generation attempt
   (caller owns the validation/retry loop).
 * :func:`write_agent_files` — materialize a ``GeneratedAgent`` to disk
-  in the standard movate file layout (``agent.yaml`` + ``prompt.md``
-  + ``schema/{input,output}.json`` + ``evals/dataset.jsonl``).
+  in the canonical movate file layout (``agent.yaml`` + ``prompt.md``
+  + ``schema/{input,output}.yaml`` + ``evals/dataset.jsonl`` +
+  ``evals/judge.yaml.example``). See ``docs/agent-layout.md``.
 * :exc:`LLMScaffoldError` — raised on malformed LLM output or wire
   errors. Callers (``mdk init --llm``) catch this and trigger the
   retry loop.
