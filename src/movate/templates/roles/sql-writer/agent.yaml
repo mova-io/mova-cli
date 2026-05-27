@@ -34,14 +34,8 @@ model:
 prompt: ./prompt.md
 
 schema:
-  input:
-    question: string
-    schema_hint: string?       # optional CREATE TABLE statements or schema summary
-    dialect: postgres|mysql|sqlite|bigquery|snowflake?
-  output:
-    sql: string                # the generated query
-    explanation: string        # plain-English description of what the query does
-    warnings: [string]         # populated when the query has destructive ops or ambiguity
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
 
 evals:
   dataset: ./evals/dataset.jsonl

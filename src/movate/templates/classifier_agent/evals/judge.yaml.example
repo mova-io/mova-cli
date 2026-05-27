@@ -1,0 +1,13 @@
+# Eval config for the classifier template. Rename to ``judge.yaml`` to enable.
+#
+# The classifier returns a single label from a closed set, so exact-match
+# scoring is exactly right — a correct label string-equals the expected label.
+# No LLM judge needed (and no extra API cost). This is the default scoring
+# mode; this file just makes the choice explicit and discoverable.
+#
+# Switch to ``method: llm_judge`` only if you later add a free-text field
+# (e.g. a `reasoning` string) whose wording can't be matched literally.
+
+method: exact
+
+threshold: 1.0

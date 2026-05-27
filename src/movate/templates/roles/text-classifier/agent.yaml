@@ -31,19 +31,9 @@ model:
 
 prompt: ./prompt.md
 
-# Note on the schema: `label` is intentionally a plain `string` (not an
-# enum) because the taxonomy is caller-provided per call. The prompt
-# enforces "label must be from the taxonomy" via strict instructions
-# + the linter catches drift via the eval dataset.
 schema:
-  input:
-    text: string
-    taxonomy: [string]     # caller passes the label set per call (e.g. ["spam", "support", "sales"])
-    multi_label: boolean?  # default false — single-label classification
-  output:
-    label: string          # one of the values in taxonomy
-    confidence: number     # 0.0-1.0
-    reasoning: string      # one-sentence justification
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
 
 evals:
   dataset: ./evals/dataset.jsonl

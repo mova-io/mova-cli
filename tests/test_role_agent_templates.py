@@ -89,21 +89,26 @@ class TestScaffoldAndLoad:
         agent_dir = project / "agents" / template
         assert (agent_dir / "agent.yaml").is_file()
         assert (agent_dir / "prompt.md").is_file()
-        # Post-PR-#95 some templates ship shorthand YAML schemas
-        # (lead-qualifier; more to follow) and others still ship
-        # hand-written JSON Schema (faq, ticket-triager, etc.).
-        # Either form is canonical; check both extensions.
-        input_schema_yaml = agent_dir / "schema" / "input.yaml"
-        input_schema_json = agent_dir / "schema" / "input.json"
-        output_schema_yaml = agent_dir / "schema" / "output.yaml"
-        output_schema_json = agent_dir / "schema" / "output.json"
-        assert input_schema_yaml.is_file() or input_schema_json.is_file(), (
-            f"{template}: missing schema/input.{{yaml,json}}"
+        # Canonical layout (#127): `mdk add` produces schema/*.yaml files
+        # (never .json) plus an evals/judge.yaml.example. The loader still
+        # accepts inline / JSON schema for hand-authored agents, but the
+        # SHIPPED templates standardize on canonical YAML.
+        assert (agent_dir / "schema" / "input.yaml").is_file(), (
+            f"{template}: missing schema/input.yaml"
         )
-        assert output_schema_yaml.is_file() or output_schema_json.is_file(), (
-            f"{template}: missing schema/output.{{yaml,json}}"
+        assert (agent_dir / "schema" / "output.yaml").is_file(), (
+            f"{template}: missing schema/output.yaml"
+        )
+        assert not (agent_dir / "schema" / "input.json").exists(), (
+            f"{template}: stray schema/input.json — should be canonical YAML"
+        )
+        assert not (agent_dir / "schema" / "output.json").exists(), (
+            f"{template}: stray schema/output.json — should be canonical YAML"
         )
         assert (agent_dir / "evals" / "dataset.jsonl").is_file()
+        assert (agent_dir / "evals" / "judge.yaml.example").is_file(), (
+            f"{template}: missing evals/judge.yaml.example"
+        )
 
         # load_agent must succeed end-to-end. This catches:
         # - YAML errors

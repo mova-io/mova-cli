@@ -1,0 +1,23 @@
+# LLM-as-judge config for the calc-agent template. Rename to ``judge.yaml`` to enable.
+#
+# The numeric `result` is deterministic, but the `explanation` is free-text
+# and varies in wording — exact-match would penalize correct answers. This
+# rubric scores numeric correctness AND a faithful explanation.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for an arithmetic agent.
+    1.0 = `result` is numerically correct AND the explanation matches the math
+    0.5 = `result` correct but the explanation is wrong, missing, or misleading
+    0.0 = `result` is numerically wrong
+
+threshold: 0.7

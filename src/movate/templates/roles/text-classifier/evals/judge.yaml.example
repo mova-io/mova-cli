@@ -1,0 +1,31 @@
+# LLM-as-judge config for the text-classifier role. Rename to ``judge.yaml`` to enable.
+#
+# The `label` is a single value from the caller's taxonomy (exact-match-friendly),
+# but `reasoning` is free-text — wording varies every run. This rubric scores
+# the chosen label AND whether the reasoning justifies it.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+#
+# If you only score the label (ignoring reasoning), exact-match scoring on the
+# `label` field works fine too — use ``method: exact`` instead.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual classification against the expected one for a text-classifier.
+    * Label — does `label` match the expected label (and is it from the taxonomy)?
+    * Confidence — is the confidence directionally sensible (high for clear
+      cases, lower for ambiguous ones)?
+    * Reasoning — does the one-sentence reasoning justify the chosen label?
+
+    1.0 = correct label from the taxonomy AND coherent reasoning
+    0.5 = correct label but weak / off reasoning, or off-base confidence
+    0.0 = wrong label, or a label outside the taxonomy
+
+threshold: 0.7

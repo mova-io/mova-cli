@@ -1,0 +1,59 @@
+# ============================================================================
+# MDK Canonical Schema — Support Triage (output)
+# ============================================================================
+# Strict enums on `priority`, `category`, and `assigned_team` so the
+# model literally cannot emit a routing decision outside the allowed set
+# — downstream ITSM can `switch` on these without defensive parsing.
+
+version: 1
+type: object
+
+title: Triage Decision
+
+fields:
+
+  priority:
+    type: enum
+    description: Routing priority.
+    values:
+      - low
+      - medium
+      - high
+      - urgent
+
+  category:
+    type: enum
+    description: Ticket category.
+    values:
+      - technical-issue
+      - billing
+      - account-access
+      - feature-request
+      - complaint
+      - other
+
+  assigned_team:
+    type: enum
+    description: Team the ticket routes to.
+    values:
+      - engineering
+      - billing
+      - support
+      - security
+      - sales
+      - escalation
+
+  escalate:
+    type: boolean
+    description: True if a human lead should be paged immediately.
+
+  summary:
+    type: string
+    description: 1-line summary for the team's queue.
+
+required:
+  - priority
+  - category
+  - assigned_team
+  - escalate
+  - summary

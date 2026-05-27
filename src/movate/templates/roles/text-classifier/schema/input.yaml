@@ -1,0 +1,30 @@
+# ============================================================================
+# MDK Canonical Schema — Text Classifier (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Text Classifier Input
+description: >
+  Text to classify plus the caller-provided taxonomy of allowed labels.
+
+fields:
+
+  text:
+    type: string
+    description: The text to classify.
+
+  taxonomy:
+    type: list[string]
+    description: >
+      The label set the caller passes per call
+      (e.g. ["spam", "support", "sales"]).
+
+  multi_label:
+    type: boolean
+    description: "Default false — single-label classification."
+
+required:
+  - text
+  - taxonomy

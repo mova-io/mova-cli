@@ -1,0 +1,28 @@
+# LLM-as-judge config for the code-reviewer template. Rename to ``judge.yaml`` to enable.
+#
+# Review summaries and findings are free-text — wording varies run to run, so
+# exact-match scoring is wrong. This rubric scores whether the review caught
+# the right issues at the right severity.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual review against the expected review for a code-review agent.
+    * Verdict — does `verdict` match (approve / request_changes / comment)?
+    * Findings — does it surface the same substantive issues at a comparable
+      severity, without inventing false positives?
+    * Summary — does the prose summary convey the same conclusion?
+
+    1.0 = verdict matches AND the key findings + severities line up
+    0.5 = verdict matches but findings are incomplete or over/under-severe
+    0.0 = wrong verdict, missed the blocking issue, or hallucinated findings
+
+threshold: 0.7

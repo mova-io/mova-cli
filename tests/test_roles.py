@@ -25,6 +25,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 
 from movate.core.loader import load_agent
 from movate.templates import (
@@ -69,7 +70,9 @@ def test_roles_and_shapes_share_no_names() -> None:
 @pytest.mark.unit
 @pytest.mark.parametrize("name", ROLE_NAMES)
 def test_role_dir_is_present_and_complete(name: str) -> None:
-    """Every role ships agent.yaml + prompt.md + dataset + ROLE.md."""
+    """Every role ships agent.yaml + prompt.md + dataset + ROLE.md, and
+    conforms to the canonical agent layout (#127): schema/*.yaml files
+    referenced by file path, plus an evals/judge.yaml.example."""
     path = get_template_path(name)
     assert path.is_dir()
     assert (path / "agent.yaml").is_file()
@@ -78,6 +81,15 @@ def test_role_dir_is_present_and_complete(name: str) -> None:
     assert (path / "ROLE.md").is_file(), (
         f"role {name!r} missing ROLE.md — roles ship when-to-use guidance"
     )
+    # Canonical layout: schema lives in schema/*.yaml + a judge.yaml.example.
+    assert (path / "schema" / "input.yaml").is_file(), f"role {name!r} missing schema/input.yaml"
+    assert (path / "schema" / "output.yaml").is_file(), f"role {name!r} missing schema/output.yaml"
+    assert (path / "evals" / "judge.yaml.example").is_file(), (
+        f"role {name!r} missing evals/judge.yaml.example"
+    )
+    spec = yaml.safe_load((path / "agent.yaml").read_text())
+    assert spec.get("schema", {}).get("input") == "./schema/input.yaml"
+    assert spec.get("schema", {}).get("output") == "./schema/output.yaml"
 
 
 # ---------------------------------------------------------------------------

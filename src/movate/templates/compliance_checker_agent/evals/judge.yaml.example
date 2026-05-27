@@ -1,0 +1,28 @@
+# LLM-as-judge config for the compliance-checker template. Rename to ``judge.yaml`` to enable.
+#
+# Violation explanations and suggested rewordings are free-text — exact-match
+# would penalize correct findings phrased differently. This rubric scores
+# whether the right rules were flagged at the right severity.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual result against the expected result for a compliance-checker.
+    * Verdict — does `compliant` match?
+    * Violations — does it flag the same rules (by `rule_id`) at a comparable
+      severity, citing the offending excerpt, without inventing violations?
+    * Rewordings — are the suggested rewordings plausible and compliant?
+
+    1.0 = same compliant verdict AND the same rules flagged at right severity
+    0.5 = right verdict but a violation missed / over-flagged / mis-severed
+    0.0 = wrong verdict, or fabricated / missed a clear violation
+
+threshold: 0.7

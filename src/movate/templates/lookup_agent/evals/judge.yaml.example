@@ -1,0 +1,28 @@
+# LLM-as-judge config for the lookup-agent template. Rename to ``judge.yaml`` to enable.
+#
+# The `answer` is free-text prose built from the looked-up record, so its
+# wording varies run to run — exact-match scoring is wrong. This rubric scores
+# whether the answer reflects the correct record and the `user_found` flag.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for a lookup agent.
+    * Correctness — does the answer convey the same fact from the looked-up
+      record (e.g. the right email / name)?
+    * Found flag — does `user_found` agree with the expected value?
+    * No fabrication — the answer must not invent details not in the record.
+
+    1.0 = same fact conveyed AND `user_found` agrees
+    0.5 = right record but partial / verbose answer, or minor flag mismatch
+    0.0 = wrong fact, hallucinated detail, or wrong `user_found`
+
+threshold: 0.7

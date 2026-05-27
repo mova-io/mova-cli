@@ -1,0 +1,29 @@
+# LLM-as-judge config for the sql-writer role. Rename to ``judge.yaml`` to enable.
+#
+# Two equivalent queries can differ textually (aliases, formatting, equivalent
+# predicates) and the `explanation` is free-text — so exact-match scoring is
+# wrong. This rubric scores semantic query correctness and safety.
+#
+# Cross-family: the agent runs on openai by default, so the judge must NOT
+# also run on openai (the eval engine refuses to let a provider judge itself).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual output against the expected one for a text-to-SQL agent.
+    * Query — is the SQL semantically equivalent to the expected query for the
+      given dialect (returns the same rows), even if phrased differently?
+    * Safety — does it default to read-only and flag destructive ops in
+      `warnings` when present?
+    * Explanation — does the plain-English explanation match the query?
+
+    1.0 = semantically equivalent query, safe, faithful explanation
+    0.5 = nearly correct (minor predicate / column difference) but right intent
+    0.0 = wrong results or an unsafe query without a warning
+
+threshold: 0.7

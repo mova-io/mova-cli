@@ -1,0 +1,38 @@
+# ============================================================================
+# MDK Canonical Schema — Support Triage (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Support Triage Input
+description: >
+  An incoming support ticket plus optional channel and customer-tier
+  signals the triage decision can use.
+
+fields:
+
+  ticket_body:
+    type: string
+    description: The incoming ticket text to triage.
+
+  channel:
+    type: enum
+    description: Where the ticket came in from.
+    values:
+      - web
+      - email
+      - phone
+      - slack
+      - teams
+
+  customer_tier:
+    type: enum
+    description: The customer's plan tier.
+    values:
+      - free
+      - standard
+      - enterprise
+
+required:
+  - ticket_body

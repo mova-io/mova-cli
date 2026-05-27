@@ -1,0 +1,38 @@
+# ============================================================================
+# MDK Canonical Schema — Document Summarizer (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Document Summarizer Input
+description: >
+  A long-form document (transcript, contract, email thread) to
+  summarize, plus optional controls over length, style, and audience.
+
+fields:
+
+  text:
+    type: string
+    description: The document to summarize.
+    example: >
+      Alice: Let's lock in scope for the next sprint...
+
+  summary_style:
+    type: enum
+    description: "Shape of the summary. Default: detailed."
+    values:
+      - brief
+      - detailed
+      - action_items_only
+
+  max_words:
+    type: integer
+    description: "Cap on summary length. Default: 200."
+
+  audience:
+    type: string
+    description: Who's reading (e.g. "executive", "engineer").
+
+required:
+  - text

@@ -33,16 +33,8 @@ model:
 prompt: ./prompt.md
 
 schema:
-  input:
-    incoming_message: string
-    intent: acknowledge|answer|escalate|decline|propose-solution|gather-info|apologize
-    tone: formal|friendly|apologetic|firm|casual?    # default: friendly
-    context: string?                                  # optional background the agent should know
-    sign_off_as: string?                              # optional signature name (e.g. "Sarah from Support")
-  output:
-    draft_subject: string                # one-line subject; for non-email replies this is the topic header
-    draft_body: string                   # the full draft, ready to send (no placeholders)
-    suggested_next_actions: [string]     # things the responder should do alongside sending the reply
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
 
 evals:
   dataset: ./evals/dataset.jsonl
