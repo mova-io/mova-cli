@@ -212,6 +212,7 @@ from movate.cli.jobs import jobs_app  # noqa: E402
 from movate.cli.kb_cmd import kb_app  # noqa: E402
 from movate.cli.keys_cmd import keys_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
+from movate.cli.mcp_cmd import mcp_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.models_cmd import models_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
@@ -428,6 +429,11 @@ app.add_typer(contexts_app, name="contexts", rich_help_panel=PANEL_DEVELOP)
 # conversational copilot + MCP server (later PRs) build on. Develop panel since
 # it's how you *evolve* an agent after init (plan → apply → verify → undo).
 app.add_typer(authoring_app, name="authoring", rich_help_panel=PANEL_DEVELOP)
+# `mcp serve` (ADR 025 PR4) exposes the SAME authoring catalog over MCP — a
+# plan_*/apply_*/validate/run tool per action — so an IDE/agent drives the
+# plan→apply→verify spine the way `authoring` does. Sits next to `authoring`
+# since it's the third surface over the one catalog (D5).
+app.add_typer(mcp_app, name="mcp", rich_help_panel=PANEL_DEVELOP)
 app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
 app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
