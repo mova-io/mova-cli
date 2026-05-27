@@ -40,6 +40,7 @@ project (project + working agent + dataset).
 
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 from dataclasses import dataclass
@@ -3101,23 +3102,194 @@ def _render_agent_next_steps(layout: _AgentLayout, *, name: str) -> None:
     )
 
 
+def _provision_template_skills_and_contexts(
+    *,
+    agent_dir: Path,
+    template: str,
+    project_root: Path | None,
+) -> None:
+    """Auto-scaffold a template's declared skills + contexts for the
+    ``mdk init -t`` path (parity with ``mdk add``).
+
+    :func:`_init_agent` already relocates skills BUNDLED inside the template
+    dir (e.g. calc-agent's ``calculator``) to ``<project>/skills/``. But
+    several templates DECLARE a skill they don't bundle (rag-qa →
+    ``kb-vector-lookup`` / ``web-search``; ticket-triager → ``kb-lookup``;
+    code-reviewer → ``lint-runner``; …). Those are auto-scaffolded only by
+    the ``mdk add`` code path (``_add_one``), so a plain ``mdk init -t rag-qa``
+    used to produce an agent that fails to LOAD ("references skill X but no
+    such skill is registered"). This brings ``mdk init -t`` to parity by
+    reusing the exact same ``mdk add`` helpers.
+
+    Best-effort + project-scoped: skills/contexts live at the PROJECT level,
+    so this no-ops for ``--bare`` (``project_root is None``) — a standalone
+    single-dir agent has no project ``skills/`` to populate. The underlying
+    helpers each swallow + warn on their own failures, so this never breaks
+    the scaffold.
+    """
+    if project_root is None:
+        # --bare standalone agent: no project skills/contexts dir to populate.
+        return
+
+    from movate.cli.add_cmd import (  # noqa: PLC0415
+        _maybe_copy_template_contexts,
+        _maybe_scaffold_declared_contexts,
+        _maybe_scaffold_declared_skills,
+    )
+
+    _maybe_scaffold_declared_skills(agent_dir=agent_dir, project_root=project_root)
+
+    try:
+        template_src_dir: Path | None = get_template_path(template)
+    except ValueError:
+        template_src_dir = None
+    if template_src_dir is not None:
+        _maybe_copy_template_contexts(template_dir=template_src_dir, project_root=project_root)
+    _maybe_scaffold_declared_contexts(agent_dir=agent_dir, project_root=project_root)
+
+
+def _maybe_eval_baseline(agent_dir: Path, *, mock: bool, skip: bool) -> None:
+    """Post-scaffold ``--mock`` eval BASELINE for the just-scaffolded agent (F4', #138).
+
+    Upgrades the F4 single-run smoke into an eval baseline: after a template
+    or ``--llm`` scaffold lands on disk, run the new agent's eval dataset
+    (``evals/dataset.jsonl``) under the deterministic mock provider and print
+    a one-line baseline pass-rate (e.g. ``baseline: 5/5 cases pass under
+    --mock``). This gives the operator a known-good starting point AND catches
+    a template whose evals don't even run.
+
+    Reuses the SHIPPED eval engine + mock path — it mirrors how
+    ``mdk eval --mock`` wires things up (:func:`build_local_runtime` →
+    :func:`_configure_mock_for_bundle` → :class:`EvalEngine`), so the baseline
+    scores the exact same way the operator's next ``mdk eval --mock`` will.
+    No new eval engine, no real model calls, no network.
+
+    Gating mirrors the F8 grounded verify's never-break-init contract:
+
+    * ``skip`` (``--no-baseline``) → operator opted out; stay quiet.
+    * NOT ``mock`` → the baseline is a hermetic ``--mock`` step only. A
+      real-provider scaffold would spend tokens on every ``init`` — skip with
+      a one-line hint pointing at the manual command.
+    * The agent can't load / has no usable dataset / the run errors → degrade
+      to a WARNING, never a non-zero exit on a successfully-scaffolded agent.
+
+    A successful baseline with a 0% pass-rate is still surfaced (not a
+    failure) — a freshly-scaffolded template SHOULD pass under the
+    dataset-aware mock, so a low rate is a useful signal, not a crash.
+    """
+    from movate.cli import _console  # noqa: PLC0415
+
+    if skip:
+        _console.hint("[dim]--no-baseline: skipped the post-scaffold eval baseline.[/dim]")
+        return
+
+    if not mock:
+        # The baseline is a zero-cost hermetic step. Outside --mock it would
+        # call the real provider for every case on every init — too costly to
+        # do silently. Point at the manual command instead.
+        _console.hint(
+            "[dim]eval baseline skipped (runs only under [bold]--mock[/bold]); "
+            "measure anytime with [bold]mdk eval --mock[/bold].[/dim]"
+        )
+        return
+
+    import asyncio  # noqa: PLC0415
+
+    try:
+        asyncio.run(_run_eval_baseline(agent_dir))
+    except Exception as exc:
+        # Defensive belt — ANY failure (load error, executor crash, storage
+        # hiccup, missing/empty dataset) must NOT turn a successful scaffold
+        # into a non-zero exit. Degrade to a warning + manual hint.
+        err_console.print(
+            f"[yellow]⚠[/yellow] eval baseline skipped: {exc} "
+            "[dim](scaffold is intact; run [bold]mdk eval --mock[/bold] to measure)[/dim]"
+        )
+
+
+async def _run_eval_baseline(agent_dir: Path) -> None:
+    """Run the scaffolded agent's eval dataset under ``--mock`` + report the
+    baseline pass-rate. The mechanics mirror ``movate.cli.eval._run_eval``'s
+    ``--mock`` branch exactly (engine, dataset-aware mock, runtime teardown).
+
+    Raises on any failure so :func:`_maybe_eval_baseline`'s catch-all degrades
+    it to a warning — the scaffold is already on disk and useful regardless.
+    """
+    from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.cli.run import _configure_mock_for_bundle  # noqa: PLC0415
+    from movate.core.eval import EvalEngine  # noqa: PLC0415
+    from movate.core.loader import load_agent  # noqa: PLC0415
+
+    bundle = load_agent(agent_dir)
+
+    rt = await build_local_runtime(mock=True)
+    # Dataset-aware mock (same as `mdk eval --mock`): make the MockProvider
+    # cycle through the dataset's ``expected`` outputs so each case is scored
+    # against the exactly-right answer instead of a single canned response.
+    _configure_mock_for_bundle(rt.provider, bundle)
+    try:
+        engine = EvalEngine(executor=rt.executor, provider=rt.provider)
+        summary = await engine.run(bundle)
+        # Persist the EvalRecord so the operator's first `mdk eval --compare`
+        # / drift check has a baseline to diff against — same as `mdk eval`.
+        with contextlib.suppress(Exception):
+            await rt.storage.save_eval(summary.to_record())
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+    passing = sum(1 for c in summary.cases if c.passed)
+    total = summary.sample_count
+    rate = summary.pass_rate
+    if total == 0:
+        # A scaffolded agent with an empty dataset — surface as a soft note,
+        # not a crash. (Shipped templates always have cases; this guards a
+        # hand-edited / future template.)
+        err_console.print(
+            "[yellow]⚠[/yellow] eval baseline: dataset has no cases — nothing to measure."
+        )
+        return
+
+    marker = "[green]✓[/green]" if passing == total else "[yellow]•[/yellow]"
+    console.print(
+        f"{marker} baseline: [bold]{passing}/{total}[/bold] cases pass under "
+        f"[bold]--mock[/bold] [dim](pass_rate={rate:.0%})[/dim]"
+    )
+    # Greppable summary line — mirrors mdk_init_summary / mdk_eval_summary so
+    # CI tooling can assert the baseline ran with one consistent prefix.
+    console.print(
+        f"[dim]mdk_baseline_summary: "
+        f"agent={summary.agent} "
+        f"cases={total} "
+        f"passing={passing} "
+        f"pass_rate={rate:.3f} "
+        f"mock=true[/dim]"
+    )
+
+
 def _finish_agent_init(
     layout: _AgentLayout,
     *,
     name: str,
     open_editor: bool,
     mock: bool,
+    no_baseline: bool = False,
 ) -> None:
     """Common post-scaffold tail for the agent-intent ``mdk init`` paths.
 
-    Renders the D4 exact-command next-steps panel, then (best-effort,
-    TTY-gated, --no-open / --mock aware via :func:`_launch_editor`) opens
-    the right surface: the PROJECT root when one was created / joined, or
-    the standalone agent dir for ``--bare``. The editor launch is deferred
-    to here (not inside the project bootstrap) so the operator opens a
-    workspace that already contains the freshly-scaffolded agent.
+    Renders the D4 exact-command next-steps panel, runs the post-scaffold
+    ``--mock`` eval baseline (F4', #138 — best-effort, gated by
+    ``--no-baseline`` + ``--mock``), then (best-effort, TTY-gated, --no-open /
+    --mock aware via :func:`_launch_editor`) opens the right surface: the
+    PROJECT root when one was created / joined, or the standalone agent dir
+    for ``--bare``. The editor launch is deferred to here (not inside the
+    project bootstrap) so the operator opens a workspace that already
+    contains the freshly-scaffolded agent.
     """
     _render_agent_next_steps(layout, name=name)
+    # Post-scaffold eval baseline (F4'). Runs against the on-disk agent in its
+    # resolved layout (project or --bare). Best-effort: never changes the
+    # exit code of a successfully-scaffolded agent.
+    _maybe_eval_baseline(layout.agent_dir, mock=mock, skip=no_baseline)
     open_path = layout.project_root if layout.project_root is not None else layout.agent_dir
     # Only auto-launch on a freshly-created project or a bare standalone
     # agent; adding to an EXISTING project shouldn't re-open the editor
@@ -3266,6 +3438,22 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
             "or an empty KB); under [bold]--mock[/bold] it runs a structural smoke "
             "only (the agent executes against the mock provider, no real grounding "
             "is asserted). Independent of [bold]--no-ingest[/bold]."
+        ),
+    ),
+    no_baseline: bool = typer.Option(
+        False,
+        "--no-baseline",
+        help=(
+            "Skip the post-scaffold eval baseline (F4'). By default, after a "
+            "template or [bold]--llm[/bold] scaffold AND when run under "
+            "[bold]--mock[/bold], [bold]mdk init[/bold] runs the new agent's eval "
+            "dataset through the deterministic mock provider and prints a one-line "
+            "baseline pass-rate (e.g. [dim]baseline: 5/5 cases pass under "
+            "--mock[/dim]) — a known-good starting point that also catches a "
+            "template whose evals don't run. Best-effort + never changes the exit "
+            "code on a successfully-scaffolded agent. It runs only under "
+            "[bold]--mock[/bold] (a hermetic, zero-cost step); without "
+            "[bold]--mock[/bold] measure anytime with [bold]mdk eval --mock[/bold]."
         ),
     ),
     open_editor: bool = typer.Option(
@@ -3506,7 +3694,13 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
             no_verify=no_verify,
         )
         if layout is not None:
-            _finish_agent_init(layout, name=name, open_editor=open_editor, mock=mock)
+            _finish_agent_init(
+                layout,
+                name=name,
+                open_editor=open_editor,
+                mock=mock,
+                no_baseline=no_baseline,
+            )
         return
 
     # No --llm: original template-copy path. --dry-run is meaningless
@@ -3528,8 +3722,25 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
         quiet=True,
     )
     if layout is not None:
+        # ADR 026 D1 + F4': a template that declares skills/contexts must be
+        # RUNNABLE after `mdk init -t`, not just after `mdk add`. `_init_agent`
+        # only relocates skills BUNDLED in the template dir — declared-but-
+        # unbundled skills (e.g. rag-qa's kb-vector-lookup) and declared
+        # contexts are scaffolded the same way `mdk add` does, so the agent
+        # loads (and the post-scaffold eval baseline below can run).
+        _provision_template_skills_and_contexts(
+            agent_dir=layout.agent_dir,
+            template=effective_template,
+            project_root=layout.project_root,
+        )
         console.print(
             f"[green]✓[/green] scaffolded [bold]{effective_template}[/bold] agent "
             f"at [bold]{layout.agent_dir}[/bold]"
         )
-        _finish_agent_init(layout, name=name, open_editor=open_editor, mock=mock)
+        _finish_agent_init(
+            layout,
+            name=name,
+            open_editor=open_editor,
+            mock=mock,
+            no_baseline=no_baseline,
+        )
