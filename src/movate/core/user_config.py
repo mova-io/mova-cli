@@ -181,6 +181,27 @@ class ScaffoldUserConfig(BaseModel):
     )
 
 
+class CopilotUserConfig(BaseModel):
+    """User-level defaults for the authoring copilot/autopilot (D7e, #136).
+
+    Lowest persistent layer of the copilot-budget precedence — settable via
+    ``mdk config set copilot.budget_usd <amount>``. A per-invocation
+    ``--budget`` flag (on ``mdk dev``) overrides this. ``extra="allow"`` leaves
+    room for future copilot knobs without a breaking schema bump.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    budget_usd: float | None = Field(
+        default=None,
+        description=(
+            "Cap on cumulative LLM spend within a single `mdk dev` / autopilot "
+            "session. When set, the copilot warns as spend nears the cap and "
+            "refuses the next LLM call once it is exceeded. None (default) = no cap."
+        ),
+    )
+
+
 class UserConfig(BaseModel):
     """The contents of ``~/.movate/config.yaml``."""
 
@@ -198,6 +219,13 @@ class UserConfig(BaseModel):
         description=(
             "User-level defaults for `mdk init --llm` scaffolding (ADR 026 D6). "
             "Set via `mdk config set scaffold.model <model>`."
+        ),
+    )
+    copilot: CopilotUserConfig = Field(
+        default_factory=CopilotUserConfig,
+        description=(
+            "User-level defaults for the authoring copilot/autopilot (D7e). "
+            "Set via `mdk config set copilot.budget_usd <amount>`."
         ),
     )
 
@@ -247,6 +275,10 @@ def save_user_config(cfg: UserConfig) -> Path:
     # deploy-only case. A populated scaffold (model set) still round-trips.
     if not data.get("scaffold"):
         data.pop("scaffold", None)
+    # Likewise the opt-in copilot block (D7e) — only persist it once a knob
+    # (e.g. budget_usd) is set, so a default config stays byte-clean.
+    if not data.get("copilot"):
+        data.pop("copilot", None)
     path.write_text(yaml.safe_dump(data, sort_keys=True))
     return path
 
@@ -287,6 +319,7 @@ def resolve_bearer_token(target: TargetConfig) -> str:
 
 
 __all__ = [
+    "CopilotUserConfig",
     "ScaffoldUserConfig",
     "TargetConfig",
     "UserConfig",

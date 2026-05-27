@@ -57,7 +57,7 @@ from movate.cli.watch import _compute_watched_paths, _snapshot_mtimes, dispatch_
 from movate.core.loader import AgentLoadError, load_agent
 
 if TYPE_CHECKING:
-    from movate.authoring import AuthoringDriver, EvalSnapshot
+    from movate.authoring import AuthoringDriver, EvalSnapshot, SessionCostTracker
     from movate.authoring.models import ActionPlan
     from movate.authoring.planner import Planner, ProposedAction
     from movate.core.executor import Executor
@@ -105,6 +105,15 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         "--target",
         help="Azure deploy target (from ~/.movate/config.yaml). Used by the deploy action.",
     ),
+    budget: float | None = typer.Option(
+        None,
+        "--budget",
+        help=(
+            "Cap on cumulative LLM spend (USD) for this session's copilot/autopilot "
+            "calls. Warns near the cap, refuses the next call once exceeded. "
+            "Overrides `copilot.budget_usd` in ~/.movate/config.yaml."
+        ),
+    ),
     poll_interval: float = typer.Option(
         0.5,
         "--poll-interval",
@@ -138,6 +147,13 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
     if test_input is None:
         test_input = _prompt_for_input(agent_dir)
 
+    # D7e (#136): one cost tracker for the whole session. Resolved budget cap
+    # comes from --budget then ~/.movate/config.yaml; with neither, no cap (the
+    # tracker still accumulates so 'session cost' can be shown). The planner the
+    # copilot/autopilot build is wired to this tracker so spend accumulates
+    # across every 'a'/'m' turn.
+    tracker = _build_cost_tracker(budget)
+
     _print_intro(agent_dir)
 
     # D7c (#134): proactively close the "RAG agent, empty KB" footgun. If the
@@ -165,9 +181,11 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         if action == "input":
             test_input = _prompt_for_input(agent_dir)
         elif action == "ask":
-            _copilot_action(agent_dir, mock=mock)
+            _copilot_action(agent_dir, mock=mock, tracker=tracker)
         elif action == "improve":
-            _improve_action(agent_dir, mock=mock)
+            _improve_action(agent_dir, mock=mock, tracker=tracker)
+        elif action == "audit":
+            _audit_action(agent_dir, tracker=tracker)
         elif action == "context":
             _add_context_action(agent_dir)
         elif action == "edit":
@@ -413,12 +431,13 @@ def _actions_menu() -> str:
     stdout.print(
         "  [bold cyan]k[/bold cyan] ingest knowledge base "
         "[bold cyan]x[/bold cyan] test deployed agent   "
-        "[bold cyan]q[/bold cyan] quit"
+        "[bold cyan]v[/bold cyan] view audit log + cost"
     )
+    stdout.print("  [bold cyan]q[/bold cyan] quit")
     try:
         choice = Prompt.ask(
             "[bold]Pick[/bold]",
-            choices=["a", "m", "r", "i", "c", "e", "g", "d", "k", "x", "o", "q"],
+            choices=["a", "m", "r", "i", "c", "e", "g", "d", "k", "x", "v", "o", "q"],
             default="r",
             show_choices=False,
         )
@@ -435,6 +454,7 @@ def _actions_menu() -> str:
         "d": "deploy",
         "k": "ingest_kb",
         "x": "test_deployed",
+        "v": "audit",
         "o": "edit",
         "q": "quit",
     }[choice]
@@ -493,15 +513,46 @@ def _project_root_for_agent(agent_dir: Path) -> Path:
     return walk_up_for_project_root() or agent_dir.parent
 
 
-def _build_planner(agent_dir: Path, project_root: Path, *, mock: bool) -> Planner:
+def _build_cost_tracker(budget_flag: float | None) -> SessionCostTracker:
+    """Resolve the session budget cap + build the shared cost tracker (D7e).
+
+    Precedence (mirrors the rest of mdk's layered config): the ``--budget`` flag
+    wins, else ``copilot.budget_usd`` from ``~/.movate/config.yaml``, else no cap.
+    A malformed user config degrades to no-cap (a warning), never crashes dev.
+    """
+    from movate.authoring import CostBudget, SessionCostTracker  # noqa: PLC0415
+
+    cap = budget_flag
+    if cap is None:
+        try:
+            from movate.core.user_config import load_user_config  # noqa: PLC0415
+
+            cap = load_user_config().copilot.budget_usd
+        except Exception as exc:
+            _console.warn(f"couldn't read copilot budget from config: {exc}")
+            cap = None
+    if cap is not None:
+        err.print(f"[dim]copilot LLM budget: ${cap:.4f} for this session[/dim]")
+    return SessionCostTracker(budget=CostBudget(cap_usd=cap))
+
+
+def _build_planner(
+    agent_dir: Path,
+    project_root: Path,
+    *,
+    mock: bool,
+    tracker: SessionCostTracker | None = None,
+) -> Planner:
     """Construct the NL→catalog planner backing the copilot (ADR 025 D6).
 
     Under ``--mock`` (or any non-keyed/offline run) this returns the
     deterministic :class:`MockPlanner` so the copilot works with no API keys —
-    the same hermetic path the tests drive. Otherwise it wraps a real
+    the same hermetic path the tests drive (and the mock path is free, so it
+    never touches the budget). Otherwise it wraps a real
     :class:`BaseLLMProvider` (the existing model seam) in an
-    :class:`LLMPlanner`. No new dependency: the provider is the one ``mdk
-    init --llm`` already uses.
+    :class:`LLMPlanner`, passing the session ``tracker`` so each proposal call's
+    cost accumulates and the budget gate fires before the cap is exceeded (D7e).
+    No new dependency: the provider is the one ``mdk init --llm`` already uses.
     """
     from movate.authoring.planner import LLMPlanner, MockPlanner  # noqa: PLC0415
 
@@ -510,10 +561,17 @@ def _build_planner(agent_dir: Path, project_root: Path, *, mock: bool) -> Planne
     from movate.cli.init import _DEFAULT_LLM_MODEL  # noqa: PLC0415
     from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
 
-    return LLMPlanner(LiteLLMProvider(), project=project_root, model=_DEFAULT_LLM_MODEL)
+    return LLMPlanner(
+        LiteLLMProvider(),
+        project=project_root,
+        model=_DEFAULT_LLM_MODEL,
+        tracker=tracker,
+    )
 
 
-def _copilot_action(agent_dir: Path, *, mock: bool) -> None:
+def _copilot_action(
+    agent_dir: Path, *, mock: bool, tracker: SessionCostTracker | None = None
+) -> None:
     """Ask the copilot: NL request → catalog action(s) → preview → confirm → apply.
 
     The native conversational surface (ADR 025 S1, F9). Maps the operator's
@@ -523,8 +581,13 @@ def _copilot_action(agent_dir: Path, *, mock: bool) -> None:
     never edits files; the driver does, behind the catalog's D8 boundaries and
     the D2 confirmation gates. An ambiguous request yields a single clarifying
     question and mutates nothing (D6).
+
+    Cost budget (D7e): the planner is wired to the session ``tracker``; a call
+    that would exceed the cap raises :class:`BudgetExceededError` BEFORE the
+    model call, so this surfaces a clear stop message and mutates nothing.
     """
     from movate.authoring import AuthoringContext, AuthoringDriver  # noqa: PLC0415
+    from movate.authoring.budget import BudgetExceededError  # noqa: PLC0415
     from movate.authoring.planner import PlannerError  # noqa: PLC0415
 
     try:
@@ -535,13 +598,18 @@ def _copilot_action(agent_dir: Path, *, mock: bool) -> None:
         return
 
     project_root = _project_root_for_agent(agent_dir)
-    planner = _build_planner(agent_dir, project_root, mock=mock)
+    planner = _build_planner(agent_dir, project_root, mock=mock, tracker=tracker)
 
     try:
         outcome = planner.plan(request, agent=agent_dir.name)
+    except BudgetExceededError as exc:
+        _console.warn(str(exc))
+        return
     except PlannerError as exc:
         _console.warn(f"copilot couldn't plan that: {exc}")
         return
+
+    _maybe_warn_budget(tracker)
 
     # Ambiguous request → ask ONE clarifying question, mutate nothing (D6).
     if outcome.is_clarification:
@@ -628,6 +696,59 @@ def _drive_proposed_action(driver: AuthoringDriver, proposed: ProposedAction) ->
         for path in result.changed_paths:
             err.print(f"[dim]  • {path}[/dim]")
     return True
+
+
+def _maybe_warn_budget(tracker: SessionCostTracker | None) -> None:
+    """Print a one-shot approaching-budget warning when spend nears the cap (D7e).
+
+    No-op when there's no tracker or no cap. Fires at most once per session (the
+    tracker tracks whether it has already warned).
+    """
+    if tracker is None or not tracker.approaching_cap():
+        return
+    remaining = tracker.remaining_usd()
+    err.print(
+        f"[yellow]![/yellow] [dim]copilot budget: spent ${tracker.total_usd:.4f}"
+        + (f", ~${remaining:.4f} left before the cap" if remaining is not None else "")
+        + "[/dim]"
+    )
+
+
+def _audit_action(agent_dir: Path, *, tracker: SessionCostTracker | None = None) -> None:
+    """View the append-only authoring audit log + this session's LLM cost (D7e).
+
+    Reads the per-project audit log via the driver (graceful on a corrupt /
+    missing log) and prints what the copilot has done — action, outcome, cost —
+    plus the live session spend from the tracker. Pure read; mutates nothing.
+    """
+    from movate.authoring import AuthoringContext, AuthoringDriver  # noqa: PLC0415
+
+    project_root = _project_root_for_agent(agent_dir)
+    driver = AuthoringDriver(AuthoringContext(project=project_root))
+    records = driver.audit_records()
+
+    if not records:
+        err.print("[dim]no authoring audit records yet for this project.[/dim]")
+    else:
+        stdout.print(f"\n[bold]Authoring audit log[/bold] ({len(records)} record(s)):")
+        recorded_cost = 0.0
+        for i, r in enumerate(records):
+            recorded_cost += r.cost_usd
+            cost = f" [dim](${r.cost_usd:.4f})[/dim]" if r.cost_usd else ""
+            stdout.print(
+                f"  [dim]{i}[/dim] [cyan]{r.action}[/cyan] "
+                f"[dim]→[/dim] {r.outcome.value}{cost} — {r.summary}"
+            )
+        err.print(f"[dim]total recorded action cost ~${recorded_cost:.4f}[/dim]")
+
+    if tracker is not None:
+        cap = tracker.budget.cap_usd
+        cap_str = f" of a ${cap:.4f} cap" if cap is not None else " (no cap set)"
+        err.print(
+            f"[dim]this session: {tracker.calls} LLM call(s), "
+            f"${tracker.total_usd:.4f} spent{cap_str}.[/dim]"
+        )
+    err.print(f"[dim]replay the recorded sequence with: {mdk_bin_name()} authoring replay[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +871,9 @@ async def _build_eval_runtime(
     return rt.executor, rt.provider, rt.storage
 
 
-def _improve_action(agent_dir: Path, *, mock: bool) -> None:
+def _improve_action(
+    agent_dir: Path, *, mock: bool, tracker: SessionCostTracker | None = None
+) -> None:
     """The "improve my agent" autopilot (ADR 025 D7).
 
     Closes the harvest→improve loop: run the agent's evals, read the failing
@@ -763,6 +886,11 @@ def _improve_action(agent_dir: Path, *, mock: bool) -> None:
     Reuses the eval path (:class:`_CliEvalRunner`), the planner, and the catalog
     driver — no new execution/eval engine. Bounded: a per-pass action cap +
     iteration cap (no infinite loop). Under ``--mock`` everything is hermetic.
+
+    Cost budget (D7e): the planner is wired to the session ``tracker``; the
+    autopilot stops cleanly (``budget_exceeded``) the moment a proposal call
+    would exceed the cap — the gate fires before the call, so nothing is left
+    half-applied.
     """
     from movate.authoring import AuthoringContext, AuthoringDriver, Autopilot  # noqa: PLC0415
 
@@ -775,7 +903,7 @@ def _improve_action(agent_dir: Path, *, mock: bool) -> None:
     )
 
     eval_runner = _CliEvalRunner(project_root, mock=mock)
-    planner = _build_planner(agent_dir, project_root, mock=mock)
+    planner = _build_planner(agent_dir, project_root, mock=mock, tracker=tracker)
     driver = AuthoringDriver(AuthoringContext(project=project_root))
     autopilot = Autopilot(eval_runner=eval_runner, planner=planner, driver=driver)
 
@@ -797,6 +925,13 @@ def _improve_action(agent_dir: Path, *, mock: bool) -> None:
             return False
 
     result = autopilot.run(agent_name, confirm=_confirm)
+
+    _maybe_warn_budget(tracker)
+    if result.budget_exceeded:
+        _console.warn(
+            "stopped: the session LLM budget was reached before the next proposal. "
+            "Applied fixes are kept (and reversible via 'mdk authoring undo')."
+        )
 
     if result.initial.total_cases == 0:
         _console.warn(

@@ -209,7 +209,8 @@ def use_target(
 # allow-list (not reflection) so `mdk config set` can't poke arbitrary
 # internal fields (targets, OIDC, etc.) — those have dedicated commands.
 # ADR 026 D6: scaffold.model is the user-level scaffold-model default.
-_SETTABLE_KEYS: tuple[str, ...] = ("scaffold.model",)
+# D7e (#136): copilot.budget_usd caps per-session copilot/autopilot LLM spend.
+_SETTABLE_KEYS: tuple[str, ...] = ("scaffold.model", "copilot.budget_usd")
 
 
 @config_app.command("set")
@@ -228,13 +229,18 @@ def set_key(
 
     [bold]Supported keys:[/bold]
 
-      [bold]scaffold.model[/bold]  — default LLM that powers ``mdk init --llm``
-                       (e.g. [dim]anthropic/claude-haiku-4-5-20251001[/dim]).
-                       Distinct from the generated agent's runtime model.
+      [bold]scaffold.model[/bold]      — default LLM that powers ``mdk init --llm``
+                           (e.g. [dim]anthropic/claude-haiku-4-5-20251001[/dim]).
+                           Distinct from the generated agent's runtime model.
+      [bold]copilot.budget_usd[/bold]  — cap on LLM spend per ``mdk dev`` / autopilot
+                           session (e.g. [dim]0.50[/dim]). The copilot warns near it
+                           and refuses the next call once exceeded. ``--budget``
+                           on ``mdk dev`` overrides this.
 
     [bold]Example:[/bold]
 
       [dim]$ mdk config set scaffold.model anthropic/claude-haiku-4-5-20251001[/dim]
+      [dim]$ mdk config set copilot.budget_usd 0.50[/dim]
     """
     if key not in _SETTABLE_KEYS:
         error(f"unknown config key {key!r}. Settable keys: {', '.join(_SETTABLE_KEYS)}.")
@@ -242,10 +248,22 @@ def set_key(
 
     cfg = load_user_config()
     section, field = key.split(".", 1)
-    # Only `scaffold.*` is in the allow-list today; the structure below
-    # generalizes to future sections without re-plumbing the command.
+    # Only `scaffold.*` / `copilot.*` are in the allow-list today; the structure
+    # below generalizes to future sections without re-plumbing the command.
     if section == "scaffold":
         setattr(cfg.scaffold, field, value)
+    elif section == "copilot":
+        # copilot.budget_usd is numeric — parse + validate so a bad value fails
+        # loudly at set time rather than silently at session time.
+        try:
+            budget = float(value)
+        except ValueError:
+            error(f"copilot.budget_usd must be a number, got {value!r}.")
+            raise typer.Exit(code=2) from None
+        if budget < 0:
+            error("copilot.budget_usd must be >= 0.")
+            raise typer.Exit(code=2)
+        setattr(cfg.copilot, field, budget)
     path = save_user_config(cfg)
     success(f"set [bold]{key}[/bold] → {value}")
     hint(f"[dim]config: {path}[/dim]")

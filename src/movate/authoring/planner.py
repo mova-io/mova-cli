@@ -42,7 +42,9 @@ from movate.authoring._yaml_edit import load_agent_yaml
 from movate.authoring.catalog import action_names, describe_catalog
 
 if TYPE_CHECKING:
+    from movate.authoring.budget import SessionCostTracker
     from movate.providers.base import BaseLLMProvider
+    from movate.providers.pricing import PricingTable
 
 
 class PlannerError(Exception):
@@ -283,12 +285,31 @@ class LLMPlanner:
     same one ``mdk init --llm`` uses). The system prompt is generated from the
     catalog + grounded in the project state; the model returns the structured
     plan parsed by :func:`parse_planner_response`.
+
+    Cost budgeting (D7e, #136): pass an optional :class:`SessionCostTracker`.
+    Before each model call the planner asks the tracker to gate the budget
+    (:meth:`SessionCostTracker.check_before_call`) — raising
+    :class:`~movate.authoring.budget.BudgetExceededError` *before* the call when
+    the cap is spent, so a session stops at a call boundary with no half-work.
+    After a successful call it derives the call's cost from the response's token
+    usage against the canonical pricing table (ADR 024) and records it. With no
+    tracker the path is byte-for-byte the prior behavior.
     """
 
-    def __init__(self, provider: BaseLLMProvider, *, project: Path, model: str) -> None:
+    def __init__(
+        self,
+        provider: BaseLLMProvider,
+        *,
+        project: Path,
+        model: str,
+        tracker: SessionCostTracker | None = None,
+        pricing: PricingTable | None = None,
+    ) -> None:
         self._provider = provider
         self._project = project.resolve()
         self._model = model
+        self._tracker = tracker
+        self._pricing = pricing
 
     def plan(self, request: str, *, agent: str) -> PlannerOutcome:
         # Lazy imports keep the module importable (and the mock path hermetic)
@@ -296,6 +317,11 @@ class LLMPlanner:
         import asyncio  # noqa: PLC0415
 
         from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
+
+        # Budget gate (D7e): refuse the call BEFORE it happens once the cap is
+        # spent. This raises so no propose/apply work begins past the cap.
+        if self._tracker is not None:
+            self._tracker.check_before_call()
 
         state = project_state_summary(self._project, agent=agent)
         messages = [
@@ -315,7 +341,32 @@ class LLMPlanner:
             response = asyncio.run(self._provider.complete(req))
         except Exception as exc:  # provider wire / auth / timeout
             raise PlannerError(f"planner provider call failed: {exc}") from exc
+
+        # Record the call's cost against the session budget (ADR 024 pricing).
+        if self._tracker is not None:
+            self._tracker.record(self._call_cost(response.tokens))
         return parse_planner_response(response.text)
+
+    def _call_cost(self, tokens: object) -> float:
+        """Derive this call's cost from token usage via the pricing table.
+
+        Reuses the canonical packaged pricing table — never the provider's own
+        cost field. A missing table / unknown model degrades to 0.0 (the
+        :func:`cost_of_tokens` helper handles the lookup miss) so an unpriced
+        model is simply not counted against the budget rather than crashing.
+        """
+        from movate.authoring.budget import cost_of_tokens  # noqa: PLC0415
+        from movate.core.models import TokenUsage  # noqa: PLC0415
+
+        if not isinstance(tokens, TokenUsage):
+            return 0.0
+        pricing = self._pricing
+        if pricing is None:
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+            pricing = load_pricing()
+            self._pricing = pricing
+        return cost_of_tokens(pricing, provider=self._model, tokens=tokens)
 
 
 # ---------------------------------------------------------------------------
