@@ -59,6 +59,43 @@ except ImportError:  # pragma: no cover - covered by the no-otel no-op tests
     pass
 
 
+# ---------------------------------------------------------------------------
+# Metric-name source of truth.
+#
+# The OTel instrument names live here as constants (not inline string literals
+# in ``init_metrics``) so there is ONE place a name is written. Anything that
+# must reference a metric by name off-process — the in-repo Grafana / Prometheus
+# / Azure dashboards (ADR 031 D2, ``dashboards/``) and their drift test — imports
+# these constants instead of hard-coding the strings, so a rename here is caught
+# (the dashboards test cross-checks every referenced metric against this set).
+#
+# Names are the dot-form OTel instrument names. Prometheus scrapes them with
+# dots → underscores (``mdk.jobs.completed`` → ``mdk_jobs_completed``) and the
+# unit suffix the OTLP→Prometheus convention appends (``_total`` for monotonic
+# counters, ``_milliseconds`` for the ms histogram); Azure Monitor's
+# ``azuremonitor`` exporter preserves the dot-names verbatim in ``AppMetrics``.
+# The dashboards encode those per-backend transforms; this set is the canonical
+# instrument-name vocabulary they all derive from.
+METRIC_JOBS_COMPLETED = "mdk.jobs.completed"
+METRIC_JOB_DURATION_MS = "mdk.job.duration_ms"
+METRIC_JOBS_IN_FLIGHT = "mdk.jobs.in_flight"
+METRIC_RUN_TOKENS = "mdk.run.tokens"
+METRIC_RUN_COST_USD = "mdk.run.cost_usd"
+
+#: Every OTel instrument name this module emits. The single source of truth the
+#: dashboards-as-code drift guard cross-checks against (a dashboard may only
+#: reference a metric that appears here).
+METRIC_NAMES: frozenset[str] = frozenset(
+    {
+        METRIC_JOBS_COMPLETED,
+        METRIC_JOB_DURATION_MS,
+        METRIC_JOBS_IN_FLIGHT,
+        METRIC_RUN_TOKENS,
+        METRIC_RUN_COST_USD,
+    }
+)
+
+
 class _State:
     """Mutable module state holder.
 
@@ -173,27 +210,27 @@ def init_metrics(*, reader: Any | None = None) -> None:
     # cardinality). Dead-letter rate is ``mdk.jobs.completed`` filtered to
     # ``status=dead_letter`` — no separate instrument needed.
     _state.jobs_completed = meter.create_counter(
-        "mdk.jobs.completed",
+        METRIC_JOBS_COMPLETED,
         unit="1",
         description="Jobs reaching a terminal status (success/error/safety_blocked/dead_letter).",
     )
     _state.job_duration_ms = meter.create_histogram(
-        "mdk.job.duration_ms",
+        METRIC_JOB_DURATION_MS,
         unit="ms",
         description="Wall-clock duration of a job from claim to terminal status.",
     )
     _state.jobs_in_flight = meter.create_up_down_counter(
-        "mdk.jobs.in_flight",
+        METRIC_JOBS_IN_FLIGHT,
         unit="1",
         description="Jobs currently being dispatched by a worker (claimed, not yet terminal).",
     )
     _state.run_tokens = meter.create_counter(
-        "mdk.run.tokens",
+        METRIC_RUN_TOKENS,
         unit="1",
         description="Total LLM tokens consumed by executed runs.",
     )
     _state.run_cost_usd = meter.create_counter(
-        "mdk.run.cost_usd",
+        METRIC_RUN_COST_USD,
         unit="usd",
         description="Total LLM cost (USD) of executed runs.",
     )
@@ -331,6 +368,12 @@ def dec_in_flight(*, tenant_id: str) -> None:
 
 
 __all__ = [
+    "METRIC_JOBS_COMPLETED",
+    "METRIC_JOBS_IN_FLIGHT",
+    "METRIC_JOB_DURATION_MS",
+    "METRIC_NAMES",
+    "METRIC_RUN_COST_USD",
+    "METRIC_RUN_TOKENS",
     "dec_in_flight",
     "inc_in_flight",
     "init_metrics",

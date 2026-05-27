@@ -1,0 +1,122 @@
+# Prometheus recording + alerting rules for mdk (movate-cli) golden signals.
+#
+# ADR 031 D2 — dashboards as code. These rules run over the OTel metrics the mdk
+# runtime/worker emit (src/movate/tracing/metrics.py), scraped via the
+# OTLP -> Prometheus naming convention:
+#   mdk.jobs.completed   (counter)        -> mdk_jobs_completed_total
+#   mdk.job.duration_ms  (histogram, ms)  -> mdk_job_duration_ms_milliseconds_bucket / _sum / _count
+#   mdk.jobs.in_flight   (up-down counter) -> mdk_jobs_in_flight
+#   mdk.run.tokens       (counter)        -> mdk_run_tokens_total
+#   mdk.run.cost_usd     (counter, usd)   -> mdk_run_cost_usd_total
+#
+# Attributes carried as Prometheus labels: kind, status (on jobs.completed /
+# job.duration_ms), tenant (on jobs.completed / jobs.in_flight / run.*).
+#
+# Thresholds mirror the Azure Monitor SLO alerts (item 27,
+# infra/azure/modules/monitor-alerts.bicep) so Grafana/Prometheus and Azure-native
+# deployments page on the same conditions:
+#   - dead-letter spike      (any dead_letter over the window)
+#   - high error rate         (>10% non-success)
+#   - high latency p95        (>30s)
+#   - throughput stall        (no successful jobs over the window)
+# See dashboards/README.md for import + the exact metric/env wiring.
+
+groups:
+  - name: mdk-golden-signals.recording
+    interval: 30s
+    rules:
+      # Pre-computed latency percentiles over the duration histogram so panels
+      # and alerts share one definition and stay cheap to evaluate.
+      - record: mdk:job_duration_ms:p50
+        expr: histogram_quantile(0.50, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[5m])))
+      - record: mdk:job_duration_ms:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[5m])))
+      - record: mdk:job_duration_ms:p99
+        expr: histogram_quantile(0.99, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[5m])))
+
+      # Job completion throughput (jobs/sec), total and split by status.
+      - record: mdk:jobs_completed:rate5m
+        expr: sum(rate(mdk_jobs_completed_total[5m]))
+      - record: mdk:jobs_completed:rate5m_by_status
+        expr: sum by (status) (rate(mdk_jobs_completed_total[5m]))
+
+      # Error rate = non-success terminal jobs / all terminal jobs.
+      - record: mdk:jobs_error_ratio:rate5m
+        expr: |
+          sum(rate(mdk_jobs_completed_total{status!="success"}[5m]))
+          /
+          clamp_min(sum(rate(mdk_jobs_completed_total[5m])), 1e-9)
+
+      # LLM spend rate (USD/sec) and token rate.
+      - record: mdk:run_cost_usd:rate5m
+        expr: sum(rate(mdk_run_cost_usd_total[5m]))
+      - record: mdk:run_tokens:rate5m
+        expr: sum(rate(mdk_run_tokens_total[5m]))
+
+  - name: mdk-golden-signals.alerts
+    rules:
+      # (1) Dead-letter spike — any job reaching status=dead_letter over 15m.
+      # Mirrors the Azure deadLetterRule (deadLetterThreshold default 1).
+      - alert: MdkDeadLetterSpike
+        expr: sum(increase(mdk_jobs_completed_total{status="dead_letter"}[15m])) > 1
+        for: 0m
+        labels:
+          severity: critical
+          service: mdk
+        annotations:
+          summary: "mdk dead-letter spike"
+          description: >-
+            More than 1 job reached status=dead_letter over the last 15m
+            (mdk.jobs.completed). A dead-letter means a job exhausted retries;
+            investigate the worker/provider failures.
+
+      # (2) High error rate — >10% of terminal jobs are non-success over 15m,
+      # gated on a minimum volume so a single failure in a quiet window doesn't
+      # page. Mirrors the Azure errorRateRule (errorRateThreshold default 10%).
+      - alert: MdkHighErrorRate
+        expr: |
+          (
+            sum(rate(mdk_jobs_completed_total{status!="success"}[15m]))
+            /
+            clamp_min(sum(rate(mdk_jobs_completed_total[15m])), 1e-9)
+          ) > 0.10
+          and
+          sum(rate(mdk_jobs_completed_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: mdk
+        annotations:
+          summary: "mdk high job error rate (>10%)"
+          description: >-
+            Non-success terminal jobs exceeded 10% of all terminal jobs over the
+            last 15m (mdk.jobs.completed, status != success).
+
+      # (3) High latency p95 — job p95 duration over 30s. Mirrors the Azure
+      # latencyRule (latencyP95ThresholdMs default 30000).
+      - alert: MdkHighLatencyP95
+        expr: mdk:job_duration_ms:p95 > 30000
+        for: 5m
+        labels:
+          severity: warning
+          service: mdk
+        annotations:
+          summary: "mdk high job latency p95 (>30s)"
+          description: >-
+            Job duration p95 exceeded 30000ms over the last 5m
+            (mdk.job.duration_ms).
+
+      # (4) Throughput stall — no successful jobs completed over 15m while the
+      # series exists. The Prometheus analogue of the Azure availability /
+      # no-traffic rule (minSuccessfulRequests default 0).
+      - alert: MdkThroughputStall
+        expr: sum(increase(mdk_jobs_completed_total{status="success"}[15m])) == 0
+        for: 0m
+        labels:
+          severity: critical
+          service: mdk
+        annotations:
+          summary: "mdk throughput stall (no successful jobs)"
+          description: >-
+            No jobs reached status=success over the last 15m
+            (mdk.jobs.completed). Possible worker outage or full pipeline stall.

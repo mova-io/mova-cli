@@ -55,6 +55,7 @@ from movate.tracing.log_correlation import (
     install_log_correlation,
 )
 from movate.tracing.metrics import (
+    METRIC_NAMES,
     dec_in_flight,
     inc_in_flight,
     init_metrics,
@@ -76,6 +77,7 @@ from movate.tracing.stdout import StdoutTracer
 _warned: set[str] = set()
 
 __all__ = [
+    "METRIC_NAMES",
     "CompositeTracer",
     "SilentTracer",
     "SpanCtx",
