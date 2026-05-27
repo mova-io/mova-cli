@@ -1,10 +1,14 @@
 """``movate watch <agent>`` — TDD-style hot-reload for the dev inner loop.
 
 Watches an agent directory's key files (``agent.yaml``, the prompt,
-both schemas, the eval dataset, the judge config) and re-runs
-``movate validate`` whenever any of them changes. The point: tight
-feedback while iterating on a prompt — save the file, see lint +
-forecast results in <1s.
+both schemas, the eval dataset, the judge config, and project- and
+agent-level ``contexts/*.md``) and, on every change, either:
+
+* re-runs ``movate validate`` (the default — lint + forecast in <1s), or
+* with ``--run`` (ADR 027), **re-executes** the agent against a test input
+  and prints the new output plus a diff vs. the previous run — the
+  live-reload test loop. ``mdk dev`` drives this same loop (:func:`run_loop`)
+  as one phase, so the loop has a single home.
 
 Implementation
 --------------
@@ -16,12 +20,21 @@ keystrokes, has no platform-specific quirks (macOS FSEvents vs
 inotify), and pulls zero extra deps.
 
 The watcher itself is split from the dispatcher so tests can drive
-``dispatch_once`` deterministically without spinning up a real loop.
+``dispatch_once`` / ``dispatch_run_once`` deterministically without
+spinning up a real loop.
+
+Concurrency (ADR 027 D4): the live-reload loop is a **single foreground
+loop** — no background thread. It polls mtimes *between* interactive
+prompts and runs each dispatch with ``asyncio.run`` (one event loop per
+dispatch, fully torn down before the next), which avoids event-loop
+reentrancy and terminal-input races. See :func:`run_loop`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import difflib
+import json
 import sys
 import time
 from collections.abc import Iterable
@@ -31,6 +44,8 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
+from rich.prompt import Prompt
 
 from movate.cli._completion import complete_agent_path
 from movate.cli._console import hint, warn
@@ -45,6 +60,30 @@ def watch(
         ...,
         help="Path to an agent directory.",
         shell_complete=complete_agent_path,
+    ),
+    run: bool = typer.Option(
+        False,
+        "--run/--no-run",
+        "--test/--no-test",
+        help=(
+            "Re-execute the agent on every save (output + diff vs. the previous run) "
+            "instead of only re-validating. Resolves a test input from --input, then "
+            "the first evals/dataset.jsonl row, then prompts you once."
+        ),
+    ),
+    input_flag: str | None = typer.Option(
+        None,
+        "--input",
+        "-i",
+        help=(
+            "Test input for --run (plain string or JSON). Defaults to the first row of "
+            "evals/dataset.jsonl, else prompts once. Ignored without --run."
+        ),
+    ),
+    mock: bool = typer.Option(
+        False,
+        "--mock",
+        help="Use the deterministic MockProvider for --run (no API keys needed).",
     ),
     poll_interval: float = typer.Option(
         0.5,
@@ -62,10 +101,21 @@ def watch(
 ) -> None:
     """Re-run ``movate validate`` whenever the agent's files change.
 
+    With ``--run`` it instead re-executes the agent against a test input
+    on every save and prints the new output plus a diff vs. the previous
+    run — the live-reload test loop (ADR 027). The same loop drives
+    ``mdk dev``.
+
     [bold]Examples:[/bold]
 
       [dim]# Watch an agent — re-runs validate on every save[/dim]
       $ movate watch ./agents/faq-agent
+
+      [dim]# Live-reload test loop: re-run the agent + diff on every save[/dim]
+      $ movate watch ./agents/faq-agent --run --mock
+
+      [dim]# Drive the loop with a specific input[/dim]
+      $ movate watch ./agents/faq-agent --run -i '{"text": "hello"}'
 
       [dim]# Slow shared filesystem? Raise the poll interval.[/dim]
       $ movate watch ./agents/faq-agent --poll-interval 2
@@ -76,6 +126,10 @@ def watch(
     Exit with Ctrl-C. Each re-run prints with a timestamp so you can
     tell at a glance which save triggered which result.
     """
+    if run:
+        _watch_run(path, input_flag, mock=mock, poll_interval=poll_interval)
+        return
+
     try:
         # First run on entry — gives an initial state + exposes any
         # broken files BEFORE the operator starts editing. Failures
@@ -118,6 +172,60 @@ def watch(
                 dispatch_once(path, strict=strict)
     except KeyboardInterrupt:
         err.print("\n[dim]watcher stopped[/dim]")
+
+
+def _watch_run(path: Path, input_flag: str | None, *, mock: bool, poll_interval: float) -> None:
+    """``mdk watch --run`` — the live-reload test loop entry point.
+
+    Resolves a test input (D3 precedence), then drives the shared
+    :func:`run_loop`. Non-TTY degrades to a documentation-only print —
+    the loop needs a tty both to prompt for a missing input and because
+    it's a human inner-loop, so on a pipe/CI we print the one-shot
+    command instead of blocking (mirrors ``mdk dev``'s non-TTY gate).
+    """
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive:
+        _print_run_noninteractive_guide(path, input_flag, mock=mock)
+        return
+
+    test_input = _resolve_test_input(input_flag, path)
+    if test_input is None:
+        test_input = _prompt_for_input(path)
+    if test_input is None:
+        warn("no test input — nothing to run")
+        return
+
+    err.print(
+        f"[bold]movate watch --run[/bold] {path}\n"
+        f"[dim]  re-runs on every save; poll every {poll_interval}s; Ctrl-C to exit[/dim]"
+    )
+    try:
+        run_loop(path, test_input, mock=mock, poll_interval=poll_interval)
+    except KeyboardInterrupt:
+        err.print("\n[dim]watcher stopped[/dim]")
+
+
+def _print_run_noninteractive_guide(path: Path, input_flag: str | None, *, mock: bool) -> None:
+    """Non-TTY ``--run``: print the one-shot run command instead of looping.
+
+    A live reload loop is a human inner-loop tool; on a pipe/CI there's no
+    editor making saves and no tty to prompt on, so we degrade to the
+    equivalent single ``mdk run`` invocation (mirrors ``_next_steps`` /
+    ``mdk dev``'s non-TTY gate) so scripts never hang waiting for input.
+    """
+    from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+    argv = [mdk_bin_name(), "run", str(path)]
+    if mock:
+        argv.append("--mock")
+    if input_flag:
+        argv += ["-i", input_flag]
+    else:
+        argv += ["-i", "<input>"]
+    err.print(
+        "[bold]movate watch --run[/bold] (non-interactive) — re-run on save needs a TTY.\n"
+        f"[dim]  run it once instead:[/dim] {' '.join(argv)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,4 +397,149 @@ def dispatch_run_once(agent_dir: Path, test_input: str, *, mock: bool) -> tuple[
     return 0, output
 
 
-__all__ = ["dispatch_once", "dispatch_run_once", "watch"]
+# ---------------------------------------------------------------------------
+# Shared live-reload loop (ADR 027) — one home for ``mdk watch --run`` + ``mdk dev``
+# ---------------------------------------------------------------------------
+
+
+def run_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: float) -> None:
+    """Re-run the agent on every change to its files until ``KeyboardInterrupt``.
+
+    The single home for the live-reload test loop (ADR 027 D1): polls
+    ``mtime``s with the same architecture as :func:`watch`, but dispatches a
+    *run* (:func:`dispatch_run_once`) instead of a validate, then prints a
+    diff vs. the previous run (:func:`_print_output_diff`). ``mdk dev`` drives
+    this as a phase; ``mdk watch --run`` drives it directly.
+
+    D4 concurrency model — the one real risk — is enforced here: this is a
+    **single foreground loop**. Each dispatch runs via ``asyncio.run`` (inside
+    :func:`dispatch_run_once`), which builds *and fully tears down* its own
+    event loop before returning, so successive dispatches never reuse a loop
+    (no "Event loop is closed" / reentrancy). There is **no background thread**:
+    the mtime poll, the per-dispatch ``asyncio.run``, and (in ``mdk dev``) the
+    interactive prompt all run on this one thread, never concurrently — so
+    there's no terminal-input race. ``KeyboardInterrupt`` propagates so the
+    caller can stop the loop (``mdk dev`` opens its actions menu; ``mdk watch``
+    exits).
+    """
+    try:
+        paths = _compute_watched_paths(agent_dir).paths
+    except AgentLoadError as exc:
+        warn(f"couldn't read agent: {exc}")
+        paths = ()
+
+    err.print(
+        "[dim]  edit prompt.md, agent.yaml, a schema, or a context — re-runs on save."
+        " Ctrl-C to stop.[/dim]"
+    )
+    _, previous = dispatch_run_once(agent_dir, test_input, mock=mock)
+
+    snapshot = _snapshot_mtimes(paths)
+    while True:
+        time.sleep(poll_interval)
+        with contextlib.suppress(AgentLoadError):
+            paths = _compute_watched_paths(agent_dir).paths
+        new_snapshot = _snapshot_mtimes(paths)
+        if new_snapshot != snapshot:
+            time.sleep(0.2)  # debounce write-then-rename saves.
+            with contextlib.suppress(AgentLoadError):
+                paths = _compute_watched_paths(agent_dir).paths
+            snapshot = _snapshot_mtimes(paths)
+            _, current = dispatch_run_once(agent_dir, test_input, mock=mock)
+            _print_output_diff(previous, current)
+            # Keep the last GOOD output as the baseline so a failed run
+            # (current is None) doesn't reset the diff reference.
+            if current is not None:
+                previous = current
+
+
+def _print_output_diff(previous: str | None, current: str | None) -> None:
+    """Show whether the output changed since the last run, and if so, how.
+
+    Answers "did my edit change anything?" at a glance: a one-line marker
+    when unchanged, a colorized unified diff when it changed. Skipped when
+    there's no baseline yet or the current run failed.
+    """
+    if previous is None or current is None:
+        return
+    if previous == current:
+        err.print("[dim]· output unchanged since last run[/dim]")
+        return
+    err.print("[yellow]✎ output changed:[/yellow]")
+    diff = difflib.unified_diff(
+        previous.splitlines(),
+        current.splitlines(),
+        fromfile="previous",
+        tofile="current",
+        lineterm="",
+    )
+    for line in diff:
+        # escape() keeps brackets / markup in the agent's own output from
+        # being interpreted as Rich tags; style is applied out-of-band.
+        text = escape(line)
+        if line.startswith("+") and not line.startswith("+++"):
+            err.print(text, style="green")
+        elif line.startswith("-") and not line.startswith("---"):
+            err.print(text, style="red")
+        elif line.startswith("@@"):
+            err.print(text, style="cyan")
+        else:
+            err.print(text, style="dim")
+
+
+def _resolve_test_input(input_flag: str | None, agent_dir: Path) -> str | None:
+    """Pick the input the live loop runs on (ADR 027 D3 precedence).
+
+    Explicit ``--input`` wins; else the first row of ``evals/dataset.jsonl``
+    (the same dataset row :func:`movate.cli.run._suggest_dataset_example`
+    surfaces); else ``None`` so the caller prompts once and remembers it for
+    the session. Best-effort on the dataset path — a broken / missing dataset
+    just falls through to the prompt.
+    """
+    if input_flag:
+        return input_flag
+    try:
+        bundle = load_agent(agent_dir)
+        dataset = bundle.spec.evals.dataset
+        if not dataset:
+            return None
+        ds_path = (bundle.agent_dir / dataset).resolve()
+        if ds_path.is_file():
+            text = ds_path.read_text().strip()
+            if text:
+                row = json.loads(text.splitlines()[0])
+                if isinstance(row, dict) and "input" in row:
+                    return json.dumps(row["input"])
+    except (AgentLoadError, OSError, json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    return None
+
+
+def _prompt_for_input(agent_dir: Path) -> str | None:
+    """Ask the operator for a test input (plain string or JSON).
+
+    Surfaces the input schema's required fields as a hint when available.
+    Returns ``None`` on an empty answer or Ctrl-C / EOF so the caller can
+    bail without a value.
+    """
+    with contextlib.suppress(AgentLoadError):
+        bundle = load_agent(agent_dir)
+        required = bundle.input_schema.get("required", [])
+        if required:
+            err.print(f"[dim]input schema requires: {required}[/dim]")
+    try:
+        value = Prompt.ask("[bold]Test input[/bold] (plain string or JSON)").strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return value or None
+
+
+__all__ = [
+    "_print_output_diff",
+    "_prompt_for_input",
+    "_resolve_test_input",
+    "dispatch_once",
+    "dispatch_run_once",
+    "run_loop",
+    "watch",
+]
