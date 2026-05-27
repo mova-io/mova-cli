@@ -410,6 +410,13 @@ class MockPlanner:
 
     def _default_rules(self) -> list[_Rule]:
         return [
+            # "improve my agent" autopilot (D7) — the failure-grounded request
+            # built by movate.authoring.autopilot.build_improve_request. Checked
+            # FIRST so its distinctive phrasing wins over the generic
+            # "instruction" keyword in the request body. Proposes a single
+            # additive+reversible+free fix (a missing-fact context) so the
+            # hermetic autopilot test applies + verifies cleanly with no keys.
+            _Rule(("failing the cases below", "propose targeted authoring"), self._improve),
             # KB ingest — checked before "context" so "ingest the docs" doesn't
             # fall into add-context. Networked + cost → the driver confirm-gates.
             _Rule(("ingest", "crawl", "knowledge base", "kb "), self._ingest_kb),
@@ -428,6 +435,34 @@ class MockPlanner:
             ),
             _Rule(("eval case", "test case", "add a test"), self._add_eval_case),
         ]
+
+    def _improve(self, request: str, agent: str) -> PlannerOutcome:
+        """Scripted fix for the D7 autopilot's failure-grounded request.
+
+        Proposes one additive+reversible+free action — a "missing-fact" context
+        the agent can lean on for the failing cases. Deterministic so the
+        hermetic autopilot test (mock eval → propose → apply → verify) is
+        repeatable with no API keys. A real LLM planner would pick from the full
+        catalog (edit-instructions / add-eval-case / …) per the failure detail.
+        """
+        return PlannerOutcome(
+            actions=[
+                ProposedAction(
+                    name="add-context",
+                    args={
+                        "agent": agent,
+                        "name": "eval-fixes",
+                        "body": (
+                            "# Eval fixes\n\n"
+                            "Guidance added by the improve autopilot to address "
+                            "failing eval cases.\n"
+                        ),
+                    },
+                    rationale="add a missing-fact context to address the failing cases",
+                )
+            ],
+            message="I'll add a context capturing the facts the failing cases need.",
+        )
 
     def _add_context(self, request: str, agent: str) -> PlannerOutcome:
         name = _quoted_name(request, default="returns-policy")

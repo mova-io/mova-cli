@@ -59,8 +59,13 @@ from movate.cli.watch import _compute_watched_paths, _snapshot_mtimes, dispatch_
 from movate.core.loader import AgentLoadError, load_agent
 
 if TYPE_CHECKING:
-    from movate.authoring import AuthoringDriver
+    from movate.authoring import AuthoringDriver, EvalSnapshot
+    from movate.authoring.models import ActionPlan
     from movate.authoring.planner import Planner, ProposedAction
+    from movate.core.executor import Executor
+    from movate.core.loader import AgentBundle
+    from movate.providers.base import BaseLLMProvider
+    from movate.storage.base import StorageProvider
 
 stdout = Console()
 err = Console(stderr=True)
@@ -154,6 +159,8 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             test_input = _prompt_for_input(agent_dir)
         elif action == "ask":
             _copilot_action(agent_dir, mock=mock)
+        elif action == "improve":
+            _improve_action(agent_dir, mock=mock)
         elif action == "context":
             _add_context_action(agent_dir)
         elif action == "edit":
@@ -375,24 +382,28 @@ def _actions_menu() -> str:
     stdout.print("[bold]Actions:[/bold]")
     stdout.print(
         "  [bold cyan]a[/bold cyan] ask the copilot     "
-        "[bold cyan]r[/bold cyan] resume live test      "
-        "[bold cyan]i[/bold cyan] change test input"
+        "[bold cyan]m[/bold cyan] improve my agent       "
+        "[bold cyan]r[/bold cyan] resume live test"
     )
     stdout.print(
-        "  [bold cyan]c[/bold cyan] add a context        "
-        "[bold cyan]e[/bold cyan] run evals             "
-        "[bold cyan]g[/bold cyan] grounding check"
+        "  [bold cyan]i[/bold cyan] change test input    "
+        "[bold cyan]c[/bold cyan] add a context          "
+        "[bold cyan]e[/bold cyan] run evals"
     )
     stdout.print(
-        "  [bold cyan]o[/bold cyan] open prompt in editor "
-        "[bold cyan]d[/bold cyan] deploy to Azure       "
-        "[bold cyan]k[/bold cyan] ingest knowledge base"
+        "  [bold cyan]g[/bold cyan] grounding check      "
+        "[bold cyan]o[/bold cyan] open prompt in editor  "
+        "[bold cyan]d[/bold cyan] deploy to Azure"
     )
-    stdout.print("  [bold cyan]x[/bold cyan] test deployed agent  [bold cyan]q[/bold cyan] quit")
+    stdout.print(
+        "  [bold cyan]k[/bold cyan] ingest knowledge base "
+        "[bold cyan]x[/bold cyan] test deployed agent   "
+        "[bold cyan]q[/bold cyan] quit"
+    )
     try:
         choice = Prompt.ask(
             "[bold]Pick[/bold]",
-            choices=["a", "r", "i", "c", "e", "g", "d", "k", "x", "o", "q"],
+            choices=["a", "m", "r", "i", "c", "e", "g", "d", "k", "x", "o", "q"],
             default="r",
             show_choices=False,
         )
@@ -400,6 +411,7 @@ def _actions_menu() -> str:
         return "quit"
     return {
         "a": "ask",
+        "m": "improve",
         "r": "resume",
         "i": "input",
         "c": "context",
@@ -601,6 +613,204 @@ def _drive_proposed_action(driver: AuthoringDriver, proposed: ProposedAction) ->
         for path in result.changed_paths:
             err.print(f"[dim]  • {path}[/dim]")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Improve autopilot (the `m` key) — eval → propose → apply → re-verify (D7)
+# ---------------------------------------------------------------------------
+
+
+class _CliEvalRunner:
+    """Reuse the ``eval`` path to produce a compact failure snapshot (ADR 025 D7).
+
+    The autopilot consumes an :class:`movate.authoring.EvalRunner` Protocol; this
+    is the control-plane impl that runs the agent's real eval suite via
+    :class:`movate.core.eval.EvalEngine` and compacts the result into an
+    :class:`movate.authoring.EvalSnapshot`. No new eval engine — it drives the
+    shipped one.
+
+    Under ``mock=True`` it builds a hermetic in-memory runtime (MockProvider +
+    :class:`InMemoryStorage`), the same offline pattern
+    :mod:`movate.authoring.verify` uses, so the autopilot runs with no API keys
+    and never touches ``~/.movate``.
+    """
+
+    def __init__(self, project_root: Path, *, mock: bool, gate: float = 0.7) -> None:
+        self._project = project_root
+        self._mock = mock
+        self._gate = gate
+
+    def run_eval(self, agent: str) -> EvalSnapshot:
+        import asyncio  # noqa: PLC0415
+
+        from movate.authoring import EvalSnapshot, FailingCase  # noqa: PLC0415
+        from movate.core.eval import EvalConfigError, EvalEngine  # noqa: PLC0415
+        from movate.core.loader import load_agent  # noqa: PLC0415
+
+        agent_dir = (self._project / "agents" / agent).resolve()
+        bundle = load_agent(agent_dir)
+
+        async def _run() -> EvalSnapshot:
+            executor, provider, storage = await _build_eval_runtime(mock=self._mock, bundle=bundle)
+            try:
+                engine = EvalEngine(executor=executor, provider=provider, gate_mode="mean")
+                summary = await engine.run(bundle)
+            finally:
+                await storage.close()
+
+            failures: list[FailingCase] = []
+            passed = 0
+            for case in summary.cases:
+                if case.aggregated_score >= self._gate:
+                    passed += 1
+                    continue
+                run0 = case.runs[0] if case.runs else None
+                failures.append(
+                    FailingCase(
+                        input=dict(case.case.input),
+                        expected=dict(case.case.expected),
+                        actual=dict(run0.response.data) if run0 else {},
+                        score=case.aggregated_score,
+                        rationale=run0.rationale if run0 else "",
+                        cost_usd=case.cost_usd,
+                    )
+                )
+            return EvalSnapshot(
+                total_cases=summary.sample_count,
+                passed_cases=passed,
+                failures=failures,
+                mean_score=summary.mean_score,
+                total_cost_usd=summary.total_cost_usd,
+            )
+
+        try:
+            return asyncio.run(_run())
+        except EvalConfigError as exc:
+            _console.warn(f"can't run evals for {agent!r}: {exc}")
+            from movate.authoring import EvalSnapshot  # noqa: PLC0415
+
+            return EvalSnapshot(total_cases=0, passed_cases=0)
+
+
+async def _build_eval_runtime(
+    *, mock: bool, bundle: AgentBundle
+) -> tuple[Executor, BaseLLMProvider, StorageProvider]:
+    """Build the (executor, provider, storage) the improve eval runs against.
+
+    Mock path: hermetic in-memory runtime (no keys, no ``~/.movate``) — mirrors
+    :func:`movate.authoring.verify.mock_run`. Real path: the shared CLI local
+    runtime. Returns storage so the caller can close it.
+    """
+    if mock:
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.core.models import AgentRuntime  # noqa: PLC0415
+        from movate.providers.mock import MockProvider, load_dataset_expecteds  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.providers.registry import ProviderRegistry  # noqa: PLC0415
+        from movate.testing import InMemoryStorage, NullTracer  # noqa: PLC0415
+
+        provider: BaseLLMProvider = MockProvider()
+        dataset_decl = getattr(bundle.spec.evals, "dataset", None) if bundle.spec.evals else None
+        if dataset_decl:
+            expecteds = load_dataset_expecteds((bundle.agent_dir / dataset_decl).resolve())
+            if expecteds:
+                provider.configure_dataset(expecteds)  # type: ignore[attr-defined]
+        registry = ProviderRegistry(default_litellm=provider)
+        for runtime in AgentRuntime:
+            registry.register(runtime, provider)
+        storage: StorageProvider = InMemoryStorage()
+        await storage.init()
+        executor = Executor(
+            registry=registry,
+            pricing=load_pricing(),
+            storage=storage,
+            tracer=NullTracer(),
+            tenant_id="local",
+        )
+        return executor, provider, storage
+
+    from movate.cli._runtime import build_local_runtime  # noqa: PLC0415
+
+    rt = await build_local_runtime(mock=False)
+    return rt.executor, rt.provider, rt.storage
+
+
+def _improve_action(agent_dir: Path, *, mock: bool) -> None:
+    """The "improve my agent" autopilot (ADR 025 D7).
+
+    Closes the harvest→improve loop: run the agent's evals, read the failing
+    cases, ask the **existing** planner to propose targeted catalog actions, and
+    drive each through the **existing** :class:`AuthoringDriver`
+    plan → preview → confirm → apply → verify spine. The LLM proposes; the
+    driver gates / applies / verifies / reverts. Re-runs the evals afterward to
+    report whether the pass rate improved.
+
+    Reuses the eval path (:class:`_CliEvalRunner`), the planner, and the catalog
+    driver — no new execution/eval engine. Bounded: a per-pass action cap +
+    iteration cap (no infinite loop). Under ``--mock`` everything is hermetic.
+    """
+    from movate.authoring import AuthoringContext, AuthoringDriver, Autopilot  # noqa: PLC0415
+
+    project_root = _project_root_for_agent(agent_dir)
+    agent_name = agent_dir.name
+
+    err.print(
+        "[dim]running evals to find failing cases, then proposing targeted fixes "
+        "(each previewed + confirmed before apply)…[/dim]"
+    )
+
+    eval_runner = _CliEvalRunner(project_root, mock=mock)
+    planner = _build_planner(agent_dir, project_root, mock=mock)
+    driver = AuthoringDriver(AuthoringContext(project=project_root))
+    autopilot = Autopilot(eval_runner=eval_runner, planner=planner, driver=driver)
+
+    def _confirm(proposed: ProposedAction, plan: ActionPlan) -> bool:
+        stdout.print(f"\n[bold]proposed fix:[/bold] {plan.summary}")
+        if proposed.rationale:
+            stdout.print(f"  [dim]why: {proposed.rationale}[/dim]")
+        stdout.print(
+            f"  side effects: {', '.join(s.value for s in plan.side_effects) or '—'}"
+            f"   reversible: {'yes' if plan.reversible else '[red]no[/red]'}"
+        )
+        if plan.estimated_cost_usd is not None:
+            stdout.print(f"  estimated cost: ~${plan.estimated_cost_usd:.4f}")
+        if plan.diff:
+            stdout.print(plan.diff)
+        try:
+            return typer.confirm("Apply this fix?", default=not plan.requires_confirmation)
+        except (KeyboardInterrupt, EOFError):
+            return False
+
+    result = autopilot.run(agent_name, confirm=_confirm)
+
+    if result.initial.total_cases == 0:
+        _console.warn(
+            "no eval cases to improve against — add a dataset first (the 'c'/'e' actions)"
+        )
+        return
+    if result.initial.all_passing:
+        _console.success(
+            f"all {result.initial.total_cases} eval case(s) already pass "
+            f"(mean {result.initial.mean_score:.2f}) — nothing to improve"
+        )
+        return
+
+    stdout.print(
+        f"\n[bold]improve summary:[/bold] applied {result.total_applied} fix(es) "
+        f"across {len(result.passes)} pass(es)"
+    )
+    before = f"{result.initial.passed_cases}/{result.initial.total_cases}"
+    after = f"{result.final.passed_cases}/{result.final.total_cases}"
+    if result.improved:
+        _console.success(f"pass rate improved: {before} → {after}")
+    elif result.total_applied:
+        _console.hint(
+            f"[dim]pass rate unchanged ({before} → {after}); the applied fixes are "
+            f"reversible — 'mdk authoring undo' rolls them back[/dim]"
+        )
+    else:
+        err.print("[dim]no fixes applied (declined, or the planner had no proposal).[/dim]")
+    err.print("[dim]resume the live loop ('r') to see changes take effect.[/dim]")
 
 
 def _ensure_target(target: str | None, *, purpose: str) -> str | None:
