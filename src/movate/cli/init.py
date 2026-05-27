@@ -1266,6 +1266,7 @@ def _init_agent_from_llm(
     starting_template: str,
     mock: bool = False,
     no_ingest: bool = False,
+    no_verify: bool = False,
 ) -> None:
     """Scaffold an agent from a natural-language description.
 
@@ -1347,6 +1348,7 @@ def _init_agent_from_llm(
             starting_template=starting_template,
             mock=mock,
             no_ingest=no_ingest,
+            no_verify=no_verify,
             dest=dest,
         )
     )
@@ -1366,6 +1368,7 @@ async def _run_llm_scaffold(
     starting_template: str,
     mock: bool,
     no_ingest: bool,
+    no_verify: bool,
     dest: Path,
 ) -> None:
     """Async body of the LLM-scaffold flow.
@@ -1608,13 +1611,31 @@ async def _run_llm_scaffold(
     # init: the agent is already on disk and valid. Skipped entirely under
     # --mock (offline) / --no-ingest, for a non-grounding scaffold, or when
     # the description has no URL — each case prints the manual hint instead.
-    await _maybe_auto_ingest(
+    ingested_pages = await _maybe_auto_ingest(
         name=name,
         description=description,
         generated=generated,
         project_root=scaffold_project_root,
         mock=mock,
         no_ingest=no_ingest,
+    )
+
+    # F8 (#117): grounded end-to-end verify — run ONE probe query through
+    # the just-scaffolded RAG agent (reusing the local-run/Executor path
+    # with ADR-023 auto-retrieval active) and confirm it answers FROM the
+    # freshly-ingested KB. Strictly best-effort + never breaks init: the
+    # agent is already on disk + valid. Skipped under --no-verify, for a
+    # non-grounding scaffold, or when there's nothing to verify (no chunks
+    # ingested). Under --mock it's a structural smoke (the agent RUNS
+    # against MockProvider), not a real-grounding assertion.
+    await _maybe_verify_grounded(
+        name=name,
+        generated=generated,
+        project_root=scaffold_project_root,
+        dest=dest,
+        mock=mock,
+        no_verify=no_verify,
+        ingested_pages=ingested_pages,
     )
 
     _emit_post_success_hint(_console, dry_run=False)
@@ -1823,8 +1844,13 @@ async def _maybe_auto_ingest(
     project_root: Path,
     mock: bool,
     no_ingest: bool,
-) -> None:
+) -> int:
     """Auto-ingest the description's URL into the new RAG agent's KB (F7, #116).
+
+    Returns the number of pages successfully ingested (``0`` when the ingest
+    was skipped for any reason — opt-out, ``--mock``, non-grounding, no URL,
+    or a best-effort failure). F8 (#117) reads this to decide whether there's
+    a populated KB worth running a grounded verify probe against.
 
     The loop-closer for ``mdk init <name> "answer questions about <url>"
     --llm``: after the RAG agent is scaffolded, crawl the URL into its KB
@@ -1861,11 +1887,11 @@ async def _maybe_auto_ingest(
     if not _is_rag_shaped(generated):
         # Non-grounding agent — no retrieval-backed KB to populate. Nothing
         # to ingest, no hint needed (a classifier has no use for one).
-        return
+        return 0
 
     if no_ingest:
         _manual_hint("[dim]--no-ingest: skipped auto-ingest.[/dim]")
-        return
+        return 0
 
     if url is None:
         # Grounded scaffold but no URL to seed from — point at the manual
@@ -1875,7 +1901,7 @@ async def _maybe_auto_ingest(
             "(no URL in the description to auto-ingest from)."
         )
         _manual_hint()
-        return
+        return 0
 
     if mock:
         # Offline path: never hit the network. Mirrors how --mock
@@ -1885,7 +1911,7 @@ async def _maybe_auto_ingest(
             f"[bold]{url}[/bold] (offline). The agent's KB starts empty."
         )
         _manual_hint()
-        return
+        return 0
 
     from movate.cli.kb_cmd import AutoIngestSkippedError, auto_ingest_url  # noqa: PLC0415
 
@@ -1901,20 +1927,330 @@ async def _maybe_auto_ingest(
     except AutoIngestSkippedError as exc:
         err_console.print(f"[yellow]⚠[/yellow] auto-ingest skipped: {exc}")
         _manual_hint()
-        return
+        return 0
     except Exception as exc:
         # Defensive belt: any unexpected error (an import-time issue, a
         # storage backend problem) must not turn a successful scaffold
         # into a non-zero exit. Warn + manual hint, scaffold stands.
         err_console.print(f"[yellow]⚠[/yellow] auto-ingest skipped: {exc}")
         _manual_hint()
-        return
+        return 0
 
     page_word = "page" if ingested == 1 else "pages"
     console.print(
         f"[green]✓[/green] your agent is ready and grounded on "
         f"[bold]{ingested}[/bold] {page_word} from [bold]{url}[/bold]."
     )
+    return ingested
+
+
+# F8 (#117): the generic probe used when the RAG scaffold shipped no
+# sample-eval question to borrow. Deliberately open-ended so it grounds
+# against whatever the KB holds rather than assuming a topic.
+_GENERIC_GROUNDED_PROBE = "Give a brief overview based on the available context."
+
+# Candidate input fields, in preference order, to read the probe query
+# from when the agent's `retrieval.query_from` is unset. Mirrors the
+# canonical-field list `mdk validate` / the Executor use to resolve the
+# default query field (see `_primary_string_input_fields`).
+_PROBE_QUERY_FIELD_CANDIDATES = ("query", "question", "text", "message")
+
+
+def _probe_query_field(generated: Any) -> str | None:
+    """Pick the input field the verify probe should write its query into.
+
+    Precedence:
+
+    1. The agent's declared ``retrieval.query_from`` (authoritative — it's
+       what the Executor reads to build the retrieval query).
+    2. The first canonical text field (`query`/`question`/`text`/`message`)
+       present in the generated input schema.
+    3. ``None`` when neither resolves — the caller falls back to skipping
+       the verify (we can't form a probe input we're confident about).
+    """
+    agent_yaml = getattr(generated, "agent_yaml", {})
+    retrieval = agent_yaml.get("retrieval") if isinstance(agent_yaml, dict) else None
+    if isinstance(retrieval, dict):
+        query_from = retrieval.get("query_from")
+        if isinstance(query_from, str) and query_from.strip():
+            return query_from.strip()
+
+    input_schema = getattr(generated, "input_schema", {})
+    props = input_schema.get("properties", {}) if isinstance(input_schema, dict) else {}
+    for candidate in _PROBE_QUERY_FIELD_CANDIDATES:
+        field = props.get(candidate)
+        if isinstance(field, dict) and field.get("type") == "string":
+            return candidate
+    return None
+
+
+def _probe_query_value(generated: Any, *, field: str) -> str:
+    """Build the probe query string.
+
+    Reuse the FIRST scaffolded sample-eval's value for ``field`` when one is
+    present + non-empty (a realistic question the LLM thought worth asking),
+    else the generic open-ended probe. Defensive against odd sample-eval
+    shapes — anything unexpected falls through to the generic probe.
+    """
+    sample_evals = getattr(generated, "sample_evals", None) or []
+    for row in sample_evals:
+        if not isinstance(row, dict):
+            continue
+        row_input = row.get("input")
+        if not isinstance(row_input, dict):
+            continue
+        value = row_input.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return _GENERIC_GROUNDED_PROBE
+
+
+def _output_is_grounded(data: dict[str, Any]) -> bool:
+    """True when a run's output indicates it answered FROM the KB.
+
+    The F3 RAG output schema carries ``grounded: bool`` + ``citations:
+    list[int]``. We treat the run as grounded when EITHER signal fires:
+    ``grounded`` is truthy, OR ``citations`` is a non-empty list — a model
+    that cited supporting chunks grounded its answer even if it omitted the
+    boolean. Tolerant of a missing/odd shape (returns ``False``): an
+    ungrounded-but-successful run is a soft warning, never a hard fail.
+    """
+    if data.get("grounded") is True:
+        return True
+    citations = data.get("citations")
+    return isinstance(citations, list) and len(citations) > 0
+
+
+def _verify_manual_hint(name: str) -> None:
+    """Stderr-only pointer at the manual ingest + run commands.
+
+    Printed when the verify is skipped for a recoverable reason (no KB,
+    no key, an execution hiccup) so the operator knows how to populate +
+    test the agent by hand. Honors ``--quiet`` via ``_console.hint``.
+    """
+    from movate.cli import _console  # noqa: PLC0415
+
+    _console.hint(
+        f"[dim]→ populate + try it manually: "
+        f"[bold]mdk kb ingest {name} <url> --crawl[/bold] then "
+        f"[bold]mdk run {name} '{{...}}'[/bold][/dim]"
+    )
+
+
+async def _maybe_verify_grounded(
+    *,
+    name: str,
+    generated: Any,
+    project_root: Path,
+    dest: Path,
+    mock: bool,
+    no_verify: bool,
+    ingested_pages: int,
+) -> None:
+    """Grounded end-to-end verify of the just-scaffolded RAG agent (F8, #117).
+
+    The final loop-closer for ``mdk init <name> "answer questions about <url>"
+    --llm``: after F7 auto-ingests the URL into the new agent's KB, run ONE
+    grounded probe query THROUGH the agent (reusing the existing local-run /
+    Executor path — :func:`build_local_runtime` → :meth:`Executor.execute`,
+    with ADR-023 auto-retrieval active so ``input.context`` is auto-filled
+    from the KB) and confirm the answer is grounded. On success prints
+    ``✓ verified: agent answered grounded from <N> retrieved chunks`` — the
+    user's immediate proof the end-to-end RAG works.
+
+    Strictly best-effort, mirroring F7's never-break-init contract — the
+    agent is already on disk + valid, so the verify NEVER changes the exit
+    code on a successfully-scaffolded agent. It skips cleanly (and returns)
+    when:
+
+    * ``--no-verify`` → operator opted out.
+    * non-grounding scaffold → nothing grounded to verify.
+    * ``ingested_pages == 0`` AND NOT ``--mock`` → nothing was ingested
+      (no key, ingest skipped/empty, ``--no-ingest``), so there's no KB to
+      ground against; point at the manual commands.
+    * ``--mock`` → no real grounding to verify; instead do a deterministic
+      STRUCTURAL smoke (the agent RUNS without error against MockProvider)
+      and say so — do NOT require real grounding in mock mode.
+
+    A successful-but-ungrounded answer is a SOFT warning (not a hard fail).
+    Any execution / load error is caught + turned into a warning + skip.
+    """
+    from movate.cli import _console  # noqa: PLC0415
+
+    if no_verify:
+        # Independent opt-out. Stay quiet beyond a one-line note (mirrors how
+        # --no-ingest announces itself) — the operator asked to skip.
+        _console.hint("[dim]--no-verify: skipped grounded verify.[/dim]")
+        return
+
+    if not _is_rag_shaped(generated):
+        # Non-grounding agent — there's no grounded answer contract to probe.
+        return
+
+    if not mock and ingested_pages <= 0:
+        # Nothing landed in the KB (no embedding key, ingest skipped, empty
+        # crawl, or --no-ingest). A grounded probe would just confirm the KB
+        # is empty — skip with the manual-command hint instead.
+        err_console.print(
+            "[yellow]⚠[/yellow] skipped grounded verify: the agent's KB is empty "
+            "(nothing was auto-ingested)."
+        )
+        _verify_manual_hint(name)
+        return
+
+    # Resolve the input field the probe writes its query into. Without a
+    # field we can't form a confident probe input → skip cleanly.
+    query_field = _probe_query_field(generated)
+    if query_field is None:
+        err_console.print(
+            "[yellow]⚠[/yellow] skipped grounded verify: couldn't resolve the "
+            "agent's query input field."
+        )
+        _verify_manual_hint(name)
+        return
+
+    probe_query = _probe_query_value(generated, field=query_field)
+
+    # Announce the action before running so a slow probe isn't mistaken for
+    # a hang. Stderr-only (informational; never part of any --json stdout).
+    err_console.print("[bold cyan]Verifying grounded answer…[/bold cyan]")
+
+    try:
+        await _run_grounded_probe(
+            name=name,
+            dest=dest,
+            query_field=query_field,
+            probe_query=probe_query,
+            mock=mock,
+        )
+    except Exception as exc:
+        # Defensive belt — ANY failure (load error, executor crash, storage
+        # hiccup) must not turn a successful scaffold into a non-zero exit.
+        err_console.print(f"[yellow]⚠[/yellow] grounded verify skipped: {exc}")
+        _verify_manual_hint(name)
+
+
+async def _run_grounded_probe(
+    *,
+    name: str,
+    dest: Path,
+    query_field: str,
+    probe_query: str,
+    mock: bool,
+) -> None:
+    """Run ONE probe query through the agent + report the grounded outcome.
+
+    Reuses the EXACT local-run path — :func:`build_local_runtime` (so the
+    provider/storage/executor are wired identically to ``mdk run``) →
+    :meth:`Executor.execute` (so ADR-023 pre-retrieval auto-fills
+    ``input.context`` from the KB before the prompt renders). We do NOT
+    pass ``context`` in the probe input so the default ``when: if_empty``
+    retrieval fires and grounds the run against the KB.
+
+    Two modes:
+
+    * ``--mock`` → STRUCTURAL smoke. The MockProvider can't produce a
+      genuinely grounded answer, so success here means only "the agent
+      RAN without error" — reported as a structural smoke, no real
+      grounding asserted.
+    * real → the run is checked for grounding (``output.grounded`` and/or
+      non-empty ``citations``). Grounded → ``✓ verified``; successful but
+      ungrounded → a soft warning; a failed run → a warning.
+
+    Raising propagates to :func:`_maybe_verify_grounded`'s catch-all so any
+    error degrades to a skip rather than failing init.
+    """
+    from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.core.loader import load_agent  # noqa: PLC0415
+    from movate.core.models import RunRequest  # noqa: PLC0415
+
+    bundle = load_agent(dest)
+
+    rt = await build_local_runtime(mock=mock)
+    if mock:
+        # Make the mock emit the agent's grounded sample output so the run
+        # validates against the RAG output schema (the canned mock response
+        # wouldn't). This keeps the smoke a clean structural pass, NOT a
+        # real-grounding assertion.
+        from movate.cli.run import _configure_mock_for_bundle  # noqa: PLC0415
+
+        _configure_mock_for_bundle(rt.provider, bundle)
+
+    # Probe input carries ONLY the query field — ADR-023 auto-retrieval
+    # fills `context` from the KB (default when: if_empty). The number of
+    # retrieved chunks is read back from the persisted run's skill_calls.
+    request = RunRequest(agent=bundle.spec.name, input={query_field: probe_query})
+    try:
+        response = await rt.executor.execute(bundle, request)
+        chunks_retrieved = await _count_retrieved_chunks(rt.storage, run_id=response.run_id)
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+    if mock:
+        # Structural smoke only — no real grounding in mock mode.
+        if response.status == "success":
+            console.print(
+                f"[green]✓[/green] smoke: [bold]{name}[/bold] ran end-to-end against the "
+                "mock provider [dim](--mock: structural only, real grounding not verified)[/dim]."
+            )
+        else:
+            err_console.print(
+                "[yellow]⚠[/yellow] grounded verify skipped: the [bold]--mock[/bold] "
+                "structural smoke run did not succeed."
+            )
+            _verify_manual_hint(name)
+        return
+
+    if response.status != "success":
+        # A failed probe run is a soft skip — the scaffold + KB still stand.
+        err_console.print(
+            f"[yellow]⚠[/yellow] grounded verify skipped: the probe run did not "
+            f"succeed (status={response.status})."
+        )
+        _verify_manual_hint(name)
+        return
+
+    if _output_is_grounded(response.data):
+        chunk_word = "chunk" if chunks_retrieved == 1 else "chunks"
+        console.print(
+            f"[green]✓[/green] verified: [bold]{name}[/bold] answered grounded from "
+            f"[bold]{chunks_retrieved}[/bold] retrieved {chunk_word}."
+        )
+    else:
+        # Successful-but-ungrounded → soft warning, NEVER a hard fail.
+        err_console.print(
+            f"[yellow]⚠[/yellow] [bold]{name}[/bold] ran but its answer wasn't "
+            "grounded (no citations / grounded=false). The KB may not cover the "
+            "probe question — try a more specific query or ingest more pages."
+        )
+
+
+async def _count_retrieved_chunks(storage: Any, *, run_id: str) -> int:
+    """Best-effort count of KB chunks retrieved by the probe run.
+
+    Reads the persisted RunRecord's ``skill_calls`` (the same source
+    ``mdk run --trace`` uses) and sums the ``chunks`` returned by any
+    kb-flavored skill call — the ADR-023 pre-retrieval phase records a
+    turn-0 skill call. Returns ``0`` on any lookup failure: the count is
+    informational decoration on the success line, never load-bearing.
+    """
+    if not run_id:
+        return 0
+    try:
+        record = await storage.get_run(run_id, tenant_id="local")
+    except Exception:
+        return 0
+    if record is None or not getattr(record, "skill_calls", None):
+        return 0
+    total = 0
+    for call in record.skill_calls:
+        if "kb" not in getattr(call, "skill", "").lower():
+            continue
+        output = getattr(call, "output", None) or {}
+        chunks = output.get("chunks") if isinstance(output, dict) else None
+        if isinstance(chunks, list):
+            total += len(chunks)
+    return total
 
 
 def _check_adr023_retrieval(bundle: Any) -> str | None:
@@ -2266,6 +2602,22 @@ def init(
             "[bold]--mock[/bold] / [bold]--dry-run[/bold] (no network)."
         ),
     ),
+    no_verify: bool = typer.Option(
+        False,
+        "--no-verify",
+        help=(
+            "Skip the post-scaffold grounded verify (F8). By default, after an "
+            "[bold]--llm[/bold] description scaffolds a grounded (RAG) agent AND "
+            "auto-ingest populates its KB, [bold]mdk init[/bold] runs ONE probe "
+            "query through the new agent to confirm it answers grounded from the "
+            "KB. The verify is best-effort + never changes the exit code on a "
+            "successfully-scaffolded agent. It's skipped automatically when there "
+            "is nothing to verify (non-grounding scaffold, [bold]--no-ingest[/bold], "
+            "or an empty KB); under [bold]--mock[/bold] it runs a structural smoke "
+            "only (the agent executes against the mock provider, no real grounding "
+            "is asserted). Independent of [bold]--no-ingest[/bold]."
+        ),
+    ),
     open_editor: bool = typer.Option(
         True,
         "--open-editor/--no-open-editor",
@@ -2458,6 +2810,7 @@ def init(
             starting_template=effective_template,
             mock=mock,
             no_ingest=no_ingest,
+            no_verify=no_verify,
         )
         return
 

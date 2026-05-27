@@ -17,14 +17,15 @@ description: >-
 schema:
   input:
     question: string
-    k?: integer
+    k: integer?
   output:
     chunks:
       - text: string
         source: string
         score: number
+        ocr: boolean?
     chunks_found: integer
-    warning?: string
+    warning: string?
 
 implementation:
   kind: python
