@@ -21,6 +21,7 @@ All provider/network calls are mocked; no real ``~/.movate`` is touched.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,20 @@ from typer.testing import CliRunner
 from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)
+
+# Help output is rendered by Rich, which (a) interleaves ANSI SGR codes
+# (CI sets FORCE_COLOR=1) and (b) wraps/truncates body text under a narrow
+# non-TTY terminal. Strip ANSI + collapse whitespace before substring
+# matching, and pin a WIDE COLUMNS in the invocation so Rich never wraps a
+# phrase across a line boundary or truncates it with an ellipsis. This keeps
+# the assertions stable regardless of CI's actual terminal width.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_WIDE = {"COLUMNS": "200"}
+
+
+def _plain(text: str) -> str:
+    """ANSI-stripped, whitespace-collapsed help output for substring matching."""
+    return " ".join(_ANSI_RE.sub("", text).split())
 
 
 _PROVIDER_KEYS = (
@@ -62,25 +77,24 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 class TestInitHelpText:
     def test_help_drops_phase_language(self) -> None:
         """`mdk init --help` no longer advertises the feature as 'Phase 2'."""
-        result = runner.invoke(app, ["init", "--help"])
+        result = runner.invoke(app, ["init", "--help"], env=_WIDE)
         assert result.exit_code == 0
-        assert "Phase 2" not in result.stdout
-        assert "Phase 3" not in result.stdout
+        flat = _plain(result.stdout)
+        assert "Phase 2" not in flat
+        assert "Phase 3" not in flat
 
     def test_dry_run_help_mentions_calling_the_model(self) -> None:
         """`--dry-run` help makes clear it STILL calls the model."""
-        result = runner.invoke(app, ["init", "--help"])
+        result = runner.invoke(app, ["init", "--help"], env=_WIDE)
         assert result.exit_code == 0
-        # Typer may wrap help across lines; normalize whitespace before matching.
-        flat = " ".join(result.stdout.split())
-        assert "calls the model" in flat.lower()
+        # Strip ANSI + collapse whitespace; Rich styles/wraps the help body.
+        assert "calls the model" in _plain(result.stdout).lower()
 
     def test_mock_help_mentions_offline(self) -> None:
         """`--mock` help makes clear it is the OFFLINE path."""
-        result = runner.invoke(app, ["init", "--help"])
+        result = runner.invoke(app, ["init", "--help"], env=_WIDE)
         assert result.exit_code == 0
-        flat = " ".join(result.stdout.split())
-        assert "offline" in flat.lower()
+        assert "offline" in _plain(result.stdout).lower()
 
 
 # ---------------------------------------------------------------------------

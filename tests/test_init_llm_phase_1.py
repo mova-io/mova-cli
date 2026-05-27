@@ -41,12 +41,14 @@ def test_llm_flag_appears_in_help() -> None:
     with ``FORCE_COLOR=1``, which causes Rich to insert escape
     sequences *inside* the option name (``--`` and ``llm`` get
     styled as separate spans). A raw substring check on the styled
-    output misses the flag entirely."""
+    output misses the flag entirely. We also pin a wide COLUMNS and
+    collapse whitespace so a narrow non-TTY terminal can't wrap a flag
+    name across a line boundary."""
     import re  # noqa: PLC0415
 
     result = runner.invoke(app, ["init", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.stdout)
+    plain = " ".join(re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.stdout).split())
     assert "--llm" in plain
     assert "--llm-model" in plain
     assert "--dry-run" in plain
