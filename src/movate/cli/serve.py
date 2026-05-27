@@ -137,6 +137,7 @@ async def _run_serve(
     # commands don't crash when the [runtime] extra isn't installed.
     import uvicorn  # noqa: PLC0415
 
+    from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
     from movate.runtime.app import build_app  # noqa: PLC0415
     from movate.runtime.registry import scan_agents  # noqa: PLC0415
     from movate.tracing import init_metrics  # noqa: PLC0415
@@ -149,6 +150,9 @@ async def _run_serve(
 
     storage = build_storage()
     await storage.init()
+    # ADR 034 D3 — wire the asyncpg pool's saturation gauges AFTER init (the
+    # pool now exists). No-op on SQLite / when metrics are off. Never raises.
+    register_pool_observability(storage)
     await _seed_bootstrap_key(storage)
 
     agents = scan_agents(agents_path)

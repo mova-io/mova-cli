@@ -141,7 +141,7 @@ _DEP_LICENSES: dict[str, str] = {
 
 # One-line role description per dep — surfaced in ``mdk doctor`` so
 # operators glancing at the table can answer "wait, why do we depend
-# on this?" without leaving the terminal. Keep entries terse (≤50
+# on this?" without leaving the terminal. Keep entries terse (<=50
 # chars) — Rich wraps but a one-liner reads cleanly. Detailed defense
 # of each choice lives in docs/stack-defense.md.
 _DEP_PURPOSE: dict[str, str] = {
@@ -484,6 +484,11 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     state = "exists" if sqlite_path.exists() else "will be created on first run"
     _add("storage (sqlite)", f"{sqlite_path} [dim]({state})[/dim]")
 
+    # DB connection-ceiling capacity (ADR 034 D1). Warns when the worst-case
+    # KEDA-autoscaled fleet would exceed Postgres max_connections. Informational
+    # + graceful when a DB / the values aren't reachable — never crashes doctor.
+    _render_pool_capacity_section(_add)
+
     # Memory store — shows the active backend and file path so operators
     # know which backend their `mdk memory` commands are reading/writing.
     mem_backend = os.environ.get("MOVATE_MEMORY_BACKEND", "memory").lower()
@@ -649,6 +654,73 @@ def _render_runtime_keys_section(_add: Any) -> None:
             continue
         # Set + not shadowed — report the source, never the value.
         _add(var, _ok(f"target {name!r} (source: {source})"))
+
+
+def _render_pool_capacity_section(_add: Any) -> None:
+    """Render the DB connection-ceiling capacity check (ADR 034 D1).
+
+    Computes whether the worst-case KEDA-autoscaled fleet
+    (``pods x pool_max``) fits under Postgres ``max_connections`` with headroom,
+    per the sizing formula ``pods x pool_max <= max_connections - headroom``.
+
+    Inputs degrade gracefully: ``pool_max`` + ``max_connections`` are probed from
+    a live Postgres (``MOVATE_DB_URL``) when reachable; otherwise they fall back
+    to documented env overrides (``MOVATE_DB_POOL_MAX_SIZE`` /
+    ``MOVATE_DB_MAX_CONNECTIONS`` / ``MOVATE_KEDA_MAX_REPLICAS`` /
+    ``MOVATE_DB_CONNECTION_HEADROOM``) and then assumed defaults that match the
+    shipped infra. A result built on assumed inputs renders as a dim
+    informational row, never a false-positive warning — and any failure inside
+    here is swallowed so the capacity check can never crash ``mdk doctor``.
+
+    Row semantics:
+
+    * green ``ok`` — fits under the ceiling with observed/env inputs.
+    * yellow ``warn`` — over the ceiling: the exhaustion risk; remediation names
+      the three fixes (lower pool_max, cap replicas, add PgBouncer → ADR 034 D1).
+    * dim ``info`` — fits, but on assumed inputs (advisory; confirm the real ones).
+    """
+    try:
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        from movate.cli._pool_capacity import (  # noqa: PLC0415
+            SIZING_FORMULA,
+            compute_capacity_verdict,
+            probe_postgres_inputs,
+        )
+
+        try:
+            observed_pool_max, observed_max_conns = _asyncio.run(probe_postgres_inputs())
+        except Exception:
+            observed_pool_max, observed_max_conns = (None, None)
+
+        verdict = compute_capacity_verdict(
+            observed_pool_max=observed_pool_max,
+            observed_max_connections=observed_max_conns,
+        )
+    except Exception as exc:  # pragma: no cover - defensive; check must not crash doctor
+        _add(
+            "db pool capacity",
+            f"[dim]skipped: capacity check failed ({str(exc)[:60]})[/dim]",
+        )
+        return
+
+    formula = f"[dim](formula: {SIZING_FORMULA})[/dim]"
+    if verdict.status == "warn":
+        _add(
+            "db pool capacity",
+            f"[yellow]⚠ {escape(verdict.summary)}[/yellow] [dim]— {escape(verdict.remediation)} "
+            f"{SIZING_FORMULA}[/dim]",
+        )
+    elif verdict.status == "info":
+        _add(
+            "db pool capacity",
+            f"[dim]> {escape(verdict.summary)} {formula}[/dim]",
+        )
+    else:
+        _add(
+            "db pool capacity",
+            _ok(escape(verdict.summary)) + f" {formula}",
+        )
 
 
 def _detect_project_config_row(
@@ -1025,6 +1097,7 @@ def _render_explanations() -> None:
             [
                 "storage (sqlite)",
                 "pricing",
+                "db pool capacity",
                 # Project-config check renders under one of three
                 # filenames; the explanation file registers all three
                 # but only the present one renders.

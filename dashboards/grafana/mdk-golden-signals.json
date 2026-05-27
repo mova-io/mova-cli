@@ -39,7 +39,7 @@
       }
     ]
   },
-  "description": "mdk (movate-cli) golden-signal ops dashboard over the OTel metrics the runtime/worker emit (ADR 031 D2). Metric instrument names: mdk.jobs.completed, mdk.job.duration_ms, mdk.jobs.in_flight, mdk.run.tokens, mdk.run.cost_usd. PromQL below assumes the OTLP -> Prometheus naming convention (dots -> underscores, unit suffix, _total for monotonic counters). See dashboards/README.md.",
+  "description": "mdk (movate-cli) golden-signal ops dashboard over the OTel metrics the runtime/worker emit (ADR 031 D2). Metric instrument names: mdk.jobs.completed, mdk.job.duration_ms, mdk.jobs.in_flight, mdk.run.tokens, mdk.run.cost_usd, plus the DB connection-pool gauges mdk.db.pool.size, mdk.db.pool.idle, mdk.db.pool.in_use, mdk.db.pool.waiting, mdk.db.pool.max (ADR 034 D3). PromQL below assumes the OTLP -> Prometheus naming convention (dots -> underscores, unit suffix, _total for monotonic counters; gauges carry no suffix). See dashboards/README.md.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -567,6 +567,164 @@
       ],
       "title": "Cumulative cost & tokens (range)",
       "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "id": 104,
+      "panels": [],
+      "title": "DB connection pool (mdk.db.pool.size / idle / in_use / waiting / max, ADR 034 D3)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Per-pod asyncpg connection-pool saturation (ADR 034 D3). mdk.db.pool.in_use (checked-out) and mdk.db.pool.idle vs the configured per-pod ceiling mdk.db.pool.max, plus total open mdk.db.pool.size. Under KEDA autoscale, sum(mdk_db_pool_in_use) across pods approaching the Postgres max_connections is the connection-exhaustion early warning the `mdk doctor` capacity check (ADR 034 D1) does statically.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_in_use)",
+          "legendFormat": "in use (fleet)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_idle)",
+          "legendFormat": "idle (fleet)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_size)",
+          "legendFormat": "open total (fleet)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_max)",
+          "legendFormat": "per-pod max x pods (ceiling)",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Pool connections: in-use / idle / open vs ceiling",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Callers blocked waiting for a free pool connection (mdk.db.pool.waiting). A sustained non-zero value means the per-pod pool is the bottleneck — connections are fully checked out and requests are queuing. This is the saturation signal that precedes connection exhaustion; pair it with the `mdk doctor` capacity check (ADR 034 D1) which flags the static ceiling.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_waiting)",
+          "legendFormat": "waiting (fleet)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pool acquire waiters (saturation)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

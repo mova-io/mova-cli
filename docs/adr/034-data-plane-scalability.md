@@ -44,3 +44,24 @@ pooling is the Azure option.
 **D3** (pool metrics) + the **D1 doctor check + pool-sizing** are buildable now
 (no infra dep). **D1 PgBouncer provisioning** + **D2 replica** are infra-shaped →
 Deva sign-off (bicep + env). Non-infra pieces ship first.
+
+### Shipped (non-infra slice)
+- **D3 pool metrics** — `PostgresProvider.pool_stats()` snapshots the live
+  asyncpg pool (size / idle / in-use / waiting / max); OTel observable gauges
+  `mdk.db.pool.{size,idle,in_use,waiting,max}` (registered at the `mdk serve` /
+  `mdk worker` edge via `tracing.metrics.register_pool_metrics`, sampling the
+  pool each collection cycle — storage never imports tracing). Panelled on the
+  Grafana dashboard; names added to `METRIC_NAMES` (dashboards anti-drift guard
+  stays green).
+- **D1 doctor check** — `mdk doctor` "db pool capacity" row computes the
+  connection-ceiling headroom against the sizing formula
+  `pods x pool_max <= max_connections - headroom`, probing `max_connections` /
+  `pool_max` from a reachable Postgres (else `MOVATE_DB_MAX_CONNECTIONS` /
+  `MOVATE_DB_POOL_MAX_SIZE` / `MOVATE_KEDA_MAX_REPLICAS` /
+  `MOVATE_DB_CONNECTION_HEADROOM`, else assumed defaults). Warns over the
+  ceiling; informational on assumed inputs; never crashes doctor without a DB.
+  Remediation points at lower pool_max / cap replicas / PgBouncer (the
+  Deva-gated D1 infra). Formula also documented in `docs/runbooks/load-soak.md`.
+
+**NOT in this slice** (Deva-gated, unchanged): D1 PgBouncer provisioning + the
+`statement_cache_size=0` pool config, and D2 read-replica routing.

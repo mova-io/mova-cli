@@ -137,6 +137,44 @@ async def build_local_runtime(*, mock: bool) -> LocalRuntime:
     return LocalRuntime(executor=executor, provider=provider, storage=storage, tracer=tracer)
 
 
+def register_pool_observability(storage: StorageProvider) -> None:
+    """Wire the asyncpg pool's saturation gauges to OTel (ADR 034 D3).
+
+    Called at the runtime edge (``mdk serve`` / ``mdk worker``) right after
+    ``storage.init()`` + ``init_metrics()``. Only the Postgres backend has a
+    pool, so we duck-type on a ``pool_stats`` method (rather than importing the
+    concrete ``PostgresProvider`` into the CLI layer): SQLite has none, so this
+    is a clean no-op locally. The callback we hand to
+    :func:`~movate.tracing.metrics.register_pool_metrics` converts the backend's
+    ``PoolStats`` snapshot into the plain ``dict[str, int]`` the tracing seam
+    expects — keeping ``tracing`` free of any ``storage`` import (boundary rule
+    6) and ``storage`` free of any ``tracing`` import (the pool is sampled at the
+    edge, never from inside execution logic).
+
+    Fail-soft: if the backend has no pool sampler, or metrics aren't active, this
+    does nothing. Never raises.
+    """
+    from movate.tracing import register_pool_metrics  # noqa: PLC0415
+
+    pool_stats = getattr(storage, "pool_stats", None)
+    if not callable(pool_stats):
+        return  # SQLite / any backend without a connection pool — nothing to sample.
+
+    def _snapshot() -> dict[str, int] | None:
+        stats = pool_stats()
+        if stats is None:
+            return None
+        return {
+            "size": stats.size,
+            "idle": stats.idle,
+            "in_use": stats.in_use,
+            "waiting": stats.waiting,
+            "max": stats.max_size,
+        }
+
+    register_pool_metrics(_snapshot)
+
+
 async def shutdown_runtime(storage: StorageProvider, tracer: Tracer) -> None:
     """Flush the tracer if supported, then close storage."""
     flush = getattr(tracer, "flush", None)

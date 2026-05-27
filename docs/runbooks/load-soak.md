@@ -165,6 +165,38 @@ watch the worker side in parallel (the report echoes this list under
 - **Scale-to-zero / cold start.** After an idle period, the first soak burst
   pays a cold-start latency tax as KEDA scales the worker pool up from zero —
   expect a fat end-to-end p99 on the first run, recovering as replicas warm.
+- **DB connection-pool saturation (ADR 034 D3).** Each pod opens its own per-pod
+  asyncpg pool. Watch the `mdk.db.pool.*` gauges (Grafana "DB connection pool"
+  row / Azure `AppMetrics`): `mdk.db.pool.in_use` climbing toward
+  `mdk.db.pool.max` and a sustained non-zero `mdk.db.pool.waiting` mean the pool
+  is the bottleneck *before* you hit the connection-exhaustion cliff below.
+
+### Connection-pool sizing (the ceiling that bites under autoscale)
+
+Each KEDA-scaled pod opens up to `pool_max` Postgres connections. With `N` pods
+that is `N x pool_max` connections against **one** Azure Postgres whose
+`max_connections` is finite — overshoot it and new connections fail with *"too
+many clients already"*, a cliff that's invisible until enough pods scale up under
+load. Size the per-pod pool against your KEDA max-replicas so worst-case demand
+stays under the server ceiling, with headroom reserved for superuser / migrations
+/ monitoring connections:
+
+```
+pods x pool_max  <=  max_connections - headroom
+```
+
+where `pods` is the **fleet** ceiling (api `maxReplicas` + worker `maxReplicas`),
+`pool_max` is the per-pod pool ceiling (PostgresProvider's `create_pool(max_size=)`,
+default 10), and `headroom` is a reserve (≈ 20).
+
+`mdk doctor` runs this check automatically (the **db pool capacity** row): it
+probes `pool_max` + `max_connections` from a reachable Postgres (or reads the
+`MOVATE_DB_POOL_MAX_SIZE` / `MOVATE_DB_MAX_CONNECTIONS` / `MOVATE_KEDA_MAX_REPLICAS`
+/ `MOVATE_DB_CONNECTION_HEADROOM` env overrides, else assumed defaults) and warns
+when the formula is violated. If it warns, the fixes are: **lower `pool_max`**,
+**cap KEDA `maxReplicas`**, or **front Postgres with PgBouncer / Azure built-in
+connection pooling** (transaction-pooling mode — the ADR 034 D1 infra piece). Run
+`mdk doctor --explain` for the full per-input breakdown.
 
 ---
 

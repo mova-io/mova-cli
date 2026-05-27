@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -104,6 +105,37 @@ def _vec_literal(embedding: list[float]) -> str:
     on the way back (see ``_parse_embedding``).
     """
     return "[" + ",".join(repr(float(x)) for x in embedding) + "]"
+
+
+@dataclass(frozen=True, slots=True)
+class PoolStats:
+    """A point-in-time snapshot of the asyncpg pool's connection counts.
+
+    Plain data — storage NEVER imports ``tracing`` (boundary rule 6). The edge
+    (``mdk serve`` / ``mdk worker``) reads this and feeds it to the OTel
+    observable gauges in :mod:`movate.tracing.metrics` (ADR 034 D3); ``mdk
+    doctor`` reads ``max_size`` for the connection-ceiling headroom check (D1).
+
+    Fields mirror the asyncpg ``Pool`` getters:
+
+    * ``size``    — connections currently held (open) by the pool.
+    * ``idle``    — of those, how many are checked **in** (available).
+    * ``in_use``  — ``size - idle``: connections currently checked **out**.
+    * ``waiting`` — callers blocked waiting for a free connection (the pool's
+      internal acquire queue). The early-warning saturation signal: a sustained
+      non-zero value means the per-pod pool is the bottleneck.
+    * ``max_size`` — the configured per-pod ceiling (``create_pool(max_size=)``).
+      The denominator for pool-saturation (``in_use / max_size``) and the input
+      to the doctor capacity formula ``pods x max_size <= max_connections - headroom``.
+    * ``min_size`` — the configured floor (warm connections).
+    """
+
+    size: int
+    idle: int
+    in_use: int
+    waiting: int
+    max_size: int
+    min_size: int
 
 
 _SCHEMA = """
@@ -907,6 +939,52 @@ class PostgresProvider:
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+
+    def pool_stats(self) -> PoolStats | None:
+        """Snapshot the live asyncpg pool's connection counts (ADR 034 D3).
+
+        Synchronous + non-blocking: reads the pool's in-memory counters, never
+        touches the DB, so it's safe to call from an OTel observable-gauge
+        callback on the collection thread. Returns ``None`` before ``init()``
+        (no pool yet) so the edge's gauge simply records nothing that cycle.
+
+        ``size`` / ``idle`` / ``max_size`` / ``min_size`` come from asyncpg's
+        public ``Pool`` getters (``get_size`` etc., 0.25.0+). ``in_use`` is
+        derived (``size - idle``). ``waiting`` reads the acquire queue's blocked
+        getters — asyncpg has no public getter for it, so it's read defensively
+        from the LifoQueue's ``_getters`` deque and degrades to ``0`` if a future
+        asyncpg release changes that internal (the gauge stays useful; only the
+        early-warning waiters line goes quiet). Never raises.
+        """
+        pool = self._pool
+        if pool is None:
+            return None
+        try:
+            size = pool.get_size()
+            idle = pool.get_idle_size()
+            max_size = pool.get_max_size()
+            min_size = pool.get_min_size()
+        except Exception:  # pragma: no cover - defensive; getters are simple
+            return None
+        # ``waiting`` = callers parked on the pool's acquire queue. asyncpg uses
+        # an asyncio.LifoQueue whose blocked getters live in ``_getters``; guard
+        # the whole access so an asyncpg internals change can't break the gauge.
+        waiting = 0
+        try:
+            queue = pool._queue
+            getters = getattr(queue, "_getters", None)
+            if getters is not None:
+                waiting = len(getters)
+        except Exception:  # pragma: no cover - defensive
+            waiting = 0
+        return PoolStats(
+            size=size,
+            idle=idle,
+            in_use=max(size - idle, 0),
+            waiting=waiting,
+            max_size=max_size,
+            min_size=min_size,
+        )
 
     # ------------------------------------------------------------------
     # DR backup/restore (item 26) — delegate to the backend-agnostic
