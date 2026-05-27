@@ -82,7 +82,10 @@ from movate.tracing.base import SpanCtx, Tracer
 
 log = logging.getLogger(__name__)
 
-_COST_DRIFT_THRESHOLD = 0.05  # 5%
+# 15% — informational cross-check only. The pricing table
+# (providers/pricing.yaml) is canonical for billing; litellm's bundled
+# prices can lag, so a gap here does not mean our reported cost is wrong.
+_COST_DRIFT_THRESHOLD = 0.15
 
 # Hard cap on tool-use turns. If the model keeps emitting tool calls
 # instead of producing a final answer, the loop bails after this many
@@ -1892,10 +1895,13 @@ class Executor:
         drift = abs(our_cost - float(litellm_cost)) / denom
         if drift > _COST_DRIFT_THRESHOLD:
             log.warning(
-                "cost drift > %.0f%%: pricing-table=$%.6f litellm=$%.6f",
+                "cost cross-check: litellm=$%.6f differs >%.0f%% from canonical "
+                "pricing-table=$%.6f (the table is authoritative for billing; "
+                "litellm's bundled prices can lag — refresh providers/pricing.yaml "
+                "only if the table itself is stale)",
+                litellm_cost,
                 _COST_DRIFT_THRESHOLD * 100,
                 our_cost,
-                litellm_cost,
             )
             self._tracer.log_event(
                 span,
