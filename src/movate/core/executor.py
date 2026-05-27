@@ -187,6 +187,7 @@ class Executor:
         model_override: ModelConfig | None = None,
         workflow_run_id: str | None = None,
         node_id: str | None = None,
+        parent_span: SpanCtx | None = None,
         on_token: Callable[[str], None] | None = None,
         history: list[Message] | None = None,
         tenant_id_override: str | None = None,
@@ -203,6 +204,17 @@ class Executor:
         :class:`RunRecord` when the executor is invoked from a
         :class:`movate.core.workflow.WorkflowRunner` — keeps the runner from
         having to re-save the same run with a workflow link patched on.
+
+        ``parent_span`` optionally nests this run's root ``agent.execute`` span
+        under a caller-provided span (ADR 024 D4). The
+        :class:`~movate.core.workflow.WorkflowRunner` opens one
+        ``workflow.execute`` span per workflow run and threads its
+        :class:`~movate.tracing.base.SpanCtx` in here, so every node's
+        ``agent.execute`` becomes a child of that workflow root — a multi-node
+        workflow renders as ONE nested trace tree (Langfuse / OTel) instead of
+        N disconnected roots. ``None`` (the default, every standalone caller)
+        leaves ``agent.execute`` a root span exactly as before — back-compat is
+        byte-for-byte for non-workflow runs.
 
         ``on_token`` opts into streaming. When set, the executor calls
         ``provider.stream()`` and invokes the callback with each text
@@ -260,6 +272,7 @@ class Executor:
                 "_user_id": request.user_id,
                 "_tags": spec.tags or [],
             },
+            parent=parent_span,
         )
 
         started = time.monotonic()
