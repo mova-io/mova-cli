@@ -427,15 +427,21 @@ def _maybe_trace_line(
     tid = (trace_id or "").strip()
     if not tid:
         return
+    # ADR 031 D1 — when Langfuse is configured, append a one-click deep link
+    # to the run's trace. Omitted (no error) when Langfuse isn't wired.
+    from movate.tracing.langfuse_link import langfuse_trace_url  # noqa: PLC0415
+
+    lf_url = langfuse_trace_url(tid)
+    lf_suffix = f"  ·  [cyan]{lf_url}[/cyan]" if lf_url else ""
     rid = (run_id or "").strip()
     if target and rid:
         _console.hint(
             f"[dim]trace: [bold]{tid}[/bold]  ·  view: [cyan]mdk runs show {rid} "
             f"--target {target}[/cyan]  (or App Insights → Transaction search "
-            f"→ paste the id)[/dim]"
+            f"→ paste the id){lf_suffix}[/dim]"
         )
     else:
-        _console.hint(f"[dim]trace: [bold]{tid}[/bold][/dim]")
+        _console.hint(f"[dim]trace: [bold]{tid}[/bold]{lf_suffix}[/dim]")
 
 
 def _coerce_agent_input(arg: str, bundle: AgentBundle) -> dict[str, Any]:

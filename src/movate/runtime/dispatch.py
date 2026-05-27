@@ -273,11 +273,12 @@ class WorkerDispatch:
         from movate.tracing import build_tracer  # noqa: PLC0415
 
         pricing = load_pricing()
+        tracer = build_tracer()
         executor = Executor(
             provider=provider,
             pricing=pricing,
             storage=self._storage,
-            tracer=build_tracer(),
+            tracer=tracer,
             tenant_id=job.tenant_id,
         )
 
@@ -304,8 +305,17 @@ class WorkerDispatch:
         # the scheduler tick) or any eval that pinned a ``baseline_id``.
         # Ad-hoc evals with neither carry no baseline intent → no drift
         # check, byte-for-byte the old behaviour. Best-effort: a drift /
-        # alert failure never changes the job's SUCCESS outcome.
-        await self._maybe_check_drift(job, record)
+        # alert failure never changes the job's SUCCESS outcome. Returns the
+        # aggregate drift deltas (vs. the selected baseline) so the Langfuse
+        # push below can attach them as scores — empty when no drift ran.
+        drift_deltas = await self._maybe_check_drift(job, record)
+
+        # ADR 031 D1 — surface this eval in Langfuse: push run-level pass-rate
+        # + per-dimension means (+ drift deltas) as scores on the run's trace,
+        # and sync the eval cases to a Langfuse dataset. Best-effort no-op
+        # unless Langfuse is wired; never flips the SUCCESS outcome. Done
+        # before the tracer is flushed by the worker's shutdown.
+        await self._push_eval_to_langfuse(tracer, summary, drift_deltas)
 
         # Store eval_id in result_run_id — field is a generic "result
         # identifier"; the API contract documents this mapping for EVAL jobs.
@@ -315,12 +325,17 @@ class WorkerDispatch:
             error=None,
         )
 
-    async def _maybe_check_drift(self, job: JobRecord, record: Any) -> None:
+    async def _maybe_check_drift(self, job: JobRecord, record: Any) -> dict[str, float] | None:
         """Compare a fresh EvalRecord to a baseline and alert on regression.
 
         Wrapped in a broad try/except: drift detection + alerting are a
         courtesy layer over a SUCCESS eval; nothing here may flip the job's
         outcome or raise into the worker loop.
+
+        Returns the aggregate + per-dimension drift deltas
+        (``{metric: current - baseline}``) so the eval→Langfuse push can
+        attach them as scores. ``None`` when no drift check ran (ad-hoc eval)
+        or it failed — the caller treats that as "no drift scores".
         """
         from movate.core.drift import alert_on_drift, detect_drift, select_baseline  # noqa: PLC0415
 
@@ -328,7 +343,7 @@ class WorkerDispatch:
         scheduled = bool(cfg.get("scheduled", False))
         baseline_id = cfg.get("baseline_id") or None
         if not scheduled and baseline_id is None:
-            return  # ad-hoc eval, no baseline intent — nothing to diff
+            return None  # ad-hoc eval, no baseline intent — nothing to diff
 
         try:
             tolerance = float(cfg.get("regression_tolerance", 0.05))
@@ -357,6 +372,16 @@ class WorkerDispatch:
             # also trip the kill switch back to the champion. Off by default →
             # this is a no-op and the behaviour above is byte-for-byte today's.
             await self._maybe_auto_rollback(job, record, result)
+            # ADR 031 D1 — hand the deltas back so they render as Langfuse
+            # scores. Only meaningful when a baseline was found.
+            if result.baseline is None:
+                return None
+            deltas: dict[str, float] = {
+                "mean_score": result.mean_score_delta,
+                "pass_rate": result.pass_rate_delta,
+            }
+            deltas.update(result.dimension_deltas)
+            return deltas
         except Exception:
             logger.warning(
                 "eval_drift_check_failed job_id=%s agent=%s — eval result is "
@@ -365,6 +390,23 @@ class WorkerDispatch:
                 record.agent,
                 exc_info=True,
             )
+            return None
+
+    async def _push_eval_to_langfuse(
+        self, tracer: Any, summary: Any, drift_deltas: dict[str, float] | None
+    ) -> None:
+        """Best-effort: mirror a dispatched eval to Langfuse (ADR 031 D1).
+
+        Pushes run-level pass-rate + per-dimension means (+ drift deltas) as
+        Langfuse scores and syncs the eval cases to a Langfuse dataset. The
+        tracing-layer edge helpers no-op when ``tracer`` isn't a Langfuse one
+        and swallow SDK errors, so this never flips the job outcome.
+        """
+        from movate.tracing.eval_sync import push_eval_scores, sync_eval_dataset  # noqa: PLC0415
+
+        await push_eval_scores(tracer, summary, drift_deltas=drift_deltas)
+        cases = [cs.case for cs in summary.cases]
+        await sync_eval_dataset(tracer, agent=summary.agent, cases=cases)
 
     async def _maybe_auto_rollback(self, job: JobRecord, record: Any, result: Any) -> None:
         """Opt-in: revert a regressed challenger to the champion (ADR 016 D5).

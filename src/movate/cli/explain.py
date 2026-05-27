@@ -28,6 +28,7 @@ from movate.cli._run_tree import build_run_tree
 from movate.cli._runtime import build_storage
 from movate.core.explain import explain_run
 from movate.core.models import JobStatus, RunRecord, SkillCallRecord
+from movate.tracing.langfuse_link import langfuse_trace_url
 
 console = Console()
 err = Console(stderr=True)
@@ -274,6 +275,13 @@ def _render_chain(record: RunRecord, *, show_steps: bool = False) -> None:
 
     if m.latency_ms:
         console.print(f"  [dim]Latency:[/dim] [cyan]{m.latency_ms} ms[/cyan]")
+
+    # ---- Langfuse trace link (ADR 031 D1) ----
+    # When the run was traced to Langfuse + Langfuse is configured, surface a
+    # one-click deep link to the trace. Omitted (no line) otherwise.
+    lf_url = langfuse_trace_url(m.trace_id)
+    if lf_url:
+        console.print(f"  [dim]Langfuse:[/dim] [cyan]{lf_url}[/cyan]")
 
     # ---- Output or Error ----
     if record.output is not None:

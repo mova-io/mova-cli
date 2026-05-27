@@ -26,6 +26,7 @@ from movate.core.replay import (
     render_replay_json,
     truncate,
 )
+from movate.tracing.langfuse_link import langfuse_trace_url
 
 trace_app = typer.Typer(
     name="trace",
@@ -111,6 +112,11 @@ def _render_agent(replay_data: Replay, *, verbose: bool) -> None:
     head.add_row("prompt_hash", r.prompt_hash[:16] + "…" if r.prompt_hash else "—")
     head.add_row("created_at", r.created_at.isoformat())
     head.add_row("run_id", r.run_id)
+    # ADR 031 D1 — one-click Langfuse deep link when the run was traced
+    # there + Langfuse is configured. Omitted (no row) otherwise.
+    _lf_url = langfuse_trace_url(r.metrics.trace_id)
+    if _lf_url:
+        head.add_row("langfuse", _lf_url)
     if r.workflow_run_id:
         head.add_row("workflow_run_id", r.workflow_run_id)
         head.add_row("node_id", r.node_id or "—")

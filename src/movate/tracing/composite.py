@@ -162,6 +162,38 @@ class CompositeTracer(Tracer):
                 continue
         return None
 
+    # ----- score_eval_summary / sync_dataset (Langfuse extensions, ADR 031) -
+
+    async def score_eval_summary(self, **kwargs: object) -> None:
+        """Fan-out :meth:`LangfuseTracer.score_eval_summary` to delegates that
+        support it. Fail-soft: a raising delegate doesn't stop the others and
+        never breaks the eval."""
+        for delegate in self._tracers:
+            fn = getattr(delegate, "score_eval_summary", None)
+            if not callable(fn):
+                continue
+            try:
+                await fn(**kwargs)
+            except Exception:  # pragma: no cover
+                continue
+
+    async def sync_dataset(self, **kwargs: object) -> int:
+        """Fan-out :meth:`LangfuseTracer.sync_dataset` to delegates that
+        support it. Returns the max items synced by any single delegate
+        (each backend syncs independently). Fail-soft."""
+        synced = 0
+        for delegate in self._tracers:
+            fn = getattr(delegate, "sync_dataset", None)
+            if not callable(fn):
+                continue
+            try:
+                result = await fn(**kwargs)
+                if isinstance(result, int):
+                    synced = max(synced, result)
+            except Exception:  # pragma: no cover
+                continue
+        return synced
+
     # ----- lifecycle --------------------------------------------------------
 
     def flush(self) -> None:

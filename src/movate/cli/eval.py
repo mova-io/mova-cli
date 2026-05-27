@@ -2563,6 +2563,14 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
         record = summary.to_record()
         await rt.storage.save_eval(record)
         baseline_record = await _resolve_storage_baseline(rt.storage, baseline_id)
+        # ADR 031 D1 — surface this eval in Langfuse: push the run-level
+        # pass-rate + per-dimension means (+ drift deltas vs. the storage
+        # baseline) as Langfuse scores on the run's trace, and sync the
+        # eval cases to a Langfuse dataset. Both are best-effort no-ops
+        # unless Langfuse is wired (rt.tracer exposes the extension) and
+        # the run produced a real trace id — done before the tracer is
+        # flushed in the finally block. Never fails the eval.
+        await _push_eval_to_langfuse(rt.tracer, summary, baseline_record, record)
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
         if remote_client is not None:
@@ -2699,6 +2707,35 @@ async def _run_eval(  # noqa: PLR0912 — orchestrator; branch count is inherent
     failed_regression = diff is not None and diff.is_regression(tolerance=regression_tolerance)
     if failed_gate or failed_regression or failed_dim:
         raise typer.Exit(code=1)
+
+
+async def _push_eval_to_langfuse(
+    tracer: Any,
+    summary: EvalSummary,
+    baseline_record: EvalRecord | None,
+    record: EvalRecord,
+) -> None:
+    """Best-effort: mirror this eval to Langfuse (ADR 031 D1).
+
+    Pushes the run-level pass-rate + per-dimension means (plus aggregate
+    drift deltas vs. ``baseline_record`` when one exists) as Langfuse scores
+    on the run's trace, then syncs the eval cases to a Langfuse dataset.
+    Delegates to the tracing-layer edge helpers, which no-op when the tracer
+    isn't a Langfuse one and swallow any SDK error — so this can't fail the
+    eval. Imported lazily so the tracing extension surface is only touched on
+    the eval path."""
+    from movate.tracing.eval_sync import push_eval_scores, sync_eval_dataset  # noqa: PLC0415
+
+    drift_deltas: dict[str, float] | None = None
+    if baseline_record is not None:
+        diff = compute_baseline_diff(baseline_record, record)
+        drift_deltas = {
+            "mean_score": diff.mean_score_delta,
+            "pass_rate": diff.pass_rate_delta,
+        }
+    await push_eval_scores(tracer, summary, drift_deltas=drift_deltas)
+    cases = [cs.case for cs in summary.cases]
+    await sync_eval_dataset(tracer, agent=summary.agent, cases=cases)
 
 
 async def _run_variant_comparison(

@@ -2480,6 +2480,17 @@ def _print_next_steps(
         "  [bold]traces:[/bold] App Insights → Transaction search "
         "[dim](paste a run's trace_id)[/dim]"
     )
+    # ADR 031 D1 — when Langfuse is configured for this shell, point operators
+    # at the LLM-observability dashboard too (one click from a run's trace_id).
+    # Omitted when Langfuse isn't wired (no host/keys) → no behavior change.
+    from movate.tracing.langfuse_link import _configured_host  # noqa: PLC0415
+
+    lf_host = _configured_host()
+    if lf_host:
+        err.print(
+            f"  [bold]Langfuse:[/bold] [cyan]{lf_host}[/cyan] "
+            "[dim](LLM traces, eval scores + datasets)[/dim]"
+        )
     err.print()
 
 
