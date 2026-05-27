@@ -390,9 +390,14 @@ def test_cli_main_import_does_not_load_mcp_server() -> None:
 def test_mcp_command_is_registered() -> None:
     """`mdk mcp serve` is wired into the top-level app (additive command group)."""
     runner = CliRunner()
-    result = runner.invoke(app, ["mcp", "serve", "--help"])
+    # Force a wide terminal so Rich doesn't wrap/hyphenate the flag name in the
+    # rendered help panel — under CI's narrow non-TTY width the literal
+    # "--list-tools" substring gets split across lines and the assert fails.
+    result = runner.invoke(app, ["mcp", "serve", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    assert "--list-tools" in result.stdout
+    # Normalize whitespace to survive any residual Rich wrapping/box-drawing.
+    normalized = " ".join(result.stdout.split())
+    assert "--list-tools" in normalized
 
 
 def test_list_tools_flag_prints_manifest(tmp_path: Path) -> None:
