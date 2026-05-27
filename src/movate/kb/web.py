@@ -32,8 +32,10 @@ from a start URL, following ``<a href>`` links to other pages on the
 zero new shipped dependencies — link discovery is a second stdlib
 :class:`html.parser.HTMLParser` subclass.
 
-Scope: single page (F5) + bounded crawl (F6). ``--llm``
-auto-ingest wiring (F7) is deferred.
+Scope: single page (F5) + bounded crawl (F6). F7 (#116) reuses these
+same functions — :func:`first_url` recovers a URL from a free-text
+``--llm`` description and ``mdk init --llm`` then drives :func:`crawl_site`
+to auto-populate the new RAG agent's KB.
 """
 
 from __future__ import annotations
@@ -51,6 +53,22 @@ from urllib.parse import urldefrag, urljoin, urlsplit
 # iff it starts with an ``http://`` or ``https://`` scheme. Everything
 # else stays on the unchanged local-file path — keeps backward compat.
 _URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+# Matches the first http(s) URL embedded ANYWHERE in a string (vs.
+# :data:`_URL_SCHEME_RE` which anchors at the start). Used by F7 (#116)
+# to pull a URL out of a free-text ``--llm`` description like
+# "answer questions about https://movate.com". Stops at whitespace and
+# the bracketing/quoting punctuation that's never part of a URL
+# ( <>"'(),;!? ). Deliberately conservative — it never has to be a perfect
+# URL parser, just good enough to recover the page/site to seed.
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"'(),;!?]+", re.IGNORECASE)
+
+# Trailing characters stripped from a recovered URL — almost always
+# sentence punctuation rather than part of the address (a real path
+# rarely ends in "." or ":"). Kept separate from the match's character
+# class because "." is legal MID-URL (domains, file extensions) — only a
+# TRAILING run of these is prose.
+_URL_TRAILING_PUNCT = ".:"
 
 # Default GET timeout (seconds). Generous enough for slow origins but
 # bounded so a hung server surfaces a clean typed error rather than
@@ -210,6 +228,27 @@ def is_url(arg: str) -> bool:
     path (unchanged behavior). Case-insensitive on the scheme.
     """
     return bool(_URL_SCHEME_RE.match(arg))
+
+
+def first_url(text: str) -> str | None:
+    """Return the first http(s) URL embedded in ``text``, or ``None``.
+
+    Unlike :func:`is_url` (which tests whether the *whole* string is a
+    URL), this scans free-text for an embedded URL — e.g. it recovers
+    ``https://movate.com`` from ``"answer questions about
+    https://movate.com"``. Used by F7 (#116) to decide whether a
+    ``--llm`` description carries a site to auto-ingest after scaffolding.
+
+    A trailing ``.`` / ``)`` / ``,`` (etc.) that's really sentence
+    punctuation is stripped by the matcher's character class, so
+    ``"…about https://movate.com."`` yields ``https://movate.com``.
+    Returns ``None`` when no http(s) URL is present (the no-auto-ingest
+    path).
+    """
+    match = _URL_IN_TEXT_RE.search(text)
+    if match is None:
+        return None
+    return match.group(0).rstrip(_URL_TRAILING_PUNCT)
 
 
 class _TextExtractor(HTMLParser):

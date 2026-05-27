@@ -899,6 +899,154 @@ def _ingest_url(
     asyncio.run(_run())
 
 
+# F7 (#116): the embedding env vars the auto-ingest path checks before
+# crawling. Auto-ingest embeds locally (same as `mdk kb ingest <url>`),
+# so it needs an embedding key — but unlike the explicit command it must
+# NEVER fail `mdk init`: a missing key just skips the ingest with a hint.
+# OpenAI's key drives the default `text-embedding-3-small` model.
+_AUTO_INGEST_EMBED_KEY_ENV = "OPENAI_API_KEY"
+
+
+class AutoIngestSkippedError(Exception):
+    """Raised by :func:`auto_ingest_url` when the bonus ingest can't run.
+
+    Carries a human-readable reason (already formatted for the operator).
+    The caller (``mdk init --llm``) catches this, prints the reason plus
+    the exact manual command, and exits SUCCESS — the agent scaffold is
+    already on disk and valid, so a failed auto-ingest is never fatal.
+    """
+
+
+async def auto_ingest_url(
+    *,
+    agent: str,
+    url: str,
+    project_root: Path,
+    max_pages: int = WEB_DEFAULT_MAX_PAGES,
+    max_depth: int = WEB_DEFAULT_MAX_DEPTH,
+    crawl: bool = True,
+) -> int:
+    """Best-effort: crawl (or fetch) ``url`` into the new agent's KB (F7, #116).
+
+    The loop-closer for ``mdk init --llm "answer questions about <url>"``:
+    after a RAG agent is scaffolded, this auto-populates its KB from the
+    URL so it can actually answer. It reuses the EXISTING ingest path —
+    :func:`movate.kb.web.crawl_site` (bounded same-site BFS) or
+    :func:`movate.kb.web.fetch_and_extract` (single page) feeding the
+    unchanged :func:`movate.kb.ingest.ingest_text` pipeline — rather than
+    reimplementing fetch / extract / chunk / embed.
+
+    Async because the caller (``mdk init --llm``) already runs inside an
+    event loop (the scaffold flow is ``asyncio.run``-driven); a nested
+    ``asyncio.run`` would raise. The synchronous ``crawl_site`` fetch is
+    run in a worker thread so it doesn't block the loop.
+
+    Returns the number of pages successfully ingested. Raises
+    :class:`AutoIngestSkippedError` (never a bare exception, never
+    ``typer.Exit``) on ANY problem — no embedding key, an unreachable
+    URL, a crawl that finds nothing, or an embed/store failure — so the
+    caller can warn + print the manual command + exit success with the
+    scaffold intact. The network action is announced to stderr before any
+    fetch so the operator knows a request is about to go out.
+    """
+    import asyncio as _asyncio  # noqa: PLC0415
+    import os  # noqa: PLC0415
+
+    from movate.kb.ingest import ingest_text  # noqa: PLC0415
+    from movate.kb.web import (  # noqa: PLC0415
+        WebFetchError,
+        crawl_site,
+        fetch_and_extract,
+    )
+
+    # Auto-ingest embeds locally — it needs an embedding key. Missing key
+    # is the single most common reason this can't run; skip cleanly
+    # (NEVER fail init) and point the operator at the manual command.
+    api_key = os.environ.get(_AUTO_INGEST_EMBED_KEY_ENV, "").strip()
+    if not api_key:
+        raise AutoIngestSkippedError(
+            f"no embedding key in ${_AUTO_INGEST_EMBED_KEY_ENV} — "
+            "set it, then ingest the site into the agent's KB manually."
+        )
+
+    # Announce the network action to stderr before doing it.
+    if crawl:
+        err_console.print(
+            f"[bold cyan]Ingesting[/bold cyan] {url} "
+            f"[dim](crawl, max {max_pages} pages, depth {max_depth}, same site only)[/dim]…"
+        )
+    else:
+        err_console.print(f"[bold cyan]Ingesting[/bold cyan] {url} [dim](single page)[/dim]…")
+
+    def _on_page(page_url: str, fetched: int, cap: int) -> None:
+        err_console.print(f"  [green]✓[/green] [{fetched}/{cap}] fetched {page_url}")
+
+    def _on_skip(page_url: str, reason: str) -> None:
+        err_console.print(f"  [yellow]⚠[/yellow] skipped {page_url} — {reason}")
+
+    # Gather pages first (network only — no storage writes yet) so a total
+    # fetch failure leaves the KB untouched. crawl_site already isolates
+    # per-page failures and never raises; the single-page path raises
+    # WebFetchError, which we translate to AutoIngestSkippedError. Both are
+    # synchronous (httpx) — offload to a thread so the event loop the
+    # caller is running on isn't blocked for the duration of the crawl.
+    pages: list[tuple[str, str]]  # (source_url, text)
+    if crawl:
+        result = await _asyncio.to_thread(
+            crawl_site,
+            url,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            on_page=_on_page,
+            on_skip=_on_skip,
+        )
+        pages = [(p.url, p.text) for p in result.pages]
+        if not pages:
+            raise AutoIngestSkippedError(
+                f"crawl of {url} found nothing ingestible "
+                f"({result.skipped_count} page(s) skipped) — "
+                "check the URL is reachable and serves HTML."
+            )
+    else:
+        try:
+            text = await _asyncio.to_thread(fetch_and_extract, url)
+        except WebFetchError as exc:
+            raise AutoIngestSkippedError(str(exc)) from exc
+        pages = [(url, text)]
+
+    storage = await _build_storage()
+    ingested = 0
+    try:
+        for page_url, text in pages:
+            try:
+                summary = await ingest_text(
+                    storage=storage,  # type: ignore[arg-type]
+                    text=text,
+                    source=page_url,
+                    agent=agent,
+                    tenant_id=_DEFAULT_TENANT,
+                    api_key=api_key,
+                )
+            except Exception as exc:
+                # Per-page isolation: one bad embed/store must not abort the
+                # rest of the crawl's pages.
+                err_console.print(f"  [yellow]⚠[/yellow] failed to ingest {page_url} — {exc}")
+                continue
+            if summary is not None:
+                ingested += 1
+    finally:
+        await storage.close()  # type: ignore[attr-defined]
+
+    if ingested == 0:
+        # Pages fetched but every embed/store failed (e.g. a bad embedding
+        # endpoint). Treat as skipped — the scaffold still stands.
+        raise AutoIngestSkippedError(
+            f"fetched {len(pages)} page(s) from {url} but none could be "
+            "embedded/stored — check the embedding provider + key."
+        )
+    return ingested
+
+
 def _ingest_crawl(
     *,
     agent: str,
