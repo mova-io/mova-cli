@@ -7,9 +7,12 @@ Three modes:
   behavior shipped pre-Sprint P.
 
 * **Project mode** (``--project``): bootstrap a fresh movate workspace
-  with ``movate.yaml`` + ``.env.example`` + ``.gitignore`` + empty
-  ``agents/``. Auto-creates an initial snapshot so the operator has
-  a baseline for ``mdk diff`` / ``mdk rollback`` immediately.
+  with ``project.yaml`` + ``AGENTS.md`` + ``.env.example`` +
+  ``.gitignore`` + empty ``agents/``. ``AGENTS.md`` is the cross-agent
+  onboarding file (ADR 025) — it teaches a coding agent (Claude Code,
+  Cursor, …) how to evolve THIS project. Auto-creates an initial
+  snapshot so the operator has a baseline for ``mdk diff`` /
+  ``mdk rollback`` immediately.
 
 * **LLM-scaffold mode** (``--llm "<description>"``): generate the
   agent from a natural-language description using an LLM. The
@@ -513,6 +516,136 @@ __pycache__/
 """
 
 
+# Project-root AGENTS.md — the cross-agent onboarding file (ADR 025).
+#
+# `AGENTS.md` is the emerging tool-agnostic convention (Claude Code,
+# Cursor, etc. all read it) — like CLAUDE.md but not Claude-specific.
+# This one teaches a coding agent how to evolve THIS mdk project: the
+# canonical agent layout (#127), the authoring-command catalog, the
+# feedback loop to run after edits, and the guardrails to respect.
+#
+# Every command + flag below MUST resolve in the Typer app — a guard
+# test (`tests/test_init_agents_md.py`) walks the catalog and fails if
+# any referenced command stops existing, so this file can't drift into
+# documenting commands that don't exist. Keep it factual; do not add a
+# command here without verifying it (and its flags) against `mdk`.
+#
+# `{name}` is the project name (folder/identity). Substituted at write
+# time via ``.format(name=...)``, same as ``_PROJECT_MOVATE_YAML``.
+_PROJECT_AGENTS_MD = """\
+# AGENTS.md — guide for AI coding agents working in `{name}`
+
+This is an **mdk** (`movate-cli`) project: a workspace of AI agents you
+build, evaluate, and deploy with the `mdk` CLI. This file teaches a
+coding agent (Claude Code, Cursor, …) how to evolve the agents in this
+project safely. It is tool-agnostic — `AGENTS.md` is the cross-agent
+convention; everything here applies whatever assistant is reading it.
+
+Prefer the `mdk` commands below over hand-editing files: they keep the
+canonical layout intact, auto-attach references, and validate as they
+go. Reach for a raw editor only for `prompt.md` (the agent's
+instructions) — that's the one file you're *meant* to write by hand.
+
+## Canonical agent layout
+
+Every agent `mdk` scaffolds uses ONE on-disk shape, regardless of how
+it was created (`mdk init <name>`, `mdk add <role>`, or
+`mdk init <name> --llm "<description>"`):
+
+```
+agents/<agent>/
+  agent.yaml          # model, timeouts, budget, tags; schema via ./schema/*.yaml
+  prompt.md           # the agent's instructions — edit this by hand
+  evals/
+    dataset.jsonl     # eval cases (one JSON object per line)
+    judge.yaml.example # copy to judge.yaml to enable an LLM judge
+  schema/
+    input.yaml        # input contract (YAML JSON-Schema 2020-12)
+    output.yaml       # output contract
+```
+
+Other things live at the **project** level, shared across agents:
+
+| Path | What it holds |
+|---|---|
+| `contexts/<name>.md` | Reusable prompt fragments prepended at runtime |
+| `agents/<agent>/contexts/<name>.md` | Per-agent context override (wins on collision) |
+| `skills/<name>/` | Callable tools (`skill.yaml` + `impl.py`) |
+| `agents/<agent>/kb/` | Per-agent knowledge-base documents for retrieval |
+| `project.yaml` | Project config + defaults + policy gates |
+
+Both schema forms load identically: the inline shorthand in
+`agent.yaml` (`schema: {{ input: {{ text: string }} }}`) for tiny
+2-to-3-field contracts, and the `schema/*.yaml` files above (what the
+scaffolders emit). Pick whichever fits the contract.
+
+## Authoring command catalog
+
+Run all of these **from the project root** (the directory holding
+`project.yaml`). `<agent>` is a directory name under `agents/`.
+
+| Command | What it does |
+|---|---|
+| `mdk add <template> [--name <n>]` | Scaffold a new agent from a role template into `agents/`. |
+| `mdk contexts create <name> --agent <agent>` | Create a context fragment + auto-attach it. |
+| `mdk kb ingest <agent> <path-or-url> [--crawl]` | Ingest a file, dir, or URL into the KB. |
+| `mdk skills scaffold <name>` | Scaffold a new skill under `skills/<name>/`. |
+| `mdk validate <agent>` | Static-check the agent (schema, policy, references) — no LLM call. |
+| `mdk run <agent> --mock '<json>'` | Zero-cost smoke run with the deterministic mock provider. |
+| `mdk eval <agent> --mock` | Run the eval dataset under the mock provider — no API spend. |
+| `mdk dev <agent>` | Resident edit → test loop: re-validates and re-runs as you edit. |
+
+`mdk kb ingest`'s `--crawl` only applies to a URL source — it follows
+links to ingest a small site rather than a single page.
+
+To change an agent's behavior, **edit its `prompt.md`** — that file is
+the agent's instructions and is meant to be hand-authored.
+
+## The feedback loop (run after every edit)
+
+After changing a `prompt.md`, `agent.yaml`, schema, or context, run
+this loop to confirm the agent still loads and behaves — all of it
+zero-cost (`--mock` never calls a provider):
+
+```
+mdk validate <agent>            # 1. does it still load + pass policy?
+mdk run <agent> --mock '<json>' # 2. does a single mock run succeed?
+mdk eval <agent> --mock         # 3. does the eval dataset still pass?
+```
+
+Or run `mdk dev <agent>` to have that loop run automatically as you
+save files.
+
+## Guardrails (read before you touch anything)
+
+- **Never write to `~/.movate/`.** That's the global state dir
+  (credentials, machine-local config). This project's runtime state
+  lives in `.mdk/` inside the project, managed by `mdk` — don't
+  hand-edit it either.
+- **Use `--mock` for smoke tests.** It uses a deterministic offline
+  provider, so `mdk run`/`mdk eval` cost nothing and need no API key.
+  Drop `--mock` only when you intend to spend real tokens.
+- **Run `mdk` from the project root** (where `project.yaml` is). The
+  commands resolve `agents/`, `skills/`, `contexts/`, and `kb/`
+  relative to it.
+- **Prefer the commands above over hand-editing.** `mdk add`,
+  `mdk contexts create`, `mdk skills scaffold`, and `mdk kb ingest`
+  keep the canonical layout and references consistent. The one file
+  you *should* edit by hand is `prompt.md`.
+- **Both schema forms are valid.** Inline `schema:` in `agent.yaml`
+  and `schema/*.yaml` files both load — don't "fix" one into the
+  other.
+
+## See also
+
+- `project.yaml` — project config, defaults, and policy gates (read
+  top-to-bottom; every block is documented in place).
+- `mdk doctor agent <agent>` — shows the merged config + resolved
+  contexts/skills an agent uses.
+- `mdk add --list` — the catalog of role templates you can scaffold.
+"""
+
+
 # Env-var names every LiteLLM-backed provider checks for credentials.
 # Kept in sync with the same list in :mod:`movate.cli.doctor` — adding a
 # provider here means adding it there too.
@@ -658,6 +791,10 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
     (project_root / "project.yaml").write_text(_PROJECT_MOVATE_YAML.format(name=project_name))
     (project_root / ".env.example").write_text(_PROJECT_ENV_EXAMPLE)
     (project_root / ".gitignore").write_text(_PROJECT_GITIGNORE)
+    # AGENTS.md — the cross-agent onboarding file (ADR 025). Teaches a
+    # coding agent how to evolve THIS project: canonical layout, the
+    # authoring-command catalog, the post-edit feedback loop, guardrails.
+    (project_root / "AGENTS.md").write_text(_PROJECT_AGENTS_MD.format(name=project_name))
 
     # Four empty top-level dirs with .gitkeep placeholders so they
     # survive `git add`:
@@ -729,6 +866,7 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
         f"[dim](open this folder in your IDE — agents/, skills/, contexts/, kb/ "
         f"are all here)[/dim]\n\n"
         f"  • [cyan]project.yaml[/cyan]   project config\n"
+        f"  • [cyan]AGENTS.md[/cyan]      guide for AI coding agents (Claude Code, Cursor, …)\n"
         f"  • [cyan].env.example[/cyan]   env-var template\n"
         f"  • [cyan].gitignore[/cyan]     standard ignores\n"
         f"  • [cyan]agents/[/cyan]        empty (waiting for agents)\n"
