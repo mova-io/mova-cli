@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.27.17"
+version = "2026.5.27.18"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -202,6 +202,33 @@ github = [
     # install what they need.
     "cryptography>=42",
 ]
+prefect = [
+    # External-orchestrator adapter (ADR 017 D3): a Prefect @task wrapper
+    # so a team that already runs Prefect drives a movate agent/workflow
+    # as one step of a flow. movate stays the *callable*, never the
+    # *dependent* — `prefect` is imported LAZILY inside
+    # movate.integrations.prefect, so the base install (and every other
+    # command) is unaffected and Prefect's API churn touches only that
+    # thin wrapper. Prefect is Apache-2.0 (permissive). OPT-IN only —
+    # NOT in the license gate's SHIPPED_EXTRAS, so it isn't policed as
+    # part of the default deliverable (same posture as anthropic/openai/
+    # github/easyocr above).
+    "prefect>=2.14,<4",
+]
+airflow = [
+    # External-orchestrator adapter (ADR 017 D3): a MovateAgentOperator
+    # (BaseOperator subclass) so a team that already runs Airflow drives a
+    # movate agent/workflow as one task in a DAG. Same posture as the
+    # prefect extra: `apache-airflow` is imported LAZILY inside
+    # movate.integrations.airflow (the operator class is built on first
+    # access via PEP 562 __getattr__), so the base install is unaffected.
+    # apache-airflow is Apache-2.0 (permissive). OPT-IN only — NOT in the
+    # license gate's SHIPPED_EXTRAS.
+    #
+    # NOTE the dist is `apache-airflow` (the `airflow` name on PyPI is an
+    # unrelated stub). The import package, however, is `airflow`.
+    "apache-airflow>=2.7,<3",
+]
 playground = [
     # Chainlit gives us a Python-native chat/form UI for testing
     # deployed agents from a browser. Operators run
@@ -350,6 +377,11 @@ module = [
     "sentence_transformers.*",
     # Anthropic SDK — optional native-anthropic runtime extra.
     "anthropic.*",
+    # External-orchestrator adapters (ADR 017 D3) — optional extras with no
+    # type stubs. Imported LAZILY inside the adapter functions/factory; this
+    # keeps mypy on `src` clean whether or not the extras are installed.
+    "prefect.*",
+    "airflow.*",
 ]
 ignore_missing_imports = true
 
