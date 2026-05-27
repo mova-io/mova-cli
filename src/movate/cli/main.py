@@ -191,6 +191,7 @@ from movate.cli import watch as watch_cmd  # noqa: E402
 from movate.cli import worker as worker_cmd  # noqa: E402
 from movate.cli.agent_cmd import agent_app  # noqa: E402
 from movate.cli.auth import auth_app  # noqa: E402
+from movate.cli.authoring_cmd import authoring_app  # noqa: E402
 from movate.cli.backup_cmd import export_state_cmd, import_state_cmd  # noqa: E402
 from movate.cli.batch_cmd import batch_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
@@ -423,6 +424,10 @@ app.add_typer(kb_app, name="kb", rich_help_panel=PANEL_DEVELOP)
 # the "did my policy.md actually load?" diagnostic. Lives next to `kb`
 # since both answer "what supporting content does my agent have?".
 app.add_typer(contexts_app, name="contexts", rich_help_panel=PANEL_DEVELOP)
+# `authoring` is the typed, reversible action catalog (ADR 025) — the spine the
+# conversational copilot + MCP server (later PRs) build on. Develop panel since
+# it's how you *evolve* an agent after init (plan → apply → verify → undo).
+app.add_typer(authoring_app, name="authoring", rich_help_panel=PANEL_DEVELOP)
 app.command("fmt", rich_help_panel=PANEL_DEVELOP)(fmt_cmd.fmt)
 app.add_typer(docs_app, name="docs", rich_help_panel=PANEL_DEVELOP)
 app.command("show", rich_help_panel=PANEL_DEVELOP)(show_cmd.show)
