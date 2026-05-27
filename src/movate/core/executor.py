@@ -44,6 +44,7 @@ from movate.core.failures import (
     PolicyViolationError,
     SchemaError,
     TenantBudgetExceededError,
+    ToolError,
 )
 from movate.core.loader import AgentBundle
 from movate.core.models import (
@@ -343,6 +344,31 @@ class Executor:
                 bundle.input_validator.validate(request.input)
             except JsonSchemaError as exc:
                 raise SchemaError(f"input failed schema: {exc.message}") from exc
+
+            # ADR 023 — opt-in declarative pre-retrieval (auto-RAG).
+            # Runs AFTER input validation and BEFORE prompt render, in
+            # this ONE shared Executor, so grounding is identical across
+            # planes (local `mdk run`, runtime inline, worker) by
+            # construction. Entirely gated behind `retrieval.auto_into`
+            # — with no `retrieval:` block (the dominant non-RAG path),
+            # ``_maybe_pre_retrieve`` returns immediately and the run is
+            # byte-for-byte unchanged. On success it mutates
+            # ``request.input[auto_into]`` and RE-VALIDATES the input
+            # against the schema so the populated field still conforms.
+            if bundle.spec.retrieval.auto_retrieval_enabled:
+                await self._maybe_pre_retrieve(
+                    bundle=bundle,
+                    request=request,
+                    span=span,
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                )
+                try:
+                    bundle.input_validator.validate(request.input)
+                except JsonSchemaError as exc:
+                    raise SchemaError(
+                        f"input failed schema after pre-retrieval: {exc.message}"
+                    ) from exc
 
             rendered = bundle.render_prompt(request.input)
 
@@ -760,6 +786,235 @@ class Executor:
                 started=started,
                 err=exc.last_error,
             )
+
+    async def _maybe_pre_retrieve(
+        self,
+        *,
+        bundle: AgentBundle,
+        request: RunRequest,
+        span: SpanCtx,
+        run_id: str,
+        tenant_id: str,
+    ) -> None:
+        """ADR 023 pre-retrieval phase — invoked only when
+        ``retrieval.auto_into`` is set (gated by the caller).
+
+        Builds the retrieval skill's input from ``query_from`` (+
+        ``top_k`` if set), invokes ``retrieval.skill`` THROUGH the
+        existing :func:`dispatch_skill` seam (no second retrieval code
+        path; no concrete storage backend imported into ``core``), and
+        writes the returned chunk texts into ``request.input[auto_into]``
+        as a ``list[string]``. Mutates ``request.input`` in place; the
+        caller re-validates against the schema afterwards.
+
+        Failure modes (ADR 023 D4):
+
+        * ``when: if_empty`` (default) — skip if ``auto_into`` already
+          holds a non-empty value (respects an explicitly-passed value;
+          preserves eval determinism). ``always`` retrieves regardless.
+        * No retriever / empty KB — NO-OP with one stderr notice; the
+          run proceeds (the prompt's empty-context branch handles it).
+          Never a hard failure regardless of ``on_error``.
+        * Empty results — set ``auto_into`` to ``[]`` and proceed.
+        * Retrieval/embedding error — surfaced via the ADR 002
+          ``SkillError`` taxonomy. ``on_error: warn`` (default) proceeds
+          ungrounded with a notice; ``on_error: fail`` re-raises so the
+          run aborts with a typed error.
+        """
+        # Local imports keep skill_backend / loader out of the hot-path
+        # module-load graph (same pattern as the tool-use loop) and the
+        # ``core`` boundary clean — we touch only the SkillBackend
+        # Protocol + StorageProvider handle, never a concrete backend.
+        from movate.core.skill_backend import (  # noqa: PLC0415
+            SkillError,
+            SkillExecutionContext,
+            dispatch_skill,
+        )
+        from movate.core.skill_backend import agent as _agent_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
+
+        cfg = bundle.spec.retrieval
+        auto_into = cfg.auto_into
+        assert auto_into is not None  # gated by the caller (auto_retrieval_enabled)
+
+        # ``when: if_empty`` (default) respects an explicitly-passed
+        # value — skip retrieval entirely so eval/test determinism holds.
+        if cfg.when == "if_empty":
+            existing = request.input.get(auto_into)
+            if existing:  # non-empty list / string / dict — caller supplied grounding
+                self._tracer.log_event(
+                    span,
+                    {"pre_retrieval_skipped": "field_non_empty", "auto_into": auto_into},
+                )
+                return
+
+        # Resolve the retrieval skill from the agent's declared skills.
+        # `mdk validate` enforces this resolves; at run time a missing
+        # skill is a no-op notice (KB-less / misconfigured environments
+        # must not hard-fail the dominant path — D4).
+        skill = next(
+            (s for s in bundle.skills if s.spec.name == cfg.auto_skill),
+            None,
+        )
+        if skill is None:
+            self._pre_retrieval_notice(
+                span,
+                auto_into,
+                f"retrieval skill {cfg.auto_skill!r} is not wired on agent "
+                f"{bundle.spec.name!r}; proceeding ungrounded",
+            )
+            request.input.setdefault(auto_into, [])
+            return
+
+        # Build the retrieval query from `query_from` (or the resolved
+        # primary text field). An empty/missing query is a no-op notice.
+        query = self._resolve_retrieval_query(bundle, request, cfg)
+        if not query:
+            self._pre_retrieval_notice(
+                span,
+                auto_into,
+                "no retrieval query resolved from input; proceeding ungrounded",
+            )
+            request.input.setdefault(auto_into, [])
+            return
+
+        skill_input: dict[str, Any] = {"question": query}
+        if cfg.top_k is not None:
+            skill_input["k"] = cfg.top_k
+
+        ctx = SkillExecutionContext(
+            trace_id=span.trace_id,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            call_ms_budget=skill.spec.timeout_call_ms or bundle.spec.timeouts.call_ms,
+            agent_name=bundle.spec.name,
+            storage=self._storage,
+            retrieval=cfg,
+            tracer=self._tracer,
+            parent_span=span,
+        )
+
+        try:
+            output = await dispatch_skill(skill, skill_input, ctx)
+        except SkillError as exc:
+            # No retriever / empty KB surfaces as a benign skill outcome
+            # (the kb-vector-lookup skill returns empty rather than
+            # raising) — so a SkillError here is a genuine failure
+            # (embedding error, backend down, timeout, …). Honor
+            # `on_error`: warn → ungrounded + notice; fail → abort.
+            if cfg.on_error == "fail":
+                self._tracer.log_event(
+                    span,
+                    {
+                        "pre_retrieval_error": exc.type.value,
+                        "auto_into": auto_into,
+                        "on_error": "fail",
+                    },
+                )
+                # Surface through the MovateError taxonomy so the
+                # executor's existing failure handler maps it to a clean
+                # failed RunResponse (status + ErrorInfo), preserving the
+                # ADR 002 SkillError type/message. Non-retryable: a failing
+                # KB won't recover within the run, and fallback would just
+                # re-fail the same way.
+                raise ToolError(
+                    f"pre-retrieval skill {cfg.auto_skill!r} failed "
+                    f"[{exc.type.value}]: {exc.message}",
+                    retryable=False,
+                ) from exc
+            self._pre_retrieval_notice(
+                span,
+                auto_into,
+                f"retrieval failed ({exc.type.value}: {exc.message}); proceeding ungrounded",
+                error_type=exc.type.value,
+            )
+            request.input.setdefault(auto_into, [])
+            return
+
+        # Extract the chunk texts → `list[string]` (the shape the
+        # `auto_into` field is validated to accept). The kb-vector-lookup
+        # skill returns {chunks: [{text, source, score, ...}], ...}; we
+        # take the `text` of each. Empty results → [] (deterministic; the
+        # template's "no context" branch fires — D4).
+        chunks = output.get("chunks") if isinstance(output, dict) else None
+        texts: list[str] = []
+        if isinstance(chunks, list):
+            for c in chunks:
+                if isinstance(c, dict) and isinstance(c.get("text"), str):
+                    texts.append(c["text"])
+                elif isinstance(c, str):
+                    texts.append(c)
+
+        request.input[auto_into] = texts
+        self._tracer.log_event(
+            span,
+            {
+                "pre_retrieval": "merged",
+                "auto_into": auto_into,
+                "skill": cfg.auto_skill,
+                "chunks_merged": len(texts),
+            },
+        )
+        if not texts:
+            # Distinct stderr notice so a KB that exists but returns
+            # nothing is debuggable (the #1 silent RAG failure).
+            log.warning(
+                "pre-retrieval: %s returned 0 chunks for agent %r; "
+                "%s set to [] (run proceeds ungrounded)",
+                cfg.auto_skill,
+                bundle.spec.name,
+                auto_into,
+            )
+
+    def _resolve_retrieval_query(
+        self,
+        bundle: AgentBundle,
+        request: RunRequest,
+        cfg: Any,
+    ) -> str:
+        """Resolve the text query for pre-retrieval.
+
+        Uses ``cfg.query_from`` when set; otherwise the agent's primary
+        string input field (canonical names first, then the sole string
+        field). ``mdk validate`` rejects an ambiguous default at load
+        time, so at run time we degrade gracefully (return "" → no-op
+        notice) rather than guessing wrong.
+        """
+        if cfg.query_from:
+            val = request.input.get(cfg.query_from)
+            return val.strip() if isinstance(val, str) and val.strip() else ""
+
+        # Default resolution mirrors the canonical query-field heuristic
+        # used elsewhere (cli.knowledge_cmd._extract_query_from_input):
+        # canonical names first, then a sole string field.
+        for key in ("query", "question", "text", "message"):
+            val = request.input.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        string_values = [v for v in request.input.values() if isinstance(v, str) and v.strip()]
+        if len(string_values) == 1:
+            return string_values[0].strip()
+        return ""
+
+    def _pre_retrieval_notice(
+        self,
+        span: SpanCtx,
+        auto_into: str,
+        message: str,
+        *,
+        error_type: str | None = None,
+    ) -> None:
+        """Emit the single stderr notice + tracer event for a
+        non-fatal pre-retrieval outcome (no-op / warn). Keeps the
+        notice path consistent across the no-retriever, no-query, and
+        on_error=warn branches (D4)."""
+        log.warning("pre-retrieval: %s", message)
+        event: dict[str, Any] = {"pre_retrieval_notice": message, "auto_into": auto_into}
+        if error_type is not None:
+            event["pre_retrieval_error"] = error_type
+        self._tracer.log_event(span, event)
 
     async def _run_with_tool_use(
         self,

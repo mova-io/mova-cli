@@ -774,7 +774,7 @@ class RetrievalConfig(BaseModel):
     The operator decides the right cost trade-off for their use case.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     hybrid: bool = Field(
         default=False,
@@ -883,6 +883,96 @@ class RetrievalConfig(BaseModel):
             "raw-truncation behavior for back-compat."
         ),
     )
+
+    # ---- ADR 023: opt-in declarative pre-retrieval (auto-RAG) ----
+    # These fields configure the Executor's pre-retrieval phase — a
+    # deterministic "fetch grounding for me before the model sees the
+    # prompt" directive. They are ORTHOGONAL to the pipeline-tuning
+    # fields above (hybrid / rewrite / rerank / multi_hop), which the
+    # `kb-vector-lookup` skill reads regardless of how it's invoked.
+    #
+    # The feature is OFF unless `auto_into` is set — with `auto_into`
+    # unset (the default), `Executor.execute` runs byte-for-byte as
+    # today: no pre-retrieval, no extra embedding call, no behavior
+    # change. This keeps the dominant non-RAG path untouched
+    # (CLAUDE.md compat rule 5; ADR 023 D1).
+
+    auto_into: str | None = Field(
+        default=None,
+        description=(
+            "ADR 023 — REQUIRED to enable opt-in pre-retrieval. Names "
+            "the input field that receives the retrieved chunk texts "
+            "(as a `list[string]`) BEFORE the prompt is rendered. With "
+            "this unset (default), the Executor's pre-retrieval phase "
+            "is skipped entirely and behavior is byte-for-byte "
+            "unchanged. The named field's schema must accept a "
+            "`list[string]` — checked by `mdk validate`."
+        ),
+    )
+    query_from: str | None = Field(
+        default=None,
+        description=(
+            "ADR 023 — the input field whose string value seeds the "
+            "retrieval query. Optional; defaults to the agent's primary "
+            "(sole, or canonically-named) string input field. `mdk "
+            "validate` errors if unset AND the primary field is "
+            "ambiguous. Only meaningful when `auto_into` is set."
+        ),
+    )
+    auto_skill: str = Field(
+        default="kb-vector-lookup",
+        alias="skill",
+        description=(
+            "ADR 023 — the retrieval skill the Executor pre-invokes "
+            "through the existing SkillBackend dispatch seam. Must be "
+            "one of the agent's declared `skills:` and resolve in the "
+            "skill registry (checked by `mdk validate`). Defaults to "
+            "`kb-vector-lookup`. Only meaningful when `auto_into` is set."
+        ),
+    )
+    top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description=(
+            "ADR 023 — passed through to the retrieval skill's input "
+            "(as `k`) when set. Controls how many chunks the "
+            "pre-retrieval phase requests. `None` leaves the skill's "
+            "own default. Only meaningful when `auto_into` is set."
+        ),
+    )
+    when: Literal["if_empty", "always"] = Field(
+        default="if_empty",
+        description=(
+            "ADR 023 — when the pre-retrieval phase fires. `if_empty` "
+            "(default) retrieves only when `auto_into` is absent/empty "
+            "in the request input, so an explicitly-passed value is "
+            "respected (preserves eval determinism). `always` "
+            "re-retrieves unconditionally. Only meaningful when "
+            "`auto_into` is set."
+        ),
+    )
+    on_error: Literal["warn", "fail"] = Field(
+        default="warn",
+        description=(
+            "ADR 023 — failure policy for the pre-retrieval phase. "
+            "`warn` (default) proceeds ungrounded with a stderr notice "
+            "if retrieval errors; `fail` aborts the run with a typed "
+            "error. A missing retriever / empty KB is always a no-op "
+            "notice (never a failure) regardless of this setting. Only "
+            "meaningful when `auto_into` is set."
+        ),
+    )
+
+    @property
+    def auto_retrieval_enabled(self) -> bool:
+        """True when ADR 023 pre-retrieval is opted in (``auto_into`` set).
+
+        The single gate the Executor checks. With this False, the whole
+        pre-retrieval phase is skipped and the non-RAG path is
+        byte-for-byte unchanged.
+        """
+        return bool(self.auto_into)
 
     def is_default(self) -> bool:
         """True when every field is at its default value.
