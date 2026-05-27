@@ -1586,6 +1586,17 @@ async def _run_llm_scaffold(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(tmp_dir, dest)
 
+    # F3 (#112): a RAG-shaped scaffold declares the built-in
+    # `kb-vector-lookup` skill. Provision it into the committed project's
+    # `skills/` dir so the written agent loads + validates (its skill +
+    # ADR 023 retrieval.skill resolve) — same as `mdk add` does for an
+    # agent's declared skills. Project root = the nearest project marker
+    # above `dest`, else `dest.parent` (matching the loader's
+    # `_resolve_project_root` fallback). A non-grounding scaffold
+    # declares no skills → this is a no-op.
+    scaffold_project_root = _find_project_root(dest) or dest.parent
+    _provision_declared_skills(generated, project_root=scaffold_project_root)
+
     _render_success_panel(name=name, dest=dest, generated=generated, cost_usd=cost_usd)
     _emit_post_success_hint(_console, dry_run=False)
     _print_init_summary_line(
@@ -1627,10 +1638,28 @@ def _try_validate(generated: Any, *, name: str) -> str | None:
             write_agent_files(generated, target_dir=tmp_agent_dir)
         except (OSError, ValueError) as exc:
             return f"file write failed: {exc}"
+        # F3 (#112): a RAG-shaped scaffold declares the built-in
+        # `kb-vector-lookup` skill. `load_agent` resolves declared skills
+        # against the project's `skills/` registry — which is empty in
+        # this isolated tempdir. Provision the declared built-in skill(s)
+        # alongside the agent (at the tempdir's project-root level) so
+        # the load-time skill resolution + ADR 023 retrieval.skill check
+        # pass exactly as they will in the committed project.
+        _provision_declared_skills(generated, project_root=Path(raw_tmp))
         try:
-            load_agent(tmp_agent_dir)
+            bundle = load_agent(tmp_agent_dir)
         except AgentLoadError as exc:
             return str(exc)
+        # ADR 023 load-time checks (the same ones `mdk validate` runs):
+        # retrieval.skill resolves in the agent's declared skills,
+        # auto_into names a field that accepts list[string], and
+        # query_from is unambiguous. `load_agent` alone doesn't run these
+        # — without this, a malformed RAG shape from a real LLM would
+        # only fail later at `mdk validate`. Surface it now so the retry
+        # loop can self-correct.
+        adr023_error = _check_adr023_retrieval(bundle)
+        if adr023_error is not None:
+            return adr023_error
 
     # Cross-check sample_evals rows against the generated I/O schemas.
     # Reuse the runtime's JSON-Schema validator (no new dep). Empty list
@@ -1681,6 +1710,124 @@ def _validate_sample_evals(generated: Any) -> str | None:
             output_validator.validate(row["expected"])
         except JSONSchemaValidationError as exc:
             return f"sample_evals[{index}].expected does not match output_schema: {exc.message}"
+    return None
+
+
+# Built-in skills the scaffolder may emit that have a packaged skill
+# template under `src/movate/templates/`. F3 (#112): a RAG-shaped
+# scaffold declares `kb-vector-lookup` (the ADR 023 retrieval skill);
+# it must be provisioned alongside the agent so skill resolution +
+# the retrieval.skill cross-link check resolve. Keyed by the skill name
+# the agent declares; value is informational (the actual template lookup
+# happens in `_scaffold_one_skill` via `SKILL_TEMPLATES`).
+_SCAFFOLDABLE_BUILTIN_SKILLS = frozenset({"kb-vector-lookup"})
+
+
+def _declared_skills(generated: Any) -> list[str]:
+    """Return the agent's declared ``skills:`` list (empty if absent).
+
+    The generated ``agent_yaml`` is a plain dict; a non-grounding
+    scaffold has no ``skills`` key, so this returns ``[]`` and the
+    provisioning / RAG paths below are all no-ops (the non-grounding
+    shape stays byte-for-byte unchanged).
+    """
+    skills = getattr(generated, "agent_yaml", {}).get("skills")
+    if not isinstance(skills, list):
+        return []
+    return [s for s in skills if isinstance(s, str)]
+
+
+def _provision_declared_skills(generated: Any, *, project_root: Path) -> None:
+    """Scaffold any declared built-in skills into ``<project_root>/skills/``.
+
+    F3 (#112): a RAG-shaped scaffold declares the built-in
+    ``kb-vector-lookup`` skill. The skill registry is built from
+    ``<project_root>/skills/`` — so the skill must physically exist there
+    for ``load_agent`` to resolve it (both in the validation tempdir and
+    in the committed project). Reuses the same ``_scaffold_one_skill``
+    code path ``mdk add`` uses to auto-scaffold declared skills, so the
+    on-disk skill is identical to what an operator would get.
+
+    Only provisions skills in :data:`_SCAFFOLDABLE_BUILTIN_SKILLS` that
+    aren't already present — an ad-hoc skill name the LLM invents is left
+    to fail loudly at skill resolution (a real misconfiguration), and an
+    existing project skill is never clobbered (idempotent). A
+    non-grounding scaffold declares no skills → this is a no-op.
+    """
+    from movate.cli.add_cmd import _scaffold_one_skill  # noqa: PLC0415
+
+    for skill_name in _declared_skills(generated):
+        if skill_name not in _SCAFFOLDABLE_BUILTIN_SKILLS:
+            continue
+        if (project_root / "skills" / skill_name).exists():
+            continue
+        try:
+            _scaffold_one_skill(name=skill_name, project_root=project_root)
+        except Exception:
+            # Best-effort: a provisioning failure surfaces downstream as
+            # a skill-resolution AgentLoadError with a clear message.
+            # Don't mask that with a less-specific error here.
+            continue
+
+
+def _check_adr023_retrieval(bundle: Any) -> str | None:
+    """Run the ADR 023 load-time retrieval checks against a loaded bundle.
+
+    Returns ``None`` when the agent either didn't opt into pre-retrieval
+    (``retrieval.auto_into`` unset — the non-grounding path) or opted in
+    correctly; otherwise an error string describing the first
+    misconfiguration, fed back into the retry prompt.
+
+    Reuses the exact pure-logic helpers ``mdk validate`` uses
+    (:func:`_field_accepts_string_list`, :func:`_primary_string_input_fields`)
+    so the scaffold-time contract matches the validate-time contract
+    by construction — a RAG scaffold that passes here passes
+    ``mdk validate``.
+    """
+    import json as _json  # noqa: PLC0415
+
+    from movate.cli.validate import (  # noqa: PLC0415
+        _field_accepts_string_list,
+        _primary_string_input_fields,
+    )
+
+    cfg = bundle.spec.retrieval
+    if not cfg.auto_retrieval_enabled:
+        return None
+
+    auto_into = cfg.auto_into
+
+    # (1) retrieval.skill must be declared on the agent + resolvable.
+    declared = {s.spec.name for s in bundle.skills}
+    if cfg.auto_skill not in declared:
+        return (
+            f"retrieval.skill {cfg.auto_skill!r} is not declared in the agent's "
+            f"skills: {sorted(declared) or 'none'}. Add it to the skills list."
+        )
+
+    # (2) auto_into must name an input field that accepts list[string].
+    props = bundle.input_schema.get("properties", {})
+    field_schema = props.get(auto_into)
+    if field_schema is None:
+        return (
+            f"retrieval.auto_into {auto_into!r} is not a field in the input schema — "
+            f"add a {auto_into}: list[string] field for the retrieved chunks."
+        )
+    if not _field_accepts_string_list(field_schema):
+        return (
+            f"retrieval.auto_into {auto_into!r} must accept a list[string] "
+            f"(the chunk shape), but its schema is {_json.dumps(field_schema)[:160]}."
+        )
+
+    # (3) query_from must be unambiguous when left to the default.
+    if not cfg.query_from:
+        candidates = _primary_string_input_fields(bundle.input_schema)
+        canonical = [c for c in ("query", "question", "text", "message") if c in candidates]
+        if not canonical and len(candidates) != 1:
+            return (
+                "retrieval.query_from is unset and the primary text input field is "
+                f"ambiguous (string fields: {candidates or 'none'}). Set retrieval.query_from."
+            )
     return None
 
 

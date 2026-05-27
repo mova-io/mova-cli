@@ -151,6 +151,7 @@ class TestCacheableMetaPromptPrefix:
         from movate.scaffold.llm_scaffold import (  # noqa: PLC0415
             _EXAMPLE_CLASSIFIER,
             _EXAMPLE_FAQ,
+            _EXAMPLE_RAG,
             _META_PROMPT,
         )
 
@@ -160,6 +161,7 @@ class TestCacheableMetaPromptPrefix:
             target_model=target_model,
             example_faq=_EXAMPLE_FAQ,
             example_classifier=_EXAMPLE_CLASSIFIER,
+            example_rag=_EXAMPLE_RAG,
         )
 
     def test_static_block_precedes_variable_suffix(self) -> None:
