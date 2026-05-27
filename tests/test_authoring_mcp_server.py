@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -390,14 +391,18 @@ def test_cli_main_import_does_not_load_mcp_server() -> None:
 def test_mcp_command_is_registered() -> None:
     """`mdk mcp serve` is wired into the top-level app (additive command group)."""
     runner = CliRunner()
-    # Force a wide terminal so Rich doesn't wrap/hyphenate the flag name in the
-    # rendered help panel — under CI's narrow non-TTY width the literal
-    # "--list-tools" substring gets split across lines and the assert fails.
-    result = runner.invoke(app, ["mcp", "serve", "--help"], env={"COLUMNS": "200"})
-    assert result.exit_code == 0
-    # Normalize whitespace to survive any residual Rich wrapping/box-drawing.
-    normalized = " ".join(result.stdout.split())
-    assert "--list-tools" in normalized
+    result = runner.invoke(app, ["mcp", "serve", "--help"])
+    # exit_code 0 is the robust registration signal: an unregistered subcommand
+    # exits 2 ("No such command 'serve'"). We deliberately do NOT assert on the
+    # Rich-rendered help body — under CI's narrow non-TTY width Typer/Rich wraps
+    # option names across panel rows and interleaves box-drawing + ANSI codes,
+    # so any substring match on a flag name is fragile. The `--list-tools` flag
+    # itself is covered behaviorally by test_list_tools_flag_prints_manifest.
+    assert result.exit_code == 0, result.output
+    # The usage line is short and never wraps; strip ANSI before matching so the
+    # assertion survives Rich styling regardless of terminal width.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    assert "mcp serve" in plain
 
 
 def test_list_tools_flag_prints_manifest(tmp_path: Path) -> None:
