@@ -285,4 +285,117 @@ def history(
     console.print(table)
 
 
+# ---------------------------------------------------------------------------
+# audit + replay (D7e, #136)
+# ---------------------------------------------------------------------------
+
+
+@authoring_app.command("audit")
+def audit_log(
+    project: Path | None = typer.Option(None, "--project", "-p", help="Project root."),
+    output: str = typer.Option("text", "--output", "-o", help="'text' (default) or 'json'."),
+) -> None:
+    """Show the append-only authoring audit log (every plan/apply/undo, D7e).
+
+    Distinct from the live undo stack (``history``): this is the immutable
+    record of what the copilot did, when, and at what cost. A corrupt/missing
+    log degrades to a warning + whatever could be read — it never crashes.
+    """
+    root = _resolve_project(project)
+    driver = AuthoringDriver(AuthoringContext(project=root))
+    records = driver.audit_records()
+    if output == "json":
+        console.print_json(json.dumps([r.model_dump(mode="json") for r in records]))
+        return
+    if not records:
+        console.print("[dim]no authoring audit records yet.[/dim]")
+        return
+    table = Table(title="Authoring audit log (D7e)")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("when", style="dim", no_wrap=True)
+    table.add_column("action", style="bold cyan")
+    table.add_column("agent")
+    table.add_column("outcome", no_wrap=True)
+    table.add_column("cost", justify="right")
+    table.add_column("summary", overflow="fold")
+    total_cost = 0.0
+    for i, r in enumerate(records):
+        total_cost += r.cost_usd
+        outcome_style = {
+            "applied": "green",
+            "reverted": "yellow",
+            "undone": "yellow",
+            "skipped": "dim",
+        }.get(r.outcome.value, "white")
+        table.add_row(
+            str(i),
+            r.created_at.split("T", 1)[0] if r.created_at else "—",
+            r.action,
+            r.agent or "—",
+            f"[{outcome_style}]{r.outcome.value}[/{outcome_style}]",
+            f"${r.cost_usd:.4f}" if r.cost_usd else "—",
+            r.summary,
+        )
+    console.print(table)
+    console.print(f"[dim]{len(records)} record(s); total recorded cost ~${total_cost:.4f}.[/dim]")
+
+
+@authoring_app.command("replay")
+def replay(
+    project: Path | None = typer.Option(None, "--project", "-p", help="Project root."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Confirm gated (cost/networked/destructive) steps."
+    ),
+    fast: bool = typer.Option(
+        False, "--fast", help="Auto-apply additive+reversible+free steps without prompting."
+    ),
+) -> None:
+    """Re-apply the recorded *applied* action sequence through the driver (D7e).
+
+    SAFETY: every step is re-driven through the SAME plan → confirm → apply →
+    verify spine as a live edit — never a raw re-write — so the D2 confirmation
+    gate + D3 verify (revert-on-failure) + D4 checkpoint/undo all hold. Gated
+    steps prompt (or require ``--yes``); a failing step is reported and the
+    replay continues.
+    """
+    from movate.authoring import replay_records, replayable  # noqa: PLC0415
+    from movate.authoring.models import ActionPlan  # noqa: PLC0415
+
+    root = _resolve_project(project)
+    driver = AuthoringDriver(AuthoringContext(project=root))
+    records = driver.audit_records()
+    pending = replayable(records)
+    if not pending:
+        console.print("[dim]nothing to replay — no applied actions in the audit log.[/dim]")
+        return
+
+    console.print(f"[bold]replaying {len(pending)} recorded action(s):[/bold]")
+
+    def _confirm(record: object, plan: ActionPlan) -> bool:
+        action = getattr(record, "action", "?")
+        console.print(f"\n[bold]replay:[/bold] {action} — {plan.summary}")
+        console.print(
+            f"  side effects: {', '.join(s.value for s in plan.side_effects) or '—'}"
+            f"   reversible: {'yes' if plan.reversible else '[red]no[/red]'}"
+        )
+        if plan.diff:
+            console.print(plan.diff)
+        if plan.requires_confirmation and not yes:
+            return typer.confirm("Re-apply this step?", default=False)
+        return True
+
+    steps = replay_records(driver, records, confirm=_confirm, fast_mode=fast)
+    applied = sum(1 for s in steps if s.applied)
+    skipped = sum(1 for s in steps if s.skipped)
+    failed = sum(1 for s in steps if s.error and not s.skipped)
+    for s in steps:
+        if s.applied:
+            console.print(f"[green]✓[/green] {s.action} — {s.summary}")
+        elif s.error:
+            console.print(f"[yellow]⚠[/yellow] {s.action} — {s.error}")
+        else:
+            console.print(f"[dim]· {s.action} — skipped[/dim]")
+    console.print(f"[dim]replay done: {applied} applied, {skipped} skipped, {failed} failed.[/dim]")
+
+
 __all__ = ["authoring_app"]

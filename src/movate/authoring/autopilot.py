@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from movate.authoring.base import AuthoringActionError
+from movate.authoring.budget import BudgetExceededError
 from movate.authoring.catalog import UnknownActionError, action_names
 from movate.authoring.driver import ApplyOutcome, AuthoringDriver, ConfirmationRequiredError
 
@@ -277,6 +278,10 @@ class AutopilotResult:
     initial: EvalSnapshot
     final: EvalSnapshot
     passes: list[ImprovePass] = field(default_factory=list)
+    budget_exceeded: bool = False
+    """True when the run stopped early because the session LLM budget was hit
+    (D7e). The planner refuses the next proposal call; the autopilot ends the
+    loop cleanly with whatever it had already applied — no half-applied action."""
 
     @property
     def improved(self) -> bool:
@@ -361,13 +366,21 @@ class Autopilot:
         initial = self._eval_runner.run_eval(agent)
         current = initial
         passes: list[ImprovePass] = []
+        budget_exceeded = False
 
         for iteration in range(1, self._max_iterations + 1):
             if current.all_passing:
                 break
-            improve_pass = self._run_pass(
-                agent, iteration, current, confirm=confirm, fast_mode=fast_mode
-            )
+            try:
+                improve_pass = self._run_pass(
+                    agent, iteration, current, confirm=confirm, fast_mode=fast_mode
+                )
+            except BudgetExceededError:
+                # The planner refused the next proposal call (D7e): stop the loop
+                # cleanly with whatever already applied. Enforcement happens
+                # BEFORE the call, so nothing is half-applied.
+                budget_exceeded = True
+                break
             passes.append(improve_pass)
             if improve_pass.applied_count == 0:
                 # Nothing changed this pass (no proposals, all declined, or all
@@ -375,7 +388,9 @@ class Autopilot:
                 break
             current = self._eval_runner.run_eval(agent)
 
-        return AutopilotResult(initial=initial, final=current, passes=passes)
+        return AutopilotResult(
+            initial=initial, final=current, passes=passes, budget_exceeded=budget_exceeded
+        )
 
     def _run_pass(
         self,

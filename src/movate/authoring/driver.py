@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from movate.authoring.audit import AuditLog, AuditOutcome, AuditRecord
 from movate.authoring.base import AuthoringAction, AuthoringActionError, AuthoringContext
 from movate.authoring.catalog import get_action
 from movate.authoring.models import (
@@ -67,9 +68,14 @@ class AuthoringDriver:
     construct per CLI invocation.
     """
 
-    def __init__(self, ctx: AuthoringContext) -> None:
+    def __init__(self, ctx: AuthoringContext, *, audit_log: AuditLog | None = None) -> None:
         self._ctx = ctx
         self._project = ctx.project.resolve()
+        # D7e (#136) — append-only audit log of every action the driver
+        # performs. Defaults to the per-project log under the state dir; a
+        # caller can inject one (tests / a shared session). Writing is
+        # best-effort, so audit never breaks an apply.
+        self._audit = audit_log if audit_log is not None else AuditLog(self._project)
 
     # -- D2: plan -------------------------------------------------------------
 
@@ -144,15 +150,25 @@ class AuthoringDriver:
             created_at=_now(),
         )
 
+        audit_args = model.model_dump(mode="json")
         verify_report: VerifyReport | None = None
         if verify:
             verify_report = self._verify(action, log_entry)
             if not verify_report.ok and verify_report.reverted:
-                # Reverted — do NOT record this as a successful applied entry.
-                return ApplyOutcome(plan=plan, result=result, verify=verify_report, log_entry=None)
+                # Reverted — do NOT record this as a successful applied entry in
+                # the undo stack, but DO record it in the append-only audit log
+                # (D7e): a reverted attempt is a real, auditable event.
+                outcome = ApplyOutcome(
+                    plan=plan, result=result, verify=verify_report, log_entry=None
+                )
+                self._audit.append(AuditRecord.from_apply(action_name, audit_args, outcome))
+                return outcome
 
         self._append_log(log_entry)
-        return ApplyOutcome(plan=plan, result=result, verify=verify_report, log_entry=log_entry)
+        outcome = ApplyOutcome(plan=plan, result=result, verify=verify_report, log_entry=log_entry)
+        # D7e — record the applied action in the append-only audit log.
+        self._audit.append(AuditRecord.from_apply(action_name, audit_args, outcome))
+        return outcome
 
     # -- D3: verify -----------------------------------------------------------
 
@@ -226,11 +242,32 @@ class AuthoringDriver:
         entry.undone = True
         log[target_idx] = entry
         self._write_log(log)
+        # D7e — record the undo in the append-only audit log.
+        self._audit.append(
+            AuditRecord(
+                action=entry.action,
+                agent=entry.agent,
+                args=dict(entry.args),
+                outcome=AuditOutcome.UNDONE,
+                summary=f"undid {entry.action}: {entry.summary}",
+                checkpoint_hash=entry.checkpoint_hash,
+                changed_paths=list(entry.changed_paths),
+                created_at=_now(),
+            )
+        )
         return entry
 
     def history(self) -> list[ActionLogEntry]:
         """Return the full action log, oldest-first."""
         return self._read_log()
+
+    def audit_records(self) -> list[AuditRecord]:
+        """Return the append-only audit log, oldest-first (D7e).
+
+        Degrades gracefully: a corrupt line is skipped, a missing log reads
+        empty — viewing audit never crashes.
+        """
+        return self._audit.read()
 
     # -- internals ------------------------------------------------------------
 

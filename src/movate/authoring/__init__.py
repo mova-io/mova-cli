@@ -30,6 +30,14 @@ Public surface:
 
 from __future__ import annotations
 
+from movate.authoring.audit import (
+    AuditLog,
+    AuditOutcome,
+    AuditRecord,
+    ReplayStep,
+    replay_records,
+    replayable,
+)
 from movate.authoring.autopilot import (
     AppliedProposal,
     Autopilot,
@@ -47,6 +55,12 @@ from movate.authoring.base import (
     AuthoringActionError,
     AuthoringContext,
     self_description,
+)
+from movate.authoring.budget import (
+    BudgetExceededError,
+    CostBudget,
+    SessionCostTracker,
+    cost_of_tokens,
 )
 from movate.authoring.catalog import (
     UnknownActionError,
@@ -84,13 +98,18 @@ __all__ = [
     "ActionResult",
     "AppliedProposal",
     "ApplyOutcome",
+    "AuditLog",
+    "AuditOutcome",
+    "AuditRecord",
     "AuthoringAction",
     "AuthoringActionError",
     "AuthoringContext",
     "AuthoringDriver",
     "Autopilot",
     "AutopilotResult",
+    "BudgetExceededError",
     "ConfirmationRequiredError",
+    "CostBudget",
     "EvalRunner",
     "EvalSnapshot",
     "FailingCase",
@@ -102,16 +121,21 @@ __all__ = [
     "PlannerError",
     "PlannerOutcome",
     "ProposedAction",
+    "ReplayStep",
+    "SessionCostTracker",
     "SideEffect",
     "UnknownActionError",
     "VerifyReport",
     "action_names",
     "build_improve_request",
+    "cost_of_tokens",
     "describe_catalog",
     "get_action",
     "list_actions",
     "project_state_summary",
     "propose_improvements",
     "register",
+    "replay_records",
+    "replayable",
     "self_description",
 ]
