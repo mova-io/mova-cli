@@ -66,6 +66,7 @@ from movate.core.models import (
 )
 from movate.core.workflow.ir import NodeType, WorkflowGraph
 from movate.storage.base import StorageProvider
+from movate.tracing.base import SpanCtx
 
 
 class WorkflowRunError(Exception):
@@ -242,10 +243,70 @@ class WorkflowRunner:
         ``start_id is None`` (a paused gate that is itself the sink — no
         successor) means "nothing left to run": the walk completes
         immediately as SUCCESS with ``state`` as the final state.
+
+        Tracing (ADR 024 D4): opens ONE ``workflow.execute`` root span for the
+        whole walk and threads its :class:`~movate.tracing.base.SpanCtx` into
+        every node's ``Executor.execute(..., parent_span=...)`` — so each
+        node's ``agent.execute`` nests under the workflow root and a multi-node
+        workflow is one trace tree (Langfuse / OTel), not N disconnected roots.
+        The span is opened on the executor's tracer (tracing stays wired at the
+        edges) and is always closed exactly once via the ``finally`` — including
+        on every early ``return`` (HITL pause, per-node error) — so a partial
+        workflow still produces a complete root span. Offline correlation is
+        unchanged: ``RunRecord.workflow_run_id`` + ``node_id`` already link the
+        node rows. With tracing off (NullTracer) the span is a no-op.
         """
         started = time.monotonic()
         runs: list[RunRecord] = []
 
+        # ADR 024 D4 — workflow-root span. One per walk; every node's
+        # agent.execute nests under it via parent_span. Opened on the executor's
+        # tracer so tracing stays at the edges (the runner is a pure
+        # orchestrator). Closed exactly once in the finally below.
+        wf_span = self._executor.tracer.start_span(
+            "workflow.execute",
+            {
+                "workflow": graph.name,
+                "workflow_version": graph.version,
+                "workflow_run_id": wf_id,
+                "tenant_id": self._tenant_id,
+            },
+        )
+        try:
+            return await self._walk_traced(
+                graph,
+                start_id=start_id,
+                state=state,
+                initial_state=initial_state,
+                wf_id=wf_id,
+                mock=mock,
+                started=started,
+                runs=runs,
+                wf_span=wf_span,
+            )
+        finally:
+            self._executor.tracer.end_span(wf_span)
+
+    async def _walk_traced(
+        self,
+        graph: WorkflowGraph,
+        *,
+        start_id: str | None,
+        state: dict[str, Any],
+        initial_state: dict[str, Any],
+        wf_id: str,
+        mock: bool,
+        started: float,
+        runs: list[RunRecord],
+        wf_span: SpanCtx,
+    ) -> WorkflowResult:
+        """Inner traversal loop — see :meth:`_walk`.
+
+        Split out so :meth:`_walk` can own the workflow-root span lifecycle
+        (open before, close in ``finally`` after) without threading the
+        try/finally around every early return. ``wf_span`` is the workflow-root
+        span every node's ``agent.execute`` nests under.
+        """
         # Dynamic traversal: start at ``start_id``, follow each node's single
         # sequential successor (for agent nodes) or the router's chosen
         # branch (for intent-router nodes).  We track visited ids to guard
@@ -271,6 +332,7 @@ class WorkflowRunner:
                     graph=graph,
                     wf_id=wf_id,
                     mock=mock,
+                    wf_span=wf_span,
                 )
                 if isinstance(result, WorkflowResult):
                     # Propagate partial failure from within the router.
@@ -365,6 +427,7 @@ class WorkflowRunner:
                 RunRequest(agent=bundle.spec.name, input=agent_input),
                 workflow_run_id=wf_id,
                 node_id=node_id,
+                parent_span=wf_span,
                 tenant_id_override=self._tenant_id,
             )
 
@@ -463,6 +526,7 @@ class WorkflowRunner:
         graph: WorkflowGraph,
         wf_id: str,
         mock: bool,
+        wf_span: SpanCtx,
     ) -> tuple[str | None, list[RunRecord]] | WorkflowResult:
         """Dispatch an ``intent-router`` node.
 
@@ -517,6 +581,7 @@ class WorkflowRunner:
             RunRequest(agent=clf_bundle.spec.name, input=clf_input),
             workflow_run_id=wf_id,
             node_id=node_id,
+            parent_span=wf_span,
             tenant_id_override=self._tenant_id,
         )
 
