@@ -46,7 +46,12 @@ class WorkflowCompileError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
+def compile_workflow(
+    spec: WorkflowSpec,
+    workflow_dir: Path,
+    *,
+    allow_cycles: bool = False,
+) -> WorkflowGraph:
     """Build a :class:`WorkflowGraph` from a parsed spec.
 
     Performs structural checks that always apply (regardless of phase):
@@ -56,6 +61,13 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
 
     Does *not* enforce phase-specific shape constraints; pair with
     :func:`validate_linear` (v0.3) or future ``validate_dag`` for that.
+
+    ``allow_cycles`` (ADR 030 D2, default ``False`` — preserves the native
+    runner contract): when ``True`` the acyclic requirement is relaxed so a
+    workflow with intentional loops (ReAct / reflection / retry-until)
+    compiles into the IR for the LangGraph *export* path. The LangGraph
+    compiler emits those loops with a mandatory recursion guard. The native
+    runner never sets this — it walks a DAG only.
     """
     workflow_dir = workflow_dir.resolve()
 
@@ -154,13 +166,25 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
             raise WorkflowCompileError(
                 f"edge from {es.from_id!r} → {es.to_id!r}: target node missing"
             )
-        if es.from_id == es.to_id:
+        # A self-loop is only a legitimate construct on the cycle-tolerant
+        # export path (e.g. a single-node ReAct loop). The native runner walks
+        # a DAG, so it stays forbidden there.
+        if es.from_id == es.to_id and not allow_cycles:
             raise WorkflowCompileError(f"self-loop on node {es.from_id!r} not allowed")
+        # Lower the spec edge kind (ADR 030 D2) into the IR's EdgeKind. Old
+        # bare {from,to} edges resolve to SEQUENTIAL → identical IR to before.
+        try:
+            edge_kind = EdgeKind(es.resolved_kind)
+        except ValueError:  # pragma: no cover — guarded by the spec Literal
+            raise WorkflowCompileError(
+                f"edge {es.from_id!r}→{es.to_id!r}: unknown kind {es.resolved_kind!r}"
+            ) from None
         edges.append(
             WorkflowEdge(
                 from_id=es.from_id,
                 to_id=es.to_id,
-                kind=EdgeKind.SEQUENTIAL,
+                kind=edge_kind,
+                condition=es.when,
             )
         )
 
@@ -212,11 +236,15 @@ def compile_workflow(spec: WorkflowSpec, workflow_dir: Path) -> WorkflowGraph:
         workflow_dir=workflow_dir,
     )
 
-    # 5. Cycle detection — fail fast at compile time.
-    try:
-        graph.topological_order()
-    except ValueError as exc:
-        raise WorkflowCompileError(str(exc)) from exc
+    # 5. Cycle detection — fail fast at compile time, UNLESS the caller opted
+    # into the cycle-tolerant export path (ADR 030 D2). The native runner
+    # always rejects cycles (it walks a DAG); the LangGraph export compiler
+    # turns back-edges into recursion-guarded loops.
+    if not allow_cycles:
+        try:
+            graph.topological_order()
+        except ValueError as exc:
+            raise WorkflowCompileError(str(exc)) from exc
 
     # 6. Reachability — every non-entrypoint node must be reachable from entrypoint.
     reachable = _reachable(graph, graph.entrypoint)

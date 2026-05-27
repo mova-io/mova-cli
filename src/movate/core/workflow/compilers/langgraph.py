@@ -1,52 +1,223 @@
 """LangGraph compiler — lower a WorkflowGraph IR to a Python LangGraph script.
 
-[bold]Sprint U scaffold.[/bold] Code generation works today —
-:func:`compile_langgraph` takes a :class:`WorkflowGraph` and returns
-a Python source string declaring an equivalent ``langgraph.graph.StateGraph``
-with one node per workflow node and one edge per workflow edge. The
-generated code runs against a real LangGraph install.
+[bold]Code-generation / export only.[/bold] :func:`compile_langgraph` takes a
+:class:`WorkflowGraph` and returns a Python source string declaring an
+equivalent ``langgraph.graph.StateGraph``. The string is what
+``mdk export langgraph`` writes to disk; it runs against a *user-provided*
+LangGraph install. This module imports **no** ``langgraph`` at runtime — mdk
+ships no LangGraph dependency (ADR 030 D2/D3, the no-dependency phase). The
+in-process ``LangGraphBackend`` (ADR 030 D1) and the ``StorageProvider``
+checkpointer (D4) are separate, dependency-gated phases and are NOT here.
 
-What's NOT here yet (Sprint U+):
+What this compiler emits, mapping the constructs the IR already models:
 
-* Conditional edges — the IR doesn't model them yet (Sprint M is
-  linear-only); when it does, this compiler grows ``add_conditional_edges``.
-* HITL nodes — requires the IR to model human-in-the-loop wait
-  states. Same story: compiler grows when IR does.
-* Checkpointing — LangGraph's checkpointer protocol needs to be
-  picked (in-memory? sqlite? our storage layer?). Architectural
-  decision, deferred.
-* State schema generation — today we emit a generic ``dict[str, Any]``
-  state. Real-world workflows want typed state per node; the IR
-  doesn't yet capture node-level state contracts.
+* **Typed state (D3)** — a ``TypedDict`` generated from the workflow
+  ``state_schema`` (one field per JSON-Schema property, JSON types mapped to
+  Python types) instead of a generic ``dict[str, Any]``.
+* **Sequential edges** — ``builder.add_edge(from, to)`` (unchanged: a linear
+  workflow compiles byte-for-byte as before).
+* **Conditional edges** (``EdgeKind.CONDITIONAL``) — ``add_conditional_edges``
+  with a generated router function whose path-map sends state to the matching
+  target (or ``END`` as the loop/branch exit).
+* **Parallel fan-out / fan-in** (``EdgeKind.PARALLEL_FAN_OUT`` /
+  ``PARALLEL_FAN_IN``) — concurrent sibling edges + a merge node, exactly the
+  map/concurrent-tools shape LangGraph runs natively.
+* **Cycles / loops** — re-using the IR's cycle detection
+  (:meth:`WorkflowGraph.find_back_edges`), emitted with a **mandatory
+  recursion guard**: a module-level ``RECURSION_LIMIT`` is passed to
+  ``invoke(...)`` so a generated graph can never run away (ADR 030 D2 /
+  CLAUDE.md failure-mode rule).
 
-Why ship the scaffold now:
-
-* Lets the BACKLOG ``mdk export langgraph`` + ``mdk compose --runtime
-  langgraph`` ergonomics land against a working compiler interface.
-* Operators can preview the LangGraph shape and confirm it matches
-  their mental model before Sprint U+ wires the real engine.
-* The compiler API (``compile_langgraph(graph) -> str``) stays stable
-  as we layer conditional / parallel / HITL in.
+The compiler API (``compile_langgraph(graph) -> str``) is stable; the emitted
+``__movate_call_agent`` hook is still a placeholder the caller wires to the
+real Executor — that wiring is the D1 backend phase, deliberately out of scope.
 """
 
 from __future__ import annotations
 
-from movate.core.workflow.ir import WorkflowGraph
+from collections import deque
+
+from movate.core.workflow.ir import EdgeKind, WorkflowGraph
+
+# LangGraph's default recursion guard. Generated graphs pass this to
+# ``invoke(...)`` so cyclic workflows (ReAct / reflection / retry-until) can
+# never loop forever — the single most important failure mode for D2. Operators
+# raise it deliberately for deep loops; it is never unbounded.
+DEFAULT_RECURSION_LIMIT = 25
+
+# JSON-Schema primitive type → Python annotation for the generated TypedDict.
+_JSON_TO_PY: dict[str, str] = {
+    "string": "str",
+    "integer": "int",
+    "number": "float",
+    "boolean": "bool",
+    "array": "list[Any]",
+    "object": "dict[str, Any]",
+    "null": "None",
+}
+
+
+def _py_type(schema: object) -> str:
+    """Map a JSON-Schema property fragment to a Python type annotation.
+
+    Conservative: anything we can't confidently map (unions, ``$ref``,
+    untyped) falls back to ``Any`` so the generated module always type-checks.
+    """
+    if not isinstance(schema, dict):
+        return "Any"
+    json_type = schema.get("type")
+    if isinstance(json_type, str):
+        return _JSON_TO_PY.get(json_type, "Any")
+    # A list-valued "type" (e.g. ["string", "null"]) or no type at all maps to
+    # Any — we keep the generated state permissive rather than guess a union.
+    return "Any"
+
+
+def _state_fields(state_schema: object) -> list[tuple[str, str]]:
+    """Extract ``(field_name, py_type)`` pairs from the workflow state schema.
+
+    Only top-level ``properties`` are lifted into the TypedDict. Property names
+    that aren't valid Python identifiers are skipped (the generic ``input`` /
+    ``output`` fallback still covers them) so the emitted class is always valid.
+    """
+    if not isinstance(state_schema, dict):
+        return []
+    props = state_schema.get("properties")
+    if not isinstance(props, dict):
+        return []
+    fields: list[tuple[str, str]] = []
+    for name, sub in props.items():
+        if not isinstance(name, str) or not name.isidentifier():
+            continue
+        fields.append((name, _py_type(sub)))
+    return fields
+
+
+def _emit_state_class(graph: WorkflowGraph) -> list[str]:
+    """Emit the typed ``State`` TypedDict (ADR 030 D3).
+
+    Generated from ``graph.state_schema`` ``properties``. Always ``total=False``
+    because workflow state accumulates incrementally across nodes — no node
+    sees every key. Falls back to a generic ``dict[str, Any]`` shape when the
+    schema declares no usable properties (preserving the old scaffold for
+    schemaless workflows).
+    """
+    fields = _state_fields(graph.state_schema)
+    lines = [
+        "class State(TypedDict, total=False):",
+        '    """Typed workflow state, generated from workflow.yaml state_schema.',
+        "",
+        "    total=False: state accumulates across nodes; no single node sees",
+        "    every key. Generated by the mdk LangGraph compiler — do not edit.",
+        '    """',
+        "",
+    ]
+    if fields:
+        for name, py_type in fields:
+            lines.append(f"    {name}: {py_type}")
+    else:
+        # No declared properties — keep the generic envelope the scaffold used.
+        lines.append("    input: dict[str, Any]")
+        lines.append("    output: dict[str, Any]")
+    return lines
+
+
+def _ordered_node_ids(graph: WorkflowGraph) -> list[str]:
+    """Stable node order for the emitted file.
+
+    Acyclic graphs use topological order so the file reads in execution order
+    (and a linear workflow is byte-identical to the prior scaffold). Cyclic
+    graphs can't be topo-sorted, so fall back to a deterministic BFS from the
+    entrypoint, then any unreached nodes in insertion order.
+    """
+    if not graph.nodes:
+        return []
+    if not graph.has_cycle():
+        return graph.topological_order()
+
+    order: list[str] = []
+    seen: set[str] = set()
+    queue: deque[str] = deque()
+    if graph.entrypoint in graph.nodes:
+        queue.append(graph.entrypoint)
+        seen.add(graph.entrypoint)
+    while queue:
+        nid = queue.popleft()
+        order.append(nid)
+        for edge in graph.successors(nid):
+            if edge.to_id in graph.nodes and edge.to_id not in seen:
+                seen.add(edge.to_id)
+                queue.append(edge.to_id)
+    # Any node unreachable from the entrypoint (shouldn't happen post-compile,
+    # but keep generation total): append in insertion order.
+    for nid in graph.nodes:
+        if nid not in seen:
+            order.append(nid)
+    return order
+
+
+def _router_name(node_id: str) -> str:
+    """Deterministic, valid-Python name for a conditional router function."""
+    safe = "".join(c if c.isalnum() else "_" for c in node_id)
+    return f"__movate_route_{safe}"
+
+
+def _emit_routers(graph: WorkflowGraph, back_edges: set[tuple[str, str]]) -> list[str]:
+    """Emit one router function per node that has conditional out-edges.
+
+    The router inspects state and returns the id of the next node (or ``END``).
+    The generated body renders each edge's ``condition`` verbatim as a comment
+    and a guarded branch over a ``__movate_eval_condition`` hook the operator
+    fills in — we never interpret the condition grammar here (boundary rule:
+    no condition-language semantics in the compiler). The final fallthrough
+    returns ``END`` so a branch (or a loop's exit) can always terminate, which
+    is what makes the recursion guard meaningful.
+    """
+    lines: list[str] = []
+    for nid in graph.nodes:
+        cond_edges = [e for e in graph.successors(nid) if e.kind is EdgeKind.CONDITIONAL]
+        if not cond_edges:
+            continue
+        fn = _router_name(nid)
+        lines.append("")
+        lines.append("")
+        lines.append(f"def {fn}(state: State) -> str:")
+        lines.append(f'    """Conditional router for node {nid!r}.')
+        lines.append("")
+        lines.append("    Returns the next node id (or END). Each branch's condition is")
+        lines.append("    rendered from workflow.yaml; wire __movate_eval_condition to your")
+        lines.append("    expression evaluator. Falls through to END so the branch / loop")
+        lines.append("    always has a terminating exit (bounds the recursion guard).")
+        lines.append('    """')
+        for e in cond_edges:
+            loop_note = "  # loop-back edge" if (e.from_id, e.to_id) in back_edges else ""
+            cond = e.condition or "true"
+            lines.append(f"    # when: {cond}{loop_note}")
+            lines.append(f"    if __movate_eval_condition({cond!r}, state):")
+            lines.append(f"        return {e.to_id!r}")
+        lines.append("    return END")
+    return lines
 
 
 def compile_langgraph(graph: WorkflowGraph) -> str:
     """Render a Python source file declaring a LangGraph equivalent.
 
-    Returned string is ready to write to disk and execute. Each
-    workflow node maps to a LangGraph node function that calls
-    movate's executor under the hood; edges map to
-    ``builder.add_edge(from, to)`` calls.
+    Returned string is ready to write to disk and execute against a
+    user-provided LangGraph install. Each workflow node maps to a LangGraph
+    node function calling movate's executor; edges map to ``add_edge`` /
+    ``add_conditional_edges``; parallel kinds map to concurrent siblings + a
+    merge; cycles are emitted under a mandatory ``RECURSION_LIMIT`` guard;
+    state is a typed ``TypedDict`` from the workflow ``state_schema``.
 
-    [bold]Caller is responsible for[/bold] piping the agent-resolution
-    logic into the generated code's ``__movate_call_agent`` placeholder.
-    The scaffold emits a stub call so the file is syntactically valid
-    Python; substituting the real call site is a Sprint U+ wiring task.
+    [bold]Caller is responsible for[/bold] wiring the real call site into the
+    generated ``__movate_call_agent`` / ``__movate_eval_condition`` hooks —
+    that is the (dependency-gated) in-process backend phase, not this export.
     """
+    ordered_ids = _ordered_node_ids(graph)
+    back_edges = {(e.from_id, e.to_id) for e in graph.find_back_edges()}
+    has_conditional = any(e.kind is EdgeKind.CONDITIONAL for e in graph.edges)
+    has_cycle = bool(back_edges)
+
     lines: list[str] = [
         '"""Auto-generated by `movate.core.workflow.compilers.langgraph`.',
         "",
@@ -61,27 +232,52 @@ def compile_langgraph(graph: WorkflowGraph) -> str:
         "",
         "from langgraph.graph import END, START, StateGraph",
         "",
-        "",
-        "class State(TypedDict, total=False):",
-        '    """Workflow state — generic for the MVP scaffold.',
-        "",
-        "    Sprint U+ replaces this with a typed state per node once the",
-        "    IR captures node-level state contracts.",
-        '    """',
-        "",
-        "    input: dict[str, Any]",
-        "    output: dict[str, Any]",
+        "# Mandatory runaway guard (ADR 030 D2): the maximum number of super-steps",
+        "# a run may take. Cyclic workflows (ReAct / reflection / retry-until) can",
+        "# never loop forever because invoke() is bounded by this limit.",
+        f"RECURSION_LIMIT = {DEFAULT_RECURSION_LIMIT}",
         "",
         "",
+    ]
+
+    # Typed state (D3).
+    lines += _emit_state_class(graph)
+    lines += ["", ""]
+
+    # Agent-invocation placeholder.
+    lines += [
         "def __movate_call_agent(node_id: str, state: State) -> State:",
         '    """Placeholder agent-invocation hook.',
         "",
-        "    Sprint U+ wires this through the movate Executor + registry.",
-        "    Today: returns the state unchanged so the generated module",
-        "    is importable + walkable but not yet executable end-to-end.",
+        "    The exported backend phase (ADR 030 D1) wires this through the movate",
+        "    Executor + registry. Today: returns state unchanged so the generated",
+        "    module is importable + walkable but not executable end-to-end.",
         '    """',
         "    _ = node_id  # noqa: B007 — placeholder",
         "    return state",
+    ]
+
+    # Condition-evaluation placeholder — only emitted when needed.
+    if has_conditional:
+        lines += [
+            "",
+            "",
+            "def __movate_eval_condition(expr: str, state: State) -> bool:",
+            '    """Placeholder condition evaluator for conditional edges.',
+            "",
+            "    The backend phase wires this to the movate expression evaluator.",
+            "    Today: returns False so generated routers fall through to END",
+            "    (a safe, terminating default that respects the recursion guard).",
+            '    """',
+            "    _ = expr, state  # noqa: B007 — placeholder",
+            "    return False",
+        ]
+
+    # Conditional routers (one per node with conditional out-edges).
+    lines += _emit_routers(graph, back_edges)
+
+    # build_graph().
+    lines += [
         "",
         "",
         "def build_graph() -> StateGraph:",
@@ -89,29 +285,61 @@ def compile_langgraph(graph: WorkflowGraph) -> str:
         "    builder = StateGraph(State)",
     ]
 
-    # Nodes — iterate via topological order so the emitted file
-    # reads in execution order. Caller code reviewers expect that.
-    ordered_ids = graph.topological_order() if graph.nodes else []
+    # Nodes.
     for nid in ordered_ids:
         lines.append(
             f"    builder.add_node({nid!r}, lambda s, _id={nid!r}: __movate_call_agent(_id, s))"
         )
 
-    # Edges. The IR currently is linear, so we can emit edges in
-    # topological-sort order without conditional logic.
+    # Edges. Emit per source node so we can group conditional edges into a
+    # single add_conditional_edges call and keep parallel siblings together.
     if ordered_ids:
-        first_id = ordered_ids[0]
-        last_id = ordered_ids[-1]
-        lines.append(f"    builder.add_edge(START, {first_id!r})")
+        entry = graph.entrypoint if graph.entrypoint in graph.nodes else ordered_ids[0]
+        lines.append(f"    builder.add_edge(START, {entry!r})")
+
+        emitted_cond_for: set[str] = set()
         for edge in graph.edges:
-            lines.append(f"    builder.add_edge({edge.from_id!r}, {edge.to_id!r})")
-        lines.append(f"    builder.add_edge({last_id!r}, END)")
+            if edge.kind is EdgeKind.CONDITIONAL:
+                # One add_conditional_edges per source node (the router covers
+                # all of that node's conditional out-edges).
+                if edge.from_id in emitted_cond_for:
+                    continue
+                emitted_cond_for.add(edge.from_id)
+                fn = _router_name(edge.from_id)
+                lines.append(f"    builder.add_conditional_edges({edge.from_id!r}, {fn})")
+            elif edge.kind in (EdgeKind.PARALLEL_FAN_OUT, EdgeKind.PARALLEL_FAN_IN):
+                # Fan-out siblings run concurrently; fan-in edges converge on
+                # the merge node. Both are plain add_edge in LangGraph — the
+                # engine schedules fan-out branches in parallel and a node with
+                # multiple inbound edges acts as the merge/join.
+                tag = "fan-out" if edge.kind is EdgeKind.PARALLEL_FAN_OUT else "fan-in (merge)"
+                lines.append(f"    builder.add_edge({edge.from_id!r}, {edge.to_id!r})  # {tag}")
+            else:  # SEQUENTIAL
+                loop_note = "  # loop-back edge" if (edge.from_id, edge.to_id) in back_edges else ""
+                lines.append(f"    builder.add_edge({edge.from_id!r}, {edge.to_id!r}){loop_note}")
+
+        # END framing. Connect every genuine sink (no outbound edges) to END.
+        # Conditional routers already return END for their branch/loop exits,
+        # so nodes whose only out-edges are conditional are not wired here.
+        for sink in graph.sinks():
+            lines.append(f"    builder.add_edge({sink!r}, END)")
 
     lines.append("    return builder")
-    lines.append("")
-    lines.append("")
-    lines.append("if __name__ == '__main__':")
-    lines.append("    graph = build_graph().compile()")
-    lines.append("    print(graph)")
+
+    # __main__ — compile + a bounded invoke so the guard is exercised.
+    invoke_note = (
+        "    # recursion_limit bounds cyclic runs — never remove it."
+        if has_cycle
+        else "    # recursion_limit applies to every run as a safety ceiling."
+    )
+    lines += [
+        "",
+        "",
+        "if __name__ == '__main__':",
+        "    graph = build_graph().compile()",
+        invoke_note,
+        "    result = graph.invoke({}, {'recursion_limit': RECURSION_LIMIT})",
+        "    print(result)",
+    ]
 
     return "\n".join(lines) + "\n"

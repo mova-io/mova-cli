@@ -382,6 +382,146 @@ def test_compile_rejects_missing_state_schema(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ADR 030 D2 — additive edge fields (when / kind) lower into IR EdgeKinds.
+# Backward-compatible: an OLD sequential workflow.yaml is unchanged.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_old_sequential_yaml_still_loads_and_compiles_unchanged(tmp_path: Path) -> None:
+    """An edge with only from/to (the v0.3 shape) parses + lowers to SEQUENTIAL,
+    carries no condition, and passes the linear phase gate — no behavior drift."""
+    yaml_path = _linear_two_node(tmp_path)
+    spec, parent = load_workflow_spec(yaml_path)
+    assert spec.edges[0].when is None
+    assert spec.edges[0].kind is None
+    assert spec.edges[0].resolved_kind == "sequential"
+    graph = compile_workflow(spec, parent)
+    validate_linear(graph)  # still a valid linear workflow
+    assert graph.edges[0].kind is EdgeKind.SEQUENTIAL
+    assert graph.edges[0].condition is None
+
+
+@pytest.mark.unit
+def test_edge_when_lowers_to_conditional(tmp_path: Path) -> None:
+    """A ``when:`` on an edge lowers to EdgeKind.CONDITIONAL carrying the
+    condition string verbatim into the IR."""
+    workflow_dir = tmp_path / "wf"
+    _scaffold_two_agents(workflow_dir)
+    yaml_path = _write_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            {"id": "second", "type": "agent", "ref": "./agents/second"},
+        ],
+        edges=[{"from": "first", "to": "second", "when": "$.approved"}],
+    )
+    spec, parent = load_workflow_spec(yaml_path)
+    assert spec.edges[0].resolved_kind == "conditional"
+    graph = compile_workflow(spec, parent)
+    edge = graph.edges[0]
+    assert edge.kind is EdgeKind.CONDITIONAL
+    assert edge.condition == "$.approved"
+
+
+@pytest.mark.unit
+def test_edge_kind_fan_out_fan_in_lowers_to_parallel(tmp_path: Path) -> None:
+    """Explicit ``kind: fan_out`` / ``fan_in`` lower to the parallel IR kinds."""
+    workflow_dir = tmp_path / "wf"
+    scaffold_agent(workflow_dir / "agents" / "split", name="split-agent")
+    scaffold_agent(workflow_dir / "agents" / "w1", name="w1-agent")
+    scaffold_agent(workflow_dir / "agents" / "merge", name="merge-agent")
+    yaml_path = _write_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "split", "type": "agent", "ref": "./agents/split"},
+            {"id": "w1", "type": "agent", "ref": "./agents/w1"},
+            {"id": "merge", "type": "agent", "ref": "./agents/merge"},
+        ],
+        edges=[
+            {"from": "split", "to": "w1", "kind": "fan_out"},
+            {"from": "w1", "to": "merge", "kind": "fan_in"},
+        ],
+        entrypoint="split",
+    )
+    spec, parent = load_workflow_spec(yaml_path)
+    graph = compile_workflow(spec, parent)
+    kinds = {(e.from_id, e.to_id): e.kind for e in graph.edges}
+    assert kinds[("split", "w1")] is EdgeKind.PARALLEL_FAN_OUT
+    assert kinds[("w1", "merge")] is EdgeKind.PARALLEL_FAN_IN
+    # These are non-sequential, non-synthetic — the v0.3 phase gate rejects them.
+    with pytest.raises(WorkflowCompileError, match="non-sequential"):
+        validate_linear(graph)
+
+
+@pytest.mark.unit
+def test_edge_when_with_non_conditional_kind_is_rejected_at_parse(tmp_path: Path) -> None:
+    """A contradictory edge (``when:`` + ``kind: fan_out``) fails Pydantic
+    validation rather than silently dropping the guard."""
+    workflow_dir = tmp_path / "wf"
+    _scaffold_two_agents(workflow_dir)
+    yaml_path = _write_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            {"id": "second", "type": "agent", "ref": "./agents/second"},
+        ],
+        edges=[{"from": "first", "to": "second", "when": "$.x", "kind": "fan_out"}],
+    )
+    with pytest.raises(WorkflowSpecLoadError, match="only valid on a conditional edge"):
+        load_workflow_spec(yaml_path)
+
+
+@pytest.mark.unit
+def test_edge_blank_when_is_rejected_at_parse(tmp_path: Path) -> None:
+    workflow_dir = tmp_path / "wf"
+    _scaffold_two_agents(workflow_dir)
+    yaml_path = _write_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            {"id": "second", "type": "agent", "ref": "./agents/second"},
+        ],
+        edges=[{"from": "first", "to": "second", "when": "   "}],
+    )
+    with pytest.raises(WorkflowSpecLoadError, match="non-empty condition"):
+        load_workflow_spec(yaml_path)
+
+
+@pytest.mark.unit
+def test_cycle_compiles_only_under_allow_cycles(tmp_path: Path) -> None:
+    """A workflow with a loop is rejected by the default (native-runner) path
+    but compiles into the IR on the cycle-tolerant export path."""
+    workflow_dir = tmp_path / "wf"
+    scaffold_agent(workflow_dir / "agents" / "a", name="a-agent")
+    scaffold_agent(workflow_dir / "agents" / "b", name="b-agent")
+    scaffold_agent(workflow_dir / "agents" / "c", name="c-agent")
+    yaml_path = _write_workflow(
+        workflow_dir,
+        nodes=[
+            {"id": "a", "type": "agent", "ref": "./agents/a"},
+            {"id": "b", "type": "agent", "ref": "./agents/b"},
+            {"id": "c", "type": "agent", "ref": "./agents/c"},
+        ],
+        edges=[
+            {"from": "a", "to": "b"},
+            {"from": "b", "to": "a", "when": "$.retry"},
+            {"from": "b", "to": "c", "when": "$.done"},
+        ],
+        entrypoint="a",
+    )
+    spec, parent = load_workflow_spec(yaml_path)
+    # Default path (native runner) still rejects cycles.
+    with pytest.raises(WorkflowCompileError, match="cycle"):
+        compile_workflow(spec, parent)
+    # Export path tolerates the loop and surfaces the back-edge.
+    graph = compile_workflow(spec, parent, allow_cycles=True)
+    assert graph.has_cycle()
+    back = {(e.from_id, e.to_id) for e in graph.find_back_edges()}
+    assert ("b", "a") in back
+
+
+# ---------------------------------------------------------------------------
 # IR helpers — topological_order, sources/sinks, is_linear
 # ---------------------------------------------------------------------------
 
@@ -445,6 +585,68 @@ def test_sources_and_sinks() -> None:
     )
     assert g.sources() == ["a"]
     assert g.sinks() == ["c"]
+
+
+@pytest.mark.unit
+def test_find_back_edges_none_for_acyclic_graph() -> None:
+    g = WorkflowGraph(
+        name="demo",
+        version="0.1.0",
+        description="",
+        state_schema={"type": "object"},
+        entrypoint="a",
+        nodes={
+            "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
+            "b": WorkflowNode(id="b", type=NodeType.AGENT, ref="/y"),
+        },
+        edges=[WorkflowEdge(from_id="a", to_id="b")],
+        workflow_dir=Path("/"),
+    )
+    assert g.find_back_edges() == []
+    assert not g.has_cycle()
+
+
+@pytest.mark.unit
+def test_find_back_edges_identifies_loop() -> None:
+    """A back-edge (b→a closing an a→b→a loop) is detected; the forward edges
+    are not flagged. This is the cycle detection the LangGraph compiler reuses
+    to bound loops with a recursion guard."""
+    g = WorkflowGraph(
+        name="demo",
+        version="0.1.0",
+        description="",
+        state_schema={"type": "object"},
+        entrypoint="a",
+        nodes={
+            "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
+            "b": WorkflowNode(id="b", type=NodeType.AGENT, ref="/y"),
+        },
+        edges=[
+            WorkflowEdge(from_id="a", to_id="b"),
+            WorkflowEdge(from_id="b", to_id="a", kind=EdgeKind.CONDITIONAL, condition="$.retry"),
+        ],
+        workflow_dir=Path("/"),
+    )
+    back = g.find_back_edges()
+    assert g.has_cycle()
+    assert len(back) == 1
+    assert (back[0].from_id, back[0].to_id) == ("b", "a")
+
+
+@pytest.mark.unit
+def test_find_back_edges_handles_self_loop() -> None:
+    g = WorkflowGraph(
+        name="demo",
+        version="0.1.0",
+        description="",
+        state_schema={"type": "object"},
+        entrypoint="a",
+        nodes={"a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x")},
+        edges=[WorkflowEdge(from_id="a", to_id="a", kind=EdgeKind.CONDITIONAL, condition="$.go")],
+        workflow_dir=Path("/"),
+    )
+    back = g.find_back_edges()
+    assert [(e.from_id, e.to_id) for e in back] == [("a", "a")]
 
 
 # ---------------------------------------------------------------------------

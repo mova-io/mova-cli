@@ -26,7 +26,14 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -166,14 +173,74 @@ NodeSpec = Annotated[
 class EdgeSpec(BaseModel):
     """One workflow edge as written in YAML.
 
-    v0.3 edges are unconditional sequential transitions. ``when:`` and
-    parallel-fan kinds are explicitly out of scope until v1.1.
+    The default edge is an unconditional sequential transition — a bare
+    ``{from: a, to: b}`` is exactly what v0.3 shipped and is unchanged.
+
+    ADR 030 D2 (additive, backward-compatible) adds two **optional** fields
+    that the LangGraph *export* compiler lowers into the IR's existing
+    ``EdgeKind`` variants. They are inert for the native linear runner /
+    ``validate_linear`` phase gate (which still rejects non-sequential
+    edges); they exist so ``mdk export langgraph`` can emit the complex
+    graphs the IR already models:
+
+    * ``when:`` — a condition expression. When present, the edge lowers to
+      ``EdgeKind.CONDITIONAL`` (LangGraph ``add_conditional_edges``). The
+      expression string is carried verbatim into ``WorkflowEdge.condition``;
+      its grammar is intentionally not interpreted here (the generated
+      router renders it as the branch predicate).
+    * ``kind:`` — the explicit edge kind for parallel graphs:
+      ``"fan_out"`` (concurrent siblings) / ``"fan_in"`` (merge), or
+      ``"conditional"`` / ``"sequential"``. Omitted ⇒ ``sequential``
+      (unless ``when:`` is set, which implies ``conditional``). The literal
+      values are generic graph terms — no LangGraph specifics leak into the
+      schema. They map 1:1 onto :class:`~movate.core.workflow.ir.EdgeKind`.
+
+    These keep `workflow.yaml` portable: an old sequential workflow loads,
+    compiles, and (per the native runner) behaves identically.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     from_id: str = Field(..., alias="from")
     to_id: str = Field(..., alias="to")
+    when: str | None = Field(
+        None,
+        description="Condition expression; presence makes the edge conditional (ADR 030 D2)",
+    )
+    kind: Literal["sequential", "conditional", "fan_out", "fan_in"] | None = Field(
+        None,
+        description="Explicit edge kind for parallel/conditional graphs; omitted ⇒ sequential",
+    )
+
+    @field_validator("when")
+    @classmethod
+    def _validate_when(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("edge 'when' must be a non-empty condition expression")
+        return v
+
+    @model_validator(mode="after")
+    def _reconcile_kind_when(self) -> EdgeSpec:
+        # ``when:`` only makes sense on a conditional edge. If the author set
+        # an explicit non-conditional kind alongside a condition, that's a
+        # contradiction — fail loud rather than silently dropping the guard.
+        if self.when is not None and self.kind not in (None, "conditional"):
+            raise ValueError(
+                f"edge {self.from_id!r}→{self.to_id!r}: 'when' is only valid on a "
+                f"conditional edge, but kind={self.kind!r} was declared"
+            )
+        return self
+
+    @property
+    def resolved_kind(self) -> str:
+        """The effective edge kind after reconciling ``when`` / ``kind``.
+
+        ``when:`` set ⇒ ``"conditional"``; otherwise the explicit ``kind`` or
+        ``"sequential"`` by default. Keeps the spec→IR lowering in one place.
+        """
+        if self.when is not None:
+            return "conditional"
+        return self.kind or "sequential"
 
 
 class WorkflowEvalsSpec(BaseModel):
