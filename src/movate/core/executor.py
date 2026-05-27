@@ -82,7 +82,10 @@ from movate.tracing.base import SpanCtx, Tracer
 
 log = logging.getLogger(__name__)
 
-_COST_DRIFT_THRESHOLD = 0.15  # 15%; informational only — providers/pricing.yaml is canonical for billing, litellm's bundled prices can lag
+# 15% — informational cross-check only. The pricing table
+# (providers/pricing.yaml) is canonical for billing; litellm's bundled
+# prices can lag, so a gap here does not mean our reported cost is wrong.
+_COST_DRIFT_THRESHOLD = 0.15
 
 # Hard cap on tool-use turns. If the model keeps emitting tool calls
 # instead of producing a final answer, the loop bails after this many
