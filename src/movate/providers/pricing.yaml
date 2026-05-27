@@ -1,5 +1,5 @@
 version: "2026.05.01"
-last_verified: "2026-05-08"
+last_verified: "2026-05-27"
 models:
   # OpenAI
   openai/gpt-4o-2024-08-06:
