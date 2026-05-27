@@ -771,6 +771,128 @@ def _ingest_remote(*, agent: str, path: Path, target: str, dry_run: bool) -> Non
     )
 
 
+def _ingest_url(
+    *,
+    agent: str,
+    url: str,
+    tenant_id: str,
+    model: str,
+    api_key_env: str,
+    clean_source: bool,
+    build_graph: bool,
+) -> None:
+    """``mdk kb ingest <agent> <url>`` — ingest a single web page (F5 / #114).
+
+    Fetches ``url`` with ``httpx``, strips the HTML to readable text with
+    the stdlib (zero new deps), then routes that text through the SAME
+    chunk → embed → store pipeline a local file uses
+    (:func:`movate.kb.ingest.ingest_text`), recording the source as the
+    URL so ``mdk kb stats --by-source`` / retrieval see it identically.
+
+    Failure modes (CLAUDE.md §10) surface as clean, typed CLI errors
+    (exit 2), never a stack trace:
+
+    * fetch error (non-2xx / timeout / connection) →
+      :class:`movate.kb.web.WebFetchError` → one-line error naming the
+      URL + reason. Nothing is written (the fetch fails before any
+      storage call).
+    * empty / too-short extracted text → "nothing ingestible" error.
+    """
+    import os  # noqa: PLC0415
+
+    from movate.kb.ingest import ingest_text  # noqa: PLC0415
+    from movate.kb.web import WebFetchError, fetch_and_extract  # noqa: PLC0415
+
+    # An embedding key is required — URL ingest embeds locally, same as
+    # the file path. (No --dry-run shortcut here; that's a local-files
+    # preview and is rejected upstream for URLs.)
+    api_key = os.environ.get(api_key_env, "").strip()
+    if not api_key:
+        err_console.print(
+            f"[red]✗[/red] no API key found in [bold]${api_key_env}[/bold]. "
+            "Set the env var or pass [bold]--api-key-env[/bold] to point at "
+            "the correct env var for your embedding provider."
+        )
+        raise typer.Exit(code=2)
+
+    console.print(f"[bold cyan]Fetching[/bold cyan] {url} -> agent [bold]{agent}[/bold]…")
+
+    # Fetch + extract first (no storage writes yet) so a fetch/extract
+    # failure leaves the KB untouched — no partial write.
+    try:
+        text = fetch_and_extract(url)
+    except WebFetchError as exc:
+        err_console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    async def _run() -> None:
+        # _build_storage() is typed -> object (it builds the duck-typed
+        # provider lazily); the same type: ignore pattern the other local
+        # KB paths in this module use applies to the storage calls here.
+        storage = await _build_storage()
+        try:
+            if clean_source:
+                console.print(
+                    "[dim]--clean-source: deleting existing chunks for this URL before "
+                    "re-ingest[/dim]"
+                )
+                removed = await storage.delete_kb_chunks(  # type: ignore[attr-defined]
+                    agent=agent, tenant_id=tenant_id, source=url
+                )
+                if removed:
+                    console.print(f"[dim]→ removed {removed} existing chunk(s)[/dim]")
+                if build_graph:
+                    await storage.delete_graph(  # type: ignore[attr-defined]
+                        agent=agent, tenant_id=tenant_id, source=url
+                    )
+
+            summary = await ingest_text(
+                storage=storage,  # type: ignore[arg-type]
+                text=text,
+                source=url,
+                agent=agent,
+                tenant_id=tenant_id,
+                embedding_model=model,
+                api_key=api_key,
+                build_graph=build_graph,
+            )
+        finally:
+            await storage.close()  # type: ignore[attr-defined]
+
+        if summary is None:
+            # Defensive: fetch_and_extract already guards against empty
+            # text, but the chunker could still drop everything (e.g. all
+            # fragments below MIN_CHUNK_CHARS).
+            err_console.print(
+                f"[yellow]⚠[/yellow] nothing ingestible at [bold]{url}[/bold] — "
+                "the extracted text produced no usable chunks."
+            )
+            raise typer.Exit(code=2)
+
+        table = Table(title=f"[bold]Ingest summary[/bold] — agent [bold]{agent}[/bold]")
+        table.add_column("source", overflow="fold")
+        table.add_column("chunks", justify="right")
+        table.add_column("embedding model")
+        table.add_row(
+            getattr(summary, "source", url),
+            str(getattr(summary, "chunks_saved", 0)),
+            getattr(summary, "embedding_model", ""),
+        )
+        console.print(table)
+        console.print(
+            f"[green]✓[/green] {getattr(summary, 'chunks_saved', 0)} chunk(s) saved "
+            f"from [bold]{url}[/bold]."
+        )
+        if build_graph:
+            console.print(
+                f"[green]✓[/green] knowledge graph: {getattr(summary, 'entities_saved', 0)} "
+                f"entities, {getattr(summary, 'relations_saved', 0)} relations."
+            )
+        console.print(f'[dim]Try it: [bold]mdk kb search {agent} "your question here"[/bold][/dim]')
+
+    asyncio.run(_run())
+
+
 def _list_remote(*, agent: str, target: str, source: str | None, limit: int) -> None:
     """``mdk kb list --target`` — list a deployed agent's KB chunks.
 
@@ -1051,13 +1173,16 @@ def ingest(
             "mismatch returns no results). Omit for interactive picker."
         ),
     ),
-    path: Path | None = typer.Argument(
+    source: str | None = typer.Argument(
         None,
+        metavar="[PATH_OR_URL]",
         help=(
-            "File or directory to ingest. Directories are walked "
-            "recursively; supported formats: .md, .txt, .pdf, .docx, "
+            "File or directory to ingest, OR a single web-page URL "
+            "(starts with http:// or https://). Directories are walked "
+            "recursively; supported file formats: .md, .txt, .pdf, .docx, "
             ".html, .png, .jpg, .jpeg, .tiff. "
-            "Hidden dirs (.git, .venv) skipped. "
+            "Hidden dirs (.git, .venv) skipped. A URL is fetched, stripped "
+            "to readable text, and ingested through the same pipeline. "
             "Defaults to agents/<agent>/kb/ when omitted."
         ),
     ),
@@ -1160,7 +1285,13 @@ def ingest(
         ),
     ),
 ) -> None:
-    """Ingest a knowledge-base file or directory into ``agent``'s KB.
+    """Ingest a knowledge-base file, directory, or web page into ``agent``'s KB.
+
+    The source can be a filesystem path (file or directory) OR a single
+    web-page URL starting with ``http://`` / ``https://`` — a URL is
+    fetched, stripped to readable text, and chunked + embedded + stored
+    through the same pipeline local files use (so ``mdk kb stats`` /
+    ``search`` see it identically, with the URL as the source).
 
     Both arguments are optional — omit them to get an interactive picker
     that auto-detects agents in the current project and defaults the
@@ -1181,11 +1312,46 @@ def ingest(
     """
     import os  # noqa: PLC0415
 
+    from movate.kb.web import is_url  # noqa: PLC0415
+
     # ── Interactive guided helpers when arguments are omitted ──────────────
     if agent is None:
         agent = _prompt_agent_picker(verb="ingest files for")
         if agent is None:
             raise typer.Exit(code=1)
+
+    # ── Source detection: URL vs filesystem path ───────────────────────────
+    # A source starting with http:// or https:// is a single web page
+    # (F5 / #114) — fetch + strip + ingest through the same pipeline. Any
+    # other string (or None) is a filesystem path, 100% unchanged below.
+    if source is not None and is_url(source):
+        if target is not None:
+            # The remote endpoint only accepts multipart file uploads; URL
+            # ingest is a local-only path. Fail clearly rather than silently.
+            err_console.print(
+                "[red]✗[/red] [bold]--target[/bold] can't be combined with a URL source — "
+                "URL ingest runs locally. Ingest the URL without --target, or pass a "
+                "file/directory path to upload to the remote runtime."
+            )
+            raise typer.Exit(code=2)
+        if dry_run:
+            err_console.print(
+                "[yellow]⚠[/yellow] [bold]--dry-run[/bold] is not supported for URL ingest yet "
+                "(it previews local files). Run without --dry-run to fetch + ingest the page."
+            )
+            raise typer.Exit(code=2)
+        _ingest_url(
+            agent=agent,
+            url=source,
+            tenant_id=tenant_id,
+            model=model,
+            api_key_env=api_key_env,
+            clean_source=clean_source,
+            build_graph=build_graph,
+        )
+        return
+
+    path = Path(source) if source is not None else None
 
     if path is None:
         from movate.cli._resolve import walk_up_for_project_root  # noqa: PLC0415
