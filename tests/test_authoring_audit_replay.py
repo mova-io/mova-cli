@@ -16,6 +16,7 @@ assert the brief's contract:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -418,5 +419,11 @@ def test_dev_audit_action_reads_log_without_crashing(tmp_path: Path) -> None:
 
 def test_dev_help_advertises_budget_flag() -> None:
     result = runner.invoke(app, ["dev", "--help"])
-    assert result.exit_code == 0
-    assert "--budget" in result.stdout
+    # exit_code 0 proves `mdk dev --help` resolves. Rich styles + width-wraps
+    # the help body under CI's narrow non-TTY terminal, so a raw substring
+    # match on the flag is brittle (cf. the mcp serve --help fix). Strip ANSI
+    # and ALL whitespace before matching so the assertion survives wrapping.
+    assert result.exit_code == 0, result.output
+    flat = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    flat = "".join(flat.split())
+    assert "--budget" in flat
