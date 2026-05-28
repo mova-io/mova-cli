@@ -1,0 +1,177 @@
+name: daily-changelog
+
+# Daily "What's New" digest.
+#
+# Every morning this collects the PREVIOUS day's merged PRs and prepends a
+# dated block to the `## What's New` section at the top of README.md (the page
+# rendered at github.com/mova-io/mova-cli/tree/main), via an auto-merged PR.
+# Durable: runs on GitHub's infra, independent of any local/agent session.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR SETUP — required for auto-merge to actually complete
+# ─────────────────────────────────────────────────────────────────────────────
+# This workflow needs a repo secret named `MOVATE_BOT_TOKEN`: a fine-grained
+# Personal Access Token with **Contents: write** and **Pull requests: write**
+# on mova-io/mova-cli.
+#
+# WHY a PAT and not the built-in GITHUB_TOKEN: GitHub has a recursion guard —
+# events (incl. `pull_request`) triggered by the default GITHUB_TOKEN do NOT
+# kick off other workflows. So a PR opened with GITHUB_TOKEN never fires the
+# repo's required `pull_request` checks (lint-and-test etc.), and `gh pr merge
+# --auto` would then wait forever for checks that can never start. Authenticating
+# the create/merge steps with a PAT makes the PR look "human-authored", so the
+# required checks run and auto-merge can complete. (The same org policy that
+# disabled "Allow GitHub Actions to create and approve pull requests" — see the
+# note at the bottom of ci.yml — also blocks GITHUB_TOKEN from opening the PR at
+# all, so the PAT is doubly required.)
+#
+# WITHOUT the secret: the workflow still runs the digest, but the create/merge
+# steps are skipped (guarded on the secret being set) and it logs how to add it.
+# See docs/daily-changelog.md for the full runbook + how to test via dispatch.
+
+on:
+  schedule:
+    # 14:00 UTC daily ≈ 06:00 US Pacific (PDT, UTC-7) / 07:00 (during PST,
+    # UTC-8) — a "what shipped yesterday" digest waiting when the US team
+    # starts the morning. GitHub cron is always UTC and has no DST.
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Digest date YYYY-MM-DD (UTC). Default: yesterday."
+        required: false
+        type: string
+
+# Least privilege: write the README commit/branch (contents) and open the PR
+# (pull-requests). No other scopes.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # One digest run at a time; a manual dispatch supersedes a queued scheduled
+  # run rather than racing it on the same README.
+  group: daily-changelog
+  cancel-in-progress: false
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the bump + branch push have a real base.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compute date window (UTC)
+        id: window
+        # Resolve the digest date (dispatch input override, else yesterday) and
+        # the [start, end) day window the gh search uses (merged:>=start..end).
+        # The dispatch input is passed via env (not interpolated into the shell)
+        # to avoid actionlint's expression-injection warning.
+        env:
+          INPUT_DATE: ${{ github.event.inputs.date }}
+        run: |
+          if [ -n "$INPUT_DATE" ]; then
+            DATE="$INPUT_DATE"
+          else
+            DATE="$(date -u -d 'yesterday' +%Y-%m-%d)"
+          fi
+          NEXT="$(date -u -d "$DATE + 1 day" +%Y-%m-%d)"
+          {
+            echo "date=$DATE"
+            echo "next=$NEXT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Digest window: merged:>=$DATE..$NEXT"
+
+      - name: Collect merged PRs
+        env:
+          # The list step only READS; the default token is fine here (the PAT
+          # is only needed for create/merge so required checks fire — see header).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DATE: ${{ steps.window.outputs.date }}
+          NEXT: ${{ steps.window.outputs.next }}
+        run: |
+          gh pr list \
+            --repo "$REPO" \
+            --state merged \
+            --search "merged:>=${DATE}..${NEXT}" \
+            --json number,title,author,mergedAt \
+            > prs.json
+          echo "Fetched $(jq 'length' prs.json) merged PR(s) for ${DATE}."
+
+      - name: Generate digest
+        id: gen
+        env:
+          REPO: ${{ github.repository }}
+          DATE: ${{ steps.window.outputs.date }}
+        # Pipe the PR JSON into the pure generator (no network in the script).
+        # Record whether the README actually changed so later steps can skip a
+        # quiet day cleanly.
+        run: |
+          python scripts/gen_daily_changelog.py \
+            --repo "$REPO" \
+            --date "${DATE}" \
+            < prs.json
+          if git diff --quiet -- README.md; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No README change for ${DATE} (nothing merged, or already recorded) — skipping PR."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for bot token
+        id: token
+        # The create/merge steps need the PAT. Gate on it so the workflow
+        # degrades gracefully (and tells the operator how to fix it) instead of
+        # opening a PR that can never auto-merge.
+        env:
+          BOT_TOKEN: ${{ secrets.MOVATE_BOT_TOKEN }}
+        run: |
+          if [ -n "$BOT_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::MOVATE_BOT_TOKEN is not set — README digest generated but the auto-merge PR is skipped. See docs/daily-changelog.md."
+          fi
+
+      - name: Bump CalVer version
+        if: steps.gen.outputs.changed == 'true'
+        # Clears the per-PR version gate (ci.yml's "Version bump gate") so the
+        # auto-merge PR's required checks pass. Don't hand-edit version files.
+        run: python scripts/bump_version.py
+
+      - name: Open auto-merge PR
+        if: steps.gen.outputs.changed == 'true' && steps.token.outputs.present == 'true'
+        env:
+          # PAT auth so the PR fires the repo's required pull_request checks and
+          # auto-merge can complete (see header for the GITHUB_TOKEN gotcha).
+          GH_TOKEN: ${{ secrets.MOVATE_BOT_TOKEN }}
+          REPO: ${{ github.repository }}
+          DATE: ${{ steps.window.outputs.date }}
+        run: |
+          BRANCH="changelog/${DATE}"
+          git config user.name "movate-bot"
+          git config user.email "movate-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add README.md pyproject.toml src/movate/__init__.py uv.lock
+          # Subject + trailer as separate -m args so no YAML block indentation
+          # leaks into the commit body.
+          git commit \
+            -m "docs(changelog): what shipped ${DATE}" \
+            -m "Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+          git push --force-with-lease origin "$BRANCH"
+          gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "docs(changelog): what shipped ${DATE}" \
+            --body "Automated daily \`What's New\` digest for ${DATE} (merged PRs). Generated by the \`daily-changelog\` workflow; auto-merges once required checks pass."
+          gh pr merge "$BRANCH" --repo "$REPO" --auto --squash
