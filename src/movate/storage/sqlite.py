@@ -25,6 +25,8 @@ from movate.core.models import (
     BenchRecord,
     CanaryConfig,
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     Entity,
     EntityWithScore,
     ErrorInfo,
@@ -664,6 +666,34 @@ _MIGRATIONS = [
     # breakdown is coherent (a turn's skill children are persisted too).
     "ALTER TABLE runs ADD COLUMN skill_calls TEXT",
     "ALTER TABLE runs ADD COLUMN turns TEXT",
+    # ADR 043 D1: Failure Pattern Diagnoser results. One row per diagnose
+    # request; upsert on diagnosis_id so the runtime's background task can
+    # transition a row from ``running`` to ``completed`` without a separate
+    # update method. ``request`` / ``result`` are JSON blobs in TEXT (no
+    # native JSON type in sqlite); the typed-fix taxonomy is validated at
+    # the wire edge so adding a new fix kind later doesn't require a
+    # storage migration. Read-only with respect to agent state — persisting
+    # a row never modifies the agent.
+    """
+    CREATE TABLE IF NOT EXISTS diagnoses (
+        diagnosis_id  TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        agent         TEXT NOT NULL,
+        status        TEXT NOT NULL,
+        request       TEXT NOT NULL,
+        result        TEXT,
+        error         TEXT,
+        tokens_used   INTEGER NOT NULL DEFAULT 0,
+        cost_usd      REAL NOT NULL DEFAULT 0.0,
+        model         TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL,
+        completed_at  TEXT
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_diagnoses_agent_created "
+        "ON diagnoses(tenant_id, agent, created_at DESC)"
+    ),
 ]
 
 
@@ -2926,6 +2956,58 @@ class SqliteProvider:
         return (cur.rowcount or 0) > 0
 
     # ------------------------------------------------------------------
+    # Diagnoses (ADR 043 D1 — Failure Pattern Diagnoser results)
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        # Upsert on diagnosis_id. ON CONFLICT preserves the original
+        # created_at so a follow-up "completed" save doesn't reset the
+        # insert timestamp — same pattern as the upsert helpers above.
+        await self._db.execute(
+            """
+            INSERT INTO diagnoses (
+                diagnosis_id, tenant_id, agent, status, request, result,
+                error, tokens_used, cost_usd, model, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(diagnosis_id) DO UPDATE SET
+                status       = excluded.status,
+                request      = excluded.request,
+                result       = excluded.result,
+                error        = excluded.error,
+                tokens_used  = excluded.tokens_used,
+                cost_usd     = excluded.cost_usd,
+                model        = excluded.model,
+                completed_at = excluded.completed_at
+            """,
+            (
+                record.diagnosis_id,
+                record.tenant_id,
+                record.agent,
+                record.status.value,
+                json.dumps(record.request),
+                json.dumps(record.result) if record.result is not None else None,
+                json.dumps(record.error.model_dump()) if record.error is not None else None,
+                record.tokens_used,
+                record.cost_usd,
+                record.model,
+                record.created_at.isoformat(),
+                record.completed_at.isoformat() if record.completed_at else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        # tenant_id in WHERE is the SQL-layer enforcement — the no-leak
+        # contract (a cross-tenant lookup is indistinguishable from a
+        # missing row).
+        async with self._db.execute(
+            "SELECT * FROM diagnoses WHERE diagnosis_id = ? AND tenant_id = ? LIMIT 1",
+            (diagnosis_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_diagnosis(row) if row else None
+
+    # ------------------------------------------------------------------
     # DR backup/restore (item 26) — delegate to the backend-agnostic
     # orchestration in movate.core.dr_backup (reads/writes only through this
     # Protocol's methods, so the snapshot round-trips across all backends).
@@ -2957,6 +3039,27 @@ def _row_to_thread(row: aiosqlite.Row) -> ConversationThread:
         title=row["title"] or "",
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_diagnosis(row: aiosqlite.Row) -> DiagnosisRecord:
+    error_raw = row["error"]
+    error_obj: ErrorInfo | None = None
+    if error_raw:
+        error_obj = ErrorInfo.model_validate(json.loads(error_raw))
+    return DiagnosisRecord(
+        diagnosis_id=row["diagnosis_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        status=DiagnosisStatus(row["status"]),
+        request=json.loads(row["request"]) if row["request"] else {},
+        result=json.loads(row["result"]) if row["result"] else None,
+        error=error_obj,
+        tokens_used=int(row["tokens_used"] or 0),
+        cost_usd=float(row["cost_usd"] or 0.0),
+        model=row["model"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+        completed_at=(datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None),
     )
 
 

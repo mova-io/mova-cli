@@ -3096,5 +3096,93 @@ class Subgraph(BaseModel):
     ``src_entity_id`` / ``dst_entity_id`` is present in ``entities``."""
 
 
+# ---------------------------------------------------------------------------
+# Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
+#
+# A diagnosis is the structured output of running the Failure Pattern
+# Diagnoser against an agent's recent failures. It is **read-only with
+# respect to agent state**: the record only describes what was found and
+# proposes typed fixes; nothing in the agent (prompt, KB, context, model)
+# is modified by persisting one. ADR 043 will introduce a separate
+# ``proposed_patches`` table for apply-side workflows; this PR ships the
+# diagnose step alone.
+#
+# The ``result`` payload is JSON-serializable (``dict[str, object]``) so
+# the schema can evolve without table migrations — the discriminated
+# fix-kind union (``prompt_edit``, ``kb_ingest``, ``context_add``,
+# ``context_remove``, ``model_swap``, ``temperature_change``,
+# ``retrieval_k_change``) is validated at the wire edge by Pydantic in
+# ``movate.runtime.schemas``.
+# ---------------------------------------------------------------------------
+
+
+class DiagnosisStatus(StrEnum):
+    """Lifecycle of a diagnosis job.
+
+    Reuses a small superset of :class:`JobStatus` semantics but is its own
+    enum so the diagnose endpoint never accidentally mixes with the job
+    queue's vocabulary (a diagnosis is run inline via FastAPI background
+    tasks, not by the worker dispatch loop).
+    """
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class DiagnosisRecord(BaseModel):
+    """Persisted result of one Failure Pattern Diagnoser run (ADR 043 D1).
+
+    Created by ``POST /api/v1/agents/{name}/diagnose`` (status=running)
+    and stamped with the structured result + token/cost totals when the
+    background task finishes (status=completed) — or with an error blob
+    on failure (status=error).
+
+    The ``result`` dict carries the cluster-and-proposed-fix payload the
+    GET endpoint renders; its wire shape is defined by the Pydantic
+    :class:`movate.runtime.schemas.DiagnoseResultView` (clusters list +
+    input_summary). It is stored as an opaque JSON blob so the typed-fix
+    taxonomy can evolve without a schema migration — validation happens
+    at the wire edge, not the storage edge.
+
+    Read-only with respect to agent state: persisting a row never
+    mutates the agent. The taxonomy is consumed by ADR 043's apply step
+    in a later PR.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    diagnosis_id: str
+    tenant_id: str
+    agent: str
+    status: DiagnosisStatus = DiagnosisStatus.RUNNING
+    request: dict[str, Any] = Field(default_factory=dict)
+    """The original ``DiagnoseRequest`` body (window_days, min_failure_count,
+    etc.) captured for audit / re-run. Stored as a plain dict so request-
+    schema evolution doesn't require a record migration."""
+    result: dict[str, Any] | None = None
+    """The structured diagnose output (clusters + per-cluster proposed
+    fixes + ``input_summary``). ``None`` while ``status == "running"``,
+    populated when the background task transitions to ``completed``.
+    Schema lives in :class:`movate.runtime.schemas.DiagnoseResultView`."""
+    error: ErrorInfo | None = None
+    """Set when ``status == "error"`` — same shape as a failed run's
+    error block so operators triage diagnoses with the same vocabulary."""
+    tokens_used: int = 0
+    """Cumulative input + output tokens spent on the diagnoser's LLM
+    calls. ``0`` until the background task finishes."""
+    cost_usd: float = 0.0
+    """Diagnoser LLM cost in USD. ``0.0`` until the background task
+    finishes. Always less than the request's ``budget_usd`` cap (the
+    diagnoser short-circuits when the budget is exhausted)."""
+    model: str = ""
+    """The provider/model string the diagnoser used (e.g.
+    ``openai/gpt-4o-mini``). Captured for audit + reproducibility."""
+    created_at: datetime = Field(default_factory=_now)
+    completed_at: datetime | None = None
+    """Stamped when the background task transitions out of ``running``
+    (either ``completed`` or ``error``). ``None`` while in flight."""
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

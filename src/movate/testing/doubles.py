@@ -20,6 +20,7 @@ from movate.core.models import (
     BenchRecord,
     CanaryConfig,
     ConversationThread,
+    DiagnosisRecord,
     Entity,
     EntityWithScore,
     EvalRecord,
@@ -87,6 +88,11 @@ class InMemoryStorage:
         # → the job_id the first async submit enqueued.
         self.run_submissions: dict[tuple[str, str], str] = {}
         self.canary_configs: list[CanaryConfig] = []
+        # ADR 043 D1: persisted Failure Pattern Diagnoser outputs. Keyed
+        # by diagnosis_id; upserted in place so the runtime background
+        # task can transition a row from ``running`` to ``completed``
+        # without a separate update method.
+        self.diagnoses: dict[str, DiagnosisRecord] = {}
 
     async def init(self) -> None:
         return None
@@ -1243,6 +1249,30 @@ class InMemoryStorage:
         from movate.core.dr_backup import import_state  # noqa: PLC0415
 
         return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        # Upsert keyed by diagnosis_id. On overwrite, preserve the
+        # insert-time fields the runtime layer never re-sends
+        # (``created_at``) so a follow-up "completed" save doesn't
+        # accidentally clobber the original timestamp.
+        existing = self.diagnoses.get(record.diagnosis_id)
+        if existing is not None:
+            record = record.model_copy(update={"created_at": existing.created_at})
+        self.diagnoses[record.diagnosis_id] = record
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        row = self.diagnoses.get(diagnosis_id)
+        if row is None:
+            return None
+        if row.tenant_id != tenant_id:
+            # No-leak contract: cross-tenant probe is indistinguishable
+            # from a missing record.
+            return None
+        return row
 
     async def close(self) -> None:
         return None

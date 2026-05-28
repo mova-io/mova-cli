@@ -22,12 +22,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -49,6 +62,9 @@ from movate.core.models import (
     BatchRecord,
     BenchRecord,
     CanaryConfig,
+    DiagnosisRecord,
+    DiagnosisStatus,
+    ErrorInfo,
     EvalRecord,
     EvalSchedule,
     JobKind,
@@ -160,6 +176,9 @@ from movate.runtime.schemas import (
     CanarySetRequest,
     CanarySideView,
     CanaryView,
+    DiagnoseAcceptedView,
+    DiagnoseJobView,
+    DiagnoseRequest,
     EvalAcceptedView,
     EvalListView,
     EvalScheduleListView,
@@ -229,6 +248,58 @@ from movate.tracing import inject_current_trace_context, record_audit_event
 
 if TYPE_CHECKING:
     from movate.providers.model_catalog import ModelInfo
+
+
+logger = logging.getLogger(__name__)
+
+
+def _serialize_proposed_fix(fix: Any) -> dict[str, Any]:
+    """Serialize a :class:`movate.core.diagnoser.ProposedFix` for storage.
+
+    Translates the internal taxonomy (``kind`` + opaque ``payload``)
+    onto the wire shape the GET endpoint's ``DiagnoseJobView`` validates
+    against — a flat dict whose fields depend on ``kind``:
+
+    * ``prompt_edit`` → ``{"kind": "prompt_edit", "diff": {...}, "rationale": ...}``
+    * ``kb_ingest`` → ``{"kind": "kb_ingest", "payload": {...}, ...}``
+    * ``context_add`` / ``context_remove`` / ``model_swap`` /
+      ``temperature_change`` / ``retrieval_k_change`` → ``{"kind": ..., <field>: ...}``
+
+    The shape MUST match :data:`movate.runtime.schemas.ProposedFixView`
+    exactly so a follow-up ``GET`` round-trips through Pydantic without
+    a discriminator-mismatch error. Any drift here is a wire-contract
+    bug surface — handle that by extending both the diagnoser taxonomy
+    AND this serializer in lockstep.
+    """
+    base: dict[str, Any] = {
+        "kind": fix.kind,
+        "rationale": fix.rationale,
+        "expected_improvement": dict(fix.expected_improvement),
+    }
+    payload = dict(fix.payload)
+    if fix.kind == "prompt_edit":
+        base["diff"] = {
+            "before": payload.get("before", ""),
+            "after": payload.get("after", ""),
+            "patch_text": payload.get("patch_text", ""),
+        }
+    elif fix.kind == "kb_ingest":
+        base["payload"] = {
+            "kind": str(payload.get("kind", "")),
+            "source": str(payload.get("source", "")),
+        }
+    elif fix.kind == "context_add":
+        base["name"] = str(payload.get("name", ""))
+        base["body"] = str(payload.get("body", ""))
+    elif fix.kind == "context_remove":
+        base["name"] = str(payload.get("name", ""))
+    elif fix.kind == "model_swap":
+        base["provider"] = str(payload.get("provider", ""))
+    elif fix.kind == "temperature_change":
+        base["delta"] = float(payload.get("delta", 0.0))
+    elif fix.kind == "retrieval_k_change":
+        base["delta"] = int(payload.get("delta", 0))
+    return base
 
 
 def _sse_frame(event: str, data: dict[str, Any]) -> str:
@@ -4381,6 +4452,227 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Failure Pattern Diagnoser (ADR 043 D1) — the foundational diagnose
+    # step of the Self-Improving Agent Loop. Reads recent failures for
+    # an agent (failed runs, eval misses, drift detections, optional
+    # canary misses), clusters them by failure mode using Claude, and
+    # proposes a TYPED fix per cluster. READ-ONLY with respect to agent
+    # state: this endpoint NEVER modifies the agent — that's ADR 043's
+    # apply step in a later PR.
+    #
+    # Async by design: a background task runs the diagnoser while the
+    # caller polls ``GET /api/v1/diagnoses/{id}``. We deliberately did
+    # NOT add a JobKind.DIAGNOSE — the diagnose phase is read-only,
+    # cheap, and runtime-only; threading it through the worker /
+    # dispatch path would be over-engineered for the single-call
+    # nature of the work.
+    # ------------------------------------------------------------------
+
+    _diagnoser_default_model = "openai/gpt-4o-mini"
+
+    @v1.post(
+        "/agents/{name}/diagnose",
+        response_model=DiagnoseAcceptedView,
+        status_code=202,
+        tags=["diagnose-v1"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_diagnose_agent(
+        name: str,
+        body: DiagnoseRequest,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> DiagnoseAcceptedView:
+        """Cluster recent failures + propose typed fixes (ADR 043 D1).
+
+        Always async — returns 202 with a ``job_id`` (= diagnosis id) and
+        a ``status_url`` pointing to ``GET /api/v1/diagnoses/{id}``. The
+        diagnoser runs in a FastAPI background task; the row is
+        persisted as ``status="running"`` here and updated to
+        ``status="completed"`` (or ``"error"``) once the task finishes.
+
+        **Read-only with respect to agent state.** The endpoint NEVER
+        modifies the agent's prompt / KB / context / model. It only
+        produces a structured analysis. ADR 043's separate apply step
+        (later PR) is the only thing that mutates an agent based on
+        these proposals.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — token lacks the ``eval`` scope
+        * **404** — agent not in the registry for this tenant
+        """
+        from movate.core.diagnose_sources import collect_failures  # noqa: PLC0415
+
+        # 404 if the agent isn't known to this runtime. Match the
+        # harvest endpoint's existence check: an ``agents_path/<name>``
+        # directory OR a registry row for this tenant counts as
+        # "exists" — the diagnose phase only needs the NAME to scope
+        # failure lookups; it never loads the bundle (no prompt /
+        # config read).
+        store: StorageProvider = request.app.state.storage
+        agents_path: Path | None = request.app.state.agents_path
+        agent_known = False
+        if agents_path is not None and (agents_path / name).is_dir():
+            agent_known = True
+        if not agent_known:
+            agents: list[AgentBundle] = request.app.state.agents
+            if any(b.spec.name == name for b in agents):
+                agent_known = True
+        if not agent_known:
+            registry_row = await store.get_agent_bundle(name, tenant_id=ctx.tenant_id)
+            if registry_row is not None:
+                agent_known = True
+        if not agent_known:
+            raise not_found("agent", name)
+
+        diagnosis_id = str(uuid4())
+        # Persist the row in ``running`` state immediately so an
+        # operator polling right after POST sees a valid record (vs.
+        # a 404 race window if the BG task hadn't started saving yet).
+        running_record = DiagnosisRecord(
+            diagnosis_id=diagnosis_id,
+            tenant_id=ctx.tenant_id,
+            agent=name,
+            status=DiagnosisStatus.RUNNING,
+            request=body.model_dump(),
+            model=body.model or _diagnoser_default_model,
+        )
+        await store.save_diagnosis(running_record)
+
+        # Snapshot what the background task needs — request-scoped state
+        # (the AuthContext, the FastAPI Request) is gone by the time the
+        # task runs, so we capture the small flat tuple of inputs here.
+        async def _run_diagnose() -> None:
+            from movate.core.diagnoser import (  # noqa: PLC0415
+                Diagnoser,
+                DiagnoserBudgetExceeded,
+                DiagnoserParseError,
+            )
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            failures: list[Any] = []
+            error: ErrorInfo | None = None
+            result_payload: dict[str, Any] | None = None
+            tokens_used = 0
+            cost_usd = 0.0
+            try:
+                failures = await collect_failures(
+                    store,
+                    agent=name,
+                    tenant_id=ctx.tenant_id,
+                    window_days=body.window_days,
+                    include_runs=True,
+                    include_eval_failures=body.include_eval_failures,
+                    include_drift_detections=body.include_drift_detections,
+                    include_canary_misses=body.include_canary_misses,
+                )
+                provider = LiteLLMProvider()
+                diagnoser = Diagnoser(
+                    provider=provider,
+                    model=body.model or _diagnoser_default_model,
+                    budget_usd=body.budget_usd,
+                    max_clusters=body.max_clusters,
+                )
+                result = await diagnoser.diagnose(failures)
+                tokens_used = result.tokens_used
+                cost_usd = result.cost_usd
+
+                # min_failure_count is enforced HERE (not in the
+                # diagnoser) so the cluster summaries the model
+                # produces aren't silently dropped before we
+                # persist — operators can see the floor was hit if
+                # the result is empty.
+                kept_clusters = [
+                    c for c in result.clusters if c.example_count >= body.min_failure_count
+                ]
+                result_payload = {
+                    "input_summary": {
+                        "total_failures_examined": result.total_failures_examined,
+                        "clusters_identified": len(kept_clusters),
+                        "examples_per_cluster_max": result.examples_per_cluster_max,
+                    },
+                    "clusters": [
+                        {
+                            "id": c.id,
+                            "summary": c.summary,
+                            "example_count": c.example_count,
+                            "example_run_ids": c.example_ids,
+                            "confidence": c.confidence,
+                            "proposed_fix": _serialize_proposed_fix(c.proposed_fix),
+                        }
+                        for c in kept_clusters
+                    ],
+                }
+                final_status = DiagnosisStatus.COMPLETED
+            except DiagnoserBudgetExceeded as exc:
+                error = ErrorInfo(type="budget_exceeded", message=str(exc))
+                final_status = DiagnosisStatus.ERROR
+            except DiagnoserParseError as exc:
+                error = ErrorInfo(type="parse_error", message=str(exc))
+                final_status = DiagnosisStatus.ERROR
+            except Exception as exc:
+                logger.exception(
+                    "diagnose_unhandled diagnosis_id=%s agent=%s",
+                    diagnosis_id,
+                    name,
+                )
+                error = ErrorInfo(type="internal", message=str(exc))
+                final_status = DiagnosisStatus.ERROR
+
+            completed_record = DiagnosisRecord(
+                diagnosis_id=diagnosis_id,
+                tenant_id=ctx.tenant_id,
+                agent=name,
+                status=final_status,
+                request=body.model_dump(),
+                result=result_payload,
+                error=error,
+                tokens_used=tokens_used,
+                cost_usd=cost_usd,
+                model=body.model or _diagnoser_default_model,
+                completed_at=datetime.now(UTC),
+            )
+            await store.save_diagnosis(completed_record)
+
+        background_tasks.add_task(_run_diagnose)
+
+        return DiagnoseAcceptedView(
+            job_id=diagnosis_id,
+            status="running",
+            status_url=f"/api/v1/diagnoses/{diagnosis_id}",
+        )
+
+    @v1.get(
+        "/diagnoses/{diagnosis_id}",
+        response_model=DiagnoseJobView,
+        tags=["diagnose-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_diagnosis(
+        diagnosis_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> DiagnoseJobView:
+        """Poll a diagnose job's status + structured result.
+
+        Tenant-scoped at the storage layer (a cross-tenant id probe
+        returns 404, never 403, to avoid leaking that the id exists).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — no diagnosis record matches the id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_diagnosis(diagnosis_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("diagnosis", diagnosis_id)
+        return DiagnoseJobView.from_record(record)
 
     # ------------------------------------------------------------------
     # Aggregate monitor feed (ADR 032 D2). Two read-scoped endpoints that

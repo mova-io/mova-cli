@@ -147,6 +147,7 @@ from movate.cli import (  # noqa: E402
     compose_cmd,
     demo_cmd,
     dev_cmd,
+    diagnose_cmd,
     diff_cmd,
     eval_gen_cmd,
     eval_harvest_cmd,
@@ -536,6 +537,11 @@ app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
 # — `runs show <run_id>` closes that gap via the existing GET /runs/{id}.
 app.add_typer(runs_app, name="runs", rich_help_panel=PANEL_RUN)
 app.add_typer(workflow_app, name="workflow", rich_help_panel=PANEL_RUN)
+# `diagnose` (ADR 043 D1) talks to a deployed runtime: cluster recent
+# failures + propose typed fixes. Read-only with respect to the agent —
+# the apply step is a follow-up. Remote panel, since the work happens
+# on the runtime side and the CLI is purely a thin wrapper.
+app.add_typer(diagnose_cmd.diagnose_app, name="diagnose", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------
 

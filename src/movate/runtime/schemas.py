@@ -13,12 +13,14 @@ in import sites and at code review.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from movate.core.models import (
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     ErrorInfo,
     FeedbackRecord,
     JobKind,
@@ -2895,4 +2897,238 @@ class AgentMetricsView(BaseModel):
             ),
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Failure Pattern Diagnoser (ADR 043 D1)
+#
+# POST /api/v1/agents/{name}/diagnose       eval  (async; returns 202)
+# GET  /api/v1/diagnoses/{diagnosis_id}     read  (poll for the result)
+#
+# Read-only with respect to agent state: the wire layer NEVER carries an
+# apply-side action. The typed-fix discriminated union below mirrors ADR
+# 043's seven fix kinds so the apply step in a later PR can dispatch on
+# ``kind`` without remapping. Adding a new kind here is an ADR 043
+# amendment, not a casual addition.
+# ---------------------------------------------------------------------------
+
+
+class DiagnoseRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/diagnose`` request body.
+
+    Caps + flags are conservative defaults; tightening them keeps the
+    diagnoser's spend predictable for a tenant with a high failure rate.
+    ``budget_usd`` is the HARD cap — the diagnoser short-circuits before
+    the LLM call if the pre-call estimate exceeds it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_days: int = Field(30, ge=1, le=365)
+    """Lookback window. Failures older than this are ignored."""
+    min_failure_count: int = Field(5, ge=1, le=1000)
+    """Cluster floor — clusters smaller than this are dropped client-side
+    when rendering. The diagnoser still considers them so a small but
+    high-confidence cluster (e.g. a confirmed security regression) isn't
+    silently lost."""
+    include_canary_misses: bool = Field(True)
+    include_eval_failures: bool = Field(True)
+    include_drift_detections: bool = Field(True)
+    max_clusters: int = Field(10, ge=1, le=50)
+    """Cap on clusters returned. Bigger numbers cost more tokens."""
+    model: str | None = Field(None)
+    """Optional provider/model override (e.g. ``"openai/gpt-4o-mini"``).
+    Defaults to the runtime's diagnoser default."""
+    budget_usd: float = Field(1.0, gt=0.0, le=100.0)
+    """Hard spend cap. The diagnoser raises if its pre-call estimate
+    exceeds this; the request fails with ``status="error"``."""
+
+
+class DiagnoseAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/diagnose`` response (202).
+
+    The diagnose work runs asynchronously inside the runtime process
+    (FastAPI background task) — no new worker / dispatch path. Poll
+    ``status_url`` until ``status == "completed"`` (or ``"error"``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    """The diagnosis id — usable as ``GET /api/v1/diagnoses/{id}``.
+    Named ``job_id`` on the wire to match the ADR 043 D1 spec."""
+    status: str = "running"
+    status_url: str
+    """Absolute path to poll for the result (``/api/v1/diagnoses/{id}``)."""
+
+
+# ---- Proposed-fix discriminated union (seven typed kinds) -----------------
+
+
+class _ProposedFixBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rationale: str
+    """One-paragraph why-this-fix explanation."""
+    expected_improvement: dict[str, Any] = Field(default_factory=dict)
+    """Optional ``{"metric": str, "delta": number, "based_on": str}``.
+    Empty dict when the diagnoser couldn't estimate (no fabrication)."""
+
+
+class PromptEditDiffView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    before: str = ""
+    after: str = ""
+    patch_text: str = ""
+
+
+class PromptEditFixView(_ProposedFixBase):
+    """Apply a unified diff to the agent's ``prompt.md``."""
+
+    kind: Literal["prompt_edit"] = "prompt_edit"
+    diff: PromptEditDiffView = Field(default_factory=PromptEditDiffView)
+
+
+class KbIngestPayloadView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    """The unified KB-ingest target kind, e.g. ``"url"`` / ``"file"``."""
+    source: str
+
+
+class KbIngestFixView(_ProposedFixBase):
+    """Ingest a new KB source via the unified KB ingest endpoint."""
+
+    kind: Literal["kb_ingest"] = "kb_ingest"
+    payload: KbIngestPayloadView
+
+
+class ContextAddFixView(_ProposedFixBase):
+    """Add a named context body to the agent."""
+
+    kind: Literal["context_add"] = "context_add"
+    name: str
+    body: str
+
+
+class ContextRemoveFixView(_ProposedFixBase):
+    """Remove a named context from the agent."""
+
+    kind: Literal["context_remove"] = "context_remove"
+    name: str
+
+
+class ModelSwapFixView(_ProposedFixBase):
+    """Swap the agent's provider/model to a different one."""
+
+    kind: Literal["model_swap"] = "model_swap"
+    provider: str
+
+
+class TemperatureChangeFixView(_ProposedFixBase):
+    """Adjust the agent's sampling temperature by ``delta``."""
+
+    kind: Literal["temperature_change"] = "temperature_change"
+    delta: float
+
+
+class RetrievalKChangeFixView(_ProposedFixBase):
+    """Adjust the agent's retrieval top-K by ``delta`` (integer)."""
+
+    kind: Literal["retrieval_k_change"] = "retrieval_k_change"
+    delta: int
+
+
+ProposedFixView = (
+    PromptEditFixView
+    | KbIngestFixView
+    | ContextAddFixView
+    | ContextRemoveFixView
+    | ModelSwapFixView
+    | TemperatureChangeFixView
+    | RetrievalKChangeFixView
+)
+
+
+class FailureClusterView(BaseModel):
+    """One root-cause cluster with its typed fix proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    summary: str
+    example_count: int = Field(..., ge=0)
+    example_run_ids: list[str] = Field(default_factory=list)
+    """Representative source ids — run_ids for the RUN/CANARY sources,
+    eval_ids for EVAL/DRIFT. Capped at 5 for response-size hygiene."""
+    confidence: Literal["high", "medium", "low"] = "medium"
+    proposed_fix: ProposedFixView = Field(..., discriminator="kind")
+
+
+class DiagnoseInputSummaryView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_failures_examined: int = Field(..., ge=0)
+    clusters_identified: int = Field(..., ge=0)
+    examples_per_cluster_max: int = Field(..., ge=0)
+
+
+class DiagnoseResultView(BaseModel):
+    """The structured analysis the GET endpoint returns when complete."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_summary: DiagnoseInputSummaryView
+    clusters: list[FailureClusterView] = Field(default_factory=list)
+
+
+class DiagnoseJobView(BaseModel):
+    """``GET /api/v1/diagnoses/{id}`` response.
+
+    Mirror of :class:`DiagnosisRecord` minus ``tenant_id`` (audit-only,
+    never returned over the wire — same convention as ``JobView`` /
+    ``RunView``). ``result`` is populated when ``status == "completed"``;
+    ``error`` is populated when ``status == "error"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["diagnose"] = "diagnose"
+    job_id: str
+    """Mirrors :attr:`DiagnosisRecord.diagnosis_id` on the wire as
+    ``job_id`` to match ADR 043 D1's spec."""
+    agent_name: str
+    status: DiagnosisStatus
+    result: DiagnoseResultView | None = None
+    error: ErrorInfo | None = None
+    tokens_used: int = Field(0, ge=0)
+    cost_usd: float = Field(0.0, ge=0.0)
+    model: str = ""
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    @classmethod
+    def from_record(cls, record: DiagnosisRecord) -> DiagnoseJobView:
+        result_view: DiagnoseResultView | None = None
+        if record.result is not None:
+            # Persisted as an opaque dict so the typed-fix taxonomy can
+            # evolve without a DB migration. Validate at the wire edge
+            # against the discriminated union — anything malformed is a
+            # bug surface (a downgrade of the schema, an operator
+            # manually editing the row) rather than user input.
+            result_view = DiagnoseResultView.model_validate(record.result)
+        return cls(
+            job_id=record.diagnosis_id,
+            agent_name=record.agent,
+            status=record.status,
+            result=result_view,
+            error=record.error,
+            tokens_used=record.tokens_used,
+            cost_usd=record.cost_usd,
+            model=record.model,
+            created_at=record.created_at,
+            completed_at=record.completed_at,
         )
