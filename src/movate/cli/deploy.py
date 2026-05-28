@@ -22,6 +22,7 @@ rollbacks / redeploys of an existing image.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import os
 import shlex
@@ -39,7 +40,7 @@ from rich.console import Console
 
 import movate
 from movate.cli._console import echo_remote_context, error, hint, success
-from movate.cli._progress import spinner
+from movate.cli._progress import LiveStep, _NullLiveStep, live_step
 from movate.cli._runtime_key_checks import (
     _verify_bearer_roundtrip,
     _warn_if_shell_shadows_runtime_key,
@@ -197,6 +198,19 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "SKIP non-interactively unless [bold]--smoke-test[/bold] is passed. "
             "[bold]--no-smoke-test[/bold] always skips. A failed smoke test "
             "warns but never fails the (already-succeeded) deploy."
+        ),
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help=(
+            "Stream the [bold]az acr build[/bold] log live during the image "
+            "build (runtime-mode). Default: show only a spinner + live elapsed "
+            "timer (the raw layer/timing output isn't useful at deploy time). "
+            "Use this to watch a slow or failing build in real time. All "
+            "progress stays on stderr; the [bold]--json[/bold]/stdout contract "
+            "is unchanged."
         ),
     ),
 ) -> None:
@@ -359,7 +373,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
     started_at = time.monotonic()
 
     if not skip_build:
-        _run_acr_build(plan)
+        _run_acr_build(plan, verbose=verbose)
     for app_name in plan.apps_to_update:
         _run_containerapp_update(plan, app_name)
 
@@ -2556,14 +2570,19 @@ def _preflight_pgvector(plan: DeployPlan) -> None:
     raise typer.Exit(code=2)
 
 
-def _run_acr_build(plan: DeployPlan) -> None:
+def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> None:
     """``az acr build`` — builds the image inside ACR (no local Docker).
 
     Uses the multi-stage Dockerfile's ``runtime`` target (the worker
     Container App reuses the same image and overrides the command).
-    Build log is captured and suppressed — the spinner conveys progress,
-    and the verbose build output (layer hashes, timing, etc.) is not
-    useful at deploy time. On failure, captured stderr is still shown.
+
+    The remote build runs the whole docker build + push in ACR (3-8 min)
+    with no chatter, so a static spinner reads as "hung". We run it under
+    a :func:`live_step` whose elapsed timer keeps ticking on its own, and
+    stream the build log through the live region when ``verbose`` (the
+    ``--verbose`` flag). Default (quiet): timer only — the layer hashes /
+    timing aren't useful at deploy time. On failure the captured tail is
+    surfaced regardless.
     """
     cmd = [
         "az",
@@ -2581,8 +2600,8 @@ def _run_acr_build(plan: DeployPlan) -> None:
         "runtime",
         ".",
     ]
-    with spinner(f"building {plan.image_tag} in ACR..."):
-        _run_az(cmd, what="acr build")
+    with live_step(f"building {plan.image_tag} in ACR…") as step:
+        _stream_az(cmd, what="acr build", step=step, echo=verbose)
     err.print(f"  [green]✓[/green] image built: {plan.fq_image}")
 
 
@@ -2603,7 +2622,10 @@ def _run_containerapp_update(plan: DeployPlan, app_name: str) -> None:
         "--image",
         plan.fq_image,
     ]
-    with spinner(f"updating {app_name}..."):
+    # Capture (not stream) here — the returned stdout is JSON parsed below.
+    # The live_step just gives it a ticking elapsed timer instead of the
+    # old static spinner.
+    with live_step(f"updating {app_name}…"):
         stdout = _run_az(cmd, what=f"containerapp update {app_name}")
 
     # Parse the JSON response and surface only the fields operators care about.
@@ -2631,8 +2653,10 @@ def _run_az(cmd: list[str], *, what: str) -> str:
 
     Capturing (rather than streaming) keeps the terminal clean — ``az
     containerapp update`` returns hundreds of lines of JSON that would
-    swamp the spinner. Callers that want to surface key fields can parse
-    the returned text. On failure, captured stderr is printed before the
+    swamp the live region, and the JSON is parsed by the caller. (See
+    :func:`_stream_az` for the streaming variant used where stdout is
+    discarded.) Callers that want to surface key fields can parse the
+    returned text. On failure, captured stderr is printed before the
     error line so operators still see the Azure error message.
     """
     try:
@@ -2651,6 +2675,79 @@ def _run_az(cmd: list[str], *, what: str) -> str:
         )
         raise typer.Exit(code=1)
     return result.stdout
+
+
+def _stream_az(
+    cmd: list[str],
+    *,
+    what: str,
+    step: LiveStep | _NullLiveStep,
+    echo: bool,
+) -> str:
+    """Run an ``az`` command, streaming its output line-by-line.
+
+    Unlike :func:`_run_az` (which blocks and captures), this uses
+    ``Popen`` and reads stdout as it arrives in the **main thread** —
+    no extra threads (Rich's Live owns its own refresh thread, which is
+    fine). stderr is merged into stdout so the build log stays ordered.
+
+    Each line is appended to a bounded ``deque`` (so memory stays flat on
+    a multi-thousand-line build log) for failure-context, and — when
+    ``echo`` (verbose) — streamed live above the spinner via ``step.log``.
+    The full captured stdout is returned so callers that parse JSON still
+    work; for ``az acr build`` the stdout is discarded, so streaming is
+    pure UX with no compat cost.
+
+    On non-zero exit: print the buffered tail (the captured log) then the
+    same error envelope :func:`_run_az` prints, and raise ``typer.Exit``.
+    Ctrl-C terminates the child so we never orphan a build process.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        # Caught upstream by shutil.which check, but defensive.
+        error(f"command not found: {cmd[0]}")
+        raise typer.Exit(code=2) from exc
+
+    # Bounded so a huge build log can't blow up memory; the tail is what
+    # matters for diagnosing a failure anyway.
+    tail: collections.deque[str] = collections.deque(maxlen=200)
+    captured: list[str] = []
+    try:
+        # ``proc.stdout`` is non-None because we passed ``stdout=PIPE``.
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            captured.append(line)
+            tail.append(line.rstrip("\n"))
+            if echo:
+                step.log(line)
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        # Don't orphan the remote-build child — terminate, reap, re-raise
+        # so the CLI exits with the usual interrupt behaviour.
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
+
+    if returncode != 0:
+        # Surface the buffered tail so the operator sees the actual Azure
+        # error even though we didn't stream it (quiet mode).
+        if tail:
+            err.print("\n".join(tail))
+        err.print(
+            f"[red]✗ az command failed:[/red] {what} (exit {returncode})\n"
+            f"[dim]command: {' '.join(cmd)}[/dim]"
+        )
+        raise typer.Exit(code=1)
+    return "".join(captured)
 
 
 def _diagnose_failed_revision(*, resource_group: str, app_name: str) -> str | None:

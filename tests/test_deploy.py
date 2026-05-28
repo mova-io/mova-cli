@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,14 +124,41 @@ def deploy_env(tmp_path: Path, monkeypatch):
     return tmp_path
 
 
+class _FakePopen:
+    """Minimal ``subprocess.Popen`` stand-in for the streaming ACR-build
+    runner (``_stream_az``). Yields ``lines`` from ``stdout`` and exits
+    with ``returncode`` — no real process is spawned."""
+
+    def __init__(self, lines: list[str] | None = None, returncode: int = 0) -> None:
+        self.stdout = iter(lines or [])
+        self._returncode = returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._returncode
+
+    def terminate(self) -> None:  # pragma: no cover — interrupt-only path
+        return
+
+    def kill(self) -> None:  # pragma: no cover — interrupt-only path
+        return
+
+
 @pytest.fixture
 def mock_subprocess(monkeypatch):
-    """Capture every ``subprocess.run`` call without executing it.
+    """Capture every ``az`` shell-out without executing it.
 
-    Returns a list that tests inspect for command shape. Default
-    return is a successful CompletedProcess with empty stdout — so
-    ``_git_short_sha`` falls through to ``"unknown"`` rather than
-    raising on a None ``stdout``.
+    Returns a list that tests inspect for command shape. Two hooks:
+
+    * ``subprocess.run`` — used by the JSON-returning ``_run_az`` (e.g.
+      ``az containerapp update``). Default return is a successful
+      CompletedProcess with empty stdout — so ``_git_short_sha`` falls
+      through to ``"unknown"`` rather than raising on a None ``stdout``.
+    * ``subprocess.Popen`` — used by the streaming ``_stream_az`` for
+      ``az acr build`` (stdout discarded). Default is a clean exit with
+      no output.
+
+    Both append their ``cmd`` to the shared ``calls`` list, so existing
+    call-shape assertions keep working across the run/Popen split.
     """
     calls: list[list[str]] = []
 
@@ -138,7 +166,12 @@ def mock_subprocess(monkeypatch):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
+    def fake_popen(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return _FakePopen(lines=[], returncode=0)
+
     monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake_run)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.Popen", fake_popen)
     return calls
 
 
@@ -533,12 +566,16 @@ def test_cli_deploy_errors_when_target_missing_azure_config(
 @pytest.mark.unit
 def test_cli_deploy_propagates_az_failure_as_exit_1(deploy_env, monkeypatch) -> None:
     """If ``az acr build`` exits non-zero we surface it as exit 1 with
-    a clear error message (not a stack trace)."""
+    a clear error message (not a stack trace), plus the buffered build
+    log tail so the operator sees the actual Azure error."""
 
-    def fail_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(args=cmd, returncode=42)
+    def fail_popen(cmd, *args, **kwargs):
+        return _FakePopen(
+            lines=["pulling base image…\n", "ERROR: failed to build: boom\n"],
+            returncode=42,
+        )
 
-    monkeypatch.setattr("movate.cli.deploy.subprocess.run", fail_run)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.Popen", fail_popen)
 
     result = runner.invoke(
         cli_app, ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:x-y"]
@@ -546,6 +583,146 @@ def test_cli_deploy_propagates_az_failure_as_exit_1(deploy_env, monkeypatch) -> 
     assert result.exit_code == 1
     assert "az command failed" in result.stderr
     assert "exit 42" in result.stderr
+    # The buffered tail is surfaced even in quiet (non-verbose) mode.
+    assert "failed to build: boom" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# _stream_az — streaming runner for `az acr build`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_stream_az_returns_full_stdout(monkeypatch) -> None:
+    """The streaming runner returns the FULL captured stdout (so a caller
+    that parses JSON still gets the whole blob), regardless of echo."""
+    from movate.cli._progress import _NULL_LIVE_STEP  # noqa: PLC0415
+    from movate.cli.deploy import _stream_az  # noqa: PLC0415
+
+    lines = ['{"properties": ', '{"provisioningState": ', '"Succeeded"}}\n']
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.Popen",
+        lambda cmd, *a, **k: _FakePopen(lines=lines, returncode=0),
+    )
+
+    out = _stream_az(["az", "acr", "build"], what="acr build", step=_NULL_LIVE_STEP, echo=False)
+    assert out == "".join(lines)
+    # And it round-trips as JSON — the compat contract for parse-callers.
+    assert json.loads(out)["properties"]["provisioningState"] == "Succeeded"
+
+
+@pytest.mark.unit
+def test_stream_az_failure_prints_tail_and_exits_1(monkeypatch, capsys) -> None:
+    """Non-zero exit → buffered tail + the standard error envelope on
+    stderr, then typer.Exit(1)."""
+    from movate.cli._progress import _NULL_LIVE_STEP  # noqa: PLC0415
+    from movate.cli.deploy import _stream_az  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.Popen",
+        lambda cmd, *a, **k: _FakePopen(lines=["building…\n", "ERROR: boom\n"], returncode=7),
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        _stream_az(["az", "acr", "build"], what="acr build", step=_NULL_LIVE_STEP, echo=False)
+    assert exc.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert "ERROR: boom" in err  # the buffered tail
+    assert "az command failed" in err
+    assert "exit 7" in err
+
+
+@pytest.mark.unit
+def test_stream_az_echo_logs_lines_to_step(monkeypatch) -> None:
+    """When echo=True the streamed lines are forwarded to step.log; when
+    echo=False the handle is never touched (quiet mode)."""
+    from movate.cli.deploy import _stream_az  # noqa: PLC0415
+
+    class _RecordingStep:
+        def __init__(self) -> None:
+            self.logged: list[str] = []
+
+        def update(self, message: str) -> None:
+            pass
+
+        def log(self, line: str) -> None:
+            self.logged.append(line)
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.Popen",
+        lambda cmd, *a, **k: _FakePopen(lines=["a\n", "b\n"], returncode=0),
+    )
+
+    echoing = _RecordingStep()
+    _stream_az(["az", "acr", "build"], what="acr build", step=echoing, echo=True)  # type: ignore[arg-type]
+    assert echoing.logged == ["a\n", "b\n"]
+
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.Popen",
+        lambda cmd, *a, **k: _FakePopen(lines=["a\n", "b\n"], returncode=0),
+    )
+    quiet = _RecordingStep()
+    _stream_az(["az", "acr", "build"], what="acr build", step=quiet, echo=False)  # type: ignore[arg-type]
+    assert quiet.logged == []
+
+
+# ---------------------------------------------------------------------------
+# --verbose flag wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_deploy_help_documents_verbose_flag() -> None:
+    """``--verbose/-v`` is present in the deploy help text."""
+    result = runner.invoke(cli_app, ["deploy", "--help"])
+    assert result.exit_code == 0
+    # Rich renders --help with ANSI styling + box-drawing + width-based
+    # wrapping that varies by terminal/CI width, so the raw stdout can splay
+    # escape codes through the text. Assert against ANSI-stripped,
+    # whitespace-collapsed help instead of the raw bytes.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    plain = re.sub(r"\s+", " ", plain)
+    assert "--verbose" in plain
+    assert "-v" in plain
+
+
+@pytest.mark.unit
+def test_deploy_verbose_threads_echo_to_acr_build(deploy_env, monkeypatch) -> None:
+    """``--verbose`` toggles the ACR build log echo. We capture the
+    ``echo`` kwarg passed to the streaming runner to prove the wiring."""
+    seen: dict[str, bool] = {}
+
+    def _fake_stream(cmd, *, what, step, echo):
+        seen["echo"] = echo
+        return ""
+
+    monkeypatch.setattr("movate.cli.deploy._stream_az", _fake_stream)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-t", "--verbose"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert seen["echo"] is True
+
+
+@pytest.mark.unit
+def test_deploy_default_does_not_echo_acr_build(deploy_env, monkeypatch) -> None:
+    """Without ``--verbose`` the ACR build log is NOT echoed (timer only)."""
+    seen: dict[str, bool] = {}
+
+    def _fake_stream(cmd, *, what, step, echo):
+        seen["echo"] = echo
+        return ""
+
+    monkeypatch.setattr("movate.cli.deploy._stream_az", _fake_stream)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-t"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert seen["echo"] is False
 
 
 @pytest.mark.unit
@@ -575,12 +752,14 @@ def test_cli_deploy_unknown_target_exits_2(tmp_path: Path, monkeypatch) -> None:
 
 
 def _fake_runtime_az(pg_servers: str, pg_param: str | None):
-    """A `subprocess.run` that answers the pgvector pre-flight's `az postgres`
-    reads + records every OTHER az call (acr build / containerapp update) so a
-    test can assert what did — and didn't — get rolled.
+    """`subprocess.run` + `subprocess.Popen` fakes that answer the pgvector
+    pre-flight's `az postgres` reads + record every OTHER az call (acr build /
+    containerapp update) so a test can assert what did — and didn't — get
+    rolled.
 
-    Returns ``(fake_run, calls)``. The `az postgres` reads are answered inline
-    (not recorded) since they're the gate, not the roll-out under test.
+    Returns ``(fake_run, fake_popen, calls)``. The `az postgres` reads are
+    answered inline (not recorded) since they're the gate, not the roll-out
+    under test. ``fake_popen`` covers the streaming ``az acr build`` path.
     """
     calls: list[list[str]] = []
 
@@ -593,18 +772,23 @@ def _fake_runtime_az(pg_servers: str, pg_param: str | None):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, "")
 
-    return _run, calls
+    def _popen(cmd, *_a, **_k):
+        calls.append(list(cmd))
+        return _FakePopen(lines=[], returncode=0)
+
+    return _run, _popen, calls
 
 
 @pytest.mark.unit
 def test_cli_deploy_aborts_when_pgvector_not_enabled(deploy_env, monkeypatch) -> None:
     """Postgres exists but azure.extensions lacks vector → exit 2 with the fix,
     and NO revision is rolled (no acr build, no containerapp update)."""
-    fake, calls = _fake_runtime_az(
+    fake, fake_popen, calls = _fake_runtime_az(
         '[{"name": "movate-prod-pg"}]',
         '{"value": "", "allowedValues": "vector,uuid-ossp"}',
     )
     monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.Popen", fake_popen)
 
     result = runner.invoke(
         cli_app,
@@ -624,11 +808,12 @@ def test_cli_deploy_aborts_when_pgvector_not_enabled(deploy_env, monkeypatch) ->
 def test_cli_deploy_proceeds_when_pgvector_enabled(deploy_env, monkeypatch) -> None:
     """azure.extensions allow-lists vector → the deploy rolls normally and
     reports the green pre-flight line."""
-    fake, calls = _fake_runtime_az(
+    fake, fake_popen, calls = _fake_runtime_az(
         '[{"name": "movate-prod-pg"}]',
         '{"value": "VECTOR", "allowedValues": "vector"}',
     )
     monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.Popen", fake_popen)
 
     result = runner.invoke(
         cli_app,
@@ -647,8 +832,9 @@ def test_cli_deploy_proceeds_when_pgvector_enabled(deploy_env, monkeypatch) -> N
 def test_cli_deploy_proceeds_when_no_postgres_server(deploy_env, monkeypatch) -> None:
     """No Postgres server in the RG (sqlite target / not deployed) → the gate
     skips silently and the deploy proceeds; no false green pre-flight line."""
-    fake, calls = _fake_runtime_az("[]", None)
+    fake, fake_popen, calls = _fake_runtime_az("[]", None)
     monkeypatch.setattr("movate.cli.deploy.subprocess.run", fake)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.Popen", fake_popen)
 
     result = runner.invoke(
         cli_app,
