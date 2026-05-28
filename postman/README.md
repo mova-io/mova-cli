@@ -81,6 +81,7 @@ send requests one at a time). The `test` scripts chain the flow: step 1a writes
 | 6 | Run | `POST /api/v1/agents/{name}/runs?wait=true` | run — grounded answer | `mdk run` | `run` |
 | 7a | Get run | `GET /api/v1/runs/{run_id}` | monitor — fetch run + output | `mdk runs get` | `read` |
 | 7b | Run trace | `GET /api/v1/runs/{run_id}/trace` | monitor — reconstructed trace | `mdk runs trace` | `read` |
+| 7c | Aggregate report | `GET /api/v1/report` | monitor — cross-agent rollup (pass-rate / cost / latency) | `mdk report` | `read` |
 
 **Suggested live ordering note:** the wizard body in 1a references a skill
 (`web-search` in `mcp_connectors`) and a context (`product-docs` in
@@ -113,11 +114,14 @@ The CLI verbs don't map one-to-one onto runtime endpoints — the control plane
   magic). Both create endpoints are structured/pre-built-bundle only. To use a
   generated bundle, run the planner locally (`mdk init --llm`) and upload the
   result via step 1b.
-- **No `/report` endpoint.** There is no aggregate `GET /api/v1/report` route on
-  the runtime — operational metrics surface via the Grafana/Prometheus/Azure
-  dashboards-as-code path, not `/api/v1`. The demo's "monitor" payoff is the
-  per-run fetch + trace (steps 7a/7b). (Eval scorecards live at
-  `GET /api/v1/evals/{eval_id}` if you want a quality view.)
+- **`/report` is the product feed, not infra metrics.** The aggregate
+  `GET /api/v1/report` route (step 7c, ADR 032 D2) is the tenant-scoped,
+  in-product monitor rollup the Mova iO front end renders — the same
+  aggregation `mdk report` runs over the local store. *Operational* metrics
+  (host/queue/latency telemetry) still surface via the
+  Grafana/Prometheus/Azure dashboards-as-code path, not `/api/v1`. For a single
+  agent's slice use `GET /api/v1/agents/{name}/metrics`; eval scorecards live at
+  `GET /api/v1/evals/{eval_id}` for a quality view.
 - **KB ingest is files-only.** `POST .../kb` takes a multipart `files` upload —
   there's no inline-text or URL body field. To ingest a URL, fetch it to an
   `.html`/`.md` file and upload that.
