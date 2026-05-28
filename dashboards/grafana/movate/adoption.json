@@ -1,0 +1,326 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_AZURE_MONITOR",
+      "label": "Azure Monitor (fleet)",
+      "description": "Azure Monitor data source on Movate's Managed Grafana, bound to a system-assigned managed identity. In Phase 1 (ADR 039 D2) the data source enumerates the customer Log Analytics workspaces delegated via Azure Lighthouse (Reader + Monitoring Reader, scoped to the workspace). In Phase 2 the same UID points at Movate's central workspace fed by the opt-in OTLP dual-export.",
+      "type": "datasource",
+      "pluginId": "grafana-azure-monitor-datasource",
+      "pluginName": "Azure Monitor"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "grafana-azure-monitor-datasource", "name": "Azure Monitor", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "name": "CalVer releases (TODO)",
+        "type": "dashboard",
+        "tags": ["calver", "release"],
+        "description": "annotation source: GitHub Releases API webhook -> Azure Logic App -> AM custom log -> Grafana annotation query. TODO post-ADR 039 sign-off; see ADR 039 Open Questions."
+      },
+      {
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "rgba(255, 200, 0, 1)",
+        "name": "Incidents (TODO)",
+        "type": "dashboard",
+        "tags": ["incident"],
+        "description": "annotation source: PagerDuty/ServiceNow incident webhook -> AM custom log. TODO post-ADR 039."
+      }
+    ]
+  },
+  "description": "ADR-039 illustrative -- Movate fleet adoption + version posture across MDK deployments. Tagged 'illustrative -- pending ADR 039 sign-off; assumes a customer template variable resolves either via Lighthouse subscription scope (Phase 1) or via the customer OTel attribute (Phase 2)'. Built only from instrument names confirmed on origin/main per docs/observability.md + src/movate/tracing/metrics.py:METRIC_NAMES.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "ADR 039",
+      "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/039-movate-product-telemetry.md",
+      "type": "link",
+      "icon": "doc"
+    },
+    {
+      "title": "Metric/span catalog (PR #518)",
+      "url": "https://github.com/movate/movate-cli/blob/main/docs/observability.md",
+      "type": "link",
+      "icon": "doc"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "Prescriptive runbook for this pane. Read this before paging anyone.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+      "id": 999,
+      "options": {
+        "mode": "markdown",
+        "content": "### Adoption + version posture -- runbook\n\n**What this pane answers:** how many MDK deployments are live across the fleet, how many agents they each run, which CalVer release is on what env, and how far behind the latest customers are. **Audience:** Movate product + SRE; not for customer-tenant import (use `dashboards/grafana/*.json` for that).\n\n**Normal:** active deployments grows monotonically; weekly new-agents is a steady-state non-zero number; upgrade lag for the production tier sits inside a 14-day window from latest CalVer; no env shows >30 days behind latest CalVer.\n\n**If red:** \n* **Upgrade lag > 30d on a customer's prod env** -- not on-call; open a customer-success ticket; cross-reference the release notes the customer is on (CalVer annotation on each panel, ADR 039 Open Question 3).\n* **Active deployments drops** -- check the per-customer health pane (`health.json`) first; a delegation expiry (ADR 039 D2 Phase 1) shows as a *missing* deployment, not a sick one.\n* **`new-agents/week == 0` for a customer's prod for 2 weeks** -- adoption signal, not an incident; raise in the next product review.\n\n**Cross-refs:** ADR 039 D1 (hosting), ADR 028 (templates -- top-template panel ties to template adoption), ADR 027 (`mdk dev` -- new-agents pipeline). All data from `agent.execute` span + `service.version` resource attribute (CalVer)."
+      },
+      "transparent": false,
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "id": 100,
+      "panels": [],
+      "title": "Deployments + active agents (across the fleet)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Count of distinct MDK deployments reporting in the window, grouped by environment. A 'deployment' is a distinct (customer, deployment) tuple resolved from the AM resource scope (Phase 1) or the customer + deployment OTel resource attributes (Phase 2). Derived from any mdk.* metric emission -- mdk.jobs.completed is the most reliable heartbeat.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 7},
+      "id": 1,
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| where TimeGenerated > ago($__interval)\n| extend env = tostring(Properties['environment'])\n| where env in ($environment) or '$environment' == 'All'\n| summarize Deployments = dcount(Resource) by env\n| order by env asc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Active deployments by environment",
+      "type": "gauge"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Per-deployment count of distinct agent names seen on agent.execute spans in the window. The 'agent' attribute on agent.execute is the span attribute confirmed in docs/observability.md.",
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10}, "unit": "short"},
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 7},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppDependencies\n| where Name == 'agent.execute'\n| where TimeGenerated > ago(7d)\n| extend agent = tostring(Properties['agent'])\n| extend cust  = tostring(Properties['customer'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize ActiveAgents = dcount(agent) by bin(TimeGenerated, 1d), cust\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Active agents per customer (7d, daily distinct)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Count of NEW agent names appearing this week vs prior weeks. Uses the agent attribute on agent.execute -- first appearance per (customer, agent) pair.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 15},
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppDependencies\n| where Name == 'agent.execute'\n| where TimeGenerated > ago(60d)\n| extend agent = tostring(Properties['agent']), cust = tostring(Properties['customer'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize FirstSeen = min(TimeGenerated) by cust, agent\n| where FirstSeen > ago(7d)\n| count",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "New agents this week",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "**Scaffold -- needs new instrument.** Top template adoption requires either a `template` attribute on agent.execute (does not exist today per docs/observability.md) or a control-plane audit signal joined in. See ADR 039 Open Questions + ADR 028 (template discoverability).",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "gridPos": {"h": 6, "w": 16, "x": 8, "y": 15},
+      "id": 4,
+      "options": {"mode": "markdown", "content": "### Top template (table) -- scaffold\n\n**Needs new instrument:** `template` attribute on the `agent.execute` span, or a control-plane `template_used` counter.\n\nNot emitted today per `docs/observability.md` -- see **ADR 039 Open Questions** + **ADR 028 (template discoverability)**. The panel ships with shape only.\n\nWhen the instrument lands, the query is:\n\n```kql\nAppDependencies\n| where Name == 'agent.execute'\n| extend tmpl = tostring(Properties['template'])\n| where isnotempty(tmpl)\n| summarize Runs = count() by tmpl\n| top 10 by Runs desc\n```"},
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 21},
+      "id": 101,
+      "panels": [],
+      "title": "Version posture (CalVer running where)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Which CalVer is currently running on each (customer, deployment, env). CalVer YYYY.M.D.N comes from the OTel `service.version` resource attribute (Azure Monitor exposes it on the AppMetrics / AppDependencies Resource column; see ADR 020 for the OTel resource pipeline).",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "gridPos": {"h": 10, "w": 14, "x": 0, "y": 22},
+      "id": 5,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| where TimeGenerated > ago(1d)\n| extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']), env = tostring(Properties['environment']), ver = tostring(Properties['service.version'])\n| where cust in ($customer) or '$customer' == 'All'\n| where env  in ($environment) or '$environment' == 'All'\n| summarize LastSeen = max(TimeGenerated) by cust, depl, env, ver\n| order by cust asc, env asc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "CalVer running where",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Upgrade-lag heatmap: for each (customer, env), days behind the latest CalVer in the fleet. Cells turn red as lag exceeds 30 days. Latest-CalVer is computed inline as the max CalVer observed anywhere in the window.",
+      "fieldConfig": {"defaults": {"custom": {"hideFrom": {"legend": false, "tooltip": false, "viz": false}}, "unit": "d"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 10, "x": 14, "y": 22},
+      "id": 6,
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {"exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "reverse": false, "scale": "exponential", "scheme": "RdYlGn", "steps": 64},
+        "tooltip": {"show": true, "yHistogram": false}
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let latest = toscalar(\n  AppMetrics\n  | where Name == 'mdk.jobs.completed'\n  | where TimeGenerated > ago(7d)\n  | extend ver = tostring(Properties['service.version'])\n  | summarize max(ver));\nAppMetrics\n| where Name == 'mdk.jobs.completed'\n| where TimeGenerated > ago(1d)\n| extend cust = tostring(Properties['customer']), env = tostring(Properties['environment']), ver = tostring(Properties['service.version'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize ver = max(ver) by cust, env\n| extend LagDays = datetime_diff('day', now(), todatetime(latest))\n| project cust, env, LagDays",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Upgrade lag (days behind latest CalVer)",
+      "type": "heatmap"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "fleet", "adoption", "adr-039", "illustrative"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_AZURE_MONITOR",
+        "options": [],
+        "query": "grafana-azure-monitor-datasource",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": "All"},
+        "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+        "definition": "Phase 1: Lighthouse subscription display names. Phase 2: distinct values of the `customer` OTel resource attribute (hashed per ADR 039 D4).",
+        "hide": 0,
+        "includeAll": true,
+        "label": "customer",
+        "multi": true,
+        "name": "customer",
+        "options": [],
+        "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['customer'])",
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": "All"},
+        "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+        "definition": "Distinct deployments per selected customer(s).",
+        "hide": 0,
+        "includeAll": true,
+        "label": "deployment",
+        "multi": true,
+        "name": "deployment",
+        "options": [],
+        "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['deployment'])",
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": "All"},
+        "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+        "definition": "Environment slug (prod/staging/dev) from the `environment` OTel resource attribute.",
+        "hide": 0,
+        "includeAll": true,
+        "label": "environment",
+        "multi": true,
+        "name": "environment",
+        "options": [],
+        "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['environment'])",
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Movate fleet -- adoption + version posture (illustrative, ADR 039)",
+  "uid": "movate-fleet-adoption",
+  "version": 1,
+  "weekStart": ""
+}

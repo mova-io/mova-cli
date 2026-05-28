@@ -1,0 +1,203 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_AZURE_MONITOR",
+      "label": "Azure Monitor (fleet)",
+      "description": "Movate Managed Grafana -> Azure Monitor. Phase 1 cross-tenant via Lighthouse / Phase 2 Movate-owned workspace via opt-in OTLP dual-export.",
+      "type": "datasource",
+      "pluginId": "grafana-azure-monitor-datasource",
+      "pluginName": "Azure Monitor"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "grafana-azure-monitor-datasource", "name": "Azure Monitor", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 96, 96, 1)", "name": "CalVer releases (TODO)", "type": "dashboard", "tags": ["calver", "release"], "description": "annotation source: GitHub Releases API webhook -> Logic App -> AM custom log. TODO post-ADR 039 sign-off."},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 200, 0, 1)", "name": "Incidents (TODO)", "type": "dashboard", "tags": ["incident"], "description": "annotation source: incident webhook -> AM custom log. TODO."}
+    ]
+  },
+  "description": "ADR-039 illustrative -- Movate fleet HEALTH pane: error rate by job-kind (per docs/observability.md, MDK does NOT emit a per-route HTTP metric; the 'route' axis degrades to 'kind'), deploy success rate by CalVer, active alerts by customer, revision stability grid. Tagged 'illustrative -- pending ADR 039 sign-off; assumes a customer template variable resolves either via Lighthouse subscription scope (Phase 1) or via the customer OTel attribute (Phase 2)'.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {"title": "ADR 039", "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/039-movate-product-telemetry.md", "type": "link", "icon": "doc"},
+    {"title": "Metric/span catalog", "url": "https://github.com/movate/movate-cli/blob/main/docs/observability.md", "type": "link", "icon": "doc"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "Prescriptive runbook for fleet health.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+      "id": 999,
+      "options": {
+        "mode": "markdown",
+        "content": "### Health + reliability -- runbook\n\n**What this pane answers:** what is BROKEN, where, and is it because of a recent CalVer? Error rate by `kind` (the closest fleet proxy for 'route' -- per `docs/observability.md` MDK does NOT emit per-route HTTP metrics), deploy success rate by CalVer, the active alert load across customers, revision stability per (customer, deployment).\n\n**Normal:** error rate by kind sits under each customer's SLO (typically <1% non-success; <0.1% dead-letter). Deploy success rate per CalVer >= 95% across the fleet. Active alerts per customer ~ 0-1 at any time.\n\n**If red:**\n* **Error rate spike on one customer, one kind** -- check the per-customer dashboard from PR #518 first (single-deployment scope); cross-reference `mdk.jobs.completed{status='error'}` and `status='dead_letter'`.\n* **Deploy success rate dips on a new CalVer** -- annotate the CalVer release (top-of-page annotation, TODO source); if multiple customers fail on the same CalVer, page release engineering.\n* **Alert count rising across multiple customers** -- correlated fleet incident, e.g. a shared provider outage; check `usage.json` provider mix for a routing-pattern shift.\n\n**Hidden assumptions** (per `docs/observability.md`): `status` values are `success` / `error` / `safety_blocked` / `dead_letter`. Dead-letter rate is NOT a separate instrument -- it's the `status='dead_letter'` slice of `mdk.jobs.completed`. There is NO per-route HTTP metric today.\n\n**Cross-refs:** ADR 020 (OTLP -> AM pipeline), ADR 034 (data-plane scalability + dead-letter discipline), ADR 027 (`mdk dev` and CalVer release flow)."
+      },
+      "transparent": false,
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "id": 100,
+      "panels": [],
+      "title": "Error rate by job kind (mdk.jobs.completed)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Error rate = non-success terminal jobs / all terminal jobs, split by job kind. Per docs/observability.md MDK has no per-route HTTP metric; the route axis degrades to 'kind'.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 7},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| extend cust = tostring(Properties['customer']), kind = tostring(Properties['kind']), status = tostring(Properties['status'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Total = sum(ValueSum), Bad = sumif(ValueSum, status != 'success') by bin(TimeGenerated, 5m), kind\n| extend ErrorRate = todouble(Bad) / todouble(iff(Total > 0, Total, 1))\n| project TimeGenerated, kind, ErrorRate\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Error rate by kind",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Dead-letter rate -- slice of mdk.jobs.completed where status='dead_letter'. Treated specially because ADR 034's DLQ discipline lifts dead-letter from a noisy error to a fleet-level reliability signal.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 30, "lineWidth": 2, "showPoints": "never"}, "max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 7},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| extend cust = tostring(Properties['customer']), status = tostring(Properties['status'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Total = sum(ValueSum), DLQ = sumif(ValueSum, status == 'dead_letter') by bin(TimeGenerated, 5m)\n| extend DLQRate = todouble(DLQ) / todouble(iff(Total > 0, Total, 1))\n| project TimeGenerated, DLQRate",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Dead-letter rate (fleet)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "id": 101,
+      "panels": [],
+      "title": "Deploy success rate by CalVer",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Per-CalVer success rate computed from mdk.jobs.completed status mix in the first 24h after each deployment of that CalVer. Service.version is the OTel resource attribute carrying CalVer YYYY.M.D.N.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}, "unit": "percentunit"}, "overrides": [{"matcher": {"id": "byName", "options": "SuccessRate"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": 0}, {"color": "orange", "value": 0.9}, {"color": "green", "value": 0.95}]}}]}]},
+      "gridPos": {"h": 10, "w": 14, "x": 0, "y": 17},
+      "id": 3,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| extend cust = tostring(Properties['customer']), ver = tostring(Properties['service.version']), status = tostring(Properties['status'])\n| where cust in ($customer) or '$customer' == 'All'\n| where isnotempty(ver)\n| summarize Total = sum(ValueSum), Good = sumif(ValueSum, status == 'success') by ver, cust\n| extend SuccessRate = todouble(Good) / todouble(iff(Total > 0, Total, 1))\n| project CalVer = ver, Customer = cust, Total, SuccessRate\n| order by CalVer desc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Deploy success rate by CalVer x customer",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Active alert rows in the AM AlertsManagement table across the delegated subscriptions. Phase 1 reads the per-customer AlertsManagement records via Lighthouse; Phase 2 reads the central workspace's mirror.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "gridPos": {"h": 10, "w": 10, "x": 14, "y": 17},
+      "id": 4,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AlertsManagementResources\n| where Properties.essentials.alertState == 'New' or Properties.essentials.alertState == 'Acknowledged'\n| extend cust = tostring(Properties.essentials.targetResource)\n| project AlertName = name, Severity = tostring(Properties.essentials.severity), Customer = cust, FiredAt = todatetime(Properties.essentials.startDateTime)\n| order by FiredAt desc\n| limit 50",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Active alerts by customer",
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 27},
+      "id": 102,
+      "panels": [],
+      "title": "Revision stability (per deployment)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Revision-stability status grid: each (customer, deployment) cell colored by recent error+dead-letter rate. Green = under 1%, amber = 1-5%, red = >5%. Read straight off mdk.jobs.completed status mix in the last hour.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": 0}, {"color": "orange", "value": 0.01}, {"color": "red", "value": 0.05}]}, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 28},
+      "id": 5,
+      "options": {"orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showThresholdLabels": false, "showThresholdMarkers": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| where TimeGenerated > ago(1h)\n| extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']), status = tostring(Properties['status'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Total = sum(ValueSum), Bad = sumif(ValueSum, status != 'success') by cust, depl\n| extend BadRate = todouble(Bad) / todouble(iff(Total > 0, Total, 1))\n| project Cell = strcat(cust, ' / ', depl), BadRate\n| order by Cell asc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Revision stability (last hour) by (customer, deployment)",
+      "type": "stat"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "fleet", "health", "adr-039", "illustrative"],
+  "templating": {
+    "list": [
+      {"current": {}, "hide": 0, "includeAll": false, "label": "Data source", "multi": false, "name": "DS_AZURE_MONITOR", "options": [], "query": "grafana-azure-monitor-datasource", "refresh": 1, "regex": "", "type": "datasource"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Phase 1: Lighthouse subscription scope. Phase 2: hashed customer OTel resource attribute (ADR 039 D4).", "hide": 0, "includeAll": true, "label": "customer", "multi": true, "name": "customer", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['customer'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Distinct deployments per selected customer(s).", "hide": 0, "includeAll": true, "label": "deployment", "multi": true, "name": "deployment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['deployment'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Environment slug.", "hide": 0, "includeAll": true, "label": "environment", "multi": true, "name": "environment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['environment'])", "refresh": 2, "regex": "", "type": "query"}
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Movate fleet -- health + reliability (illustrative, ADR 039)",
+  "uid": "movate-fleet-health",
+  "version": 1,
+  "weekStart": ""
+}
