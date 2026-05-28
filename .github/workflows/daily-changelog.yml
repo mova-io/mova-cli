@@ -72,7 +72,10 @@ jobs:
       - name: Compute date window (UTC)
         id: window
         # Resolve the digest date (dispatch input override, else yesterday) and
-        # the [start, end) day window the gh search uses (merged:>=start..end).
+        # the day window the gh search uses (merged:start..next). NOTE: a `>=`
+        # prefix on a `..` range is malformed GitHub-search syntax and silently
+        # matches NOTHING — use the bare range `merged:DATE..NEXT`, which at day
+        # granularity resolves to exactly DATE's calendar day (UTC).
         # The dispatch input is passed via env (not interpolated into the shell)
         # to avoid actionlint's expression-injection warning.
         env:
@@ -88,7 +91,7 @@ jobs:
             echo "date=$DATE"
             echo "next=$NEXT"
           } >> "$GITHUB_OUTPUT"
-          echo "Digest window: merged:>=$DATE..$NEXT"
+          echo "Digest window: merged:$DATE..$NEXT"
 
       - name: Collect merged PRs
         env:
@@ -102,7 +105,7 @@ jobs:
           gh pr list \
             --repo "$REPO" \
             --state merged \
-            --search "merged:>=${DATE}..${NEXT}" \
+            --search "merged:${DATE}..${NEXT}" \
             --json number,title,author,mergedAt \
             > prs.json
           echo "Fetched $(jq 'length' prs.json) merged PR(s) for ${DATE}."
