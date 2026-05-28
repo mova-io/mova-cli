@@ -1,0 +1,284 @@
+{
+  "version": "Notebook/1.0",
+  "$schema": "https://schema.management.azure.com/schemas/2018-06-01/Microsoft.Insights.Workbook.json",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# mdk - daily insights workbook (what happened & what to look at)\n\n**Persona:** lead / on-call reviewing the day (\"what changed, which project is unhealthy, what are the top 3 things to look at?\").\n\nThis is the **Azure Monitor equivalent** of the insight-fed Grafana dashboards (`dashboards/grafana/insights/`). It is the intelligence layer on top of the #518 **operator** workbook (`infra/azure-monitor/workbooks/operator.workbook.json`): a narrative section, health gauges, a **Top 3** list, and anomaly-annotated golden-signal panels. Scope it to the Log Analytics workspace the deployment writes to (`logs.outputs.workspaceId` in `infra/azure/main.bicep`).\n\n**Two data sources, on purpose.**\n\n1. **Raw OTel metrics** - KQL against the workspace `AppMetrics` / `AppDependencies` tables the OTel Collector's `azuremonitor` exporter writes (ADR 020). These work **today**, exactly like the #518 workbooks.\n2. **The intelligence layer** (narrative digest, health scores, anomalies, top failures) - comes from the **ADR 047** Observability Intelligence API (`GET /api/v1/observability/insights`), **not** from an App Insights table. See the gap banner in the next section for how to feed it.\n\n**Cross-surface.** PromQL/Grafana side: `dashboards/grafana/insights/mdk-daily-insights.json` + `mdk-project-health.json`. Raw-metric Azure side: the #518 `operator` / `platform` / `eval-and-drift` workbooks."
+      },
+      "name": "title"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "> ## Gap banner - the intelligence layer needs ADR 047 (not on `main` yet)\n>\n> The **narrative digest**, **health scores**, **anomalies**, and **top failures** below are produced by the ADR 047 `observability_insights` store and exposed at `GET /api/v1/observability/{insights,health}`. **There is no App Insights / Log Analytics table that holds them** - so this workbook does **not** fabricate a KQL query against a non-existent table for those sections.\n>\n> **Realistic options to feed the intelligence sections (pick one):**\n>\n> 1. **Custom-endpoint query (preferred, once ADR 047 ships).** Use a workbook **ARM Actions / Custom Endpoint** query item (`queryType: 10`) pointed at `https://<runtime-host>/api/v1/observability/insights` with the `Authorization: Bearer <token>` header. The placeholder query items below are pre-shaped for this - swap the `query` JSON's `url` to your runtime host and supply the token via a workbook **parameter** (`insightsToken`).\n> 2. **Paste-the-digest (works today, zero deps).** The operator runs `mdk observability digest --json` (ADR 047 CLI) and pastes the markdown into the **Narrative** parameter at the top; the narrative section renders it. No live call.\n> 3. **Persist insights to a custom table.** If you configure ADR 047 to also emit insights as custom logs (e.g. `MdkInsights_CL`), replace the placeholder query items with KQL against that table. **Do this only if that table actually exists in your workspace** - otherwise leave the placeholder.\n>\n> Until you choose one, the intelligence sections show this banner + the placeholder text. **The raw-metric sections (latency / errors / throughput) work today** against `AppMetrics` / `AppDependencies`."
+      },
+      "name": "gap-banner"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "param-timerange",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "type": 4,
+            "isRequired": true,
+            "value": {"durationMs": 86400000},
+            "typeSettings": {
+              "selectableValues": [
+                {"durationMs": 3600000},
+                {"durationMs": 86400000},
+                {"durationMs": 604800000}
+              ]
+            }
+          },
+          {
+            "id": "param-project",
+            "version": "KqlParameterItem/1.0",
+            "name": "Project",
+            "type": 2,
+            "isRequired": false,
+            "description": "Project to scope the health + top-3 sections to. Backed by the projects seen in AppMetrics (the `project` custom dimension on mdk.* instruments).",
+            "query": "AppMetrics\n| where Name startswith \"mdk.\"\n| extend project = tostring(Properties[\"project\"])\n| where isnotempty(project)\n| distinct project\n| order by project asc",
+            "typeSettings": {"additionalResourceOptions": [], "showDefault": false},
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces"
+          },
+          {
+            "id": "param-narrative",
+            "version": "KqlParameterItem/1.0",
+            "name": "Narrative",
+            "type": 1,
+            "isRequired": false,
+            "description": "Paste the output of `mdk observability digest --json` (.narrative_digest markdown) here to render the narrative section without a live API call (gap-banner option 2).",
+            "value": ""
+          },
+          {
+            "id": "param-insights-token",
+            "version": "KqlParameterItem/1.0",
+            "name": "insightsToken",
+            "type": 1,
+            "isRequired": false,
+            "description": "Bearer token for GET /api/v1/observability/insights, used by the custom-endpoint query items (gap-banner option 1). Leave blank to use the paste-the-digest path.",
+            "value": ""
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 11,
+      "content": {
+        "version": "LinkItem/1.0",
+        "style": "list",
+        "links": [
+          {
+            "id": "operator-link",
+            "linkTarget": "Resource",
+            "linkLabel": "Open the #518 operator workbook (raw golden signals)",
+            "subTarget": "workbooks",
+            "style": "link"
+          },
+          {
+            "id": "alerts-link",
+            "linkTarget": "Resource",
+            "linkLabel": "Open Azure Monitor Alerts blade (item-27 SLO rules)",
+            "subTarget": "alertsManagementSummary",
+            "style": "link"
+          }
+        ]
+      },
+      "name": "links"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 1. Narrative digest (yesterday / watch)\n\n**What.** The ADR 047 `narrative_digest` markdown - a short \"Yesterday: ... Watch: ...\" summary. Rendered from the **Narrative** parameter above (paste-the-digest path) or from the custom-endpoint query (option 1).\n\n**Normal.** Reads \"nominal\"; no SLO mentions.\n\n**If red, do.** Use it as the index into the rest of the workbook - whatever project / signal it calls out, jump to that section below."
+      },
+      "name": "narrative-header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "{Narrative}"
+      },
+      "conditionalVisibility": {"parameterName": "Narrative", "comparison": "isNotEqualTo", "value": ""},
+      "name": "narrative-rendered"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "_Awaiting the digest. Paste `mdk observability digest --json` output into the **Narrative** parameter above, or wire the custom-endpoint query (gap-banner option 1). Until ADR 047 ships, no digest exists - this is expected._"
+      },
+      "conditionalVisibility": {"parameterName": "Narrative", "comparison": "isEqualTo", "value": ""},
+      "name": "narrative-placeholder"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 2. Project health scores (0-100; green >= 80, amber 50-79, red < 50)\n\n**What.** Per-project composite `health_score` from `GET /api/v1/observability/health` (ADR 047). The tiles use the same color map as the Grafana gauges.\n\n**Normal.** All tiles green (>= 80).\n\n**If red, do.** Note the red/amber project, then go to the **Top 3** section for it.\n\n> **This section needs ADR 047** (custom-endpoint query item below). It is a **placeholder** until the endpoint exists - no fabricated KQL against a non-existent health table."
+      },
+      "name": "health-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "{\"version\":\"CustomEndpoint/1.0\",\"data\":null,\"headers\":[{\"name\":\"Authorization\",\"value\":\"Bearer {insightsToken}\"}],\"method\":\"GET\",\"url\":\"https://REPLACE-WITH-RUNTIME-HOST/api/v1/observability/health\",\"urlParams\":[{\"key\":\"project\",\"value\":\"{Project}\"}],\"batchDisabled\":false,\"transformers\":[{\"type\":\"jsonpath\",\"settings\":{\"tablePath\":\"$.projects\",\"columns\":[{\"path\":\"$.project\",\"columnid\":\"project\"},{\"path\":\"$.health_score\",\"columnid\":\"health_score\",\"columnType\":\"real\"}]}}]}",
+        "size": 4,
+        "title": "Project health_score (ADR 047 - GET /api/v1/observability/health)",
+        "noDataMessage": "No health data. Set insightsToken + the runtime host URL in this query (gap-banner option 1), or wait for ADR 047 to ship. This is a placeholder, not a misconfiguration.",
+        "queryType": 10,
+        "visualization": "tiles",
+        "tileSettings": {
+          "titleContent": {"columnMatch": "project", "formatter": 1},
+          "leftContent": {
+            "columnMatch": "health_score",
+            "formatter": 18,
+            "formatOptions": {
+              "thresholdsOptions": "colors",
+              "thresholdsGrid": [
+                {"operator": "<", "thresholdValue": "50", "representation": "redBright", "text": "{0}{1}"},
+                {"operator": "<", "thresholdValue": "80", "representation": "yellow", "text": "{0}{1}"},
+                {"operator": "Default", "thresholdValue": null, "representation": "green", "text": "{0}{1}"}
+              ]
+            }
+          },
+          "showBorder": true
+        }
+      },
+      "name": "health-tiles"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 3. Top 3 to look at today (anomalies + top failures, by severity)\n\n**What.** The merged `anomalies[]` + `top_failures[]` from `GET /api/v1/observability/insights`, sorted by severity, capped at 3. Each row carries a representative `trace_id` (paste into App Insights transaction search) and `run_id`.\n\n**Normal.** Empty or one low-severity row.\n\n**If red, do.** Triage exactly like the operator workbook: latency anomaly -> latency heatmap (section 5) + Jaeger by `kind`; error cluster -> recent-failures (section 4) + Langfuse replay; cost anomaly -> token volume + `mdk eval`.\n\n> **This section needs ADR 047** (custom-endpoint query below). Placeholder until the endpoint exists."
+      },
+      "name": "top3-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "{\"version\":\"CustomEndpoint/1.0\",\"data\":null,\"headers\":[{\"name\":\"Authorization\",\"value\":\"Bearer {insightsToken}\"}],\"method\":\"GET\",\"url\":\"https://REPLACE-WITH-RUNTIME-HOST/api/v1/observability/insights\",\"urlParams\":[{\"key\":\"project\",\"value\":\"{Project}\"}],\"batchDisabled\":false,\"transformers\":[{\"type\":\"jsonpath\",\"settings\":{\"tablePath\":\"$.watchlist\",\"columns\":[{\"path\":\"$.severity\",\"columnid\":\"severity\"},{\"path\":\"$.project\",\"columnid\":\"project\"},{\"path\":\"$.title\",\"columnid\":\"what\"},{\"path\":\"$.explanation\",\"columnid\":\"explanation\"},{\"path\":\"$.count\",\"columnid\":\"count\",\"columnType\":\"long\"},{\"path\":\"$.trace_id\",\"columnid\":\"trace_id\"},{\"path\":\"$.run_id\",\"columnid\":\"run_id\"}]}}]}",
+        "size": 0,
+        "title": "Top 3 to look at (ADR 047 - GET /api/v1/observability/insights .watchlist)",
+        "noDataMessage": "No watchlist data. Set insightsToken + the runtime host URL in this query, or wait for ADR 047. Placeholder, not a misconfiguration.",
+        "queryType": 10,
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "severity",
+              "formatter": 18,
+              "formatOptions": {
+                "thresholdsOptions": "colors",
+                "thresholdsGrid": [
+                  {"operator": "==", "thresholdValue": "critical", "representation": "redBright", "text": "{0}"},
+                  {"operator": "==", "thresholdValue": "high", "representation": "red", "text": "{0}"},
+                  {"operator": "==", "thresholdValue": "medium", "representation": "orange", "text": "{0}"},
+                  {"operator": "Default", "thresholdValue": null, "representation": "yellow", "text": "{0}"}
+                ]
+              }
+            }
+          ]
+        },
+        "sortBy": [{"itemKey": "severity", "sortOrder": 1}]
+      },
+      "name": "top3-table"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 4. Recent failures (raw - works today)\n\n**What.** Failed `agent.execute` / `workflow.execute` in the window from `AppDependencies` (ADR 020). This is the **ground-truth** behind the Top-3 error clusters. The `OperationId` pastes into App Insights transaction search.\n\n**Normal.** Empty or a trickle of non-retried provider 5xx.\n\n**If red, do.** Concentrated on one `ResultCode` -> provider-side; spread across codes after a deploy -> revert/pin (correlate with Container Apps revisions in the platform workbook); KB-heavy agents predominate -> open `eval-and-drift`."
+      },
+      "name": "recent-failures-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where AppRoleName == \"movate-runtime\" and Success == false\n| where Name in (\"agent.execute\", \"workflow.execute\")\n| extend project = tostring(Properties[\"project\"])\n| where isempty(\"{Project}\") or project == \"{Project}\"\n| project TimeGenerated, project, Name, DurationMs, ResultCode, OperationId, AppRoleInstance\n| order by TimeGenerated desc\n| take 100",
+        "size": 0,
+        "title": "Recent failed agent.execute / workflow.execute (last 100)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "recent-failures"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 5. Latency with deploy markers (raw - works today)\n\n**What.** `agent.execute` `DurationMs` p95 over time (`AppDependencies`), the ground truth the latency anomalies are detected against. Overlay your CalVer deploy times mentally from the Container Apps revision history (the platform workbook lists them) - the Grafana equivalent draws them as annotations automatically from the insights `deploys[]`.\n\n**Normal.** p95 under ~2000 ms.\n\n**If red, do.** p95 > 30000 ms -> the `*-high-latency-p95` SLO is firing; line it up against the most recent revision rollout; if a model regression is suspected open `eval-and-drift`."
+      },
+      "name": "latency-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| extend project = tostring(Properties[\"project\"])\n| where isempty(\"{Project}\") or project == \"{Project}\"\n| summarize P95 = percentile(DurationMs, 95) by bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "agent.execute p95 latency (15m bins)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "latency-timechart"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 6. Throughput by status (raw - works today)\n\n**What.** `mdk.jobs.completed` summed by `status` over 15-minute bins (`AppMetrics`). Direct equivalent of the Grafana stacked-throughput panel; the ground truth behind error/dead-letter anomalies.\n\n**Normal.** Steady `success`; `error` < 1%; `dead_letter` flat at zero.\n\n**If red, do.** Any non-zero `dead_letter` -> `*-deadletter-spike` is or will fire; pull the failing run from section 4 and replay from Langfuse."
+      },
+      "name": "throughput-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend status = tostring(Properties[\"status\"]), project = tostring(Properties[\"project\"])\n| where isempty(\"{Project}\") or project == \"{Project}\"\n| summarize Jobs = sum(Sum) by status, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "mdk.jobs.completed by status (15m bins)",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "throughput-by-status"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 7. Cost trend (raw - works today)\n\n**What.** `mdk.run.cost_usd` summed over 1-hour bins (`AppMetrics`), the ground truth behind the cost anomalies + the project-health cost trend sparkline.\n\n**Normal.** Flat / proportional to throughput.\n\n**If red, do.** Step-change with no token change -> provider price/model swap; runaway with token growth -> KB chunk-size regression or prompt drift; run `mdk eval` for the project's agents."
+      },
+      "name": "cost-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.run.cost_usd\"\n| extend project = tostring(Properties[\"project\"])\n| where isempty(\"{Project}\") or project == \"{Project}\"\n| summarize CostUsd = sum(Sum) by bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "mdk.run.cost_usd per hour",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "cost-timechart"
+    }
+  ],
+  "fallbackResourceIds": ["Azure Monitor"],
+  "fromTemplateId": "mdk-insights-workbook"
+}

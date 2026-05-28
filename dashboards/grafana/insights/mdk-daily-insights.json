@@ -1,0 +1,555 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics (the same source the #518 raw-metric dashboards use).",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_INSIGHTS",
+      "label": "Insights API (JSON / Infinity)",
+      "description": "JSON/Infinity datasource pointed at the ADR 047 Observability Intelligence API: GET /api/v1/observability/insights and /health. See dashboards/grafana/insights/README.md for the datasource setup. Plugin: yesoreyeram-infinity-datasource (or grafana-json-datasource).",
+      "type": "datasource",
+      "pluginId": "yesoreyeram-infinity-datasource",
+      "pluginName": "Infinity"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "yesoreyeram-infinity-datasource",
+      "name": "Infinity",
+      "version": "1.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "red",
+        "name": "Insight anomalies",
+        "type": "tags",
+        "target": {
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "format": "timeseries",
+          "root_selector": "anomalies",
+          "columns": [
+            {"selector": "detected_at", "text": "time", "type": "timestamp_epoch_s"},
+            {"selector": "explanation", "text": "text", "type": "string"},
+            {"selector": "severity", "text": "tags", "type": "string"},
+            {"selector": "metric", "text": "title", "type": "string"}
+          ]
+        },
+        "$comment": "ADR 047 anomaly markers. Each anomalies[] item supplies detected_at -> annotation time, explanation -> hover text, severity -> tag (drives marker color via Grafana annotation styling), metric -> title. Sourced from GET /api/v1/observability/insights (see README 'How anomaly annotations are sourced'). Until ADR 047 ships, this query returns nothing and the charts render with deploy annotations only."
+      },
+      {
+        "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "blue",
+        "name": "CalVer deploys",
+        "type": "tags",
+        "target": {
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "format": "timeseries",
+          "root_selector": "deploys",
+          "columns": [
+            {"selector": "deployed_at", "text": "time", "type": "timestamp_epoch_s"},
+            {"selector": "version", "text": "text", "type": "string"},
+            {"selector": "environment", "text": "tags", "type": "string"}
+          ]
+        },
+        "$comment": "CalVer (YYYY.M.D.N) deploy markers. deploys[] is part of the insights digest payload; deployed_at -> time, version (e.g. 2026.5.28.1) -> hover text. Lets you correlate an anomaly with the release that introduced it."
+      }
+    ]
+  },
+  "description": "mdk - daily insights (insight-fed). The intelligence layer on top of the #518 golden-signal dashboards: a narrative banner, per-project health gauges, a 'Top 3 to look at today' watchlist, and the golden-signal charts overlaid with anomaly + deploy annotations. The top rows read from the ADR 047 Observability Intelligence API (GET /api/v1/observability/insights) via a JSON/Infinity datasource; the time-series charts read the same raw OTel metrics as #518 (mdk.job.duration_ms, mdk.jobs.completed, mdk.run.cost_usd) from Prometheus. See dashboards/grafana/insights/README.md. NOTE: ADR 047 endpoints are not on main yet - until they ship, the insight panels render their documented-gap state (banner explains this) and the metric charts work standalone.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "title": "Raw-metric golden signals (#518)",
+      "type": "link",
+      "url": "/d/mdk-golden-signals",
+      "targetBlank": true,
+      "icon": "external link"
+    },
+    {
+      "title": "Per-project health detail",
+      "type": "link",
+      "url": "/d/mdk-project-health",
+      "targetBlank": true,
+      "icon": "external link"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 300,
+      "panels": [],
+      "title": "What happened & what to look at (start here)",
+      "type": "row"
+    },
+    {
+      "type": "text",
+      "id": 301,
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 1},
+      "title": "How to read this dashboard (insight-fed)",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - daily insights\n\n**What this shows.** The *intelligence* layer over the #518 golden-signal dashboards. Instead of raw charts you read first, the top rows answer **\"what happened yesterday and what should I look at today?\"** from the ADR 047 Observability Intelligence layer (`observability_insights` store + `GET /api/v1/observability/insights`): a narrative digest, per-project **health scores**, a **Top 3** watchlist, and anomaly markers overlaid on the golden-signal charts.\n\n**Normal.** All health gauges green (>= 80); the Top 3 table short or empty; the narrative reads \"nominal\"; no red anomaly markers on the charts.\n\n**If you see X.** Start at the **Top 3 to look at today** panel; each row links straight to the Jaeger trace + the matching run. Then scan the gauges for the red/amber project, then drop into the anomaly-annotated charts below (hover a red marker for the explanation).\n\n> **Gap banner (ADR 047 not on main yet).** The narrative banner, health gauges, Top-3 table, and anomaly/deploy annotations read from `GET /api/v1/observability/insights`, which is delivered by **ADR 047** (Observability Intelligence). That endpoint is **not on `main` at the time this pack shipped.** Until it is, those panels show empty/placeholder data (Grafana will surface a datasource error on the insight panels) - this is expected, not a misconfiguration. The Prometheus metric charts below work standalone today. Wire the JSON/Infinity datasource per `dashboards/grafana/insights/README.md` once ADR 047 is deployed.\n\n**Cross-surface.** Raw metrics: `dashboards/grafana/mdk-golden-signals.json` (#518). Azure equivalent: `infra/azure-monitor/workbooks/insights.workbook.json`."
+      }
+    },
+    {
+      "type": "text",
+      "id": 302,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 7, "w": 16, "x": 0, "y": 6},
+      "title": "Narrative digest (yesterday / watch)",
+      "description": "Renders narrative_digest (markdown) from GET /api/v1/observability/insights. The digest is a short 'Yesterday: ... Watch: ...' summary the ADR 047 layer composes from the day's anomalies, top failures, and trends. Until ADR 047 ships this panel is empty (see gap banner above).",
+      "options": {
+        "mode": "markdown",
+        "content": "_Awaiting `narrative_digest` from `GET /api/v1/observability/insights` (ADR 047)._\n\nWhen the insights API is wired, this panel renders the latest narrative markdown, e.g.:\n\n> **Yesterday.** 12,400 runs across 4 projects; success 99.2%. `acme-support` p95 latency rose 38% after deploy `2026.5.28.1` - traced to a slower rerank stage. Cost flat.\n>\n> **Watch.** `acme-support` latency anomaly (amber); `internal-rag` token volume trending up 3 days running.\n\nTo render live markdown from the API, replace this static text panel with a **Business Text** (or **Dynamic Text**) panel bound to the `${DS_INSIGHTS}` datasource, `root_selector: narrative_digest`. The core Grafana `text` panel cannot template a datasource field, so the live wiring uses that community panel - documented in the README."
+      }
+    },
+    {
+      "type": "stat",
+      "id": 303,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 6},
+      "title": "Fleet health (worst project)",
+      "description": "Lowest health_score across projects in scope, from GET /api/v1/observability/insights. Thresholds: green >= 80, amber 50-79, red < 50.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 50},
+              {"color": "green", "value": 80}
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["min"], "fields": "/^health_score$/", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "root_selector": "health",
+          "filters": [
+            {"field": "project", "operator": "regex", "value": "$project"},
+            {"field": "tenant", "operator": "regex", "value": "$tenant"},
+            {"field": "environment", "operator": "regex", "value": "$environment"}
+          ],
+          "columns": [
+            {"selector": "project", "text": "project", "type": "string"},
+            {"selector": "health_score", "text": "health_score", "type": "number"}
+          ]
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 13},
+      "id": 310,
+      "panels": [],
+      "title": "Per-project health (health_score 0-100; green >= 80, amber 50-79, red < 50)",
+      "type": "row"
+    },
+    {
+      "type": "gauge",
+      "id": 311,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 8, "w": 18, "x": 0, "y": 14},
+      "title": "Health gauge per project",
+      "description": "One gauge per project from health[].health_score (GET /api/v1/observability/insights). Color thresholds: red < 50, amber 50-79, green >= 80 (documented in the README). The score is the ADR 047 composite of success rate, latency-vs-baseline, cost-vs-baseline, and eval/quality signals.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 50},
+              {"color": "green", "value": 80}
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^health_score$/", "values": true},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/health",
+          "root_selector": "projects",
+          "filters": [
+            {"field": "project", "operator": "regex", "value": "$project"},
+            {"field": "tenant", "operator": "regex", "value": "$tenant"},
+            {"field": "environment", "operator": "regex", "value": "$environment"}
+          ],
+          "columns": [
+            {"selector": "project", "text": "project", "type": "string"},
+            {"selector": "health_score", "text": "health_score", "type": "number"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": 312,
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 14},
+      "title": "Sub-panel: how to read health",
+      "options": {
+        "mode": "markdown",
+        "content": "**What.** Composite **health_score** (0-100) per project from `GET /api/v1/observability/health` (ADR 047).\n\n**Color map.**\n\n- **Green** `>= 80` - nominal.\n- **Amber** `50-79` - degraded; check the narrative + Top 3.\n- **Red** `< 50` - one or more SLOs breached or a hard anomaly.\n\n**If amber/red.** Open **Top 3 to look at** below for that project, then the anomaly-annotated charts. The score blends success rate, latency-vs-baseline, cost-vs-baseline, and eval pass-rate (ADR 047 scoring)."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
+      "id": 320,
+      "panels": [],
+      "title": "Top 3 to look at today (anomalies + top failures, by severity)",
+      "type": "row"
+    },
+    {
+      "type": "table",
+      "id": 321,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 23},
+      "title": "Top 3 to look at today",
+      "description": "Merged anomalies[] + top_failures[] from GET /api/v1/observability/insights, sorted by severity (critical > high > medium > low), top 3. Each row links to the Jaeger trace search and the matching run. Until ADR 047 ships this table is empty (see gap banner).",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "filterable": true},
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "severity"},
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {"type": "value", "options": {"critical": {"color": "dark-red", "index": 0}, "high": {"color": "red", "index": 1}, "medium": {"color": "orange", "index": 2}, "low": {"color": "yellow", "index": 3}}}
+                ]
+              },
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "trace"},
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {"title": "Open Jaeger trace", "url": "http://localhost:16686/trace/${__data.fields.trace_id}", "targetBlank": true}
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "run"},
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {"title": "Open run detail", "url": "/d/mdk-project-health?var-project=${__data.fields.project}&var-run=${__data.fields.run_id}", "targetBlank": true}
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"displayName": "severity", "desc": false}]
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "root_selector": "watchlist",
+          "filters": [
+            {"field": "project", "operator": "regex", "value": "$project"},
+            {"field": "tenant", "operator": "regex", "value": "$tenant"},
+            {"field": "environment", "operator": "regex", "value": "$environment"}
+          ],
+          "columns": [
+            {"selector": "severity", "text": "severity", "type": "string"},
+            {"selector": "project", "text": "project", "type": "string"},
+            {"selector": "title", "text": "what", "type": "string"},
+            {"selector": "explanation", "text": "explanation", "type": "string"},
+            {"selector": "count", "text": "count", "type": "number"},
+            {"selector": "trace_id", "text": "trace", "type": "string"},
+            {"selector": "run_id", "text": "run", "type": "string"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": 322,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 32},
+      "title": "Sub-panel: how to use the Top 3",
+      "options": {
+        "mode": "markdown",
+        "content": "**What.** The day's most-important things, merged from the insights `anomalies[]` (statistical deviations) and `top_failures[]` (clustered errors), sorted by `severity` (critical > high > medium > low), capped at 3.\n\n**Normal.** Empty or a single low-severity row.\n\n**If a row is present.** Click **trace** to open the representative Jaeger trace, **run** to open the matching run in the project-health dashboard. Triage like #518: latency anomaly -> p95-by-kind + Jaeger; error cluster -> failed runs in Langfuse + provider 5xx; cost anomaly -> token volume + eval drift.\n\n**Color map.** `critical` dark-red, `high` red, `medium` orange, `low` yellow (matches the README severity table)."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "id": 330,
+      "panels": [],
+      "title": "Golden signals with anomaly + deploy annotations (raw metrics, #518 catalog)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Job latency p95 (mdk.job.duration_ms) overlaid with the 'Insight anomalies' and 'CalVer deploys' annotations defined on this dashboard. Red markers = anomalies[] from the insights API (hover for the explanation); blue markers = deploys. Same metric + 30s SLO line as the #518 golden-signals dashboard.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 30000}]},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
+      "id": 331,
+      "links": [
+        {"title": "Open Jaeger - slow agent.execute", "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=2s", "targetBlank": true}
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "histogram_quantile(0.95, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))", "legendFormat": "p95", "range": true, "refId": "p95"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "histogram_quantile(0.99, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))", "legendFormat": "p99", "range": true, "refId": "p99"}
+      ],
+      "title": "Latency p95/p99 with anomaly markers (red line = high-latency-p95 SLO @ 30s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Error + dead-letter rate (mdk.jobs.completed) overlaid with the insight anomaly + deploy annotations. Red markers correlate an error spike with its explanation; blue markers with the deploy that introduced it. Same metric + 10% SLO line as #518.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "max": 1,
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.1}]},
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
+      "id": 332,
+      "links": [
+        {"title": "Open Jaeger - failed agent.execute", "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22error%22%3A%22true%22%7D", "targetBlank": true}
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(mdk_jobs_completed_total{status!=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(mdk_jobs_completed_total[$__rate_interval])), 1e-9)", "legendFormat": "error rate (all non-success)", "range": true, "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(mdk_jobs_completed_total{status=\"dead_letter\"}[$__rate_interval])) / clamp_min(sum(rate(mdk_jobs_completed_total[$__rate_interval])), 1e-9)", "legendFormat": "dead-letter rate", "range": true, "refId": "B"}
+      ],
+      "title": "Error & dead-letter rate with anomaly markers (red line = high-error-rate SLO @ 10%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "LLM spend rate (USD/hr) per tenant from mdk.run.cost_usd, overlaid with the insight anomaly + deploy annotations. A red marker on a cost step-change points to the anomaly explanation (e.g. token regression after a deploy). Same metric as the #518 cost dashboard.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never"},
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44},
+      "id": 333,
+      "links": [
+        {"title": "Open Jaeger - agent.execute (provider/model)", "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute", "targetBlank": true}
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum by (tenant) (rate(mdk_run_cost_usd_total{tenant=~\"$tenant\"}[$__rate_interval])) * 3600", "legendFormat": "tenant {{tenant}} (USD/hr)", "range": true, "refId": "A"}
+      ],
+      "title": "Cost rate (USD/hr) by tenant with anomaly markers",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 334,
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 52},
+      "title": "Sub-panel: how the annotations are sourced",
+      "options": {
+        "mode": "markdown",
+        "content": "**What.** The charts above are the same raw OTel metrics as #518 (`mdk.job.duration_ms`, `mdk.jobs.completed`, `mdk.run.cost_usd`), but with two **dashboard annotation queries** layered on top:\n\n- **Insight anomalies** (red) - from `anomalies[]` on `GET /api/v1/observability/insights`. Each item's `detected_at` places the marker; `explanation` is the hover text; `severity` drives the color. Defined under this dashboard's `annotations.list` (datasource `${DS_INSIGHTS}`).\n- **CalVer deploys** (blue) - from `deploys[]` on the same endpoint (`deployed_at` + `version` like `2026.5.28.1`). Lets you line up an anomaly with the release that caused it.\n\n**Normal.** No red markers; sparse blue markers at deploy times.\n\n**If you see X.** Hover a red marker for the explanation, then drill via the panel's Jaeger link or the **Top 3** table above. **Gap:** until ADR 047 ships, the annotation queries return nothing and only the metric lines render."
+      }
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "insights", "observability-intelligence", "adr-047"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Insights API",
+        "multi": false,
+        "name": "DS_INSIGHTS",
+        "options": [],
+        "query": "yesoreyeram-infinity-datasource",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_run_cost_usd_total, project)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "project",
+        "multi": true,
+        "name": "project",
+        "options": [],
+        "query": {"query": "label_values(mdk_run_cost_usd_total, project)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_run_cost_usd_total, tenant)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": {"query": "label_values(mdk_run_cost_usd_total, tenant)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "current": {"selected": true, "text": "prod", "value": "prod"},
+        "hide": 0,
+        "includeAll": true,
+        "label": "environment",
+        "multi": false,
+        "name": "environment",
+        "options": [
+          {"selected": true, "text": "prod", "value": "prod"},
+          {"selected": false, "text": "staging", "value": "staging"},
+          {"selected": false, "text": "dev", "value": "dev"}
+        ],
+        "query": "prod,staging,dev",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {"from": "now-24h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - daily insights (narrative, health, top 3, anomalies)",
+  "uid": "mdk-daily-insights",
+  "version": 1,
+  "weekStart": ""
+}
