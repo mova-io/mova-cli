@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.27.39"
+version = "2026.5.28.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -103,6 +103,20 @@ runtime = [
     "PyJWT[crypto]>=2.8,<3",
 ]
 langfuse = ["langfuse>=3,<4"]
+graph-notebook = [
+    # Interactive knowledge-graph viewer for analysts who live in
+    # notebooks (`mdk graph notebook` + `movate.graph.notebook`). ipysigma
+    # (MIT) renders a graphology/NetworkX graph as a sigma.js widget inside
+    # Jupyter; networkx (BSD-3-Clause) is the in-memory graph the graph
+    # query API's graphology JSON is adapted into. Both are permissively
+    # licensed and imported lazily with a friendly install hint — so the
+    # core install never pays for them, and this is purely opt-in. NOT in
+    # SHIPPED_EXTRAS (scripts/check_licenses.py): an analyst explicitly
+    # chooses to install the notebook viewer, so it's out of scope for the
+    # default customer deliverable's license closure.
+    "ipysigma>=0.24",
+    "networkx>=3,<4",
+]
 keychain = [
     # Optional OS-keychain credential backend (ADR 012 D2). Lets
     # operators keep machine-global runtime/provider keys out of the
@@ -382,6 +396,12 @@ module = [
     # keeps mypy on `src` clean whether or not the extras are installed.
     "prefect.*",
     "airflow.*",
+    # Interactive knowledge-graph viewer extra (graph-notebook) — networkx
+    # ships no inline py.typed and ipysigma has no stubs. Both are imported
+    # LAZILY inside movate.graph.notebook / movate.core.graph.networkx_format,
+    # so this keeps mypy clean whether or not the extra is installed.
+    "networkx.*",
+    "ipysigma.*",
 ]
 ignore_missing_imports = true
 

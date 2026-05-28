@@ -205,6 +205,7 @@ from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.doctor import doctor_app  # noqa: E402
 from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.fleet_cmd import fleet_app  # noqa: E402
+from movate.cli.graph_notebook_cmd import graph_app  # noqa: E402
 from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.infra_cmd import infra_app  # noqa: E402
@@ -422,6 +423,11 @@ app.add_typer(schema_app, name="schema", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.add_typer(knowledge_app, name="knowledge", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(kb_app, name="kb", rich_help_panel=PANEL_DEVELOP)
+# `graph notebook` generates a ready-to-run Jupyter notebook (ipysigma) for
+# interactively exploring the knowledge graph — the data-science viewer in the
+# graph-viz bake-off. Lives next to `kb`/`knowledge` since it explores the KB
+# graph. Needs the opt-in `graph-notebook` extra (networkx + ipysigma).
+app.add_typer(graph_app, name="graph", rich_help_panel=PANEL_DEVELOP)
 # `contexts` lists + inspects shared context files wired into agents —
 # the "did my policy.md actually load?" diagnostic. Lives next to `kb`
 # since both answer "what supporting content does my agent have?".
