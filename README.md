@@ -14,6 +14,21 @@ dropped in a future major release). Every example in this README uses `mdk`; sub
 
 _Auto-maintained daily by the [`daily-changelog`](.github/workflows/daily-changelog.yml) workflow — yesterday's merged PRs, newest first._
 
+### 2026-05-28
+
+**Features**
+
+- feat(changelog): daily "What's New" GitHub Action (#507) @jeremyyuAWS
+- feat(runtime): aggregate monitor endpoints — report + per-agent metrics (ADR 032 D2) (#510) @jeremyyuAWS
+
+**Fixes**
+
+- fix(changelog): correct merged-PR search query (drop malformed >=) (#513) @jeremyyuAWS
+
+**Docs**
+
+- docs(adr): land ADR 032/033/038 (decision-log catch-up) (#508) @jeremyyuAWS
+
 ### 2026-05-27
 
 **Docs**
