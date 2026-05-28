@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "_comment": "EXAMPLE values only — replace with your real workspace id and tenant prefix. Do NOT commit a populated copy; this file is the shape, your real parameters file should live outside the repo or be encrypted at rest.",
+  "parameters": {
+    "logAnalyticsWorkspaceId": {
+      "value": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-rg/providers/Microsoft.OperationalInsights/workspaces/example-workspace"
+    },
+    "namePrefix": {
+      "value": "MDK · "
+    },
+    "tags": {
+      "value": {
+        "movate:deployment": "example",
+        "movate:tenant": "example",
+        "movate:cost-center": "example"
+      }
+    }
+  }
+}
