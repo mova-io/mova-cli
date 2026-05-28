@@ -42,11 +42,14 @@ on:
         required: false
         type: string
 
-# Least privilege: read the repo to run the generator, and write Issues to post
-# the digest comment. No pull-requests / contents:write — we never open a PR or
-# push to a branch anymore.
+# Least privilege: read the repo + its pull requests to build the digest, and
+# write Issues to post the digest comment. `pull-requests: read` is REQUIRED —
+# the "Collect merged PRs" step searches merged PRs with GITHUB_TOKEN, which on
+# a private repo returns nothing without it. No contents:write / no
+# pull-requests:write — we never open a PR or push to a branch anymore.
 permissions:
   contents: read
+  pull-requests: read
   issues: write
 
 concurrency:
