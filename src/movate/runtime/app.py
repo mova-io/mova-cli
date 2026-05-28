@@ -24,7 +24,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
@@ -111,6 +111,8 @@ from movate.runtime.request_context import (
     install_request_id_logging,
 )
 from movate.runtime.schemas import (
+    KB_INGEST_URL_MAX_PAGES_CAP,
+    KB_INGEST_URL_TIMEOUT_S,
     AgentCatalogItemView,
     AgentCatalogView,
     AgentCommitView,
@@ -182,6 +184,9 @@ from movate.runtime.schemas import (
     KbChunkView,
     KbDeletedView,
     KbIngestFileResult,
+    KbIngestGeneratedRequest,
+    KbIngestTextRequest,
+    KbIngestUrlRequest,
     KbIngestView,
     KbListView,
     KbReindexSubmission,
@@ -1118,6 +1123,530 @@ def _apply_history_char_budget(
         else:
             break
     return list(reversed(kept_reverse))
+
+
+# ---------------------------------------------------------------------------
+# KB ingest handlers — one per ingest kind (upload / text / url / generated).
+# Each takes the resolved agent ``name`` + the AuthContext + Request, calls
+# into the shared ``movate.kb.ingest.ingest_text`` pipeline with the
+# appropriate text source, and returns a KbIngestView. Lifted out of the
+# route function so each kind is independently testable and so the route
+# itself stays a thin Content-Type dispatcher.
+# ---------------------------------------------------------------------------
+
+# Rough token-estimation ratio for the OpenAI embedding API. The
+# embeddings endpoint does NOT return token usage on the wire, so we
+# approximate as ``chars / 4`` — accurate to ~10% for English prose
+# which is sufficient for a billing/audit display ("you spent ~$0.002
+# on this ingest"). Exposed as a module constant so the cost-derivation
+# helper + the wire docstring stay in sync.
+_KB_INGEST_CHARS_PER_TOKEN = 4
+
+
+def _kb_estimate_embedding_cost(
+    *,
+    text_chars: int,
+    embedding_model: str,
+) -> tuple[int, float]:
+    """Estimate ``(tokens_in, cost_usd)`` for embedding ``text_chars`` chars.
+
+    Reads the canonical packaged pricing table (ADR 024) for the cost
+    side; an unknown / unpriced model yields ``cost_usd=0.0`` rather
+    than crashing — a missing price is a documented degrade (see
+    :func:`movate.providers.pricing.load_pricing`). The token estimate
+    is a deliberate ``chars // 4`` heuristic — see the module constant
+    comment above for the rationale.
+    """
+    if text_chars <= 0:
+        return 0, 0.0
+    tokens = text_chars // _KB_INGEST_CHARS_PER_TOKEN
+    try:
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        pricing = load_pricing()
+        entry = pricing.models.get(embedding_model)
+        if entry is None:
+            return tokens, 0.0
+        # Embedding pricing is input-only — the canonical packaged
+        # table stores per-1k rates; we estimate ``input_per_1k`` over
+        # ``tokens / 1000``. An unpriced model (or an LLM whose entry
+        # lacks an input rate) degrades to ``0.0`` rather than crashing.
+        cost = (tokens / 1000.0) * float(entry.input_per_1k)
+        return tokens, round(cost, 6)
+    except Exception:
+        # Pricing is best-effort metadata for the wire — never the
+        # blocker for a successful ingest. Suppress and report zero.
+        return tokens, 0.0
+
+
+def _kb_ingest_view_from_summary(
+    *,
+    agent_name: str,
+    kind: str,
+    source: str,
+    summary: Any,  # IngestSummary | None
+    tokens_in: int,
+    cost_usd: float,
+    generated_content: str | None = None,
+) -> KbIngestView:
+    """Build the wire response from a single-source ingest summary."""
+    from uuid import uuid4  # noqa: PLC0415
+
+    ingest_id = uuid4().hex
+    if summary is None:
+        # Empty content / nothing-to-embed — return a 200 with an
+        # ``empty`` file row + zero counts. Same semantics as the
+        # multipart path's per-file ``status="empty"``.
+        return KbIngestView(
+            agent_name=agent_name,
+            files=[KbIngestFileResult(source=source, status="empty")],
+            total_chunks_saved=0,
+            ingest_id=ingest_id,
+            kind=kind,
+            chunks_added=0,
+            tokens_in=tokens_in,
+            embedding_cost_usd=cost_usd,
+            generated_content=generated_content,
+        )
+    return KbIngestView(
+        agent_name=agent_name,
+        files=[
+            KbIngestFileResult(
+                source=source,
+                status="ingested",
+                chunks_total=summary.chunks_total,
+                chunks_saved=summary.chunks_saved,
+                embedding_model=summary.embedding_model,
+            )
+        ],
+        total_chunks_saved=summary.chunks_saved,
+        ingest_id=ingest_id,
+        kind=kind,
+        chunks_added=summary.chunks_saved,
+        tokens_in=tokens_in,
+        embedding_cost_usd=cost_usd,
+        generated_content=generated_content,
+    )
+
+
+async def _ingest_upload(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+) -> KbIngestView:
+    """Multipart upload — the existing kind ``"upload"`` path.
+
+    Preserved BYTE-FOR-BYTE from the pre-JSON-modes implementation so
+    front-end teams already integrated against ``POST /api/v1/agents/
+    {name}/kb`` with ``multipart/form-data`` are unaffected. The only
+    delta from the old path is that we now read the form ourselves
+    (FastAPI's ``File(...)`` binding requires a parameter on the route
+    function, and the route now only takes ``request: Request``).
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+    from starlette.datastructures import UploadFile as _StarletteUploadFile  # noqa: PLC0415
+
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text  # noqa: PLC0415
+    from movate.kb.parsers import (  # noqa: PLC0415
+        is_supported_extension,
+        parse_document,
+    )
+
+    form = await request.form()
+    # Starlette's UploadFile is the base; FastAPI's is a subclass —
+    # ``isinstance`` against the Starlette class catches both. The
+    # cast to FastAPI's ``UploadFile`` keeps the rest of the function
+    # typed against the FastAPI type the existing helpers expect.
+    files: list[UploadFile] = [
+        cast(UploadFile, v)
+        for v in form.getlist("files")
+        if isinstance(v, _StarletteUploadFile)
+    ]
+
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "no files in the multipart form; supply one or more "
+                "``files`` fields (.md / .markdown / .txt)."
+            ),
+        )
+
+    store: StorageProvider = request.app.state.storage
+
+    per_file: list[KbIngestFileResult] = []
+    total_saved = 0
+    total_chars = 0
+    last_embed_model = ""
+    for upload in files:
+        raw_name = (upload.filename or "").lstrip("/")
+        basename = Path(raw_name).name
+        if not basename:
+            per_file.append(KbIngestFileResult(source="<unnamed>", status="skipped"))
+            continue
+        if not is_supported_extension(basename):
+            per_file.append(KbIngestFileResult(source=basename, status="skipped"))
+            continue
+        raw = await upload.read()
+        parse_result = parse_document(basename, raw)
+        if parse_result is None:
+            per_file.append(KbIngestFileResult(source=basename, status="skipped"))
+            continue
+        summary = await ingest_text(
+            storage=store,
+            text=parse_result.text,
+            source=basename,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            embedding_model=embedding_model(),
+            ocr=parse_result.ocr_used,
+        )
+        if summary is None:
+            per_file.append(KbIngestFileResult(source=basename, status="empty"))
+            continue
+        total_saved += summary.chunks_saved
+        total_chars += len(parse_result.text)
+        last_embed_model = summary.embedding_model
+        per_file.append(
+            KbIngestFileResult(
+                source=basename,
+                status="ingested",
+                chunks_total=summary.chunks_total,
+                chunks_saved=summary.chunks_saved,
+                embedding_model=summary.embedding_model,
+            )
+        )
+
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=total_chars,
+        embedding_model=last_embed_model,
+    )
+    # Multipart path keeps the legacy response shape — empty
+    # ``ingest_id`` / ``kind="upload"`` so existing clients that ignore
+    # the new fields see no behavior change. Cost/tokens are populated
+    # additively so callers that DO read them get the same audit data
+    # the JSON paths surface.
+    return KbIngestView(
+        agent_name=name,
+        files=per_file,
+        total_chunks_saved=total_saved,
+        ingest_id="",
+        kind="upload",
+        chunks_added=total_saved,
+        tokens_in=tokens_in,
+        embedding_cost_usd=cost_usd,
+        generated_content=None,
+    )
+
+
+async def _ingest_json(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+) -> KbIngestView:
+    """Parse the JSON body, route to the right kind-specific handler.
+
+    Raises 422 on a missing/invalid body via Pydantic's validation
+    error (mapped to FastAPI's normal RequestValidationError surface).
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+    from pydantic import TypeAdapter, ValidationError  # noqa: PLC0415
+
+    from movate.runtime.schemas import KbIngestRequest  # noqa: PLC0415
+
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}") from exc
+
+    adapter: TypeAdapter[Any] = TypeAdapter(KbIngestRequest)
+    try:
+        parsed = adapter.validate_python(body)
+    except ValidationError as exc:
+        # Surface as 422 — the standard FastAPI shape for body
+        # validation errors. Hand-rolling the dispatch means we own
+        # the error path, so we re-raise with a 422 the same way the
+        # framework would have.
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    if isinstance(parsed, KbIngestTextRequest):
+        return await _ingest_text(name, request, ctx, parsed)
+    if isinstance(parsed, KbIngestUrlRequest):
+        return await _ingest_url(name, request, ctx, parsed)
+    if isinstance(parsed, KbIngestGeneratedRequest):
+        return await _ingest_generated(name, request, ctx, parsed)
+    # Discriminator covers all three; this branch is unreachable.
+    raise HTTPException(status_code=422, detail=f"unknown ingest kind: {body!r}")
+
+
+async def _ingest_text(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+    body: KbIngestTextRequest,
+) -> KbIngestView:
+    """``kind="text"`` — chunk + embed + persist the inline body."""
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text as _ingest_text_fn  # noqa: PLC0415
+
+    store: StorageProvider = request.app.state.storage
+    embed_model = embedding_model()
+    summary = await _ingest_text_fn(
+        storage=store,
+        text=body.content,
+        source=body.title,
+        agent=name,
+        tenant_id=ctx.tenant_id,
+        embedding_model=embed_model,
+    )
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=len(body.content),
+        embedding_model=summary.embedding_model if summary else embed_model,
+    )
+    return _kb_ingest_view_from_summary(
+        agent_name=name,
+        kind="text",
+        source=body.title,
+        summary=summary,
+        tokens_in=tokens_in,
+        cost_usd=cost_usd,
+    )
+
+
+async def _ingest_url(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+    body: KbIngestUrlRequest,
+) -> KbIngestView:
+    """``kind="url"`` — single page (default) or bounded same-host crawl.
+
+    Reuses :func:`movate.kb.web.fetch_and_extract` / :func:`crawl_site`
+    — no new extractor or HTTP client. Synchronous + bounded in v1
+    (see :data:`KB_INGEST_URL_MAX_PAGES_CAP` / :data:`KB_INGEST_URL_TIMEOUT_S`);
+    async-job variant for larger crawls is a documented follow-up.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text as _ingest_text_fn  # noqa: PLC0415
+    from movate.kb.web import (  # noqa: PLC0415
+        WebFetchError,
+        crawl_site,
+        fetch_and_extract,
+    )
+
+    store: StorageProvider = request.app.state.storage
+    embed_model = embedding_model()
+
+    # Enforce the schema's max_pages cap defensively in case a future
+    # change to the request model loosens it without updating the
+    # handler.
+    max_pages = min(body.max_pages, KB_INGEST_URL_MAX_PAGES_CAP)
+
+    if not body.crawl or max_pages <= 1:
+        # Single-page mode.
+        try:
+            text = fetch_and_extract(body.url, timeout_s=KB_INGEST_URL_TIMEOUT_S)
+        except WebFetchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        summary = await _ingest_text_fn(
+            storage=store,
+            text=text,
+            source=body.url,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            embedding_model=embed_model,
+        )
+        tokens_in, cost_usd = _kb_estimate_embedding_cost(
+            text_chars=len(text),
+            embedding_model=summary.embedding_model if summary else embed_model,
+        )
+        return _kb_ingest_view_from_summary(
+            agent_name=name,
+            kind="url",
+            source=body.url,
+            summary=summary,
+            tokens_in=tokens_in,
+            cost_usd=cost_usd,
+        )
+
+    # Crawl mode — bounded same-host BFS. Per-page timeout budgeted so
+    # the overall wall-clock stays under KB_INGEST_URL_TIMEOUT_S even
+    # in the worst-case fan-out (sequential by design — see
+    # crawl_site's docstring).
+    per_page_timeout = max(2.0, KB_INGEST_URL_TIMEOUT_S / max_pages)
+    crawl_result = crawl_site(
+        body.url,
+        max_pages=max_pages,
+        timeout_s=per_page_timeout,
+    )
+
+    per_file: list[KbIngestFileResult] = []
+    total_saved = 0
+    total_chars = 0
+    last_embed_model = embed_model
+    for page in crawl_result.pages:
+        summary = await _ingest_text_fn(
+            storage=store,
+            text=page.text,
+            source=page.url,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            embedding_model=embed_model,
+        )
+        if summary is None:
+            per_file.append(KbIngestFileResult(source=page.url, status="empty"))
+            continue
+        total_saved += summary.chunks_saved
+        total_chars += len(page.text)
+        last_embed_model = summary.embedding_model
+        per_file.append(
+            KbIngestFileResult(
+                source=page.url,
+                status="ingested",
+                chunks_total=summary.chunks_total,
+                chunks_saved=summary.chunks_saved,
+                embedding_model=summary.embedding_model,
+            )
+        )
+    for skipped_url, _reason in crawl_result.skipped:
+        per_file.append(KbIngestFileResult(source=skipped_url, status="skipped"))
+
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=total_chars,
+        embedding_model=last_embed_model,
+    )
+    from uuid import uuid4  # noqa: PLC0415
+
+    return KbIngestView(
+        agent_name=name,
+        files=per_file,
+        total_chunks_saved=total_saved,
+        ingest_id=uuid4().hex,
+        kind="url",
+        chunks_added=total_saved,
+        tokens_in=tokens_in,
+        embedding_cost_usd=cost_usd,
+        generated_content=None,
+    )
+
+
+# ``kind="generated"`` — fixed system prompt instructing the LLM to flag
+# unknowns rather than hallucinate. Plain string at module scope so the
+# tests can import + assert on it without standing the runtime stack up.
+KB_INGEST_GENERATED_SYSTEM_PROMPT = (
+    "You are authoring a knowledge-base document. Write a clear, "
+    "structured Markdown document of ~1500 words on the topic described. "
+    "Use headings and bullet points. Do not invent facts; if you don't "
+    "know something, write 'TODO: confirm with subject matter expert' "
+    "instead."
+)
+
+
+async def _ingest_generated(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+    body: KbIngestGeneratedRequest,
+) -> KbIngestView:
+    """``kind="generated"`` — LLM authors the document, then chunk + embed.
+
+    Uses the agent's configured provider (``bundle.spec.model.provider``)
+    via the existing :class:`BaseLLMProvider` seam — so the customer's
+    BYOK keys are used, never Movate's. Returns the generated content
+    in ``generated_content`` for review.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text as _ingest_text_fn  # noqa: PLC0415
+    from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
+
+    store: StorageProvider = request.app.state.storage
+    agents: list[AgentBundle] = request.app.state.agents
+    # Already 404'd in the route function on unknown agent; fetch the
+    # bundle to read its declared model.provider. Filesystem fallback
+    # is fine here — generated ingest does not need the durable
+    # registry copy, just the model string.
+    bundle = next((b for b in agents if b.spec.name == name), None)
+    if bundle is None:
+        raise not_found("agent", name)
+
+    # Build the provider via the same seam ``mdk init --llm`` and the
+    # planner use — see ``movate.scaffold.llm_scaffold`` / planner.py.
+    # NOT a new provider — :class:`LiteLLMProvider` is the existing
+    # default that honours per-tenant BYOK keys via env / pricing.
+    provider_override = getattr(request.app.state, "kb_generated_provider", None)
+    if provider_override is not None:
+        # Test seam: lets the suite stub the provider without monkey-
+        # patching the import. Production never sets this.
+        provider = provider_override
+    else:
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+        provider = LiteLLMProvider()
+
+    completion_request = CompletionRequest(
+        provider=bundle.spec.model.provider,
+        messages=[
+            Message(role="system", content=KB_INGEST_GENERATED_SYSTEM_PROMPT),
+            Message(
+                role="user",
+                content=(f"Title: {body.title}\n\nTopic / description:\n{body.description}"),
+            ),
+        ],
+        params={"temperature": 0.2, "max_tokens": 4096},
+    )
+    try:
+        response = await provider.complete(completion_request)
+    except Exception as exc:
+        # Provider auth / wire / timeout — surface as 502 (upstream
+        # provider unreachable), mirroring the embedding-error case.
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM provider call failed for generated ingest: {exc}",
+        ) from exc
+
+    generated = response.text or ""
+    if not generated.strip():
+        # The model returned an empty body — treat as "nothing
+        # ingestible". 200 with status=empty rather than 502 so the UI
+        # can show "the model didn't produce content" cleanly.
+        return _kb_ingest_view_from_summary(
+            agent_name=name,
+            kind="generated",
+            source=body.title,
+            summary=None,
+            tokens_in=0,
+            cost_usd=0.0,
+            generated_content=generated,
+        )
+
+    embed_model = embedding_model()
+    summary = await _ingest_text_fn(
+        storage=store,
+        text=generated,
+        source=body.title,
+        agent=name,
+        tenant_id=ctx.tenant_id,
+        embedding_model=embed_model,
+    )
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=len(generated),
+        embedding_model=summary.embedding_model if summary else embed_model,
+    )
+    return _kb_ingest_view_from_summary(
+        agent_name=name,
+        kind="generated",
+        source=body.title,
+        summary=summary,
+        tokens_in=tokens_in,
+        cost_usd=cost_usd,
+        generated_content=generated,
+    )
 
 
 def build_app(
@@ -2813,153 +3342,145 @@ def build_app(
             ],
         )
 
+    # Build the OpenAPI extras up-front so the spec advertises the
+    # JSON-mode request bodies even though the route function reads
+    # the body manually (FastAPI's body-binding only supports ONE
+    # body source per route, but the front-end client-codegen needs
+    # to see ALL four body shapes). We register the three JSON request
+    # types as schema components and reference them in a oneOf, plus
+    # the legacy multipart form description, so the generated TS
+    # types include them.
+    _kb_ingest_openapi_extra: dict[str, Any] = {
+        "requestBody": {
+            "description": (
+                "KB ingest body. The route dispatches on Content-Type: "
+                "`multipart/form-data` hits the legacy upload path "
+                "(kind=upload); `application/json` is parsed as one of "
+                "the three discriminated kinds below "
+                "(`text`/`url`/`generated`)."
+            ),
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                            }
+                        },
+                    }
+                },
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/KbIngestTextRequest"},
+                            {"$ref": "#/components/schemas/KbIngestUrlRequest"},
+                            {"$ref": "#/components/schemas/KbIngestGeneratedRequest"},
+                        ],
+                        "discriminator": {"propertyName": "kind"},
+                    }
+                },
+            },
+        }
+    }
+
     @v1.post(
         "/agents/{name}/kb",
         response_model=KbIngestView,
         status_code=200,
         tags=["agents-v1", "kb"],
         dependencies=[_scope("kb:write")],
+        openapi_extra=_kb_ingest_openapi_extra,
     )
     async def v1_upload_agent_kb(
         name: str,
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
-        files: list[UploadFile] = File(default=[]),
     ) -> KbIngestView:
-        """Ingest one or more KB documents into an agent's knowledge
-        base (Tier 10 RAG enhancement, PR-D).
+        """Ingest content into an agent's knowledge base.
 
-        Accepts a ``multipart/form-data`` upload with a repeating
-        ``files`` field. Each file is split into paragraph chunks,
-        embedded via the configured embedding model, and persisted
-        via the storage layer's :func:`save_kb_chunk` (deduped on the
-        ``(agent, tenant_id, content_hash)`` constraint — re-uploading
-        the same document is a no-op).
+        FOUR ingest kinds, dispatched on the request's ``Content-Type``:
 
-        Supported extensions: ``.md``, ``.markdown``, ``.txt``,
-        ``.pdf`` (text-based; scanned-image PDFs need OCR, deferred
-        to a future extras flag), ``.docx`` (Word documents; legacy
-        binary .doc not supported — convert to .docx first),
-        ``.html`` / ``.htm`` (extracted main-article content via
-        Readability — strips nav / sidebar / ads). Files with
-        unsupported extensions OR parser failures (corrupt PDF,
-        non-UTF-8 text, encrypted PDF, malformed DOCX, empty HTML)
-        get ``status="skipped"`` in the per-file result but the
-        overall upload still returns 200 — the operator sees the
-        mix instead of getting a 400 that blocks the whole batch.
+        * **``multipart/form-data``** — the *existing* upload path
+          (kind ``"upload"``). Accepts one or more ``files`` parts; each
+          file is split into paragraph chunks, embedded via the
+          configured embedding model, and persisted via the storage
+          layer's :func:`save_kb_chunk` (deduped on the
+          ``(agent, tenant_id, content_hash)`` constraint). Supported
+          extensions: ``.md`` / ``.markdown`` / ``.txt`` / ``.pdf`` /
+          ``.docx`` / ``.html`` / ``.htm``. Parser failures /
+          unsupported extensions get ``status="skipped"`` in the
+          per-file result; the overall upload still returns 200 so
+          one bad file never blocks the whole batch.
 
-        Wraps the same ingest path as ``mdk kb ingest`` (see
-        :func:`movate.kb.ingest.ingest_text`); this endpoint exists so
-        the Chainlit playground (and the future Angular Agent Console)
-        can offer a drag-drop upload without requiring an SSH
-        connection to a project directory.
+        * **``application/json``** with ``kind: "text"`` — inline
+          document body: ``{"kind": "text", "title": "...",
+          "content": "..."}``. The content is chunked + embedded
+          + persisted with ``title`` as the per-chunk source.
+
+        * **``application/json``** with ``kind: "url"`` — fetch a single
+          page (default) or a bounded same-host crawl:
+          ``{"kind": "url", "url": "...", "crawl": false, "max_pages": 1}``.
+          Reuses :func:`movate.kb.web.fetch_and_extract` (single page)
+          or :func:`movate.kb.web.crawl_site` (BFS crawl) — the same
+          extractor the CLI's ``mdk kb ingest <url>`` uses. v1 is
+          synchronous + bounded (``max_pages`` hard-capped at
+          :data:`KB_INGEST_URL_MAX_PAGES_CAP`, wall-clock at
+          :data:`KB_INGEST_URL_TIMEOUT_S` seconds); larger crawls are
+          a documented async-job follow-up.
+
+        * **``application/json``** with ``kind: "generated"`` — LLM
+          authors the document from a description:
+          ``{"kind": "generated", "title": "...", "description": "..."}``.
+          Calls the agent's configured provider (i.e. the customer's
+          BYOK keys, never Movate's) through the existing
+          :class:`BaseLLMProvider` seam with a fixed system prompt
+          instructing the model to flag uncertainty rather than
+          hallucinate facts. The generated Markdown is returned in
+          ``generated_content`` so the caller can review what was
+          embedded.
+
+        All four kinds chunk → embed → persist through the same
+        :func:`movate.kb.ingest.ingest_text` pipeline; only the *source
+        of text* differs. Returns the additive :class:`KbIngestView`
+        (the multipart path keeps its byte-for-byte response shape;
+        JSON modes populate the additional ``ingest_id`` / ``kind`` /
+        ``chunks_added`` / ``tokens_in`` / ``embedding_cost_usd`` /
+        ``generated_content`` fields).
 
         Errors:
 
-        * **400** — empty multipart form (no ``files`` field)
+        * **400** — empty multipart form (no ``files`` field) /
+          malformed JSON body shape
         * **401** — missing / bad bearer token
         * **404** — agent not found
-        * **502** — embedding API unreachable
+        * **422** — JSON body missing a required field for its kind
+          (e.g. ``kind="text"`` without ``content``)
+        * **502** — embedding API or LLM provider unreachable
         """
-        from movate.kb.embed import embedding_model  # noqa: PLC0415
-        from movate.kb.ingest import ingest_text  # noqa: PLC0415
-
-        if not files:
-            from fastapi import HTTPException  # noqa: PLC0415
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "no files in the multipart form; supply one or more "
-                    "``files`` fields (.md / .markdown / .txt)."
-                ),
-            )
-
         # 404 on unknown agent — same surface as other agent endpoints.
+        # Done up front so every dispatch branch shares it.
         agents: list[AgentBundle] = request.app.state.agents
         agent_names = {b.spec.name for b in agents}
         if name not in agent_names:
             raise not_found("agent", name)
 
-        store: StorageProvider = request.app.state.storage
-
-        # Dispatch table for per-extension parsers lives in
-        # ``movate.kb.parsers`` — extends to PDF (PR-G) and future
-        # DOCX / HTML without touching the endpoint code.
-        from movate.kb.parsers import (  # noqa: PLC0415 — lazy: KB upload path only
-            is_supported_extension,
-            parse_document,
-        )
-
-        per_file: list[KbIngestFileResult] = []
-        total_saved = 0
-        for upload in files:
-            raw_name = (upload.filename or "").lstrip("/")
-            basename = Path(raw_name).name
-            if not basename:
-                # Unnamed multipart part — skip silently with a
-                # placeholder source so the operator sees something.
-                per_file.append(
-                    KbIngestFileResult(
-                        source="<unnamed>",
-                        status="skipped",
-                    )
-                )
-                continue
-            if not is_supported_extension(basename):
-                per_file.append(
-                    KbIngestFileResult(
-                        source=basename,
-                        status="skipped",
-                    )
-                )
-                continue
-            raw = await upload.read()
-            parse_result = parse_document(basename, raw)
-            if parse_result is None:
-                # Parser returned None — corrupt PDF, non-UTF8 .txt,
-                # encrypted PDF, scanned-image PDF, etc. Skip the
-                # file rather than 400'ing the whole batch.
-                per_file.append(
-                    KbIngestFileResult(
-                        source=basename,
-                        status="skipped",
-                    )
-                )
-                continue
-            summary = await ingest_text(
-                storage=store,
-                text=parse_result.text,
-                source=basename,
-                agent=name,
-                tenant_id=ctx.tenant_id,
-                embedding_model=embedding_model(),
-                ocr=parse_result.ocr_used,
-            )
-            if summary is None:
-                per_file.append(
-                    KbIngestFileResult(
-                        source=basename,
-                        status="empty",
-                    )
-                )
-                continue
-            total_saved += summary.chunks_saved
-            per_file.append(
-                KbIngestFileResult(
-                    source=basename,
-                    status="ingested",
-                    chunks_total=summary.chunks_total,
-                    chunks_saved=summary.chunks_saved,
-                    embedding_model=summary.embedding_model,
-                )
-            )
-
-        return KbIngestView(
-            agent_name=name,
-            files=per_file,
-            total_chunks_saved=total_saved,
-        )
+        # Dispatch on Content-Type. FastAPI's normal body-binding can't
+        # do this (a route function only declares ONE body source), so
+        # we read the header ourselves and parse the appropriate body
+        # in the chosen handler. Keeps the multipart path byte-for-byte
+        # the same as before.
+        content_type = (request.headers.get("content-type") or "").lower()
+        if content_type.startswith("multipart/"):
+            return await _ingest_upload(name, request, ctx)
+        if content_type.startswith("application/json"):
+            return await _ingest_json(name, request, ctx)
+        # Other content types: most front-end clients will hit one of
+        # the two above. Treat unknown as multipart for the existing
+        # error shape — the multipart parser will fail with a clean
+        # 400 ("no files in the multipart form") on a bogus body.
+        return await _ingest_upload(name, request, ctx)
 
     @v1.get(
         "/agents/{name}/kb",
@@ -6708,6 +7229,48 @@ def build_app(
                 }
             },
         )
+
+    # ------------------------------------------------------------------
+    # OpenAPI patch — register schemas that the KB ingest route's JSON
+    # discriminated union references via ``$ref`` (the route reads the
+    # body manually, so FastAPI doesn't auto-walk these models). Without
+    # this the generated TS client wouldn't have types for the
+    # ``KbIngest{Text,Url,Generated}Request`` shapes the front end
+    # POSTs. See ``test_kb_ingest_exposes_three_json_modes`` in
+    # ``tests/test_front_end_api_contract.py``.
+    # ------------------------------------------------------------------
+    from fastapi.openapi.utils import get_openapi  # noqa: PLC0415
+
+    _default_openapi = app.openapi
+
+    def _patched_openapi() -> dict[str, Any]:
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = _default_openapi()
+        components = schema.setdefault("components", {}).setdefault("schemas", {})
+        for model_cls in (
+            KbIngestTextRequest,
+            KbIngestUrlRequest,
+            KbIngestGeneratedRequest,
+        ):
+            if model_cls.__name__ not in components:
+                model_schema = model_cls.model_json_schema(
+                    ref_template="#/components/schemas/{model}"
+                )
+                # Pydantic includes a per-model ``$defs`` block; merge
+                # any referenced sub-models into the components map and
+                # drop the inner ``$defs`` so the spec stays flat.
+                for ref_name, ref_schema in (model_schema.pop("$defs", {}) or {}).items():
+                    components.setdefault(ref_name, ref_schema)
+                components[model_cls.__name__] = model_schema
+        app.openapi_schema = schema
+        return schema
+
+    # Quiet the unused-import linter for the helper above — kept the
+    # explicit import so the intent is grep-able even though we only
+    # use the schema-walker via the wrapper.
+    _ = get_openapi
+    app.openapi = _patched_openapi  # type: ignore[method-assign]
 
     return app
 

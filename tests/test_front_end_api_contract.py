@@ -65,6 +65,11 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/agents/{name}/evals"): "eval",
     ("GET", "/api/v1/evals"): "read",
     ("GET", "/api/v1/evals/{eval_id}"): "read",
+    # kb ingest — multipart (existing) + JSON (new modes: text / url /
+    # generated) share this same route + scope (the route dispatches on
+    # Content-Type internally). Pinning it here so a future rename /
+    # scope change is caught by the front-end contract guard.
+    ("POST", "/api/v1/agents/{name}/kb"): "kb:write",
     # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
     ("GET", "/api/v1/report"): "read",
     ("GET", "/api/v1/agents/{name}/metrics"): "read",
@@ -167,6 +172,53 @@ def test_generated_openapi_exposes_front_end_paths(app) -> None:
         if entry is None or method.lower() not in entry:
             missing.append(f"{method} {path}")
     assert not missing, f"OpenAPI spec missing front-end paths/methods: {missing}"
+
+
+def test_kb_ingest_exposes_three_json_modes(app) -> None:
+    """``POST /api/v1/agents/{name}/kb`` retains its multipart contract AND
+    exposes three additive JSON ingest kinds (``text``/``url``/``generated``).
+
+    Pins the load-bearing request-schema shapes so an accidental rename
+    of a discriminator field — or an accidental REMOVAL of one of the
+    kinds — surfaces here, alongside the route/scope guards above.
+    The route + scope contract (one ``POST`` with ``kb:write``) is
+    unchanged: see the ``EXPECTED_ROUTES`` entry for ``/api/v1/agents/
+    {name}/kb``.
+    """
+    schemas = app.openapi()["components"]["schemas"]
+
+    # All three JSON-mode request bodies are advertised by the spec.
+    for cls in ("KbIngestTextRequest", "KbIngestUrlRequest", "KbIngestGeneratedRequest"):
+        assert cls in schemas, f"missing JSON ingest schema: {cls}"
+
+    # Each carries its discriminator literal + required fields.
+    text_props = schemas["KbIngestTextRequest"]["properties"]
+    assert text_props["kind"].get("const") == "text" or text_props["kind"].get("enum") == ["text"]
+    assert {"title", "content"}.issubset(set(text_props))
+    assert set(schemas["KbIngestTextRequest"].get("required", [])) >= {"title", "content"}
+
+    url_props = schemas["KbIngestUrlRequest"]["properties"]
+    assert url_props["kind"].get("const") == "url" or url_props["kind"].get("enum") == ["url"]
+    assert {"url", "crawl", "max_pages"}.issubset(set(url_props))
+
+    gen_props = schemas["KbIngestGeneratedRequest"]["properties"]
+    assert gen_props["kind"].get("const") == "generated" or gen_props["kind"].get("enum") == [
+        "generated"
+    ]
+    assert {"title", "description"}.issubset(set(gen_props))
+
+    # The response advertises the additive JSON-mode fields so the
+    # Angular client codegens types for them.
+    view_props = schemas["KbIngestView"]["properties"]
+    for field in (
+        "ingest_id",
+        "kind",
+        "chunks_added",
+        "tokens_in",
+        "embedding_cost_usd",
+        "generated_content",
+    ):
+        assert field in view_props, f"KbIngestView missing additive field: {field}"
 
 
 def test_wizard_create_is_structured_not_llm(app) -> None:

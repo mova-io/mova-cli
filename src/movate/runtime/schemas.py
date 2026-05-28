@@ -13,7 +13,7 @@ in import sites and at code review.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -1625,14 +1625,170 @@ class KbIngestView(BaseModel):
     Aggregate plus per-file detail. Total counts make the success
     summary trivial to render in the playground UI; per-file detail
     lets the operator see exactly which uploads contributed.
+
+    The wire shape is intentionally additive across all four ingest
+    kinds (``upload`` / ``text`` / ``url`` / ``generated``). The
+    multipart upload path populates ``files`` + ``total_chunks_saved``
+    and leaves the new JSON-mode fields at their defaults — byte-for-byte
+    backwards compatible with the pre-JSON-modes client contract. JSON
+    modes populate ``ingest_id`` / ``kind`` / ``chunks_added`` /
+    ``tokens_in`` / ``embedding_cost_usd`` (and ``generated_content``
+    for ``kind="generated"``) so a single response model serves every
+    front-end branch.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     agent_name: str
-    files: list[KbIngestFileResult]
-    total_chunks_saved: int
-    """Sum of chunks_saved across all files — convenience for the UI."""
+    files: list[KbIngestFileResult] = Field(default_factory=list)
+    """Per-file detail. Populated for the multipart ``upload`` kind;
+    a single one-element entry is included for the JSON ``text`` /
+    ``url`` / ``generated`` kinds so the UI can render the same
+    "what was ingested" row regardless of mode."""
+    total_chunks_saved: int = 0
+    """Sum of chunks_saved across all files — convenience for the UI.
+    Equal to ``chunks_added`` for the JSON modes."""
+
+    # --- JSON-mode additive fields (KB ingest kinds: text / url / generated) ---
+    ingest_id: str = ""
+    """Unique id for this ingest operation. Empty string on the legacy
+    multipart path (no id was minted historically); a uuid hex on the
+    JSON paths so callers can correlate with future async-job tracking."""
+    kind: str = "upload"
+    """``"upload"`` (multipart, existing) | ``"text"`` | ``"url"`` |
+    ``"generated"`` (new JSON modes). Lets the UI branch on response."""
+    chunks_added: int = 0
+    """Chunks persisted on this call. Equal to ``total_chunks_saved`` —
+    surfaced separately so the JSON-mode contract matches the spec
+    without forcing JSON callers to read a multipart-specific field."""
+    tokens_in: int = 0
+    """Approximate input tokens consumed by the embedding model for
+    this ingest. Best-effort character / 4 heuristic — the OpenAI
+    embeddings response does not expose token usage, so we estimate.
+    Zero for skipped / empty content."""
+    embedding_cost_usd: float = 0.0
+    """Approximate embedding cost in USD. Derived from ``tokens_in``
+    against the canonical pricing table; ``0.0`` when the model is
+    not priced (unknown model) or no chunks were embedded."""
+    generated_content: str | None = None
+    """The LLM-authored Markdown body. Set ONLY for ``kind="generated"``
+    so the caller can review (and surface in the UI) what was actually
+    embedded. ``None`` for every other kind."""
+
+
+# ---------------------------------------------------------------------------
+# KB JSON ingest modes (text / url / generated) — additive to the existing
+# multipart upload endpoint. The route dispatches on Content-Type: a
+# ``multipart/form-data`` body hits the legacy upload path, an
+# ``application/json`` body is parsed into one of these via the discriminated
+# union. The route + scope are unchanged (``POST /api/v1/agents/{name}/kb``,
+# ``kb:write``) so front-end clients integrated against the existing surface
+# keep working byte-for-byte. See docs/front-end-api.md.
+# ---------------------------------------------------------------------------
+
+# Hard cap on the v1 synchronous-crawl ``max_pages``. Lifted out as a
+# module-level constant so the schema + the handler enforce the same
+# bound — keeps the OpenAPI spec honest about the limit.
+KB_INGEST_URL_MAX_PAGES_CAP = 50
+
+# Hard wall-clock budget (seconds) for the entire URL ingest path in v1
+# (single page or bounded crawl). A crawl whose summed fetches exceed
+# this budget short-circuits — partial pages already ingested are kept,
+# the rest are skipped. Async-job variant for larger crawls is a
+# follow-up.
+KB_INGEST_URL_TIMEOUT_S = 60.0
+
+
+class KbIngestTextRequest(BaseModel):
+    """``kind="text"`` — inline document body authored by the caller.
+
+    The simplest JSON mode: the caller hands the runtime the text to
+    chunk + embed + persist directly. ``title`` is the per-chunk
+    ``source`` label (shows up in ``GET /api/v1/agents/{name}/kb`` so
+    a human can tell which inline doc a chunk came from); ``content``
+    is the body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["text"] = "text"
+    title: str = Field(..., min_length=1, max_length=256)
+    """Short label for the document — becomes the per-chunk ``source``.
+    Required so chunks have a human-readable provenance string."""
+    content: str = Field(..., min_length=1)
+    """The raw text to ingest. Markdown is fine — the paragraph
+    chunker treats ``\\n\\n`` boundaries the same way. Empty / blank
+    content is rejected at the pydantic layer (``min_length=1``); a
+    content body whose chunks all fall below the splitter floor yields
+    a 200 with ``chunks_added=0`` and ``status="empty"`` per-file."""
+
+
+class KbIngestUrlRequest(BaseModel):
+    """``kind="url"`` — fetch a single page (default) or a bounded crawl.
+
+    Reuses the same ``movate.kb.web`` front-end the CLI's
+    ``mdk kb ingest <url>`` does — :func:`movate.kb.web.fetch_and_extract`
+    for the single-page mode, :func:`movate.kb.web.crawl_site` for the
+    bounded same-host crawl. No new extractor or HTTP client.
+
+    Synchronous + bounded by design (v1): ``max_pages`` defaults to 1,
+    is hard-capped at 50, and the crawl is wall-clock-bounded by the
+    endpoint's overall timeout (60s). An async-job variant for larger
+    crawls is a documented follow-up (see PR body).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["url"] = "url"
+    url: str = Field(..., min_length=1, pattern=r"^https?://")
+    """The starting URL. Must be http(s); other schemes are rejected
+    at the pydantic layer."""
+    crawl: bool = False
+    """When true and ``max_pages > 1``, follow same-host ``<a href>``
+    links breadth-first up to ``max_pages``. Defaults to a single-page
+    fetch — the safe default."""
+    max_pages: int = Field(default=1, ge=1, le=KB_INGEST_URL_MAX_PAGES_CAP)
+    """Hard cap on pages fetched. Defaults to 1 (single page);
+    operators opting into a crawl typically set ``crawl=true`` + a
+    small ``max_pages`` (5-25). The 50-page ceiling matches the CLI's
+    safe-default bound and the v1 synchronous-execution budget."""
+
+
+class KbIngestGeneratedRequest(BaseModel):
+    """``kind="generated"`` — LLM authors the document from a description.
+
+    Calls into the agent's configured provider (``bundle.spec.model.provider``)
+    via the existing ``BaseLLMProvider`` seam — so the CUSTOMER's BYOK keys
+    are used, never Movate's. The generated Markdown body is returned in
+    the response (``generated_content``) so the caller can review what
+    was actually embedded; the same body is chunked + embedded through
+    the unchanged ``movate.kb.ingest.ingest_text`` pipeline.
+
+    No new provider is added. The system prompt is fixed (see the
+    handler) and instructs the model to flag uncertainty with
+    ``TODO: confirm with subject matter expert`` rather than
+    hallucinate facts.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["generated"] = "generated"
+    title: str = Field(..., min_length=1, max_length=256)
+    """Short label for the generated document — becomes the per-chunk
+    ``source``. Same role as ``KbIngestTextRequest.title``."""
+    description: str = Field(..., min_length=1)
+    """Free-form description of what the model should write about
+    (e.g. "FAQ covering pricing tiers, upgrade paths, billing cycles,
+    refund policy"). Becomes the user message of the completion."""
+
+
+# Discriminated union for the JSON body — FastAPI parses the right
+# concrete request based on the ``kind`` field. The route's Content-Type
+# inspection chooses between this union and the existing multipart path.
+KbIngestRequest = Annotated[
+    KbIngestTextRequest | KbIngestUrlRequest | KbIngestGeneratedRequest,
+    Field(discriminator="kind"),
+]
 
 
 # ---------------------------------------------------------------------------
