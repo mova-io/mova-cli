@@ -55,6 +55,11 @@ _PG_TABLES = (
     "kb_relations",
     "trigger_deliveries",
     "run_submissions",
+    "projects",
+    "project_members",
+    "project_agents",
+    "project_workflows",
+    "project_kbs",
 )
 
 

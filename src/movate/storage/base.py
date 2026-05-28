@@ -46,6 +46,10 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    Project,
+    ProjectKbMode,
+    ProjectMember,
+    ProjectMemberRole,
     Relation,
     RunRecord,
     Subgraph,
@@ -1297,6 +1301,256 @@ class StorageProvider(Protocol):
         already exists; ``mode="overwrite"`` re-saves every row. Idempotent +
         safe to re-run. Returns per-entity imported/skipped counts. See
         :func:`movate.core.dr_backup.import_state`.
+        """
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040) — tenant-scoped first-class container for agents,
+    # workflows, and KBs. Tables: ``projects``, ``project_members``,
+    # ``project_agents``, ``project_workflows``, ``project_kbs``. All carry
+    # ``tenant_id`` invariants via the project's ``tenant_id`` (the junctions
+    # join through it). Soft-deleted on archive (D6). Default project per
+    # tenant is created lazily by
+    # :meth:`get_or_create_default_project` (D5) and cannot be archived —
+    # ``archive_project`` rejects it at the storage layer in addition to the
+    # API guard.
+    # ------------------------------------------------------------------
+
+    async def create_project(self, project: Project) -> Project:
+        """Insert a brand-new project row.
+
+        Raises :class:`ValueError` on a duplicate ``(tenant_id, name)`` — the
+        unique invariant is per-tenant. The caller is responsible for the
+        owner-member row (the API layer does the dual write); this method
+        only persists the project itself so the storage layer stays a thin
+        adapter seam.
+        """
+
+    async def get_project(self, tenant_id: str, project_id: str) -> Project | None:
+        """Exact lookup by ``project_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the project belongs to a different
+        tenant — same 404-not-403 no-leak contract as every other
+        single-record getter. Archived projects ARE returned so callers can
+        present an "archived" detail view; filter at the listing layer.
+        """
+
+    async def get_project_by_name(self, tenant_id: str, name: str) -> Project | None:
+        """Exact lookup by ``(tenant_id, name)`` — the human-key path.
+
+        Powers the "is this name taken?" check on project create + the
+        default-project resolver. Archived projects are returned (the unique
+        ``(tenant_id, name)`` invariant applies regardless of archive state)
+        so a caller can distinguish "name in use" from "name free".
+        """
+
+    async def list_projects(
+        self,
+        tenant_id: str,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> list[Project]:
+        """List a tenant's projects, newest-first.
+
+        ``include_archived=False`` (the default) hides soft-deleted projects;
+        the front end's archive view flips it. ``after_id`` is a stable
+        keyset cursor — the caller passes the last ``project_id`` from the
+        previous page to fetch the next. Tenant-scoped: results for a wrong
+        tenant are empty (no existence leak).
+        """
+
+    async def update_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Project | None:
+        """Patch a project's mutable fields.
+
+        Only ``name`` and ``description`` are mutable. Either or both may be
+        provided; passing both ``None`` is a no-op that returns the current
+        row. Bumps ``updated_at``. Returns ``None`` if the project doesn't
+        exist OR belongs to a different tenant (same no-leak contract). The
+        unique ``(tenant_id, name)`` invariant is enforced by the backend
+        index — implementations raise :class:`ValueError` on a rename
+        collision.
+        """
+
+    async def archive_project(self, tenant_id: str, project_id: str) -> bool:
+        """Soft-delete a project (D6): set ``archived_at`` to now.
+
+        Idempotent — re-archiving an already-archived project is a no-op
+        that returns ``False`` (no row was newly changed). Tenant-scoped: a
+        wrong-tenant archive is a no-op (returns ``False``). **Rejects the
+        default project**: raises :class:`ValueError` if the target project
+        has ``name == "default"`` — the storage layer enforces this in
+        addition to the API guard so a buggy code path can never lose the
+        default attachment target (D5).
+
+        Attachments (members, junctions) are NOT cascaded — they remain so
+        the project can be un-archived in a future ADR; the listing-side
+        filter on ``archived_at IS NULL`` keeps them invisible meanwhile.
+        """
+
+    # -- Members ---------------------------------------------------------
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        role: ProjectMemberRole,
+        added_by: str,
+    ) -> None:
+        """Insert one member row. Raises :class:`ValueError` on a duplicate
+        ``(project_id, principal_id)`` — membership is at-most-one per
+        principal per project; role changes go through
+        :meth:`update_project_member`."""
+
+    async def list_project_members(self, project_id: str) -> list[ProjectMember]:
+        """List a project's members, ordered ``added_at ASC`` (creation
+        order — owners typically land first). Empty list for an unknown
+        ``project_id`` rather than raising (callers commonly probe before
+        existence checks)."""
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        *,
+        role: ProjectMemberRole,
+    ) -> ProjectMember | None:
+        """Transition a member's role (e.g. viewer → editor → owner).
+
+        Returns the updated :class:`ProjectMember`, or ``None`` if no such
+        member exists on this project. Last-write-wins; the API layer
+        enforces the "at least one owner" invariant on demotion, not the
+        storage layer (so a force-correction path can still flip a stuck
+        row).
+        """
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> bool:
+        """Remove one member. Returns ``True`` if a row was deleted,
+        ``False`` if no matching member existed. Idempotent."""
+
+    async def get_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+    ) -> ProjectMember | None:
+        """Exact lookup by ``(project_id, principal_id)`` — the RBAC path.
+
+        The composed-RBAC check (ADR 040 D4) calls this per request to
+        resolve a principal's project role; implementations should make it
+        cheap (PK lookup). ``None`` if no membership.
+        """
+
+    # -- Agent attachments ----------------------------------------------
+
+    async def attach_agent_to_project(self, project_id: str, agent_name: str) -> None:
+        """Attach an existing agent to a project (M:N, D2).
+
+        Idempotent on ``(project_id, agent_name)``: a duplicate attach is a
+        silent no-op (not an error) so retries are safe. Does NOT validate
+        that ``agent_name`` exists in the agent registry — the API layer
+        does that pre-check, and the storage layer stays a thin adapter.
+        """
+
+    async def detach_agent_from_project(self, project_id: str, agent_name: str) -> bool:
+        """Detach (the inverse of :meth:`attach_agent_to_project`).
+
+        Returns ``True`` if a row was removed, ``False`` if no attachment
+        existed. Does NOT delete the agent itself — its registry row
+        survives, and other projects' attachments are untouched.
+        """
+
+    async def list_project_agents(self, project_id: str) -> list[str]:
+        """List agent names attached to ``project_id``, ordered
+        ``added_at ASC`` (creation order). Empty list for an unknown
+        project."""
+
+    async def list_projects_for_agent(self, tenant_id: str, agent_name: str) -> list[str]:
+        """Reverse lookup: which projects in ``tenant_id`` does this agent
+        attach to?
+
+        Implements D5's implicit-default rule: if the agent has NO
+        ``project_agents`` row in this tenant, returns
+        ``[<default_project_id>]`` (lazily creating the default project if
+        needed). If it has any explicit attachment, returns the list of
+        ``project_id``s — the default project is NOT auto-added on top of
+        explicit attachments.
+        """
+
+    # -- Workflow attachments -------------------------------------------
+
+    async def attach_workflow_to_project(self, project_id: str, workflow_name: str) -> None:
+        """Idempotent attach; same shape as :meth:`attach_agent_to_project`."""
+
+    async def detach_workflow_from_project(self, project_id: str, workflow_name: str) -> bool:
+        """Detach; same shape as :meth:`detach_agent_from_project`."""
+
+    async def list_project_workflows(self, project_id: str) -> list[str]:
+        """List workflow names attached to ``project_id``, ordered
+        ``added_at ASC``."""
+
+    async def list_projects_for_workflow(self, tenant_id: str, workflow_name: str) -> list[str]:
+        """Reverse lookup, default-project fallback identical to
+        :meth:`list_projects_for_agent`."""
+
+    # -- KB attachments --------------------------------------------------
+
+    async def attach_kb_to_project(
+        self,
+        project_id: str,
+        kb_id: str,
+        mode: ProjectKbMode,
+    ) -> None:
+        """Attach a KB to a project with a sharing ``mode`` (D3).
+
+        Idempotent on ``(project_id, kb_id)``: a duplicate attach with the
+        same ``mode`` is a no-op; an attach with a different ``mode``
+        updates the row (a reference share can be later promoted to a
+        copy, mirroring the API's ``POST .../share`` semantics). The
+        "exactly one ``owned`` row per ``kb_id``" invariant is enforced by
+        the API layer on share, not at the storage seam.
+        """
+
+    async def detach_kb_from_project(self, project_id: str, kb_id: str) -> bool:
+        """Detach a KB row. Returns ``True`` if a row was removed, ``False``
+        otherwise. Does NOT delete the KB chunks; the chunks belong to the
+        KB id and live in the ``kb_chunks`` table."""
+
+    async def list_project_kbs(self, project_id: str) -> list[tuple[str, ProjectKbMode]]:
+        """List ``(kb_id, mode)`` pairs attached to ``project_id``, ordered
+        ``added_at ASC``. Empty list for an unknown project."""
+
+    async def list_projects_for_kb(self, tenant_id: str, kb_id: str) -> list[str]:
+        """Reverse lookup: which projects in ``tenant_id`` attach to this KB?
+
+        Unlike agents/workflows, KBs don't implicitly land in the default
+        project — they're project-scoped by their creating project (D3), and
+        ``mode='owned'`` is set explicitly on create. Returns the raw list
+        without the default-project fallback.
+        """
+
+    # -- Default project (D5) -------------------------------------------
+
+    async def get_or_create_default_project(self, tenant_id: str) -> Project:
+        """Return the per-tenant default project, creating it lazily if
+        missing (ADR 040 D5).
+
+        First read after the migration creates a project with
+        ``name == "default"`` owned by the synthetic ``"tenant-system"``
+        principal (movate.core.auth has no separate tenant-admin user
+        registry, so the synthetic principal mirrors the migration text in
+        the ADR). Subsequent reads return the existing row. The default
+        project is a normal project in every respect except that it cannot
+        be archived — :meth:`archive_project` rejects it.
+
+        Idempotent and concurrency-safe: implementations rely on the unique
+        ``(tenant_id, name)`` index so two racing creates collapse to one.
         """
 
     async def close(self) -> None: ...
