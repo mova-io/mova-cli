@@ -1259,9 +1259,7 @@ async def _ingest_upload(
     # cast to FastAPI's ``UploadFile`` keeps the rest of the function
     # typed against the FastAPI type the existing helpers expect.
     files: list[UploadFile] = [
-        cast(UploadFile, v)
-        for v in form.getlist("files")
-        if isinstance(v, _StarletteUploadFile)
+        cast(UploadFile, v) for v in form.getlist("files") if isinstance(v, _StarletteUploadFile)
     ]
 
     if not files:
