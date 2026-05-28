@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -675,8 +676,14 @@ def test_deploy_help_documents_verbose_flag() -> None:
     """``--verbose/-v`` is present in the deploy help text."""
     result = runner.invoke(cli_app, ["deploy", "--help"])
     assert result.exit_code == 0
-    assert "--verbose" in result.stdout
-    assert "-v" in result.stdout
+    # Rich renders --help with ANSI styling + box-drawing + width-based
+    # wrapping that varies by terminal/CI width, so the raw stdout can splay
+    # escape codes through the text. Assert against ANSI-stripped,
+    # whitespace-collapsed help instead of the raw bytes.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    plain = re.sub(r"\s+", " ", plain)
+    assert "--verbose" in plain
+    assert "-v" in plain
 
 
 @pytest.mark.unit
