@@ -1,8 +1,16 @@
 # ADR 014 — Durable shared agent registry: publish agents without rebuilding the image
 
-**Status:** Proposed
-**Date:** 2026-05-23
+**Status:** Accepted (partially shipped)
+**Date:** 2026-05-23 (proposed); 2026-05-27 (accepted — D1/D2/D3 shipped)
 **Deciders:** Engineering (storage + deployment-lifecycle — structural; CODEOWNER review required)
+
+> **Reconcile note (2026-05-27).** Accepted retroactively now the registry has
+> shipped: durable bundle-as-row storage (`save_agent_bundle`/`get_agent_bundle`/
+> `list_agent_versions`/`delete_agent_bundle` in `src/movate/storage/base.py`),
+> registry-first resolution for API + worker (`src/movate/runtime/registry.py`,
+> `src/movate/runtime/dispatch.py`), and the `POST/PUT /api/v1/agents` lifecycle
+> with versioning, `If-Match` optimistic concurrency, and revert
+> (`_check_agent_if_match`/`_mint_revert_version` in `src/movate/runtime/app.py`).
 **Context window:** v1.0 Azure operability — async + team agent authoring
 **Builds on / related:** ADR 013 (scopes gate *who* may publish), ADR 009 (pgvector KB storage — KB stays there), ADR 001 (cloud-portability),
 the jobs/worker infra (`JobKind`, `dispatch.py`), `src/movate/promotions/store.py`,

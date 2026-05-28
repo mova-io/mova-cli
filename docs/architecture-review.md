@@ -166,9 +166,9 @@ API hardening (ADR 033) makes it production-grade for a browser front end.
 | 029 | Workflow authoring | Accepted | Extend the ADR-025 spine to a `workflow` entity — new catalog actions over `workflow.yaml`, `mdk dev <workflow>` visualises/runs/traces, planner authors in NL, `verify` = validate + `--mock` run + eval gate. |
 | 030 | LangGraph optional execution backend | **Proposed** | Promote LangGraph from codegen-export to a first-class **opt-in** backend behind the runner seam (native runner stays default); grow compiler (conditional/parallel/cycles + typed state) + `StorageProvider` checkpointer. **Dep adoption gated on Deva sign-off.** |
 | 031 | Reporting & dashboards | Accepted | Surface telemetry via 3 surfaces, no new core dep: deepen Langfuse (D1), Grafana/Prometheus/Azure **dashboards-as-code** (D2), offline `mdk report` rollup (D3). |
-| 032 | Front-end API completion | Accepted (not on `main`) | Three additive `/api/v1` capabilities: draft/preview + server-side LLM authoring (D1), aggregate monitor endpoints over a factored `core/reporting` (D2), async KB ingest via `JobKind.INGEST` (D3). |
+| 032 | Front-end API completion | Accepted (D2 on `main`; D1/D3 not yet) | Three additive `/api/v1` capabilities: draft/preview + server-side LLM authoring (D1), aggregate monitor endpoints over a factored `core/reporting` (**D2 shipped to `main`, PR #510** — `core/reporting.py` + `GET /api/v1/report` + `GET /api/v1/agents/{name}/metrics`), async KB ingest via `JobKind.INGEST` (D3). |
 | 033 | API hardening | Accepted (not on `main`) | Uniform cross-cutting hardening on `/api/v1`: cursor pagination, request-id correlation, rate-limit headers, idempotency everywhere, `ETag`/`If-Match` (soft→enforced), payload limits, OpenAPI completeness, deprecation policy. |
-| 034 | Data-plane scalability | Accepted | PgBouncer/server-side pooling under autoscale with a `pods × pool_max ≤ max_connections` ceiling (D1, infra → Deva sign-off), read replicas behind `StorageProvider` (D2), pool observability + `doctor` check (D3). |
+| 034 | Data-plane scalability | Accepted (D3 + D1 doctor check on `main`; PgBouncer/replicas not yet) | **Shipped on `main`:** pool observability (`PostgresProvider.pool_stats` in `storage/postgres.py`) + the `doctor` "db pool capacity" check (`cli/doctor.py`) — D3 and the non-infra slice of D1. **Deva-gated / not shipped:** PgBouncer/server-side pooling under autoscale with a `pods × pool_max ≤ max_connections` ceiling (D1 infra), read replicas behind `StorageProvider` (D2). |
 | 035 | Outbound events + webhooks | Accepted | Typed tenant-scoped lifecycle events emitted at the edges (D1); HMAC-signed at-least-once webhook subscriptions over the worker queue (D2); front-end realtime SSE stream (D3). |
 | 036 | Usage metering + quotas | Accepted | Per-tenant usage rollup + `GET /usage` (D1); admission-time quotas with soft 80% / hard 100% (D2, **policy → Deva sign-off**); billing export (D3). Reuses per-run cost records. |
 | 037 | Workflow API parity | Accepted | Workflow CRUD/validate/version/publish over `/api/v1` (D1), run-management parity incl. HITL signal + per-node trace (D2), authoring-over-API (D3) — agent-parity for workflows. |
@@ -197,11 +197,10 @@ This pairs with ADR 032 D3 (**async KB ingest** via `JobKind.INGEST` on the
 KEDA-autoscaled worker — moving bulk crawl/embed off the request path).
 
 **Shipped vs gated:** D3 pool metrics + the D1 doctor check + pool-sizing are
-buildable with no infra dependency and ship first; **D1 PgBouncer provisioning
-and D2 read replicas are infra-shaped (bicep/env) and gated on Deva sign-off**
-(see §9). NB: on `origin/main` the pool-metrics code and `doctor` check are not
-yet present (the ADR-034 implementation commit is not merged); on the review
-branch they are an in-flight item.
+buildable with no infra dependency and **are now on `origin/main`**
+(`PostgresProvider.pool_stats` in `storage/postgres.py`; the `doctor` "db pool
+capacity" check in `cli/doctor.py`). **D1 PgBouncer provisioning and D2 read
+replicas remain infra-shaped (bicep/env) and gated on Deva sign-off** (see §9).
 
 ---
 
@@ -221,9 +220,9 @@ trace/explain → eval scorecard loop) are all **ready**. Auth is bearer-key +
 least-privilege scopes (ADR 013), with an OIDC/SSO path when `MOVATE_OIDC_ISSUER`
 is set, and CORS pinned per environment.
 
-The **gaps**, all tracked by ADR 032 (Accepted as decisions; **not yet on
-`main`** — `core/reporting.py` and the preview/usage/ingest endpoints are not
-present):
+The **gaps**, all tracked by ADR 032 (Accepted as decisions; **D2 has merged to
+`main`** (PR #510 — `core/reporting.py` + the aggregate monitor endpoints); D1
+preview + D3 async ingest are not yet on `main`):
 
 - **No server-side LLM authoring + no draft/preview.** Every create endpoint is
   structured-fields / pre-built-bundle only (the wizard writes `agent_prompt`
@@ -232,10 +231,10 @@ present):
   `POST /agents/preview`, which requires factoring the generator
   (`movate.scaffold.generate_agent_from_description`, a non-`cli` module) to be
   runtime-importable.
-- **No aggregate monitor data API.** A dashboard must page raw `/runs`; the
-  `mdk report` rollup is CLI-only. ADR 032 D2 factors the aggregation into a
-  backend-agnostic `core/reporting` consumed by both `mdk report` and a new
-  `GET /report` + `GET /agents/{name}/metrics`.
+- **Aggregate monitor data API — shipped (ADR 032 D2, PR #510).** The
+  aggregation is factored into a backend-agnostic `core/reporting.py` consumed by
+  both `mdk report` and the new `GET /api/v1/report` + `GET /api/v1/agents/{name}/metrics`
+  endpoints, so a dashboard no longer has to page raw `/runs`.
 - **Synchronous KB ingest.** ADR 032 D3 adds async ingest (above).
 
 ADR 033 (API hardening) and ADR 037 (workflow API parity) layer on top — also
@@ -319,25 +318,28 @@ recommendation* to resolve in the room.
 
 ---
 
-## 9. ADR status reconciliation (noted for the meeting, not edited)
+## 9. ADR status reconciliation
 
-A few ADRs carry a status that lags reality — worth reconciling so the decision
-log reads true at the review (this packet did **not** edit any ADR):
+A few ADRs carried a status that lagged reality. This packet reconciled them so
+the decision log reads true at the review (mirroring the earlier ADR-017 flip):
 
-- **ADR 013 (scopes)** and **ADR 016 (continuous-improvement loop)** are marked
-  **Proposed**, but their substance is shipped and depended on as such: the scope
-  vocabulary + `require_scope` is live and audited in `docs/front-end-api.md`, and
-  canary/harvest/drift code (`core/canary.py`, `core/harvest.py`, `core/drift.py`)
-  + the `/api/v1` canary/harvest/eval-schedule endpoints exist. Candidates to flip
-  to **Accepted (partially shipped)**, the way ADR 017 was reconciled.
-- **ADR 014 (durable registry)** is marked **Proposed**, but the registry
-  endpoints (versions/publish/revert, `If-Match`) are in the live `/api/v1`
-  inventory — likely Accepted in practice.
-- **ADRs 032 / 033 / 038 are not present on `origin/main`** as files (they live on
-  unmerged branches); 032/033 read "Accepted" and 038 "Proposed". Their *code* is
-  largely ADR-stage on `main` (`core/reporting.py`, the preview/usage/ingest
-  endpoints, the ADR-034 pool metrics, and the API-hardening middleware are not on
-  `main` yet). Treat §4's "Accepted (not on main)" rows accordingly.
+- **ADR 013 (scopes)**, **ADR 014 (durable registry)**, and **ADR 016
+  (continuous-improvement loop)** were marked **Proposed** but their substance is
+  shipped on `origin/main`. All three are now **Accepted (partially shipped)**:
+  013's L2 scope model (vocabulary + `require_scope` + `--scope` minting), 014's
+  full registry (versions/publish/revert + `If-Match`), and 016's
+  harvest/continuous-eval/drift/canary loop (`core/harvest.py`, `core/drift.py`,
+  `core/canary.py` + the `/api/v1` harvest/eval-schedule/canary endpoints). The
+  remaining slices (013 L1 SSO + L3 gateway) stay proposed; see each ADR's
+  reconcile note.
+- **ADR 032 D2 has merged to `main`** (PR #510): `core/reporting.py` +
+  `GET /api/v1/report` + `GET /api/v1/agents/{name}/metrics`. **ADR 034's D3 pool
+  metrics + the D1 `doctor` capacity check are also on `main`** (`storage/postgres.py`
+  `pool_stats`; `cli/doctor.py`). §4–§6 reflect this. Still off `main`: ADR 032
+  D1 preview + D3 async ingest, ADR 033 hardening middleware, and the Deva-gated
+  ADR 034 D1 PgBouncer / D2 replica infra.
+- **ADRs 032 / 033 / 038 are not present on `origin/main` as files** (they live on
+  unmerged branches); 032/033 read "Accepted", 038 "Proposed".
 - General pattern: several 023→031 ADRs are dated "proposed and approved the same
   day" — fine, but it means "Accepted" denotes *decision agreed*, not *shipped*.
   §3/§6 distinguish shipped vs ADR-stage explicitly.

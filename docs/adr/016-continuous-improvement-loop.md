@@ -1,8 +1,15 @@
 # ADR 016 — The continuous-improvement loop: harvest → continuous eval → canary
 
-**Status:** Proposed
-**Date:** 2026-05-23
+**Status:** Accepted (partially shipped)
+**Date:** 2026-05-23 (proposed); 2026-05-27 (accepted — D1/D2/D3 shipped)
 **Deciders:** Engineering (eval/runtime/deploy-lifecycle — touches several seams)
+
+> **Reconcile note (2026-05-27).** Accepted retroactively now the loop has
+> shipped: harvest (`src/movate/core/harvest.py` + `POST /api/v1/agents/{name}/dataset/harvest`),
+> continuous eval + drift alerting (`src/movate/core/drift.py`, the eval-schedule
+> endpoints, and the drift check wired into `src/movate/runtime/dispatch.py`), and
+> canary / champion-challenger with assisted promotion (`src/movate/core/canary.py`
+> + the canary set/get endpoints in `src/movate/runtime/app.py`).
 **Context window:** v1.0 — make the platform *compound* in value, not just ship once
 **Builds on / depends on:** ADR 014 (durable agent registry — versions enable canary), ADR 015 (self-hosted observability — quality signals), ADR 013 (scopes — gate promotion), ADR 008 (workflow-level evals), ADR 001 (portability)
 **Related (existing assets it composes):**
