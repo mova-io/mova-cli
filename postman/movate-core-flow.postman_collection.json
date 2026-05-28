@@ -473,6 +473,48 @@
               }
             }
           ]
+        },
+        {
+          "name": "7c. Monitor — aggregate report — mdk report",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/report",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "report"],
+              "query": [
+                {
+                  "key": "window",
+                  "value": "30",
+                  "disabled": true,
+                  "description": "OPTIONAL — only count runs / evals from the last N days. 0 (default) = all-time. Mirrors `mdk report --last N`. Range 0–3650."
+                },
+                {
+                  "key": "top",
+                  "value": "5",
+                  "disabled": true,
+                  "description": "OPTIONAL — how many failing cases to surface in `top_failing_cases` (default 5). Range 1–50."
+                }
+              ]
+            },
+            "description": "The `mdk report` equivalent — the cross-agent aggregate monitor feed (ADR 032 D2). Returns `ReportView`: tenant-scoped pass-rate trends, cost-over-time, latency p50/p95/p99, top failing cases, and a per-agent/workflow rollup over the requested `window`. This is the fleet-wide \"how are my agents doing?\" panel the Mova iO front end renders — the aggregate complement to the per-run fetch + trace (7a/7b). Tenant-scoped; an empty store returns a zeroed report (200), never a 500. Scope: `read`.\n\nOptional query params (disabled by default — enable to scope the rollup): `?window=<days>` narrows to the last N days (0 = all-time) and `?top=<n>` sets how many failing cases to surface. For a single agent's slice use `GET /api/v1/agents/{name}/metrics` (same `read` scope, same params)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const rep = pm.response.json();",
+                  "console.log('Report agents', (rep.per_agent||rep.agents||[]).length, 'window(days)', rep.window_days);"
+                ]
+              }
+            }
+          ]
         }
       ]
     }
