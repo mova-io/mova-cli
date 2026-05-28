@@ -402,6 +402,14 @@ def _clear_tracer_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "OTEL_DEPLOYMENT_ENVIRONMENT",
     ):
         monkeypatch.delenv(name, raising=False)
+    # build_tracer()'s _warn_once helper uses a module-level `_warned` set so
+    # operators don't see the same fallback line on every agent execution. In
+    # tests that exercise the fallback-warning path we need a clean slate per
+    # test — otherwise an earlier test in this file pollutes the set and the
+    # current test's capsys.err comes back empty.
+    import movate.tracing as _tracing_pkg  # noqa: PLC0415 - test-local reset
+
+    _tracing_pkg._warned.clear()
 
 
 @pytest.mark.unit
@@ -456,12 +464,16 @@ def test_build_tracer_otel_implicit_via_endpoint_falls_back(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     """When OTel SDK is missing, OTEL_EXPORTER_OTLP_ENDPOINT alone falls
-    back to stdout with a stderr warning. This guards the misconfigured-prod
-    path: env vars set, package not actually installed."""
+    back to SILENT with a stderr warning — matching the sibling
+    explicit-otel fallback above. Per the prod-code comment in
+    _build_otel_or_fallback: "Fall back to SilentTracer, NOT StdoutTracer:
+    the operator asked for OTel, not a flood of JSON spans interleaved with
+    progress bars." This guards the misconfigured-prod path: env vars set,
+    package not actually installed."""
     _clear_tracer_env(monkeypatch)
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
     tracer = build_tracer()
-    assert isinstance(tracer, StdoutTracer)
+    assert isinstance(tracer, SilentTracer)
     assert "OTel unavailable" in capsys.readouterr().err
 
 
