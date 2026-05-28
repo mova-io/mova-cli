@@ -3096,5 +3096,162 @@ class Subgraph(BaseModel):
     ``src_entity_id`` / ``dst_entity_id`` is present in ``entities``."""
 
 
+# ---------------------------------------------------------------------------
+# Projects (ADR 040) — tenant-scoped first-class container for agents,
+# workflows, and KBs, with a member/role model layered on top of ADR 013
+# tenant scopes. Agents and workflows are M:N with projects (D2); a KB is
+# created under exactly one owning project and may be reference- or
+# copy-shared into others (D3). Project deletion is soft (D6); a per-tenant
+# ``default`` project absorbs unattached resources for D5 back-compat.
+# Storage-only here — the /api/v1 endpoints and the composed RBAC layer ship
+# in separate PRs on top of this one.
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_PROJECT_NAME = "default"
+"""Reserved project name per tenant — auto-created on first read and
+guarded against deletion at the storage layer (D5 + D6, ADR 040)."""
+
+_DEFAULT_PROJECT_DESCRIPTION = "Auto-assigned for agents created without an explicit project"
+"""Stable description for the per-tenant default project; surfaced in the
+front-end so users understand why an un-projected agent shows up here."""
+
+_TENANT_SYSTEM_PRINCIPAL = "tenant-system"
+"""Synthetic principal recorded as the default project's owner when no
+tenant-admin principal is discoverable from the auth/key infrastructure.
+Projects are tenant-scoped containers (D1), and ``movate.core.auth`` only
+exposes per-key principals (``api_key:<key_id>``) — there is no separate
+"tenant admin user" registry to look up here, so the synthetic principal
+mirrors ADR 040's migration text ("owned by a synthetic ``tenant-system``
+principal")."""
+
+
+class ProjectMemberRole(StrEnum):
+    """Project-level RBAC roles (ADR 040 D4).
+
+    ``viewer`` reads project + attached resources; ``editor`` adds CRUD on
+    those resources; ``owner`` adds membership + archive. Composes with
+    (never weakens) tenant scopes (ADR 013).
+    """
+
+    VIEWER = "viewer"
+    EDITOR = "editor"
+    OWNER = "owner"
+
+
+class ProjectKbMode(StrEnum):
+    """How a KB row is bound to a project (ADR 040 D3).
+
+    ``owned`` — the project that originally created the KB (exactly one
+    such row per kb_id).
+    ``shared_reference`` — a read-only reference share to another project
+    in the same tenant; no chunks are duplicated.
+    ``shared_copy`` — a copy-on-attach share that forks chunks under the
+    consuming project so it can diverge (re-ingest / re-chunk) without
+    touching the upstream.
+    """
+
+    OWNED = "owned"
+    SHARED_REFERENCE = "shared_reference"
+    SHARED_COPY = "shared_copy"
+
+
+class Project(BaseModel):
+    """A tenant-scoped Project (ADR 040 D1).
+
+    Unique on ``(tenant_id, name)``. ``archived_at`` is NULL while live;
+    soft-delete (D6) sets it. The default project per tenant
+    (``name == "default"``) cannot be archived — :meth:`storage.archive_project`
+    rejects it at the storage layer in addition to the API guard.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(default_factory=lambda: f"prj_{uuid4().hex[:16]}")
+    """Stable id minted at create time; the API surface keys by this."""
+    tenant_id: str
+    """Owning tenant — never NULL, never crosses a tenant boundary."""
+    name: str
+    """Human-facing name; unique within ``tenant_id``."""
+    description: str | None = None
+    owner_principal_id: str
+    """Principal that created the project (or the synthetic
+    ``tenant-system`` for the default project). The API layer maps this to
+    an initial ``owner`` member row."""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    archived_at: datetime | None = None
+    """Set by :meth:`storage.archive_project` for soft delete (D6); the
+    project disappears from default listings but its attachments + history
+    remain."""
+
+
+class ProjectMember(BaseModel):
+    """One member row on a project (ADR 040 D1 + D4).
+
+    Composite PK ``(project_id, principal_id)``; role transitions (e.g.
+    viewer → editor → owner) are in-place updates via
+    :meth:`storage.update_project_member`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    principal_id: str
+    role: ProjectMemberRole
+    added_by: str
+    """Principal that performed the invite — distinct from
+    ``Project.owner_principal_id`` so a later membership audit can attribute
+    every grant to its actor."""
+    added_at: datetime = Field(default_factory=_now)
+
+
+class ProjectAgent(BaseModel):
+    """Junction row attaching an agent name to a project (ADR 040 D2).
+
+    M:N: one agent can attach to multiple projects within the same tenant.
+    The agent's tenant-scoped registry row (ADR 014) is unchanged; this is
+    a membership relation, not a re-parenting.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    agent_name: str
+    """The agent's :class:`AgentBundleRecord` ``name`` — the registry key."""
+    added_at: datetime = Field(default_factory=_now)
+
+
+class ProjectWorkflow(BaseModel):
+    """Junction row attaching a workflow name to a project (ADR 040 D2).
+
+    M:N, identical shape to :class:`ProjectAgent`; the workflow's
+    tenant-scoped definition is unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    workflow_name: str
+    added_at: datetime = Field(default_factory=_now)
+
+
+class ProjectKb(BaseModel):
+    """Junction row attaching a KB id to a project (ADR 040 D3).
+
+    Unlike agents/workflows, KBs carry a ``mode`` indicating whether this
+    project is the owner, a read-only reference share, or a forked copy.
+    Exactly one ``owned`` row per ``kb_id`` is the invariant; the API layer
+    enforces it on share, the storage layer just round-trips ``mode``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    kb_id: str
+    mode: ProjectKbMode
+    added_at: datetime = Field(default_factory=_now)
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

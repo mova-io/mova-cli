@@ -14,6 +14,9 @@ from typing import Any
 from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
+    _DEFAULT_PROJECT_DESCRIPTION,
+    _DEFAULT_PROJECT_NAME,
+    _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
     ApiKeyRecord,
     BatchRecord,
@@ -31,6 +34,13 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    Project,
+    ProjectAgent,
+    ProjectKb,
+    ProjectKbMode,
+    ProjectMember,
+    ProjectMemberRole,
+    ProjectWorkflow,
     Relation,
     RunRecord,
     Subgraph,
@@ -87,6 +97,13 @@ class InMemoryStorage:
         # → the job_id the first async submit enqueued.
         self.run_submissions: dict[tuple[str, str], str] = {}
         self.canary_configs: list[CanaryConfig] = []
+        # ADR 040 — projects + members + M:N junctions for agents/workflows/KBs.
+        # Lists for direct test assertion (matches the other entities here).
+        self.projects: list[Project] = []
+        self.project_members: list[ProjectMember] = []
+        self.project_agents: list[ProjectAgent] = []
+        self.project_workflows: list[ProjectWorkflow] = []
+        self.project_kbs: list[ProjectKb] = []
 
     async def init(self) -> None:
         return None
@@ -519,6 +536,308 @@ class InMemoryStorage:
         to_delete = [b for b in self.agent_bundles if _matches(b)]
         self.agent_bundles = [b for b in self.agent_bundles if not _matches(b)]
         return len(to_delete)
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040)
+    # ------------------------------------------------------------------
+
+    async def create_project(self, project: Project) -> Project:
+        # Unique (tenant_id, name) — matches the SQL backends' invariant.
+        for existing in self.projects:
+            if existing.tenant_id == project.tenant_id and existing.name == project.name:
+                raise ValueError(
+                    f"project ({project.tenant_id!r}, {project.name!r}) already exists"
+                )
+            if existing.project_id == project.project_id:
+                raise ValueError(f"project_id {project.project_id!r} already exists")
+        self.projects.append(project)
+        return project
+
+    async def get_project(self, tenant_id: str, project_id: str) -> Project | None:
+        return next(
+            (p for p in self.projects if p.project_id == project_id and p.tenant_id == tenant_id),
+            None,
+        )
+
+    async def get_project_by_name(self, tenant_id: str, name: str) -> Project | None:
+        return next(
+            (p for p in self.projects if p.tenant_id == tenant_id and p.name == name),
+            None,
+        )
+
+    async def list_projects(
+        self,
+        tenant_id: str,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> list[Project]:
+        rows = [p for p in self.projects if p.tenant_id == tenant_id]
+        if not include_archived:
+            rows = [p for p in rows if p.archived_at is None]
+        # Stable ordering: newest-first, tie-broken by project_id DESC.
+        rows.sort(key=lambda p: (p.created_at, p.project_id), reverse=True)
+        if after_id is not None:
+            cursor = next((p for p in self.projects if p.project_id == after_id), None)
+            if cursor is not None:
+                key = (cursor.created_at, cursor.project_id)
+                rows = [p for p in rows if (p.created_at, p.project_id) < key]
+        return rows[:limit]
+
+    async def update_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Project | None:
+        target_idx = next(
+            (
+                i
+                for i, p in enumerate(self.projects)
+                if p.project_id == project_id and p.tenant_id == tenant_id
+            ),
+            None,
+        )
+        if target_idx is None:
+            return None
+        target = self.projects[target_idx]
+        if name is None and description is None:
+            return target
+        # Rename collision guard matches the SQL UNIQUE(tenant_id, name).
+        if name is not None and name != target.name:
+            for p in self.projects:
+                if p.tenant_id == tenant_id and p.name == name:
+                    raise ValueError(
+                        f"project name {name!r} already exists in tenant {tenant_id!r}"
+                    )
+        updated = target.model_copy(
+            update={
+                "name": name if name is not None else target.name,
+                "description": description if description is not None else target.description,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.projects[target_idx] = updated
+        return updated
+
+    async def archive_project(self, tenant_id: str, project_id: str) -> bool:
+        target_idx = next(
+            (
+                i
+                for i, p in enumerate(self.projects)
+                if p.project_id == project_id and p.tenant_id == tenant_id
+            ),
+            None,
+        )
+        if target_idx is None:
+            return False
+        target = self.projects[target_idx]
+        if target.name == _DEFAULT_PROJECT_NAME:
+            raise ValueError(f"default project for tenant {tenant_id!r} cannot be archived")
+        if target.archived_at is not None:
+            return False
+        now = datetime.now(UTC)
+        self.projects[target_idx] = target.model_copy(
+            update={"archived_at": now, "updated_at": now}
+        )
+        return True
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        role: ProjectMemberRole,
+        added_by: str,
+    ) -> None:
+        for m in self.project_members:
+            if m.project_id == project_id and m.principal_id == principal_id:
+                raise ValueError(f"member {principal_id!r} already on project {project_id!r}")
+        self.project_members.append(
+            ProjectMember(
+                project_id=project_id,
+                principal_id=principal_id,
+                role=role,
+                added_by=added_by,
+            )
+        )
+
+    async def list_project_members(self, project_id: str) -> list[ProjectMember]:
+        rows = [m for m in self.project_members if m.project_id == project_id]
+        return sorted(rows, key=lambda m: (m.added_at, m.principal_id))
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        *,
+        role: ProjectMemberRole,
+    ) -> ProjectMember | None:
+        for i, m in enumerate(self.project_members):
+            if m.project_id == project_id and m.principal_id == principal_id:
+                updated = m.model_copy(update={"role": role})
+                self.project_members[i] = updated
+                return updated
+        return None
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> bool:
+        before = len(self.project_members)
+        self.project_members = [
+            m
+            for m in self.project_members
+            if not (m.project_id == project_id and m.principal_id == principal_id)
+        ]
+        return len(self.project_members) < before
+
+    async def get_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+    ) -> ProjectMember | None:
+        return next(
+            (
+                m
+                for m in self.project_members
+                if m.project_id == project_id and m.principal_id == principal_id
+            ),
+            None,
+        )
+
+    async def attach_agent_to_project(self, project_id: str, agent_name: str) -> None:
+        for a in self.project_agents:
+            if a.project_id == project_id and a.agent_name == agent_name:
+                return  # idempotent
+        self.project_agents.append(ProjectAgent(project_id=project_id, agent_name=agent_name))
+
+    async def detach_agent_from_project(self, project_id: str, agent_name: str) -> bool:
+        before = len(self.project_agents)
+        self.project_agents = [
+            a
+            for a in self.project_agents
+            if not (a.project_id == project_id and a.agent_name == agent_name)
+        ]
+        return len(self.project_agents) < before
+
+    async def list_project_agents(self, project_id: str) -> list[str]:
+        rows = sorted(
+            (a for a in self.project_agents if a.project_id == project_id),
+            key=lambda a: (a.added_at, a.agent_name),
+        )
+        return [a.agent_name for a in rows]
+
+    async def list_projects_for_agent(self, tenant_id: str, agent_name: str) -> list[str]:
+        # Filter via the project's tenant — junction has no tenant column,
+        # tenant-isolation is single-sourced through the project row.
+        project_ids_in_tenant = {p.project_id for p in self.projects if p.tenant_id == tenant_id}
+        rows = sorted(
+            (
+                a
+                for a in self.project_agents
+                if a.agent_name == agent_name and a.project_id in project_ids_in_tenant
+            ),
+            key=lambda a: (a.added_at, a.project_id),
+        )
+        if rows:
+            return [a.project_id for a in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_workflow_to_project(self, project_id: str, workflow_name: str) -> None:
+        for w in self.project_workflows:
+            if w.project_id == project_id and w.workflow_name == workflow_name:
+                return
+        self.project_workflows.append(
+            ProjectWorkflow(project_id=project_id, workflow_name=workflow_name)
+        )
+
+    async def detach_workflow_from_project(self, project_id: str, workflow_name: str) -> bool:
+        before = len(self.project_workflows)
+        self.project_workflows = [
+            w
+            for w in self.project_workflows
+            if not (w.project_id == project_id and w.workflow_name == workflow_name)
+        ]
+        return len(self.project_workflows) < before
+
+    async def list_project_workflows(self, project_id: str) -> list[str]:
+        rows = sorted(
+            (w for w in self.project_workflows if w.project_id == project_id),
+            key=lambda w: (w.added_at, w.workflow_name),
+        )
+        return [w.workflow_name for w in rows]
+
+    async def list_projects_for_workflow(self, tenant_id: str, workflow_name: str) -> list[str]:
+        project_ids_in_tenant = {p.project_id for p in self.projects if p.tenant_id == tenant_id}
+        rows = sorted(
+            (
+                w
+                for w in self.project_workflows
+                if w.workflow_name == workflow_name and w.project_id in project_ids_in_tenant
+            ),
+            key=lambda w: (w.added_at, w.project_id),
+        )
+        if rows:
+            return [w.project_id for w in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_kb_to_project(
+        self,
+        project_id: str,
+        kb_id: str,
+        mode: ProjectKbMode,
+    ) -> None:
+        for i, k in enumerate(self.project_kbs):
+            if k.project_id == project_id and k.kb_id == kb_id:
+                # Upsert mode in place (mirror SQL backends' ON CONFLICT path).
+                self.project_kbs[i] = k.model_copy(update={"mode": mode})
+                return
+        self.project_kbs.append(ProjectKb(project_id=project_id, kb_id=kb_id, mode=mode))
+
+    async def detach_kb_from_project(self, project_id: str, kb_id: str) -> bool:
+        before = len(self.project_kbs)
+        self.project_kbs = [
+            k for k in self.project_kbs if not (k.project_id == project_id and k.kb_id == kb_id)
+        ]
+        return len(self.project_kbs) < before
+
+    async def list_project_kbs(self, project_id: str) -> list[tuple[str, ProjectKbMode]]:
+        rows = sorted(
+            (k for k in self.project_kbs if k.project_id == project_id),
+            key=lambda k: (k.added_at, k.kb_id),
+        )
+        return [(k.kb_id, k.mode) for k in rows]
+
+    async def list_projects_for_kb(self, tenant_id: str, kb_id: str) -> list[str]:
+        project_ids_in_tenant = {p.project_id for p in self.projects if p.tenant_id == tenant_id}
+        rows = sorted(
+            (
+                k
+                for k in self.project_kbs
+                if k.kb_id == kb_id and k.project_id in project_ids_in_tenant
+            ),
+            key=lambda k: (k.added_at, k.project_id),
+        )
+        return [k.project_id for k in rows]
+
+    async def get_or_create_default_project(self, tenant_id: str) -> Project:
+        existing = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+        if existing is not None:
+            return existing
+        project = Project(
+            tenant_id=tenant_id,
+            name=_DEFAULT_PROJECT_NAME,
+            description=_DEFAULT_PROJECT_DESCRIPTION,
+            owner_principal_id=_TENANT_SYSTEM_PRINCIPAL,
+        )
+        try:
+            return await self.create_project(project)
+        except ValueError:
+            row = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+            assert row is not None  # invariant after race
+            return row
 
     async def list_workflow_runs(
         self,

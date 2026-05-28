@@ -17,6 +17,9 @@ import aiosqlite
 from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
+    _DEFAULT_PROJECT_DESCRIPTION,
+    _DEFAULT_PROJECT_NAME,
+    _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
@@ -40,6 +43,10 @@ from movate.core.models import (
     KbChunk,
     KbChunkWithScore,
     Metrics,
+    Project,
+    ProjectKbMode,
+    ProjectMember,
+    ProjectMemberRole,
     Relation,
     RunRecord,
     SkillCallRecord,
@@ -664,6 +671,87 @@ _MIGRATIONS = [
     # breakdown is coherent (a turn's skill children are persisted too).
     "ALTER TABLE runs ADD COLUMN skill_calls TEXT",
     "ALTER TABLE runs ADD COLUMN turns TEXT",
+    # ADR 040 — Projects as a first-class cloud entity. Five additive,
+    # idempotent (CREATE TABLE IF NOT EXISTS) tables. No existing column is
+    # modified, no ALTER on existing tables; the front end's project UX
+    # composes onto this without any back-compat hazard. ``tenant_id NOT
+    # NULL`` is the invariant on ``projects``; members + junctions derive
+    # the tenant via the project's row (joined when needed) so the
+    # tenant-isolation story stays single-sourced. Soft delete via
+    # ``archived_at`` (D6); a default-per-tenant row is created lazily by
+    # ``get_or_create_default_project`` (D5) and the unique
+    # ``(tenant_id, name)`` index keeps two racing creates collapsing to one.
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        project_id           TEXT PRIMARY KEY,
+        tenant_id            TEXT NOT NULL,
+        name                 TEXT NOT NULL,
+        description          TEXT,
+        owner_principal_id   TEXT NOT NULL,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL,
+        archived_at          TEXT,
+        UNIQUE (tenant_id, name)
+    )
+    """,
+    # Listing filter (D6 — hide archived) + tenant scope.
+    "CREATE INDEX IF NOT EXISTS idx_projects_tenant_archived ON projects(tenant_id, archived_at)",
+    # Member CRUD: PK is (project_id, principal_id); the secondary index
+    # covers the RBAC "members of project X with role Y" filter the API
+    # composes on (e.g. "is this principal a project owner?").
+    """
+    CREATE TABLE IF NOT EXISTS project_members (
+        project_id    TEXT NOT NULL,
+        principal_id  TEXT NOT NULL,
+        role          TEXT NOT NULL CHECK (role IN ('viewer','editor','owner')),
+        added_by      TEXT NOT NULL,
+        added_at      TEXT NOT NULL,
+        PRIMARY KEY (project_id, principal_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_members_project_role "
+    "ON project_members(project_id, role)",
+    # Agent attachment junction (D2 — M:N). Indices cover both directions:
+    # forward ("agents attached to project X") + reverse ("projects this
+    # agent belongs to" — D5 implicit-default check).
+    """
+    CREATE TABLE IF NOT EXISTS project_agents (
+        project_id  TEXT NOT NULL,
+        agent_name  TEXT NOT NULL,
+        added_at    TEXT NOT NULL,
+        PRIMARY KEY (project_id, agent_name)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_agents_project ON project_agents(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_agents_agent_name ON project_agents(agent_name)",
+    # Workflow attachment junction (D2 — M:N). Mirror of project_agents.
+    """
+    CREATE TABLE IF NOT EXISTS project_workflows (
+        project_id     TEXT NOT NULL,
+        workflow_name  TEXT NOT NULL,
+        added_at       TEXT NOT NULL,
+        PRIMARY KEY (project_id, workflow_name)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_workflows_project ON project_workflows(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_workflows_workflow_name "
+    "ON project_workflows(workflow_name)",
+    # KB attachment junction (D3). Carries the share mode (owned /
+    # shared_reference / shared_copy). The "exactly one ``owned`` row per
+    # kb_id" invariant is enforced by the API layer on share, not at the
+    # storage seam — keeps the table portable to backends that don't
+    # support partial unique indexes.
+    """
+    CREATE TABLE IF NOT EXISTS project_kbs (
+        project_id  TEXT NOT NULL,
+        kb_id       TEXT NOT NULL,
+        mode        TEXT NOT NULL CHECK (mode IN ('owned','shared_reference','shared_copy')),
+        added_at    TEXT NOT NULL,
+        PRIMARY KEY (project_id, kb_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_project_kbs_project ON project_kbs(project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_kbs_kb_id ON project_kbs(kb_id)",
 ]
 
 
@@ -1553,6 +1641,354 @@ class SqliteProvider:
         cur = await self._db.execute(sql, params)
         await self._db.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040)
+    # ------------------------------------------------------------------
+
+    async def create_project(self, project: Project) -> Project:
+        try:
+            await self._db.execute(
+                "INSERT INTO projects (project_id, tenant_id, name, description, "
+                "owner_principal_id, created_at, updated_at, archived_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project.project_id,
+                    project.tenant_id,
+                    project.name,
+                    project.description,
+                    project.owner_principal_id,
+                    project.created_at.isoformat(),
+                    project.updated_at.isoformat(),
+                    project.archived_at.isoformat() if project.archived_at else None,
+                ),
+            )
+        except aiosqlite.IntegrityError as exc:
+            # UNIQUE(tenant_id, name) collision OR duplicate project_id.
+            raise ValueError(
+                f"project ({project.tenant_id!r}, {project.name!r}) already exists"
+            ) from exc
+        await self._db.commit()
+        return project
+
+    async def get_project(self, tenant_id: str, project_id: str) -> Project | None:
+        async with self._db.execute(
+            "SELECT * FROM projects WHERE project_id = ? AND tenant_id = ? LIMIT 1",
+            (project_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_project(row) if row else None
+
+    async def get_project_by_name(self, tenant_id: str, name: str) -> Project | None:
+        async with self._db.execute(
+            "SELECT * FROM projects WHERE tenant_id = ? AND name = ? LIMIT 1",
+            (tenant_id, name),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_project(row) if row else None
+
+    async def list_projects(
+        self,
+        tenant_id: str,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> list[Project]:
+        clauses = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if not include_archived:
+            clauses.append("archived_at IS NULL")
+        # Keyset cursor: walk strictly past the last project_id from the
+        # prior page in the (created_at DESC, project_id DESC) order. Match
+        # the ORDER BY tuple in the WHERE so we never skip or repeat a row.
+        if after_id is not None:
+            async with self._db.execute(
+                "SELECT created_at, project_id FROM projects WHERE project_id = ?",
+                (after_id,),
+            ) as cur:
+                cursor_row = await cur.fetchone()
+            if cursor_row is not None:
+                clauses.append(
+                    "(created_at, project_id) < (?, ?)",
+                )
+                params.extend([cursor_row["created_at"], cursor_row["project_id"]])
+        sql = (
+            "SELECT * FROM projects WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC, project_id DESC LIMIT ?"
+        )
+        params.append(limit)
+        async with self._db.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_project(r) for r in rows]
+
+    async def update_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Project | None:
+        # Return current row if no fields were provided (idempotent no-op).
+        if name is None and description is None:
+            return await self.get_project(tenant_id, project_id)
+        sets = ["updated_at = ?"]
+        params: list[object] = [datetime.now(UTC).isoformat()]
+        if name is not None:
+            sets.append("name = ?")
+            params.append(name)
+        if description is not None:
+            sets.append("description = ?")
+            params.append(description)
+        params.extend([project_id, tenant_id])
+        try:
+            cur = await self._db.execute(
+                f"UPDATE projects SET {', '.join(sets)} WHERE project_id = ? AND tenant_id = ?",
+                tuple(params),
+            )
+        except aiosqlite.IntegrityError as exc:
+            # Rename collision on UNIQUE(tenant_id, name).
+            raise ValueError(
+                f"project name {name!r} already exists in tenant {tenant_id!r}"
+            ) from exc
+        await self._db.commit()
+        if cur.rowcount == 0:
+            return None
+        return await self.get_project(tenant_id, project_id)
+
+    async def archive_project(self, tenant_id: str, project_id: str) -> bool:
+        existing = await self.get_project(tenant_id, project_id)
+        if existing is None:
+            return False
+        # D5 + D6: the default project is never archivable. Enforce at the
+        # storage layer in addition to the API guard so a buggy code path
+        # can't lose the default attachment target.
+        if existing.name == _DEFAULT_PROJECT_NAME:
+            raise ValueError(f"default project for tenant {tenant_id!r} cannot be archived")
+        if existing.archived_at is not None:
+            return False
+        now = datetime.now(UTC).isoformat()
+        cur = await self._db.execute(
+            "UPDATE projects SET archived_at = ?, updated_at = ? "
+            "WHERE project_id = ? AND tenant_id = ? AND archived_at IS NULL",
+            (now, now, project_id, tenant_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        role: ProjectMemberRole,
+        added_by: str,
+    ) -> None:
+        try:
+            await self._db.execute(
+                "INSERT INTO project_members "
+                "(project_id, principal_id, role, added_by, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    project_id,
+                    principal_id,
+                    role.value,
+                    added_by,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        except aiosqlite.IntegrityError as exc:
+            raise ValueError(f"member {principal_id!r} already on project {project_id!r}") from exc
+        await self._db.commit()
+
+    async def list_project_members(self, project_id: str) -> list[ProjectMember]:
+        async with self._db.execute(
+            "SELECT * FROM project_members WHERE project_id = ? "
+            "ORDER BY added_at ASC, principal_id ASC",
+            (project_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_project_member(r) for r in rows]
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        *,
+        role: ProjectMemberRole,
+    ) -> ProjectMember | None:
+        cur = await self._db.execute(
+            "UPDATE project_members SET role = ? WHERE project_id = ? AND principal_id = ?",
+            (role.value, project_id, principal_id),
+        )
+        await self._db.commit()
+        if cur.rowcount == 0:
+            return None
+        return await self.get_project_member(project_id, principal_id)
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM project_members WHERE project_id = ? AND principal_id = ?",
+            (project_id, principal_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def get_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+    ) -> ProjectMember | None:
+        async with self._db.execute(
+            "SELECT * FROM project_members WHERE project_id = ? AND principal_id = ?",
+            (project_id, principal_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_project_member(row) if row else None
+
+    async def attach_agent_to_project(self, project_id: str, agent_name: str) -> None:
+        await self._db.execute(
+            "INSERT OR IGNORE INTO project_agents (project_id, agent_name, added_at) "
+            "VALUES (?, ?, ?)",
+            (project_id, agent_name, datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+
+    async def detach_agent_from_project(self, project_id: str, agent_name: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM project_agents WHERE project_id = ? AND agent_name = ?",
+            (project_id, agent_name),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def list_project_agents(self, project_id: str) -> list[str]:
+        async with self._db.execute(
+            "SELECT agent_name FROM project_agents WHERE project_id = ? "
+            "ORDER BY added_at ASC, agent_name ASC",
+            (project_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [r["agent_name"] for r in rows]
+
+    async def list_projects_for_agent(self, tenant_id: str, agent_name: str) -> list[str]:
+        async with self._db.execute(
+            "SELECT pa.project_id FROM project_agents pa "
+            "JOIN projects p ON p.project_id = pa.project_id "
+            "WHERE p.tenant_id = ? AND pa.agent_name = ? "
+            "ORDER BY pa.added_at ASC, pa.project_id ASC",
+            (tenant_id, agent_name),
+        ) as cur:
+            rows = await cur.fetchall()
+        if rows:
+            return [r["project_id"] for r in rows]
+        # D5: an agent with no explicit attachment is implicitly in the
+        # tenant's default project; create it lazily so first-read after the
+        # migration matches the ADR's "no backfill" contract.
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_workflow_to_project(self, project_id: str, workflow_name: str) -> None:
+        await self._db.execute(
+            "INSERT OR IGNORE INTO project_workflows "
+            "(project_id, workflow_name, added_at) VALUES (?, ?, ?)",
+            (project_id, workflow_name, datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+
+    async def detach_workflow_from_project(self, project_id: str, workflow_name: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM project_workflows WHERE project_id = ? AND workflow_name = ?",
+            (project_id, workflow_name),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def list_project_workflows(self, project_id: str) -> list[str]:
+        async with self._db.execute(
+            "SELECT workflow_name FROM project_workflows WHERE project_id = ? "
+            "ORDER BY added_at ASC, workflow_name ASC",
+            (project_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [r["workflow_name"] for r in rows]
+
+    async def list_projects_for_workflow(self, tenant_id: str, workflow_name: str) -> list[str]:
+        async with self._db.execute(
+            "SELECT pw.project_id FROM project_workflows pw "
+            "JOIN projects p ON p.project_id = pw.project_id "
+            "WHERE p.tenant_id = ? AND pw.workflow_name = ? "
+            "ORDER BY pw.added_at ASC, pw.project_id ASC",
+            (tenant_id, workflow_name),
+        ) as cur:
+            rows = await cur.fetchall()
+        if rows:
+            return [r["project_id"] for r in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_kb_to_project(
+        self,
+        project_id: str,
+        kb_id: str,
+        mode: ProjectKbMode,
+    ) -> None:
+        # Upsert: a duplicate attach with the same mode is a no-op; a
+        # different mode updates in place (the share-promotion path).
+        await self._db.execute(
+            "INSERT INTO project_kbs (project_id, kb_id, mode, added_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project_id, kb_id) DO UPDATE SET mode = excluded.mode",
+            (project_id, kb_id, mode.value, datetime.now(UTC).isoformat()),
+        )
+        await self._db.commit()
+
+    async def detach_kb_from_project(self, project_id: str, kb_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM project_kbs WHERE project_id = ? AND kb_id = ?",
+            (project_id, kb_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def list_project_kbs(self, project_id: str) -> list[tuple[str, ProjectKbMode]]:
+        async with self._db.execute(
+            "SELECT kb_id, mode FROM project_kbs WHERE project_id = ? "
+            "ORDER BY added_at ASC, kb_id ASC",
+            (project_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [(r["kb_id"], ProjectKbMode(r["mode"])) for r in rows]
+
+    async def list_projects_for_kb(self, tenant_id: str, kb_id: str) -> list[str]:
+        async with self._db.execute(
+            "SELECT pk.project_id FROM project_kbs pk "
+            "JOIN projects p ON p.project_id = pk.project_id "
+            "WHERE p.tenant_id = ? AND pk.kb_id = ? "
+            "ORDER BY pk.added_at ASC, pk.project_id ASC",
+            (tenant_id, kb_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [r["project_id"] for r in rows]
+
+    async def get_or_create_default_project(self, tenant_id: str) -> Project:
+        existing = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+        if existing is not None:
+            return existing
+        project = Project(
+            tenant_id=tenant_id,
+            name=_DEFAULT_PROJECT_NAME,
+            description=_DEFAULT_PROJECT_DESCRIPTION,
+            owner_principal_id=_TENANT_SYSTEM_PRINCIPAL,
+        )
+        try:
+            return await self.create_project(project)
+        except ValueError:
+            # Concurrent create raced us; re-read the winner.
+            row = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+            assert row is not None  # invariant after race
+            return row
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         # Upsert on the workflow_run_id PRIMARY KEY: the runner saves a row
@@ -2985,6 +3421,30 @@ def _row_to_agent_bundle(row: aiosqlite.Row) -> AgentBundleRecord:
         content_hash=row["content_hash"],
         files=json.loads(row["files"]),
         created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_project(row: aiosqlite.Row) -> Project:
+    archived = row["archived_at"]
+    return Project(
+        project_id=row["project_id"],
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        description=row["description"],
+        owner_principal_id=row["owner_principal_id"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        archived_at=datetime.fromisoformat(archived) if archived else None,
+    )
+
+
+def _row_to_project_member(row: aiosqlite.Row) -> ProjectMember:
+    return ProjectMember(
+        project_id=row["project_id"],
+        principal_id=row["principal_id"],
+        role=ProjectMemberRole(row["role"]),
+        added_by=row["added_by"],
+        added_at=datetime.fromisoformat(row["added_at"]),
     )
 
 

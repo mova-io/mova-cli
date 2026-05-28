@@ -32,6 +32,9 @@ import asyncpg
 from movate.core.dr_backup import ImportResult
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
+    _DEFAULT_PROJECT_DESCRIPTION,
+    _DEFAULT_PROJECT_NAME,
+    _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
@@ -55,6 +58,10 @@ from movate.core.models import (
     KbChunk,
     KbChunkWithScore,
     Metrics,
+    Project,
+    ProjectKbMode,
+    ProjectMember,
+    ProjectMemberRole,
     Relation,
     RunRecord,
     SkillCallRecord,
@@ -708,6 +715,84 @@ CREATE TABLE IF NOT EXISTS tenant_provider_keys (
     updated_at  TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_id, provider)
 );
+
+-- ADR 040 — Projects as a first-class cloud entity. Five additive,
+-- idempotent (CREATE TABLE IF NOT EXISTS) tables. No existing column is
+-- modified, no ALTER on existing tables; the front end's project UX
+-- composes onto this without any back-compat hazard. ``tenant_id NOT NULL``
+-- is the invariant on ``projects``; members + junctions derive the tenant
+-- via the project's row (joined when needed) so the tenant-isolation story
+-- stays single-sourced. Soft delete via ``archived_at`` (D6); a default-
+-- per-tenant row is created lazily by ``get_or_create_default_project``
+-- (D5) and the unique ``(tenant_id, name)`` index keeps two racing creates
+-- collapsing to one.
+CREATE TABLE IF NOT EXISTS projects (
+    project_id           TEXT PRIMARY KEY,
+    tenant_id            TEXT NOT NULL,
+    name                 TEXT NOT NULL,
+    description          TEXT,
+    owner_principal_id   TEXT NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL,
+    archived_at          TIMESTAMPTZ,
+    UNIQUE (tenant_id, name)
+);
+-- Listing filter (D6 — hide archived) + tenant scope.
+CREATE INDEX IF NOT EXISTS idx_projects_tenant_archived
+    ON projects(tenant_id, archived_at);
+
+-- Member CRUD: PK is (project_id, principal_id); the secondary index covers
+-- the RBAC "members of project X with role Y" filter the API composes on.
+CREATE TABLE IF NOT EXISTS project_members (
+    project_id    TEXT NOT NULL,
+    principal_id  TEXT NOT NULL,
+    role          TEXT NOT NULL CHECK (role IN ('viewer','editor','owner')),
+    added_by      TEXT NOT NULL,
+    added_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, principal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_members_project_role
+    ON project_members(project_id, role);
+
+-- Agent attachment junction (D2 — M:N). Indices cover both directions:
+-- forward ("agents attached to project X") + reverse ("projects this agent
+-- belongs to" — D5 implicit-default check).
+CREATE TABLE IF NOT EXISTS project_agents (
+    project_id  TEXT NOT NULL,
+    agent_name  TEXT NOT NULL,
+    added_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, agent_name)
+);
+CREATE INDEX IF NOT EXISTS idx_project_agents_project
+    ON project_agents(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_agents_agent_name
+    ON project_agents(agent_name);
+
+-- Workflow attachment junction (D2 — M:N). Mirror of project_agents.
+CREATE TABLE IF NOT EXISTS project_workflows (
+    project_id     TEXT NOT NULL,
+    workflow_name  TEXT NOT NULL,
+    added_at       TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, workflow_name)
+);
+CREATE INDEX IF NOT EXISTS idx_project_workflows_project
+    ON project_workflows(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_workflows_workflow_name
+    ON project_workflows(workflow_name);
+
+-- KB attachment junction (D3). Carries the share mode (owned /
+-- shared_reference / shared_copy). The "exactly one ``owned`` row per
+-- kb_id" invariant is enforced by the API layer on share, not at the
+-- storage seam — keeps the table portable.
+CREATE TABLE IF NOT EXISTS project_kbs (
+    project_id  TEXT NOT NULL,
+    kb_id       TEXT NOT NULL,
+    mode        TEXT NOT NULL CHECK (mode IN ('owned','shared_reference','shared_copy')),
+    added_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, kb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_kbs_project ON project_kbs(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_kbs_kb_id ON project_kbs(kb_id);
 """
 
 
@@ -1794,6 +1879,337 @@ class PostgresProvider:
             )
         # asyncpg returns a command tag like "DELETE <n>".
         return int(status.split()[-1])
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040)
+    # ------------------------------------------------------------------
+
+    async def create_project(self, project: Project) -> Project:
+        try:
+            await self._db.execute(
+                """
+                INSERT INTO projects (
+                    project_id, tenant_id, name, description,
+                    owner_principal_id, created_at, updated_at, archived_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                project.project_id,
+                project.tenant_id,
+                project.name,
+                project.description,
+                project.owner_principal_id,
+                project.created_at,
+                project.updated_at,
+                project.archived_at,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(
+                f"project ({project.tenant_id!r}, {project.name!r}) already exists"
+            ) from exc
+        return project
+
+    async def get_project(self, tenant_id: str, project_id: str) -> Project | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM projects WHERE project_id = $1 AND tenant_id = $2",
+            project_id,
+            tenant_id,
+        )
+        return _row_to_project(row) if row else None
+
+    async def get_project_by_name(self, tenant_id: str, name: str) -> Project | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM projects WHERE tenant_id = $1 AND name = $2",
+            tenant_id,
+            name,
+        )
+        return _row_to_project(row) if row else None
+
+    async def list_projects(
+        self,
+        tenant_id: str,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> list[Project]:
+        clauses = ["tenant_id = $1"]
+        params: list[object] = [tenant_id]
+        if not include_archived:
+            clauses.append("archived_at IS NULL")
+        if after_id is not None:
+            cursor_row = await self._db.fetchrow(
+                "SELECT created_at, project_id FROM projects WHERE project_id = $1",
+                after_id,
+            )
+            if cursor_row is not None:
+                params.append(cursor_row["created_at"])
+                params.append(cursor_row["project_id"])
+                clauses.append(f"(created_at, project_id) < (${len(params) - 1}, ${len(params)})")
+        params.append(limit)
+        sql = (
+            "SELECT * FROM projects WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY created_at DESC, project_id DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_project(r) for r in rows]
+
+    async def update_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Project | None:
+        if name is None and description is None:
+            return await self.get_project(tenant_id, project_id)
+        sets = ["updated_at = $1"]
+        params: list[object] = [datetime.now(UTC)]
+        if name is not None:
+            params.append(name)
+            sets.append(f"name = ${len(params)}")
+        if description is not None:
+            params.append(description)
+            sets.append(f"description = ${len(params)}")
+        params.append(project_id)
+        params.append(tenant_id)
+        sql = (
+            f"UPDATE projects SET {', '.join(sets)} "
+            f"WHERE project_id = ${len(params) - 1} AND tenant_id = ${len(params)}"
+        )
+        try:
+            status = await self._db.execute(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(
+                f"project name {name!r} already exists in tenant {tenant_id!r}"
+            ) from exc
+        # asyncpg returns "UPDATE <n>" — int 0 means no row matched.
+        if int(status.split()[-1]) == 0:
+            return None
+        return await self.get_project(tenant_id, project_id)
+
+    async def archive_project(self, tenant_id: str, project_id: str) -> bool:
+        existing = await self.get_project(tenant_id, project_id)
+        if existing is None:
+            return False
+        if existing.name == _DEFAULT_PROJECT_NAME:
+            raise ValueError(f"default project for tenant {tenant_id!r} cannot be archived")
+        if existing.archived_at is not None:
+            return False
+        now = datetime.now(UTC)
+        status = await self._db.execute(
+            "UPDATE projects SET archived_at = $1, updated_at = $1 "
+            "WHERE project_id = $2 AND tenant_id = $3 AND archived_at IS NULL",
+            now,
+            project_id,
+            tenant_id,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        role: ProjectMemberRole,
+        added_by: str,
+    ) -> None:
+        try:
+            await self._db.execute(
+                "INSERT INTO project_members "
+                "(project_id, principal_id, role, added_by, added_at) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                project_id,
+                principal_id,
+                role.value,
+                added_by,
+                datetime.now(UTC),
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(f"member {principal_id!r} already on project {project_id!r}") from exc
+
+    async def list_project_members(self, project_id: str) -> list[ProjectMember]:
+        rows = await self._db.fetch(
+            "SELECT * FROM project_members WHERE project_id = $1 "
+            "ORDER BY added_at ASC, principal_id ASC",
+            project_id,
+        )
+        return [_row_to_project_member(r) for r in rows]
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        *,
+        role: ProjectMemberRole,
+    ) -> ProjectMember | None:
+        status = await self._db.execute(
+            "UPDATE project_members SET role = $1 WHERE project_id = $2 AND principal_id = $3",
+            role.value,
+            project_id,
+            principal_id,
+        )
+        if int(status.split()[-1]) == 0:
+            return None
+        return await self.get_project_member(project_id, principal_id)
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_members WHERE project_id = $1 AND principal_id = $2",
+            project_id,
+            principal_id,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def get_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+    ) -> ProjectMember | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM project_members WHERE project_id = $1 AND principal_id = $2",
+            project_id,
+            principal_id,
+        )
+        return _row_to_project_member(row) if row else None
+
+    async def attach_agent_to_project(self, project_id: str, agent_name: str) -> None:
+        await self._db.execute(
+            "INSERT INTO project_agents (project_id, agent_name, added_at) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            project_id,
+            agent_name,
+            datetime.now(UTC),
+        )
+
+    async def detach_agent_from_project(self, project_id: str, agent_name: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_agents WHERE project_id = $1 AND agent_name = $2",
+            project_id,
+            agent_name,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def list_project_agents(self, project_id: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT agent_name FROM project_agents WHERE project_id = $1 "
+            "ORDER BY added_at ASC, agent_name ASC",
+            project_id,
+        )
+        return [r["agent_name"] for r in rows]
+
+    async def list_projects_for_agent(self, tenant_id: str, agent_name: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT pa.project_id FROM project_agents pa "
+            "JOIN projects p ON p.project_id = pa.project_id "
+            "WHERE p.tenant_id = $1 AND pa.agent_name = $2 "
+            "ORDER BY pa.added_at ASC, pa.project_id ASC",
+            tenant_id,
+            agent_name,
+        )
+        if rows:
+            return [r["project_id"] for r in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_workflow_to_project(self, project_id: str, workflow_name: str) -> None:
+        await self._db.execute(
+            "INSERT INTO project_workflows (project_id, workflow_name, added_at) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            project_id,
+            workflow_name,
+            datetime.now(UTC),
+        )
+
+    async def detach_workflow_from_project(self, project_id: str, workflow_name: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_workflows WHERE project_id = $1 AND workflow_name = $2",
+            project_id,
+            workflow_name,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def list_project_workflows(self, project_id: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT workflow_name FROM project_workflows WHERE project_id = $1 "
+            "ORDER BY added_at ASC, workflow_name ASC",
+            project_id,
+        )
+        return [r["workflow_name"] for r in rows]
+
+    async def list_projects_for_workflow(self, tenant_id: str, workflow_name: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT pw.project_id FROM project_workflows pw "
+            "JOIN projects p ON p.project_id = pw.project_id "
+            "WHERE p.tenant_id = $1 AND pw.workflow_name = $2 "
+            "ORDER BY pw.added_at ASC, pw.project_id ASC",
+            tenant_id,
+            workflow_name,
+        )
+        if rows:
+            return [r["project_id"] for r in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_kb_to_project(
+        self,
+        project_id: str,
+        kb_id: str,
+        mode: ProjectKbMode,
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO project_kbs (project_id, kb_id, mode, added_at) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT(project_id, kb_id) DO UPDATE SET mode = EXCLUDED.mode",
+            project_id,
+            kb_id,
+            mode.value,
+            datetime.now(UTC),
+        )
+
+    async def detach_kb_from_project(self, project_id: str, kb_id: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_kbs WHERE project_id = $1 AND kb_id = $2",
+            project_id,
+            kb_id,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def list_project_kbs(self, project_id: str) -> list[tuple[str, ProjectKbMode]]:
+        rows = await self._db.fetch(
+            "SELECT kb_id, mode FROM project_kbs WHERE project_id = $1 "
+            "ORDER BY added_at ASC, kb_id ASC",
+            project_id,
+        )
+        return [(r["kb_id"], ProjectKbMode(r["mode"])) for r in rows]
+
+    async def list_projects_for_kb(self, tenant_id: str, kb_id: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT pk.project_id FROM project_kbs pk "
+            "JOIN projects p ON p.project_id = pk.project_id "
+            "WHERE p.tenant_id = $1 AND pk.kb_id = $2 "
+            "ORDER BY pk.added_at ASC, pk.project_id ASC",
+            tenant_id,
+            kb_id,
+        )
+        return [r["project_id"] for r in rows]
+
+    async def get_or_create_default_project(self, tenant_id: str) -> Project:
+        existing = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+        if existing is not None:
+            return existing
+        project = Project(
+            tenant_id=tenant_id,
+            name=_DEFAULT_PROJECT_NAME,
+            description=_DEFAULT_PROJECT_DESCRIPTION,
+            owner_principal_id=_TENANT_SYSTEM_PRINCIPAL,
+        )
+        try:
+            return await self.create_project(project)
+        except ValueError:
+            row = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+            assert row is not None  # invariant after race
+            return row
 
     # ------------------------------------------------------------------
     # Workflow runs
@@ -3256,6 +3672,29 @@ def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
         content_hash=row["content_hash"],
         files=dict(row["files"]),
         created_at=row["created_at"],
+    )
+
+
+def _row_to_project(row: asyncpg.Record) -> Project:
+    return Project(
+        project_id=row["project_id"],
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        description=row["description"],
+        owner_principal_id=row["owner_principal_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        archived_at=row["archived_at"],
+    )
+
+
+def _row_to_project_member(row: asyncpg.Record) -> ProjectMember:
+    return ProjectMember(
+        project_id=row["project_id"],
+        principal_id=row["principal_id"],
+        role=ProjectMemberRole(row["role"]),
+        added_by=row["added_by"],
+        added_at=row["added_at"],
     )
 
 
