@@ -29,7 +29,14 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
-from movate.core.reporting import AgentRollup, FailingCase, LatencyPercentiles, Report
+from movate.core.reporting import (
+    AgentRollup,
+    FailingCase,
+    LatencyPercentiles,
+    Report,
+    Usage,
+    UsageRollup,
+)
 
 
 class RunSubmission(BaseModel):
@@ -2895,4 +2902,99 @@ class AgentMetricsView(BaseModel):
             ),
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Usage metering (ADR 036 D1) — ``GET /api/v1/usage``
+#
+# The billing-visibility companion to the agent-health ``/api/v1/report``
+# feed: per-tenant counters (requests, tokens, cost) over a time window, with
+# optional by-agent / by-provider breakdowns. Mirrors the ``ReportView`` style
+# (typed Pydantic shell over the ``core.reporting`` dataclasses) so the front
+# end + OpenAPI spec stay rich.
+# ---------------------------------------------------------------------------
+
+
+class UsageRollupView(BaseModel):
+    """A single grouped usage row — one agent, one provider, or the totals.
+
+    ``key`` carries the grouping value: tenant_id for the totals row, the
+    agent name for ``by_agent`` rows, the provider/model id for
+    ``by_provider`` rows. Empty string ``""`` is the deliberate sentinel for
+    older records that didn't capture the value — distinguishable from a
+    genuine "(unknown)" so the front end can render it explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(
+        ...,
+        description=(
+            "Grouping value: tenant_id (totals), agent name (by_agent), or "
+            "provider id (by_provider). '' = older record with no captured value."
+        ),
+    )
+    requests: int = Field(0, description="Count of runs in the window.")
+    tokens_in: int = Field(0, description="Sum of metrics.tokens.input.")
+    tokens_out: int = Field(0, description="Sum of metrics.tokens.output.")
+    cost_usd: float = Field(
+        0.0,
+        description=(
+            "Sum of metrics.cost_usd — the **estimated** cost from pricing.yaml, "
+            "NOT the actual provider invoice (ADR 036 §Risks)."
+        ),
+    )
+
+    @classmethod
+    def from_dataclass(cls, r: UsageRollup) -> UsageRollupView:
+        return cls(
+            key=r.key,
+            requests=r.requests,
+            tokens_in=r.tokens_in,
+            tokens_out=r.tokens_out,
+            cost_usd=r.cost_usd,
+        )
+
+
+class UsageView(BaseModel):
+    """``GET /api/v1/usage`` response (ADR 036 D1).
+
+    Per-tenant usage rollup over the requested time window — the billing /
+    spend-visibility feed. Built from the same per-run records the agent-health
+    report uses (ADR 024 ``RunRecord.metrics``); no new measurement plumbing.
+
+    Tenant scoping: non-admin keys always see their own tenant; admin keys may
+    pass ``tenant=<id>`` to read another tenant's rollup. Empty window → a
+    zeroed rollup (200), not a 500 — billing surfaces a $0 month explicitly.
+
+    NOTE: cost is the **estimated** cost from ``pricing.yaml`` at run time, NOT
+    the actual provider invoice. ADR 036 D3 (billing export) will document the
+    estimate↔actual gap when it ships.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str = Field(..., description="The tenant this rollup describes.")
+    window_days: int = Field(
+        30,
+        description="Time window in days; 0 = all-time. Default 30.",
+    )
+    agent_filter: str | None = Field(
+        None,
+        description="Set when the caller scoped the rollup to a single agent.",
+    )
+    totals: UsageRollupView
+    by_agent: list[UsageRollupView]
+    by_provider: list[UsageRollupView]
+
+    @classmethod
+    def from_usage(cls, usage: Usage) -> UsageView:
+        return cls(
+            tenant_id=usage.tenant_id,
+            window_days=usage.window_days,
+            agent_filter=usage.agent_filter,
+            totals=UsageRollupView.from_dataclass(usage.totals),
+            by_agent=[UsageRollupView.from_dataclass(r) for r in usage.by_agent],
+            by_provider=[UsageRollupView.from_dataclass(r) for r in usage.by_provider],
         )
