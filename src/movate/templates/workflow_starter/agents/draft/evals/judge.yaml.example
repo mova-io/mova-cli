@@ -1,0 +1,20 @@
+# LLM-as-judge config for the draft node.
+#
+# Rule: judge family must differ from the agent family. The agent runs on
+# openai/* by default, so the judge here is anthropic/*. Drop into ./judge.yaml
+# to activate.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual draft against the expected draft for semantic
+  equivalence and topical fit. Reward staying on topic, brevity (2-4
+  sentences), and absence of fabricated stats. 1.0 = fully correct,
+  0.5 = partially aligned, 0.0 = off-topic or fabricated.
+
+threshold: 0.7

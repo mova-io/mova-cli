@@ -1,0 +1,20 @@
+# ============================================================================
+# Draft node — output schema
+# ============================================================================
+# The draft node produces a `draft` string that is merged back into the
+# workflow state for the downstream review node to consume.
+
+version: 1
+type: object
+
+title: Draft Node Output
+
+fields:
+
+  draft:
+    type: string
+    description: First-pass draft (2-4 sentences). Polished by the review node.
+    example: Spending time outdoors lifts mood, improves sleep, and lowers stress.
+
+required:
+  - draft

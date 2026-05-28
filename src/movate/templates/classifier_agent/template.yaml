@@ -1,0 +1,7 @@
+title: Text classifier
+description: Text plus a caller-supplied label list to the chosen label. Exact-match friendly.
+shape: agent
+tags:
+  - classification
+  - exact-match
+recommended_for: Routing text into a finite, well-defined taxonomy where exact-match scoring works.
