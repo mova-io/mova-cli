@@ -25,6 +25,9 @@ from movate.core.models import (
     JobRecord,
     JobStatus,
     Metrics,
+    Project,
+    ProjectMember,
+    ProjectMemberRole,
     RunRecord,
     WorkflowRunRecord,
     WorkflowStatus,
@@ -2896,3 +2899,154 @@ class AgentMetricsView(BaseModel):
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
         )
+
+
+# ---------------------------------------------------------------------------
+# Projects (ADR 040) — wire types for the /api/v1/projects + /members surface.
+# Kept here rather than in ``movate.core.models`` so the API contract can
+# evolve independently of the persisted shape (per module docstring).
+# ---------------------------------------------------------------------------
+
+
+class ProjectCreateRequest(BaseModel):
+    """``POST /api/v1/projects`` request body.
+
+    ``name`` is unique within the caller's tenant; the reserved literal
+    ``"default"`` is rejected with 422 (the per-tenant default project is
+    auto-created by storage at first read; clients can't materialize it
+    explicitly). ``owner_principal_id`` defaults to the caller's principal
+    (the API layer fills it from the auth context when omitted) — the API
+    refusal is a friendlier alternative to the storage layer's synthetic
+    ``"tenant-system"`` owner used only for the lazy default project.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    owner_principal_id: str | None = None
+    """Optional explicit owner. Omit to default to the caller's principal
+    (``api_key:<key_id>`` on the opaque-key path, or the OIDC sub claim)."""
+
+
+class ProjectUpdateRequest(BaseModel):
+    """``PUT /api/v1/projects/{id}`` request body — partial update.
+
+    Either or both of ``name`` / ``description`` may be set. An
+    all-``None`` body is a no-op (returns the current row). The reserved
+    name ``"default"`` is rejected; renaming the per-tenant default
+    project is not supported via this endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+
+
+class ProjectView(BaseModel):
+    """``GET /api/v1/projects/{id}`` (and create/update) response.
+
+    Mirror of :class:`Project` with the ``etag`` derived from
+    ``updated_at`` — clients echo it back as ``If-Match`` for optimistic
+    concurrency on PUT (412 on stale).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    tenant_id: str
+    name: str
+    description: str | None = None
+    owner_principal_id: str
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+    etag: str
+    """Opaque concurrency token derived from ``updated_at`` (ISO-8601). A
+    client sends it back as ``If-Match: "<etag>"`` on PUT to opt into
+    optimistic concurrency; absent header → last-write-wins (back-compat
+    with the rest of the runtime)."""
+
+    @classmethod
+    def from_record(cls, p: Project) -> ProjectView:
+        return cls(
+            project_id=p.project_id,
+            tenant_id=p.tenant_id,
+            name=p.name,
+            description=p.description,
+            owner_principal_id=p.owner_principal_id,
+            created_at=p.created_at,
+            updated_at=p.updated_at,
+            archived_at=p.archived_at,
+            etag=_project_etag(p),
+        )
+
+
+class ProjectListResponse(BaseModel):
+    """``GET /api/v1/projects`` response — tenant-scoped, newest-first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    projects: list[ProjectView]
+    count: int
+
+
+class ProjectMemberView(BaseModel):
+    """``GET /api/v1/projects/{id}/members/{principal_id}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    principal_id: str
+    role: ProjectMemberRole
+    added_by: str
+    added_at: datetime
+
+    @classmethod
+    def from_record(cls, m: ProjectMember) -> ProjectMemberView:
+        return cls(
+            project_id=m.project_id,
+            principal_id=m.principal_id,
+            role=m.role,
+            added_by=m.added_by,
+            added_at=m.added_at,
+        )
+
+
+class ProjectMemberListView(BaseModel):
+    """``GET /api/v1/projects/{id}/members`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    members: list[ProjectMemberView]
+    count: int
+
+
+class ProjectMemberAddRequest(BaseModel):
+    """``POST /api/v1/projects/{id}/members`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_id: str = Field(..., min_length=1)
+    role: ProjectMemberRole
+
+
+class ProjectMemberPatchRequest(BaseModel):
+    """``PATCH /api/v1/projects/{id}/members/{principal_id}`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: ProjectMemberRole
+
+
+def _project_etag(p: Project) -> str:
+    """Derive the ``ETag`` value from a project's ``updated_at``.
+
+    ISO-8601 down to microseconds is monotonic per-row (every storage
+    write bumps it) and stable across reads — perfect for an
+    optimistic-concurrency token without standing up a separate version
+    column. Returned bare (no quotes) — :func:`_normalize_if_match`
+    strips client-side decoration.
+    """
+    return p.updated_at.isoformat()

@@ -55,6 +55,8 @@ from movate.core.models import (
     JobRecord,
     JobSchedule,
     JobStatus,
+    Project,
+    ProjectMemberRole,
     TenantProviderKey,
     Trigger,
     WorkflowStatus,
@@ -195,6 +197,14 @@ from movate.runtime.schemas import (
     ModelInfoView,
     PricingEntryView,
     PricingView,
+    ProjectCreateRequest,
+    ProjectListResponse,
+    ProjectMemberAddRequest,
+    ProjectMemberListView,
+    ProjectMemberPatchRequest,
+    ProjectMemberView,
+    ProjectUpdateRequest,
+    ProjectView,
     ProviderKeyListView,
     ProviderKeySetRequest,
     ProviderKeyView,
@@ -6665,6 +6675,546 @@ def build_app(
         await store.save_conversation_thread(refreshed)
 
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    # ==================================================================
+    # /api/v1/projects (ADR 040) — Project CRUD + membership.
+    # Tenant-scoped via the existing auth middleware (``ctx.tenant_id``
+    # filters every storage call); the "admin scope OR project owner
+    # role" gate composes so a non-tenant-admin owner can CRUD their own
+    # project (D4), while a fleet/tenant admin scope still works
+    # fleet-wide.
+    # ==================================================================
+
+    project_default_name = "default"
+    """Reserved per-tenant project name (ADR 040 D5). Auto-created lazily
+    by storage; rejected on create + archive at the API layer (storage
+    rejects archive too, defense in depth)."""
+
+    def _principal_from_auth(ctx: AuthContext) -> str:
+        """Resolve the caller's stable principal id from the auth context.
+
+        Today's middleware surfaces a per-API-key identity (no separate
+        tenant-user registry exists yet), so opaque-key calls map to
+        ``api_key:<key_id>``. Project membership keys off this string —
+        any future "real user" surface (OIDC sub, etc.) is additive (the
+        storage layer just stores the bytes).
+        """
+        return f"api_key:{ctx.api_key_id}"
+
+    async def _resolve_project_role(
+        request: Request,
+        ctx: AuthContext,
+        project_id: str,
+    ) -> ProjectMemberRole | None:
+        """Return the caller's effective role on ``project_id``, or ``None``.
+
+        Two gates compose for project mutations (ADR 040 D4):
+
+        1. **Admin scope** (``admin`` / ``fleet-admin``) — checked at the
+           endpoint via :func:`require_scope`; lets a tenant/fleet admin
+           CRUD any project in their tenant.
+        2. **Project owner role** — checked here per request; lets a
+           non-admin who owns the project still mutate it.
+
+        Both are accepted; either grants write access. ``None`` means
+        "no membership row" — the admin-scope path can still grant
+        access even when this returns ``None``.
+        """
+        store: StorageProvider = request.app.state.storage
+        principal = _principal_from_auth(ctx)
+        member = await store.get_project_member(project_id, principal)
+        return member.role if member is not None else None
+
+    def _caller_has_admin_scope(ctx: AuthContext) -> bool:
+        """``True`` when the caller's resolved scopes include ``admin`` or
+        ``fleet-admin`` (the latter expands to all scopes, but check both
+        names so a future direct ``fleet-admin``-only key path still
+        composes correctly)."""
+        return "admin" in ctx.scopes or "fleet-admin" in ctx.scopes
+
+    async def _require_project_write(
+        request: Request,
+        ctx: AuthContext,
+        project_id: str,
+    ) -> None:
+        """Enforce the composed gate for project mutations.
+
+        Admin scope OR ``owner`` project role grants access; anything
+        else 403s with a clear, non-sensitive message. Called per
+        endpoint after the project's existence has been confirmed (so a
+        wrong-tenant project is 404, not 403 — preserves the no-leak
+        contract every other tenant-scoped getter follows).
+        """
+        if _caller_has_admin_scope(ctx):
+            return
+        role = await _resolve_project_role(request, ctx, project_id)
+        if role == ProjectMemberRole.OWNER:
+            return
+        raise http_error(
+            ErrorCode.FORBIDDEN,
+            status_code=403,
+            message=("project mutation requires the 'admin' scope or the project 'owner' role"),
+        )
+
+    def _unprocessable(message: str) -> Any:
+        """422 envelope — used for reserved-name + default-project +
+        last-owner guards. The runtime's :class:`ErrorCode` has no
+        dedicated "unprocessable" code, so we re-use ``BAD_REQUEST``
+        with the 422 status (the standard mapping for a syntactically
+        valid but semantically rejected body)."""
+        return http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=message,
+        )
+
+    def _precondition_failed(message: str) -> Any:
+        """412 envelope — ``If-Match`` precondition stale. Re-uses the
+        ``CONFLICT`` code (the closest existing semantic) so a wire
+        consumer can branch without a new code; the status code (412 vs
+        409) is the distinguishing signal."""
+        return http_error(
+            ErrorCode.CONFLICT,
+            status_code=412,
+            message=message,
+        )
+
+    @v1.post(
+        "/projects",
+        response_model=ProjectView,
+        status_code=201,
+        tags=["projects-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_project(
+        request: Request,
+        body: ProjectCreateRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Create a project in the caller's tenant.
+
+        ``name`` is unique within the tenant. The reserved literal
+        ``"default"`` is rejected (422) — the per-tenant default project
+        is auto-created by storage at first read. ``owner_principal_id``
+        defaults to the caller's principal (``api_key:<key_id>`` today)
+        when omitted; the API layer also writes an initial ``owner``
+        member row so the requesting principal has project-level access
+        from creation.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``admin`` scope
+        * **409** — a project with this name already exists in the tenant
+        * **422** — ``name == "default"`` (reserved)
+        """
+        if body.name.strip().lower() == project_default_name:
+            raise _unprocessable(
+                "project name 'default' is reserved — the per-tenant default "
+                "project is created automatically on first use"
+            )
+        store: StorageProvider = request.app.state.storage
+        owner_principal = body.owner_principal_id or _principal_from_auth(ctx)
+        project = Project(
+            tenant_id=ctx.tenant_id,
+            name=body.name,
+            description=body.description,
+            owner_principal_id=owner_principal,
+        )
+        try:
+            created = await store.create_project(project)
+        except ValueError as exc:
+            raise conflict(str(exc)) from None
+        # Initial owner membership: the creator (or the explicit
+        # ``owner_principal_id``) gets an ``owner`` row so the
+        # "non-admin owner can mutate their own project" gate has
+        # something to bind to (D4). Suppress the storage layer's
+        # duplicate-row ValueError — possible if a caller-supplied
+        # ``owner_principal_id`` collides with the same auth principal
+        # (the create is otherwise idempotent for that case).
+        with contextlib.suppress(ValueError):
+            await store.add_project_member(
+                created.project_id,
+                owner_principal,
+                ProjectMemberRole.OWNER,
+                added_by=_principal_from_auth(ctx),
+            )
+        return ProjectView.from_record(created)
+
+    @v1.get(
+        "/projects",
+        response_model=ProjectListResponse,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_projects(
+        request: Request,
+        include_archived: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+        after_id: str | None = Query(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectListResponse:
+        """List the caller's tenant's projects, newest-first.
+
+        ``include_archived=true`` surfaces soft-deleted projects; the
+        default hides them. ``limit`` + ``after_id`` provide stable
+        keyset pagination (pass the last ``project_id`` from the prior
+        page).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_projects(
+            ctx.tenant_id,
+            include_archived=include_archived,
+            limit=limit,
+            after_id=after_id,
+        )
+        views = [ProjectView.from_record(p) for p in rows]
+        return ProjectListResponse(projects=views, count=len(views))
+
+    @v1.get(
+        "/projects/{project_id}",
+        response_model=ProjectView,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_project(
+        request: Request,
+        project_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Project detail. Archived projects ARE returned (operators may
+        want to inspect them) — filter on the listing endpoint, not here.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        * **404** — no such project in this tenant (same shape for
+          cross-tenant misses — no existence leak)
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        return ProjectView.from_record(project)
+
+    @v1.put(
+        "/projects/{project_id}",
+        response_model=ProjectView,
+        tags=["projects-v1"],
+    )
+    async def v1_update_project(
+        request: Request,
+        project_id: str,
+        body: ProjectUpdateRequest,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Rename / re-describe a project.
+
+        Writes are admitted to callers with the ``admin`` scope OR the
+        ``owner`` role on this specific project (ADR 040 D4 — composes,
+        doesn't replace). Optional ``If-Match: "<etag>"`` opts into
+        optimistic concurrency: 412 if the stored ``updated_at`` no
+        longer matches; absent header → last-write-wins (back-compat).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **409** — rename collision (the new name is taken)
+        * **412** — ``If-Match`` precondition stale
+        * **422** — attempting to rename to the reserved ``"default"``
+        """
+        store: StorageProvider = request.app.state.storage
+        current = await store.get_project(ctx.tenant_id, project_id)
+        if current is None:
+            raise not_found("project", project_id)
+
+        await _require_project_write(request, ctx, project_id)
+
+        if if_match is not None:
+            expected = _normalize_if_match(if_match)
+            if expected != current.updated_at.isoformat():
+                raise _precondition_failed(
+                    f"project {project_id!r} was updated concurrently: "
+                    f"If-Match {expected!r} no longer matches the current "
+                    "version — re-fetch and retry",
+                )
+
+        if body.name is not None and body.name.strip().lower() == project_default_name:
+            raise _unprocessable("project name 'default' is reserved and cannot be assigned")
+
+        try:
+            updated = await store.update_project(
+                ctx.tenant_id,
+                project_id,
+                name=body.name,
+                description=body.description,
+            )
+        except ValueError as exc:
+            raise conflict(str(exc)) from None
+        if updated is None:
+            # Lost a race with archive / cross-tenant — re-raise as 404.
+            raise not_found("project", project_id)
+        return ProjectView.from_record(updated)
+
+    @v1.delete(
+        "/projects/{project_id}",
+        response_model=ProjectView,
+        tags=["projects-v1"],
+    )
+    async def v1_archive_project(
+        request: Request,
+        project_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Soft-delete (archive) a project.
+
+        The per-tenant default project (``name == "default"``) cannot be
+        archived (422) — it absorbs unattached resources for D5 back-compat.
+        Idempotent: re-archiving an already-archived project is a no-op
+        that still returns the (already-archived) detail view.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **422** — attempting to archive the default project
+        """
+        store: StorageProvider = request.app.state.storage
+        current = await store.get_project(ctx.tenant_id, project_id)
+        if current is None:
+            raise not_found("project", project_id)
+
+        await _require_project_write(request, ctx, project_id)
+
+        if current.name == project_default_name:
+            raise _unprocessable(
+                "the per-tenant 'default' project cannot be archived — it "
+                "absorbs unattached agents/workflows"
+            )
+
+        try:
+            await store.archive_project(ctx.tenant_id, project_id)
+        except ValueError as exc:
+            # Defense in depth — storage independently rejects the
+            # default project; surface it as the same 422.
+            raise _unprocessable(str(exc)) from None
+        # Re-read to return the post-archive detail (the archived_at
+        # field is the meaningful return shape).
+        archived = await store.get_project(ctx.tenant_id, project_id)
+        # Re-read can only return None if a concurrent deletion fully
+        # purged the row, which the soft-delete contract doesn't do —
+        # but defend the type contract anyway.
+        if archived is None:  # pragma: no cover - defensive
+            raise not_found("project", project_id)
+        return ProjectView.from_record(archived)
+
+    # -- Members -------------------------------------------------------
+
+    @v1.get(
+        "/projects/{project_id}/members",
+        response_model=ProjectMemberListView,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_project_members(
+        request: Request,
+        project_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberListView:
+        """List the project's members (creation order).
+
+        Tenant-scoped — the project lookup runs the same no-leak 404
+        contract as the project detail endpoint.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        * **404** — no such project in this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        members = await store.list_project_members(project_id)
+        return ProjectMemberListView(
+            members=[ProjectMemberView.from_record(m) for m in members],
+            count=len(members),
+        )
+
+    @v1.post(
+        "/projects/{project_id}/members",
+        response_model=ProjectMemberView,
+        status_code=201,
+        tags=["projects-v1"],
+    )
+    async def v1_add_project_member(
+        request: Request,
+        project_id: str,
+        body: ProjectMemberAddRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberView:
+        """Invite a principal to the project with a role.
+
+        Membership mutations are admin-scope-OR-owner-role gated (same
+        composed gate as project PUT/DELETE). ``added_by`` is the
+        caller's principal (audit attribution distinct from the project
+        owner field).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **409** — principal is already a member of this project
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        await _require_project_write(request, ctx, project_id)
+        try:
+            await store.add_project_member(
+                project_id,
+                body.principal_id,
+                body.role,
+                added_by=_principal_from_auth(ctx),
+            )
+        except ValueError as exc:
+            raise conflict(str(exc)) from None
+        member = await store.get_project_member(project_id, body.principal_id)
+        if member is None:  # pragma: no cover - defensive
+            raise not_found("project member", body.principal_id)
+        return ProjectMemberView.from_record(member)
+
+    @v1.get(
+        "/projects/{project_id}/members/{principal_id}",
+        response_model=ProjectMemberView,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_project_member(
+        request: Request,
+        project_id: str,
+        principal_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberView:
+        """Get one project member by principal id.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        * **404** — no such project in this tenant OR no such member
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        member = await store.get_project_member(project_id, principal_id)
+        if member is None:
+            raise not_found("project member", principal_id)
+        return ProjectMemberView.from_record(member)
+
+    @v1.patch(
+        "/projects/{project_id}/members/{principal_id}",
+        response_model=ProjectMemberView,
+        tags=["projects-v1"],
+    )
+    async def v1_update_project_member(
+        request: Request,
+        project_id: str,
+        principal_id: str,
+        body: ProjectMemberPatchRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberView:
+        """Change a member's role (e.g. viewer → editor → owner).
+
+        Rejects demotions that would leave the project with zero
+        ``owner`` members (422); the storage layer is permissive by
+        design (last-write-wins; the API enforces the social contract).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant OR no such member
+        * **422** — would remove the project's last ``owner``
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        await _require_project_write(request, ctx, project_id)
+        existing = await store.get_project_member(project_id, principal_id)
+        if existing is None:
+            raise not_found("project member", principal_id)
+        if existing.role == ProjectMemberRole.OWNER and body.role != ProjectMemberRole.OWNER:
+            members = await store.list_project_members(project_id)
+            owner_count = sum(1 for m in members if m.role == ProjectMemberRole.OWNER)
+            if owner_count <= 1:
+                raise _unprocessable(
+                    "cannot demote the last 'owner' on a project — promote another member first",
+                )
+        updated = await store.update_project_member(
+            project_id,
+            principal_id,
+            role=body.role,
+        )
+        if updated is None:  # pragma: no cover - defensive race
+            raise not_found("project member", principal_id)
+        return ProjectMemberView.from_record(updated)
+
+    @v1.delete(
+        "/projects/{project_id}/members/{principal_id}",
+        status_code=204,
+        tags=["projects-v1"],
+    )
+    async def v1_remove_project_member(
+        request: Request,
+        project_id: str,
+        principal_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove a member from the project.
+
+        Refuses to remove the last ``owner`` (422). Idempotent — a
+        repeat remove of an already-gone member returns 204 (the
+        post-state is the same: not a member).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **422** — would remove the project's last ``owner``
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        await _require_project_write(request, ctx, project_id)
+        existing = await store.get_project_member(project_id, principal_id)
+        if existing is not None and existing.role == ProjectMemberRole.OWNER:
+            members = await store.list_project_members(project_id)
+            owner_count = sum(1 for m in members if m.role == ProjectMemberRole.OWNER)
+            if owner_count <= 1:
+                raise _unprocessable(
+                    "cannot remove the last 'owner' from a project — promote "
+                    "another member to owner first",
+                )
+        await store.remove_project_member(project_id, principal_id)
+        return Response(status_code=204)
 
     app.include_router(v1)
 
