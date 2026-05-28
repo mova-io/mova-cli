@@ -3096,5 +3096,148 @@ class Subgraph(BaseModel):
     ``src_entity_id`` / ``dst_entity_id`` is present in ``entities``."""
 
 
+# ---------------------------------------------------------------------------
+# Agent catalog (ADR 041)
+#
+# Three namespaces in one schema, distinguished by ``source``:
+#
+# * ``movate``    — curated public catalog (synced from ``catalog.movate.io``).
+#                    ``tenant_id`` is NULL.
+# * ``private``   — tenant-private entries that NEVER sync upward.
+#                    ``tenant_id`` is set to the owning tenant.
+# * ``community`` — column-ready slot for a future user-contributed namespace.
+#                    ``tenant_id`` NULL. No rows are written in v1.
+#
+# Uniqueness key ``(slug, source, tenant_id)`` covers all three (the
+# pydantic models do not enforce uniqueness — the storage layer does, via
+# the table's PK / unique index).
+# ---------------------------------------------------------------------------
+
+
+class CatalogSource(StrEnum):
+    """Catalog namespace. See module docstring for the semantics of each."""
+
+    MOVATE = "movate"
+    PRIVATE = "private"
+    COMMUNITY = "community"
+
+
+class CatalogRatingsSummary(BaseModel):
+    """Aggregate of all ratings for one catalog entry. Carried inline on
+    :class:`CatalogEntry` so a list view can render it without a second
+    query. Recomputed by :meth:`StorageProvider.record_catalog_rating`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = 0
+    avg: float = 0.0
+
+
+class CatalogEntry(BaseModel):
+    """A single entry in the agent catalog (ADR 041 D2).
+
+    One row per (slug, source, tenant_id). ``latest_version`` points at
+    the most-recently-published row in :class:`CatalogEntryVersion`. The
+    bundle bytes for any version live in the version table; this record
+    is the catalog **manifest** — what the browse / search / detail
+    endpoints render.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    """Stable id (URL-safe). E.g. ``ticket_triager``."""
+    source: CatalogSource
+    """Namespace (``movate`` | ``private`` | ``community``)."""
+    tenant_id: str | None = None
+    """The owning tenant for ``private`` entries; ``None`` for ``movate`` and
+    ``community`` (public namespaces).
+
+    Storage enforces ``NOT NULL`` for ``private`` and ``NULL`` for the public
+    namespaces; the Pydantic model accepts either because callers serialize
+    public entries with no ``tenant_id`` field at all."""
+    latest_version: str
+    """Semver string. The version that detail / clone uses by default."""
+    name: str
+    """Short human label (~one or two words)."""
+    title: str
+    """Display title for the catalog card."""
+    description: str
+    """Plain-text description — the catalog card's body."""
+    tags: list[str] = Field(default_factory=list)
+    """Free-form tags used for filtering (ADR 028 taxonomy + custom)."""
+    shape: str | None = None
+    """One of the ADR 028 shape taxonomy values (``faq``, ``rag_qa``, ...)."""
+    recommended_for: str | None = None
+    """One-line use-case statement (rendered under the title)."""
+    ratings_summary: CatalogRatingsSummary = Field(default_factory=CatalogRatingsSummary)
+    """Aggregate of all ratings — count + mean."""
+    popularity: int = 0
+    """Add-from-catalog count (ADR 041 D6). Maintained by future work; an
+    integer here so the storage column exists from day one."""
+    synced_at: datetime = Field(default_factory=_now)
+    """When this row was last written by the sync job (or by the tenant
+    on a private submission). Drives the watermark + cache TTL."""
+
+
+class CatalogEntryVersion(BaseModel):
+    """One published version of a :class:`CatalogEntry`.
+
+    The bundle bytes live here (``bundle_tar``) — fetched lazily on add.
+    Versions are immutable once published; a re-publish writes a new row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    version: str
+    """SemVer (``MAJOR.MINOR.PATCH``)."""
+    source: CatalogSource
+    tenant_id: str | None = None
+    """Tenant scope for ``private`` versions; ``None`` for public."""
+    bundle_tar: bytes
+    """Raw tar bytes of the entry bundle. Customer-side storage; the
+    contents are opaque to the catalog service (ADR 041)."""
+    digest: str
+    """SHA-256 of ``bundle_tar`` (hex). Stable id for caching + integrity."""
+    published_at: datetime = Field(default_factory=_now)
+    deprecated_at: datetime | None = None
+
+
+class CatalogEntryRating(BaseModel):
+    """One tenant's rating + (optional) comment for one catalog entry.
+
+    PK ``(slug, source, tenant_id)`` — one rating per tenant per entry.
+    Re-rating overwrites the prior row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    source: CatalogSource = CatalogSource.MOVATE
+    """Which namespace the rating targets. ``movate`` is the common case
+    today; ``private`` is allowed for tenants who want internal feedback
+    on their own catalog entries."""
+    tenant_id: str
+    """The rating tenant. Required (a rating is always attributable)."""
+    rating: int = Field(ge=1, le=5)
+    """1-5 stars."""
+    comment: str | None = None
+    created_at: datetime = Field(default_factory=_now)
+
+
+class CatalogSyncWatermark(BaseModel):
+    """Per-source watermark — the last time we synced from ``source``.
+
+    A row is created the first time a sync runs for that source. The sync
+    job advances this in lockstep with the upserts so the next run can
+    incrementally fetch deltas (ADR 041 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: CatalogSource
+    last_synced_at: datetime = Field(default_factory=_now)
+
+
 # Forward ref resolution
 ModelConfig.model_rebuild()

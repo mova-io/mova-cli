@@ -24,6 +24,10 @@ from movate.core.models import (
     BenchModelResult,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogEntryVersion,
+    CatalogRatingsSummary,
+    CatalogSource,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -664,6 +668,87 @@ _MIGRATIONS = [
     # breakdown is coherent (a turn's skill children are persisted too).
     "ALTER TABLE runs ADD COLUMN skill_calls TEXT",
     "ALTER TABLE runs ADD COLUMN turns TEXT",
+    # ADR 041: Agent catalog. Three namespaces (movate / private / community)
+    # in one schema, distinguished by ``source``; the read API joins
+    # ``movate`` + the caller's ``private`` + (future) ``community``. The
+    # ``tenant_id_key`` column is a generated computed key over (tenant_id,
+    # '') so a NULL tenant for public entries still participates in the
+    # composite PRIMARY KEY (sqlite's PK semantics ignore NULL otherwise).
+    # ``tags`` is stored as JSON text (a list[str]) — the gin-equivalent
+    # filter is "JSON_EACH" in queries. ``ratings_summary`` is JSON text.
+    # Bundle bytes live in ``catalog_entry_versions.bundle_tar`` (BLOB).
+    """
+    CREATE TABLE IF NOT EXISTS catalog_entries (
+        slug             TEXT NOT NULL,
+        source           TEXT NOT NULL CHECK (source IN ('movate','private','community')),
+        tenant_id        TEXT,
+        tenant_id_key    TEXT NOT NULL,
+        latest_version   TEXT NOT NULL,
+        name             TEXT NOT NULL,
+        title            TEXT NOT NULL,
+        description      TEXT NOT NULL,
+        tags             TEXT NOT NULL DEFAULT '[]',
+        shape            TEXT,
+        recommended_for  TEXT,
+        ratings_summary  TEXT NOT NULL DEFAULT '{"count": 0, "avg": 0.0}',
+        popularity       INTEGER NOT NULL DEFAULT 0,
+        synced_at        TEXT NOT NULL,
+        PRIMARY KEY (slug, source, tenant_id_key),
+        CHECK (
+            (source = 'private' AND tenant_id IS NOT NULL)
+            OR (source IN ('movate','community') AND tenant_id IS NULL)
+        )
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entries_source_tenant "
+    "ON catalog_entries(source, tenant_id)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entries_shape ON catalog_entries(shape)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entries_synced_at ON catalog_entries(synced_at DESC)",
+    # Per-version table — the bundle bytes live here, fetched lazily on add.
+    # PK (slug, source, version, tenant_id_key) — re-publishing the same
+    # version overwrites the prior row (idempotent re-sync).
+    """
+    CREATE TABLE IF NOT EXISTS catalog_entry_versions (
+        slug          TEXT NOT NULL,
+        version       TEXT NOT NULL,
+        source        TEXT NOT NULL,
+        tenant_id     TEXT,
+        tenant_id_key TEXT NOT NULL,
+        bundle_tar    BLOB NOT NULL,
+        digest        TEXT NOT NULL,
+        published_at  TEXT NOT NULL,
+        deprecated_at TEXT,
+        PRIMARY KEY (slug, source, version, tenant_id_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_versions_slug_source "
+    "ON catalog_entry_versions(slug, source)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_versions_published "
+    "ON catalog_entry_versions(published_at DESC)",
+    # One rating per tenant per entry. Re-rating overwrites in place.
+    """
+    CREATE TABLE IF NOT EXISTS catalog_entry_ratings (
+        slug       TEXT NOT NULL,
+        source     TEXT NOT NULL,
+        tenant_id  TEXT NOT NULL,
+        rating     INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+        comment    TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (slug, source, tenant_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_ratings_slug ON catalog_entry_ratings(slug)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_ratings_tenant "
+    "ON catalog_entry_ratings(tenant_id)",
+    # Per-source sync watermark. One row per source — the last successful
+    # sync timestamp. Drives the incremental ``?since=`` request to
+    # catalog.movate.io (ADR 041 D4).
+    """
+    CREATE TABLE IF NOT EXISTS catalog_sync_watermark (
+        source           TEXT PRIMARY KEY,
+        last_synced_at   TEXT NOT NULL
+    )
+    """,
 ]
 
 
@@ -700,6 +785,67 @@ def _row_to_entity(r: Any) -> Entity:
         source_chunk_ids=json.loads(r["source_chunk_ids"]) if r["source_chunk_ids"] else [],
         metadata=json.loads(r["metadata"]) if r["metadata"] else None,
         created_at=datetime.fromisoformat(r["created_at"]),
+    )
+
+
+def _tenant_key(tenant_id: str | None) -> str:
+    """Encode ``tenant_id`` into a non-null PK component for catalog tables.
+
+    SQLite's PRIMARY KEY ignores NULL when checking uniqueness, so two
+    public-namespace rows with the same slug + source + NULL tenant_id
+    would silently both insert. Stamping a sentinel (``__public__``)
+    into a non-null companion column keeps the composite PK uniqueness
+    guarantee intact for public entries while preserving ``tenant_id``
+    itself as NULL for the read API."""
+
+    return tenant_id if tenant_id is not None else "__public__"
+
+
+def _enforce_catalog_namespace(source: CatalogSource, tenant_id: str | None) -> None:
+    """The same invariant the DB CHECK constraint enforces — raised early
+    so callers get a clear Python error instead of an opaque SQL one."""
+
+    if source is CatalogSource.PRIVATE:
+        if not tenant_id:
+            raise ValueError("catalog 'private' entries require tenant_id")
+    elif tenant_id is not None:
+        raise ValueError(f"catalog '{source.value}' entries must have tenant_id=None")
+
+
+_RATING_MIN = 1
+_RATING_MAX = 5
+
+
+def _row_to_catalog_entry(r: Any) -> CatalogEntry:
+    summary_raw = r["ratings_summary"]
+    summary = CatalogRatingsSummary.model_validate(json.loads(summary_raw))
+    return CatalogEntry(
+        slug=r["slug"],
+        source=CatalogSource(r["source"]),
+        tenant_id=r["tenant_id"],
+        latest_version=r["latest_version"],
+        name=r["name"],
+        title=r["title"],
+        description=r["description"],
+        tags=json.loads(r["tags"]) if r["tags"] else [],
+        shape=r["shape"],
+        recommended_for=r["recommended_for"],
+        ratings_summary=summary,
+        popularity=int(r["popularity"]),
+        synced_at=datetime.fromisoformat(r["synced_at"]),
+    )
+
+
+def _row_to_catalog_entry_version(r: Any) -> CatalogEntryVersion:
+    return CatalogEntryVersion(
+        slug=r["slug"],
+        version=r["version"],
+        source=CatalogSource(r["source"]),
+        tenant_id=r["tenant_id"],
+        bundle_tar=bytes(r["bundle_tar"]),
+        digest=r["digest"],
+        published_at=datetime.fromisoformat(r["published_at"]),
+        deprecated_at=(datetime.fromisoformat(r["deprecated_at"]) if r["deprecated_at"] else None),
     )
 
 
@@ -1553,6 +1699,274 @@ class SqliteProvider:
         cur = await self._db.execute(sql, params)
         await self._db.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041)
+    # ------------------------------------------------------------------
+
+    async def upsert_catalog_entry(self, entry: CatalogEntry) -> None:
+        _enforce_catalog_namespace(entry.source, entry.tenant_id)
+        tkey = _tenant_key(entry.tenant_id)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entries (
+                slug, source, tenant_id, tenant_id_key, latest_version,
+                name, title, description, tags, shape, recommended_for,
+                ratings_summary, popularity, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug, source, tenant_id_key) DO UPDATE SET
+                latest_version  = excluded.latest_version,
+                name            = excluded.name,
+                title           = excluded.title,
+                description     = excluded.description,
+                tags            = excluded.tags,
+                shape           = excluded.shape,
+                recommended_for = excluded.recommended_for,
+                ratings_summary = excluded.ratings_summary,
+                popularity      = excluded.popularity,
+                synced_at       = excluded.synced_at
+            """,
+            (
+                entry.slug,
+                entry.source.value,
+                entry.tenant_id,
+                tkey,
+                entry.latest_version,
+                entry.name,
+                entry.title,
+                entry.description,
+                json.dumps(list(entry.tags)),
+                entry.shape,
+                entry.recommended_for,
+                json.dumps(entry.ratings_summary.model_dump()),
+                entry.popularity,
+                entry.synced_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_catalog_entry(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> CatalogEntry | None:
+        # For private, NULL tenant_id can never resolve to a stored row (the
+        # PK uses a non-null tenant_id_key, and the schema CHECK forbids NULL
+        # tenant_id on private). Short-circuit cleanly so callers can pass
+        # tenant_id=None for the public namespaces.
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        async with self._db.execute(
+            "SELECT * FROM catalog_entries "
+            "WHERE slug = ? AND source = ? AND tenant_id_key = ? LIMIT 1",
+            (slug, source.value, tkey),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_catalog_entry(row) if row else None
+
+    async def list_catalog_entries(
+        self,
+        tenant_id: str,
+        *,
+        source_filter: CatalogSource | None = None,
+        tag_filter: str | None = None,
+        shape_filter: str | None = None,
+        q: str | None = None,
+        limit: int = 100,
+        after_slug: str | None = None,
+    ) -> list[CatalogEntry]:
+        # Visibility: movate (any tenant) + private (caller) + community.
+        clauses: list[str] = [
+            "(source = 'movate' OR (source = 'private' AND tenant_id = ?) OR source = 'community')"
+        ]
+        params: list[object] = [tenant_id]
+
+        if source_filter is not None:
+            clauses.append("source = ?")
+            params.append(source_filter.value)
+        if shape_filter is not None:
+            clauses.append("shape = ?")
+            params.append(shape_filter)
+        if tag_filter is not None:
+            # JSON_EACH(tags) iterates the JSON list; the EXISTS subquery
+            # asserts membership.
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(catalog_entries.tags) WHERE json_each.value = ?)"
+            )
+            params.append(tag_filter)
+        if q:
+            needle = f"%{q.lower()}%"
+            clauses.append(
+                "(LOWER(name) LIKE ? OR LOWER(title) LIKE ? OR LOWER(description) LIKE ?)"
+            )
+            params.extend([needle, needle, needle])
+        if after_slug is not None:
+            clauses.append("slug > ?")
+            params.append(after_slug)
+
+        sql = (
+            "SELECT * FROM catalog_entries WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY slug ASC LIMIT ?"
+        )
+        params.append(int(limit))
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_catalog_entry(r) for r in rows]
+
+    async def get_catalog_entry_versions(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> list[CatalogEntryVersion]:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return []
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        async with self._db.execute(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = ? AND source = ? AND tenant_id_key = ? "
+            "ORDER BY published_at DESC",
+            (slug, source.value, tkey),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_catalog_entry_version(r) for r in rows]
+
+    async def get_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion | None:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        async with self._db.execute(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = ? AND source = ? AND version = ? AND tenant_id_key = ? "
+            "LIMIT 1",
+            (slug, source.value, version, tkey),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_catalog_entry_version(row) if row else None
+
+    async def upsert_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        bundle_tar: bytes,
+        digest: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion:
+        _enforce_catalog_namespace(source, tenant_id)
+        tkey = _tenant_key(tenant_id)
+        now = datetime.now(UTC)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entry_versions (
+                slug, version, source, tenant_id, tenant_id_key,
+                bundle_tar, digest, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug, source, version, tenant_id_key) DO UPDATE SET
+                bundle_tar = excluded.bundle_tar,
+                digest     = excluded.digest
+            """,
+            (
+                slug,
+                version,
+                source.value,
+                tenant_id,
+                tkey,
+                bundle_tar,
+                digest,
+                now.isoformat(),
+            ),
+        )
+        await self._db.commit()
+        # Re-read to get the stamped published_at (a first insert uses ``now``
+        # above; a subsequent upsert preserves the original published_at).
+        async with self._db.execute(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = ? AND source = ? AND version = ? AND tenant_id_key = ?",
+            (slug, source.value, version, tkey),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        return _row_to_catalog_entry_version(row)
+
+    async def record_catalog_rating(
+        self,
+        slug: str,
+        *,
+        tenant_id: str,
+        source: CatalogSource = CatalogSource.MOVATE,
+        rating: int,
+        comment: str | None = None,
+    ) -> CatalogRatingsSummary:
+        if not (_RATING_MIN <= rating <= _RATING_MAX):
+            raise ValueError("rating must be between 1 and 5")
+        now = datetime.now(UTC)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entry_ratings (
+                slug, source, tenant_id, rating, comment, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug, source, tenant_id) DO UPDATE SET
+                rating     = excluded.rating,
+                comment    = excluded.comment,
+                created_at = excluded.created_at
+            """,
+            (slug, source.value, tenant_id, int(rating), comment, now.isoformat()),
+        )
+        # Recompute summary from the ratings table for this (slug, source).
+        async with self._db.execute(
+            "SELECT COUNT(*) AS c, AVG(rating) AS a FROM catalog_entry_ratings "
+            "WHERE slug = ? AND source = ?",
+            (slug, source.value),
+        ) as cur:
+            agg = await cur.fetchone()
+        assert agg is not None  # COUNT(*) always yields a row
+        count = int(agg["c"] or 0)
+        avg = float(agg["a"] or 0.0)
+        summary = CatalogRatingsSummary(count=count, avg=avg)
+        # Update the entry's cached summary in place (public namespace
+        # rows use tenant_id_key='__public__'; we update wherever the slug
+        # exists for this source — both private (per-tenant) and public).
+        await self._db.execute(
+            "UPDATE catalog_entries SET ratings_summary = ? WHERE slug = ? AND source = ?",
+            (json.dumps(summary.model_dump()), slug, source.value),
+        )
+        await self._db.commit()
+        return summary
+
+    async def get_catalog_sync_watermark(self, source: CatalogSource) -> datetime | None:
+        async with self._db.execute(
+            "SELECT last_synced_at FROM catalog_sync_watermark WHERE source = ?",
+            (source.value,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(row["last_synced_at"])
+
+    async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO catalog_sync_watermark (source, last_synced_at)
+            VALUES (?, ?)
+            ON CONFLICT(source) DO UPDATE SET last_synced_at = excluded.last_synced_at
+            """,
+            (source.value, ts.isoformat()),
+        )
+        await self._db.commit()
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         # Upsert on the workflow_run_id PRIMARY KEY: the runner saves a row

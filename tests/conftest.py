@@ -55,6 +55,10 @@ _PG_TABLES = (
     "kb_relations",
     "trigger_deliveries",
     "run_submissions",
+    "catalog_entries",
+    "catalog_entry_versions",
+    "catalog_entry_ratings",
+    "catalog_sync_watermark",
 )
 
 

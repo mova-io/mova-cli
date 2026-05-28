@@ -19,6 +19,11 @@ from movate.core.models import (
     BatchRecord,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogEntryRating,
+    CatalogEntryVersion,
+    CatalogRatingsSummary,
+    CatalogSource,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -47,6 +52,9 @@ from movate.providers.base import (
     StreamChunk,
 )
 from movate.tracing.base import SpanCtx, Tracer
+
+_RATING_MIN = 1
+_RATING_MAX = 5
 
 
 class InMemoryStorage:
@@ -87,6 +95,14 @@ class InMemoryStorage:
         # → the job_id the first async submit enqueued.
         self.run_submissions: dict[tuple[str, str], str] = {}
         self.canary_configs: list[CanaryConfig] = []
+        # ADR 041 — agent catalog. Three namespaces in one bucket, keyed by
+        # (slug, source, tenant_id) so the uniqueness contract is preserved
+        # without sentinels (the in-memory double doesn't care about NULL-in-PK
+        # semantics — that quirk only matters in sqlite/postgres).
+        self.catalog_entries: list[CatalogEntry] = []
+        self.catalog_entry_versions: list[CatalogEntryVersion] = []
+        self.catalog_entry_ratings: list[CatalogEntryRating] = []
+        self.catalog_sync_watermarks: dict[str, datetime] = {}
 
     async def init(self) -> None:
         return None
@@ -519,6 +535,213 @@ class InMemoryStorage:
         to_delete = [b for b in self.agent_bundles if _matches(b)]
         self.agent_bundles = [b for b in self.agent_bundles if not _matches(b)]
         return len(to_delete)
+
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _catalog_namespace_ok(source: CatalogSource, tenant_id: str | None) -> None:
+        if source is CatalogSource.PRIVATE:
+            if not tenant_id:
+                raise ValueError("catalog 'private' entries require tenant_id")
+        elif tenant_id is not None:
+            raise ValueError(f"catalog '{source.value}' entries must have tenant_id=None")
+
+    async def upsert_catalog_entry(self, entry: CatalogEntry) -> None:
+        self._catalog_namespace_ok(entry.source, entry.tenant_id)
+        self.catalog_entries = [
+            e
+            for e in self.catalog_entries
+            if not (
+                e.slug == entry.slug and e.source == entry.source and e.tenant_id == entry.tenant_id
+            )
+        ]
+        self.catalog_entries.append(entry)
+
+    async def get_catalog_entry(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> CatalogEntry | None:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        wanted = tenant_id if source is CatalogSource.PRIVATE else None
+        return next(
+            (
+                e
+                for e in self.catalog_entries
+                if e.slug == slug and e.source == source and e.tenant_id == wanted
+            ),
+            None,
+        )
+
+    async def list_catalog_entries(
+        self,
+        tenant_id: str,
+        *,
+        source_filter: CatalogSource | None = None,
+        tag_filter: str | None = None,
+        shape_filter: str | None = None,
+        q: str | None = None,
+        limit: int = 100,
+        after_slug: str | None = None,
+    ) -> list[CatalogEntry]:
+        def _visible(e: CatalogEntry) -> bool:
+            if e.source is CatalogSource.MOVATE:
+                return True
+            if e.source is CatalogSource.COMMUNITY:
+                return True
+            return e.source is CatalogSource.PRIVATE and e.tenant_id == tenant_id
+
+        rows = [e for e in self.catalog_entries if _visible(e)]
+        if source_filter is not None:
+            rows = [e for e in rows if e.source == source_filter]
+        if shape_filter is not None:
+            rows = [e for e in rows if e.shape == shape_filter]
+        if tag_filter is not None:
+            rows = [e for e in rows if tag_filter in e.tags]
+        if q:
+            needle = q.lower()
+            rows = [
+                e
+                for e in rows
+                if needle in e.name.lower()
+                or needle in e.title.lower()
+                or needle in e.description.lower()
+            ]
+        if after_slug is not None:
+            rows = [e for e in rows if e.slug > after_slug]
+        rows.sort(key=lambda e: e.slug)
+        return rows[:limit]
+
+    async def get_catalog_entry_versions(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> list[CatalogEntryVersion]:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return []
+        wanted = tenant_id if source is CatalogSource.PRIVATE else None
+        rows = [
+            v
+            for v in self.catalog_entry_versions
+            if v.slug == slug and v.source == source and v.tenant_id == wanted
+        ]
+        return sorted(rows, key=lambda v: v.published_at, reverse=True)
+
+    async def get_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion | None:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        wanted = tenant_id if source is CatalogSource.PRIVATE else None
+        return next(
+            (
+                v
+                for v in self.catalog_entry_versions
+                if v.slug == slug
+                and v.source == source
+                and v.version == version
+                and v.tenant_id == wanted
+            ),
+            None,
+        )
+
+    async def upsert_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        bundle_tar: bytes,
+        digest: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion:
+        self._catalog_namespace_ok(source, tenant_id)
+        existing = next(
+            (
+                v
+                for v in self.catalog_entry_versions
+                if v.slug == slug
+                and v.source == source
+                and v.version == version
+                and v.tenant_id == tenant_id
+            ),
+            None,
+        )
+        if existing is not None:
+            updated = existing.model_copy(update={"bundle_tar": bundle_tar, "digest": digest})
+            self.catalog_entry_versions = [
+                updated if v is existing else v for v in self.catalog_entry_versions
+            ]
+            return updated
+        record = CatalogEntryVersion(
+            slug=slug,
+            version=version,
+            source=source,
+            tenant_id=tenant_id,
+            bundle_tar=bundle_tar,
+            digest=digest,
+        )
+        self.catalog_entry_versions.append(record)
+        return record
+
+    async def record_catalog_rating(
+        self,
+        slug: str,
+        *,
+        tenant_id: str,
+        source: CatalogSource = CatalogSource.MOVATE,
+        rating: int,
+        comment: str | None = None,
+    ) -> CatalogRatingsSummary:
+        if not (_RATING_MIN <= rating <= _RATING_MAX):
+            raise ValueError("rating must be between 1 and 5")
+        # Overwrite any prior rating from this tenant for this entry.
+        self.catalog_entry_ratings = [
+            r
+            for r in self.catalog_entry_ratings
+            if not (r.slug == slug and r.source == source and r.tenant_id == tenant_id)
+        ]
+        self.catalog_entry_ratings.append(
+            CatalogEntryRating(
+                slug=slug,
+                source=source,
+                tenant_id=tenant_id,
+                rating=int(rating),
+                comment=comment,
+            )
+        )
+        rows = [r for r in self.catalog_entry_ratings if r.slug == slug and r.source == source]
+        count = len(rows)
+        avg = sum(r.rating for r in rows) / count if count else 0.0
+        summary = CatalogRatingsSummary(count=count, avg=avg)
+        # Update every visible entry row for (slug, source) so a list view
+        # reflects the new aggregate.
+        updated_entries: list[CatalogEntry] = []
+        for entry in self.catalog_entries:
+            if entry.slug == slug and entry.source == source:
+                updated_entries.append(entry.model_copy(update={"ratings_summary": summary}))
+            else:
+                updated_entries.append(entry)
+        self.catalog_entries = updated_entries
+        return summary
+
+    async def get_catalog_sync_watermark(self, source: CatalogSource) -> datetime | None:
+        return self.catalog_sync_watermarks.get(source.value)
+
+    async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
+        self.catalog_sync_watermarks[source.value] = ts
 
     async def list_workflow_runs(
         self,

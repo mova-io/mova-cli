@@ -197,6 +197,7 @@ from movate.cli.backup_cmd import export_state_cmd, import_state_cmd  # noqa: E4
 from movate.cli.batch_cmd import batch_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.canary_cmd import canary_app  # noqa: E402
+from movate.cli.catalog_cmd import catalog_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.contexts_cmd import contexts_app  # noqa: E402
@@ -418,6 +419,10 @@ app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
+# `catalog` browses + contributes to the agent catalog over the runtime
+# `/api/v1/catalog/...` surface (ADR 041). Lives in DEVELOP next to
+# `templates` since both surface "reusable starters."
+app.add_typer(catalog_app, name="catalog", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(schema_app, name="schema", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.add_typer(knowledge_app, name="knowledge", rich_help_panel=PANEL_DEVELOP)

@@ -20,7 +20,9 @@ and ``movate serve`` CLI binding (uvicorn integration).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -49,6 +51,9 @@ from movate.core.models import (
     BatchRecord,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogRatingsSummary,
+    CatalogSource,
     EvalRecord,
     EvalSchedule,
     JobKind,
@@ -160,6 +165,16 @@ from movate.runtime.schemas import (
     CanarySetRequest,
     CanarySideView,
     CanaryView,
+    CatalogEntryDetailView,
+    CatalogEntryListResponse,
+    CatalogEntryVersionView,
+    CatalogEntryView,
+    CatalogPublishVersionRequest,
+    CatalogRatingRequest,
+    CatalogRatingsSummaryView,
+    CatalogSubmitRequest,
+    CatalogSyncRequest,
+    CatalogSyncResponse,
     EvalAcceptedView,
     EvalListView,
     EvalScheduleListView,
@@ -6665,6 +6680,481 @@ def build_app(
         await store.save_conversation_thread(refreshed)
 
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041). Three namespaces (movate / private /
+    # community) under one read API; tenant-private writes land in the
+    # caller's tenant; the sync handler is a STUB in v1 (preserves the
+    # contract for future activation against catalog.movate.io).
+    # ------------------------------------------------------------------
+
+    import logging  # noqa: PLC0415
+
+    catalog_logger = logging.getLogger("movate.runtime.catalog")
+
+    catalog_sync_stub_detail = (
+        "Production sync from catalog.movate.io will be wired by the "
+        "Movate-side service. The stub logged the intent, advanced the "
+        "watermark, and returned 202 — no upstream fetch occurred."
+    )
+
+    def _parse_catalog_source(value: str) -> CatalogSource:
+        try:
+            return CatalogSource(value)
+        except ValueError:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    f"unknown catalog source {value!r}; expected one of movate/private/community"
+                ),
+            ) from None
+
+    def _decode_bundle_tar(b64: str) -> bytes:
+        try:
+            return base64.b64decode(b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=f"bundle_tar_b64 is not valid base64: {exc}",
+            ) from None
+
+    def _catalog_entry_to_view(entry: CatalogEntry) -> CatalogEntryView:
+        return CatalogEntryView(
+            slug=entry.slug,
+            source=entry.source.value,
+            tenant_id=entry.tenant_id,
+            latest_version=entry.latest_version,
+            name=entry.name,
+            title=entry.title,
+            description=entry.description,
+            tags=list(entry.tags),
+            shape=entry.shape,
+            recommended_for=entry.recommended_for,
+            ratings_summary=CatalogRatingsSummaryView(
+                count=entry.ratings_summary.count,
+                avg=entry.ratings_summary.avg,
+            ),
+            popularity=entry.popularity,
+            synced_at=entry.synced_at.isoformat(),
+        )
+
+    @v1.get(
+        "/catalog/agents",
+        response_model=CatalogEntryListResponse,
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_catalog_entries(
+        request: Request,
+        source: str | None = Query(default=None),
+        tag: str | None = Query(default=None),
+        shape: str | None = Query(default=None),
+        q: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        after_slug: str | None = Query(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryListResponse:
+        """List catalog entries visible to the caller (ADR 041 D2 / D5).
+
+        Visibility join: all ``movate`` entries + the caller's
+        ``private`` entries + (future) ``community`` (always empty in v1
+        because writes to that namespace are blocked).
+
+        Filters (all ANDed):
+
+        * ``source`` — narrow to one namespace.
+        * ``tag``    — single-tag membership match.
+        * ``shape``  — exact (ADR 028 shape taxonomy).
+        * ``q``      — case-insensitive substring over name / title / description.
+
+        Pagination: pass the slug of the last entry you saw as
+        ``after_slug``; ``next_after_slug`` in the response is the cursor
+        for the next page (``None`` once the end is reached).
+
+        Errors:
+
+        * **400** — bad ``source`` value
+        * **401** — bad bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        source_filter = _parse_catalog_source(source) if source else None
+        entries = await store.list_catalog_entries(
+            ctx.tenant_id,
+            source_filter=source_filter,
+            tag_filter=tag,
+            shape_filter=shape,
+            q=q,
+            limit=limit,
+            after_slug=after_slug,
+        )
+        views = [_catalog_entry_to_view(e) for e in entries]
+        next_cursor = views[-1].slug if len(views) >= limit else None
+        return CatalogEntryListResponse(
+            entries=views,
+            count=len(views),
+            next_after_slug=next_cursor,
+        )
+
+    @v1.get(
+        "/catalog/agents/{slug}",
+        response_model=CatalogEntryDetailView,
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_catalog_entry(
+        slug: str,
+        request: Request,
+        source: str = Query(default="movate"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryDetailView:
+        """Detail view for one catalog entry (latest version + summary).
+
+        Pass ``?source=private`` to fetch a tenant-private entry (scoped
+        to the caller). Public entries default to ``source=movate``.
+
+        Errors:
+
+        * **404** — no matching entry (or cross-tenant for ``private``)
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(source)
+        tenant_filter = ctx.tenant_id if src is CatalogSource.PRIVATE else None
+        entry = await store.get_catalog_entry(slug, source=src, tenant_id=tenant_filter)
+        if entry is None:
+            raise not_found("catalog entry", f"{slug} (source={src.value})")
+
+        latest_digest: str | None = None
+        version_row = await store.get_catalog_entry_version(
+            slug,
+            source=src,
+            version=entry.latest_version,
+            tenant_id=tenant_filter,
+        )
+        if version_row is not None:
+            latest_digest = version_row.digest
+
+        return CatalogEntryDetailView(
+            slug=entry.slug,
+            source=entry.source.value,
+            tenant_id=entry.tenant_id,
+            latest_version=entry.latest_version,
+            name=entry.name,
+            title=entry.title,
+            description=entry.description,
+            tags=list(entry.tags),
+            shape=entry.shape,
+            recommended_for=entry.recommended_for,
+            ratings_summary=CatalogRatingsSummaryView(
+                count=entry.ratings_summary.count,
+                avg=entry.ratings_summary.avg,
+            ),
+            popularity=entry.popularity,
+            synced_at=entry.synced_at.isoformat(),
+            latest_version_digest=latest_digest,
+        )
+
+    @v1.get(
+        "/catalog/agents/{slug}/versions",
+        response_model=list[CatalogEntryVersionView],
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_catalog_versions(
+        slug: str,
+        request: Request,
+        source: str = Query(default="movate"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> list[CatalogEntryVersionView]:
+        """List versions of one catalog entry, newest-first.
+
+        Omits ``bundle_tar_b64`` — the bytes ship only from the
+        per-version endpoint to keep this list cheap to render.
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(source)
+        tenant_filter = ctx.tenant_id if src is CatalogSource.PRIVATE else None
+        versions = await store.get_catalog_entry_versions(slug, source=src, tenant_id=tenant_filter)
+        return [
+            CatalogEntryVersionView(
+                slug=v.slug,
+                source=v.source.value,
+                tenant_id=v.tenant_id,
+                version=v.version,
+                digest=v.digest,
+                published_at=v.published_at.isoformat(),
+                deprecated_at=(v.deprecated_at.isoformat() if v.deprecated_at else None),
+                bundle_tar_b64=None,
+            )
+            for v in versions
+        ]
+
+    @v1.get(
+        "/catalog/agents/{slug}/versions/{version}",
+        response_model=CatalogEntryVersionView,
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_catalog_version(
+        slug: str,
+        version: str,
+        request: Request,
+        source: str = Query(default="movate"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryVersionView:
+        """Fetch one specific version, including ``bundle_tar`` (base64)."""
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(source)
+        tenant_filter = ctx.tenant_id if src is CatalogSource.PRIVATE else None
+        v = await store.get_catalog_entry_version(
+            slug, source=src, version=version, tenant_id=tenant_filter
+        )
+        if v is None:
+            raise not_found("catalog entry version", f"{slug}@{version} (source={src.value})")
+        return CatalogEntryVersionView(
+            slug=v.slug,
+            source=v.source.value,
+            tenant_id=v.tenant_id,
+            version=v.version,
+            digest=v.digest,
+            published_at=v.published_at.isoformat(),
+            deprecated_at=(v.deprecated_at.isoformat() if v.deprecated_at else None),
+            bundle_tar_b64=base64.b64encode(v.bundle_tar).decode("ascii"),
+        )
+
+    @v1.post(
+        "/catalog/agents",
+        response_model=CatalogEntryView,
+        status_code=201,
+        tags=["catalog"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_submit_catalog_entry(
+        body: CatalogSubmitRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryView:
+        """Submit a tenant-private catalog entry (ADR 041 D5).
+
+        Server forces ``source='private'`` and
+        ``tenant_id=caller_tenant`` regardless of any client value — the
+        public namespaces are read-only over the customer-facing API.
+
+        Errors:
+
+        * **400** — bad bundle base64 / missing required fields
+        * **409** — slug already exists for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        bundle_bytes = _decode_bundle_tar(body.bundle_tar_b64)
+
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        existing = await store.get_catalog_entry(
+            body.slug, source=CatalogSource.PRIVATE, tenant_id=ctx.tenant_id
+        )
+        if existing is not None:
+            raise conflict(f"catalog entry {body.slug!r} already exists for this tenant")
+
+        digest = hashlib.sha256(bundle_bytes).hexdigest()
+        await store.upsert_catalog_entry_version(
+            body.slug,
+            source=CatalogSource.PRIVATE,
+            version=body.version,
+            bundle_tar=bundle_bytes,
+            digest=digest,
+            tenant_id=ctx.tenant_id,
+        )
+        entry = CatalogEntry(
+            slug=body.slug,
+            source=CatalogSource.PRIVATE,
+            tenant_id=ctx.tenant_id,
+            latest_version=body.version,
+            name=body.name,
+            title=body.title,
+            description=body.description,
+            tags=list(body.tags),
+            shape=body.shape,
+            recommended_for=body.recommended_for,
+            ratings_summary=CatalogRatingsSummary(),
+            popularity=0,
+            synced_at=datetime.now(UTC),
+        )
+        await store.upsert_catalog_entry(entry)
+        return _catalog_entry_to_view(entry)
+
+    @v1.post(
+        "/catalog/agents/{slug}/versions",
+        response_model=CatalogEntryVersionView,
+        status_code=201,
+        tags=["catalog"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_publish_catalog_version(
+        slug: str,
+        body: CatalogPublishVersionRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryVersionView:
+        """Publish a new version of a tenant-private entry (ADR 041 D5).
+
+        Allowed only for the caller's own tenant's private entries — the
+        catalog.movate.io namespace is gated through the GitHub +
+        catalog-CI path (ADR 041 D3), not this endpoint.
+
+        Errors:
+
+        * **400** — bad bundle base64
+        * **404** — no such tenant-private entry
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        entry = await store.get_catalog_entry(
+            slug, source=CatalogSource.PRIVATE, tenant_id=ctx.tenant_id
+        )
+        if entry is None:
+            raise not_found("tenant-private catalog entry", slug)
+        bundle_bytes = _decode_bundle_tar(body.bundle_tar_b64)
+        digest = hashlib.sha256(bundle_bytes).hexdigest()
+        record = await store.upsert_catalog_entry_version(
+            slug,
+            source=CatalogSource.PRIVATE,
+            version=body.version,
+            bundle_tar=bundle_bytes,
+            digest=digest,
+            tenant_id=ctx.tenant_id,
+        )
+        # Bump latest_version on the entry so detail reflects the new tip.
+        bumped = entry.model_copy(
+            update={
+                "latest_version": body.version,
+                "synced_at": datetime.now(UTC),
+            }
+        )
+        await store.upsert_catalog_entry(bumped)
+        return CatalogEntryVersionView(
+            slug=record.slug,
+            source=record.source.value,
+            tenant_id=record.tenant_id,
+            version=record.version,
+            digest=record.digest,
+            published_at=record.published_at.isoformat(),
+            deprecated_at=(record.deprecated_at.isoformat() if record.deprecated_at else None),
+            bundle_tar_b64=None,
+        )
+
+    @v1.post(
+        "/catalog/agents/{slug}/ratings",
+        response_model=CatalogRatingsSummaryView,
+        tags=["catalog"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_rate_catalog_entry(
+        slug: str,
+        body: CatalogRatingRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogRatingsSummaryView:
+        """Record this tenant's rating for one catalog entry.
+
+        Re-rating overwrites the prior row (one rating per tenant per
+        entry). Returns the rolled-up summary AFTER the write — clients
+        can refresh the entry card without a second read.
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(body.source)
+        if src is CatalogSource.COMMUNITY:
+            # Schema-ready but the namespace has no rows in v1 — rating
+            # a non-existent entry surfaces as a 501 so a future
+            # community ADR can flip this on without changing the URL.
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=501,
+                message=(
+                    "rating the community namespace is reserved for a future "
+                    "community-moderation ADR (ADR 041 D7)"
+                ),
+            )
+        summary = await store.record_catalog_rating(
+            slug,
+            tenant_id=ctx.tenant_id,
+            source=src,
+            rating=body.rating,
+            comment=body.comment,
+        )
+        return CatalogRatingsSummaryView(count=summary.count, avg=summary.avg)
+
+    @v1.post(
+        "/catalog/sync",
+        response_model=CatalogSyncResponse,
+        status_code=202,
+        tags=["catalog"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_catalog_sync(
+        body: CatalogSyncRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogSyncResponse:
+        """Trigger a sync from the requested catalog source.
+
+        **v1 stub (ADR 041 D4).** The handler:
+
+        1. Logs an "intent to sync" event so an operator can confirm the
+           call landed.
+        2. Advances the per-source watermark to ``now()``.
+        3. Returns 202 with ``status="stub"`` + a note that the production
+           wiring against ``catalog.movate.io`` is a separate Movate-side
+           build.
+
+        This preserves the API contract so the production handler can
+        flip on without changing the customer-facing surface or any
+        client code.
+
+        Errors:
+
+        * **400** — ``source='private'`` (private entries don't sync — D5)
+        * **501** — ``source='community'`` (deferred — D7)
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(body.source)
+        if src is CatalogSource.PRIVATE:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    "tenant-private entries are not synced from any upstream "
+                    "(ADR 041 D5 — data sovereignty)"
+                ),
+            )
+        if src is CatalogSource.COMMUNITY:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=501,
+                message=(
+                    "community-namespace sync is deferred to a future moderation ADR (ADR 041 D7)"
+                ),
+            )
+
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        prior = await store.get_catalog_sync_watermark(src)
+        now = datetime.now(UTC)
+        catalog_logger.info(
+            "catalog.sync.intent source=%s tenant=%s prior_watermark=%s",
+            src.value,
+            ctx.tenant_id,
+            prior.isoformat() if prior else None,
+        )
+        await store.set_catalog_sync_watermark(src, now)
+        return CatalogSyncResponse(
+            source=src.value,
+            status="stub",
+            watermark=now.isoformat(),
+            detail=catalog_sync_stub_detail,
+        )
 
     app.include_router(v1)
 
