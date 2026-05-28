@@ -369,7 +369,7 @@ class WebhookCreatedView(WebhookView):
     secret: str
 
     @classmethod
-    def from_record(cls, record: WebhookSubscription) -> WebhookCreatedView:  # type: ignore[override]
+    def from_record(cls, record: WebhookSubscription) -> WebhookCreatedView:
         return cls(
             id=record.id,
             tenant_id=record.tenant_id,

@@ -3395,11 +3395,14 @@ class PostgresProvider:
         return [_row_to_webhook_attempt(r) for r in rows]
 
     async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
-        return await self._db.fetchval(
+        # asyncpg.fetchval returns ``Any``; explicit cast keeps mypy happy
+        # without disabling no-any-return wholesale on this file.
+        value = await self._db.fetchval(
             "SELECT last_event_id FROM webhook_cursors WHERE webhook_id = $1 AND tenant_id = $2",
             webhook_id,
             tenant_id,
         )
+        return value if value is None else str(value)
 
     async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
         # Postgres ``INSERT ... ON CONFLICT ... DO UPDATE`` upsert. The

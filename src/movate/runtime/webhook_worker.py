@@ -147,11 +147,14 @@ class WebhookWorkerConfig:
     timestamps and attempted_at are deterministic."""
 
     def __post_init__(self) -> None:
-        # Default the seam callables here so the dataclass field defaults
-        # don't need a lambda (mypy + linter happier).
-        if self.sleep_fn is None:  # type: ignore[truthy-function]
+        # Default the seam callables here so the dataclass field
+        # defaults don't need a lambda (mypy + linter happier). The
+        # callables are typed non-Optional but defaulted to ``None``
+        # via ``field(default=None)``; we coerce to the real defaults
+        # exactly once on construction.
+        if self.sleep_fn is None:
             self.sleep_fn = asyncio.sleep
-        if self.now_fn is None:  # type: ignore[truthy-function]
+        if self.now_fn is None:
             self.now_fn = lambda: datetime.now(UTC)
 
 
