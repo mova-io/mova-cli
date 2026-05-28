@@ -2193,6 +2193,53 @@ class AgentBundleRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class WorkflowBundleRecord(BaseModel):
+    """One published, versioned **workflow** bundle (ADR 037 — workflow API parity).
+
+    Workflow analogue of :class:`AgentBundleRecord`. A row is immutable: each
+    publish of a workflow writes a new ``(name, tenant_id, version)`` row, so
+    the table doubles as the version history. Tenant-scoped like every other
+    durable record.
+
+    The ``files`` map carries the workflow's canonical files (``workflow.yaml``,
+    ``schema/state.json``, and any other relative-path files the workflow.yaml
+    references) keyed by POSIX-style relative path. Excludes runs / KB.
+
+    ``published`` is the soft "promote-this-version" flag exercised by
+    :class:`StorageProvider.publish_workflow_version` (ADR 037 D1) — at most
+    one version per ``(tenant, name)`` is ``published=True``; the rest are
+    drafts. The newest version (by ``created_at``) is what a versionless
+    resolve returns regardless of this flag — ``published`` is the operator's
+    "this one's blessed" pointer, distinct from "latest".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """The workflow name (``workflow.yaml`` ``name``) — paired with
+    ``version`` as the registry key."""
+    tenant_id: str
+    version: str
+    """The bundle's ``workflow.yaml`` version. ``(name, tenant_id, version)``
+    is unique; a new publish bumps this and writes a new row."""
+    created_by: str | None = None
+    """Auth identity that published this version (ADR 013), or ``None`` for a
+    system/seed import. Drives the "who published what when" audit."""
+    content_hash: str
+    """Content-addressed hash of the bundle (over ``files``), so an unchanged
+    re-publish is detectable and a version can be verified."""
+    files: dict[str, str]
+    """The bundle's text files keyed by relative path, e.g.
+    ``workflow.yaml``, ``schema/state.json``. JSON-serializable
+    (path -> file contents)."""
+    published: bool = False
+    """ADR 037 D1 — operator promote/revert flag. At most one version per
+    ``(tenant, name)`` is ``True``; a publish sets this and clears it on every
+    other version of the same name. Independent of "latest" (newest by
+    ``created_at``)."""
+    created_at: datetime = Field(default_factory=_now)
+
+
 # ---------------------------------------------------------------------------
 # Job queue (v0.5+)
 #

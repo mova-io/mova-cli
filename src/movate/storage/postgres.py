@@ -63,6 +63,7 @@ from movate.core.models import (
     TenantProviderKey,
     Trigger,
     TurnRecord,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -479,6 +480,29 @@ CREATE INDEX IF NOT EXISTS idx_agent_bundles_name
 -- Latest-version-per-name + history ordering scan.
 CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created
     ON agent_bundles(tenant_id, name, created_at DESC);
+
+-- ADR 037 D1: durable workflow registry. Workflow analogue of agent_bundles —
+-- one immutable (name, version) row per publish, tenant-scoped, ``files`` is
+-- JSONB. ``published`` is the operator promote/revert flag (ADR 037 D1) —
+-- at most one True per (tenant, name) at any time (enforced application-side
+-- by publish_workflow_version, mirroring the agent registry's "no schema
+-- constraint, behavior-enforced" pattern). Additive new table (CREATE TABLE
+-- IF NOT EXISTS, re-run idempotently on every init) — no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS workflow_bundles (
+    name          TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    created_by    TEXT,
+    content_hash  TEXT NOT NULL,
+    files         JSONB NOT NULL,
+    published     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name
+    ON workflow_bundles(tenant_id, name);
+CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name_created
+    ON workflow_bundles(tenant_id, name, created_at DESC);
 
 -- ADR 016 D2: continuous-eval schedules. One row per (tenant, agent) with a
 -- cadence; the scheduler tick enqueues EVAL jobs for due rows. Additive new
@@ -1794,6 +1818,182 @@ class PostgresProvider:
             )
         # asyncpg returns a command tag like "DELETE <n>".
         return int(status.split()[-1])
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO workflow_bundles (
+                name, tenant_id, version, created_by, content_hash,
+                files, published, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8
+            )
+            """,
+            bundle.name,
+            bundle.tenant_id,
+            bundle.version,
+            bundle.created_by,
+            bundle.content_hash,
+            bundle.files,
+            bundle.published,
+            bundle.created_at,
+        )
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        if version is not None:
+            row = await self._db.fetchrow(
+                "SELECT * FROM workflow_bundles "
+                "WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            row = await self._db.fetchrow(
+                "SELECT * FROM workflow_bundles WHERE name = $1 AND tenant_id = $2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                name,
+                tenant_id,
+            )
+        return _row_to_workflow_bundle(row) if row else None
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        # Latest version per name, newest-first: DISTINCT ON the name picks
+        # each name's most-recent row, then the outer sort orders by that
+        # row's created_at DESC. Mirrors list_agents in postgres.py.
+        if published_only:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (name) * FROM workflow_bundles
+                    WHERE tenant_id = $1
+                      AND name IN (
+                          SELECT DISTINCT name FROM workflow_bundles
+                          WHERE tenant_id = $1 AND published = TRUE
+                      )
+                    ORDER BY name, created_at DESC
+                ) latest
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                limit,
+            )
+        else:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (name) * FROM workflow_bundles
+                    WHERE tenant_id = $1
+                    ORDER BY name, created_at DESC
+                ) latest
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                limit,
+            )
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM workflow_bundles WHERE name = $1 AND tenant_id = $2 "
+            "ORDER BY created_at DESC LIMIT $3",
+            name,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM workflow_bundles ORDER BY tenant_id, name, created_at LIMIT $1",
+            limit,
+        )
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            status = await self._db.execute(
+                "DELETE FROM workflow_bundles WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            status = await self._db.execute(
+                "DELETE FROM workflow_bundles WHERE name = $1 AND tenant_id = $2",
+                name,
+                tenant_id,
+            )
+        return int(status.split()[-1])
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        # ADR 037 D1: at most one published row per (tenant, name). Use a
+        # transaction so the promote + clear-others is atomic — a concurrent
+        # publish can't leave two rows flagged. The exists-probe distinguishes
+        # 404 (no such version) from a successful idempotent re-promote.
+        async with self._db.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT 1 FROM workflow_bundles "
+                "WHERE tenant_id = $1 AND name = $2 AND version = $3",
+                tenant_id,
+                name,
+                version,
+            )
+            if row is None:
+                return False
+            await conn.execute(
+                "UPDATE workflow_bundles SET published = TRUE "
+                "WHERE tenant_id = $1 AND name = $2 AND version = $3",
+                tenant_id,
+                name,
+                version,
+            )
+            await conn.execute(
+                "UPDATE workflow_bundles SET published = FALSE "
+                "WHERE tenant_id = $1 AND name = $2 AND version <> $3",
+                tenant_id,
+                name,
+                version,
+            )
+            return True
 
     # ------------------------------------------------------------------
     # Workflow runs
@@ -3255,6 +3455,21 @@ def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
         created_by=row["created_by"],
         content_hash=row["content_hash"],
         files=dict(row["files"]),
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_workflow_bundle(row: asyncpg.Record) -> WorkflowBundleRecord:
+    # ADR 037 D1 — JSONB ``files`` decoded by the per-connection codec, same
+    # as agent_bundles. ``published`` is a real BOOLEAN column in postgres.
+    return WorkflowBundleRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        files=dict(row["files"]),
+        published=bool(row["published"]),
         created_at=row["created_at"],
     )
 

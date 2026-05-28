@@ -52,6 +52,7 @@ from movate.core.models import (
     TenantBudget,
     TenantProviderKey,
     Trigger,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -1146,6 +1147,127 @@ class StorageProvider(Protocol):
         Tenant-scoped in WHERE so a caller can't delete another tenant's
         agents by guessing names — a cross-tenant or unknown name deletes
         nothing and returns ``0``.
+        """
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1 — workflow API parity)
+    #
+    # The workflow analogue of the agent-bundle surface above. Same shape /
+    # immutability / tenant-scoping guarantees; ``files`` is the workflow's
+    # canonical layout (``workflow.yaml`` + ``schema/state.json`` + anything
+    # else the spec references), JSON-encoded on every backend. Backs the
+    # ``/api/v1/workflows`` CRUD + versioning + publish/revert endpoints
+    # exposed by the runtime so the front end can manage workflow
+    # definitions the same way it manages agents.
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        """Persist one published workflow bundle as an immutable
+        ``(name, tenant_id, version)`` row.
+
+        Each publish writes a new row, so the table is also the version
+        history. Errors on a duplicate ``(name, tenant_id, version)`` —
+        a given version is written exactly once and never mutated.
+        Mirrors :meth:`save_agent_bundle`.
+        """
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        """Fetch one workflow bundle by ``name``, scoped to ``tenant_id``.
+
+        ``version=None`` returns the **latest** version (newest
+        ``created_at``); an explicit ``version`` returns that exact version.
+        Returns ``None`` if no match OR if the workflow belongs to a
+        different tenant — same 404-not-403 no-leak contract as the agent
+        registry.
+        """
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        """List the **latest version per workflow name**, newest-first,
+        scoped to ``tenant_id``.
+
+        One row per distinct ``name`` (the most recently published version
+        of each), ordered by that version's ``created_at`` DESC.
+
+        ``published_only=True`` filters to names whose CURRENT-PUBLISHED
+        version exists — i.e. there is at least one ``published=True`` row
+        for that name; the returned row is still the *latest* (newest
+        ``created_at``) for the name, NOT necessarily the published one,
+        so callers can detect drift between "blessed" and "latest" without
+        a second call. ADR 037 D1.
+        """
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        """List the version history for one workflow ``name``, newest-first,
+        scoped to ``tenant_id``.
+
+        Drives ``GET /api/v1/workflows/{name}/versions``. A cross-tenant or
+        unknown ``name`` returns ``[]`` rather than raising — same no-leak
+        contract as :meth:`list_agent_versions`.
+        """
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        """List **every** published workflow-bundle version, all tenants.
+
+        Operator-only / DR-export style helper analogous to
+        :meth:`list_all_agent_bundles`. Ordered ``(tenant_id, name,
+        created_at)`` for a stable, diff-friendly snapshot.
+        """
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        """Delete workflow bundle rows scoped to ``tenant_id``; return the
+        count deleted.
+
+        ``version=None`` removes all versions of ``name``; an explicit
+        ``version`` removes just that one. Tenant-scoped in WHERE so a
+        cross-tenant or unknown name deletes nothing and returns ``0``.
+        Mirrors :meth:`delete_agent_bundle`.
+        """
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        """Promote ``(name, version)`` to the published version (ADR 037 D1).
+
+        At most one version per ``(tenant_id, name)`` is published at a time:
+        this sets the target's ``published`` to ``True`` and clears every
+        other version of the same name in the same tenant. Returns ``True``
+        when a row matched (the promote happened), ``False`` when the
+        ``(name, version)`` doesn't exist for this tenant (the caller maps
+        ``False`` to a 404 at the API edge).
+
+        Idempotent — re-promoting the same version is a no-op (still
+        returns ``True``). Tenant-scoped in WHERE so a caller can't flip
+        another tenant's flag.
         """
 
     # ------------------------------------------------------------------

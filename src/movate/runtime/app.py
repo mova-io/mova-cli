@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import yaml
 from fastapi import APIRouter, Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -57,6 +58,7 @@ from movate.core.models import (
     JobStatus,
     TenantProviderKey,
     Trigger,
+    WorkflowBundleRecord,
     WorkflowStatus,
 )
 from movate.core.provider_keys import (
@@ -79,6 +81,7 @@ from movate.core.triggers import (
     mint_trigger,
     verify_signature,
 )
+from movate.core.workflow.spec import WorkflowSpecLoadError, load_workflow_spec
 from movate.runtime.agent_creation import (
     AgentCreationError,
     persist_bundle,
@@ -216,13 +219,43 @@ from movate.runtime.schemas import (
     TriggerListView,
     TriggerView,
     WizardAgentSubmission,
+    WorkflowCreatedView,
+    WorkflowCreateRequest,
+    WorkflowDeletedView,
+    WorkflowDetailView,
+    WorkflowListResponse,
+    WorkflowPublishedView,
+    WorkflowRevertedView,
+    WorkflowRevertSubmission,
     WorkflowRunListView,
     WorkflowRunView,
     WorkflowSignalRequest,
+    WorkflowUpdatedView,
+    WorkflowValidationIssue,
+    WorkflowValidationView,
+    WorkflowVersionsView,
+    WorkflowVersionView,
+    WorkflowView,
 )
 from movate.runtime.skill_creation import (
     SkillCreationError,
     persist_skill_bundle,
+)
+from movate.runtime.workflow_persistence import PublishResult as WorkflowPublishResult
+from movate.runtime.workflow_persistence import (
+    WorkflowPersistenceError,
+    persist_workflow_bundle,
+    publish_workflow_bundle,
+    soft_delete_workflow,
+)
+from movate.runtime.workflow_persistence import (
+    bundle_files_from_dir as workflow_bundle_files_from_dir,
+)
+from movate.runtime.workflow_persistence import (
+    mint_revert_version as mint_workflow_revert_version,
+)
+from movate.runtime.workflow_persistence import (
+    unzip_bundle as unzip_workflow_bundle,
 )
 from movate.storage.base import StorageProvider
 from movate.tracing import inject_current_trace_context, record_audit_event
@@ -362,6 +395,30 @@ async def _sse_run_stream(
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+def _default_sibling_path(
+    explicit: Path | None,
+    agents_path: Path | None,
+    *,
+    name: str,
+    at_parent: bool = False,
+) -> Path | None:
+    """Resolve an optional path that defaults to a sibling of ``agents_path``.
+
+    Used to wire ``skills_path`` (defaults to ``<agents_path>/skills``) and
+    ``workflows_path`` (defaults to ``<agents_path>/../workflows`` —
+    ``at_parent=True``). Returns ``None`` only when no explicit path was
+    given AND ``agents_path`` is also missing (typical for a unit-test
+    runtime that doesn't persist anything to disk).
+    """
+    if explicit is not None:
+        return explicit
+    if agents_path is None:
+        return None
+    if at_parent:
+        return agents_path.parent / name
+    return agents_path / name
 
 
 def _github_is_enabled() -> bool:
@@ -892,6 +949,419 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
     )
 
 
+# ---------------------------------------------------------------------------
+# Workflow API parity helpers (ADR 037 D1) — the workflow-side analogues of
+# the agent helpers above. Kept module-level (not under build_app) so the
+# test suite can import them directly.
+# ---------------------------------------------------------------------------
+
+
+async def _collect_workflow_bundle_files(
+    *,
+    body: WorkflowCreateRequest | None,
+    workflow_yaml: UploadFile | None,
+    state_schema: UploadFile | None,
+    dataset: UploadFile | None,
+    bundle: UploadFile | None,
+) -> dict[str, bytes]:
+    """Normalize the three create-modes (JSON / multipart fields / zipped
+    bundle) into a single ``{rel_path: bytes}`` dict.
+
+    Exactly one mode must be supplied; multiple modes → 400. Mirrors
+    :func:`_collect_bundle_files` for agents.
+    """
+    modes_set = sum(
+        1
+        for v in (
+            body,
+            workflow_yaml,
+            bundle,
+        )
+        if v is not None
+    )
+    if modes_set == 0:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=400,
+            message=(
+                "POST/PUT /api/v1/workflows requires one of: a JSON body, an "
+                "individual workflow_yaml multipart field, or a zipped bundle "
+                "field"
+            ),
+        )
+    if modes_set > 1:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=400,
+            message=(
+                "POST/PUT /api/v1/workflows accepts exactly one of: JSON body, "
+                "individual fields, or zipped bundle — pick ONE"
+            ),
+        )
+
+    if bundle is not None:
+        return unzip_workflow_bundle(await bundle.read())
+
+    if body is not None:
+        files: dict[str, bytes] = {"workflow.yaml": body.workflow_yaml.encode("utf-8")}
+        for rel, content in body.files.items():
+            files[rel] = content.encode("utf-8")
+        return files
+
+    # Individual-fields mode.
+    assert workflow_yaml is not None  # narrowed by the modes_set guard above
+    files = {"workflow.yaml": await workflow_yaml.read()}
+    if state_schema is not None:
+        files["schema/state.json"] = await state_schema.read()
+    if dataset is not None:
+        files["evals/dataset.jsonl"] = await dataset.read()
+    return files
+
+
+async def _dual_write_workflow_to_registry(
+    storage: StorageProvider,
+    workflow_dir: Path,
+    *,
+    tenant_id: str,
+    version: str,
+    created_by: str | None,
+) -> WorkflowPublishResult | None:
+    """Publish a freshly-persisted workflow dir into the durable registry.
+
+    Mirrors :func:`_dual_write_agent_to_registry`. Best-effort: a registry
+    failure must not fail the persist — the FS write is still live for
+    local serve. Always returns ``None`` on failure (logged) so the caller
+    can render the response cleanly.
+    """
+    try:
+        files = workflow_bundle_files_from_dir(workflow_dir)
+        return await publish_workflow_bundle(
+            storage,
+            name=workflow_dir.name,
+            tenant_id=tenant_id,
+            version=version,
+            files=files,
+            created_by=created_by,
+        )
+    except Exception:
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning(
+            "workflow_registry_publish_failed name=%s tenant_id=%s version=%s",
+            workflow_dir.name,
+            tenant_id,
+            version,
+            exc_info=True,
+        )
+        return None
+
+
+async def _check_workflow_if_match(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+    if_match: str,
+) -> None:
+    """Enforce ``If-Match`` optimistic concurrency on workflow PUT.
+
+    Mirrors :func:`_check_agent_if_match`: matches either the current
+    latest version's ``version`` OR its ``content_hash``. A missing
+    registry row is treated as a match (the on-disk bundle exists but the
+    registry is empty — local-serve case).
+    """
+    current = await storage.get_workflow_bundle(name, tenant_id=tenant_id)
+    if current is None:
+        return
+    expected = _normalize_if_match(if_match)
+    if expected in (current.version, current.content_hash):
+        return
+    raise conflict(
+        f"workflow {name!r} was updated concurrently: If-Match {expected!r} "
+        f"no longer matches the current version {current.version!r} — re-fetch "
+        f"and retry",
+    )
+
+
+async def _do_validate_workflow(
+    *,
+    request: Request,
+    name: str,
+    body: WorkflowCreateRequest | None,
+    workflow_yaml: UploadFile | None,
+    state_schema: UploadFile | None,
+    bundle: UploadFile | None,
+    ctx: AuthContext,
+) -> WorkflowValidationView:
+    """Shared validate body — runs the parse/compile path on either the
+    supplied bundle (any mode) or the on-disk bundle when nothing is
+    supplied (multipart-only convenience for "is the current bundle still
+    valid?")."""
+    _ = ctx.tenant_id  # future per-tenant isolation
+    workflows_path: Path | None = request.app.state.workflows_path
+    any_input = (
+        body is not None
+        or workflow_yaml is not None
+        or state_schema is not None
+        or bundle is not None
+    )
+    if not any_input:
+        if workflows_path is None or not (workflows_path / name).is_dir():
+            raise not_found("workflow", name)
+        try:
+            load_workflow_spec(workflows_path / name)
+        except WorkflowSpecLoadError as exc:
+            return _validation_failed(str(exc))
+        return WorkflowValidationView(passed=True, errors=[], warnings=[])
+    try:
+        files = await _collect_workflow_bundle_files(
+            body=body,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            dataset=None,
+            bundle=bundle,
+        )
+    except WorkflowPersistenceError as exc:
+        return _validation_failed(str(exc))
+
+    import tempfile as _tempfile  # noqa: PLC0415
+
+    from movate.runtime.workflow_persistence import _write_files  # noqa: PLC0415
+
+    staging = Path(_tempfile.mkdtemp(prefix=f".validate-{name}-"))
+    try:
+        _write_files(staging, files)
+        try:
+            load_workflow_spec(staging)
+        except WorkflowSpecLoadError as exc:
+            return _validation_failed(str(exc))
+    finally:
+        import shutil as _shutil  # noqa: PLC0415
+
+        _shutil.rmtree(staging, ignore_errors=True)
+    return WorkflowValidationView(passed=True, errors=[], warnings=[])
+
+
+async def _do_update_workflow(
+    *,
+    request: Request,
+    name: str,
+    body: WorkflowCreateRequest | None,
+    workflow_yaml: UploadFile | None,
+    state_schema: UploadFile | None,
+    dataset: UploadFile | None,
+    bundle: UploadFile | None,
+    if_match: str | None,
+    ctx: AuthContext,
+) -> WorkflowUpdatedView:
+    """Shared PUT body for the multipart + JSON-body workflow update
+    endpoints. Single point of truth so the two routes never diverge.
+    """
+    workflows_path: Path | None = request.app.state.workflows_path
+    if workflows_path is None:
+        raise WorkflowPersistenceError(
+            "runtime was built without a workflows_path; "
+            "PUT /api/v1/workflows/{name} is unavailable",
+            status_code=503,
+        )
+    store: StorageProvider = request.app.state.storage
+    existing = await store.get_workflow_bundle(name, tenant_id=ctx.tenant_id)
+    on_disk = (workflows_path / name).is_dir()
+    if existing is None and not on_disk:
+        raise not_found("workflow", name)
+    previous_version = existing.version if existing is not None else "<unknown>"
+    if if_match is not None:
+        await _check_workflow_if_match(store, name, tenant_id=ctx.tenant_id, if_match=if_match)
+    files = await _collect_workflow_bundle_files(
+        body=body,
+        workflow_yaml=workflow_yaml,
+        state_schema=state_schema,
+        dataset=dataset,
+        bundle=bundle,
+    )
+    try:
+        yaml_name = yaml.safe_load(files["workflow.yaml"])["name"]
+    except Exception as exc:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=f"workflow.yaml could not be parsed: {exc}",
+        ) from exc
+    if yaml_name != name:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=(
+                f"workflow.yaml name {yaml_name!r} does not match the URL path parameter {name!r}"
+            ),
+        )
+    result = persist_workflow_bundle(files, workflows_path=workflows_path, on_conflict="replace")
+    published = await _dual_write_workflow_to_registry(
+        store,
+        result.workflow_dir,
+        tenant_id=ctx.tenant_id,
+        version=result.spec.version,
+        created_by=ctx.api_key_id,
+    )
+    return WorkflowUpdatedView(
+        name=result.spec.name,
+        version=result.spec.version,
+        description=result.spec.description,
+        workflow_dir=result.workflow_dir.name,
+        files_persisted=result.files_persisted,
+        previous_version=previous_version,
+        published_version=published.version if published is not None else None,
+        changed=published.published if published is not None else True,
+    )
+
+
+async def _resolve_published_version(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+) -> str | None:
+    """Return the version flagged ``published=True`` for ``(name, tenant)``,
+    or ``None`` when nothing is published.
+
+    Walks the version history newest-first; at most one row has the flag set
+    so this terminates quickly. Pure-helper — exposed here so list / publish /
+    delete handlers can label the response uniformly.
+    """
+    history = await storage.list_workflow_versions(name, tenant_id=tenant_id, limit=1000)
+    for row in history:
+        if row.published:
+            return row.version
+    return None
+
+
+async def _demote_workflow_published(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+) -> None:
+    """No-op hook for now — the DELETE handler invokes this so a future
+    "explicit unpublish-all" Protocol method can land without touching
+    every call site.
+
+    ADR 037 D1 design call: a soft-delete preserves the entire version
+    history (the contract the API documents — "DELETE preserves versions").
+    A registry row's ``published`` flag is intentionally NOT cleared on
+    delete: the row remains the immutable record of "this is what was
+    published when soft-delete happened." After a soft-delete, the
+    workflow disappears from the **filesystem** catalog (the API
+    surfaces "are there registry rows" as the existence signal, but a
+    versionless GET still returns the registry's latest). Operators
+    who want to fully remove a workflow + its history use a separate
+    operator-level path (out of scope for this PR — durable revoke is
+    its own ADR seam).
+
+    Kept as a function (not inlined) so the DELETE handler reads cleanly
+    and a future "really unpublish" Protocol primitive can replace this
+    body without disturbing the route.
+    """
+    _ = storage, name, tenant_id  # documented no-op
+
+
+def _peek_workflow_yaml_tags(files: dict[str, str]) -> tuple[list[str], str]:
+    """Extract ``tags`` + ``description`` from a bundle's workflow.yaml.
+
+    Lightweight YAML parse used by the catalog list view so it can render
+    metadata without re-loading + compiling the full spec for every row.
+    Returns ``([], "")`` on any parse failure — the list view degrades
+    gracefully rather than 500-ing on a corrupt row.
+    """
+    raw = files.get("workflow.yaml")
+    if not raw:
+        return [], ""
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return [], ""
+    if not isinstance(doc, dict):
+        return [], ""
+    tags = doc.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    description = doc.get("description") or ""
+    if not isinstance(description, str):
+        description = ""
+    return [str(t) for t in tags], description
+
+
+def _render_workflow_detail(record: WorkflowBundleRecord) -> WorkflowDetailView:
+    """Build the ``WorkflowDetailView`` from a registry record.
+
+    Pure function — parses the bundle's ``workflow.yaml`` for the spec
+    metadata + nodes/edges; tolerates malformed YAML (returns empty
+    nodes/edges rather than 500). The full Pydantic validation happened at
+    publish time, so a registry row is by construction parseable; the
+    defensive branches exist for forward-compat (a future schema bump that
+    a stale handler hasn't learned to read).
+    """
+    files_sorted = sorted(record.files.keys())
+    raw = record.files.get("workflow.yaml", "")
+    description = ""
+    owner = ""
+    tags: list[str] = []
+    entrypoint = ""
+    state_schema_path = ""
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        doc = None
+    if isinstance(doc, dict):
+        description = str(doc.get("description") or "")
+        owner = str(doc.get("owner") or "")
+        raw_tags = doc.get("tags") or []
+        if isinstance(raw_tags, list):
+            tags = [str(t) for t in raw_tags]
+        entrypoint = str(doc.get("entrypoint") or "")
+        state_schema_path = str(doc.get("state_schema") or "")
+        raw_nodes = doc.get("nodes") or []
+        if isinstance(raw_nodes, list):
+            nodes = [n if isinstance(n, dict) else {"value": n} for n in raw_nodes]
+        raw_edges = doc.get("edges") or []
+        if isinstance(raw_edges, list):
+            edges = [e if isinstance(e, dict) else {"value": e} for e in raw_edges]
+
+    return WorkflowDetailView(
+        name=record.name,
+        version=record.version,
+        description=description,
+        owner=owner,
+        tags=tags,
+        entrypoint=entrypoint,
+        state_schema_path=state_schema_path,
+        nodes=nodes,
+        edges=edges,
+        content_hash=record.content_hash,
+        created_by=record.created_by,
+        created_at=record.created_at,
+        published_version=record.version if record.published else None,
+        is_published=record.published,
+        files=files_sorted,
+    )
+
+
+def _validation_failed(message: str) -> WorkflowValidationView:
+    """Build a ``WorkflowValidationView`` from a single error message."""
+    return WorkflowValidationView(
+        passed=False,
+        errors=[
+            WorkflowValidationIssue(
+                code="invalid_workflow_spec",
+                severity="error",
+                message=message,
+            )
+        ],
+        warnings=[],
+    )
+
+
 # How many prior turns to inject into a threaded message's input
 # under ``conversation_history`` (PR-R). 20 turns at ~500 tokens each
 # is ~10k tokens of context — comfortable for modern models, leaves
@@ -1126,6 +1596,7 @@ def build_app(
     agents: list[AgentBundle] | None = None,
     agents_path: Path | None = None,
     skills_path: Path | None = None,
+    workflows_path: Path | None = None,
     rate_limit_per_minute: int | None = 60,
     tenant_rate_limit_per_minute: int | None = None,
     cors_allowed_origins: list[str] | None = None,
@@ -1247,12 +1718,16 @@ def build_app(
     # fallback (``agent_dir.parent`` when no project marker is found)
     # resolves to the same directory. Explicit skills_path overrides —
     # used by tests and operators who keep skills on a sibling volume.
-    if skills_path is not None:
-        app.state.skills_path = skills_path
-    elif agents_path is not None:
-        app.state.skills_path = agents_path / "skills"
-    else:
-        app.state.skills_path = None
+    # ADR 037 D1: where new workflows (POST /api/v1/workflows) land on disk.
+    # Defaults to a sibling ``workflows/`` next to ``agents_path`` so the
+    # bundled-deploy convention "agents/, workflows/, skills/" Just Works.
+    # ``None`` (no agents_path either) means the workflow CRUD endpoints
+    # return 503 — same back-compat as agents (test configurations may pass
+    # neither; mdk serve always passes both).
+    app.state.skills_path = _default_sibling_path(skills_path, agents_path, name="skills")
+    app.state.workflows_path = _default_sibling_path(
+        workflows_path, agents_path, name="workflows", at_parent=True
+    )
     # GitHub integration (item 78 / ADR 007). Built lazily when
     # ``MDK_GITHUB_ENABLED=1`` so the typical runtime (no GitHub) pays
     # no cost. Tests pass a pre-built mock through ``github_client``.
@@ -5864,6 +6339,585 @@ def build_app(
         )
 
     # ------------------------------------------------------------------
+    # Workflow definitions (ADR 037 D1) — workflow API parity.
+    #
+    # Workflow analogue of the agent CRUD/version/publish/revert surface
+    # above. The wire shape mirrors agents row-for-row: same scopes (read /
+    # admin), same If-Match optimistic-concurrency on PUT, same versions
+    # endpoint pattern, same error envelope. The bundle layout is narrower
+    # (just workflow.yaml + state schema + optional evals/dataset), so the
+    # multipart form has fewer fields, and validation runs the Pydantic +
+    # compiler path rather than the prompt linter. This is the runtime
+    # surface backing the front end's workflow profile / catalog views.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/workflows",
+        response_model=WorkflowCreatedView,
+        status_code=201,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_workflow(
+        request: Request,
+        # Multipart fields. The route accepts EITHER individual files OR a
+        # single zipped bundle; the choice is detected in the handler. A
+        # pure-JSON sibling endpoint at ``/workflows/from-spec`` covers
+        # callers that don't want multipart encoding (mirrors agents'
+        # ``POST /api/v1/agents/from-wizard``).
+        workflow_yaml: UploadFile | None = File(default=None),
+        state_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        bundle: UploadFile | None = File(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowCreatedView:
+        """Create a new workflow from a multipart-form bundle.
+
+        Mirrors ``POST /api/v1/agents``: two multipart input modes (pick ONE):
+
+        1. **Individual multipart files** — ``workflow_yaml`` + optional
+           ``state_schema`` + optional ``dataset``.
+        2. **Zipped bundle** — single ``bundle`` field carrying the canonical
+           workflow layout (workflow.yaml + schema/ + evals/).
+
+        For pure-JSON callers, see ``POST /api/v1/workflows/from-spec``.
+
+        Persists to ``<workflows_path>/<name>/`` and writes an immutable row
+        to the durable registry (ADR 037 D1).
+
+        Errors:
+
+        * **400** — neither mode supplied OR multiple modes supplied
+        * **409** — workflow with this name already exists; use PUT to update
+        * **422** — bundle failed validation (parse / Pydantic / compiler)
+        * **503** — runtime was built without a ``workflows_path``
+        """
+        workflows_path: Path | None = request.app.state.workflows_path
+        if workflows_path is None:
+            raise WorkflowPersistenceError(
+                "runtime was built without a workflows_path; POST /api/v1/workflows is unavailable",
+                status_code=503,
+            )
+
+        files = await _collect_workflow_bundle_files(
+            body=None,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            dataset=dataset,
+            bundle=bundle,
+        )
+
+        result = persist_workflow_bundle(files, workflows_path=workflows_path)
+
+        store: StorageProvider = request.app.state.storage
+        published = await _dual_write_workflow_to_registry(
+            store,
+            result.workflow_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.spec.version,
+            created_by=ctx.api_key_id,
+        )
+
+        return WorkflowCreatedView(
+            name=result.spec.name,
+            version=result.spec.version,
+            description=result.spec.description,
+            workflow_dir=result.workflow_dir.name,
+            files_persisted=result.files_persisted,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
+        )
+
+    @v1.post(
+        "/workflows/from-spec",
+        response_model=WorkflowCreatedView,
+        status_code=201,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_workflow_from_spec(
+        body: WorkflowCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowCreatedView:
+        """Create a new workflow from a JSON body (no multipart).
+
+        Sibling of the multipart ``POST /api/v1/workflows`` — same persist
+        path + response shape, JSON wire format. Mirrors the role
+        ``POST /api/v1/agents/from-wizard`` plays for agents: a clean
+        no-multipart shape for Angular and other JSON-only clients.
+        """
+        workflows_path: Path | None = request.app.state.workflows_path
+        if workflows_path is None:
+            raise WorkflowPersistenceError(
+                "runtime was built without a workflows_path; "
+                "POST /api/v1/workflows/from-spec is unavailable",
+                status_code=503,
+            )
+
+        files = await _collect_workflow_bundle_files(
+            body=body,
+            workflow_yaml=None,
+            state_schema=None,
+            dataset=None,
+            bundle=None,
+        )
+
+        result = persist_workflow_bundle(files, workflows_path=workflows_path)
+
+        store: StorageProvider = request.app.state.storage
+        published = await _dual_write_workflow_to_registry(
+            store,
+            result.workflow_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.spec.version,
+            created_by=ctx.api_key_id,
+        )
+
+        return WorkflowCreatedView(
+            name=result.spec.name,
+            version=result.spec.version,
+            description=result.spec.description,
+            workflow_dir=result.workflow_dir.name,
+            files_persisted=result.files_persisted,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
+        )
+
+    @v1.get(
+        "/workflows",
+        response_model=WorkflowListResponse,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflows(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> WorkflowListResponse:
+        """List workflows for the caller's tenant, newest-first.
+
+        ``?published_only=true`` narrows to workflows that have at least one
+        published version (ADR 037 D1). The returned row is still the
+        *latest* version of each name — the ``published_version`` field
+        on each item names the version flagged as published, so a UI can
+        render "blessed v0.2.0 (latest v0.3.0)" drift without a second
+        round-trip.
+
+        Tenant-scoped — other tenants' workflows are invisible.
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_workflows(
+            tenant_id=ctx.tenant_id,
+            published_only=published_only,
+            limit=limit,
+        )
+        items: list[WorkflowView] = []
+        for row in rows:
+            tags, description = _peek_workflow_yaml_tags(row.files)
+            # Look up the published version (if any) for this name. One extra
+            # cheap query per row — keeps list_workflows' API minimal.
+            published_version = await _resolve_published_version(
+                store, row.name, tenant_id=ctx.tenant_id
+            )
+            items.append(
+                WorkflowView(
+                    name=row.name,
+                    version=row.version,
+                    description=description,
+                    published_version=published_version,
+                    tags=tags,
+                    created_at=row.created_at,
+                )
+            )
+        return WorkflowListResponse(workflows=items, count=len(items))
+
+    @v1.get(
+        "/workflows/{name}",
+        response_model=WorkflowDetailView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_workflow(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> WorkflowDetailView:
+        """Return the parsed spec + bundle metadata for a single workflow.
+
+        ``?version=<v>`` returns that exact registry version (404 if not
+        found for this tenant); omitting ``?version`` returns the current
+        latest. Tenant-scoped — a cross-tenant lookup is 404, not 403.
+
+        Sets a strong ``ETag`` carrying the current version so an Angular
+        client can pass it as ``If-Match`` on a subsequent PUT for
+        optimistic concurrency (mirrors the agent endpoint).
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_workflow_bundle(name, tenant_id=ctx.tenant_id, version=version)
+        if record is None:
+            raise not_found(
+                "workflow",
+                f"{name}@{version}" if version else name,
+            )
+        return _render_workflow_detail(record)
+
+    @v1.get(
+        "/workflows/{name}/versions",
+        response_model=WorkflowVersionsView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_versions(
+        name: str,
+        request: Request,
+        limit: int = 50,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowVersionsView:
+        """List the durable-registry version history for one workflow.
+
+        Newest-first. The newest row is flagged ``is_current``; the version
+        with ``published=True`` (if any) is flagged ``is_published``.
+        Mirrors :func:`v1_list_agent_versions`.
+        """
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_workflow_versions(name, tenant_id=ctx.tenant_id, limit=limit)
+        items = [
+            WorkflowVersionView(
+                version=r.version,
+                created_by=r.created_by,
+                created_at=r.created_at,
+                content_hash=r.content_hash,
+                is_current=(i == 0),
+                is_published=r.published,
+            )
+            for i, r in enumerate(records)
+        ]
+        return WorkflowVersionsView(name=name, versions=items, count=len(items))
+
+    @v1.put(
+        "/workflows/{name}",
+        response_model=WorkflowUpdatedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_update_workflow(
+        name: str,
+        request: Request,
+        workflow_yaml: UploadFile | None = File(default=None),
+        state_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        bundle: UploadFile | None = File(default=None),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowUpdatedView:
+        """Replace an existing workflow bundle in-place (multipart).
+
+        Accepts the same multipart modes as POST. The path ``{name}`` must
+        match the uploaded ``workflow.yaml``'s ``name`` field; mismatches
+        are rejected with 422. For JSON-body callers see
+        ``PUT /api/v1/workflows/{name}/from-spec``.
+
+        **Optimistic concurrency** — opt-in via ``If-Match``. Send the
+        version or ``content_hash`` the caller believes is current; if it
+        no longer matches the registry's latest for this tenant, 409
+        ("someone else updated this; re-fetch"). Absent ``If-Match`` →
+        last-write-wins (back-compat).
+
+        Errors:
+
+        * **400** — neither mode supplied OR multiple modes supplied
+        * **404** — workflow ``{name}`` is not registered (never created)
+        * **409** — ``If-Match`` precondition is stale
+        * **422** — bundle failed validation OR workflow_yaml.name ≠ path
+        * **503** — runtime built without a ``workflows_path``
+        """
+        return await _do_update_workflow(
+            request=request,
+            name=name,
+            body=None,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            dataset=dataset,
+            bundle=bundle,
+            if_match=if_match,
+            ctx=ctx,
+        )
+
+    @v1.put(
+        "/workflows/{name}/from-spec",
+        response_model=WorkflowUpdatedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_update_workflow_from_spec(
+        name: str,
+        body: WorkflowCreateRequest,
+        request: Request,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowUpdatedView:
+        """Replace an existing workflow from a JSON body (no multipart).
+
+        Sibling of the multipart ``PUT /api/v1/workflows/{name}``. Same
+        If-Match semantics, same 404/409/422 behavior.
+        """
+        return await _do_update_workflow(
+            request=request,
+            name=name,
+            body=body,
+            workflow_yaml=None,
+            state_schema=None,
+            dataset=None,
+            bundle=None,
+            if_match=if_match,
+            ctx=ctx,
+        )
+
+    @v1.delete(
+        "/workflows/{name}",
+        response_model=WorkflowDeletedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_workflow(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowDeletedView:
+        """Soft-delete a workflow.
+
+        Moves the on-disk bundle to ``.deleted-<name>-<timestamp>/`` (no
+        rmtree — recoverable out-of-band) AND clears the registry's
+        ``published`` flag from every version of this name. Versions
+        themselves are PRESERVED — the history stays intact so an operator
+        can revert later if the delete was a mistake.
+
+        Errors:
+
+        * **404** — workflow dir doesn't exist at the runtime's
+          workflows_path AND no registry rows match
+        * **503** — runtime built without a ``workflows_path``
+        """
+        workflows_path: Path | None = request.app.state.workflows_path
+        if workflows_path is None:
+            raise WorkflowPersistenceError(
+                "runtime was built without a workflows_path; "
+                "DELETE /api/v1/workflows/{name} is unavailable",
+                status_code=503,
+            )
+        store: StorageProvider = request.app.state.storage
+        # Soft-delete on disk if the dir exists. If only the registry has it,
+        # we still clear the published flag below so the catalog reflects
+        # the delete.
+        deleted_dir_name = ""
+        on_disk = (workflows_path / name).is_dir()
+        if on_disk:
+            result = soft_delete_workflow(name, workflows_path=workflows_path)
+            deleted_dir_name = result.deleted_dir.name
+        else:
+            # Registry-only delete: 404 if nothing exists for this tenant.
+            registry_versions = await store.list_workflow_versions(
+                name, tenant_id=ctx.tenant_id, limit=1
+            )
+            if not registry_versions:
+                raise not_found("workflow", name)
+            deleted_dir_name = f"<registry-only:{name}>"
+
+        # Demote any published version so the front-end catalog
+        # (?published_only=true) stops surfacing this name immediately.
+        # Versions are preserved — operators can revert.
+        await _demote_workflow_published(store, name, tenant_id=ctx.tenant_id)
+
+        return WorkflowDeletedView(
+            name=name,
+            deleted_dir=deleted_dir_name,
+        )
+
+    @v1.post(
+        "/workflows/{name}/validate",
+        response_model=WorkflowValidationView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_validate_workflow(
+        name: str,
+        request: Request,
+        workflow_yaml: UploadFile | None = File(default=None),
+        state_schema: UploadFile | None = File(default=None),
+        bundle: UploadFile | None = File(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowValidationView:
+        """Validate a workflow bundle WITHOUT persisting (multipart).
+
+        Runs the same Pydantic + compiler path persist would run — duplicate
+        node ids, unknown entrypoint, dangling edges, missing/malformed
+        state schema. Returns ``passed=True`` when the spec is structurally
+        valid. Cost forecast is intentionally omitted today (workflows have
+        no single-token estimate; ADR 029 D4 will add this).
+
+        If no multipart file is supplied, validates the currently-persisted
+        bundle on disk (so the UI can pre-validate the latest registered
+        workflow before opening the editor). For JSON-body validation see
+        ``POST /api/v1/workflows/{name}/validate/from-spec``.
+
+        ``read`` scope — pure inspection, no mutation.
+        """
+        return await _do_validate_workflow(
+            request=request,
+            name=name,
+            body=None,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            bundle=bundle,
+            ctx=ctx,
+        )
+
+    @v1.post(
+        "/workflows/{name}/validate/from-spec",
+        response_model=WorkflowValidationView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_validate_workflow_from_spec(
+        name: str,
+        body: WorkflowCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowValidationView:
+        """Validate a workflow bundle from a JSON body (no multipart)."""
+        return await _do_validate_workflow(
+            request=request,
+            name=name,
+            body=body,
+            workflow_yaml=None,
+            state_schema=None,
+            bundle=None,
+            ctx=ctx,
+        )
+
+    @v1.post(
+        "/workflows/{name}/publish",
+        response_model=WorkflowPublishedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_publish_workflow(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> WorkflowPublishedView:
+        """Promote a version to "published" (ADR 037 D1).
+
+        Soft promote on the durable registry: sets ``published=True`` on
+        the target version and clears every other version of the same name
+        in this tenant. ``?version=<v>`` selects the version; omit it to
+        publish the current LATEST (newest ``created_at``).
+
+        Idempotent — re-promoting the same version is a no-op. The
+        response carries the prior published version (if any) so the UI
+        can label the transition.
+
+        Errors:
+
+        * **404** — no such version for this workflow in this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        target_version = version
+        # Versionless → promote the current latest.
+        if target_version is None:
+            latest = await store.get_workflow_bundle(name, tenant_id=ctx.tenant_id)
+            if latest is None:
+                raise not_found("workflow", name)
+            target_version = latest.version
+
+        # Look up the previously-published version BEFORE we flip it.
+        previous_published = await _resolve_published_version(store, name, tenant_id=ctx.tenant_id)
+        ok = await store.publish_workflow_version(
+            name, tenant_id=ctx.tenant_id, version=target_version
+        )
+        if not ok:
+            raise not_found("workflow version", f"{name}@{target_version}")
+        return WorkflowPublishedView(
+            name=name,
+            published_version=target_version,
+            previous_published_version=(
+                previous_published if previous_published != target_version else None
+            ),
+        )
+
+    @v1.post(
+        "/workflows/{name}/revert",
+        response_model=WorkflowRevertedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_revert_workflow(
+        name: str,
+        request: Request,
+        body: WorkflowRevertSubmission | None = None,
+        to_version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowRevertedView:
+        """Revert a workflow to a prior version (non-destructive).
+
+        Fetches the bundle for ``to_version`` and re-publishes it FORWARD
+        as a new latest version — a fresh ``save_workflow_bundle`` row
+        with a new ``created_at`` / ``created_by`` and the same ``files``.
+        No version is ever deleted or rewritten.
+
+        ``to_version`` may be supplied in the JSON body OR as a query
+        param; the body wins when both are present. Mirrors the agent
+        revert endpoint.
+
+        Errors:
+
+        * **400** — no ``to_version`` supplied
+        * **404** — no such ``to_version`` for this workflow in this tenant
+        """
+        target_version = body.to_version if body is not None else to_version
+        if not target_version:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    'revert requires a target version: send {"to_version": "..."} '
+                    "in the body or ?to_version=..."
+                ),
+            )
+        store: StorageProvider = request.app.state.storage
+        target = await store.get_workflow_bundle(
+            name, tenant_id=ctx.tenant_id, version=target_version
+        )
+        if target is None:
+            raise not_found("workflow version", f"{name}@{target_version}")
+
+        history = await store.list_workflow_versions(name, tenant_id=ctx.tenant_id, limit=1000)
+        previous_version = history[0].version if history else target_version
+        existing_versions = {r.version for r in history}
+        new_version = mint_workflow_revert_version(target_version, existing_versions)
+
+        reverted = WorkflowBundleRecord(
+            name=target.name,
+            tenant_id=target.tenant_id,
+            version=new_version,
+            created_by=ctx.api_key_id,
+            content_hash=target.content_hash,
+            files=target.files,
+            published=False,
+        )
+        await store.save_workflow_bundle(reverted)
+        return WorkflowRevertedView(
+            name=name,
+            version=new_version,
+            reverted_from=target_version,
+            previous_version=previous_version,
+        )
+
+    # ------------------------------------------------------------------
     # Workflow HITL — resume-on-signal (ADR 017 D5, PR 2).
     #
     # A paused workflow run (the runner stopped at a HUMAN gate and
@@ -6696,6 +7750,25 @@ def build_app(
     @app.exception_handler(SkillCreationError)
     async def _skill_creation_error_handler(
         _request: Request, exc: SkillCreationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": {
+                    "error": {
+                        "code": _agent_creation_error_code(exc.status_code),
+                        "message": str(exc),
+                    }
+                }
+            },
+        )
+
+    # ADR 037 D1: WorkflowPersistenceError uses the same status_code → wire-
+    # code mapping as the agent/skill counterparts so the Angular front end
+    # branches uniformly on ``error.code``.
+    @app.exception_handler(WorkflowPersistenceError)
+    async def _workflow_persistence_error_handler(
+        _request: Request, exc: WorkflowPersistenceError
     ) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,

@@ -71,6 +71,16 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
+    # ADR 037 D1: workflow definition CRUD/version/publish (parity with agents).
+    ("POST", "/api/v1/workflows"): "admin",
+    ("GET", "/api/v1/workflows"): "read",
+    ("GET", "/api/v1/workflows/{name}"): "read",
+    ("PUT", "/api/v1/workflows/{name}"): "admin",
+    ("DELETE", "/api/v1/workflows/{name}"): "admin",
+    ("GET", "/api/v1/workflows/{name}/versions"): "read",
+    ("POST", "/api/v1/workflows/{name}/validate"): "read",
+    ("POST", "/api/v1/workflows/{name}/publish"): "admin",
+    ("POST", "/api/v1/workflows/{name}/revert"): "admin",
 }
 
 
