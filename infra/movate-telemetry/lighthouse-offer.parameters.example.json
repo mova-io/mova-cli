@@ -1,0 +1,27 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "_comment": [
+        "Example parameter values for lighthouse-offer.json. Customer-side use.",
+        "Replace the two GUID placeholders with the values Movate sends you:",
+        "  - movateTenantId      : Movate's Entra tenant ID.",
+        "  - movateApplicationId : the Movate Managed Grafana MI's object ID.",
+        "Both come from the outputs of `az deployment group show` against the",
+        "managed-grafana.bicep deployment in Movate's subscription — see",
+        "docs/movate-telemetry-onboarding.md."
+    ],
+    "parameters": {
+        "mspOfferName": {
+            "value": "Movate Product Telemetry (read-only)"
+        },
+        "mspOfferDescription": {
+            "value": "Grants Movate's Managed Grafana managed identity Monitoring Reader on this resource group's Log Analytics workspace so Movate can render fleet dashboards (metrics + span metadata only; no prompts, no PII). Per ADR 039."
+        },
+        "movateTenantId": {
+            "value": "00000000-0000-0000-0000-000000000000"
+        },
+        "movateApplicationId": {
+            "value": "00000000-0000-0000-0000-000000000000"
+        }
+    }
+}
