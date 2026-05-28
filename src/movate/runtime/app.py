@@ -114,7 +114,12 @@ from movate.runtime.schemas import (
     AgentCatalogItemView,
     AgentCatalogView,
     AgentCommitView,
+    AgentCreateAccepted,
+    AgentCreateCatalogRequest,
     AgentCreatedView,
+    AgentCreateLlmRequest,
+    AgentCreateSpecRequest,
+    AgentCreateWizardRequest,
     AgentDatasetInfo,
     AgentDatasetUploadView,
     AgentDeletedView,
@@ -215,6 +220,7 @@ from movate.runtime.schemas import (
     TriggerCreateRequest,
     TriggerListView,
     TriggerView,
+    UnifiedAgentCreatedView,
     WizardAgentSubmission,
     WorkflowRunListView,
     WorkflowRunView,
@@ -223,6 +229,12 @@ from movate.runtime.schemas import (
 from movate.runtime.skill_creation import (
     SkillCreationError,
     persist_skill_bundle,
+)
+from movate.runtime.unified_create import (
+    attach_to_project,
+    clone_from_catalog,
+    llm_authoring_stream,
+    spec_to_bundle_files,
 )
 from movate.storage.base import StorageProvider
 from movate.tracing import inject_current_trace_context, record_audit_event
@@ -579,6 +591,186 @@ async def _dual_write_agent_to_registry(
             exc_info=True,
         )
         return None
+
+
+async def _unified_create_persist_and_attach(
+    request: Request,
+    files: dict[str, bytes],
+    *,
+    project_id: str,
+    source: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Shared tail for spec / wizard / catalog sources.
+
+    Persists ``files`` to ``agents_path``, refreshes the in-memory
+    registry, dual-writes to the durable registry, and attaches to
+    ``project_id``. Returns the unified response view.
+
+    Pure factoring — every byte that lands on disk goes through the
+    same persist / publish / scan path the canonical endpoints use.
+    """
+    result = persist_bundle(files, agents_path=agents_path)
+    request.app.state.agents = scan_agents(agents_path)
+    store: StorageProvider = request.app.state.storage
+    published = await _dual_write_agent_to_registry(
+        store,
+        result.agent_dir,
+        tenant_id=ctx.tenant_id,
+        version=result.bundle.spec.version,
+        created_by=ctx.api_key_id,
+    )
+    attachment = await attach_to_project(
+        store,
+        project_id=project_id,
+        agent_name=result.bundle.spec.name,
+        tenant_id=ctx.tenant_id,
+    )
+    return UnifiedAgentCreatedView(
+        source=source,  # type: ignore[arg-type]
+        project_id=project_id,
+        agent_name=result.bundle.spec.name,
+        version=result.bundle.spec.version,
+        description=result.bundle.spec.description,
+        agent_dir=result.agent_dir.name,
+        files_persisted=result.files_persisted,
+        published_version=published.version if published is not None else None,
+        changed=published.published if published is not None else True,
+        attached=attachment.attached,
+    )
+
+
+async def _unified_create_spec(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Handle ``source: "spec"`` — translate spec JSON → bundle bytes."""
+    try:
+        req = AgentCreateSpecRequest.model_validate(body_dict)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'spec' request body: {exc}",
+            status_code=422,
+        ) from exc
+    files = spec_to_bundle_files(req)
+    return await _unified_create_persist_and_attach(
+        request,
+        files,
+        project_id=project_id,
+        source="spec",
+        ctx=ctx,
+        agents_path=agents_path,
+    )
+
+
+async def _unified_create_wizard(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Handle ``source: "wizard"`` — re-parse the wizard_form through
+    the canonical WizardAgentSubmission model and run the same
+    translation the existing /agents/from-wizard endpoint uses."""
+    try:
+        req = AgentCreateWizardRequest.model_validate(body_dict)
+        wizard_submission = WizardAgentSubmission.model_validate(req.wizard_form)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'wizard' request body: {exc}",
+            status_code=422,
+        ) from exc
+    files = wizard_to_bundle_files(wizard_submission)
+    return await _unified_create_persist_and_attach(
+        request,
+        files,
+        project_id=project_id,
+        source="wizard",
+        ctx=ctx,
+        agents_path=agents_path,
+    )
+
+
+async def _unified_create_catalog(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Handle ``source: "catalog"`` — clone-and-decouple from the
+    agent catalog."""
+    try:
+        req = AgentCreateCatalogRequest.model_validate(body_dict)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'catalog' request body: {exc}",
+            status_code=422,
+        ) from exc
+    store: StorageProvider = request.app.state.storage
+    cloned = await clone_from_catalog(store, req=req, tenant_id=ctx.tenant_id)
+    return await _unified_create_persist_and_attach(
+        request,
+        cloned.files,
+        project_id=project_id,
+        source="catalog",
+        ctx=ctx,
+        agents_path=agents_path,
+    )
+
+
+async def _unified_create_llm(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> Any:
+    """Handle ``source: "llm"`` — async pipeline, returns 202 +
+    stream_url. The SSE pipeline COMPOSES scaffold-preview / KB
+    ingest / eval-gen / judge-engineer; missing upstreams emit
+    ``stage_skipped`` events rather than failing the whole job.
+
+    We mint a ``job_id`` synchronously and return it immediately
+    so the caller can subscribe to the SSE stream. The stream
+    itself is served by ``GET /api/v1/projects/{project_id}/agents/
+    create-stream/{job_id}`` (see route below).
+    """
+    try:
+        req = AgentCreateLlmRequest.model_validate(body_dict)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'llm' request body: {exc}",
+            status_code=422,
+        ) from exc
+    job_id = str(uuid4())
+    # Cache the request on app.state so the SSE GET can pick it up.
+    # In a multi-replica deploy this would go through storage; for the
+    # local-serve + single-pod case the in-memory cache is enough.
+    pending: dict[str, dict[str, Any]] = (
+        getattr(request.app.state, "_pending_llm_create", None) or {}
+    )
+    pending[job_id] = {
+        "req": req,
+        "project_id": project_id,
+        "tenant_id": ctx.tenant_id,
+        "agents_path": str(agents_path),
+    }
+    request.app.state._pending_llm_create = pending
+    base_url = str(request.base_url).rstrip("/")
+    return JSONResponse(
+        status_code=202,
+        content=AgentCreateAccepted(
+            job_id=job_id,
+            status_url=f"{base_url}/jobs/{job_id}",
+            stream_url=(f"{base_url}/api/v1/projects/{project_id}/agents/create-stream/{job_id}"),
+        ).model_dump(mode="json"),
+    )
 
 
 def _normalize_if_match(raw: str) -> str:
@@ -2100,6 +2292,221 @@ def build_app(
             published_version=published.version if published is not None else None,
             changed=published.published if published is not None else True,
         )
+
+    # ------------------------------------------------------------------
+    # Unified agent-creation surface (ADR 042 — Bundle Composer +
+    # additive convenience layer for Mova iO Angular).
+    #
+    # Single dispatcher endpoint that routes to one of five existing
+    # creation paths based on a discriminated-union JSON body OR a
+    # multipart upload. Every legacy endpoint
+    # (POST /agents, /agents/from-wizard, etc.) continues to work
+    # byte-for-byte — this endpoint COMPOSES them, never replaces.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/projects/{project_id}/agents",
+        tags=["agents-v1", "projects-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_agent_unified(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        # Multipart-form fields — populated by FastAPI ONLY when the
+        # Content-Type is multipart/form-data. JSON bodies pass through
+        # all-None defaults; we re-read the raw body below for those.
+        agent_yaml: UploadFile | None = File(default=None),
+        prompt: UploadFile | None = File(default=None),
+        input_schema: UploadFile | None = File(default=None),
+        output_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        contexts: list[UploadFile] = File(default=[]),
+        kb: list[UploadFile] = File(default=[]),
+        bundle: UploadFile | None = File(default=None),
+    ) -> Any:
+        """Unified create — five sources, one route.
+
+        Routes internally to the right pipeline based on either:
+
+        * **multipart/form-data** → ``source: "bundle"`` path
+          (same code the canonical ``POST /api/v1/agents`` runs).
+        * **application/json** → parse the body's ``source``
+          discriminator and dispatch:
+
+          - ``source: "spec"`` → spec JSON → bundle bytes →
+            ``persist_bundle``.
+          - ``source: "wizard"`` → ``wizard_to_bundle_files`` →
+            ``persist_bundle`` (identical to ``POST /agents/from-wizard``).
+          - ``source: "llm"`` → 202 + ``stream_url`` SSE pipeline.
+          - ``source: "catalog"`` → catalog lookup → unpack →
+            apply overrides → ``persist_bundle``.
+
+        All sync paths attach the freshly-persisted agent to
+        ``project_id`` via the storage Protocol's
+        ``attach_agent_to_project`` method when present. When the
+        projects-storage layer isn't yet deployed, the response
+        carries ``attached=false`` and the endpoint still returns
+        200 — the agent IS persisted regardless.
+
+        Errors:
+
+        * **400** — both multipart bytes and JSON body supplied
+        * **404** — project doesn't exist (when projects-storage rejects)
+        * **422** — JSON body fails discriminated-union parse OR
+          bundle fails validation
+        * **503** — required upstream pipeline not deployed (catalog
+          read API; llm-source preserves the SSE pipeline and emits
+          ``stage_skipped`` instead)
+        """
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/projects/{project_id}/agents is unavailable",
+                status_code=503,
+            )
+
+        content_type = (request.headers.get("content-type") or "").lower()
+        is_multipart = content_type.startswith("multipart/")
+
+        # ---- multipart path → source: "bundle" ----
+        if is_multipart:
+            files = await _collect_bundle_files(
+                agent_yaml=agent_yaml,
+                prompt=prompt,
+                input_schema=input_schema,
+                output_schema=output_schema,
+                dataset=dataset,
+                bundle=bundle,
+                contexts=contexts,
+                kb=kb,
+            )
+            # Reuse the same skills-split logic the canonical endpoint
+            # uses — keeps the on-disk shape identical.
+            agent_files, skills_per_name = split_skills_from_bundle(files)
+            if skills_per_name:
+                skills_path: Path | None = request.app.state.skills_path
+                if skills_path is None:
+                    raise AgentCreationError(
+                        "bundle ships skills/ entries but the runtime "
+                        "was built without a skills_path",
+                        status_code=503,
+                    )
+                for skill_name, skill_files in skills_per_name.items():
+                    if "skill.yaml" not in skill_files:
+                        continue
+                    persist_skill_bundle(skill_files, skills_path=skills_path)
+                    _ = skill_name
+            result = persist_bundle(agent_files, agents_path=agents_path)
+            request.app.state.agents = scan_agents(agents_path)
+            store: StorageProvider = request.app.state.storage
+            published = await _dual_write_agent_to_registry(
+                store,
+                result.agent_dir,
+                tenant_id=ctx.tenant_id,
+                version=result.bundle.spec.version,
+                created_by=ctx.api_key_id,
+            )
+            attachment = await attach_to_project(
+                store,
+                project_id=project_id,
+                agent_name=result.bundle.spec.name,
+                tenant_id=ctx.tenant_id,
+            )
+            return UnifiedAgentCreatedView(
+                source="bundle",
+                project_id=project_id,
+                agent_name=result.bundle.spec.name,
+                version=result.bundle.spec.version,
+                description=result.bundle.spec.description,
+                agent_dir=result.agent_dir.name,
+                files_persisted=result.files_persisted,
+                published_version=published.version if published is not None else None,
+                changed=published.published if published is not None else True,
+                attached=attachment.attached,
+            )
+
+        # ---- JSON path → parse discriminator ----
+        try:
+            raw_body = await request.body()
+            if not raw_body:
+                raise AgentCreationError(
+                    "POST /api/v1/projects/{project_id}/agents requires "
+                    "either multipart/form-data or a JSON body",
+                    status_code=400,
+                )
+            body_dict = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise AgentCreationError(
+                f"could not parse JSON body: {exc}",
+                status_code=422,
+            ) from exc
+
+        source = body_dict.get("source")
+        if source == "spec":
+            return await _unified_create_spec(request, body_dict, project_id, ctx, agents_path)
+        if source == "wizard":
+            return await _unified_create_wizard(request, body_dict, project_id, ctx, agents_path)
+        if source == "llm":
+            return await _unified_create_llm(request, body_dict, project_id, ctx, agents_path)
+        if source == "catalog":
+            return await _unified_create_catalog(request, body_dict, project_id, ctx, agents_path)
+        raise AgentCreationError(
+            f"unknown ``source``: {source!r}; expected one of "
+            "'bundle' (multipart), 'spec', 'wizard', 'llm', 'catalog'",
+            status_code=422,
+        )
+
+    @v1.get(
+        "/projects/{project_id}/agents/create-stream/{job_id}",
+        tags=["agents-v1", "projects-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_agent_llm_stream(
+        project_id: str,
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> StreamingResponse:
+        """SSE stream for the ``source: "llm"`` async authoring pipeline.
+
+        The 202 response from the POST endpoint carries the
+        ``stream_url`` pointing here; the caller subscribes
+        immediately to receive ``stage_*`` events as each pipeline
+        stage runs. When the request's job_id isn't in the pending
+        queue, returns 404 — the caller raced past the cache or the
+        runtime restarted.
+        """
+        pending: dict[str, dict[str, Any]] = (
+            getattr(request.app.state, "_pending_llm_create", None) or {}
+        )
+        entry = pending.pop(job_id, None)
+        if entry is None:
+            raise not_found("llm-create job", job_id)
+
+        # Enforce tenant + project scope: the cached entry must match the
+        # path params and auth context.
+        if entry.get("tenant_id") != ctx.tenant_id:
+            raise not_found("llm-create job", job_id)
+        if entry.get("project_id") != project_id:
+            raise not_found("llm-create job", job_id)
+
+        req: AgentCreateLlmRequest = entry["req"]
+        agents_path_str: str = entry["agents_path"]
+        store: StorageProvider = request.app.state.storage
+
+        async def _stream() -> Any:
+            async for frame in llm_authoring_stream(
+                req=req,
+                project_id=project_id,
+                job_id=job_id,
+                storage=store,
+                agents_path=Path(agents_path_str) if agents_path_str else None,
+                tenant_id=ctx.tenant_id,
+            ):
+                yield frame
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
 
     @v1.post(
         "/skills",
