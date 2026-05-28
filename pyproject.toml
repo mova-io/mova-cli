@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.27.39"
+version = "2026.5.28.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -249,6 +249,28 @@ playground = [
     # explicitly listed.
     "httpx>=0.27",
 ]
+graph-dash = [
+    # Python-native knowledge-graph viewer (viz bake-off). `mdk graph
+    # serve-dash` launches a Dash app that renders the graph the runtime's
+    # graph API serves via dash-cytoscape — no JavaScript is authored.
+    #
+    # These are HEAVY (Dash pulls Flask + plotly + a bundled JS runtime;
+    # dash-cytoscape ships the Cytoscape.js bundle), so they're OPT-IN here
+    # and never in core. Same posture as the [playground] (chainlit) extra.
+    # The command import-guards on the extra and prints a friendly install
+    # hint + exits cleanly when it's absent.
+    #
+    # dash, dash-cytoscape, and plotly are all MIT-licensed (permissive,
+    # passes scripts/check_licenses.py). This extra is NOT in the gate's
+    # SHIPPED_EXTRAS — same as anthropic/openai/playground — so it isn't
+    # policed as part of the default deliverable; an operator opts in.
+    "dash>=2.14,<4",
+    "dash-cytoscape>=1.0,<2",
+    # httpx is the synchronous HTTP client the Dash server uses to call the
+    # graph API (Dash callbacks are sync). Transitive via Dash's Flask in
+    # practice, but listed explicitly so a standalone viewer install has it.
+    "httpx>=0.27",
+]
 
 [dependency-groups]
 dev = [
@@ -361,6 +383,12 @@ module = [
     "asyncpg.*",
     "pgvector.*",
     "chainlit.*",
+    # Optional knowledge-graph viewer extra ([graph-dash]) — no type stubs.
+    # Imported at top level only in movate.cli.graph_dash_app, which is itself
+    # imported LAZILY after the extra is confirmed present, so the base install
+    # (and mypy on `src`) stays clean whether or not the extra is installed.
+    "dash.*",
+    "dash_cytoscape.*",
     "readability.*",
     "bs4.*",
     # Pillow ships type stubs in a separate `types-Pillow` package; the
@@ -417,6 +445,13 @@ module = [
     # the grandfather list keeps strict-mode on the rest of the
     # codebase while letting Chainlit's untyped decorators work.
     "movate.playground.app",
+    # Same posture for the Dash knowledge-graph viewer app ([graph-dash]
+    # extra): dash/dash-cytoscape ship no type stubs, and the module is a
+    # thin glue layer over dash's untyped ``@app.callback`` decorators
+    # (which mypy reports as untyped-decorator). Strict-mode stays on for
+    # the pure adapter (movate.core.graph.cytoscape_format) + the command
+    # (movate.cli.graph_dash_cmd), which carry no dash types.
+    "movate.cli.graph_dash_app",
     "movate.knowledge.loader",
     "movate.snapshot.manifest",
     "movate.templates.calc_agent.skills.calculator.impl",
