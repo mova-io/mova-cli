@@ -144,6 +144,7 @@ from movate.cli import (  # noqa: E402
     _console,
     add_cmd,
     audit_cmd,
+    audit_llm_cmd,
     compose_cmd,
     demo_cmd,
     dev_cmd,
@@ -603,6 +604,10 @@ app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
 app.command("migrate-state", rich_help_panel=PANEL_MANAGE)(migrate_state_cmd.migrate_state)
 app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
+# ``mdk audit-llm`` is the runtime client for the Claude-orchestrated audit
+# endpoint (read-only). Distinct sub-app rather than a flag on ``mdk audit``
+# to keep the static-scanner audit's CLI surface unchanged + back-compat.
+app.add_typer(audit_llm_cmd.audit_llm_app, name="audit-llm", rich_help_panel=PANEL_MANAGE)
 app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
 # `agent` surfaces the durable agent registry's version history + rollback

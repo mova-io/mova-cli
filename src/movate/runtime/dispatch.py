@@ -119,6 +119,8 @@ class WorkerDispatch:
                 return await self._execute_eval(job)
             if job.kind == JobKind.BENCH:
                 return await self._execute_bench(job)
+            if job.kind == JobKind.AUDIT:
+                return await self._execute_audit(job)
             return _error(
                 "unknown_kind",
                 f"unsupported JobKind {job.kind!r}",
@@ -598,6 +600,101 @@ class WorkerDispatch:
         return DispatchOutcome(
             status=JobStatus.SUCCESS,
             result_run_id=record.bench_id,
+            error=None,
+        )
+
+    async def _execute_audit(self, job: JobRecord) -> DispatchOutcome:
+        """Run an async Claude-orchestrated audit job (read-only).
+
+        ``job.input`` carries the audit configuration dict (the same
+        fields as :class:`movate.runtime.schemas.AuditRequest` plus
+        ``scope_kind`` / ``scope_id``). The completed
+        :class:`AuditRecord` is persisted via storage; ``result_run_id``
+        is set to the ``audit_id`` so callers can retrieve it via
+        ``GET /api/v1/audits/{audit_id}``.
+
+        Read-only invariant: the worker dispatch path NEVER calls
+        ``save_agent_bundle`` / ``save_kb_chunk`` / ``save_eval`` /
+        etc. on this code path. The only write is the terminal
+        ``save_audit``. ``test_audit_does_not_modify_agent`` pins this
+        on InMemory storage.
+        """
+        from movate.core.auditor import Auditor  # noqa: PLC0415
+        from movate.core.models import AuditFindingSeverity  # noqa: PLC0415
+
+        cfg = job.input
+        scope_kind = str(cfg.get("scope_kind", "agent"))
+        scope_id = str(cfg.get("scope_id", job.target))
+        categories = cfg.get("categories")
+        if categories is not None and not isinstance(categories, list):
+            categories = None
+        severity_raw = str(cfg.get("severity_floor", "info")).lower()
+        try:
+            severity_floor = AuditFindingSeverity(severity_raw)
+        except ValueError:
+            severity_floor = AuditFindingSeverity.INFO
+        model = str(cfg.get("model") or "openai/gpt-4o-mini")
+        budget_usd = float(cfg.get("budget_usd", 0.0))
+
+        # The auditor consumes the BaseLLMProvider Protocol — use Mock
+        # for hermetic / mocked tests, LiteLLM otherwise. Reuses the
+        # exact same provider-selection policy as the eval/bench paths.
+        if self._use_mock_for_eval or bool(cfg.get("mock", False)):
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        auditor = Auditor(
+            provider=provider,
+            storage=self._storage,
+            model=model,
+            budget_usd=budget_usd,
+            severity_floor=severity_floor,
+        )
+
+        try:
+            if scope_kind == "project":
+                # Project-scoped audit fans out across every agent the
+                # tenant has access to. We use the worker's local fallback
+                # bundle list (the same list resolve_agent_bundle reads)
+                # so the project audit composes with the existing
+                # registry plumbing without a new storage seam.
+                bundles = list(self._agents_fallback)
+                record = await auditor.audit_project(
+                    bundles=bundles,
+                    project_id=scope_id,
+                    tenant_id=job.tenant_id,
+                    categories=categories,
+                )
+            else:
+                bundle = await self._resolve_bundle(job)
+                if bundle is None:
+                    return _error(
+                        "unknown_agent",
+                        f"agent {job.target!r} not registered for "
+                        f"tenant {job.tenant_id!r}",
+                        retryable=False,
+                    )
+                record = await auditor.audit_agent(
+                    bundle=bundle,
+                    tenant_id=job.tenant_id,
+                    categories=categories,
+                )
+        except Exception as exc:
+            logger.exception("audit_execute_unhandled job_id=%s", job.job_id)
+            return _error("internal", str(exc), retryable=True)
+
+        await self._storage.save_audit(record)
+        # ``result_run_id`` mirrors the eval/bench convention: the
+        # generic "result identifier" field carries the audit_id so the
+        # API contract for GET /api/v1/audits/{audit_id} is uniform.
+        return DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id=record.audit_id,
             error=None,
         )
 

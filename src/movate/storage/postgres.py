@@ -35,6 +35,9 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
+    AuditFinding,
+    AuditFindingSeverity,
+    AuditRecord,
     BatchRecord,
     BenchModelResult,
     BenchRecord,
@@ -209,6 +212,27 @@ CREATE TABLE IF NOT EXISTS bench (
 );
 CREATE INDEX IF NOT EXISTS idx_bench_agent_created
     ON bench(agent, created_at DESC);
+
+-- Claude-orchestrated audit records (read-only audit pipeline). Findings +
+-- categories are JSONB. One immutable row per terminal audit, tenant-scoped
+-- at the row level. Additive + idempotent — backfill not needed.
+CREATE TABLE IF NOT EXISTS audits (
+    audit_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    scope_kind      TEXT NOT NULL,
+    scope_id        TEXT NOT NULL,
+    categories      JSONB NOT NULL,
+    severity_floor  TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    budget_usd      DOUBLE PRECISION NOT NULL,
+    findings        JSONB NOT NULL,
+    partial         BOOLEAN NOT NULL DEFAULT FALSE,
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audits_scope_created
+    ON audits(tenant_id, scope_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_run_id   TEXT PRIMARY KEY,
@@ -1227,6 +1251,67 @@ class PostgresProvider:
         sql = f"SELECT * FROM bench {where} ORDER BY created_at DESC LIMIT ${len(params)}"
         rows = await self._db.fetch(sql, *params)
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Audit records (Claude-orchestrated read-only audit pipeline). See
+    # base.py for the read-only contract — this provider's writes are
+    # gated to ``save_audit`` only.
+    # ------------------------------------------------------------------
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO audits (
+                audit_id, tenant_id, scope_kind, scope_id, categories,
+                severity_floor, model, budget_usd, findings, partial,
+                tokens_used, cost_usd, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+            )
+            """,
+            a.audit_id,
+            a.tenant_id,
+            a.scope_kind,
+            a.scope_id,
+            a.categories,
+            a.severity_floor.value,
+            a.model,
+            a.budget_usd,
+            [f.model_dump() for f in a.findings],
+            a.partial,
+            a.tokens_used,
+            a.cost_usd,
+            a.created_at,
+        )
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM audits WHERE audit_id = $1 AND tenant_id = $2",
+            audit_id,
+            tenant_id,
+        )
+        return _row_to_audit(row) if row else None
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
+        if scope_id is not None:
+            params.append(scope_id)
+            clauses.append(f"scope_id = ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        sql = f"SELECT * FROM audits {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_audit(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Eval schedules (ADR 016 D2)
@@ -3160,6 +3245,24 @@ def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
         runs_per_model=row["runs_per_model"],
         gate_mode=row["gate_mode"],
         models=[BenchModelResult.model_validate(m) for m in row["models"]],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_audit(row: asyncpg.Record) -> AuditRecord:
+    return AuditRecord(
+        audit_id=row["audit_id"],
+        tenant_id=row["tenant_id"],
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        categories=list(row["categories"]),
+        severity_floor=AuditFindingSeverity(row["severity_floor"]),
+        model=row["model"],
+        budget_usd=float(row["budget_usd"]),
+        findings=[AuditFinding.model_validate(f) for f in row["findings"]],
+        partial=bool(row["partial"]),
+        tokens_used=int(row["tokens_used"]),
+        cost_usd=float(row["cost_usd"]),
         created_at=row["created_at"],
     )
 

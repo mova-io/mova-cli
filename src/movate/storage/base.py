@@ -31,6 +31,7 @@ from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
+    AuditRecord,
     BatchRecord,
     BenchRecord,
     CanaryConfig,
@@ -82,6 +83,38 @@ class StorageProvider(Protocol):
     async def save_eval(self, e: EvalRecord) -> None: ...
 
     async def save_bench(self, b: BenchRecord) -> None: ...
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        """Persist a completed :class:`AuditRecord`.
+
+        Mirrors :meth:`save_eval` / :meth:`save_bench`: one immutable
+        row per terminal audit, keyed by ``audit_id``, tenant-scoped at
+        the row level. The Claude-orchestrated audit pipeline is the
+        ONLY caller of this method — it is intentionally not exposed
+        on the HTTP write surface (the audit is read-only by
+        construction; the *findings* are the only thing that lands
+        durably, and they land here)."""
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        """Exact lookup by ``audit_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the audit belongs to a
+        different tenant — same no-leak contract as :meth:`get_eval`."""
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        """List audits newest-first, optionally filtered.
+
+        ``scope_id`` narrows to one agent name or project id — set when
+        a caller wants "all audits for this agent". ``tenant_id=None``
+        returns audits across all tenants — operator tooling only,
+        never exposed on the HTTP API.
+        """
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None: ...
 

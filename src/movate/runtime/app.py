@@ -113,6 +113,9 @@ from movate.runtime.request_context import (
 from movate.runtime.schemas import (
     AgentCatalogItemView,
     AgentCatalogView,
+    AuditAcceptedView,
+    AuditJobView,
+    AuditRequest,
     AgentCommitView,
     AgentCreatedView,
     AgentDatasetInfo,
@@ -362,6 +365,131 @@ async def _sse_run_stream(
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+async def _sse_audit_job_stream(
+    *,
+    store: StorageProvider,
+    job: JobRecord,
+    tenant_id: str,
+) -> Any:
+    """SSE generator for a Claude-orchestrated audit job.
+
+    Audit jobs run on the worker dispatch path; this stream is a
+    *polling-based* progress bridge — it polls the job + the
+    associated :class:`AuditRecord` and emits SSE events as the worker
+    drives the audit forward. The category fan-out happens inside the
+    worker; the runtime side stays purely read-only.
+
+    Two modes:
+
+    * **Live**: the job is still queued/running when the client subscribes.
+      The generator polls the job at a fixed cadence and emits
+      ``category_complete`` events derived from the partial findings
+      the worker writes as it progresses (the auditor accumulates
+      findings before persisting them as one final ``AuditRecord``, so
+      the partial-progress signal in v1 is coarse — we emit a single
+      ``agent_complete`` event when the job hits SUCCESS and the final
+      ``completed`` frame from the AuditRecord).
+    * **Already terminal**: the job is already in a terminal state when
+      the client subscribes. The generator emits the final
+      ``agent_complete`` + ``completed`` events immediately + closes,
+      so SSE replay never blocks.
+
+    Failure: a terminal job with ``status=error`` emits a single
+    ``error`` SSE frame + closes — the client can still poll
+    ``GET /api/v1/jobs/{job_id}`` for the structured error payload.
+
+    The v1 progress granularity is a known limitation: the worker side
+    doesn't expose a writable progress channel to the API pod (no
+    pub/sub bus today), so cross-pod live ``category_complete`` events
+    are deferred to a future PR that pairs the dispatch path with a
+    redis/notify bus. The wire shape ships now so callers don't have
+    to migrate later.
+    """
+    poll_interval = 0.5  # seconds between job status checks (live mode)
+    max_polls = 240  # cap at ~2 minutes; an audit longer than that is unusual
+
+    polls = 0
+    while polls < max_polls:
+        record = await store.get_job(job.job_id, tenant_id=tenant_id)
+        if record is None:
+            # Job vanished between subscribe + first poll → emit an error
+            # and close. Defensive against a (highly unusual) DELETE.
+            yield _sse_frame("error", {"message": "job_disappeared", "code": "not_found"})
+            return
+        if record.status == JobStatus.SUCCESS:
+            # Terminal SUCCESS — emit the final agent_complete + completed
+            # frames from the persisted AuditRecord.
+            audit_id = record.result_run_id
+            audit_record = None
+            if audit_id:
+                audit_record = await store.get_audit(audit_id, tenant_id=tenant_id)
+            if audit_record is not None:
+                # One ``category_complete`` event per actually-run category
+                # so client-side counters increment as expected. Order
+                # follows AuditRecord.categories (the auditor stamps the
+                # declared order at construction).
+                running_count = 0
+                by_cat: dict[str, int] = {}
+                for f in audit_record.findings:
+                    by_cat[f.category] = by_cat.get(f.category, 0) + 1
+                for cat in audit_record.categories:
+                    running_count += by_cat.get(cat, 0)
+                    yield _sse_frame(
+                        "category_complete",
+                        {
+                            "category": cat,
+                            "findings_so_far": running_count,
+                        },
+                    )
+                yield _sse_frame(
+                    "agent_complete",
+                    {
+                        "agent_name": audit_record.scope_id,
+                        "findings_for_agent": len(audit_record.findings),
+                    },
+                )
+                yield _sse_frame(
+                    "completed",
+                    {
+                        "total_findings": len(audit_record.findings),
+                        "cost_usd": audit_record.cost_usd,
+                        "partial": audit_record.partial,
+                    },
+                )
+            else:
+                # Job marked success but no audit record — shouldn't happen
+                # in practice (the worker writes both atomically). Emit a
+                # bare ``completed`` so the client still gets a terminal frame.
+                yield _sse_frame(
+                    "completed",
+                    {"total_findings": 0, "cost_usd": 0.0, "partial": True},
+                )
+            return
+        if record.status in (
+            JobStatus.ERROR,
+            JobStatus.SAFETY_BLOCKED,
+            JobStatus.DEAD_LETTER,
+            JobStatus.CANCELLED,
+        ):
+            err = record.error
+            yield _sse_frame(
+                "error",
+                {
+                    "message": err.message if err else "audit failed",
+                    "code": err.type if err else record.status.value,
+                },
+            )
+            return
+        # Still queued / running — wait and poll again.
+        await asyncio.sleep(poll_interval)
+        polls += 1
+    # Polling cap hit — emit a soft error so clients don't hang forever.
+    yield _sse_frame(
+        "error",
+        {"message": "audit_poll_timeout", "code": "timeout"},
+    )
 
 
 def _github_is_enabled() -> bool:
@@ -4381,6 +4509,203 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Claude-orchestrated audit endpoints (BACKLOG audit-llm).
+    #
+    # Read-only by construction (the dispatch path NEVER calls
+    # save_agent_bundle / save_kb_chunk / save_eval). Two POST endpoints
+    # (agent-scoped + project-scoped) enqueue a JobKind.AUDIT job;
+    # findings land in a separate AuditRecord retrievable via
+    # GET /api/v1/audits/{audit_id}. SSE progress lives on
+    # GET /api/v1/jobs/{job_id}/stream (audit-only — the standard job
+    # poll endpoint remains JobView for back-compat).
+    # ------------------------------------------------------------------
+
+    def _build_audit_status_urls(job_id: str) -> tuple[str, str]:
+        """Mirror the pattern used elsewhere — the response surfaces a
+        pre-built URL so the client doesn't reconstruct it. Versioned
+        prefix on both so they continue to work if the URL contract
+        evolves."""
+        return (
+            f"/api/v1/jobs/{job_id}",
+            f"/api/v1/jobs/{job_id}/stream",
+        )
+
+    @v1.post(
+        "/agents/{name}/audit/from-llm",
+        response_model=AuditAcceptedView,
+        status_code=202,
+        tags=["audit-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_audit_agent_from_llm(
+        name: str,
+        body: AuditRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuditAcceptedView:
+        """Kick off a read-only Claude-orchestrated audit of one agent.
+
+        Returns 202 + ``job_id`` immediately. Poll ``status_url`` or
+        stream ``stream_url`` for progress; once the job is terminal
+        with ``status=success``, fetch the rich findings from
+        ``GET /api/v1/audits/{job.result_run_id}``.
+
+        The audit is READ-ONLY: it never mutates the agent registry,
+        prompt, contexts, schemas, or eval dataset. A regression test
+        (``test_audit_does_not_modify_agent``) pins this on InMemory
+        storage.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == name), None)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        job = JobRecord(
+            job_id=f"audit_{uuid4().hex[:24]}",
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.AUDIT,
+            target=name,
+            input={
+                "scope_kind": "agent",
+                "scope_id": name,
+                "categories": body.categories,
+                "severity_floor": body.severity_floor.value,
+                "model": body.model,
+                "budget_usd": body.budget_usd,
+            },
+            api_key_id=ctx.api_key_id,
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        status_url, stream_url = _build_audit_status_urls(job.job_id)
+        return AuditAcceptedView(
+            job_id=job.job_id,
+            status="queued",
+            status_url=status_url,
+            stream_url=stream_url,
+        )
+
+    @v1.post(
+        "/projects/{project_id}/audit/from-llm",
+        response_model=AuditAcceptedView,
+        status_code=202,
+        tags=["audit-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_audit_project_from_llm(
+        project_id: str,
+        body: AuditRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuditAcceptedView:
+        """Kick off a read-only project-wide audit.
+
+        The auditor fans out across every agent the runtime knows about
+        and aggregates findings into one :class:`AuditRecord` keyed by
+        ``project_id``. ``cost_outliers`` is computed across the whole
+        project (mean + stddev), so cross-agent outliers are surfaced
+        in this scope but not in the per-agent scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        job = JobRecord(
+            job_id=f"audit_{uuid4().hex[:24]}",
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.AUDIT,
+            target=project_id,
+            input={
+                "scope_kind": "project",
+                "scope_id": project_id,
+                "categories": body.categories,
+                "severity_floor": body.severity_floor.value,
+                "model": body.model,
+                "budget_usd": body.budget_usd,
+            },
+            api_key_id=ctx.api_key_id,
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        status_url, stream_url = _build_audit_status_urls(job.job_id)
+        return AuditAcceptedView(
+            job_id=job.job_id,
+            status="queued",
+            status_url=status_url,
+            stream_url=stream_url,
+        )
+
+    @v1.get(
+        "/audits/{audit_id}",
+        response_model=AuditJobView,
+        tags=["audit-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_audit(
+        audit_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuditJobView:
+        """Retrieve the rich findings view of a completed audit.
+
+        Tenant-scoped at the storage layer (cross-tenant id probes
+        return 404, never 403) — same no-leak contract as
+        ``GET /api/v1/evals/{eval_id}``.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — no audit record matches the id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_audit(audit_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("audit", audit_id)
+        return AuditJobView.from_record(record)
+
+    @v1.get(
+        "/jobs/{job_id}/stream",
+        # No response_model — SSE raw byte stream. OpenAPI lists 200.
+        tags=["audit-v1", "jobs"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_audit_job_stream(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Any:
+        """Stream audit progress over Server-Sent Events.
+
+        Audit-only: a non-audit job returns 404 here (the stream wire
+        is category-specific). Events:
+
+        * ``category_complete`` — fired after each per-category
+          sub-agent returns, with ``findings_so_far`` running total.
+        * ``agent_complete`` — fired after every category for one agent
+          has run (always once on the agent path; one per agent on the
+          project path).
+        * ``completed`` — terminal frame with ``total_findings`` +
+          ``cost_usd``.
+
+        The stream emits progress against the WORKER's terminal
+        ``save_audit`` call: if the job is already terminal when the
+        client subscribes, the stream replays the final state + closes.
+        """
+        store: StorageProvider = request.app.state.storage
+        job = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        if job is None or job.kind != JobKind.AUDIT:
+            raise not_found("audit_job", job_id)
+
+        generator = _sse_audit_job_stream(store=store, job=job, tenant_id=ctx.tenant_id)
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+        )
 
     # ------------------------------------------------------------------
     # Aggregate monitor feed (ADR 032 D2). Two read-scoped endpoints that

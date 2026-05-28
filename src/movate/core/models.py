@@ -2147,6 +2147,127 @@ class BenchRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Audit records — Claude-orchestrated read-only audit of an agent / project
+# (BACKLOG ``audit-llm``). Stored alongside the other terminal records
+# (Eval/Bench) so the wire shape mirrors them: the queue carries the
+# JobRecord, the terminal artifact is a separate ``AuditRecord`` keyed by
+# ``audit_id`` and fetched via GET /api/v1/audits/{audit_id}.
+#
+# Read-only invariant: the auditor only READS the agent bundle, KB chunks,
+# and run history. It NEVER calls save_agent_bundle / save_kb_chunk /
+# save_eval / etc. — enforced by the dispatch wiring (no mutating storage
+# calls from inside the dispatch path beyond persisting the AuditRecord
+# itself).
+# ---------------------------------------------------------------------------
+
+
+class AuditFindingSeverity(StrEnum):
+    """Severity ladder for an audit finding. Ordered low → high so the
+    severity-floor filter is a simple ``>=`` comparison.
+    """
+
+    INFO = "info"
+    WARN = "warn"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class AuditFindingLocation(BaseModel):
+    """Where a finding is anchored in an agent's source.
+
+    ``kind`` is a discriminator the renderer uses to format the jump-hint:
+    ``prompt_line`` → ``prompt.md:<line>``; ``schema_path`` → ``schema/<file>:<json_pointer>``;
+    ``dataset_row`` → ``evals/dataset.jsonl:<row>``; ``yaml_field`` → ``agent.yaml:<dotted.path>``;
+    ``kb_chunk`` → ``kb/<source>#<chunk_id>``. ``None`` for findings that
+    aren't anchored to a specific spot (e.g. project-wide cost outliers).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    line: int | None = None
+    path: str | None = None
+    """JSON pointer / dotted YAML path / source URI, depending on ``kind``."""
+    chunk_id: str | None = None
+
+
+class AuditFinding(BaseModel):
+    """One typed, severity-classified audit finding.
+
+    Read-only output of the per-category sub-agent. The Auditor never
+    mutates anything; findings are *advisory* — operators decide whether
+    to act on them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    """Stable per-audit id (``f1``, ``f2``, ...) so callers can reference one
+    finding in follow-up workflows."""
+    category: str
+    """One of the seven categories the Auditor ships (see
+    :mod:`movate.core.auditor`): ``ambiguous_prompts``, ``missing_eval_coverage``,
+    ``security_smells``, ``cost_outliers``, ``kb_quality``, ``schema_drift``,
+    ``model_choice``. Open vocabulary so future categories slot in additively."""
+    severity: AuditFindingSeverity
+    agent_name: str
+    """Which agent the finding is scoped to. For project-wide findings that
+    don't belong to one agent, the Auditor stamps this with ``"<project>"``
+    so the wire stays uniform."""
+    location: AuditFindingLocation | None = None
+    title: str
+    description: str
+    suggestion: str
+    """One-line operator-facing remediation suggestion. ALWAYS advisory —
+    never an auto-applied fix."""
+    confidence: str = "medium"
+    """``low`` | ``medium`` | ``high`` — the sub-agent's self-rated
+    confidence. Used by the CLI to grey out low-confidence findings on the
+    default rendering."""
+
+
+class AuditRecord(BaseModel):
+    """Persisted summary of one Claude-orchestrated audit job.
+
+    Mirrors :class:`EvalRecord` / :class:`BenchRecord` in shape so the
+    storage layer treats audit results identically (one immutable row
+    per terminal audit, tenant-scoped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    audit_id: str
+    tenant_id: str
+    scope_kind: str
+    """``"agent"`` for an agent-scoped audit, ``"project"`` for a project-wide
+    audit. Discriminator paired with :attr:`scope_id`."""
+    scope_id: str
+    """The agent name (when ``scope_kind == "agent"``) or the project id
+    (when ``scope_kind == "project"``)."""
+    categories: list[str]
+    """The categories the auditor was asked to run (after request validation
+    + default-fill). Stored so the GET endpoint can echo it back."""
+    severity_floor: AuditFindingSeverity = AuditFindingSeverity.INFO
+    """Findings below this floor were filtered out before persistence."""
+    model: str
+    """The provider string the sub-agents ran against (e.g.
+    ``openai/gpt-4o-mini``). Stored for reproducibility."""
+    budget_usd: float = Field(0.0, ge=0)
+    """Server-side spend cap for the audit. ``0.0`` means "no cap" (the
+    submission left it unset)."""
+    findings: list[AuditFinding] = Field(default_factory=list)
+    """Severity-floored, deduplicated findings — the only mutating output of
+    the audit."""
+    partial: bool = False
+    """``True`` if the budget cap (or another short-circuit) fired before
+    every requested category completed. Callers can re-run the missing
+    categories explicitly when they have more budget."""
+    tokens_used: int = 0
+    cost_usd: float = 0.0
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
 # Durable agent registry (ADR 014 D1) — a published agent bundle persisted
 # as one immutable (name, version) row behind the StorageProvider Protocol.
 #
@@ -2226,6 +2347,16 @@ class JobKind(StrEnum):
     EVAL, ``result_run_id`` carries the produced ``bench_id`` so the
     caller can fetch the completed BenchRecord via
     GET /api/v1/bench/{bench_id}. See BACKLOG item 64."""
+    AUDIT = "audit"
+    """Async Claude-orchestrated audit (read-only). JobRecord.input carries
+    the audit config (categories, severity_floor, model, budget_usd, scope).
+    Worker loads the agent bundle(s), runs :class:`movate.core.auditor.Auditor`,
+    persists an :class:`AuditRecord`. ``result_run_id`` carries the produced
+    ``audit_id`` so callers fetch the rich finding list via
+    GET /api/v1/audits/{audit_id}. The dispatch path MUST NOT mutate the
+    agent registry, prompts, contexts, or eval datasets — read-only is
+    enforced by construction (the Auditor only reads + calls the
+    BaseLLMProvider; never invokes the storage save_agent / save_kb paths)."""
 
 
 class JobRecord(BaseModel):
