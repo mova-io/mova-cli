@@ -244,6 +244,52 @@ def test_spinner_silent_on_non_tty() -> None:
 
 
 @pytest.mark.unit
+def test_live_step_silent_on_non_tty() -> None:
+    """live_step is a strict no-op when stderr isn't a TTY — no spinner,
+    no timer, no ANSI — and the yielded handle is a working no-op whose
+    .update / .log do nothing (so call sites stay branch-free)."""
+    from io import StringIO  # noqa: PLC0415
+
+    from rich.console import Console  # noqa: PLC0415
+
+    from movate.cli._progress import live_step  # noqa: PLC0415
+
+    captured = StringIO()
+    fake_stderr = Console(file=captured, force_terminal=False, width=80)
+
+    with live_step("building image in ACR…", console=fake_stderr) as step:
+        # Handle must be callable and a no-op on non-TTY.
+        step.update("still building…")
+        step.log("layer 1/9: pulling base image\n")
+
+    assert captured.getvalue() == ""
+
+
+@pytest.mark.unit
+def test_live_step_streams_log_lines_on_tty() -> None:
+    """On a TTY, .log lines are printed (above the live region). We
+    force a terminal Console into a buffer to capture them — the timer
+    itself is transient so it clears, but logged lines persist."""
+    from io import StringIO  # noqa: PLC0415
+
+    from rich.console import Console  # noqa: PLC0415
+
+    from movate.cli._progress import live_step  # noqa: PLC0415
+
+    captured = StringIO()
+    fake_tty = Console(file=captured, force_terminal=True, width=80)
+
+    with live_step("building…", console=fake_tty) as step:
+        step.log("Step 1/9 : FROM python:3.11-slim\n")
+        step.update("pushing…")
+
+    out = captured.getvalue()
+    # The logged build line made it through; markup is disabled so a
+    # payload with brackets wouldn't be eaten as a Rich tag.
+    assert "FROM python:3.11-slim" in out
+
+
+@pytest.mark.unit
 def test_print_event_writes_to_stderr_console() -> None:
     """``print_event`` should write to the provided console.
 
