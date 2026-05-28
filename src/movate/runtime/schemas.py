@@ -29,6 +29,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.reporting import AgentRollup, FailingCase, LatencyPercentiles, Report
 
 
 class RunSubmission(BaseModel):
@@ -2686,3 +2687,212 @@ class ThreadMessageSubmission(BaseModel):
             "Same semantics as the standalone /run flow."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Aggregate monitor feed (ADR 032 D2) — the in-product "how are my agents
+# doing?" rollup the Mova iO front end renders. Wire mirror of the pure
+# ``movate.core.reporting.Report`` dataclass tree (the SAME aggregation
+# ``mdk report`` uses), wrapped in typed Pydantic so OpenAPI / the front-end's
+# generated client + the contract test stay rich. The runtime never imports
+# ``cli``; the shared rollup lives in ``core`` (``cli ⊥ runtime``).
+# ---------------------------------------------------------------------------
+
+
+class LatencyPercentilesView(BaseModel):
+    """p50 / p95 / p99 of run latency (ms) over the windowed runs.
+
+    ``None`` on every field when no run in scope carried a recorded
+    latency — distinguishes "no signal" from a genuine ``0`` so the
+    front end can render "N/A" rather than a misleading instant.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    p50: float | None = None
+    p95: float | None = None
+    p99: float | None = None
+    count: int = Field(0, description="How many runs contributed a latency sample.")
+
+    @classmethod
+    def from_dataclass(cls, lp: LatencyPercentiles) -> LatencyPercentilesView:
+        return cls(p50=lp.p50, p95=lp.p95, p99=lp.p99, count=lp.count)
+
+
+class ReportTotalsView(BaseModel):
+    """Cross-scope headline numbers for the windowed rollup."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runs: int
+    failed_runs: int
+    cost_usd: float
+    eval_runs: int
+    latest_pass_rate: float | None = Field(
+        None, description="Pass-rate of the single most recent eval run; null if none."
+    )
+    latency_ms: LatencyPercentilesView
+
+
+class AgentMetricsRollupView(BaseModel):
+    """Per-agent (or per-workflow) rollup row.
+
+    Pass-rate fields are ``null`` when the agent has no eval runs in the
+    window (cost / latency come from agent *runs*, which can exist without
+    any eval). Workflows surface here too — a workflow eval is persisted
+    under the workflow's name in the same column, so it groups transparently.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    runs: int
+    failed_runs: int
+    failure_rate: float = Field(..., description="failed_runs / runs (0 when no runs).")
+    total_cost_usd: float
+    mean_cost_usd: float = Field(..., description="total_cost_usd / runs (0 when no runs).")
+    latency_ms: LatencyPercentilesView
+    last_run_at: str = Field(
+        "", description="ISO-8601 timestamp of the most recent run; '' if none."
+    )
+    eval_runs: int
+    latest_pass_rate: float | None = None
+    mean_pass_rate: float | None = None
+    latest_eval_at: str = Field(
+        "", description="ISO-8601 timestamp of the most recent eval; '' if none."
+    )
+
+    @classmethod
+    def from_rollup(cls, a: AgentRollup) -> AgentMetricsRollupView:
+        return cls(
+            name=a.name,
+            runs=a.runs,
+            failed_runs=a.failed_runs,
+            failure_rate=a.failure_rate,
+            total_cost_usd=a.total_cost_usd,
+            mean_cost_usd=a.mean_cost_usd,
+            latency_ms=LatencyPercentilesView.from_dataclass(a.latency),
+            last_run_at=a.last_run_at,
+            eval_runs=a.eval_runs,
+            latest_pass_rate=a.latest_pass_rate,
+            mean_pass_rate=a.mean_pass_rate,
+            latest_eval_at=a.latest_eval_at,
+        )
+
+
+class FailingCaseView(BaseModel):
+    """One recurring failing input clustered across runs (offline failure signal).
+
+    The store keeps eval *summaries* not per-case detail, so the offline
+    per-instance failure signal is failing *runs* grouped by a stable input
+    key — surfacing the inputs that fail most often.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    case: str = Field(..., description="A short, stable rendering of the failing input.")
+    failures: int
+    agents: list[str]
+    last_error: str = ""
+
+    @classmethod
+    def from_dataclass(cls, c: FailingCase) -> FailingCaseView:
+        return cls(case=c.case, failures=c.failures, agents=list(c.agents), last_error=c.last_error)
+
+
+class ReportView(BaseModel):
+    """``GET /api/v1/report`` response (ADR 032 D2).
+
+    The cross-agent, tenant-scoped monitor feed: pass-rate, cost, latency
+    percentiles, top failing cases, and a per-agent/workflow rollup over the
+    requested time window. Identical aggregation to ``mdk report`` — the front
+    end renders this directly (no external infra; complements Grafana / Azure /
+    Langfuse, ADR 031).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_filter: str | None = Field(
+        None, description="Set only on the per-agent endpoint; null for the cross-agent feed."
+    )
+    window_days: int = Field(0, description="Time window in days; 0 = all-time.")
+    totals: ReportTotalsView
+    agents: list[AgentMetricsRollupView]
+    top_failing_cases: list[FailingCaseView]
+
+    @classmethod
+    def from_report(cls, report: Report) -> ReportView:
+        return cls(
+            agent_filter=report.agent_filter,
+            window_days=report.window_days,
+            totals=ReportTotalsView(
+                runs=report.total_runs,
+                failed_runs=report.total_failed_runs,
+                cost_usd=report.total_cost_usd,
+                eval_runs=report.total_eval_runs,
+                latest_pass_rate=report.overall_latest_pass_rate,
+                latency_ms=LatencyPercentilesView.from_dataclass(report.overall_latency),
+            ),
+            agents=[AgentMetricsRollupView.from_rollup(a) for a in report.agents],
+            top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
+        )
+
+
+class AgentMetricsView(BaseModel):
+    """``GET /api/v1/agents/{name}/metrics`` response (ADR 032 D2).
+
+    The per-agent slice of the monitor feed: the named agent's rollup row
+    (or a zeroed row when it has no runs/evals in the window) plus the same
+    totals + top-failing-cases scoped to that agent. Powers the agent-profile
+    page's health panel in the front end.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    window_days: int = Field(0, description="Time window in days; 0 = all-time.")
+    totals: ReportTotalsView
+    rollup: AgentMetricsRollupView = Field(
+        ..., description="The agent's own rollup row; zeroed when it has no data in the window."
+    )
+    top_failing_cases: list[FailingCaseView]
+
+    @classmethod
+    def from_report(cls, name: str, report: Report) -> AgentMetricsView:
+        # The report was built scoped to this agent, so at most one rollup row
+        # exists. A queried agent with no runs/evals in the window yields an
+        # empty ``agents`` list — surface a zeroed row (not a 404) so the front
+        # end renders an empty panel rather than erroring (failure-mode rule).
+        rollup = next((a for a in report.agents if a.name == name), None)
+        rollup_view = (
+            AgentMetricsRollupView.from_rollup(rollup)
+            if rollup is not None
+            else AgentMetricsRollupView(
+                name=name,
+                runs=0,
+                failed_runs=0,
+                failure_rate=0.0,
+                total_cost_usd=0.0,
+                mean_cost_usd=0.0,
+                latency_ms=LatencyPercentilesView(count=0),
+                last_run_at="",
+                eval_runs=0,
+                latest_pass_rate=None,
+                mean_pass_rate=None,
+                latest_eval_at="",
+            )
+        )
+        return cls(
+            name=name,
+            window_days=report.window_days,
+            totals=ReportTotalsView(
+                runs=report.total_runs,
+                failed_runs=report.total_failed_runs,
+                cost_usd=report.total_cost_usd,
+                eval_runs=report.total_eval_runs,
+                latest_pass_rate=report.overall_latest_pass_rate,
+                latency_ms=LatencyPercentilesView.from_dataclass(report.overall_latency),
+            ),
+            rollup=rollup_view,
+            top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
+        )

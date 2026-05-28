@@ -65,6 +65,9 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/agents/{name}/evals"): "eval",
     ("GET", "/api/v1/evals"): "read",
     ("GET", "/api/v1/evals/{eval_id}"): "read",
+    # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
+    ("GET", "/api/v1/report"): "read",
+    ("GET", "/api/v1/agents/{name}/metrics"): "read",
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
