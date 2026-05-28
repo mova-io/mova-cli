@@ -381,9 +381,7 @@ def submit_cmd(
         help="Plain-text description.",
     ),
     tag: list[str] = typer.Option([], "--tag", help="Tag to attach (repeatable)."),
-    shape: str | None = typer.Option(
-        None, "--shape", help="ADR 028 shape (faq / rag_qa / ...)."
-    ),
+    shape: str | None = typer.Option(None, "--shape", help="ADR 028 shape (faq / rag_qa / ...)."),
     recommended_for: str | None = typer.Option(
         None, "--recommended-for", help="One-line use-case statement."
     ),
