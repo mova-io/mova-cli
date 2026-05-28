@@ -1,19 +1,18 @@
 # Daily "What's New" changelog automation
 
 Every morning a scheduled GitHub Action collects the **previous day's merged
-PRs** and prepends a dated digest to the `## What's New` section at the top of
-[`README.md`](../README.md) — the page rendered at
-github.com/mova-io/mova-cli/tree/main. The update lands via an **auto-merged
-PR**, so it runs durably on GitHub's infrastructure (independent of any local
-or agent session).
+PRs** and posts a dated digest as a **comment on a single pinned "What's New"
+tracking Issue**. It runs durably on GitHub's infrastructure (independent of any
+local or agent session) using only the built-in `GITHUB_TOKEN` — **no PAT, no
+GitHub App, no PR**.
 
 Moving parts:
 
 | Piece | What it does |
 |---|---|
-| [`.github/workflows/daily-changelog.yml`](../.github/workflows/daily-changelog.yml) | Scheduled (+ manual) workflow: fetch PRs → generate → bump version → open auto-merge PR. |
-| [`scripts/gen_daily_changelog.py`](../scripts/gen_daily_changelog.py) | Pure, hermetic generator: PR JSON in (stdin/file) → dated, grouped block prepended to the README section. No network in here. |
-| `## What's New` in `README.md` | The rendered landing-page section the digest writes into. |
+| [`.github/workflows/daily-changelog.yml`](../.github/workflows/daily-changelog.yml) | Scheduled (+ manual) workflow: fetch PRs → generate digest → post a comment on the pinned tracking Issue. |
+| [`scripts/gen_daily_changelog.py`](../scripts/gen_daily_changelog.py) | Pure, hermetic generator: PR JSON in (stdin/file) → dated, grouped digest. `--format issue` writes the comment body to stdout; `--format readme` (legacy) edits the README in place. No network in here. |
+| The pinned "What's New" tracking Issue | One open issue (marked `<!-- whats-new-tracker -->`) that accumulates one digest comment per day. |
 
 ## Schedule
 
@@ -26,68 +25,69 @@ Moving parts:
 
 1. Resolve the digest date (yesterday UTC, or the `workflow_dispatch` `date`
    input) and the day window `[date, date+1)`.
-2. `gh pr list --state merged --search "merged:>=<date>..<next>" --json
+2. `gh pr list --state merged --search "merged:<date>..<next>" --json
    number,title,author,mergedAt` → `prs.json`.
-3. `python scripts/gen_daily_changelog.py --date <date> < prs.json`:
+3. `python scripts/gen_daily_changelog.py --format issue --date <date> <
+   prs.json > digest.md`:
    - Groups PRs by conventional-commit prefix from the title
      (`feat`/`fix`/`docs`/`chore`/other).
-   - Renders `### YYYY-MM-DD` + grouped bullets `- <title> (#<num>) @author`.
-   - **Prepends** the block at the top of `## What's New` (newest date first),
-     creating the section under the intro if absent.
-   - **Idempotent:** a date already present is a no-op (no file rewrite).
-   - **Empty day:** writes nothing and exits 0 (a quiet day is not an error).
-4. If the README changed, `python scripts/bump_version.py` bumps CalVer (so the
-   PR clears the version gate in `ci.yml`), then a branch is committed, pushed,
-   and a PR is opened + set to auto-merge (squash).
+   - Renders a hidden per-date marker `<!-- changelog:YYYY-MM-DD -->`, a
+     `### What shipped — YYYY-MM-DD` heading, and grouped bullets
+     `- <title> (#<num>) @author`.
+   - **Deterministic:** PRs are sorted by number within each bucket, so the same
+     input renders byte-for-byte identical output.
+   - **Empty day:** the workflow records `changed=false` and skips posting (a
+     quiet day is not an error).
+4. The workflow finds the open tracking Issue by its `<!-- whats-new-tracker -->`
+   marker (creating + pinning it on the first run), checks the issue's existing
+   comments for the per-date marker, and — if this date hasn't been posted —
+   posts `digest.md` as a new comment.
 
 The generator is **hermetic** — the PR list is injected (stdin or `--prs-file`),
 never fetched in the script — so its unit tests
 ([`tests/test_gen_daily_changelog.py`](../tests/test_gen_daily_changelog.py))
 run with no network and no `gh`.
 
-## Required secret — `MOVATE_BOT_TOKEN` (and why)
+## Credentials — just `GITHUB_TOKEN` (and why this design)
 
-The auto-merge step needs a repo secret named **`MOVATE_BOT_TOKEN`**: a
-**fine-grained Personal Access Token** scoped to `mova-io/mova-cli` with:
+The workflow needs only the **built-in `GITHUB_TOKEN`** with `issues: write`
+(the repo has Issues enabled). No repo secret, no PAT, no GitHub App.
 
-- **Contents: write** (push the branch + commit)
-- **Pull requests: write** (open the PR + enable auto-merge)
+### Why a tracking Issue instead of a README-on-`main` PR
 
-### Why a PAT and not the built-in `GITHUB_TOKEN`
+The original design prepended the digest to `README.md` via an **auto-merged
+PR**. In this org that path is a dead end with no zero-credential way out:
 
-GitHub has a **recursion guard**: events (including `pull_request`) triggered by
-the default `GITHUB_TOKEN` do **not** start other workflows. A PR opened with
-`GITHUB_TOKEN` therefore never fires the repo's required `pull_request` checks
-(`lint-and-test`, etc.), so `gh pr merge --auto` would wait **forever** for
-checks that can never start.
+- the org **forbids fine-grained PATs** (they can't be approved), so the old
+  `MOVATE_BOT_TOKEN` approach can't be provisioned;
+- **"Allow GitHub Actions to create and approve pull requests" is OFF**
+  (`can_approve_pull_request_reviews: false`), so the built-in `GITHUB_TOKEN`
+  can't open a PR at all; and
+- `main` **requires status checks**, so `GITHUB_TOKEN` can't push to it either.
 
-Authenticating the create/merge steps with a PAT makes the PR look
-"human-authored", so the required checks run and auto-merge can complete.
-(Separately, the mova-io org disables "Allow GitHub Actions to create and
-approve pull requests" — see the note at the bottom of
-[`ci.yml`](../.github/workflows/ci.yml) — which also blocks `GITHUB_TOKEN` from
-opening the PR at all. So the PAT is doubly required.)
+Landing README on `main` would therefore require a **GitHub App** — extra infra
+and credentials we don't want. Posting each day's digest as a comment on a
+pinned tracking Issue needs only `GITHUB_TOKEN: issues: write` — the
+org-compliant, zero-credential path.
 
-### Behavior without the secret
+### Idempotency
 
-The workflow still runs the generator and updates the README in the runner, but
-the create/merge steps are **skipped** (guarded on the secret being present) and
-it logs a warning telling the operator to add `MOVATE_BOT_TOKEN`. No PR is
-opened until the secret exists.
+Re-dispatching the same `date` does **not** double-post. The generated comment
+begins with a hidden `<!-- changelog:YYYY-MM-DD -->` marker; before posting, the
+workflow scans the issue's existing comments for that marker and exits early if
+the date was already recorded.
 
-### Creating the secret
+### Pinning
 
-1. GitHub → your account/org → **Settings → Developer settings → Fine-grained
-   tokens → Generate new token**.
-   - Resource owner: `mova-io`; repository access: `mova-io/mova-cli`.
-   - Repository permissions: **Contents → Read and write**, **Pull requests →
-     Read and write**.
-2. Copy the token.
-3. Repo → **Settings → Secrets and variables → Actions → New repository
-   secret**, name **`MOVATE_BOT_TOKEN`**, paste the token.
+On first run the workflow creates the tracking Issue and **best-effort pins**
+it (`gh issue pin … || true`). Pinning is nice-to-have — if the token isn't
+permitted to pin, the run logs a warning and continues; the digest is still
+posted.
 
-Never commit a token; the workflow references it only as
-`secrets.MOVATE_BOT_TOKEN`.
+### `MOVATE_BOT_TOKEN` is no longer used
+
+The old fine-grained-PAT secret `MOVATE_BOT_TOKEN` is no longer referenced by
+this workflow and **may be deleted** from the repo's Actions secrets.
 
 ## Testing it
 
@@ -97,21 +97,21 @@ Never commit a token; the workflow references it only as
 uv run pytest tests/test_gen_daily_changelog.py
 ```
 
-### Locally, end-to-end against the real repo (read-only, no PR)
+### Locally, end-to-end against the real repo (read-only, no post)
 
 ```bash
 gh pr list --repo mova-io/mova-cli --state merged \
-  --search "merged:>=2026-05-26..2026-05-27" \
+  --search "merged:2026-05-26..2026-05-27" \
   --json number,title,author,mergedAt \
-  | python scripts/gen_daily_changelog.py --date 2026-05-26 --readme /tmp/README.md
+  | python scripts/gen_daily_changelog.py --format issue --date 2026-05-26
 ```
 
-(Point `--readme` at a scratch copy so you can inspect the result without
-touching the tracked README.)
+This prints the exact comment body (marker + heading + grouped bullets) to
+stdout without touching any issue.
 
 ### Via `workflow_dispatch` (manual run on GitHub)
 
 Actions → **daily-changelog** → **Run workflow**. Optionally set the `date`
-input (`YYYY-MM-DD`, UTC) to backfill a specific day. With `MOVATE_BOT_TOKEN`
-set, this opens an auto-merge PR exactly as the scheduled run would; without it,
-the digest is generated and the PR step is skipped with a warning.
+input (`YYYY-MM-DD`, UTC) to backfill a specific day. The run posts (or, on the
+very first run, creates + pins) the pinned tracking Issue and adds the digest
+comment; re-dispatching the same date is a no-op.

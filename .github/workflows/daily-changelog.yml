@@ -2,32 +2,32 @@ name: daily-changelog
 
 # Daily "What's New" digest.
 #
-# Every morning this collects the PREVIOUS day's merged PRs and prepends a
-# dated block to the `## What's New` section at the top of README.md (the page
-# rendered at github.com/mova-io/mova-cli/tree/main), via an auto-merged PR.
-# Durable: runs on GitHub's infra, independent of any local/agent session.
+# Every morning this collects the PREVIOUS day's merged PRs and posts a dated
+# digest as a COMMENT on a single pinned "What's New" tracking Issue. Durable:
+# runs on GitHub's infra, independent of any local/agent session.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# OPERATOR SETUP — required for auto-merge to actually complete
+# WHY a tracking Issue (and not a README-on-main PR)
 # ─────────────────────────────────────────────────────────────────────────────
-# This workflow needs a repo secret named `MOVATE_BOT_TOKEN`: a fine-grained
-# Personal Access Token with **Contents: write** and **Pull requests: write**
-# on mova-io/mova-cli.
+# The original design prepended the digest to README.md via an auto-merged PR.
+# In this org that path is a dead end with no zero-credential way out:
+#   * the org forbids fine-grained PATs (they can't be approved), so the old
+#     `MOVATE_BOT_TOKEN` approach can't be provisioned;
+#   * "Allow GitHub Actions to create and approve pull requests" is OFF
+#     (can_approve_pull_request_reviews: false), so the built-in GITHUB_TOKEN
+#     can't open a PR at all; and
+#   * `main` requires status checks, so GITHUB_TOKEN can't push to it either.
+# Landing README on main would therefore require a GitHub App — extra infra and
+# credentials we don't want.
 #
-# WHY a PAT and not the built-in GITHUB_TOKEN: GitHub has a recursion guard —
-# events (incl. `pull_request`) triggered by the default GITHUB_TOKEN do NOT
-# kick off other workflows. So a PR opened with GITHUB_TOKEN never fires the
-# repo's required `pull_request` checks (lint-and-test etc.), and `gh pr merge
-# --auto` would then wait forever for checks that can never start. Authenticating
-# the create/merge steps with a PAT makes the PR look "human-authored", so the
-# required checks run and auto-merge can complete. (The same org policy that
-# disabled "Allow GitHub Actions to create and approve pull requests" — see the
-# note at the bottom of ci.yml — also blocks GITHUB_TOKEN from opening the PR at
-# all, so the PAT is doubly required.)
+# Instead we post each day's digest as a comment on a pinned tracking Issue.
+# Writing Issues needs only the built-in GITHUB_TOKEN with `issues: write`
+# (this repo has issues enabled) — NO PAT, NO App, NO PR, NO protected-branch
+# write, NO version bump. This is the org-compliant, zero-credential path.
 #
-# WITHOUT the secret: the workflow still runs the digest, but the create/merge
-# steps are skipped (guarded on the secret being set) and it logs how to add it.
-# See docs/daily-changelog.md for the full runbook + how to test via dispatch.
+# NOTE: the `MOVATE_BOT_TOKEN` secret is no longer used by this workflow and may
+# be deleted. See docs/daily-changelog.md for the runbook + how to test via
+# dispatch.
 
 on:
   schedule:
@@ -42,15 +42,16 @@ on:
         required: false
         type: string
 
-# Least privilege: write the README commit/branch (contents) and open the PR
-# (pull-requests). No other scopes.
+# Least privilege: read the repo to run the generator, and write Issues to post
+# the digest comment. No pull-requests / contents:write — we never open a PR or
+# push to a branch anymore.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  issues: write
 
 concurrency:
   # One digest run at a time; a manual dispatch supersedes a queued scheduled
-  # run rather than racing it on the same README.
+  # run rather than racing it on the same tracking issue.
   group: daily-changelog
   cancel-in-progress: false
 
@@ -60,9 +61,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # Full history so the bump + branch push have a real base.
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -95,8 +93,7 @@ jobs:
 
       - name: Collect merged PRs
         env:
-          # The list step only READS; the default token is fine here (the PAT
-          # is only needed for create/merge so required checks fire — see header).
+          # Read-only listing; the built-in token can read PRs fine.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           DATE: ${{ steps.window.outputs.date }}
@@ -115,66 +112,70 @@ jobs:
         env:
           REPO: ${{ github.repository }}
           DATE: ${{ steps.window.outputs.date }}
-        # Pipe the PR JSON into the pure generator (no network in the script).
-        # Record whether the README actually changed so later steps can skip a
-        # quiet day cleanly.
+        # Pipe the PR JSON into the pure generator (no network in the script) in
+        # issue mode: the digest Markdown (with its hidden per-date marker) is
+        # written to digest.md. Record whether anything actually merged so the
+        # post step can skip a quiet day cleanly.
         run: |
           python scripts/gen_daily_changelog.py \
+            --format issue \
             --repo "$REPO" \
             --date "${DATE}" \
-            < prs.json
-          if git diff --quiet -- README.md; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No README change for ${DATE} (nothing merged, or already recorded) — skipping PR."
-          else
+            < prs.json \
+            > digest.md
+          if [ "$(jq 'length>0' prs.json)" = "true" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check for bot token
-        id: token
-        # The create/merge steps need the PAT. Gate on it so the workflow
-        # degrades gracefully (and tells the operator how to fix it) instead of
-        # opening a PR that can never auto-merge.
-        env:
-          BOT_TOKEN: ${{ secrets.MOVATE_BOT_TOKEN }}
-        run: |
-          if [ -n "$BOT_TOKEN" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::MOVATE_BOT_TOKEN is not set — README digest generated but the auto-merge PR is skipped. See docs/daily-changelog.md."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No PRs merged for ${DATE} — skipping the tracking-issue comment."
           fi
 
-      - name: Bump CalVer version
+      - name: Post digest to tracking issue
         if: steps.gen.outputs.changed == 'true'
-        # Clears the per-PR version gate (ci.yml's "Version bump gate") so the
-        # auto-merge PR's required checks pass. Don't hand-edit version files.
-        run: python scripts/bump_version.py
-
-      - name: Open auto-merge PR
-        if: steps.gen.outputs.changed == 'true' && steps.token.outputs.present == 'true'
         env:
-          # PAT auth so the PR fires the repo's required pull_request checks and
-          # auto-merge can complete (see header for the GITHUB_TOKEN gotcha).
-          GH_TOKEN: ${{ secrets.MOVATE_BOT_TOKEN }}
+          # Built-in token with issues:write — the whole point of this design:
+          # no PAT, no App, just GITHUB_TOKEN posting an Issue comment.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           DATE: ${{ steps.window.outputs.date }}
+        # Find (or bootstrap + pin) the single "What's New" tracking issue, then
+        # post the day's digest as a comment — unless a comment for this date
+        # already exists (idempotent re-dispatch via the per-date marker).
         run: |
-          BRANCH="changelog/${DATE}"
-          git config user.name "movate-bot"
-          git config user.email "movate-bot@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add README.md pyproject.toml src/movate/__init__.py uv.lock
-          # Subject + trailer as separate -m args so no YAML block indentation
-          # leaks into the commit body.
-          git commit \
-            -m "docs(changelog): what shipped ${DATE}" \
-            -m "Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
-          git push --force-with-lease origin "$BRANCH"
-          gh pr create \
+          set -euo pipefail
+
+          MARKER="<!-- whats-new-tracker -->"
+          DATE_MARKER="<!-- changelog:${DATE} -->"
+
+          # 1. Find the open tracking issue by its hidden marker in the body.
+          ISSUE="$(gh issue list \
             --repo "$REPO" \
-            --base main \
-            --head "$BRANCH" \
-            --title "docs(changelog): what shipped ${DATE}" \
-            --body "Automated daily \`What's New\` digest for ${DATE} (merged PRs). Generated by the \`daily-changelog\` workflow; auto-merges once required checks pass."
-          gh pr merge "$BRANCH" --repo "$REPO" --auto --squash
+            --state open \
+            --search "\"${MARKER}\" in:body" \
+            --json number,body \
+            --jq "[.[] | select(.body | contains(\"${MARKER}\"))][0].number // empty")"
+
+          # 2. None found → create it (with the marker), then best-effort pin it.
+          if [ -z "$ISSUE" ]; then
+            ISSUE="$(gh issue create \
+              --repo "$REPO" \
+              --title "📋 What's New — daily digest" \
+              --body "${MARKER}"$'\n\n'"Daily \"What's New\" digests are posted as comments below — one per day, newest at the bottom. Auto-maintained by the [\`daily-changelog\`](.github/workflows/daily-changelog.yml) workflow." \
+              | grep -oE '[0-9]+$')"
+            echo "Created tracking issue #${ISSUE}."
+            # Pinning is nice-to-have, not required; never fail the run on it.
+            gh issue pin "$ISSUE" --repo "$REPO" || echo "::warning::Could not pin issue #${ISSUE} (pinning not permitted) — continuing."
+          else
+            echo "Using existing tracking issue #${ISSUE}."
+          fi
+
+          # 3. Idempotency: skip if a comment for this date already exists.
+          if gh api "repos/${REPO}/issues/${ISSUE}/comments" --paginate --jq '.[].body' \
+            | grep -qF "${DATE_MARKER}"; then
+            echo "already posted for ${DATE} — skipping."
+            exit 0
+          fi
+
+          # 4. Post the digest (its first line is the per-date marker).
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file digest.md
+          echo "Posted digest for ${DATE} to tracking issue #${ISSUE}."
