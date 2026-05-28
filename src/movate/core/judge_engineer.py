@@ -262,8 +262,7 @@ def validate_judge_yaml(judge_yaml: str) -> JudgeConfig:
         ) from exc
     if not isinstance(data, dict):
         raise JudgeEngineerError(
-            "judge YAML must be a top-level mapping (got "
-            f"{type(data).__name__})",
+            f"judge YAML must be a top-level mapping (got {type(data).__name__})",
             status_code=422,
         )
     try:
@@ -280,9 +279,10 @@ def validate_judge_yaml(judge_yaml: str) -> JudgeConfig:
 # ---------------------------------------------------------------------------
 
 
-_JUDGE_ENGINEER_PROMPT_TEMPLATE = """You are a senior eval engineer authoring an LLM-as-judge rubric for an AI \
-agent. Your output will be saved as `evals/judge.yaml` and used by `mdk \
-eval` to score the agent's runs.
+_JUDGE_ENGINEER_PROMPT_TEMPLATE = """You are a senior eval engineer \
+authoring an LLM-as-judge rubric for an AI agent. Your output will be \
+saved as `evals/judge.yaml` and used by `mdk eval` to score the agent's \
+runs.
 
 # Agent under evaluation
 
@@ -387,7 +387,9 @@ def _build_meta_prompt(
     """Compose the prompt the engineer LLM receives. Pure string transform."""
     spec = bundle.spec
     examples_block = _build_examples_block(samples) if include_examples else ""
-    examples_instruction = _EXAMPLES_INSTRUCTION_ON if include_examples else _EXAMPLES_INSTRUCTION_OFF
+    examples_instruction = (
+        _EXAMPLES_INSTRUCTION_ON if include_examples else _EXAMPLES_INSTRUCTION_OFF
+    )
     return _JUDGE_ENGINEER_PROMPT_TEMPLATE.format(
         name=spec.name,
         description=spec.description or "(no description)",
@@ -483,9 +485,7 @@ def _build_judge_yaml(
     agent_provider = bundle.spec.model.provider
     judge_provider = judge_model or _pick_cross_family_judge(agent_provider)
 
-    dimensions_preamble = "Dimensions covered:\n" + "\n".join(
-        f"- {d}" for d in dimensions
-    )
+    dimensions_preamble = "Dimensions covered:\n" + "\n".join(f"- {d}" for d in dimensions)
     full_rubric = f"{dimensions_preamble}\n\n{rubric_markdown.strip()}\n"
 
     config = JudgeConfig(

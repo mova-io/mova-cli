@@ -34,7 +34,6 @@ from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
-
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
 # ---------------------------------------------------------------------------
@@ -271,9 +270,7 @@ async def test_commit_rejects_malformed_yaml_without_touching_disk(
     )
     assert r.status_code == 422, r.text
     # The pre-existing file is untouched.
-    assert (
-        agents_path / "judge-target" / "evals" / "judge.yaml"
-    ).read_text() == pre_existing
+    assert (agents_path / "judge-target" / "evals" / "judge.yaml").read_text() == pre_existing
 
 
 @pytest.mark.asyncio
@@ -324,9 +321,7 @@ def test_commit_unauthed_returns_401(client: TestClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_generate_requires_eval_scope(
-    client: TestClient, storage: InMemoryStorage
-) -> None:
+async def test_generate_requires_eval_scope(client: TestClient, storage: InMemoryStorage) -> None:
     _, headers = await _mint(storage, scopes=list(ALL_SCOPES))
     _create_agent(client, headers)
     # Make a fresh key WITHOUT eval scope.
@@ -340,9 +335,7 @@ async def test_generate_requires_eval_scope(
 
 
 @pytest.mark.asyncio
-async def test_commit_requires_admin_scope(
-    client: TestClient, storage: InMemoryStorage
-) -> None:
+async def test_commit_requires_admin_scope(client: TestClient, storage: InMemoryStorage) -> None:
     _, headers = await _mint(storage, scopes=list(ALL_SCOPES))
     _create_agent(client, headers)
     # eval scope is NOT enough to commit — that's a mutation.
@@ -369,9 +362,7 @@ async def test_generate_unknown_agent_returns_404(
 
 
 @pytest.mark.asyncio
-async def test_generate_tenant_isolation(
-    client: TestClient, storage: InMemoryStorage
-) -> None:
+async def test_generate_tenant_isolation(client: TestClient, storage: InMemoryStorage) -> None:
     """Tenant A's agent is invisible to tenant B."""
     # Tenant A creates the agent.
     _, headers_a = await _mint(storage, scopes=list(ALL_SCOPES))

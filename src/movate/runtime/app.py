@@ -1133,7 +1133,7 @@ def _apply_history_char_budget(
 # :func:`movate.core.judge_engineer._parse_engineer_response` expects.
 _MOCK_JUDGE_ENGINEER_RESPONSE = (
     '{"rubric_markdown": "## Mock rubric\\n\\nDeterministic anchor for '
-    'hermetic tests. Scores 1.0 when the actual matches the expected '
+    "hermetic tests. Scores 1.0 when the actual matches the expected "
     'on the listed dimensions, 0.5 on near-misses, 0.0 otherwise.\\n", '
     '"rationale": "mock engineer response — dimensions inferred from the '
     'agent shape"}'
@@ -2939,9 +2939,7 @@ def build_app(
 
         store: StorageProvider = request.app.state.storage
         agents: list[AgentBundle] = request.app.state.agents
-        bundle = await resolve_agent_bundle(
-            store, name, tenant_id=ctx.tenant_id, fallback=agents
-        )
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
         if bundle is None:
             raise not_found("agent", name)
 
@@ -3038,9 +3036,7 @@ def build_app(
         # able to commit a judge into another tenant's agent dir.
         store: StorageProvider = request.app.state.storage
         agents: list[AgentBundle] = request.app.state.agents
-        bundle = await resolve_agent_bundle(
-            store, name, tenant_id=ctx.tenant_id, fallback=agents
-        )
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
         if bundle is None:
             raise not_found("agent", name)
 

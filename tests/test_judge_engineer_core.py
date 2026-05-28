@@ -36,7 +36,6 @@ from movate.core.loader import load_agent
 from movate.core.models import JudgeConfig, JudgeMethod
 from movate.providers.mock import MockProvider
 
-
 # ---------------------------------------------------------------------------
 # Bundle helpers — minimal on-disk agents in different shapes
 # ---------------------------------------------------------------------------
@@ -107,10 +106,7 @@ def _write_agent(
         # Knowledge requires a knowledge.yaml — declare a trivial one.
         (agent_dir / "kb.json").write_text(json.dumps([{"title": "x", "body": "y"}]))
         (agent_dir / "knowledge.yaml").write_text(
-            "api_version: movate/v1\n"
-            "kind: Knowledge\n"
-            "retriever: bm25\n"
-            "corpus: ./kb.json\n"
+            "api_version: movate/v1\nkind: Knowledge\nretriever: bm25\ncorpus: ./kb.json\n"
         )
         spec["knowledge"] = "./knowledge.yaml"
     if dataset_rows is not None:
@@ -386,7 +382,5 @@ async def test_generate_judge_rejects_empty_dimensions(tmp_path: Path) -> None:
     bundle = _load(tmp_path, name="bot")
     provider = MockProvider(response=_MOCK_ENGINEER_JSON)
     with pytest.raises(JudgeEngineerError) as exc:
-        await generate_judge(
-            bundle=bundle, provider=provider, rubric_dimensions=[]
-        )
+        await generate_judge(bundle=bundle, provider=provider, rubric_dimensions=[])
     assert exc.value.status_code == 400

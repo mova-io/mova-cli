@@ -321,9 +321,7 @@ class MovateClient:
             model=model,
             budget_usd=budget_usd,
         )
-        headers = (
-            {"X-MDK-Judge-Engineer-Mock": "1"} if mock else None
-        )
+        headers = {"X-MDK-Judge-Engineer-Mock": "1"} if mock else None
         r = await self._client.post(
             f"/api/v1/agents/{agent}/judge/generate",
             json=body.model_dump(mode="json", exclude_none=False),
