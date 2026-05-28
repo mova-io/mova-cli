@@ -59,6 +59,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from movate.core.agent_schema_utils import check_adr023_retrieval as _check_adr023_retrieval
 from movate.core.config import PROJECT_MARKER_FILES as _PROJECT_MARKERS
 from movate.core.paths import project_state_dir
 from movate.templates import get_template_path, list_templates
@@ -1695,155 +1696,106 @@ async def _run_llm_scaffold(
     from movate.cli._progress import spinner  # noqa: PLC0415
     from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
     from movate.core.models import TokenUsage  # noqa: PLC0415
-    from movate.scaffold import (  # noqa: PLC0415
-        LLMScaffoldError,
-        generate_agent_from_description,
-        write_agent_files,
+    from movate.core.scaffold_preview import (  # noqa: PLC0415
+        PreviewFailureMode,
+        PreviewProgressEvent,
+        ScaffoldPreviewError,
+        preview_agent_from_description,
     )
-
-    # Roll token usage across every LLM call (attempt 1 + retry) so the
-    # final cost line reflects total spend. Used by the cost echo +
-    # mdk_init_summary line at the end.
-    total_tokens = TokenUsage()
-    # Track whether a retry actually fired — used by the summary line
-    # so CI dashboards can flag "this scaffold needed correction" runs.
-    retried = False
+    from movate.scaffold import write_agent_files  # noqa: PLC0415
 
     # The model written INTO the generated agent (key-matched), distinct
     # from `llm_model` which DRIVES the scaffold call. See _pick_target_model.
     target_model = _pick_target_model(llm_model=llm_model, mock=mock)
 
+    # Name the model that will run the scaffold so the operator sees what's
+    # being called, and flag the offline mock path so a hung-looking spinner
+    # isn't mistaken for a real (paid) provider call.
+    model_label = f"{llm_model} (mock, offline)" if mock else llm_model
+
     rt = await build_local_runtime(mock=mock)
-    # `generated` is set once an attempt both generates AND validates.
-    generated: Any = None
-    try:
-        # ------------------------------------------------------------------
-        # Unified up-to-2-attempts loop. A single attempt can fail in two
-        # ways:
-        #   (a) generation fails (LLMScaffoldError): provider wire error,
-        #       non-JSON prose, or schema mismatch. The most common real
-        #       LLM failure — it now earns a retry just like (b).
-        #   (b) generation succeeds but load-validation fails: the retry
-        #       feeds the parsed attempt + error back so the model can
-        #       self-correct.
-        # Exit-code contract (preserved from the pre-refactor flow):
-        #   * exit 2 when the FINAL attempt failed at generation
-        #     (LLMScaffoldError) — "hard scaffold failure".
-        #   * exit 1 when the FINAL attempt generated but failed
-        #     load-validation — "retry-validation failure".
-        # ------------------------------------------------------------------
-        # Carry the parsed-but-invalid agent + its error from attempt 1
-        # into attempt 2's feedback retry. Only set when attempt 1
-        # *generated* something (a generation error leaves these None →
-        # attempt 2 re-rolls fresh).
-        feedback_attempt: Any = None
-        feedback_error: str | None = None
-        # The failure mode of the last attempt, so the final error
-        # handling picks the right exit code + message.
-        last_gen_error: str | None = None
-        last_validation_error: str | None = None
 
-        max_attempts = 2
-        for attempt in range(1, max_attempts + 1):
-            is_retry = attempt > 1
-            if is_retry:
-                retried = True
+    # ADR 032 D1 factor-out: the actual generate+validate retry loop now lives
+    # in :func:`movate.core.scaffold_preview.preview_agent_from_description`
+    # — the same callable the runtime's ``POST /api/v1/agents/preview``
+    # endpoint uses. Behavior here is byte-identical to the pre-refactor flow:
+    # up to two attempts, the second feeding the parsed-but-invalid candidate
+    # + validation error back to the model for self-correction. The
+    # per-attempt spinner / between-attempts warning UX is wired through the
+    # progress callback so the operator sees the same console output as before.
 
-            # Name the model that will run the scaffold so the operator
-            # sees what's being called, and flag the offline mock path
-            # so a hung-looking spinner isn't mistaken for a real (paid)
-            # provider call.
-            model_label = f"{llm_model} (mock, offline)" if mock else llm_model
-            spin_msg = (
-                f"retrying '{name}' with {model_label}…"
-                if is_retry
-                else f"scaffolding '{name}' with {model_label}…"
+    # Two-stage spinner: a placeholder for attempt 1 swapped to "retrying…" if
+    # attempt 2 fires. Managed via an ExitStack so the spinner cleans up on
+    # the success path AND on failure.
+    import contextlib  # noqa: PLC0415
+
+    spinner_stack = contextlib.ExitStack()
+
+    def _on_progress(event: PreviewProgressEvent, message: str | None) -> None:
+        """Drive the CLI's Rich console output as the shared pipeline runs.
+
+        Closes over ``spinner_stack`` to swap the per-attempt spinner and
+        ``err_console`` to render the yellow between-attempts warning. Keeps
+        the wire format byte-identical to the pre-refactor flow.
+        """
+        if event is PreviewProgressEvent.ATTEMPT_STARTED:
+            spinner_stack.enter_context(spinner(f"scaffolding '{name}' with {model_label}…"))
+        elif event is PreviewProgressEvent.ATTEMPT_RETRY_STARTED:
+            # Close the attempt-1 spinner and open the attempt-2 one.
+            spinner_stack.close()
+            spinner_stack.enter_context(spinner(f"retrying '{name}' with {model_label}…"))
+        elif event is PreviewProgressEvent.GENERATION_FAILED:
+            err_console.print(
+                f"[yellow]⚠[/yellow] first attempt failed: "
+                f"[dim]{message}[/dim]\n"
+                f"[dim]retrying once (the output was not a valid agent)...[/dim]"
             )
-            try:
-                with spinner(spin_msg):
-                    result = await generate_agent_from_description(
-                        description=description,
-                        name=name,
-                        model=llm_model,
-                        target_model=target_model,
-                        provider=rt.provider,
-                        # Feedback retry ONLY when attempt 1 parsed but
-                        # failed validation. A generation error leaves
-                        # both None → this is a fresh re-roll.
-                        previous_attempt=feedback_attempt,
-                        validation_error=feedback_error,
-                    )
-            except LLMScaffoldError as exc:
-                last_gen_error = str(exc)
-                last_validation_error = None
-                # A generation error yields no parsed object to feed back;
-                # the next attempt (if any) re-rolls fresh.
-                feedback_attempt = None
-                feedback_error = None
-                if is_retry:
-                    break  # both attempts exhausted; handle failure below
-                err_console.print(
-                    f"[yellow]⚠[/yellow] first attempt failed: "
-                    f"[dim]{last_gen_error}[/dim]\n"
-                    f"[dim]retrying once (the output was not a valid agent)...[/dim]"
-                )
-                continue
-
-            total_tokens = _accumulate_tokens(total_tokens, result.tokens)
-            candidate = result.agent
-
-            # Defensive coercions, applied to EVERY generated candidate so
-            # the dir/file/agent-yaml correspondence + key-match hold
-            # regardless of what the LLM emitted:
-            #   * name → the CLI <name> argument (a forgetful LLM might
-            #     echo the few-shot exemplar's name).
-            #   * model.provider → the key-matched target_model so the
-            #     scaffolded agent runs with the operator's key.
-            candidate.agent_yaml["name"] = name
-            model_block = candidate.agent_yaml.get("model")
-            if isinstance(model_block, dict):
-                model_block["provider"] = target_model
-
-            # #127 (PR1): align the emitted agent.yaml field set with a
-            # hand-init'd agent (`templates/agent_init/agent.yaml`) so a
-            # --llm scaffold isn't a thinner artifact than `mdk init`.
-            # Adds sensible defaults for `model.fallback`, `timeouts`,
-            # `budget`, and `tags` HERE (post-generation) rather than asking
-            # the model to invent them — keeps the meta-prompt focused on the
-            # behavioral fields (prompt + schemas + evals) and the operational
-            # knobs consistent across every scaffold. Only fills gaps: a field
-            # the LLM already emitted (e.g. the RAG shape's `tags`) is kept.
-            _apply_canonical_agent_defaults(candidate.agent_yaml, target_model=target_model)
-
-            # Validate by writing to a tempdir and loading.
-            validation_error = _try_validate(candidate, name=name)
-            if validation_error is None:
-                generated = candidate
-                last_gen_error = None
-                last_validation_error = None
-                break  # success
-
-            # Validation failed: stash for the feedback retry (or final fail).
-            last_validation_error = validation_error
-            last_gen_error = None
-            feedback_attempt = candidate
-            feedback_error = validation_error
-            if is_retry:
-                break  # both attempts exhausted; handle failure below
+        elif event is PreviewProgressEvent.VALIDATION_FAILED:
             err_console.print(
                 f"[yellow]⚠[/yellow] first attempt failed validation: "
-                f"[dim]{validation_error}[/dim]\n"
+                f"[dim]{message}[/dim]\n"
                 f"[dim]retrying once with the error fed back to the model...[/dim]"
             )
 
-        # Final failure handling — only reached when both attempts failed.
-        if generated is None:
-            if last_gen_error is not None:
-                # Hard scaffold failure (generation never produced a valid
-                # parsed agent on the final attempt) → exit 2.
-                _save_debug_artifact(name, payload=None, raw_error=last_gen_error)
+    generated: Any = None
+    total_tokens = TokenUsage()
+    retried = False
+    try:
+        try:
+            preview = await preview_agent_from_description(
+                description=description,
+                name=name,
+                provider=rt.provider,
+                model=llm_model,
+                target_model=target_model,
+                progress=_on_progress,
+                # F3 (#112): provision the candidate's declared built-in /
+                # tool-use stubbed skills into the validation tempdir's
+                # project root so a RAG-shape scaffold's ``kb-vector-lookup``
+                # resolves at ``load_agent`` time — identical to what the
+                # committed project gets after a successful preview. The
+                # runtime preview endpoint passes ``None`` (read-only; no
+                # project to provision into). Lambda adapts the CLI
+                # helper's kw-only ``project_root`` to the positional
+                # :class:`SkillProvisioner` shape.
+                skill_provisioner=lambda gen, root: _provision_declared_skills(
+                    gen, project_root=root
+                ),
+            )
+        except ScaffoldPreviewError as exc:
+            # Close any open spinner before we render the failure panel.
+            spinner_stack.close()
+            total_tokens = exc.tokens
+            retried = exc.retried
+            # Preserve the pre-refactor exit-code contract:
+            #   * exit 2 when the FINAL attempt failed at generation
+            #     (LLMScaffoldError) — "hard scaffold failure".
+            #   * exit 1 when the FINAL attempt generated but failed
+            #     load-validation — "retry-validation failure".
+            if exc.mode is PreviewFailureMode.GENERATION:
+                _save_debug_artifact(name, payload=None, raw_error=exc.message)
                 err_console.print(
-                    f"[red]✗[/red] LLM scaffold failed: {last_gen_error}\n"
+                    f"[red]✗[/red] LLM scaffold failed: {exc.message}\n"
                     f"[dim]raw error saved to "
                     f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]"
                 )
@@ -1856,14 +1808,13 @@ async def _run_llm_scaffold(
                     retried=retried,
                 )
                 raise typer.Exit(code=2) from None
-            # Retry-validation failure (final attempt generated but failed
-            # load-validation) → exit 1.
-            _save_debug_artifact(
-                name, payload=feedback_attempt, raw_error=last_validation_error or "unknown"
-            )
+            # PreviewFailureMode.VALIDATION (or the empty-description guard,
+            # which the CLI front-loaded; treat anything else here as a
+            # validation failure for symmetry).
+            _save_debug_artifact(name, payload=exc.partial_agent, raw_error=exc.message)
             err_console.print(
                 f"[red]✗[/red] scaffold failed validation after retry:\n"
-                f"[dim]{last_validation_error}[/dim]\n"
+                f"[dim]{exc.message}[/dim]\n"
                 f"[dim]raw LLM output saved to "
                 f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]\n"
                 f"[dim]inspect, fix manually, or re-run with a different "
@@ -1877,8 +1828,14 @@ async def _run_llm_scaffold(
                 ok=False,
                 retried=retried,
             )
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
+        else:
+            spinner_stack.close()
+            generated = preview.agent
+            total_tokens = preview.tokens
+            retried = preview.retried
     finally:
+        spinner_stack.close()
         await shutdown_runtime(rt.storage, rt.tracer)
 
     # Compute cost. Lookups against the pricing table can fail (model
@@ -2635,67 +2592,6 @@ async def _count_retrieved_chunks(storage: Any, *, run_id: str) -> int:
         if isinstance(chunks, list):
             total += len(chunks)
     return total
-
-
-def _check_adr023_retrieval(bundle: Any) -> str | None:
-    """Run the ADR 023 load-time retrieval checks against a loaded bundle.
-
-    Returns ``None`` when the agent either didn't opt into pre-retrieval
-    (``retrieval.auto_into`` unset — the non-grounding path) or opted in
-    correctly; otherwise an error string describing the first
-    misconfiguration, fed back into the retry prompt.
-
-    Reuses the exact pure-logic helpers ``mdk validate`` uses
-    (:func:`_field_accepts_string_list`, :func:`_primary_string_input_fields`)
-    so the scaffold-time contract matches the validate-time contract
-    by construction — a RAG scaffold that passes here passes
-    ``mdk validate``.
-    """
-    import json as _json  # noqa: PLC0415
-
-    from movate.cli.validate import (  # noqa: PLC0415
-        _field_accepts_string_list,
-        _primary_string_input_fields,
-    )
-
-    cfg = bundle.spec.retrieval
-    if not cfg.auto_retrieval_enabled:
-        return None
-
-    auto_into = cfg.auto_into
-
-    # (1) retrieval.skill must be declared on the agent + resolvable.
-    declared = {s.spec.name for s in bundle.skills}
-    if cfg.auto_skill not in declared:
-        return (
-            f"retrieval.skill {cfg.auto_skill!r} is not declared in the agent's "
-            f"skills: {sorted(declared) or 'none'}. Add it to the skills list."
-        )
-
-    # (2) auto_into must name an input field that accepts list[string].
-    props = bundle.input_schema.get("properties", {})
-    field_schema = props.get(auto_into)
-    if field_schema is None:
-        return (
-            f"retrieval.auto_into {auto_into!r} is not a field in the input schema — "
-            f"add a {auto_into}: list[string] field for the retrieved chunks."
-        )
-    if not _field_accepts_string_list(field_schema):
-        return (
-            f"retrieval.auto_into {auto_into!r} must accept a list[string] "
-            f"(the chunk shape), but its schema is {_json.dumps(field_schema)[:160]}."
-        )
-
-    # (3) query_from must be unambiguous when left to the default.
-    if not cfg.query_from:
-        candidates = _primary_string_input_fields(bundle.input_schema)
-        canonical = [c for c in ("query", "question", "text", "message") if c in candidates]
-        if not canonical and len(candidates) != 1:
-            return (
-                "retrieval.query_from is unset and the primary text input field is "
-                f"ambiguous (string fields: {candidates or 'none'}). Set retrieval.query_from."
-            )
-    return None
 
 
 def _save_debug_artifact(name: str, *, payload: Any, raw_error: str) -> None:

@@ -2896,3 +2896,186 @@ class AgentMetricsView(BaseModel):
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
         )
+
+
+# ---------------------------------------------------------------------------
+# Describe / preview agent (ADR 032 D1) — wire types for
+# ``POST /api/v1/agents/preview``. The endpoint runs the same LLM-scaffold
+# generate+validate pipeline ``mdk init --llm`` runs (shared in
+# :mod:`movate.core.scaffold_preview`) and returns the candidate WITHOUT
+# committing it to disk or the runtime's storage. The front end commits via
+# the existing ``POST /agents`` / ``POST /agents/from-wizard`` once the
+# operator accepts the preview.
+# ---------------------------------------------------------------------------
+
+
+# Caps applied at the API layer so a misbehaving / malicious client can't drag
+# the endpoint into long requests or oversized provider calls. Description is
+# capped at 4 KB — long enough for a paragraph of intent, well below the
+# meta-prompt budget. Names track AgentSpec's regex (lowercase alphanumeric +
+# hyphens) at the load layer; we only bound length here.
+_DESCRIBE_MAX_DESCRIPTION_CHARS = 4000
+_DESCRIBE_MAX_NAME_LEN = 64
+_DESCRIBE_MAX_MODEL_LEN = 128
+
+
+class DescribeAgentRequest(BaseModel):
+    """``POST /api/v1/agents/preview`` request body (ADR 032 D1).
+
+    Describes an agent in natural language and returns the generated candidate
+    (``agent.yaml`` + ``prompt.md`` + schemas + sample evals + cost forecast)
+    so the Mova iO front end can preview before committing. The endpoint is
+    read-only — nothing is written to disk or to the runtime's storage. The
+    front end commits via the existing ``POST /agents`` / ``POST
+    /agents/from-wizard`` after preview.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(
+        ...,
+        min_length=1,
+        max_length=_DESCRIBE_MAX_DESCRIPTION_CHARS,
+        description=(
+            "Natural-language description of the agent. Capped at "
+            f"{_DESCRIBE_MAX_DESCRIPTION_CHARS} characters at the API "
+            "boundary so an oversized payload fails fast instead of "
+            "ballooning the provider call."
+        ),
+    )
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=_DESCRIBE_MAX_NAME_LEN,
+        description=(
+            "Slug the candidate's agent.yaml will declare. Same charset as "
+            "the canonical AgentSpec (lowercase alphanumeric + hyphens)."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=_DESCRIBE_MAX_MODEL_LEN,
+        description=(
+            "LiteLLM-style model id that DRIVES the scaffold call (e.g. "
+            "``openai/gpt-4o-mini-2024-07-18``). When unset, the runtime "
+            "picks the same default ``mdk init --llm`` uses."
+        ),
+    )
+    target_model: str | None = Field(
+        default=None,
+        max_length=_DESCRIBE_MAX_MODEL_LEN,
+        description=(
+            "Optional model string to embed in the GENERATED agent.yaml's "
+            "``model.provider``. Defaults to ``model`` when unset — useful "
+            "when the operator wants the scaffold driven by a cheap model "
+            "but the resulting agent to run on a more capable one."
+        ),
+    )
+    mock: bool = Field(
+        default=False,
+        description=(
+            "When true, the deterministic ``MockProvider`` is used instead "
+            "of a real LLM call. Useful for an offline preview / "
+            "smoke-test from the UI. No tokens spent; cost is reported as "
+            "the mock's zero usage."
+        ),
+    )
+    dry_run: bool = Field(
+        default=True,
+        description=(
+            "Reserved for forward-compat with a future ``persist`` option. "
+            "Today the endpoint is always read-only — passing ``false`` "
+            "still does not persist; commit via ``POST /agents`` instead. "
+            "The field exists so the front end can pin its intent in the "
+            "request log."
+        ),
+    )
+
+
+class DescribeAgentTokenUsageView(BaseModel):
+    """Token-usage view: input, output, cached-input (rolled over attempts).
+
+    Mirrors :class:`~movate.core.models.TokenUsage` as a flat, OpenAPI-friendly
+    response field so client codegen doesn't need to follow the persisted
+    model.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: int = 0
+    output: int = 0
+    cached_input: int = 0
+
+
+class DescribeAgentResponse(BaseModel):
+    """``POST /api/v1/agents/preview`` response body (ADR 032 D1).
+
+    Carries the validated candidate plus the cost forecast. The candidate is
+    a runnable agent bundle on the wire — the front end renders it
+    (``agent_yaml`` + ``prompt_md`` + schemas + sample evals) and commits via
+    ``POST /agents`` when the operator accepts.
+
+    ``preview`` is always ``true`` for now (the endpoint is read-only). It's
+    surfaced so a future ``persist`` mode (deferred per ADR 032) can flip it
+    to ``false`` without churning the schema.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    preview: bool = Field(
+        True,
+        description=(
+            "Always ``true`` today — the endpoint never persists. Reserved "
+            "for a future persist mode (ADR 032 deferred)."
+        ),
+    )
+    name: str = Field(..., description="Agent slug the candidate declares.")
+    target_model: str = Field(
+        ...,
+        description=(
+            "Model string the candidate's ``agent.yaml`` declares "
+            "(``model.provider``). May differ from the model that drove "
+            "generation."
+        ),
+    )
+    agent_yaml: dict[str, Any] = Field(
+        ...,
+        description="The candidate ``agent.yaml`` contents.",
+    )
+    prompt_md: str = Field(..., description="The candidate Jinja prompt template body.")
+    input_schema: dict[str, Any] = Field(
+        ..., description="JSON Schema 2020-12 for the input contract."
+    )
+    output_schema: dict[str, Any] = Field(
+        ..., description="JSON Schema 2020-12 for the output contract."
+    )
+    sample_evals: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "2-3 sample dataset rows the meta-prompt asks for. Empty list "
+            "is legal but produces a ``missing-evals`` audit finding when "
+            "the committed agent runs ``mdk audit``."
+        ),
+    )
+    tokens: DescribeAgentTokenUsageView = Field(
+        ...,
+        description=(
+            "Token usage rolled across every LLM call (attempt 1 + retry) "
+            "so the cost reflects total spend."
+        ),
+    )
+    cost_usd: float | None = Field(
+        None,
+        description=(
+            "Cost in USD looked up via the shipped pricing table. ``null`` "
+            "when the model isn't in the table — the front end renders "
+            "that as 'N/A' rather than failing the preview."
+        ),
+    )
+    retried: bool = Field(
+        False,
+        description=(
+            "True if attempt 2 fired (a retry happened). The front end may "
+            "use this to flag slightly-flakier-than-usual scaffolds."
+        ),
+    )

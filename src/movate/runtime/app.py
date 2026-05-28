@@ -160,6 +160,9 @@ from movate.runtime.schemas import (
     CanarySetRequest,
     CanarySideView,
     CanaryView,
+    DescribeAgentRequest,
+    DescribeAgentResponse,
+    DescribeAgentTokenUsageView,
     EvalAcceptedView,
     EvalListView,
     EvalScheduleListView,
@@ -2099,6 +2102,166 @@ def build_app(
             files_persisted=result.files_persisted,
             published_version=published.version if published is not None else None,
             changed=published.published if published is not None else True,
+        )
+
+    # ------------------------------------------------------------------
+    # Describe / preview agent (ADR 032 D1). The Mova iO front end's
+    # "describe → preview → commit" authoring flow calls this endpoint to
+    # turn a natural-language description into a candidate bundle WITHOUT
+    # persisting it. The shared generate+validate pipeline
+    # (``core/scaffold_preview.preview_agent_from_description``) is the
+    # same one ``mdk init --llm`` runs — one source of truth, no drift.
+    #
+    # Scope: ``admin`` — the endpoint spends LLM tokens (the
+    # WizardAgentSubmission / LLM-spending routes above also gate on
+    # ``admin``; see ADR 013 L2). Tenant-scoped via ``ctx.tenant_id``.
+    # Bounded request via a runtime timeout so a slow provider can't drag
+    # the request out.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/preview",
+        response_model=DescribeAgentResponse,
+        tags=["agents-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_describe_agent(
+        body: DescribeAgentRequest,
+        # ``_scope("admin")`` in the route's dependencies handles auth +
+        # scope check; the handler itself doesn't need the AuthContext.
+        # Pattern mirrors the few other admin-scoped, storage-less endpoints
+        # in this module. Tenant-scoped at the auth layer (a tenant's
+        # admin key sees only its own previews), even though the response
+        # itself carries no tenant-specific data.
+        _ctx: AuthContext = Depends(auth_dep),
+    ) -> DescribeAgentResponse:
+        """Generate + validate a candidate agent from a natural-language
+        description (ADR 032 D1).
+
+        Read-only describe / preview path: the request body's ``description``
+        (plus optional ``name``, ``model``, ``target_model``, ``mock`` flag)
+        is run through the same LLM-scaffold pipeline ``mdk init --llm``
+        uses. The candidate is returned to the caller; **NOTHING is written
+        to disk or to the runtime's storage**. The front end commits via the
+        existing ``POST /agents`` / ``POST /agents/from-wizard`` after
+        showing the preview.
+
+        The pipeline (``movate.core.scaffold_preview``) runs the same
+        generate → defensive-coerce → canonical-defaults → load-validate →
+        ADR 023 retrieval check → sample-evals schema check loop the CLI
+        runs, with one retry on a validation failure (feeding the
+        parsed-but-invalid candidate + error back so the model can
+        self-correct). On success the response carries the candidate plus a
+        token + USD cost forecast (looked up via the shipped pricing
+        table). On failure the response surfaces a 422 with the typed
+        validation error.
+
+        LLM spend: scoped on ``admin`` (matches the other
+        agent-creation routes that spend LLM tokens, e.g. the wizard create
+        path). Tenant-scoped via the auth context. The provider seam is the
+        shipped ``BaseLLMProvider`` — ``LiteLLMProvider`` for real calls,
+        ``MockProvider`` when ``mock=true`` (offline, no API key needed).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — authenticated but key lacks the ``admin`` scope
+        * **422** — body shape failure (FastAPI handles) OR the LLM
+          produced a candidate that failed validation after one retry
+        * **502** — the provider call itself failed (wire error, non-JSON
+          response) after one retry
+        * **504** — the provider call exceeded the runtime preview timeout
+        """
+        # Lazy imports — keep cold-start light. The non-LLM endpoints don't
+        # need to drag the provider stack in.
+        from movate.core.scaffold_preview import (  # noqa: PLC0415
+            PreviewFailureMode,
+            ScaffoldPreviewError,
+            preview_agent_from_description,
+        )
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+        # Default model matches ``mdk init --llm`` (``cli/init.py``:
+        # ``_DEFAULT_LLM_MODEL``) so the CLI and the API agree on what a
+        # description-only request scaffolds. A real client can pin
+        # ``model`` for cost / capability trade-offs.
+        chosen_model = body.model or "openai/gpt-4o-mini-2024-07-18"
+
+        # ``mock=true`` → deterministic MockProvider (sub-second, no API
+        # keys). Otherwise LiteLLMProvider, which honors the provider keys
+        # configured in the runtime's env / per-tenant key store. The same
+        # provider seam ``mdk init --llm`` uses (``BaseLLMProvider``).
+        provider: BaseLLMProvider = MockProvider() if body.mock else LiteLLMProvider()
+
+        try:
+            preview = await preview_agent_from_description(
+                description=body.description,
+                name=body.name,
+                provider=provider,
+                model=chosen_model,
+                target_model=body.target_model,
+                # 60s ceiling on the provider call so a slow LLM can't drag
+                # the request out. Generous: the meta-prompt typically
+                # returns in 3-15s. Two attempts at 30s each fit within the
+                # budget. asyncio.TimeoutError → 504 below.
+                timeout_seconds=60.0,
+                # ADR 032 D1: the endpoint never has a project root in
+                # scope, so a candidate that declares an unresolvable
+                # skill fails validation cleanly here.
+                skill_provisioner=None,
+            )
+        except ScaffoldPreviewError as exc:
+            # Map the typed failure mode → the right HTTP status. We surface
+            # the operator-facing error string (same one the CLI feeds back
+            # to its retry); no provider key / internal stack traces leak.
+            if exc.mode is PreviewFailureMode.EMPTY_DESCRIPTION:
+                raise http_error(
+                    ErrorCode.BAD_REQUEST,
+                    status_code=422,
+                    message=exc.message,
+                ) from exc
+            if exc.mode is PreviewFailureMode.GENERATION:
+                # Provider call failed after one retry — treat as a
+                # bad-gateway since the failure is the LLM provider, not
+                # the caller's payload.
+                raise http_error(
+                    ErrorCode.INTERNAL,
+                    status_code=502,
+                    message=f"LLM scaffold generation failed: {exc.message}",
+                ) from exc
+            # PreviewFailureMode.VALIDATION — the model produced a parseable
+            # candidate that fails load-validation. The caller's
+            # description is the proximate cause (it's pushing the model
+            # to emit something that doesn't validate), so 422 is right.
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=f"generated candidate failed validation: {exc.message}",
+            ) from exc
+        except TimeoutError as exc:
+            raise http_error(
+                ErrorCode.INTERNAL,
+                status_code=504,
+                message="LLM scaffold timed out (preview ceiling exceeded)",
+            ) from exc
+
+        return DescribeAgentResponse(
+            preview=True,
+            name=body.name,
+            target_model=preview.target_model,
+            agent_yaml=preview.agent.agent_yaml,
+            prompt_md=preview.agent.prompt_md,
+            input_schema=preview.agent.input_schema,
+            output_schema=preview.agent.output_schema,
+            sample_evals=list(preview.agent.sample_evals),
+            tokens=DescribeAgentTokenUsageView(
+                input=preview.tokens.input,
+                output=preview.tokens.output,
+                cached_input=preview.tokens.cached_input,
+            ),
+            cost_usd=preview.cost_usd,
+            retried=preview.retried,
         )
 
     @v1.post(
