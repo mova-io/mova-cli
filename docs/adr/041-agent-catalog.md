@@ -270,23 +270,47 @@ This matches ADR 018 / ADR 022's tenant-data-stays-in-tenant posture.
   immediate need is a curated catalog and a tenant-private reuse pattern;
   community pricing is a separate problem.
 
-## Open questions (for Deva)
+## Resolved decisions (locked 2026-05-28)
 
-1. **AuthN on `catalog.movate.io`.** Anonymous read (no identity), signed
-   org-attribution token (per-org ratings/analytics), or full Entra ID
-   (deeper coupling)? Recommendation: **anonymous read by default**, opt-in
-   org-attribution token for ratings.
-2. **Versioning convention.** Catalog entries are reusable templates, not
-   the MDK CalVer system — recommend **SemVer** (`MAJOR.MINOR.PATCH`) for
-   `catalog_entry_versions.version`. Confirm.
-3. **Versioning of the catalog API itself.** `/v1/catalog/...` —
-   **additive evolution only** (CLAUDE.md rule 5). Confirm we never go to
-   `/v2/catalog`.
-4. **CLA + moderation for community.** Defer to a separate ADR (recommended)
-   or design now? Schema is ready either way.
-5. **Air-gapped flow.** Provide `mdk catalog export` (Movate side, packages
-   a snapshot) + `mdk catalog import-bundle` (customer side, sideloads the
-   snapshot) as the offline path. Confirm.
+All five open questions have been resolved with input from the architectural
+review. Resolutions hold the drafted recommendations:
+
+1. **AuthN on `catalog.movate.io` — RESOLVED: anonymous read + opt-in
+   org-attribution for ratings.**
+   Public catalog reads are unauthenticated; this is intentional (the catalog
+   is published Movate content). Customers who want their ratings or download
+   counts attributed to their org can mint a signed org-attribution token via
+   `mdk catalog register-org`; the token is opaque to MDK and never grants
+   any write capability against MDK runtimes. Full Entra ID coupling is
+   explicitly rejected — it would couple every customer to a single identity
+   provider for what is fundamentally public-content distribution.
+
+2. **Versioning convention — RESOLVED: SemVer for catalog entries.**
+   `catalog_entry_versions.version` uses `MAJOR.MINOR.PATCH` strings.
+   Templates are reusable artifacts with their own version lifecycle, distinct
+   from MDK's CalVer build-line. SemVer surfaces breaking-change semantics
+   (MAJOR bump = consumers should review before adopting).
+
+3. **Catalog API evolution — RESOLVED: additive-only under `/v1/catalog/...`.**
+   Confirms CLAUDE.md rule 5. New optional fields, new endpoints, and new
+   response keys are additive and require no version bump. Removing or
+   re-typing any existing field is forbidden without a deprecation window. We
+   do not plan a `/v2/catalog`; long-term schema growth happens additively.
+
+4. **Community CLA + moderation — RESOLVED: deferred to a future ADR.**
+   Schema is community-ready (the `source = "community"` namespace exists
+   from day one) but writes to that namespace are blocked at the API surface
+   in v1. A future ADR will design the moderation flow, CLA, abuse handling,
+   and rate-limited submissions. No code-level prep work is sacrificed by
+   this deferral.
+
+5. **Air-gapped flow — RESOLVED: `mdk catalog export` + `import-bundle`
+   ship as the offline path.**
+   `mdk catalog export <slug>[@version]` (operator side; pulls the bundle
+   from `catalog.movate.io` and packages it as a tar.gz with manifest +
+   signature) and `mdk catalog import-bundle <path>` (customer side; sideloads
+   into local `catalog_entries`) together form the air-gapped sync path.
+   The same bundle format also feeds the image-bundled floor (D1).
 
 ## Boundaries (out of scope)
 
