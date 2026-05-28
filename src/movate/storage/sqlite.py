@@ -664,6 +664,39 @@ _MIGRATIONS = [
     # breakdown is coherent (a turn's skill children are persisted too).
     "ALTER TABLE runs ADD COLUMN skill_calls TEXT",
     "ALTER TABLE runs ADD COLUMN turns TEXT",
+    # Eval-generation jobs (``mdk eval generate``). Runtime-resident,
+    # SSE-driven; persistence is so the status GET + commit endpoint can
+    # read back what generation produced. Additive new table, idempotent
+    # (CREATE TABLE IF NOT EXISTS) — no row exists unless a caller hit
+    # the generate endpoint. ``result`` is a JSON-encoded
+    # :class:`GenerationResult` (cases + judge + cost) populated when the
+    # pipeline finishes; ``error`` is populated on failure. Both NULL
+    # while ``status='running'``.
+    """
+    CREATE TABLE IF NOT EXISTS eval_generation_jobs (
+        job_id          TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        agent_name      TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        description     TEXT NOT NULL,
+        count_requested INTEGER NOT NULL,
+        categories      TEXT NOT NULL,
+        include_judge   INTEGER NOT NULL DEFAULT 0,
+        model           TEXT NOT NULL,
+        budget_usd      REAL,
+        progress        REAL NOT NULL DEFAULT 0.0,
+        result          TEXT,
+        error           TEXT,
+        tokens_used     INTEGER NOT NULL DEFAULT 0,
+        cost_usd        REAL NOT NULL DEFAULT 0.0,
+        created_at      TEXT NOT NULL,
+        completed_at    TEXT
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_eval_gen_jobs_tenant_created "
+        "ON eval_generation_jobs(tenant_id, created_at DESC)"
+    ),
 ]
 
 
@@ -2942,6 +2975,141 @@ class SqliteProvider:
         from movate.core.dr_backup import import_state  # noqa: PLC0415
 
         return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Eval-generation jobs (``mdk eval generate``)
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: Any) -> None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        assert isinstance(job, EvalGenerationJob)
+        assert self._conn is not None
+        await self._conn.execute(
+            """
+            INSERT INTO eval_generation_jobs (
+                job_id, tenant_id, agent_name, status, description,
+                count_requested, categories, include_judge, model,
+                budget_usd, progress, result, error, tokens_used,
+                cost_usd, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                progress = excluded.progress,
+                result = excluded.result,
+                error = excluded.error,
+                tokens_used = excluded.tokens_used,
+                cost_usd = excluded.cost_usd,
+                completed_at = excluded.completed_at
+            """,
+            (
+                job.job_id,
+                job.tenant_id,
+                job.agent_name,
+                job.status,
+                job.description,
+                job.count,
+                json.dumps(job.categories),
+                1 if job.include_judge else 0,
+                job.model,
+                job.budget_usd,
+                job.progress,
+                json.dumps(job.result) if job.result is not None else None,
+                json.dumps(job.error) if job.error is not None else None,
+                job.tokens_used,
+                job.cost_usd,
+                job.created_at,
+                job.completed_at,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_eval_generation_job(self, job_id: str, *, tenant_id: str) -> Any | None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT * FROM eval_generation_jobs WHERE job_id = ? AND tenant_id = ?",
+            (job_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return EvalGenerationJob(
+            job_id=row["job_id"],
+            tenant_id=row["tenant_id"],
+            agent_name=row["agent_name"],
+            status=row["status"],
+            description=row["description"],
+            count=row["count_requested"],
+            categories=json.loads(row["categories"]),
+            include_judge=bool(row["include_judge"]),
+            model=row["model"],
+            budget_usd=row["budget_usd"],
+            progress=row["progress"],
+            result=json.loads(row["result"]) if row["result"] else None,
+            error=json.loads(row["error"]) if row["error"] else None,
+            tokens_used=row["tokens_used"],
+            cost_usd=row["cost_usd"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Any,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> Any:
+        # Same disk-mutation contract as the in-memory double; the SQL
+        # layer doesn't store the dataset (the agent's evals/dataset.jsonl
+        # lives on the runtime's filesystem). Delegated to a shared helper
+        # so the three backends stay byte-identical on the commit shape.
+        from pathlib import Path  # noqa: PLC0415
+
+        from movate.core.eval_generator import serialize_case_for_dataset  # noqa: PLC0415
+        from movate.storage.base import EvalCommitResult  # noqa: PLC0415
+
+        job = await self.get_eval_generation_job(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise FileNotFoundError(f"eval-generation job {job_id!r} not found")
+        if job.result is None:
+            raise ValueError(f"job {job_id!r} status={job.status!r} — no result to commit")
+        cases = list(job.result.get("cases") or [])
+        if case_ids is not None:
+            wanted = set(case_ids)
+            cases = [c for c in cases if c.get("id") in wanted]
+
+        agent_dir = Path(agents_path) / job.agent_name
+        if not agent_dir.is_dir():
+            raise FileNotFoundError(f"agent dir not found: {agent_dir}")
+        evals_dir = agent_dir / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+        dataset = evals_dir / "dataset.jsonl"
+        prior = dataset.read_bytes() if dataset.exists() else b""
+        if prior and not prior.endswith(b"\n"):
+            prior = prior + b"\n"
+        with dataset.open("wb") as fh:
+            fh.write(prior)
+            for case in cases:
+                fh.write(serialize_case_for_dataset(case))
+
+        judge_updated = False
+        if commit_judge:
+            judge_blob = job.result.get("judge_yaml")
+            if isinstance(judge_blob, str) and judge_blob.strip():
+                (evals_dir / "judge.yaml").write_text(judge_blob, encoding="utf-8")
+                judge_updated = True
+
+        return EvalCommitResult(
+            agent_name=job.agent_name,
+            dataset_path=str(dataset.relative_to(agent_dir.parent)),
+            cases_added=len(cases),
+            judge_yaml_updated=judge_updated,
+        )
 
     async def close(self) -> None:
         if self._conn is not None:

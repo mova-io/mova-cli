@@ -161,6 +161,12 @@ from movate.runtime.schemas import (
     CanarySideView,
     CanaryView,
     EvalAcceptedView,
+    EvalCommitRequest,
+    EvalCommitView,
+    EvalGenerateAcceptedView,
+    EvalGenerateJobView,
+    EvalGenerateRequest,
+    EvalGenerationResultView,
     EvalListView,
     EvalScheduleListView,
     EvalScheduleSubmission,
@@ -170,6 +176,7 @@ from movate.runtime.schemas import (
     FeedbackListView,
     FeedbackSubmission,
     FeedbackView,
+    GeneratedEvalCaseView,
     HarvestedCaseView,
     HarvestView,
     HealthView,
@@ -193,6 +200,7 @@ from movate.runtime.schemas import (
     KbStatsView,
     ModelCatalogView,
     ModelInfoView,
+    PreviewScoreView,
     PricingEntryView,
     PricingView,
     ProviderKeyListView,
@@ -362,6 +370,180 @@ async def _sse_run_stream(
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+async def _run_eval_generation(
+    *,
+    store: StorageProvider,
+    bundle: AgentBundle,
+    job: Any,
+    model: str,
+    event_queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+    streams_map: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]],
+) -> None:
+    """Drive one eval-generation pipeline + persist the terminal status.
+
+    Lives at module level (not nested inside ``build_app``) so the
+    asyncio.Task that runs it doesn't hold the build_app closure alive.
+    Pushes :func:`movate.core.eval_generator.generate_eval_cases`'s
+    progress events onto ``event_queue`` for the SSE endpoint to drain.
+
+    Always pops the queue from ``streams_map`` on exit so a finished
+    job's SSE replay path falls through to the persisted record (the
+    GET status endpoint serves that case). Never raises — every
+    failure mode lands as a ``failed`` status on the persisted job.
+    """
+    from movate.core.eval_generator import (  # noqa: PLC0415
+        BudgetExceededError,
+        GenerationFailedError,
+        generate_eval_cases,
+    )
+    from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+    from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+    # Provider selection: mock when the agent's model spec is the mock,
+    # otherwise LiteLLM. Mirrors the choice in ``v1_agent_run_stream``.
+    # The mock provider returns deterministic content so test-mode jobs
+    # produce empty results (no JSON object in the reply) — which is the
+    # correct contract for "hermetic CI": no real LLM call, no cost.
+    provider_impl: Any = (
+        MockProvider() if model.startswith("mock") or "mock" in model.lower() else LiteLLMProvider()
+    )
+
+    def _on_event(event: str, data: dict[str, Any]) -> None:
+        try:
+            event_queue.put_nowait((event, data))
+        except asyncio.QueueFull:
+            # Buffer full = a slow client. Drop the event silently rather
+            # than block the pipeline. The terminal frame is what matters;
+            # the persisted record carries the cumulative state anyway.
+            log = __import__("logging").getLogger(__name__)
+            log.debug("eval_gen: SSE buffer full, dropping event=%s", event)
+
+    error_payload: dict[str, Any] | None = None
+    result_payload: dict[str, Any] | None = None
+    final_status = "completed"
+    try:
+        result = await generate_eval_cases(
+            bundle=bundle,
+            description=job.description,
+            provider_impl=provider_impl,
+            model=model,
+            count=job.count,
+            categories=list(job.categories),
+            include_judge=job.include_judge,
+            budget_usd=job.budget_usd,
+            on_event=_on_event,
+        )
+        result_payload = result.to_dict()
+        # ── Smoke preview score (mock pass rate) ──
+        # Run every generated case against the agent under the mock
+        # provider so the operator gets a quick "does the case shape
+        # match" signal BEFORE they commit. Failures don't fail the
+        # job — the score just stays None.
+        try:
+            preview = await _smoke_preview_score(bundle, result.cases)
+            if preview is not None:
+                result_payload["preview_score"] = preview
+                _on_event("preview_eval", {"mock_pass_rate": preview["mock_pass_rate"]})
+        except Exception:  # never fail the job on a preview hiccup
+            __import__("logging").getLogger(__name__).debug(
+                "eval_gen: preview-score step failed", exc_info=True
+            )
+    except BudgetExceededError as exc:
+        final_status = "failed"
+        error_payload = {
+            "code": "budget_exceeded",
+            "message": str(exc),
+            "spent": exc.spent,
+            "ceiling": exc.ceiling,
+        }
+        _on_event("error", {"message": str(exc)})
+    except GenerationFailedError as exc:
+        final_status = "failed"
+        error_payload = {"code": "generation_failed", "message": str(exc)}
+        _on_event("error", {"message": str(exc)})
+    except Exception as exc:  # last-ditch — never bubble
+        final_status = "failed"
+        error_payload = {"code": "internal_error", "message": str(exc)}
+        _on_event("error", {"message": str(exc)})
+    finally:
+        # Persist the terminal state. Construct a fresh EvalGenerationJob
+        # rather than mutating the frozen dataclass.
+        from dataclasses import replace  # noqa: PLC0415
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        completed_at = datetime.now(UTC).isoformat()
+        updated = replace(
+            job,
+            status=final_status,
+            result=result_payload,
+            error=error_payload,
+            tokens_used=(result_payload or {}).get("tokens_used", 0) if result_payload else 0,
+            cost_usd=(result_payload or {}).get("cost_usd", 0.0) if result_payload else 0.0,
+            progress=1.0 if final_status == "completed" else job.progress,
+            completed_at=completed_at,
+        )
+        try:
+            await store.save_eval_generation_job(updated)
+        except Exception:
+            __import__("logging").getLogger(__name__).warning(
+                "eval_gen: failed to persist terminal status job_id=%s", job.job_id, exc_info=True
+            )
+        # Drop the queue + task ref so the SSE endpoint's not-running
+        # replay path takes over for any late-arriving subscriber. The
+        # task ref is the one stashed by the route handler to keep us
+        # alive against asyncio's GC.
+        streams_map.pop(job.job_id, None)
+        streams_map.pop(f"_task_{job.job_id}", None)
+
+
+async def _smoke_preview_score(bundle: AgentBundle, cases: list[Any]) -> dict[str, Any] | None:
+    """Run generated cases against the agent under the mock provider.
+
+    Pure smoke check: confirms each generated input passes the agent's
+    input schema (already validated by the pipeline) and that the
+    mock-mode Executor can produce a structurally-valid output for it.
+    The "pass rate" is the fraction of cases that ran to completion
+    without an error — NOT a semantic correctness check (that's what
+    the real eval engine + ``--mock`` is for, post-commit).
+
+    Returns ``None`` if there are no cases to score; otherwise
+    ``{"mock_pass_rate": float, "tested_against_model": "mock"}``.
+    Never raises.
+    """
+    if not cases:
+        return None
+    from movate.core.executor import Executor  # noqa: PLC0415
+    from movate.core.models import RunRequest  # noqa: PLC0415
+    from movate.providers.mock import MockProvider  # noqa: PLC0415
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+    from movate.testing import InMemoryStorage  # noqa: PLC0415
+    from movate.tracing import build_tracer  # noqa: PLC0415
+
+    # Use an ephemeral in-memory store so the smoke runs don't pollute
+    # the real audit trail. Same pattern the test fixtures use.
+    ephemeral = InMemoryStorage()
+    await ephemeral.init()
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=load_pricing(),
+        storage=ephemeral,
+        tracer=build_tracer(),
+        tenant_id="__preview__",
+    )
+    passes = 0
+    for case in cases:
+        try:
+            resp = await executor.execute(
+                bundle, RunRequest(agent=bundle.spec.name, input=case.input)
+            )
+            if getattr(resp, "status", None) != "error":
+                passes += 1
+        except Exception:
+            continue
+    rate = passes / len(cases) if cases else 0.0
+    return {"mock_pass_rate": round(rate, 4), "tested_against_model": "mock"}
 
 
 def _github_is_enabled() -> bool:
@@ -4063,20 +4245,64 @@ def build_app(
     # ------------------------------------------------------------------
     @v1.get(
         "/jobs/{job_id}",
-        response_model=JobView,
+        # No fixed response_model — this endpoint returns one of two
+        # shapes depending on the job's kind: ``JobView`` for queue
+        # jobs (agent / workflow / eval / bench), or
+        # ``EvalGenerateJobView`` for the eval-generator's
+        # runtime-resident jobs. FastAPI's union response_model would
+        # add discriminator constraints we don't actually need on the
+        # wire (the ``kind`` field is the discriminator). The OpenAPI
+        # entry stays for both as a documented union.
         tags=["jobs-v1"],
         dependencies=[_scope("read")],
+        responses={
+            200: {
+                "model": JobView,
+                "description": "Queue job (agent / workflow / eval / bench).",
+            },
+        },
     )
     async def v1_get_job(
         job_id: str,
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
-    ) -> JobView:
+    ) -> Any:
         """Versioned alias of ``GET /jobs/{job_id}``.
 
-        Delegates to the unversioned :func:`get_job` handler — identical
-        ``read`` scope, ``JobView`` response, and tenant-scoping (404 on
-        cross-tenant access, never 403)."""
+        Routes by job_id format: ``evgen_*`` ids land in the
+        eval-generation table (returning :class:`EvalGenerateJobView`);
+        everything else delegates to the queue ``JobView`` path. Both
+        responses use the same ``read`` scope + 404-not-403 tenant
+        gating — the discriminator is the response's ``kind`` field
+        (``evals_generate`` vs. ``agent`` / ``workflow`` / ``eval``)."""
+        if job_id.startswith("evgen_"):
+            store: StorageProvider = request.app.state.storage
+            ev_job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
+            if ev_job is None:
+                raise not_found("job", job_id)
+            result_view: EvalGenerationResultView | None = None
+            if ev_job.result is not None:
+                cases_payload = ev_job.result.get("cases") or []
+                preview_payload = ev_job.result.get("preview_score")
+                result_view = EvalGenerationResultView(
+                    cases=[GeneratedEvalCaseView(**c) for c in cases_payload],
+                    judge_yaml=ev_job.result.get("judge_yaml"),
+                    preview_score=(
+                        PreviewScoreView(**preview_payload)
+                        if isinstance(preview_payload, dict)
+                        else None
+                    ),
+                )
+            return EvalGenerateJobView(
+                job_id=ev_job.job_id,
+                agent_name=ev_job.agent_name,
+                status=ev_job.status,
+                progress=ev_job.progress,
+                result=result_view,
+                error=ev_job.error,
+                tokens_used=ev_job.tokens_used,
+                cost_usd=ev_job.cost_usd,
+            )
         return await get_job(job_id, request, ctx)
 
     @v1.post(
@@ -4381,6 +4607,298 @@ def build_app(
         )
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Eval generator (review-then-commit pattern). Three endpoints:
+    #
+    # * ``POST /agents/{name}/evals/generate``  — accept a description,
+    #   spin up the pipeline as an asyncio.Task, persist the job,
+    #   return 202 + status/stream URLs.
+    # * ``GET /jobs/{job_id}/stream``           — SSE feed of progress
+    #   events the running task pushes through a per-job queue.
+    # * ``POST /jobs/{job_id}/commit``          — atomic dataset append.
+    #
+    # The status read piggybacks on ``GET /api/v1/jobs/{job_id}`` (which
+    # already exists for queue jobs); we route the lookup by trying the
+    # eval-generation table first, falling back to the queue.
+    #
+    # Why runtime-resident (not the queue worker): generation is a
+    # human-in-the-loop authoring flow — the caller is watching the
+    # progress SSE in their browser. Queueing it would push the
+    # progress events back through a separate channel for the same
+    # lifetime, with no operational benefit. The pattern mirrors
+    # ``POST /agents/{name}/runs/stream`` (which is also driven by an
+    # asyncio.Task + a queue, not the worker).
+    # ------------------------------------------------------------------
+
+    # Per-process map of running generation jobs → asyncio.Queue carrying
+    # progress events. The SSE endpoint pulls from this queue; a missing
+    # entry means the job already finished (the client polls GET
+    # /jobs/{id} for the result instead of streaming). Set on app state
+    # so this dict is shared across all routes inside this build_app
+    # closure without leaking to module level (tests get a fresh map
+    # per app build).
+    app.state.eval_gen_streams = {}
+
+    @v1.post(
+        "/agents/{name}/evals/generate",
+        response_model=EvalGenerateAcceptedView,
+        status_code=202,
+        tags=["evals-v1"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_eval_generate(
+        name: str,
+        body: EvalGenerateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> EvalGenerateAcceptedView:
+        """Author an eval dataset from a plain-English agent description.
+
+        Asynchronous: returns 202 + ``job_id`` immediately. The
+        caller either polls ``GET /api/v1/jobs/{job_id}`` for the
+        completed result OR subscribes to
+        ``GET /api/v1/jobs/{job_id}/stream`` for live SSE progress
+        (``category_complete`` / ``judge_drafted`` / ``preview_eval``
+        / ``completed`` events).
+
+        The generation pipeline lives in :mod:`movate.core.eval_generator`
+        and runs as an asyncio.Task on this process. Categories,
+        ``count`` (max 100), ``include_judge``, and the optional
+        ``budget_usd`` ceiling are validated at the edge; an unknown
+        category or out-of-range count returns 422 BEFORE the job is
+        persisted (so a malformed request never shows up in
+        ``GET /jobs``).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — agent not in the registry
+        * **422** — request shape failure (count out of range, unknown
+          category, etc.)
+        """
+        from movate.core.eval_generator import (  # noqa: PLC0415
+            EvalGenerationJob,
+            validate_categories,
+            validate_count,
+        )
+
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == name), None)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Edge validation — surface bad shape as 422 BEFORE persisting
+        # anything. The pipeline's defense-in-depth re-checks too, so a
+        # direct in-process caller can't bypass them.
+        try:
+            count = validate_count(body.count)
+            categories = list(validate_categories(body.categories))
+        except ValueError as exc:
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        store: StorageProvider = request.app.state.storage
+        model_str = body.model or bundle.spec.model.provider
+        job_id = f"evgen_{uuid4().hex[:24]}"
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        now_iso = datetime.now(UTC).isoformat()
+
+        job = EvalGenerationJob(
+            job_id=job_id,
+            tenant_id=ctx.tenant_id,
+            agent_name=name,
+            status="running",
+            description=body.description,
+            count=count,
+            categories=categories,
+            include_judge=body.include_judge,
+            model=model_str,
+            budget_usd=body.budget_usd,
+            progress=0.0,
+            created_at=now_iso,
+        )
+        await store.save_eval_generation_job(job)
+
+        # Per-job queue for SSE event fan-out. The pipeline pushes events
+        # via on_event; the SSE endpoint drains them. Bounded so a slow
+        # client can't OOM us: events older than the buffer are dropped
+        # (the operator still gets the terminal `completed` frame off
+        # the GET /jobs/{id} result).
+        event_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=256)
+        request.app.state.eval_gen_streams[job_id] = event_queue
+
+        # Background task drives the pipeline + persists the terminal
+        # status. NOT awaited here — the 202 response must fire while
+        # the work continues. Stash a reference on app.state so the
+        # event loop's GC can't reap the task before it finishes
+        # (asyncio docs: keep a strong ref to every long-running task).
+        bg_task = asyncio.create_task(
+            _run_eval_generation(
+                store=store,
+                bundle=bundle,
+                job=job,
+                model=model_str,
+                event_queue=event_queue,
+                streams_map=request.app.state.eval_gen_streams,
+            )
+        )
+        # `_run_eval_generation`'s finally pops the queue from
+        # streams_map; we set the task as a sibling key so it stays
+        # alive until that finally runs, then drops out of scope.
+        request.app.state.eval_gen_streams[f"_task_{job_id}"] = bg_task
+
+        # Rough estimate: ~3-5s/case for a typical provider, scaled by
+        # whether the judge step is included. Not a guarantee — the SSE
+        # `completed` event tells the truth.
+        per_case_s = 4
+        judge_s = 8 if body.include_judge else 0
+        estimated_seconds = count * per_case_s + judge_s
+
+        return EvalGenerateAcceptedView(
+            job_id=job_id,
+            status="running",
+            estimated_seconds=estimated_seconds,
+            status_url=f"/api/v1/jobs/{job_id}",
+            stream_url=f"/api/v1/jobs/{job_id}/stream",
+        )
+
+    @v1.get(
+        "/jobs/{job_id}/stream",
+        tags=["jobs-v1"],
+        dependencies=[_scope("read")],
+        # No response_model — raw SSE byte stream (text/event-stream).
+    )
+    async def v1_eval_generate_stream(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> StreamingResponse:
+        """SSE feed of generation progress for one eval-generation job.
+
+        Frame shape (one ``data: <json>\\n\\n`` per event):
+
+        * ``{"event": "category_complete", "category": str, "cases_so_far": int}``
+        * ``{"event": "judge_drafted", "preview": str}`` (only with ``include_judge=true``)
+        * ``{"event": "preview_eval", "mock_pass_rate": float}``
+        * ``{"event": "completed", "case_count": int, "cost_usd": float}``
+        * ``{"event": "error", "message": str}`` (on failure)
+
+        Same tenant gating as the GET job endpoint: a cross-tenant job
+        id returns 404 (no leak of existence). When the SSE stream is
+        opened AFTER the job has already finished, this endpoint
+        replays the terminal event from the persisted result so the
+        client always sees a final frame.
+        """
+        store: StorageProvider = request.app.state.storage
+        # Tenant-scoped existence check — also handles the
+        # "job finished before client connected" replay path.
+        job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
+        if job is None:
+            raise not_found("job", job_id)
+
+        streams_map = getattr(request.app.state, "eval_gen_streams", {})
+        queue = streams_map.get(job_id)
+
+        async def _stream() -> Any:
+            # Already-finished replay: send one terminal frame + close.
+            if queue is None:
+                if job.status == "failed":
+                    msg = (job.error or {}).get("message", "failed")
+                    yield _sse_frame("error", {"message": msg})
+                else:
+                    yield _sse_frame(
+                        "completed",
+                        {
+                            "case_count": len((job.result or {}).get("cases") or []),
+                            "cost_usd": job.cost_usd,
+                        },
+                    )
+                return
+            # Live-task path: drain the queue until a terminal event
+            # arrives. The pipeline always emits a ``completed`` or
+            # ``error`` frame as its final push.
+            while True:
+                event, data = await queue.get()
+                yield _sse_frame(event, data)
+                if event in ("completed", "error"):
+                    return
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @v1.post(
+        "/jobs/{job_id}/commit",
+        response_model=EvalCommitView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_eval_generate_commit(
+        job_id: str,
+        body: EvalCommitRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> EvalCommitView:
+        """Atomically commit selected generated cases to the agent's dataset.
+
+        The ONLY mutation path for the eval generator — generation alone
+        never touches the agent bundle on disk. Selective acceptance:
+        ``case_ids=None`` commits every case; ``case_ids=[...]`` appends
+        only the named ones. ``commit_judge=True`` (when the job drafted
+        a judge) writes ``evals/judge.yaml`` alongside the dataset.
+
+        Gated on the ``admin`` scope (this writes to the agent bundle —
+        same scope that POSTs / PUTs an agent).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — token lacks the ``admin`` scope
+        * **404** — job not found for this tenant, or agent dir missing
+        * **409** — job not yet ``completed`` (no result to commit)
+        """
+        store: StorageProvider = request.app.state.storage
+        # Tenant-scope check first so a cross-tenant 404 doesn't leak
+        # into a 409 by accident.
+        job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
+        if job is None:
+            raise not_found("job", job_id)
+        if job.status != "completed":
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"job {job_id!r} status={job.status!r} — only completed jobs can be committed"
+                ),
+            )
+
+        try:
+            result = await store.commit_eval_cases(
+                job_id,
+                tenant_id=ctx.tenant_id,
+                agents_path=request.app.state.agents_path,
+                case_ids=body.case_ids,
+                commit_judge=body.commit_judge,
+            )
+        except FileNotFoundError as exc:
+            raise not_found("agent", job.agent_name) from exc
+        except ValueError as exc:
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return EvalCommitView(
+            agent_name=result.agent_name,
+            dataset_path=result.dataset_path,
+            cases_added=result.cases_added,
+            judge_yaml_updated=result.judge_yaml_updated,
+        )
 
     # ------------------------------------------------------------------
     # Aggregate monitor feed (ADR 032 D2). Two read-scoped endpoints that

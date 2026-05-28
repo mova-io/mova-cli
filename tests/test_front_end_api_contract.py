@@ -65,6 +65,14 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/agents/{name}/evals"): "eval",
     ("GET", "/api/v1/evals"): "read",
     ("GET", "/api/v1/evals/{eval_id}"): "read",
+    # eval generator (review-then-commit) — author a dataset from a
+    # plain-English description, stream SSE progress, commit selected
+    # cases atomically to the agent's dataset on disk. The /jobs/{id}
+    # status endpoint (already pinned above) returns the generator
+    # job view when the id is in the eval-generation table.
+    ("POST", "/api/v1/agents/{name}/evals/generate"): "eval",
+    ("GET", "/api/v1/jobs/{job_id}/stream"): "read",
+    ("POST", "/api/v1/jobs/{job_id}/commit"): "admin",
     # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
     ("GET", "/api/v1/report"): "read",
     ("GET", "/api/v1/agents/{name}/metrics"): "read",
