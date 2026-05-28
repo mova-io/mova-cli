@@ -210,7 +210,16 @@ def test_every_emitted_metric_appears_on_some_dashboard() -> None:
     a reason.
     """
     # Metrics deliberately not (yet) on a dashboard, with justification.
-    _not_dashboarded: dict[str, str] = {}
+    _not_dashboarded: dict[str, str] = {
+        # ADR 035 D3 — SSE event-stream subscriber gauge. Powers the
+        # internal "is a runaway client owning the pool?" operator
+        # check + pairs with the advisory per-tenant cap; not yet on a
+        # customer-facing dashboard because D3 just shipped and the
+        # alerting story for SSE saturation is the same item-#27 work
+        # the rest of the data-plane gauges are waiting on. Add a panel
+        # alongside the DB-pool gauges when item #27 lands.
+        "mdk.sse.connections_active": "ADR 035 D3, dashboard panel deferred to item #27",
+    }
 
     covered: set[str] = set()
     for case in _CASES:
