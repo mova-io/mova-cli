@@ -1584,6 +1584,139 @@ class HarvestView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Judge Engineer — author + commit a judge.yaml
+# (POST /api/v1/agents/{name}/judge/{generate,commit})
+# ---------------------------------------------------------------------------
+
+
+class JudgeGenerateRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/generate`` request body.
+
+    All fields are optional — an empty ``{}`` body asks the engineer to
+    infer dimensions from the agent shape, use the default engineer
+    model, and include anchor examples. The generation is sync (~few
+    seconds) and read-only — it does NOT touch the agent's bundle on
+    disk. The follow-up commit endpoint is what writes ``judge.yaml``.
+
+    The shape of the generated YAML is the existing canonical
+    :class:`~movate.core.models.JudgeConfig` (CLAUDE.md rule 5 —
+    judge.yaml is a flagged surface). The dimensions are reflected
+    INSIDE the rubric text, not as a new top-level YAML key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rubric_dimensions: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of scoring dimensions the rubric must cover. "
+            "Each entry is a lowercase snake_case identifier (e.g. "
+            "``accuracy``, ``tone``, ``schema_adherence``). When omitted "
+            "or null, the engineer infers a sensible set from the agent's "
+            "shape (RAG / tool-use / workflow / generic)."
+        ),
+    )
+    include_examples: bool = Field(
+        default=True,
+        description=(
+            "When true (the default) the rubric is anchored with 2-3 "
+            "concrete scored examples drawn from the agent's domain (and "
+            "from the agent's evals dataset when available). False keeps "
+            "the rubric leaner — useful when the agent has no dataset yet."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Optional LiteLLM-style provider/model override for the "
+            "ENGINEER model — the model that authors the rubric. Defaults "
+            "to a strong general-purpose model (currently "
+            "``anthropic/claude-sonnet-4-6``). Distinct from the judge "
+            "model the generated YAML uses at eval time."
+        ),
+    )
+    budget_usd: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Hard ceiling on the generation call's cost in USD. Typical "
+            "generation is <$0.01; this is a safety valve. Exceeded → "
+            "402 with no commit."
+        ),
+    )
+
+
+class JudgeGenerateResponse(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/generate`` response.
+
+    The ``judge_yaml`` is the complete, validated YAML body — a UI can
+    render it for review, the operator hand-edits if desired, then the
+    edited string POSTs back to ``/judge/commit`` (which re-validates
+    before persisting).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    judge_yaml: str
+    """The full ``judge.yaml`` body as a string. Validated against
+    :class:`~movate.core.models.JudgeConfig` before returning — the
+    eval engine can load this byte-for-byte. Edit and POST to
+    ``/judge/commit`` to persist."""
+    rubric_dimensions: list[str]
+    """The dimensions the rubric covers. Mirrored from the ``Dimensions
+    covered:`` preamble inside the rubric text so a client can render
+    the dimension chip set without re-parsing the markdown."""
+    rationale: str
+    """One or two sentences explaining why these dimensions were picked
+    for this agent. Surfaced to the human reviewer; not persisted."""
+    tokens_used: int = 0
+    """Total tokens (input + output) consumed by the engineer LLM call."""
+    cost_usd: float = 0.0
+    """Best-effort cost of the engineer call in USD, looked up via the
+    pricing table. 0.0 when pricing data is unavailable for the chosen
+    engineer model — the call still happened."""
+
+
+class JudgeCommitRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/commit`` request body.
+
+    The ``judge_yaml`` is the YAML the operator wants persisted at
+    ``<agent_dir>/evals/judge.yaml``. The server re-validates against
+    :class:`~movate.core.models.JudgeConfig` BEFORE writing — a hand
+    edit that breaks the schema can't land. Idempotent: posting the
+    same YAML twice overwrites with the same bytes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    judge_yaml: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The complete ``judge.yaml`` body to persist. Validated "
+            "against :class:`~movate.core.models.JudgeConfig`; a "
+            "malformed body returns 422 without touching disk."
+        ),
+    )
+
+
+class JudgeCommitResponse(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/commit`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    judge_path: str
+    """Where the file landed, as a path RELATIVE to the agent dir
+    (``evals/judge.yaml`` in the canonical layout)."""
+    updated: bool
+    """``True`` when an existing ``judge.yaml`` was overwritten; ``False``
+    when the file was created fresh. Lets the UI surface the right
+    affirmative ("Saved" vs "Created")."""
+
+
+# ---------------------------------------------------------------------------
 # KB upload wire types
 # ---------------------------------------------------------------------------
 

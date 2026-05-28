@@ -65,6 +65,10 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/agents/{name}/evals"): "eval",
     ("GET", "/api/v1/evals"): "read",
     ("GET", "/api/v1/evals/{eval_id}"): "read",
+    # judge engineer — Claude authors a judge.yaml; commit is the
+    # human-review-gated mutation that writes evals/judge.yaml.
+    ("POST", "/api/v1/agents/{name}/judge/generate"): "eval",
+    ("POST", "/api/v1/agents/{name}/judge/commit"): "admin",
     # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
     ("GET", "/api/v1/report"): "read",
     ("GET", "/api/v1/agents/{name}/metrics"): "read",
