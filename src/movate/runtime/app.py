@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -42,6 +43,7 @@ from movate.core.auth import (
 )
 from movate.core.cache import build_cache
 from movate.core.canary import aggregate_side, choose_version
+from movate.core.events import EventKind, EventListView, EventView
 from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
@@ -95,6 +97,7 @@ from movate.runtime.agent_resolver import (
     resolve_agent_bundle,
 )
 from movate.runtime.errors import ErrorCode, auth_required, conflict, http_error, not_found
+from movate.runtime.events import emit_event
 from movate.runtime.hardening import (
     PayloadSizeLimitMiddleware,
     RequestIdMiddleware,
@@ -560,7 +563,7 @@ async def _dual_write_agent_to_registry(
     """
     try:
         files = bundle_files_from_dir(agent_dir)
-        return await publish_agent_bundle(
+        result = await publish_agent_bundle(
             storage,
             name=agent_dir.name,
             tenant_id=tenant_id,
@@ -579,6 +582,26 @@ async def _dual_write_agent_to_registry(
             exc_info=True,
         )
         return None
+
+    # ADR 035 D1 — emit ``agent.published`` only on a content-changed
+    # publish (``result.published is True``). A no-op re-deploy of
+    # byte-identical content does NOT emit (it's not a new state on the
+    # registry — same audit-meaningful discipline as the registry
+    # itself, which skips the duplicate history row). Fire-and-forget.
+    if result.published:
+        emit_event(
+            storage,
+            tenant_id=tenant_id,
+            kind=EventKind.AGENT_PUBLISHED,
+            subject=agent_dir.name,
+            data={
+                "version": result.version,
+                "content_hash": result.content_hash,
+                "previous_version": result.previous_version,
+                "created_by": created_by,
+            },
+        )
+    return result
 
 
 def _normalize_if_match(raw: str) -> str:
@@ -2609,6 +2632,25 @@ def build_app(
             files=target.files,
         )
         await store.save_agent_bundle(reverted)
+
+        # ADR 035 D1 — emit ``agent.reverted`` (the revert is a forward-
+        # append publish at the registry, ADR 014 D3, so an ``agent.
+        # published`` is conceptually possible too; we emit the dedicated
+        # ``reverted`` kind only — front ends/webhooks subscribing to
+        # publishes care about new content, not re-publishes of prior
+        # versions). Fire-and-forget.
+        emit_event(
+            store,
+            tenant_id=ctx.tenant_id,
+            kind=EventKind.AGENT_REVERTED,
+            subject=name,
+            data={
+                "version": new_version,
+                "reverted_from": target_version,
+                "previous_version": previous_version,
+                "created_by": ctx.api_key_id,
+            },
+        )
 
         return AgentRevertedView(
             name=name,
@@ -5516,6 +5558,21 @@ def build_app(
             mode=mode,
             previous_champion=previous_champion,
         )
+        # ADR 035 D1 — emit ``canary.promoted`` for the human-initiated
+        # promotion. The auto-rollback path emits its own ``canary.
+        # demoted`` from dispatch._maybe_auto_rollback. Fire-and-forget.
+        emit_event(
+            store,
+            tenant_id=ctx.tenant_id,
+            kind=EventKind.CANARY_PROMOTED,
+            subject=name,
+            data={
+                "promoted_version": target,
+                "previous_champion": previous_champion,
+                "mode": mode,
+                "actor": ctx.api_key_id,
+            },
+        )
         return CanaryPromotedView(
             agent=name,
             promoted_version=target,
@@ -5570,6 +5627,21 @@ def build_app(
             actor=ctx.api_key_id,
             tenant_id=ctx.tenant_id,
             target=f"{name}@{target if target is not None else '<latest>'}",
+        )
+        # ADR 035 D1 — emit ``canary.demoted`` for the human-initiated
+        # rollback (same kind as the drift-auto-rollback path; ``actor``
+        # discriminates). Fire-and-forget.
+        emit_event(
+            store,
+            tenant_id=ctx.tenant_id,
+            kind=EventKind.CANARY_DEMOTED,
+            subject=name,
+            data={
+                "challenger_version": config.challenger_version,
+                "champion_version": target,
+                "actor": ctx.api_key_id,
+                "reason": "manual_rollback",
+            },
         )
         return CanaryPromotedView(
             agent=name,
@@ -6665,6 +6737,118 @@ def build_app(
         await store.save_conversation_thread(refreshed)
 
         return RunAccepted(job_id=job.job_id, status=job.status)
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1) — read-only feed of lifecycle events
+    # (``run.completed``, ``agent.published``, ``eval.failed``,
+    # ``drift.detected``, ``canary.promoted/demoted``, ...).
+    #
+    # D1 surface is read-only: ``record_event`` is called by the runtime
+    # edges (executor / dispatch / deploy), never by clients. D2 will
+    # add webhook subscriptions that DELIVER these events; D3 will add
+    # an SSE stream that PUSHES them. Both consume the same outbox.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/events",
+        response_model=EventListView,
+        tags=["events-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_events(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        since: datetime | None = Query(
+            None,
+            description=("ISO-8601 lower bound on ``created_at`` (inclusive). Default: now - 24h."),
+        ),
+        until: datetime | None = Query(
+            None,
+            description="ISO-8601 upper bound on ``created_at`` (exclusive).",
+        ),
+        kind: str | None = Query(
+            None,
+            description=(
+                "Filter to one event kind (e.g. ``run.completed``, "
+                "``agent.published``, ``canary.demoted``). Exact match."
+            ),
+        ),
+        subject: str | None = Query(
+            None,
+            description=(
+                "Filter to one subject — the thing the event is about "
+                "(agent name / run id / etc.). Exact match."
+            ),
+        ),
+        limit: int = Query(
+            200,
+            ge=1,
+            le=1000,
+            description="Page size; capped at 1000.",
+        ),
+        after_id: str | None = Query(
+            None,
+            description=(
+                "Cursor: pass the previous response's ``next_after_id`` "
+                "to continue paginating in oldest-first order."
+            ),
+        ),
+        tenant: str | None = Query(
+            None,
+            description=(
+                "Operator override: list events for a specific tenant. "
+                "Requires a ``fleet-admin`` key; ignored otherwise."
+            ),
+        ),
+    ) -> EventListView:
+        """List lifecycle events for the calling tenant (ADR 035 D1).
+
+        Tenant-scoped by default (the caller's ``ctx.tenant_id``).
+        A key with the ``fleet-admin`` scope may pass ``?tenant=<id>``
+        to scope the read to a different tenant; non-fleet-admin
+        callers ignore the parameter (their own tenant only — no leak).
+
+        The default time window is the last 24 hours so a polling
+        client doesn't accidentally request the full history of an
+        active tenant. ``until`` defaults to "now" (unbounded). Pass
+        ``since=1970-01-01T00:00:00Z`` to read the full outbox.
+
+        Cursor pagination is **oldest-first** — consumers reading
+        forward in time pass the response's ``next_after_id`` back as
+        ``?after_id=`` to continue. ``next_after_id`` is populated only
+        when results were truncated at ``limit``; ``None`` means the
+        page is the tail.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — authenticated but key lacks the ``read`` scope
+        * **422** — ``limit`` outside ``[1, 1000]`` (FastAPI handles)
+        """
+        store: StorageProvider = request.app.state.storage
+        # Resolve tenant scope: fleet-admin may override; everyone else
+        # is locked to their own tenant (silently — same 404-not-403
+        # no-leak posture as cross-tenant resource lookups).
+        target_tenant = ctx.tenant_id
+        if tenant is not None and "fleet-admin" in ctx.scopes:
+            target_tenant = tenant
+        # Default window: last 24h (unless caller pinned ``since``).
+        effective_since = since if since is not None else datetime.now(UTC) - timedelta(hours=24)
+        records = await store.list_events(
+            target_tenant,
+            since=effective_since,
+            until=until,
+            kind=kind,
+            subject=subject,
+            limit=limit,
+            after_id=after_id,
+        )
+        views = [EventView.from_record(r) for r in records]
+        # Cursor: populate ``next_after_id`` only when the result hit
+        # the page cap (more rows may exist). The client passes this
+        # back unchanged on the next request.
+        next_after_id: str | None = records[-1].id if len(records) == limit else None
+        return EventListView(events=views, count=len(views), next_after_id=next_after_id)
 
     app.include_router(v1)
 

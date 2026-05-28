@@ -71,6 +71,8 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
+    # events — ADR 035 D1 events outbox (read-only feed)
+    ("GET", "/api/v1/events"): "read",
 }
 
 
