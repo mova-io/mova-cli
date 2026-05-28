@@ -300,27 +300,45 @@ optional everywhere it appears.
   forecloses the common "shared utility agent across teams" case and forces
   copies. **Rejected**; D2 keeps the option open.
 
-## Open questions (for Deva)
+## Resolved decisions (locked 2026-05-28)
 
-1. **Membership administration model.** Owner-driven (project owner invites
-   anyone in the tenant — current draft) vs tenant-admin-driven (tenant admin
-   must approve cross-team invitations) vs hybrid. The draft is owner-driven
-   for velocity; tenant admins always retain a force-add/remove backstop via
-   their tenant scopes.
-2. **Nested projects.** Confirm **flat for v1** is acceptable; if any
-   committed customer scenario needs hierarchy, we'd revise D1/D4 before
-   implementation.
-3. **Standalone (un-projected) agents.** The draft **allows** them and wraps
-   them in the default project (D5). The alternative — *require* every agent
-   to be in at least one explicit project — is cleaner but breaks back-compat
-   with ADR 014. Confirm D5 stands.
-4. **KB share semantics.** The draft is **reference-share by default,
-   copy-on-attach as an override** (D3). Confirm; the inverse (copy-by-default,
-   reference as override) is also coherent but heavier on storage.
-5. **URL ingest crawl scope.** Belongs to the unified-ingest PR, surfaced here
-   because it shapes the Project-KB story. Recommend supporting **both**
-   single-page and multi-page crawl, gated by a `?recursive=true&max_depth=N`
-   flag — but the final shape is decided in the ingest PR, not this ADR.
+The five open questions surfaced during draft have been resolved with input
+from the architectural review. All five resolutions hold the originally
+proposed shape:
+
+1. **Membership administration model — RESOLVED: owner-driven.**
+   Project owners can invite any principal within the tenant. Tenant admins
+   retain a force-add / force-remove backstop via their tenant-level scopes;
+   they do not need to be invited per-project. This composes cleanly with
+   ADR 013 — tenant admin's `admin` scope is the floor on every project.
+
+2. **Nested projects — RESOLVED: flat for v1.**
+   No project hierarchy in v1. A future ADR can revisit if a committed
+   customer scenario emerges; D1 + D4 are structured so a future `parent_id`
+   column is an additive migration, not a rewrite.
+
+3. **Standalone (un-projected) agents — RESOLVED: allowed (D5 stands).**
+   Legacy agents — and any agent created without an explicit `project_id` —
+   auto-attach to a per-tenant `default` project on first read. This preserves
+   ADR 014 back-compat verbatim. The default project cannot be deleted; it can
+   be renamed.
+
+4. **KB share semantics — RESOLVED: reference-share by default, copy-on-attach
+   as an explicit override (D3 stands).**
+   The default `POST /projects/{id}/kbs/share` attaches a read-only reference
+   to the source KB. A future `copy=true` flag will materialize a forked KB
+   (separate `kb_id`, independent chunk lifecycle) when a project needs to
+   diverge from the upstream KB's content. The forked copy is its own owned
+   resource of the new project.
+
+5. **URL ingest crawl scope — RESOLVED: support both modes via the unified
+   ingest endpoint.**
+   The unified-ingest PR will support both single-page synchronous ingest
+   (default, `recursive=false`) and multi-page asynchronous crawl
+   (`recursive=true&max_depth=N`, runs as a background job, returns a job_id
+   that the caller polls or subscribes to via SSE). The final endpoint shape
+   is owned by the unified-ingest PR; this ADR commits only to the Project-KB
+   attachment semantics that surround it.
 
 ## Boundaries (explicit scope-out)
 
