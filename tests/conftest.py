@@ -55,6 +55,9 @@ _PG_TABLES = (
     "kb_relations",
     "trigger_deliveries",
     "run_submissions",
+    "webhooks",
+    "webhook_attempts",
+    "webhook_cursors",
 )
 
 

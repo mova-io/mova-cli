@@ -73,6 +73,13 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/auth/keys"): "admin",
     # events — ADR 035 D1 events outbox (read-only feed)
     ("GET", "/api/v1/events"): "read",
+    # webhooks — ADR 035 D2 outbound delivery (CRUD + attempts feed)
+    ("POST", "/api/v1/webhooks"): "admin",
+    ("GET", "/api/v1/webhooks"): "read",
+    ("GET", "/api/v1/webhooks/{webhook_id}"): "read",
+    ("PATCH", "/api/v1/webhooks/{webhook_id}"): "admin",
+    ("DELETE", "/api/v1/webhooks/{webhook_id}"): "admin",
+    ("GET", "/api/v1/webhooks/{webhook_id}/attempts"): "read",
 }
 
 

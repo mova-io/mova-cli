@@ -81,6 +81,16 @@ from movate.core.triggers import (
     mint_trigger,
     verify_signature,
 )
+from movate.core.webhooks import (
+    WebhookAttemptListView,
+    WebhookAttemptView,
+    WebhookCreatedView,
+    WebhookCreateRequest,
+    WebhookListView,
+    WebhookSubscription,
+    WebhookUpdateRequest,
+    WebhookView,
+)
 from movate.runtime.agent_creation import (
     AgentCreationError,
     persist_bundle,
@@ -6849,6 +6859,248 @@ def build_app(
         # back unchanged on the next request.
         next_after_id: str | None = records[-1].id if len(records) == limit else None
         return EventListView(events=views, count=len(views), next_after_id=next_after_id)
+
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2) — CRUD + attempts feed. The
+    # delivery worker (movate.runtime.webhook_worker) lives alongside
+    # the job worker and consumes these subscriptions out-of-band; the
+    # endpoints below are the management surface only.
+    #
+    # Secret discipline:
+    #
+    # * POST returns the plaintext secret EXACTLY ONCE in
+    #   ``WebhookCreatedView.secret``. Subsequent reads (GET / list /
+    #   PATCH) return ``WebhookView`` which carries only a last-4
+    #   ``secret_hint`` — the secret never re-traverses the wire.
+    # * The HMAC scheme is Stripe-style (t=<ts>,v1=<hmac_hex> over
+    #   ``"<ts>.<raw_body>"`` UTF-8 bytes); subscribers verify against
+    #   the secret they captured on create.
+    #
+    # Scopes: admin for mutation (create/delete/patch — minting or
+    # revoking a long-lived secret is a privileged action, mirroring
+    # api-key + trigger creation); read for the get/list/attempts
+    # views.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/webhooks",
+        response_model=WebhookCreatedView,
+        status_code=201,
+        tags=["webhooks"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_webhook(
+        body: WebhookCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WebhookCreatedView:
+        """Subscribe a webhook to lifecycle events (ADR 035 D2).
+
+        Mints a per-subscription HMAC secret and returns it ONCE — copy
+        it now, it is never retransmitted. Subsequent reads surface a
+        ``secret_hint`` (last 4 chars) only.
+
+        The delivery worker (mdk worker process) drains the events
+        outbox and POSTs each matching event to ``url`` with a
+        Stripe-style ``X-MDK-Signature: t=<ts>,v1=<hex>`` header. The
+        canonical signed string is ``"<ts>.<raw_body>"``; subscribers
+        verify by recomputing the HMAC under the stored secret.
+
+        Gated on ``admin`` — creating a subscription mints a long-
+        lived secret credential (same posture as api-key + trigger
+        create).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **422** — non-HTTPS URL / malformed ``kind_filter``
+        """
+        store: StorageProvider = request.app.state.storage
+        sub = WebhookSubscription(
+            tenant_id=ctx.tenant_id,
+            url=body.url,
+            kind_filter=body.kind_filter,
+            enabled=body.enabled,
+        )
+        await store.create_webhook(sub)
+        return WebhookCreatedView.from_record(sub)
+
+    @v1.get(
+        "/webhooks",
+        response_model=WebhookListView,
+        tags=["webhooks"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_webhooks(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        include_disabled: bool = Query(
+            True,
+            description=(
+                "Include disabled subscriptions. Default true (the management view "
+                "wants to see what's there); the delivery worker uses the in-process "
+                "Protocol with ``enabled_only=True``."
+            ),
+        ),
+    ) -> WebhookListView:
+        """List this tenant's webhook subscriptions (no full secrets).
+
+        Each row carries a last-4 ``secret_hint`` only — the full
+        secret is irrecoverable from this surface.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_webhooks(ctx.tenant_id, enabled_only=not include_disabled)
+        views = [WebhookView.from_record(r) for r in rows]
+        return WebhookListView(webhooks=views, count=len(views))
+
+    @v1.get(
+        "/webhooks/{webhook_id}",
+        response_model=WebhookView,
+        tags=["webhooks"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_webhook(
+        webhook_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WebhookView:
+        """Fetch one webhook by id (no full secret).
+
+        Tenant-scoped: a webhook under another tenant 404s rather than
+        403s — same no-leak contract as every other single-record
+        getter.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no webhook with this id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        row = await store.get_webhook(ctx.tenant_id, webhook_id)
+        if row is None:
+            raise not_found("webhook", webhook_id)
+        return WebhookView.from_record(row)
+
+    @v1.delete(
+        "/webhooks/{webhook_id}",
+        status_code=204,
+        tags=["webhooks"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_webhook(
+        webhook_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove a webhook subscription.
+
+        Idempotent: deleting a non-existent subscription still returns
+        204. Tenant-scoped (a cross-tenant id is a 204 no-op, never a
+        cross-tenant delete). Gated on ``admin`` — it revokes the
+        long-lived signing credential.
+
+        The historical ``webhook_attempts`` log rows are intentionally
+        kept (operators may want post-mortem on a removed webhook);
+        a later GC sweep can prune them.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        await store.delete_webhook(ctx.tenant_id, webhook_id)
+        return Response(status_code=204)
+
+    @v1.patch(
+        "/webhooks/{webhook_id}",
+        response_model=WebhookView,
+        tags=["webhooks"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_update_webhook(
+        webhook_id: str,
+        body: WebhookUpdateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WebhookView:
+        """Toggle a webhook's ``enabled`` flag.
+
+        Only ``enabled`` is mutable on this endpoint. URL / kind_filter
+        changes belong in delete+recreate so the audit log + secret
+        story stay explicit about a subscriber rewire.
+
+        ``failure_count`` is bumped by the delivery worker; operators
+        clear it (when they will at all) via delete+recreate.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **404** — no webhook with this id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        updated = await store.update_webhook(ctx.tenant_id, webhook_id, enabled=body.enabled)
+        if updated is None:
+            raise not_found("webhook", webhook_id)
+        return WebhookView.from_record(updated)
+
+    @v1.get(
+        "/webhooks/{webhook_id}/attempts",
+        response_model=WebhookAttemptListView,
+        tags=["webhooks"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_webhook_attempts(
+        webhook_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        since: datetime | None = Query(
+            None,
+            description="ISO-8601 lower bound on ``attempted_at`` (inclusive).",
+        ),
+        limit: int = Query(
+            100,
+            ge=1,
+            le=500,
+            description="Page size; capped at 500.",
+        ),
+    ) -> WebhookAttemptListView:
+        """List recent delivery attempts for ``webhook_id``.
+
+        Newest-first. Each row carries ``status_code`` / ``error_kind``
+        / ``response_excerpt`` (truncated to ~512 chars) so an ops
+        dashboard can render flake patterns at a glance. Tenant-scoped
+        — a webhook under another tenant 404s.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no webhook with this id for this tenant
+        * **422** — ``limit`` outside ``[1, 500]``
+        """
+        store: StorageProvider = request.app.state.storage
+        # Verify the webhook exists for this tenant before exposing
+        # any attempts — protects against a leak via a guessed id.
+        webhook = await store.get_webhook(ctx.tenant_id, webhook_id)
+        if webhook is None:
+            raise not_found("webhook", webhook_id)
+        rows = await store.list_webhook_attempts(
+            ctx.tenant_id,
+            webhook_id=webhook_id,
+            since=since,
+            limit=limit,
+        )
+        views = [WebhookAttemptView.from_record(r) for r in rows]
+        return WebhookAttemptListView(attempts=views, count=len(views))
 
     app.include_router(v1)
 

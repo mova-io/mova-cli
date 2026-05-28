@@ -52,6 +52,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -694,6 +695,65 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_events_tenant_kind_created "
         "ON events(tenant_id, kind, created_at)"
     ),
+    # ADR 035 D2 — webhook subscriptions (outbound delivery). One row per
+    # configured subscriber; the secret is STORED (not hashed) so the
+    # worker can re-sign every outbound POST. Additive new table — a row
+    # exists only when the tenant POSTs ``/api/v1/webhooks``, so pre-D2
+    # behavior is byte-for-byte unchanged. ``tenant_id NOT NULL`` matches
+    # the rest of the schema; ``kind_filter`` is a JSON list (TEXT) for
+    # backend portability.
+    """
+    CREATE TABLE IF NOT EXISTS webhooks (
+        id            TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        url           TEXT NOT NULL,
+        kind_filter   TEXT NOT NULL,
+        secret        TEXT NOT NULL,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks(tenant_id)",
+    # ADR 035 D2 — per-attempt delivery log (one row per
+    # (webhook_id, event_id, attempt_n) triple). Bounded
+    # ``response_excerpt`` keeps a misbehaving subscriber from
+    # ballooning the table.
+    """
+    CREATE TABLE IF NOT EXISTS webhook_attempts (
+        id                TEXT PRIMARY KEY,
+        webhook_id        TEXT NOT NULL,
+        event_id          TEXT NOT NULL,
+        tenant_id         TEXT NOT NULL,
+        attempted_at      TEXT NOT NULL,
+        status_code       INTEGER,
+        response_excerpt  TEXT,
+        error_kind        TEXT NOT NULL,
+        attempt_n         INTEGER NOT NULL
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_webhook_attempts_tenant_at "
+        "ON webhook_attempts(tenant_id, attempted_at)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_webhook_attempts_webhook_at "
+        "ON webhook_attempts(webhook_id, attempted_at)"
+    ),
+    # ADR 035 D2 — per-webhook delivery cursor. One row per subscription
+    # (``webhook_id`` PK); ``last_event_id`` is the most recently
+    # processed event id. Per-webhook cursor (vs a single global one)
+    # avoids re-delivering everyone's events when a new subscriber
+    # signs up.
+    """
+    CREATE TABLE IF NOT EXISTS webhook_cursors (
+        webhook_id    TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        last_event_id TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webhook_cursors_tenant ON webhook_cursors(tenant_id)",
 ]
 
 
@@ -3055,10 +3115,192 @@ class SqliteProvider:
             for r in rows
         ]
 
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery). The
+    # ``secret`` is stored verbatim because the worker must re-sign
+    # every outbound delivery with the same key the subscriber
+    # configured (we never echo it back on the wire after create).
+    # ``kind_filter`` is json-encoded (TEXT) for portability.
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        await self._db.execute(
+            "INSERT INTO webhooks "
+            "(id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sub.id,
+                sub.tenant_id,
+                sub.url,
+                json.dumps(sub.kind_filter),
+                sub.secret,
+                1 if sub.enabled else 0,
+                sub.failure_count,
+                sub.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+        return sub
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        sql = "SELECT * FROM webhooks WHERE tenant_id = ?"
+        params: list[object] = [tenant_id]
+        if enabled_only:
+            sql += " AND enabled = 1"
+        sql += " ORDER BY created_at ASC, id ASC"
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_webhook(r) for r in rows]
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        async with self._db.execute(
+            "SELECT * FROM webhooks WHERE id = ? AND tenant_id = ? LIMIT 1",
+            (webhook_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_webhook(row) if row is not None else None
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        # Defensive no-op when neither field is set — same shape as a
+        # PATCH with an empty body.
+        if enabled is None and failure_count is None:
+            return await self.get_webhook(tenant_id, webhook_id)
+        sets: list[str] = []
+        params: list[object] = []
+        if enabled is not None:
+            sets.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        if failure_count is not None:
+            sets.append("failure_count = ?")
+            params.append(failure_count)
+        params.extend([webhook_id, tenant_id])
+        await self._db.execute(
+            f"UPDATE webhooks SET {', '.join(sets)} WHERE id = ? AND tenant_id = ?",
+            params,
+        )
+        await self._db.commit()
+        return await self.get_webhook(tenant_id, webhook_id)
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM webhooks WHERE id = ? AND tenant_id = ?",
+            (webhook_id, tenant_id),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        await self._db.execute(
+            "INSERT INTO webhook_attempts "
+            "(id, webhook_id, event_id, tenant_id, attempted_at, status_code, "
+            " response_excerpt, error_kind, attempt_n) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt.id,
+                attempt.webhook_id,
+                attempt.event_id,
+                attempt.tenant_id,
+                attempt.attempted_at.isoformat(),
+                attempt.status_code,
+                attempt.response_excerpt,
+                attempt.error_kind,
+                attempt.attempt_n,
+            ),
+        )
+        await self._db.commit()
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        clauses: list[str] = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if webhook_id is not None:
+            clauses.append("webhook_id = ?")
+            params.append(webhook_id)
+        if since is not None:
+            clauses.append("attempted_at >= ?")
+            params.append(since.isoformat())
+        params.append(limit)
+        sql = (
+            "SELECT * FROM webhook_attempts WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY attempted_at DESC, id DESC LIMIT ?"
+        )
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_webhook_attempt(r) for r in rows]
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        async with self._db.execute(
+            "SELECT last_event_id FROM webhook_cursors "
+            "WHERE webhook_id = ? AND tenant_id = ? LIMIT 1",
+            (webhook_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return row["last_event_id"] if row is not None else None
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        # SQLite's ``INSERT ... ON CONFLICT DO UPDATE`` — same upsert
+        # idiom as the trigger-deliveries dedup write.
+        await self._db.execute(
+            "INSERT INTO webhook_cursors (webhook_id, tenant_id, last_event_id, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(webhook_id) DO UPDATE SET "
+            "  last_event_id = excluded.last_event_id, "
+            "  updated_at = excluded.updated_at",
+            (webhook_id, tenant_id, last_event_id, now),
+        )
+        await self._db.commit()
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+
+def _row_to_webhook(row: aiosqlite.Row) -> WebhookSubscription:
+    return WebhookSubscription(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        url=row["url"],
+        kind_filter=json.loads(row["kind_filter"]) if row["kind_filter"] else [],
+        secret=row["secret"],
+        enabled=bool(row["enabled"]),
+        failure_count=row["failure_count"] or 0,
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_webhook_attempt(row: aiosqlite.Row) -> WebhookAttempt:
+    return WebhookAttempt(
+        id=row["id"],
+        webhook_id=row["webhook_id"],
+        event_id=row["event_id"],
+        tenant_id=row["tenant_id"],
+        attempted_at=datetime.fromisoformat(row["attempted_at"]),
+        status_code=row["status_code"],
+        response_excerpt=row["response_excerpt"],
+        error_kind=row["error_kind"],
+        attempt_n=row["attempt_n"],
+    )
 
 
 def _row_to_thread(row: aiosqlite.Row) -> ConversationThread:

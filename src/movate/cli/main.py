@@ -229,6 +229,7 @@ from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
+from movate.cli.webhooks_cmd import webhooks_app  # noqa: E402
 from movate.cli.workflow_cmd import workflow_app  # noqa: E402
 from movate.tracing import install_log_correlation  # noqa: E402
 
@@ -530,6 +531,10 @@ app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 app.command("submit", rich_help_panel=PANEL_RUN)(submit_cmd.submit)
 app.add_typer(batch_app, name="batch", rich_help_panel=PANEL_RUN)
 app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
+# `webhooks` (ADR 035 D2) is the outbound sibling of `trigger`: where a
+# trigger lets an external system POST events INTO the runtime, a webhook
+# subscription pushes lifecycle events OUT to a configured URL.
+app.add_typer(webhooks_app, name="webhooks", rich_help_panel=PANEL_RUN)
 # `runs` is the read-only sibling of `jobs`: look up a PAST run's result by
 # id (the run_id a synchronous `mdk run --target` prints). Inline runs persist
 # a RunRecord without a queryable JobRecord, so `jobs list` can't surface them

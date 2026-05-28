@@ -19,6 +19,12 @@ from typing import Any
 import httpx
 
 from movate.core.models import JobKind, JobStatus, WorkflowStatus
+from movate.core.webhooks import (
+    WebhookAttemptListView,
+    WebhookCreatedView,
+    WebhookListView,
+    WebhookView,
+)
 from movate.runtime.schemas import (
     AgentListView,
     BatchAcceptedView,
@@ -324,6 +330,84 @@ class MovateClient:
                 )
             await asyncio.sleep(poll_interval_seconds)
             elapsed += poll_interval_seconds
+
+    # ------------------------------------------------------------------
+    # Webhooks (ADR 035 D2 — outbound delivery management)
+    # ------------------------------------------------------------------
+
+    async def create_webhook(
+        self,
+        *,
+        url: str,
+        kind_filter: list[str],
+        enabled: bool = True,
+    ) -> WebhookCreatedView:
+        """``POST /api/v1/webhooks`` — subscribe to lifecycle events.
+
+        Returns the subscription view plus the plaintext signing
+        ``secret`` — surfaced ONCE on creation. Capture it now; it is
+        irrecoverable from any later call. Requires ``admin``.
+        """
+        body = {"url": url, "kind_filter": kind_filter, "enabled": enabled}
+        r = await self._client.post("/api/v1/webhooks", json=body)
+        self._raise_for_status(r)
+        return WebhookCreatedView.model_validate(r.json())
+
+    async def list_webhooks(self, *, include_disabled: bool = True) -> WebhookListView:
+        """``GET /api/v1/webhooks`` — this tenant's webhook subscriptions.
+
+        Carries ``secret_hint`` (last 4 chars) only; never the full
+        secret. Requires ``read``.
+        """
+        params = {"include_disabled": "true" if include_disabled else "false"}
+        r = await self._client.get("/api/v1/webhooks", params=params)
+        self._raise_for_status(r)
+        return WebhookListView.model_validate(r.json())
+
+    async def get_webhook(self, webhook_id: str) -> WebhookView:
+        """``GET /api/v1/webhooks/{id}`` — single subscription view.
+
+        Tenant-scoped: cross-tenant id 404s. Requires ``read``.
+        """
+        r = await self._client.get(f"/api/v1/webhooks/{webhook_id}")
+        self._raise_for_status(r)
+        return WebhookView.model_validate(r.json())
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        """``DELETE /api/v1/webhooks/{id}`` — remove a subscription.
+
+        Idempotent (204 even on unknown id). Requires ``admin``.
+        """
+        r = await self._client.delete(f"/api/v1/webhooks/{webhook_id}")
+        self._raise_for_status(r)
+
+    async def set_webhook_enabled(self, webhook_id: str, *, enabled: bool) -> WebhookView:
+        """``PATCH /api/v1/webhooks/{id}`` — toggle the enabled flag.
+
+        Returns the post-update view. Requires ``admin``.
+        """
+        r = await self._client.patch(
+            f"/api/v1/webhooks/{webhook_id}",
+            json={"enabled": enabled},
+        )
+        self._raise_for_status(r)
+        return WebhookView.model_validate(r.json())
+
+    async def list_webhook_attempts(
+        self, webhook_id: str, *, limit: int = 100
+    ) -> WebhookAttemptListView:
+        """``GET /api/v1/webhooks/{id}/attempts`` — recent delivery log.
+
+        Newest-first. Each row has ``status_code`` / ``error_kind`` /
+        ``response_excerpt`` (truncated to ~512 chars). Requires
+        ``read``.
+        """
+        r = await self._client.get(
+            f"/api/v1/webhooks/{webhook_id}/attempts",
+            params={"limit": limit},
+        )
+        self._raise_for_status(r)
+        return WebhookAttemptListView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Internal

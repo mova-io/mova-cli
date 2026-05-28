@@ -56,6 +56,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 
 
 class StorageProvider(Protocol):
@@ -1359,6 +1360,124 @@ class StorageProvider(Protocol):
         cross-tenant list mode on this method, since the API exposes
         events directly. Operator cross-tenant queries can run SQL by
         hand against the table.
+        """
+
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery)
+    #
+    # Additive, default-off: a row exists only when a tenant POSTs
+    # ``/api/v1/webhooks``. The delivery worker
+    # (movate.runtime.webhook_worker) reads these on every drain pass,
+    # matches each new event against ``kind_filter``, and POSTs a signed
+    # JSON payload to ``url``. Each attempt is logged separately in
+    # ``webhook_attempts`` for ops triage; the per-webhook cursor
+    # (``webhook_cursors``) advances after every event the worker has
+    # processed (delivered OR exhausted).
+    #
+    # Tenant invariant: ``tenant_id NOT NULL`` on every webhooks table.
+    # Like the rest of the schema, every single-record fetch is
+    # tenant-scoped — a wrong-tenant id 404s rather than raises.
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        """Insert a freshly-minted subscription row. Errors on duplicate ``id``.
+
+        Returns the persisted row (same instance the caller passed in;
+        backends MAY return a freshly-loaded one if they need to).
+        ``secret`` is stored as-is (we re-sign every delivery; see
+        :mod:`movate.core.webhooks` for why this differs from API keys).
+        """
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        """List subscriptions for ``tenant_id``.
+
+        ``enabled_only`` defaults to ``True`` — the worker's drain path
+        wants live subscribers only. The CRUD/CLI surface passes
+        ``False`` to render disabled rows too.
+        """
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        """Exact lookup by ``webhook_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR the row belongs to a different
+        tenant — same 404-not-403 no-leak contract as the other
+        single-record getters.
+        """
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        """Mutate ``enabled`` and/or ``failure_count`` in place.
+
+        Only the named fields update; passing ``None`` leaves that
+        column untouched. Returns the post-update row, or ``None`` if
+        no row matched (cross-tenant id or unknown). The runtime API
+        only exposes ``enabled`` (``PATCH``); ``failure_count`` is
+        bumped from the delivery worker after a max-retries terminal.
+        """
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        """Delete one subscription by ``(webhook_id, tenant_id)``.
+
+        Idempotent: returns ``True`` on actual deletion, ``False`` on a
+        no-op (unknown / cross-tenant). The matching cursor row in
+        ``webhook_cursors`` and historical attempts in
+        ``webhook_attempts`` are intentionally kept — operators may
+        still want the delivery history of a deleted webhook for
+        audit. (A later GC sweep can remove them; out of scope for D2.)
+        """
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        """Append one row to the delivery-attempts log.
+
+        Insert-only; attempts are immutable history. The worker calls
+        this once per attempt (initial + every retry + the final
+        ``max_retries`` terminal). Storage failures here MUST NOT
+        bring down the delivery loop — the worker wraps + logs.
+        """
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        """List delivery attempts, newest-first, scoped to ``tenant_id``.
+
+        ``webhook_id`` filters to one subscriber (the CLI / API typical
+        path — "show me this webhook's recent failures"). ``since``
+        narrows by ``attempted_at >= since``. ``limit`` is capped by
+        the caller; storage defaults to 100.
+        """
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        """Return the last-delivered event id for ``webhook_id``.
+
+        ``None`` means the worker has never advanced this cursor — the
+        first drain pass treats it as "deliver every event newer than
+        the subscription's ``created_at``" (per-webhook cursor avoids
+        re-delivering historical events when a webhook is added).
+        """
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        """Upsert the cursor row for ``webhook_id`` to ``last_event_id``.
+
+        Atomic insert-or-update keyed by ``(webhook_id)``; tenant scope
+        is denormalized for cheap tenant-bounded reads. The worker
+        advances this AFTER recording the attempt — at-least-once on
+        crash is acceptable (subscribers dedupe on ``X-MDK-Event-Id``).
         """
 
     async def close(self) -> None: ...

@@ -41,6 +41,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -91,6 +92,14 @@ class InMemoryStorage:
         # ADR 035 D1: events outbox. Appended in record_event order;
         # list_events sorts oldest-first by (created_at, id).
         self.events: list[Event] = []
+        # ADR 035 D2: webhook subscriptions + per-attempt delivery log
+        # + per-webhook cursor. Default-off — no rows unless created.
+        self.webhooks: list[WebhookSubscription] = []
+        self.webhook_attempts: list[WebhookAttempt] = []
+        # Cursor map: webhook_id -> last delivered event id. Tenant
+        # bound is preserved by always reading via the tenant-scoped
+        # get_webhook (we never look up cursors for cross-tenant ids).
+        self.webhook_cursors: dict[str, str] = {}
 
     async def init(self) -> None:
         return None
@@ -1286,6 +1295,92 @@ class InMemoryStorage:
             if cursor is not None:
                 rows = [e for e in rows if (e.created_at, e.id) > (cursor.created_at, cursor.id)]
         return rows[:limit]
+
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery).
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        self.webhooks.append(sub)
+        return sub
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        rows = [w for w in self.webhooks if w.tenant_id == tenant_id]
+        if enabled_only:
+            rows = [w for w in rows if w.enabled]
+        return sorted(rows, key=lambda w: (w.created_at, w.id))
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        for w in self.webhooks:
+            if w.id == webhook_id and w.tenant_id == tenant_id:
+                return w
+        return None
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        existing = await self.get_webhook(tenant_id, webhook_id)
+        if existing is None:
+            return None
+        if enabled is not None:
+            existing.enabled = enabled
+        if failure_count is not None:
+            existing.failure_count = failure_count
+        return existing
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        for i, w in enumerate(self.webhooks):
+            if w.id == webhook_id and w.tenant_id == tenant_id:
+                del self.webhooks[i]
+                return True
+        return False
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        self.webhook_attempts.append(attempt)
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        rows = [a for a in self.webhook_attempts if a.tenant_id == tenant_id]
+        if webhook_id is not None:
+            rows = [a for a in rows if a.webhook_id == webhook_id]
+        if since is not None:
+            rows = [a for a in rows if a.attempted_at >= since]
+        rows = sorted(rows, key=lambda a: (a.attempted_at, a.id), reverse=True)
+        return rows[:limit]
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        # Tenant-scoping is enforced one layer up — the worker always
+        # reads cursors only after looking up the tenant-scoped webhook
+        # row, so a wrong-tenant cursor lookup is impossible by
+        # construction. We still verify the webhook exists for that
+        # tenant before returning a cursor, mirroring the DB backends.
+        webhook = await self.get_webhook(tenant_id, webhook_id)
+        if webhook is None:
+            return None
+        return self.webhook_cursors.get(webhook_id)
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        # Same tenant-scope discipline as the cursor read.
+        webhook = await self.get_webhook(tenant_id, webhook_id)
+        if webhook is None:
+            return
+        self.webhook_cursors[webhook_id] = last_event_id
 
     async def close(self) -> None:
         return None
