@@ -9,11 +9,16 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
+from typer.testing import CliRunner
 
-from movate.cli.run import _print_kb_trace
+from movate.cli._output import Run
+from movate.cli.main import app as cli_app
+from movate.cli.run import _print_kb_trace, _render_estimate
+from movate.testing import scaffold_agent
 
 
 def _make_skill_call(
@@ -207,9 +212,6 @@ class TestEstimateRender:
     def test_text_render_shows_table_and_no_run_notice(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        from movate.cli._output import Run
-        from movate.cli.run import _render_estimate
-
         _render_estimate(est_dict=self._est_dict(), output_format=Run.TEXT)
         out = capsys.readouterr()
         # Table (stdout) carries the agent + a token figure.
@@ -222,11 +224,6 @@ class TestEstimateRender:
 
     @pytest.mark.unit
     def test_json_render_dumps_estimate(self, capsys: pytest.CaptureFixture[str]) -> None:
-        import json
-
-        from movate.cli._output import Run
-        from movate.cli.run import _render_estimate
-
         _render_estimate(est_dict=self._est_dict(), output_format=Run.JSON)
         out = capsys.readouterr()
         parsed = json.loads(out.out)
@@ -236,9 +233,6 @@ class TestEstimateRender:
 
     @pytest.mark.unit
     def test_text_render_flags_over_budget(self, capsys: pytest.CaptureFixture[str]) -> None:
-        from movate.cli._output import Run
-        from movate.cli.run import _render_estimate
-
         est = self._est_dict(
             budget_check={"within_per_run_budget": False, "per_run_budget_usd": 0.001}
         )
@@ -256,11 +250,6 @@ def test_run_estimate_local_end_to_end(
     Uses an isolated SQLite DB (MOVATE_DB) so the estimate's historical
     query has no prior runs — exercising the fallback path through the real
     CLI dispatch + renderer."""
-    from typer.testing import CliRunner
-
-    from movate.cli.main import app as cli_app
-    from movate.testing import scaffold_agent
-
     monkeypatch.setenv("MOVATE_DB", str(tmp_path / "local.db"))
     agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
 
@@ -270,7 +259,6 @@ def test_run_estimate_local_end_to_end(
         ["run", str(agent_dir), "hello there", "--estimate", "--output", "json"],
     )
     assert result.exit_code == 0, result.stderr
-    import json
 
     body = json.loads(result.stdout)
     assert body["estimate"] is True

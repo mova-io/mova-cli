@@ -219,7 +219,7 @@ async def estimate_run(
     # zero-token estimate with a note rather than crashing the caller.
     try:
         rendered = bundle.render_prompt(effective_input)
-    except Exception as exc:  # noqa: BLE001 — best-effort estimate
+    except Exception as exc:
         notes.append(f"prompt render failed ({type(exc).__name__}); tokens_in is 0")
         rendered = ""
     tokens_in = _count_tokens(rendered)
@@ -232,7 +232,7 @@ async def estimate_run(
     )
     out_tokens = [r.metrics.tokens.output for r in history if r.metrics.tokens.output > 0]
     if out_tokens:
-        tokens_out_expected = int(round(statistics.fmean(out_tokens)))
+        tokens_out_expected = round(statistics.fmean(out_tokens))
         out_expected_method = "historical_mean"
     else:
         tokens_out_expected = tokens_out_max
@@ -378,7 +378,7 @@ async def _populate_retrieval(
         {"agent": bundle.spec.name, "estimate": True},
     )
     try:
-        await executor._maybe_pre_retrieve(  # noqa: SLF001 — intentional reuse of the run path
+        await executor._maybe_pre_retrieve(
             bundle=bundle,
             request=request,
             span=span,
@@ -390,7 +390,7 @@ async def _populate_retrieval(
         effective_input.clear()
         effective_input.update(request.input)
         return True
-    except Exception as exc:  # noqa: BLE001 — estimate must not crash on retrieval failure
+    except Exception as exc:
         notes.append(
             f"retrieval failed during estimate ({type(exc).__name__}); "
             f"retrieved-chunk tokens excluded from tokens_in"

@@ -93,9 +93,7 @@ async def test_tokens_in_reflects_assembled_prompt(tmp_path: Path) -> None:
     storage = await _storage()
 
     short = await estimate_run(bundle, {"text": "hi"}, storage=storage)
-    long = await estimate_run(
-        bundle, {"text": "word " * 500}, storage=storage
-    )
+    long = await estimate_run(bundle, {"text": "word " * 500}, storage=storage)
 
     assert long.predicted.tokens_in > short.predicted.tokens_in
     assert short.predicted.tokens_in > 0

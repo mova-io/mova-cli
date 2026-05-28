@@ -53,7 +53,7 @@ console = Console(stderr=True)
 _default_output_format: Run = Run.TEXT if sys.stdout.isatty() else Run.JSON
 
 
-def run(
+def run(  # noqa: PLR0912 — flat mode-dispatch (remote/replay/estimate/workflow/agent) reads better than nested helpers
     path: Path = typer.Argument(
         ...,
         help="Path to an agent or workflow directory.",

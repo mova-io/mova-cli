@@ -70,9 +70,7 @@ async def read_only_auth(storage: InMemoryStorage):
     """A key with only the ``read`` scope — must be rejected by the
     estimate endpoint (it shares the ``run`` write scope)."""
     tenant_id = uuid4().hex
-    minted = mint_api_key(
-        tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="ro", scopes=["read"]
-    )
+    minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="ro", scopes=["read"])
     await storage.save_api_key(minted.record)
     return {"Authorization": f"Bearer {minted.full_key}"}, tenant_id
 
@@ -212,9 +210,7 @@ async def test_estimate_enqueues_no_job(
 
 
 @pytest.mark.asyncio
-async def test_estimate_tokens_in_grows_with_prompt(
-    client: TestClient, auth_setup
-) -> None:
+async def test_estimate_tokens_in_grows_with_prompt(client: TestClient, auth_setup) -> None:
     auth_header, _ = auth_setup
     _create_agent(client, auth_header)
 
@@ -238,9 +234,7 @@ async def test_estimate_tokens_in_grows_with_prompt(
 
 
 @pytest.mark.asyncio
-async def test_estimate_max_tokens_fallback_without_history(
-    client: TestClient, auth_setup
-) -> None:
+async def test_estimate_max_tokens_fallback_without_history(client: TestClient, auth_setup) -> None:
     auth_header, _ = auth_setup
     _create_agent(client, auth_header)
 
@@ -262,9 +256,7 @@ async def test_estimate_historical_mean_with_history(
     auth_header, tenant_id = auth_setup
     _create_agent(client, auth_header)
     for i, out in enumerate((100, 200, 300)):
-        await _save_history(
-            storage, tenant_id=tenant_id, output_tokens=out, latency_ms=500, n=i
-        )
+        await _save_history(storage, tenant_id=tenant_id, output_tokens=out, latency_ms=500, n=i)
 
     body = client.post(
         "/api/v1/agents/est-demo/runs?estimate=true",
@@ -283,9 +275,7 @@ async def test_estimate_historical_mean_with_history(
 
 
 @pytest.mark.asyncio
-async def test_estimate_latency_unavailable_without_history(
-    client: TestClient, auth_setup
-) -> None:
+async def test_estimate_latency_unavailable_without_history(client: TestClient, auth_setup) -> None:
     auth_header, _ = auth_setup
     _create_agent(client, auth_header)
     body = client.post(
@@ -305,9 +295,7 @@ async def test_estimate_latency_present_with_history(
     auth_header, tenant_id = auth_setup
     _create_agent(client, auth_header)
     for i, lat in enumerate((100, 300, 500, 700, 900)):
-        await _save_history(
-            storage, tenant_id=tenant_id, output_tokens=50, latency_ms=lat, n=i
-        )
+        await _save_history(storage, tenant_id=tenant_id, output_tokens=50, latency_ms=lat, n=i)
 
     body = client.post(
         "/api/v1/agents/est-demo/runs?estimate=true",
@@ -326,9 +314,7 @@ async def test_estimate_latency_present_with_history(
 
 
 @pytest.mark.asyncio
-async def test_estimate_budget_check_reflects_agent_budget(
-    client: TestClient, auth_setup
-) -> None:
+async def test_estimate_budget_check_reflects_agent_budget(client: TestClient, auth_setup) -> None:
     auth_header, _ = auth_setup
     _create_agent(client, auth_header)
     body = client.post(
@@ -375,9 +361,7 @@ async def test_estimate_history_is_tenant_scoped(
 # ---------------------------------------------------------------------------
 
 
-def test_estimate_requires_run_scope(
-    client: TestClient, read_only_auth
-) -> None:
+def test_estimate_requires_run_scope(client: TestClient, read_only_auth) -> None:
     """A read-only key is rejected — estimate shares the ``run`` write scope."""
     ro_header, _ = read_only_auth
     r = client.post(
