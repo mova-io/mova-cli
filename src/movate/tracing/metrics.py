@@ -98,6 +98,15 @@ METRIC_DB_POOL_IN_USE = "mdk.db.pool.in_use"
 METRIC_DB_POOL_WAITING = "mdk.db.pool.waiting"
 METRIC_DB_POOL_MAX = "mdk.db.pool.max"
 
+# ADR 035 D3 — number of SSE subscribers currently holding open a
+# ``GET /api/v1/events/stream`` connection. UpDownCounter (not a gauge):
+# incremented when a connection opens, decremented when it closes — the
+# delta is the source of truth, no separate observer callback. Surfaces
+# the runtime's primary cost from D3 (one polling task per active
+# subscriber) so an operator can spot a runaway client owning a slice
+# of the pool, and pair the count with the advisory per-tenant cap.
+METRIC_SSE_CONNECTIONS_ACTIVE = "mdk.sse.connections_active"
+
 #: Every OTel instrument name this module emits. The single source of truth the
 #: dashboards-as-code drift guard cross-checks against (a dashboard may only
 #: reference a metric that appears here).
@@ -113,6 +122,7 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_DB_POOL_IN_USE,
         METRIC_DB_POOL_WAITING,
         METRIC_DB_POOL_MAX,
+        METRIC_SSE_CONNECTIONS_ACTIVE,
     }
 )
 
@@ -138,6 +148,7 @@ class _State:
     jobs_in_flight: Any = None  # UpDownCounter[int]
     run_tokens: Any = None  # Counter[int]
     run_cost_usd: Any = None  # Counter[float]
+    sse_connections_active: Any = None  # UpDownCounter[int]
 
     # ADR 034 D3 — DB pool observable gauges are registered lazily by
     # ``register_pool_metrics`` (after storage.init at the edge), not in
@@ -260,6 +271,14 @@ def init_metrics(*, reader: Any | None = None) -> None:
         METRIC_RUN_COST_USD,
         unit="usd",
         description="Total LLM cost (USD) of executed runs.",
+    )
+    _state.sse_connections_active = meter.create_up_down_counter(
+        METRIC_SSE_CONNECTIONS_ACTIVE,
+        unit="1",
+        description=(
+            "SSE event-stream subscribers currently holding open a "
+            "GET /api/v1/events/stream connection (ADR 035 D3)."
+        ),
     )
 
     _state.initialized = True
@@ -487,6 +506,31 @@ def dec_in_flight(*, tenant_id: str) -> None:
     _state.jobs_in_flight.add(-1, {"tenant": tenant_id})
 
 
+def inc_sse_connections(*, tenant_id: str) -> None:
+    """Increment the active SSE subscriber gauge (attrs: ``tenant``).
+
+    Bumped on every ``GET /api/v1/events/stream`` connection open (ADR
+    035 D3). Pair with :func:`dec_sse_connections` in a try/finally so a
+    client disconnect / handler exception still drops the count — leaks
+    here turn the gauge into a fake-news number very quickly.
+    """
+    if _state.sse_connections_active is None:
+        return
+    _state.sse_connections_active.add(1, {"tenant": tenant_id})
+
+
+def dec_sse_connections(*, tenant_id: str) -> None:
+    """Decrement the active SSE subscriber gauge (attrs: ``tenant``).
+
+    No-op when metrics are off. Always invoke in the matching
+    :func:`inc_sse_connections` call's ``finally`` block so disconnects
+    (the common terminal state for SSE) decrement reliably.
+    """
+    if _state.sse_connections_active is None:
+        return
+    _state.sse_connections_active.add(-1, {"tenant": tenant_id})
+
+
 __all__ = [
     "METRIC_DB_POOL_IDLE",
     "METRIC_DB_POOL_IN_USE",
@@ -499,9 +543,12 @@ __all__ = [
     "METRIC_NAMES",
     "METRIC_RUN_COST_USD",
     "METRIC_RUN_TOKENS",
+    "METRIC_SSE_CONNECTIONS_ACTIVE",
     "PoolStatsCallback",
     "dec_in_flight",
+    "dec_sse_connections",
     "inc_in_flight",
+    "inc_sse_connections",
     "init_metrics",
     "record_job_completed",
     "record_run_usage",

@@ -73,6 +73,8 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/auth/keys"): "admin",
     # events — ADR 035 D1 events outbox (read-only feed)
     ("GET", "/api/v1/events"): "read",
+    # events — ADR 035 D3 SSE event stream (read-only push)
+    ("GET", "/api/v1/events/stream"): "read",
 }
 
 
