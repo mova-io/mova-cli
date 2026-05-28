@@ -39,7 +39,7 @@
       }
     ]
   },
-  "description": "mdk (movate-cli) golden-signal ops dashboard over the OTel metrics the runtime/worker emit (ADR 031 D2). Metric instrument names: mdk.jobs.completed, mdk.job.duration_ms, mdk.jobs.in_flight, mdk.run.tokens, mdk.run.cost_usd, plus the DB connection-pool gauges mdk.db.pool.size, mdk.db.pool.idle, mdk.db.pool.in_use, mdk.db.pool.waiting, mdk.db.pool.max (ADR 034 D3). PromQL below assumes the OTLP -> Prometheus naming convention (dots -> underscores, unit suffix, _total for monotonic counters; gauges carry no suffix). See dashboards/README.md.",
+  "description": "mdk (movate-cli) golden-signal ops dashboard over the OTel metrics the runtime/worker emit (ADR 031 D2). Prescriptive layer: triage flow at the top, per-chart triage notes, SLO threshold annotations matching infra/azure/modules/monitor-alerts.bicep, and drill-down links to Jaeger + Azure Monitor Workbooks. Metric instrument names: mdk.jobs.completed, mdk.job.duration_ms, mdk.jobs.in_flight, mdk.run.tokens, mdk.run.cost_usd, plus the DB connection-pool gauges mdk.db.pool.size, mdk.db.pool.idle, mdk.db.pool.in_use, mdk.db.pool.waiting, mdk.db.pool.max (ADR 034 D3). See dashboards/README.md.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -48,63 +48,75 @@
   "panels": [
     {
       "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 200,
+      "panels": [],
+      "title": "Triage flow (start here)",
+      "type": "row"
+    },
+    {
+      "type": "text",
+      "id": 201,
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 1},
+      "title": "mdk - golden signals: triage",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - golden signals\n\n**What this shows.** The four golden signals for the mdk runtime/worker (latency, throughput + errors, saturation, and cost) sourced from OTel metrics emitted at the runtime edge (`src/movate/tracing/metrics.py`).\n\n**Normal range** (steady-state, single tenant, mixed workload):\n\n- Latency p95 < 2s, p99 < 5s (the **high-latency-p95** SLO alert fires at p95 > 30000ms; see `infra/azure/modules/monitor-alerts.bicep`).\n- Error rate (`status != success`) < 1% (SLO alert: **high-error-rate** > 10%).\n- Dead-letter count = 0 (SLO alert: **deadletter-spike** > 1 in 15m).\n- Cost burn flat (no order-of-magnitude jumps).\n- DB pool `in_use/max` < 0.7; `waiting` = 0.\n\n**Triage flow.** Walk these rows top-to-bottom; the first row that's anomalous is usually the proximate cause.\n\n```mermaid\ngraph TD\n  A[Page fired or SLO breach] --> B{Latency row red?}\n  B -- yes --> B1[Open p95-by-kind panel] --> B2[Jaeger: filter by slow kind, inspect agent.execute children]\n  B -- no  --> C{Throughput / errors row red?}\n  C -- yes --> C1{status == dead_letter?}\n  C1 -- yes --> C2[Inspect failed runs in Langfuse; check provider 5xx + retry budget]\n  C1 -- no  --> C3[Correlate error spike with deploy revision annotations]\n  C -- no  --> D{Saturation row red?}\n  D -- yes --> D1[in_flight rising without throughput? -> workers stuck on a slow tool/LLM]\n  D -- no  --> E{Cost row red?}\n  E -- yes --> E1[Tokens spiked? -> KB chunk-size regression; mdk eval drift]\n  E -- no  --> F{DB pool row red?}\n  F -- yes --> F1[in_use/max > 0.9 or waiting > 0 -> raise pod count or pool_max; rerun mdk doctor]\n  F -- no  --> G[Check upstream: collector / Prometheus scrape gap?]\n```\n\nIf Mermaid does not render in your Grafana, the same flow as a list:\n\n1. Latency red -> p95-by-kind -> Jaeger by kind.\n2. Throughput/errors red -> dead-letter? then Langfuse, else deploy correlation.\n3. Saturation red -> workers stuck on slow tool/LLM.\n4. Cost red -> token spike -> KB / eval drift.\n5. DB pool red -> raise pods or pool_max; rerun `mdk doctor`.\n\n**Cross-surface.** Same metrics rendered KQL-side in `infra/azure-monitor/workbooks/operator.workbook.json` (Azure Monitor). The Azure SLO alert names referenced below all live in `infra/azure/modules/monitor-alerts.bicep`."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 10},
       "id": 100,
       "panels": [],
       "title": "Latency (mdk.job.duration_ms)",
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "Job wall-clock duration percentiles from the mdk.job.duration_ms histogram (claim -> terminal status). p50 / p95 / p99 over the histogram buckets.",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": {"mode": "palette-classic"},
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
             "lineWidth": 2,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 30000}
+            ]
           },
           "unit": "ms"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 1
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 11},
       "id": 1,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+      "links": [
+        {
+          "title": "Open Jaeger - agent.execute traces (slow)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=2s",
+          "targetBlank": true
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        {
+          "title": "Azure Monitor Workbook - Operator (latency section)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "histogram_quantile(0.50, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
           "legendFormat": "p50",
@@ -112,10 +124,7 @@
           "refId": "p50"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
           "legendFormat": "p95",
@@ -123,10 +132,7 @@
           "refId": "p95"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "histogram_quantile(0.99, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
           "legendFormat": "p99",
@@ -134,55 +140,54 @@
           "refId": "p99"
         }
       ],
-      "title": "Job duration p50 / p95 / p99",
+      "title": "Job duration p50 / p95 / p99 (red line = high-latency-p95 SLO @ 30s)",
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "Job latency p95 split by job kind (the `kind` attribute on mdk.job.duration_ms).",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": {"mode": "palette-classic"},
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
             "lineWidth": 2,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 30000}
+            ]
           },
           "unit": "ms"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 1
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 11},
       "id": 2,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+      "links": [
+        {
+          "title": "Open Jaeger - filter by slowest kind",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=2s",
+          "targetBlank": true
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        {
+          "title": "Azure Monitor Workbook - Operator",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
           "legendFormat": "{{kind}}",
@@ -190,72 +195,65 @@
           "refId": "A"
         }
       ],
-      "title": "Job duration p95 by kind",
+      "title": "Job duration p95 by kind (red line = high-latency-p95 SLO @ 30s)",
       "type": "timeseries"
     },
     {
+      "type": "text",
+      "id": 210,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 19},
+      "title": "Sub-panel: triage notes (latency)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** End-to-end wall-clock from job claim to terminal status (`mdk.job.duration_ms`), and the same split by `kind`.\n\n**Normal.** p95 < 2s, p99 < 5s under steady load. The red threshold line at **30000ms** mirrors the **`*-high-latency-p95`** SLO alert in `infra/azure/modules/monitor-alerts.bicep`.\n\n**If you see X.**\n\n- `p95 > 5s` -> check the per-tenant rate-limit dashboard; in Jaeger, search `service=movate-runtime operation=agent.execute minDuration=5s` and look for slow `agent.turn[N]` or `skill.<name>` children. If the agent is KB-heavy, inspect `kb_search` spans for slow `embed`/`rerank` stages.\n- `p95 > 30s` (SLO line) -> **`*-high-latency-p95`** is firing; treat as an SEV-2. Correlate timing with deploy revisions in Azure Container Apps (or with `mdk deploy` Activity Log entries).\n- `p99 spike, p50 flat` -> tail-latency only; usually a provider hiccup. Inspect provider attribute on `agent.execute` in Jaeger.\n\n**ADR refs.** ADR 013 (tracing baseline) / ADR 015 (Langfuse) / ADR 020 (Azure exporter). **Alert rule.** `*-high-latency-p95`."
+      }
+    },
+    {
       "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 9
-      },
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
       "id": 101,
       "panels": [],
       "title": "Throughput & errors (mdk.jobs.completed)",
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "Job completion throughput (jobs/sec) by terminal status, from mdk.jobs.completed (`status` = success / error / safety_blocked / dead_letter).",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": {"mode": "palette-classic"},
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 20,
             "lineWidth": 2,
             "showPoints": "never",
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            }
+            "stacking": {"group": "A", "mode": "normal"}
           },
           "unit": "reqps"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 10
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
       "id": 3,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "sum"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+      "links": [
+        {
+          "title": "Open Jaeger - failed agent.execute traces",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22error%22%3A%22true%22%7D",
+          "targetBlank": true
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        {
+          "title": "Azure Monitor Workbook - Operator",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum by (status) (rate(mdk_jobs_completed_total[$__rate_interval]))",
           "legendFormat": "{{status}}",
@@ -267,53 +265,52 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "Error rate = non-success terminal jobs / all terminal jobs over the window (mdk.jobs.completed). Dead-letters are the `status=dead_letter` slice.",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": {"mode": "palette-classic"},
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
             "lineWidth": 2,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
           },
           "max": 1,
           "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.1}
+            ]
+          },
           "unit": "percentunit"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 10
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
       "id": 4,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+      "links": [
+        {
+          "title": "Open Jaeger - failed agent.execute traces",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22error%22%3A%22true%22%7D",
+          "targetBlank": true
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        {
+          "title": "Azure Monitor Workbook - Operator",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(rate(mdk_jobs_completed_total{status!=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(mdk_jobs_completed_total[$__rate_interval])), 1e-9)",
           "legendFormat": "error rate (all non-success)",
@@ -321,10 +318,7 @@
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(rate(mdk_jobs_completed_total{status=\"dead_letter\"}[$__rate_interval])) / clamp_min(sum(rate(mdk_jobs_completed_total[$__rate_interval])), 1e-9)",
           "legendFormat": "dead-letter rate",
@@ -332,68 +326,59 @@
           "refId": "B"
         }
       ],
-      "title": "Error rate & dead-letter rate",
+      "title": "Error rate & dead-letter rate (red line = high-error-rate SLO @ 10%)",
       "type": "timeseries"
     },
     {
+      "type": "text",
+      "id": 211,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 31},
+      "title": "Sub-panel: triage notes (throughput & errors)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Job completion rate split by terminal `status`, and the non-success / dead-letter ratio over the rate window. Source: `mdk.jobs.completed`.\n\n**Normal.** Steady non-zero `success` line; `error` < 1% of total; `dead_letter` rate = 0. Red threshold line on the right panel = **10%** (the **`*-high-error-rate`** SLO from `infra/azure/modules/monitor-alerts.bicep`).\n\n**If you see X.**\n\n- `error rate > 1%` -> check Azure Container Apps Activity Log for the deploy window; correlate with revision rollouts (annotate the chart with deploy time via Grafana's manual annotation if you have that wired).\n- `error rate > 10%` (SLO line) -> **`*-high-error-rate`** is firing; treat as SEV-1. Open Jaeger filter `error=true`; pivot on the `provider` attribute on `agent.execute`.\n- `dead_letter rate > 0` -> the **`*-deadletter-spike`** SLO fires on any non-zero; inspect failed runs in Langfuse, check provider 5xx + retry budget, and confirm Sentinel poison-message handling isn't suppressed.\n- `503 errors` -> suspect runtime cold start; check Container Apps revision restart events (use the `eval-and-drift` workbook's Container Apps section, or `AppEvents | where Type contains 'restart'`).\n\n**ADR refs.** ADR 013 / ADR 019 (queue tracing) / ADR 020. **Alert rules.** `*-high-error-rate`, `*-deadletter-spike`."
+      }
+    },
+    {
       "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 18
-      },
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
       "id": 102,
       "panels": [],
       "title": "Saturation (mdk.jobs.in_flight)",
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "In-flight jobs being dispatched by workers (claimed, not yet terminal) from the mdk.jobs.in_flight up-down counter. A proxy for queue/worker saturation. (A true queue-depth instrument is deferred to item #27 and not yet emitted as a metric.)",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 15,
-            "lineWidth": 2,
-            "showPoints": "never"
-          },
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never"},
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 19
-      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 35},
       "id": 5,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+      "links": [
+        {
+          "title": "Open Jaeger - long-running agent.execute (saturated workers)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=10s",
+          "targetBlank": true
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        {
+          "title": "Azure Monitor Workbook - Platform (queue depth)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(mdk_jobs_in_flight)",
           "legendFormat": "in-flight (total)",
@@ -401,10 +386,7 @@
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum by (tenant) (mdk_jobs_in_flight)",
           "legendFormat": "tenant {{tenant}}",
@@ -416,64 +398,55 @@
       "type": "timeseries"
     },
     {
+      "type": "text",
+      "id": 212,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 43},
+      "title": "Sub-panel: triage notes (saturation)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Up-down counter of currently-claimed-but-not-terminal jobs (proxy for in-pipe depth; true queue depth is deferred per ADR 031). Source: `mdk.jobs.in_flight`.\n\n**Normal.** Rises with traffic, falls with throughput. Steady-state value approximates `(arrival_rate * avg_duration)`. No alert rule yet (true queue depth is item #27).\n\n**If you see X.**\n\n- `in_flight rising, throughput flat or falling` -> workers stuck. Pull Jaeger with `minDuration=10s`; the long traces will reveal the stuck `skill.<name>` or LLM call.\n- `in_flight stuck non-zero with zero throughput` -> consumer side dead. Check Container Apps worker scale-out (KEDA), confirm `mdk worker` pods are healthy, look at the **`*-availability-no-traffic`** alert if API stalled.\n- `flat at 0 with traffic on the API side` -> claim path broken (locks held, storage outage). Inspect the DB pool row.\n\n**ADR refs.** ADR 019 (queue + W3C context) / ADR 031 (instrument catalog). **Alert rule (related).** `*-availability-no-traffic` (API-side stall)."
+      }
+    },
+    {
       "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 27
-      },
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 46},
       "id": 103,
       "panels": [],
       "title": "Cost & tokens (mdk.run.cost_usd, mdk.run.tokens)",
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "LLM spend rate (USD/hour) from the mdk.run.cost_usd counter, by tenant.",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 15,
-            "lineWidth": 2,
-            "showPoints": "never"
-          },
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never"},
           "unit": "currencyUSD"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 28
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 47},
       "id": 6,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "sum"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+      "links": [
+        {
+          "title": "Open Jaeger - agent.execute (inspect provider/model)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute",
+          "targetBlank": true
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+        {
+          "title": "Azure Monitor Workbook - Platform (cost section)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum by (tenant) (rate(mdk_run_cost_usd_total[$__rate_interval])) * 3600",
           "legendFormat": "tenant {{tenant}} (USD/hr)",
@@ -485,68 +458,47 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "Cumulative LLM cost (USD) over the selected range from mdk.run.cost_usd, and cumulative tokens from mdk.run.tokens.",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
+          "color": {"mode": "thresholds"},
           "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
           "unit": "currencyUSD"
         },
         "overrides": [
           {
-            "matcher": {
-              "id": "byName",
-              "options": "Cumulative tokens"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "short"
-              }
-            ]
+            "matcher": {"id": "byName", "options": "Cumulative tokens"},
+            "properties": [{"id": "unit", "value": "short"}]
           }
         ]
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 28
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 47},
       "id": 7,
+      "links": [
+        {
+          "title": "Open Jaeger - agent.execute (inspect provider/model)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Platform (cost)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
       "options": {
         "colorMode": "value",
         "graphMode": "area",
         "justifyMode": "auto",
         "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
         "textMode": "value_and_name"
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(increase(mdk_run_cost_usd_total[$__range]))",
           "legendFormat": "Cumulative cost",
@@ -554,10 +506,7 @@
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(increase(mdk_run_tokens_total[$__range]))",
           "legendFormat": "Cumulative tokens",
@@ -569,64 +518,50 @@
       "type": "stat"
     },
     {
+      "type": "text",
+      "id": 213,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 55},
+      "title": "Sub-panel: triage notes (cost & tokens)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Per-tenant LLM spend rate (USD/hr derived from `mdk.run.cost_usd`) and cumulative cost + tokens over the dashboard window. Both counters only carry the `tenant` attribute; per-agent / per-provider splits live on `agent.execute` span attributes (query Jaeger / Langfuse).\n\n**Normal.** Flat / proportional to throughput. No alert rule today (cost is observed, not paged; the relevant ADR is 017 for budget posture).\n\n**If you see X.**\n\n- `cost per agent runs away` -> check the `mdk-cost.json` dashboard's `mdk.run.tokens` panel for the same tenant. If input tokens spiked, look for a KB chunk-size regression (run `mdk eval` against that agent's regression set). If output tokens spiked, suspect prompt/temperature drift; cross-link to `mdk eval` for the agent.\n- `USD/hr step-change with no token change` -> provider price change or model swap. Confirm against the `provider` and `model_override` attributes on recent `agent.execute` spans.\n- `cost going to zero` -> usage instrument not firing; check `record_run_usage` wiring or `MOVATE_TRACE_SINK`.\n\n**ADR refs.** ADR 017 (cost posture) / ADR 015 (Langfuse for per-run drilldown). **Alert rule.** None today (observed only)."
+      }
+    },
+    {
       "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 36
-      },
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 58},
       "id": 104,
       "panels": [],
       "title": "DB connection pool (mdk.db.pool.size / idle / in_use / waiting / max, ADR 034 D3)",
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "description": "Per-pod asyncpg connection-pool saturation (ADR 034 D3). mdk.db.pool.in_use (checked-out) and mdk.db.pool.idle vs the configured per-pod ceiling mdk.db.pool.max, plus total open mdk.db.pool.size. Under KEDA autoscale, sum(mdk_db_pool_in_use) across pods approaching the Postgres max_connections is the connection-exhaustion early warning the `mdk doctor` capacity check (ADR 034 D1) does statically.",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 15,
-            "lineWidth": 2,
-            "showPoints": "never"
-          },
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never"},
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 37
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 59},
       "id": 8,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+      "links": [
+        {
+          "title": "Azure Monitor Workbook - Platform (pool stats)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(mdk_db_pool_in_use)",
           "legendFormat": "in use (fleet)",
@@ -634,10 +569,7 @@
           "refId": "A"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(mdk_db_pool_idle)",
           "legendFormat": "idle (fleet)",
@@ -645,10 +577,7 @@
           "refId": "B"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(mdk_db_pool_size)",
           "legendFormat": "open total (fleet)",
@@ -656,10 +585,7 @@
           "refId": "C"
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(mdk_db_pool_max)",
           "legendFormat": "per-pod max x pods (ceiling)",
@@ -671,51 +597,45 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "description": "Callers blocked waiting for a free pool connection (mdk.db.pool.waiting). A sustained non-zero value means the per-pod pool is the bottleneck — connections are fully checked out and requests are queuing. This is the saturation signal that precedes connection exhaustion; pair it with the `mdk doctor` capacity check (ADR 034 D1) which flags the static ceiling.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Callers blocked waiting for a free pool connection (mdk.db.pool.waiting). A sustained non-zero value means the per-pod pool is the bottleneck.",
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "color": {"mode": "palette-classic"},
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 20,
             "lineWidth": 2,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 37
-      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 59},
       "id": 9,
-      "options": {
-        "legend": {
-          "calcs": ["lastNotNull", "max"],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+      "links": [
+        {
+          "title": "Azure Monitor Workbook - Platform (pool waiters)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
         }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "editorMode": "code",
           "expr": "sum(mdk_db_pool_waiting)",
           "legendFormat": "waiting (fleet)",
@@ -723,8 +643,18 @@
           "refId": "A"
         }
       ],
-      "title": "Pool acquire waiters (saturation)",
+      "title": "Pool acquire waiters (saturation; red line = any waiter is anomalous)",
       "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 214,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 67},
+      "title": "Sub-panel: triage notes (DB pool, ADR 034 D3)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Per-pod asyncpg pool composition (`mdk.db.pool.size`/`idle`/`in_use`/`max`) and acquire-queue waiters (`mdk.db.pool.waiting`). Sampled at OTel collection time.\n\n**Normal.** `in_use/max` < 0.7; `waiting` = 0. Pool gauges are flat/zero on the local SQLite backend.\n\n**If you see X.**\n\n- `in_use/max > 0.9` -> pod is close to pool exhaustion. Cross-reference total `sum(mdk_db_pool_in_use)` vs Azure Postgres `max_connections` (header capacity = `N_pods * pool_max`). Run `mdk doctor` (ADR 034 D1) for the static math.\n- `waiting > 0 sustained` -> ceiling too tight. Raise `pool_max` (per-pod) OR add pod headroom; do NOT raise both blindly (you'll trip the Postgres ceiling).\n- `in_use rising while throughput flat` -> connection leak in a recently added storage call site. Bisect against the latest deploy.\n\n**ADR refs.** ADR 034 (D1 static doctor check, D3 live gauges). **Alert rule.** None today; the live signal precedes a `503` on the runtime which would trip `*-high-error-rate`."
+      }
     }
   ],
   "refresh": "30s",
@@ -748,14 +678,11 @@
       }
     ]
   },
-  "time": {
-    "from": "now-6h",
-    "to": "now"
-  },
+  "time": {"from": "now-6h", "to": "now"},
   "timepicker": {},
   "timezone": "",
-  "title": "mdk — golden signals (jobs, latency, errors, cost)",
+  "title": "mdk - golden signals (jobs, latency, errors, cost)",
   "uid": "mdk-golden-signals",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

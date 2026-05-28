@@ -26,7 +26,7 @@
       }
     ]
   },
-  "description": "mdk LLM cost + token volume over the two cost-related instruments mdk.run.tokens and mdk.run.cost_usd. Source: src/movate/tracing/metrics.py (METRIC_RUN_TOKENS / METRIC_RUN_COST_USD), recorded by record_run_usage() at the runtime edge. Both carry ONE attribute today: 'tenant'. The brief asked for splits by agent and provider, but neither is an attribute on these counters at the OTel layer (the per-agent/per-provider breakdown lives on the agent.execute span attributes instead -- query traces in Jaeger / Langfuse to slice that way). The tenant variable is the only metric-side slicer available.",
+  "description": "mdk LLM cost + token volume over the two cost-related instruments mdk.run.tokens and mdk.run.cost_usd. Source: src/movate/tracing/metrics.py. Prescriptive layer: triage flow + per-chart notes + drill-down links. Both counters carry only the 'tenant' attribute; per-agent/per-provider breakdown lives on agent.execute span attributes -- query Jaeger/Langfuse to slice that way.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -36,6 +36,24 @@
     {
       "collapsed": false,
       "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 200,
+      "panels": [],
+      "title": "Triage flow (start here)",
+      "type": "row"
+    },
+    {
+      "type": "text",
+      "id": 201,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 1},
+      "title": "mdk - cost: triage",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - cost (tokens + USD)\n\n**What this shows.** Per-tenant LLM spend (USD) and token volume from `mdk.run.cost_usd` and `mdk.run.tokens`. Both counters carry only the `tenant` attribute; **per-agent/per-provider splits live on the `agent.execute` span** (query Jaeger / Langfuse), not on these metrics.\n\n**Normal range.** Cost is observed, not paged - there is no SLO alert rule for cost. Healthy steady-state: USD/hr and tok/s proportional to throughput; **USD per 1k tokens stable**. A 2x step-change in any of these without a workload change is the triage trigger.\n\n**Triage flow.**\n\n```mermaid\ngraph TD\n  A[Cost anomaly noticed] --> B[Pick tenant in dropdown]\n  B --> C{Tokens spiked?}\n  C -- yes --> C1{Input or output dominant?}\n  C1 -- input --> C2[Look for KB chunk-size regression / retrieval over-fetch]\n  C1 -- output --> C3[Prompt/temperature drift; mdk eval on the agent]\n  C -- no  --> D{USD/1k tokens spiked?}\n  D -- yes --> D1[Provider price change OR model swap; check agent.execute provider/model]\n  D -- no  --> E[Mix shift -> expensive agent's share grew; Langfuse session view]\n```\n\nList fallback:\n1. Tokens up? -> input vs output -> KB regression or prompt drift.\n2. USD/1k tokens up? -> provider/model change.\n3. Otherwise: workload mix shift; Langfuse.\n\n**Cross-surface.** KQL equivalent in `infra/azure-monitor/workbooks/platform.workbook.json` (cost section)."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9},
       "id": 100,
       "panels": [],
       "title": "LLM cost (mdk.run.cost_usd)",
@@ -52,8 +70,20 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 1},
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 10},
       "id": 1,
+      "links": [
+        {
+          "title": "Jaeger - agent.execute (inspect provider/model)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Platform (cost)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -87,8 +117,20 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 6, "w": 18, "x": 6, "y": 1},
+      "gridPos": {"h": 6, "w": 18, "x": 6, "y": 10},
       "id": 2,
+      "links": [
+        {
+          "title": "Jaeger - agent.execute (inspect provider/model)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Platform (cost)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
       "options": {
         "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
@@ -107,8 +149,18 @@
       "type": "timeseries"
     },
     {
+      "type": "text",
+      "id": 210,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 16},
+      "title": "Sub-panel: triage notes (spend)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Cumulative USD over the dashboard window and the live spend rate by tenant. Source: `mdk.run.cost_usd`.\n\n**Normal.** Proportional to throughput, flat USD/hr line. No SLO alert (cost is observed only; see ADR 017 budget posture).\n\n**If you see X.**\n\n- `step-change in USD/hr with throughput flat` -> model swap or provider price change. Open Jaeger and group `agent.execute` traces by the `provider` / `model_override` attributes.\n- `cost climbing while throughput flat` -> per-run cost climbing; pair with the tokens dashboard below. If input tokens up -> KB chunk-size regression; if output -> prompt drift; run `mdk eval` for the affected agent.\n- `cost going to zero` -> usage telemetry broken; verify `record_run_usage` in `src/movate/tracing/metrics.py` is being called and `MOVATE_TRACE_SINK` is `otlp` or `both`.\n\n**ADR refs.** ADR 017 (cost) / ADR 015 (Langfuse drilldown). **Alert rule.** None today."
+      }
+    },
+    {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 19},
       "id": 101,
       "panels": [],
       "title": "Token volume (mdk.run.tokens)",
@@ -125,8 +177,20 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
       "id": 3,
+      "links": [
+        {
+          "title": "Jaeger - agent.execute (token deltas in span attrs)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Platform (cost)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
       "options": {
         "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
@@ -155,8 +219,20 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
       "id": 4,
+      "links": [
+        {
+          "title": "Jaeger - agent.execute (compare provider/model)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Platform (cost)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
       "options": {
         "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
@@ -173,6 +249,16 @@
       ],
       "title": "Effective USD per 1k tokens",
       "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 211,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 28},
+      "title": "Sub-panel: triage notes (tokens)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Tokens/sec by tenant (`mdk.run.tokens` is the combined input+output total - **direction is not broken out today**; per-direction splits live on the `agent.execute` span attributes) and the derived USD-per-1k-tokens ratio.\n\n**Normal.** USD/1k stable to ~1 decimal place; tokens/sec proportional to throughput.\n\n**If you see X.**\n\n- `tokens/sec doubles, throughput flat` -> per-run token use rising. Drill via Jaeger; look at `kb_search` children of `agent.execute` for input swell (KB chunk-size regression), or compare prompt/response sizes in Langfuse for output swell.\n- `USD/1k tokens steps up` -> model swap or provider price change; verify the `provider`/`model_override` attributes on recent `agent.execute` spans (don't trust dashboards for that; this metric doesn't carry it).\n- `tokens flat, USD climbing` -> almost always a billing-side reclassification by the provider; check `mdk eval` cost reports.\n\n**ADR refs.** ADR 015 / ADR 017. **Alert rule.** None today."
+      }
     }
   ],
   "refresh": "30s",
@@ -214,8 +300,8 @@
   "time": {"from": "now-24h", "to": "now"},
   "timepicker": {},
   "timezone": "",
-  "title": "mdk — cost (tokens + USD)",
+  "title": "mdk - cost (tokens + USD)",
   "uid": "mdk-cost",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

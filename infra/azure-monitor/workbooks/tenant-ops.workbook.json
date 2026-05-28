@@ -1,0 +1,170 @@
+{
+  "version": "Notebook/1.0",
+  "$schema": "https://schema.management.azure.com/schemas/2018-06-01/Microsoft.Insights.Workbook.json",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# mdk - tenant ops workbook (per-tenant slice)\n\n**Persona:** tenant operator / customer-success (\"is **this tenant** healthy right now?\").\n\nSlices the runtime golden signals to a **single tenant** selected from the dropdown above. The dropdown is populated by a `distinct` KQL query against `AppMetrics.Properties.tenant`. All charts filter by `tenant == \"{Tenant}\"` so the panels are scoped.\n\n**Cross-surface.** Grafana equivalent: `dashboards/grafana/mdk-runtime-overview.json` (the `$tenant` template variable). Choose this workbook when on a Portal-shared screen with the customer; Grafana when you need quick trace links.\n\n_Caveat:_ `mdk.job.duration_ms` does **not** carry the `tenant` attribute today (only `kind` + `status`), so the latency panels below derive p95 from the `agent.execute` span `DurationMs` filtered by `Properties.tenant_id` instead - that's the per-tenant signal that exists.\n\n_ADR refs: ADR 020, ADR 031 D2._"
+      },
+      "name": "title"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "tenant-param",
+            "version": "KqlParameterItem/1.0",
+            "name": "Tenant",
+            "label": "Tenant",
+            "type": 2,
+            "isRequired": true,
+            "multiSelect": false,
+            "quote": "\"",
+            "delimiter": ",",
+            "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| where isnotempty(tenant)\n| summarize by tenant\n| order by tenant asc",
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces"
+          }
+        ],
+        "style": "above",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "tenant-selector"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 1. Requests (tenant)\n\n**What.** Per-tenant job completion rate by `status` from `mdk.jobs.completed`.\n\n**Normal.** Steady `success`; `error` < 1%; `dead_letter` = 0.\n\n**If red, do.** Any spike outside the steady-state mix -> jump to the recent-failures panel below; in parallel, check whether the **`*-availability-no-traffic`** alert fired (fleet-wide today; per-tenant variant deferred)."
+      },
+      "name": "requests-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend tenant = tostring(Properties[\"tenant\"]), status = tostring(Properties[\"status\"])\n| where tenant == \"{Tenant}\"\n| summarize Jobs = sum(Sum) by status, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "mdk.jobs.completed for {Tenant} by status (5m bins)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "requests-by-status"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 2. Latency (tenant)\n\n**What.** `agent.execute` p50/p95/p99 from `AppDependencies` filtered to this tenant (via `Properties.tenant_id` carried on the span; `mdk.job.duration_ms` metric instrument is **not** keyed on tenant - see caveat at the top of this workbook).\n\n**Normal.** p95 < 2000 ms; p99 < 5000 ms.\n\n**If red, do.**\n- p95 > 5000 ms -> jump to Application Insights transaction search with `operation_Name == 'agent.execute'` and `customDimensions.tenant_id == '{Tenant}'`.\n- p95 > 30000 ms -> the **`*-high-latency-p95`** SLO is firing fleet-wide; correlate."
+      },
+      "name": "latency-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| extend tenant_id = tostring(Properties[\"tenant_id\"])\n| where tenant_id == \"{Tenant}\"\n| summarize p50 = percentile(DurationMs, 50), p95 = percentile(DurationMs, 95), p99 = percentile(DurationMs, 99) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "agent.execute p50 / p95 / p99 for {Tenant} (ms, 5m bins)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "latency-percentiles"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 3. Errors (tenant)\n\n**What.** Failed `agent.execute` for this tenant, plus the failure-fraction time-series.\n\n**Normal.** Error fraction < 1%; failures table sparse.\n\n**If red, do.**\n- error fraction > 10% (matches **`*-high-error-rate`** SLO threshold) -> pull the top `ResultCode` from the failures table; cross-check provider status.\n- failures clustered after a deploy -> use the platform workbook to verify revision health and consider revert."
+      },
+      "name": "errors-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| extend tenant_id = tostring(Properties[\"tenant_id\"])\n| where tenant_id == \"{Tenant}\"\n| summarize Total = count(), Failed = countif(Success == false) by bin(TimeGenerated, 5m)\n| extend ErrorPct = iff(Total == 0, 0.0, round(100.0 * Failed / Total, 2))\n| project TimeGenerated, ErrorPct\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "agent.execute error % for {Tenant} (5m bins; SLO line at 10%)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "error-rate"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\" and Success == false\n| extend tenant_id = tostring(Properties[\"tenant_id\"])\n| where tenant_id == \"{Tenant}\"\n| project TimeGenerated, DurationMs, ResultCode, OperationId, Properties\n| order by TimeGenerated desc\n| take 50",
+        "size": 0,
+        "title": "Recent failed agent.execute for {Tenant}",
+        "timeContext": {"durationMs": 3600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "recent-failures"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 4. Cost & tokens (tenant)\n\n**What.** Per-tenant LLM spend and token volume from `mdk.run.cost_usd` / `mdk.run.tokens`.\n\n**Normal.** Proportional to throughput; USD/1k stable.\n\n**If red, do.** Sudden cost spike with throughput flat -> use the platform workbook's USD/1k chart to confirm provider price / model swap; otherwise inspect this tenant's `agent.execute` traces for prompt drift via Langfuse."
+      },
+      "name": "cost-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.run.cost_usd\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| where tenant == \"{Tenant}\"\n| summarize USD = sum(Sum) by bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Cost USD for {Tenant} (15m bins)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "areachart"
+      },
+      "name": "cost-time-series"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.run.tokens\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| where tenant == \"{Tenant}\"\n| summarize Tokens = sum(Sum) by bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Tokens for {Tenant} (15m bins)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "areachart"
+      },
+      "name": "tokens-time-series"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let tokens = AppMetrics | where Name == \"mdk.run.tokens\" | extend tenant = tostring(Properties[\"tenant\"]) | where tenant == \"{Tenant}\" | summarize T = sum(Sum) by bin(TimeGenerated, 1h);\nlet cost = AppMetrics | where Name == \"mdk.run.cost_usd\" | extend tenant = tostring(Properties[\"tenant\"]) | where tenant == \"{Tenant}\" | summarize C = sum(Sum) by bin(TimeGenerated, 1h);\ntokens\n| join kind=inner cost on TimeGenerated\n| extend USDper1k = iff(T == 0, 0.0, round(C / (T / 1000.0), 4))\n| project TimeGenerated, USDper1k\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Effective USD per 1k tokens for {Tenant} (drift indicator, 1h bins)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "usd-per-1k"
+    }
+  ],
+  "fallbackResourceIds": ["Azure Monitor"],
+  "fromTemplateId": "mdk-tenant-ops-workbook"
+}

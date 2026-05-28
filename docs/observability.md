@@ -155,6 +155,39 @@ The Jaeger search-by-trace-id flow in the local demo is the same shape as the
 prod Application Insights → trace flow in Azure (`AppDependencies` /
 `AppTraces` keyed by `OperationId`).
 
+## Prescriptive layer + persona Workbooks
+
+The four Grafana dashboards now carry a **prescriptive triage layer**: each one
+opens with a triage-flow text panel (Mermaid graph + numbered-list fallback),
+every chart has a sibling "Sub-panel: triage notes" text panel using the
+**What / Normal / If red, do** pattern, the chart thresholds match the
+item-27 SLO alert thresholds from `infra/azure/modules/monitor-alerts.bicep`,
+and every chart has drill-down links to the local Jaeger demo (`http://localhost:16686/...`)
+and to the corresponding Azure Monitor Workbook page. Anti-drift coverage is
+unchanged: `tests/test_grafana_dashboards.py` walks `targets[*].expr` only,
+so the new `text` panels are transparent to the gate.
+
+The same metrics are also exposed Azure-side as four **persona-scoped
+Workbooks** under `infra/azure-monitor/workbooks/`: `operator`, `platform`,
+`eval-and-drift` (scaffolded - eval scores live in Langfuse today per ADR 031
+D1; the workbook documents the shape for when those instruments land), and
+`tenant-ops` (per-tenant slice with a `Tenant` workbook parameter). See
+[`docs/azure-monitor-workbooks.md`](azure-monitor-workbooks.md) for portal
+import + persona-to-on-call-flow mapping.
+
+### Choosing between Grafana and Workbooks
+
+Both surface the same OTel catalog. Pick **Grafana** when you want
+open-source / multi-cloud, the local demo stack
+(`infra/otel-collector/docker-compose.yml`), or live trace-search drill-downs
+into Jaeger (Workbooks can't replace those without leaving the Portal). Pick
+**Workbooks** when you want native Azure (shares auth with the Portal), KQL
+(the right language when you need to pivot to Activity Log / Resource Graph),
+and the same identity that owns the alert rules in
+`infra/azure/modules/monitor-alerts.bicep`. The two surfaces are anti-drift
+tested against the same `METRIC_NAMES`, so the choice is ergonomic, not
+semantic.
+
 ## How to import the in-repo dashboards
 
 ### Local (Grafana + Prometheus, via the demo stack)
