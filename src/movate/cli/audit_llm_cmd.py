@@ -70,10 +70,12 @@ def _resolve_runtime(target: str) -> tuple[str, str]:
     ``typer.Exit(2)`` with a one-line operator pointer.
     """
     try:
-        from movate.config import resolve_target  # noqa: PLC0415
+        from movate.config import resolve_target  # type: ignore[import-untyped]  # noqa: PLC0415
     except ImportError:
         # Older user_config layout.
-        from movate.core.user_config import resolve_target  # type: ignore[no-redef]  # noqa: PLC0415
+        from movate.core.user_config import (  # noqa: PLC0415
+            resolve_target,
+        )
 
     try:
         _, target_cfg = resolve_target(target)
@@ -112,7 +114,7 @@ def _poll_until_terminal(
     while True:
         resp = client.get(f"{base_url}/api/v1/jobs/{job_id}", headers=headers)
         resp.raise_for_status()
-        payload = resp.json()
+        payload: dict[str, Any] = resp.json()
         status = payload.get("status", "queued")
         if status in ("success", "error", "safety_blocked", "dead_letter", "cancelled"):
             return payload
@@ -143,13 +145,13 @@ def _post_audit_and_wait(
         except httpx.HTTPError as exc:
             err_console.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
             raise typer.Exit(code=2) from None
-        if resp.status_code == 401:
+        if resp.status_code == httpx.codes.UNAUTHORIZED:
             err_console.print("[red]✗[/red] 401 Unauthorized — key invalid or expired.")
             raise typer.Exit(code=2)
-        if resp.status_code == 404:
+        if resp.status_code == httpx.codes.NOT_FOUND:
             err_console.print(f"[red]✗[/red] 404 — {resp.json().get('detail', resp.text[:200])}")
             raise typer.Exit(code=2)
-        if resp.status_code not in (200, 202):
+        if resp.status_code not in (httpx.codes.OK, httpx.codes.ACCEPTED):
             err_console.print(f"[red]✗[/red] HTTP {resp.status_code}: {resp.text[:300]!r}")
             raise typer.Exit(code=2)
         accepted = resp.json()
@@ -164,19 +166,17 @@ def _post_audit_and_wait(
         if terminal.get("status") != "success":
             err_info = terminal.get("error") or {}
             err_console.print(
-                f"[red]✗[/red] audit failed: "
-                f"{err_info.get('message', terminal.get('status'))}"
+                f"[red]✗[/red] audit failed: {err_info.get('message', terminal.get('status'))}"
             )
             raise typer.Exit(code=1)
         audit_id = terminal.get("result_run_id")
         if not audit_id:
             err_console.print(f"[red]✗[/red] no audit_id on terminal job: {terminal!r}")
             raise typer.Exit(code=1)
-        fetch = client.get(
-            f"{base_url}/api/v1/audits/{audit_id}", headers=headers
-        )
+        fetch = client.get(f"{base_url}/api/v1/audits/{audit_id}", headers=headers)
         fetch.raise_for_status()
-        return fetch.json()
+        view: dict[str, Any] = fetch.json()
+        return view
 
 
 # ---------------------------------------------------------------------------
@@ -203,14 +203,14 @@ _SEVERITY_ICON: dict[str, str] = {
 def _format_location(loc: dict[str, Any] | None) -> str:
     if not loc:
         return ""
-    kind = loc.get("kind", "")
+    kind: str = str(loc.get("kind", ""))
     line = loc.get("line")
     path = loc.get("path")
     chunk_id = loc.get("chunk_id")
     if kind == "prompt_line" and line is not None:
         return f"prompt.md:{line}"
     if path:
-        return path + (f":{line}" if line is not None else "")
+        return str(path) + (f":{line}" if line is not None else "")
     if chunk_id:
         return f"chunk:{chunk_id}"
     return kind
@@ -351,8 +351,7 @@ def audit_agent(
     invalid = [c for c in categories if c not in _VALID_CATEGORIES]
     if invalid:
         err_console.print(
-            f"[red]✗[/red] unknown --category {invalid!r}; "
-            f"valid: {sorted(_VALID_CATEGORIES)}."
+            f"[red]✗[/red] unknown --category {invalid!r}; valid: {sorted(_VALID_CATEGORIES)}."
         )
         raise typer.Exit(code=2)
 
@@ -399,9 +398,7 @@ def audit_project(
 ) -> None:
     """Run a Claude-orchestrated audit across every agent in a project."""
     if severity_floor not in _VALID_SEVERITIES:
-        err_console.print(
-            f"[red]✗[/red] invalid --severity-floor {severity_floor!r}."
-        )
+        err_console.print(f"[red]✗[/red] invalid --severity-floor {severity_floor!r}.")
         raise typer.Exit(code=2)
     invalid = [c for c in categories if c not in _VALID_CATEGORIES]
     if invalid:

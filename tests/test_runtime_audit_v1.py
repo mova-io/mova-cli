@@ -35,8 +35,16 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from movate.core.auditor import Auditor  # imported at module top to avoid PLC0415
 from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
 from movate.core.executor import Executor
+from movate.core.models import (
+    AuditFindingSeverity,
+    AuditRecord,
+    JobKind,
+    JobRecord,
+    JobStatus,
+)
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -45,7 +53,7 @@ from movate.providers.base import (
 )
 from movate.providers.pricing import load_pricing
 from movate.runtime import build_app
-from movate.runtime.dispatch import WorkerDispatch
+from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.runtime.registry import scan_agents
 from movate.testing import InMemoryStorage, NullTracer
 
@@ -211,9 +219,6 @@ async def _run_dispatch(
 
     async def _patched(job):  # type: ignore[no-untyped-def]
         # Mirror the original but force the stub provider.
-        from movate.core.auditor import Auditor
-        from movate.core.models import AuditFindingSeverity, JobStatus
-
         cfg = job.input
         scope_kind = str(cfg.get("scope_kind", "agent"))
         scope_id = str(cfg.get("scope_id", job.target))
@@ -247,11 +252,7 @@ async def _run_dispatch(
                 bundle=bundle, tenant_id=job.tenant_id, categories=categories
             )
         await storage.save_audit(record)
-        from movate.runtime.dispatch import DispatchOutcome
-
-        return DispatchOutcome(
-            status=JobStatus.SUCCESS, result_run_id=record.audit_id, error=None
-        )
+        return DispatchOutcome(status=JobStatus.SUCCESS, result_run_id=record.audit_id, error=None)
 
     dispatch._execute_audit = _patched  # type: ignore[assignment]
     del original  # silence "unused"
@@ -299,7 +300,7 @@ async def test_audit_full_lifecycle_persists_record(
 ) -> None:
     """End-to-end: POST → dispatch → GET /audits/{audit_id} returns the
     rich AuditJobView with findings + summary."""
-    auth_header, tenant_id = auth_setup
+    auth_header, _tenant_id = auth_setup
     _create_agent(client, auth_header)
 
     canned = {
@@ -402,16 +403,9 @@ async def test_audit_does_not_modify_agent(
     assert len(storage.audits) == 1
 
 
-async def test_audit_tenant_isolation_on_get(
-    client: TestClient, storage: InMemoryStorage
-) -> None:
+async def test_audit_tenant_isolation_on_get(client: TestClient, storage: InMemoryStorage) -> None:
     """A second tenant's GET /audits/{id} for the first tenant's
     audit returns 404 (never 403, never the actual row)."""
-    from movate.core.models import (
-        AuditFindingSeverity,
-        AuditRecord,
-    )
-
     # Need a real tenant id that satisfies TENANT_PREFIX_LEN.
     tenant_a = uuid4().hex
     tenant_b = uuid4().hex
@@ -441,9 +435,7 @@ async def test_audit_tenant_isolation_on_get(
     assert r.status_code == 404
 
 
-def test_audit_project_endpoint_returns_job_id(
-    client: TestClient, auth_setup
-) -> None:
+def test_audit_project_endpoint_returns_job_id(client: TestClient, auth_setup) -> None:
     """The project-scoped route 202s with a project-scoped job."""
     auth_header, _ = auth_setup
     _create_agent(client, auth_header)
@@ -458,9 +450,7 @@ def test_audit_project_endpoint_returns_job_id(
     assert body["status"] == "queued"
 
 
-def test_audit_agent_endpoint_unknown_agent_returns_404(
-    client: TestClient, auth_setup
-) -> None:
+def test_audit_agent_endpoint_unknown_agent_returns_404(client: TestClient, auth_setup) -> None:
     auth_header, _ = auth_setup
     r = client.post(
         "/api/v1/agents/never-existed/audit/from-llm",
@@ -558,8 +548,6 @@ async def test_audit_stream_non_audit_job_returns_404(
     client: TestClient, auth_setup, storage: InMemoryStorage
 ) -> None:
     """The audit SSE stream is audit-only — a non-audit job returns 404."""
-    from movate.core.models import JobKind, JobRecord
-
     auth_header, tenant_id = auth_setup
     job = JobRecord(
         job_id="ag_xxx",

@@ -160,9 +160,7 @@ async def test_audit_agent_returns_record_with_seven_categories_by_default(
 
 
 @pytest.mark.unit
-async def test_audit_subagent_only_sees_its_own_slice(
-    storage: InMemoryStorage, bundle
-) -> None:
+async def test_audit_subagent_only_sees_its_own_slice(storage: InMemoryStorage, bundle) -> None:
     """Per-category isolation: the cost_outliers sub-agent's user
     prompt MUST NOT carry the full prompt.md (that's an
     ambiguous_prompts-only slice), and the ambiguous_prompts user
@@ -173,7 +171,9 @@ async def test_audit_subagent_only_sees_its_own_slice(
     await auditor.audit_agent(bundle=bundle, tenant_id="t1")
 
     by_category = {
-        _classify_category(c[0] + "\n"): c[2] for c in provider.calls if _classify_category(c[0] + "\n")
+        _classify_category(c[0] + "\n"): c[2]
+        for c in provider.calls
+        if _classify_category(c[0] + "\n")
     }
     # The cost_outliers slice carries agent.yaml summary + run cost stats,
     # NOT the full prompt.md banner.
@@ -187,9 +187,7 @@ async def test_audit_subagent_only_sees_its_own_slice(
 
 
 @pytest.mark.unit
-async def test_audit_filters_below_severity_floor(
-    storage: InMemoryStorage, bundle
-) -> None:
+async def test_audit_filters_below_severity_floor(storage: InMemoryStorage, bundle) -> None:
     """severity_floor=warn drops info-level findings; warn+ keep."""
     findings = {
         "ambiguous_prompts": [
@@ -254,9 +252,7 @@ async def test_audit_provider_failure_marks_category_skipped(
 
 
 @pytest.mark.unit
-async def test_audit_does_not_modify_agent(
-    storage: InMemoryStorage, bundle
-) -> None:
+async def test_audit_does_not_modify_agent(storage: InMemoryStorage, bundle) -> None:
     """Read-only invariant: every mutable storage list MUST be the same
     after an audit as before (modulo the new AuditRecord)."""
     # Capture the storage state BEFORE the audit (deep copy so we
@@ -288,9 +284,7 @@ async def test_audit_does_not_modify_agent(
             ]
         }
     )
-    auditor = Auditor(
-        provider=provider, storage=storage, model="openai/gpt-4o-mini"
-    )
+    auditor = Auditor(provider=provider, storage=storage, model="openai/gpt-4o-mini")
     await auditor.audit_agent(bundle=bundle, tenant_id="t1")
 
     # The ONLY thing the audit may write durably is an AuditRecord (and
@@ -326,9 +320,7 @@ async def test_audit_project_aggregates_across_bundles(
             ]
         }
     )
-    auditor = Auditor(
-        provider=provider, storage=storage, model="openai/gpt-4o-mini"
-    )
+    auditor = Auditor(provider=provider, storage=storage, model="openai/gpt-4o-mini")
     record = await auditor.audit_project(
         bundles=[b1, b2],
         project_id="proj-1",
@@ -343,9 +335,7 @@ async def test_audit_project_aggregates_across_bundles(
 
 
 @pytest.mark.unit
-async def test_audit_emits_progress_events_via_on_event(
-    storage: InMemoryStorage, bundle
-) -> None:
+async def test_audit_emits_progress_events_via_on_event(storage: InMemoryStorage, bundle) -> None:
     """The on_event callback receives one ``category_complete`` per
     category + one ``agent_complete`` at the end."""
     events: list[tuple[str, dict[str, Any]]] = []
@@ -354,9 +344,7 @@ async def test_audit_emits_progress_events_via_on_event(
         events.append((name, payload))
 
     provider = MockAuditProvider()
-    auditor = Auditor(
-        provider=provider, storage=storage, model="openai/gpt-4o-mini"
-    )
+    auditor = Auditor(provider=provider, storage=storage, model="openai/gpt-4o-mini")
     await auditor.audit_agent(
         bundle=bundle,
         tenant_id="t1",
@@ -372,15 +360,11 @@ async def test_audit_emits_progress_events_via_on_event(
 
 
 @pytest.mark.unit
-async def test_audit_drops_unknown_categories_silently(
-    storage: InMemoryStorage, bundle
-) -> None:
+async def test_audit_drops_unknown_categories_silently(storage: InMemoryStorage, bundle) -> None:
     """Unknown categories are filtered (defensive). Mix of one valid
     + one typo'd → only the valid one runs."""
     provider = MockAuditProvider()
-    auditor = Auditor(
-        provider=provider, storage=storage, model="openai/gpt-4o-mini"
-    )
+    auditor = Auditor(provider=provider, storage=storage, model="openai/gpt-4o-mini")
     record = await auditor.audit_agent(
         bundle=bundle,
         tenant_id="t1",
@@ -406,9 +390,7 @@ async def test_audit_record_has_summary_counts_by_severity(
             ]
         }
     )
-    auditor = Auditor(
-        provider=provider, storage=storage, model="openai/gpt-4o-mini"
-    )
+    auditor = Auditor(provider=provider, storage=storage, model="openai/gpt-4o-mini")
     record = await auditor.audit_agent(
         bundle=bundle, tenant_id="t1", categories=["ambiguous_prompts"]
     )

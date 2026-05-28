@@ -118,11 +118,7 @@ class InMemoryStorage:
 
     async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
         return next(
-            (
-                au
-                for au in self.audits
-                if au.audit_id == audit_id and au.tenant_id == tenant_id
-            ),
+            (au for au in self.audits if au.audit_id == audit_id and au.tenant_id == tenant_id),
             None,
         )
 

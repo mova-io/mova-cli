@@ -675,8 +675,7 @@ class WorkerDispatch:
                 if bundle is None:
                     return _error(
                         "unknown_agent",
-                        f"agent {job.target!r} not registered for "
-                        f"tenant {job.tenant_id!r}",
+                        f"agent {job.target!r} not registered for tenant {job.tenant_id!r}",
                         retryable=False,
                     )
                 record = await auditor.audit_agent(

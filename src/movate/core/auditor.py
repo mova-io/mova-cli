@@ -28,7 +28,7 @@ Seven categories ship in this PR:
   dataset; KB chunks never retrieved.
 * ``security_smells`` — PII patterns in contexts, hardcoded secrets,
   prompt-injection vulnerabilities, missing input validation.
-* ``cost_outliers`` — agents with cost-per-run >2σ above project
+* ``cost_outliers`` — agents with cost-per-run >2 stddev above project
   average; ``max_tokens`` excess; redundant context inclusion.
 * ``kb_quality`` — stale chunks, low-signal chunks (rarely retrieved +
   low judge scores), duplicate content.
@@ -107,25 +107,25 @@ _CATEGORY_PROMPTS: dict[str, str] = {
     "ambiguous_prompts": (
         "You audit one AI-agent prompt for ambiguity / contradictions / "
         "missing escape clauses / hallucination risk. Return ONLY a JSON "
-        "object of the shape {\"findings\": [...]} where each finding has "
+        'object of the shape {"findings": [...]} where each finding has '
         "fields: severity (one of info|warn|error|critical), title (short), "
         "description (one paragraph), suggestion (one line, advisory only), "
         "confidence (low|medium|high), and optionally line (1-based line "
         "number in prompt.md). Categories you may flag: contradictory "
-        "instructions, vague directives, missing-escape-clause (\"if unsure, "
-        "say X\"), hallucination-prone phrasing. Be SPECIFIC — quote the "
+        'instructions, vague directives, missing-escape-clause ("if unsure, '
+        'say X"), hallucination-prone phrasing. Be SPECIFIC — quote the '
         "offending lines. NEVER suggest writing/mutating files. Return "
-        "{\"findings\": []} when the prompt is clean."
+        '{"findings": []} when the prompt is clean.'
     ),
     "missing_eval_coverage": (
         "You audit an AI agent for eval-coverage gaps. You are given the "
         "agent's prompt.md and its eval dataset (one JSONL row per case). "
         "Identify rules / branches in the prompt that NO dataset row "
         "exercises, and KB chunks (if provided) that are never retrieved. "
-        "Return ONLY a JSON object {\"findings\": [...]} with fields: "
+        'Return ONLY a JSON object {"findings": [...]} with fields: '
         "severity, title, description, suggestion (one line), confidence. "
         "ALL suggestions are advisory — never recommend automatic dataset "
-        "edits. Return {\"findings\": []} when coverage looks complete."
+        'edits. Return {"findings": []} when coverage looks complete.'
     ),
     "security_smells": (
         "You audit an AI agent for security smells: PII patterns hardcoded "
@@ -133,7 +133,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
         "vulnerabilities (untrusted user input concatenated without "
         "fencing), and missing input validation. You are given the agent's "
         "prompt + contexts + skill list. Return ONLY a JSON object "
-        "{\"findings\": [...]} with fields: severity, title, description, "
+        '{"findings": [...]} with fields: severity, title, description, '
         "suggestion (one line, advisory only), confidence. Be conservative "
         "— flag only what you can name a concrete pattern for. NEVER "
         "suggest writing/mutating files."
@@ -142,8 +142,8 @@ _CATEGORY_PROMPTS: dict[str, str] = {
         "You audit an AI agent's configuration for cost concerns. You are "
         "given the agent.yaml (model, max_tokens, contexts) and recent "
         "run cost statistics (mean cost per run, vs. project average + "
-        "stddev). Flag: cost >2σ above project mean, excessive max_tokens, "
-        "redundant context inclusion. Return ONLY {\"findings\": [...]} "
+        "stddev). Flag: cost >2 stddev above project mean, excessive max_tokens, "
+        'redundant context inclusion. Return ONLY {"findings": [...]} '
         "with fields: severity, title, description, suggestion (one line, "
         "advisory), confidence. NEVER suggest auto-changing the model."
     ),
@@ -152,7 +152,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
         "are given KB chunk stats (retrieval frequency, age in days, "
         "rough text). Flag: stale chunks (very old + never retrieved), "
         "low-signal chunks (rarely retrieved + small text), duplicate "
-        "content. Return ONLY {\"findings\": [...]} with fields: severity, "
+        'content. Return ONLY {"findings": [...]} with fields: severity, '
         "title, description, suggestion (one line, advisory), confidence. "
         "NEVER suggest auto-deleting chunks — only flag them for human "
         "review."
@@ -162,7 +162,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
         "given the agent's schemas + a sample of recent run inputs/outputs. "
         "Flag: schema not enforced (run inputs missing required fields), "
         "type mismatches (e.g. string where number declared), undeclared "
-        "fields appearing in runs. Return ONLY {\"findings\": [...]} with "
+        'fields appearing in runs. Return ONLY {"findings": [...]} with '
         "fields: severity, title, description, suggestion (one line, "
         "advisory), confidence. NEVER suggest auto-tightening the schema."
     ),
@@ -172,7 +172,7 @@ _CATEGORY_PROMPTS: dict[str, str] = {
         "pass-rate, and recent cost stats. Flag: model too big for "
         "workload (high cost + simple task + high pass-rate), or model "
         "too small for complexity (low pass-rate + complex task). Return "
-        "ONLY {\"findings\": [...]} with fields: severity, title, "
+        'ONLY {"findings": [...]} with fields: severity, title, '
         "description, suggestion (one line, advisory), confidence. NEVER "
         "suggest auto-swapping models — only flag for human review."
     ),
@@ -298,15 +298,13 @@ class Auditor:
         """Audit a list of agents as one project-wide audit.
 
         Project-wide cost outliers are computed across ``bundles`` (so
-        ``cost_outliers`` flags agents above the project mean +2σ);
+        ``cost_outliers`` flags agents above the project mean +2 stddev);
         every other category runs per-agent and the findings are
         concatenated, severity-floored, and persisted as one
         :class:`AuditRecord` keyed by ``project_id``.
         """
         resolved_cats = self._resolve_categories(categories)
-        project_stats = await self._compute_project_cost_stats(
-            bundles=bundles, tenant_id=tenant_id
-        )
+        project_stats = await self._compute_project_cost_stats(bundles=bundles, tenant_id=tenant_id)
         all_outcomes: list[_CategoryOutcome] = []
         for b in bundles:
             outcomes = await self._run_categories(
@@ -520,9 +518,7 @@ class Auditor:
         # Per-category slice. Kept compact — the LLM does its job with
         # less noise + the budget guard sees a smaller token footprint.
         return {
-            "ambiguous_prompts": (
-                f"=== prompt.md ===\n{prompt_md}\n=== end ==="
-            ),
+            "ambiguous_prompts": (f"=== prompt.md ===\n{prompt_md}\n=== end ==="),
             "missing_eval_coverage": (
                 f"=== prompt.md ===\n{prompt_md}\n=== end ===\n"
                 f"=== eval dataset summary ===\n{dataset_summary}\n=== end ===\n"
@@ -535,11 +531,10 @@ class Auditor:
             ),
             "cost_outliers": (
                 f"=== agent.yaml summary ===\n{agent_yaml_summary}\n=== end ===\n"
-                f"=== recent run cost stats ===\n{run_cost_summary}{project_stats_blob}\n=== end ==="
+                f"=== recent run cost stats ===\n{run_cost_summary}"
+                f"{project_stats_blob}\n=== end ==="
             ),
-            "kb_quality": (
-                f"=== KB chunks ===\n{kb_summary}\n=== end ==="
-            ),
+            "kb_quality": (f"=== KB chunks ===\n{kb_summary}\n=== end ==="),
             "schema_drift": (
                 f"=== input_schema ===\n{json.dumps(bundle.input_schema)}\n=== end ===\n"
                 f"=== output_schema ===\n{json.dumps(bundle.output_schema)}\n=== end ===\n"
@@ -650,7 +645,7 @@ class Auditor:
         n = len(all_costs)
         mean = sum(all_costs) / n
         variance = sum((c - mean) ** 2 for c in all_costs) / n
-        stddev = variance ** 0.5
+        stddev = variance**0.5
         return {
             "mean_cost_usd": round(mean, 6),
             "stddev_cost_usd": round(stddev, 6),
@@ -750,18 +745,22 @@ def _summarize_skills(bundle: AgentBundle) -> str:
     return "\n".join(rows)
 
 
+_KB_SAMPLE_SIZE = 5  # how many chunks to dump verbatim into the LLM prompt
+_DATASET_SAMPLE_SIZE = 3  # how many dataset rows the eval-coverage sub-agent sees
+
+
 def _summarize_kb_chunks(chunks: list[Any]) -> str:
     if not chunks:
         return "<no KB chunks>"
     total = len(chunks)
-    sample = chunks[:5]
+    sample = chunks[:_KB_SAMPLE_SIZE]
     rows: list[str] = [f"total_chunks: {total}"]
     for c in sample:
         text = getattr(c, "text", "") or ""
         source = getattr(c, "source", "") or ""
         rows.append(f"- source={source!r} text={text[:200]!r}")
-    if total > 5:
-        rows.append(f"... ({total - 5} more)")
+    if total > _KB_SAMPLE_SIZE:
+        rows.append(f"... ({total - _KB_SAMPLE_SIZE} more)")
     return "\n".join(rows)
 
 
@@ -784,7 +783,7 @@ def _summarize_run_costs(runs: list[Any]) -> str:
 def _summarize_sample_runs(runs: list[Any]) -> str:
     if not runs:
         return "<no recent runs>"
-    sample = runs[:5]
+    sample = runs[:_KB_SAMPLE_SIZE]
     rows = []
     for r in sample:
         rows.append(
@@ -817,7 +816,7 @@ def _summarize_dataset(bundle: AgentBundle) -> str:
     except Exception:
         return "<dataset unreadable>"
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    sample = lines[:3]
+    sample = lines[:_DATASET_SAMPLE_SIZE]
     return json.dumps({"row_count": len(lines), "sample_rows": sample})
 
 
@@ -837,9 +836,7 @@ def _summarize_evals(evals: list[Any]) -> str:
 _JSON_BLOB_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def _parse_findings(
-    text: str, *, category: str, agent_name: str
-) -> list[AuditFinding]:
+def _parse_findings(text: str, *, category: str, agent_name: str) -> list[AuditFinding]:
     """Parse the sub-agent's JSON reply into typed findings.
 
     Defensive: an LLM that ignores the schema (non-JSON, missing
@@ -855,9 +852,7 @@ def _parse_findings(
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning(
-            "audit_finding_json_parse_failed category=%s agent=%s", category, agent_name
-        )
+        logger.warning("audit_finding_json_parse_failed category=%s agent=%s", category, agent_name)
         return []
     raw_findings = data.get("findings") if isinstance(data, dict) else None
     if not isinstance(raw_findings, list):
