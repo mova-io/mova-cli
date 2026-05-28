@@ -197,6 +197,7 @@ from movate.cli.backup_cmd import export_state_cmd, import_state_cmd  # noqa: E4
 from movate.cli.batch_cmd import batch_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.canary_cmd import canary_app  # noqa: E402
+from movate.cli.catalog_cmd import catalog_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.contexts_cmd import contexts_app  # noqa: E402
@@ -219,6 +220,7 @@ from movate.cli.models_cmd import models_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
+from movate.cli.project_cmd import project_app  # noqa: E402
 from movate.cli.runs import runs_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.schema_cmd import schema_app  # noqa: E402
@@ -593,6 +595,15 @@ app.add_typer(auth_app, name="auth", rich_help_panel=PANEL_MANAGE)
 app.add_typer(keys_app, name="keys", rich_help_panel=PANEL_MANAGE)
 app.add_typer(config_app, name="config", rich_help_panel=PANEL_MANAGE)
 app.add_typer(fleet_app, name="fleet", rich_help_panel=PANEL_MANAGE)
+# `project` + `catalog` are the comprehensive CLI parity layer over the
+# per-endpoint PRs landing tonight (item 17 polish). They live in MANAGE
+# alongside `fleet` since they're remote-runtime read/write commands;
+# `project add-agent --from-llm` composes semantically with `mdk init`
+# (Develop panel) — that cross-reference lives in the command's --help
+# rather than a panel split. Same shape as `fleet`/`runs`: --json on every
+# read, next-step hint on every write, --target plumbing throughout.
+app.add_typer(project_app, name="project", rich_help_panel=PANEL_MANAGE)
+app.add_typer(catalog_app, name="catalog", rich_help_panel=PANEL_MANAGE)
 app.add_typer(policy_app, name="policy", rich_help_panel=PANEL_MANAGE)
 app.add_typer(profiles_app, name="profiles", rich_help_panel=PANEL_MANAGE)
 app.add_typer(secrets_app, name="secrets", rich_help_panel=PANEL_MANAGE)

@@ -3554,6 +3554,50 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
       [bold]mdk authoring audit[/bold] / [bold]replay[/bold] — the copilot's
         reversible-action audit log.
     """
+    # Cloud-side bundle flow (the combined `mdk init "..." --target <env>`
+    # "wow" CLI demo from the project + catalog polish PR). Triggered ONLY
+    # when ALL of the following hold:
+    #
+    #   * `--target` resolves to a REGISTERED runtime target name in
+    #     ~/.movate/config.yaml (sniff via `load_user_config`), and
+    #   * an agent name + a natural-language description are both present
+    #     (positional `description` OR `--llm`), and
+    #   * we're NOT in `--project` mode (project bootstrap is local-only).
+    #
+    # When matched, dispatch to `_init_target.init_with_target` which calls
+    # the unified `POST /api/v1/agents` endpoint with `source: "llm"`,
+    # streams the SSE progress events through a Rich live spinner (same UX
+    # idiom `mdk deploy --verbose` uses for `az acr build`), and writes the
+    # final bundle to `./<name>/`. Backward compat (CLAUDE.md rule 5): when
+    # `--target` is a PATH (not a registered runtime name) the existing
+    # local-only scaffold path runs unchanged — same behaviour every
+    # pre-existing call site sees.
+    if not project and name is not None and (llm is not None or description is not None):
+        from movate.cli._init_target import init_with_target  # noqa: PLC0415
+        from movate.core.user_config import load_user_config  # noqa: PLC0415
+
+        # Sniff: is `target` a registered runtime name? `target` is typed
+        # as `Path` so it stringifies to whatever the operator passed
+        # (e.g. `Path("dev")` → `"dev"`). A registered name disambiguates
+        # cloud-side mode from the legacy "scaffold parent dir" meaning.
+        candidate = str(target)
+        try:
+            cfg = load_user_config()
+        except Exception:
+            cfg = None
+        if cfg is not None and candidate in cfg.targets:
+            effective_desc = llm if llm is not None else description
+            assert effective_desc is not None  # narrowed by the outer guard
+            code = init_with_target(
+                name=name,
+                description=effective_desc,
+                target=candidate,
+                force=force,
+            )
+            if code != 0:
+                raise typer.Exit(code=code)
+            return
+
     # Mutual-exclusion guard: --llm only makes sense in agent mode.
     # Project mode is just a movate.yaml + .gitignore + empty agents/ —
     # nothing for an LLM to scaffold. Point the operator at agent mode

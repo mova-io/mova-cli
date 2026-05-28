@@ -208,6 +208,33 @@ def build_actions(status: WorkspaceStatus) -> list[Action]:
             )
         )
 
+    # Item 17 (project + catalog CLI parity polish): surface the remote
+    # project + catalog browse / manage commands as guided picks once the
+    # operator has any agents in the workspace. Both are remote-runtime
+    # reads, so they're always safe — no destructive action without an
+    # explicit additional flag. Needs an operator-supplied --target so we
+    # mark `needs_user_input=True` (the menu prints the command but
+    # doesn't auto-execute).
+    if status.has_agents:
+        actions.append(
+            Action(
+                label="Browse reusable agents in the runtime's catalog",
+                command="mdk catalog list --target <env>",
+                argv=("catalog", "list", "--target", "<env>"),
+                priority=60,
+                needs_user_input=True,
+            )
+        )
+        actions.append(
+            Action(
+                label="List deployed projects on the runtime",
+                command="mdk project list --target <env>",
+                argv=("project", "list", "--target", "<env>"),
+                priority=65,
+                needs_user_input=True,
+            )
+        )
+
     # Always-available housekeeping (run last in the menu).
     if status.has_movate_yaml:
         actions.append(
