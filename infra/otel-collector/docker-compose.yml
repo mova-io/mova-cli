@@ -1,0 +1,97 @@
+# Local OpenTelemetry demo stack for mdk (movate-cli).
+#
+# What this is: a 4-service runnable Collector -> Jaeger (traces) + Prometheus
+# (metrics) -> Grafana fanout, matched 1:1 to mdk's prod OTLP exporter wiring
+# (src/movate/tracing/otel.py + src/movate/tracing/metrics.py). Use it to
+# exercise the in-repo dashboards under dashboards/grafana/ against a real
+# Prometheus, before pushing to the Azure path (infra/azure/modules/
+# containerapp-otel-collector.bicep + ADR 020).
+#
+# Run:
+#   docker compose -f infra/otel-collector/docker-compose.yml up
+# Stop & wipe:
+#   docker compose -f infra/otel-collector/docker-compose.yml down -v
+#
+# Point mdk at it (in another shell):
+#   export MOVATE_TRACE_SINK=otlp          # gate: turns mdk OTel metrics on
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#   export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+#   export OTEL_SERVICE_NAME=movate-runtime
+#   mdk dev / mdk serve / mdk worker ...
+#
+# Open:
+#   Grafana    http://localhost:3000   (anonymous Admin role enabled below)
+#   Jaeger UI  http://localhost:16686
+#   Prom UI    http://localhost:9090
+#
+# All four images are pinned to a known-good minor; no licenses to chase
+# (Apache-2.0 for otel-collector + Prom; Apache-2.0 for Jaeger; AGPLv3 for
+# Grafana OSS, but this is a DEV docker compose, not a shipped Python dep, so
+# it falls outside the scripts/check_licenses.py gate which covers pyproject
+# deps only -- see docs/license-posture.md).
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.103.0
+    container_name: mdk-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP/gRPC  (used when OTEL_EXPORTER_OTLP_PROTOCOL=grpc)
+      - "4318:4318"   # OTLP/HTTP  (the default in mdk; src/movate/tracing/metrics.py _otlp_metric_exporter_class)
+      - "8889:8889"   # Prometheus exporter scrape endpoint (Prometheus pulls from here)
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    # all-in-one: agent + collector + query UI in one container, OTLP-native.
+    image: jaegertracing/all-in-one:1.57
+    container_name: mdk-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      # OTLP receivers inside the collector route here over the docker network;
+      # we don't expose 4317/4318 from Jaeger to the host (the otel-collector
+      # is the canonical entry point for mdk).
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: mdk-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../dashboards/prometheus/mdk-rules.yaml:/etc/prometheus/rules/mdk-rules.yaml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:10.4.4
+    container_name: mdk-grafana
+    environment:
+      # Anonymous Admin for the demo only -- DO NOT mirror this in prod.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # The in-repo dashboards-as-code (dashboards/grafana/*.json) are mounted
+      # read-only into the path the provisioning provider points at, so they
+      # auto-load on startup. Adding a JSON to dashboards/grafana/ + bouncing
+      # this compose stack is the end-to-end loop.
+      - ../../dashboards/grafana:/var/lib/grafana/dashboards/mdk:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
