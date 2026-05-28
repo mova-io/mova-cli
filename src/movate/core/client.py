@@ -24,6 +24,7 @@ from movate.runtime.schemas import (
     BatchAcceptedView,
     BatchListView,
     BatchStatusView,
+    CapabilitiesView,
     HealthView,
     JobCancelView,
     JobListView,
@@ -104,6 +105,23 @@ class MovateClient:
         r = await self._client.get("/agents")
         self._raise_for_status(r)
         return AgentListView.model_validate(r.json())
+
+    async def capabilities(self) -> CapabilitiesView:
+        """``GET /api/v1/capabilities`` — what THIS runtime version supports.
+
+        Read-only self-description: reachable models, feature flags (derived
+        from the deployed route table / importable modules), the scope
+        vocabulary, this tenant's effective limits, and installed extras.
+
+        Sends the bearer (so a ``read``-scoped key gets the full matrix); a
+        keyless/under-scoped caller gets the minimal subset (``minimal:
+        true``) rather than a 401/403 — the endpoint is probe-friendly. We
+        still ``_raise_for_status`` to surface a genuine 5xx / transport
+        error, but the auth-degradation path returns 200.
+        """
+        r = await self._client.get("/api/v1/capabilities")
+        self._raise_for_status(r)
+        return CapabilitiesView.model_validate(r.json())
 
     async def submit_job(
         self,

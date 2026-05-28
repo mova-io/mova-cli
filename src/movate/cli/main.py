@@ -144,6 +144,7 @@ from movate.cli import (  # noqa: E402
     _console,
     add_cmd,
     audit_cmd,
+    capabilities_cmd,
     compose_cmd,
     demo_cmd,
     dev_cmd,
@@ -559,6 +560,11 @@ app.command("pricing", rich_help_panel=PANEL_DIAGNOSE)(pricing_cmd.pricing)
 # Sits alongside `pricing` (per-1k cost table) since both answer
 # "what models can I use and what do they cost?".
 app.add_typer(models_app, name="models", rich_help_panel=PANEL_DIAGNOSE)
+# `capabilities` queries a DEPLOYED runtime ("what does THIS deployment
+# support?") — reachable models, feature flags (route/import-detected),
+# scopes, limits, extras. Sits with `models`/`pricing` as a discovery
+# command, but read against a remote target rather than the local catalog.
+app.command("capabilities", rich_help_panel=PANEL_DIAGNOSE)(capabilities_cmd.capabilities)
 # `costs` reports on historical spend (different from `pricing` which
 # shows the live tariff). Both share the Diagnose panel since they
 # answer adjacent operator questions ("what does this cost?" vs
