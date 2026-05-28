@@ -164,3 +164,119 @@ class TestPrintKbTrace:
         captured = capsys.readouterr()
         assert "first result" in captured.err
         assert "second result" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# mdk run --estimate (Cost Prediction)
+# ---------------------------------------------------------------------------
+
+
+class TestEstimateRender:
+    """The shared estimate renderer used by both local + remote --estimate."""
+
+    @staticmethod
+    def _est_dict(**overrides: object) -> dict:
+        base = {
+            "estimate": True,
+            "agent_name": "demo",
+            "model": "openai/gpt-4o-mini-2024-07-18",
+            "predicted": {
+                "tokens_in": 1240,
+                "tokens_out_max": 512,
+                "tokens_out_expected": 180,
+                "cost_usd_min": 0.0008,
+                "cost_usd_expected": 0.0021,
+                "cost_usd_max": 0.0034,
+                "latency_ms_p50": 850,
+                "latency_ms_p95": 2100,
+            },
+            "basis": {
+                "prompt_tokens_method": "assembled+tiktoken",
+                "out_expected_method": "historical_mean",
+                "latency_method": "historical_p50p95",
+                "sample_size": 142,
+            },
+            "budget_check": {"within_per_run_budget": True, "per_run_budget_usd": 0.5},
+            "retrieval_embedded": False,
+            "notes": [],
+        }
+        base.update(overrides)  # type: ignore[arg-type]
+        return base
+
+    @pytest.mark.unit
+    def test_text_render_shows_table_and_no_run_notice(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from movate.cli._output import Run
+        from movate.cli.run import _render_estimate
+
+        _render_estimate(est_dict=self._est_dict(), output_format=Run.TEXT)
+        out = capsys.readouterr()
+        # Table (stdout) carries the agent + a token figure.
+        assert "demo" in out.out
+        assert "1240" in out.out
+        # The "no run executed" notice + greppable summary land on stderr.
+        assert "NO run executed" in out.err
+        assert "mdk_estimate_summary:" in out.err
+        assert "executed=false" in out.err
+
+    @pytest.mark.unit
+    def test_json_render_dumps_estimate(self, capsys: pytest.CaptureFixture[str]) -> None:
+        import json
+
+        from movate.cli._output import Run
+        from movate.cli.run import _render_estimate
+
+        _render_estimate(est_dict=self._est_dict(), output_format=Run.JSON)
+        out = capsys.readouterr()
+        parsed = json.loads(out.out)
+        assert parsed["estimate"] is True
+        assert parsed["predicted"]["tokens_in"] == 1240
+        assert "mdk_estimate_summary:" in out.err
+
+    @pytest.mark.unit
+    def test_text_render_flags_over_budget(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from movate.cli._output import Run
+        from movate.cli.run import _render_estimate
+
+        est = self._est_dict(
+            budget_check={"within_per_run_budget": False, "per_run_budget_usd": 0.001}
+        )
+        _render_estimate(est_dict=est, output_format=Run.TEXT)
+        out = capsys.readouterr()
+        assert "OVER" in out.out
+
+
+@pytest.mark.unit
+def test_run_estimate_local_end_to_end(
+    tmp_path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`mdk run <agent-dir> --estimate "<input>"` predicts without executing.
+
+    Uses an isolated SQLite DB (MOVATE_DB) so the estimate's historical
+    query has no prior runs — exercising the fallback path through the real
+    CLI dispatch + renderer."""
+    from typer.testing import CliRunner
+
+    from movate.cli.main import app as cli_app
+    from movate.testing import scaffold_agent
+
+    monkeypatch.setenv("MOVATE_DB", str(tmp_path / "local.db"))
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+
+    runner = CliRunner(mix_stderr=False)
+    result = runner.invoke(
+        cli_app,
+        ["run", str(agent_dir), "hello there", "--estimate", "--output", "json"],
+    )
+    assert result.exit_code == 0, result.stderr
+    import json
+
+    body = json.loads(result.stdout)
+    assert body["estimate"] is True
+    assert body["agent_name"] == "demo"
+    assert body["predicted"]["tokens_in"] > 0
+    # No history in the isolated DB → the fallback path, and crucially the
+    # command exits 0 having executed nothing (no run_id is ever minted).
+    assert body["basis"]["sample_size"] == 0
+    assert "run_id" not in body

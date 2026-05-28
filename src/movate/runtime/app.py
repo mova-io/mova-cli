@@ -201,6 +201,7 @@ from movate.runtime.schemas import (
     ReadyView,
     ReportView,
     RunAccepted,
+    RunEstimateView,
     RunExplainLlmCallView,
     RunExplainView,
     RunSubmission,
@@ -3498,9 +3499,10 @@ def build_app(
     @v1.post(
         "/agents/{name}/runs",
         # Union response: 202 + RunAccepted in async mode (default);
-        # 200 + RunView when ?wait=true. FastAPI auto-generates a
+        # 200 + RunView when ?wait=true; 200 + RunEstimateView when
+        # ?estimate=true (NO run executed). FastAPI auto-generates a
         # oneOf in OpenAPI so the Angular client can branch.
-        response_model=RunAccepted | RunView,
+        response_model=RunAccepted | RunView | RunEstimateView,
         tags=["agents-v1"],
         dependencies=[_scope("run")],
     )
@@ -3511,8 +3513,10 @@ def build_app(
         response: Response,
         ctx: AuthContext = Depends(auth_dep),
         wait: bool = False,
-    ) -> RunAccepted | RunView:
-        """Run an agent. Two modes:
+        estimate: bool = False,
+        estimate_retrieval: bool = False,
+    ) -> RunAccepted | RunView | RunEstimateView:
+        """Run an agent. Three modes:
 
         * **Default (?wait=false):** queue a job for the worker pool
           to claim. Returns 202 + ``{job_id, status: queued}``. Angular
@@ -3526,6 +3530,17 @@ def build_app(
           end-to-end. Trade-off: the request blocks for the full
           agent duration (typically a few seconds for one LLM call;
           can be longer with tool-use loops).
+
+        * **Estimate mode (?estimate=true):** return a pre-flight cost +
+          latency ``RunEstimateView`` (200) and execute NOTHING — no LLM
+          call, no job enqueued, no charge. The estimate reflects THIS
+          agent's real assembled prompt + real historical runs (see
+          :mod:`movate.core.run_estimator`). For a RAG agent, retrieved-
+          chunk tokens are folded in only when ``?estimate_retrieval=true``
+          (an embedding for the retrieval query — small cost; OFF by
+          default to keep the estimate zero-LLM-cost). ``estimate`` takes
+          precedence over ``wait`` — the body is the same as a normal run.
+          Gated on the same ``run`` scope as a real run.
 
         URL-anchored variant of ``POST /run`` — the agent name comes
         from the path, ``kind=AGENT`` is implicit. REST-clean for
@@ -3566,6 +3581,41 @@ def build_app(
         )
         if bundle is None:
             raise not_found("agent", name)
+
+        if estimate:
+            # Estimate mode — return a pre-flight cost + latency prediction
+            # and execute NOTHING. This branch MUST come before the wait /
+            # async paths so it never enqueues a job, never builds a
+            # provider that completes, never persists a run, never charges.
+            # The estimator may embed for RAG retrieval ONLY when
+            # estimate_retrieval=true (and the agent uses auto-retrieval);
+            # to support that we build an Executor purely as a retrieval
+            # seam (no .execute() is ever called).
+            from movate.core.executor import Executor  # noqa: PLC0415
+            from movate.core.run_estimator import estimate_run  # noqa: PLC0415
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+            from movate.tracing import build_tracer  # noqa: PLC0415
+
+            retrieval_executor: Executor | None = None
+            if estimate_retrieval and bundle.spec.retrieval.auto_retrieval_enabled:
+                retrieval_executor = Executor(
+                    provider=LiteLLMProvider(),
+                    pricing=load_pricing(),
+                    storage=store,
+                    tracer=build_tracer(),
+                    tenant_id=ctx.tenant_id,
+                )
+            est = await estimate_run(
+                bundle,
+                body.input,
+                storage=store,
+                tenant_id=ctx.tenant_id,
+                executor=retrieval_executor,
+                estimate_retrieval=estimate_retrieval,
+            )
+            response.status_code = 200
+            return RunEstimateView.from_estimate(est)
 
         if wait:
             # Inline mode — same Executor stack the worker uses.
