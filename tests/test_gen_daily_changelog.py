@@ -141,6 +141,124 @@ def test_render_block_author_fallbacks() -> None:
 
 
 # ---------------------------------------------------------------------------
+# render_issue_comment — tracking-issue comment body (marker + grouped bullets)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_issue_comment_starts_with_per_date_marker() -> None:
+    body = gen.render_issue_comment(SAMPLE_PRS, "2026-05-26")
+    # The hidden per-date marker MUST be the very first line — the workflow's
+    # idempotency check greps for it, and it's the comment's leading content.
+    assert body.startswith("<!-- changelog:2026-05-26 -->\n")
+    assert gen.changelog_marker("2026-05-26") == "<!-- changelog:2026-05-26 -->"
+
+
+@pytest.mark.unit
+def test_issue_comment_marker_tracks_the_date() -> None:
+    assert "<!-- changelog:2026-01-02 -->" in gen.render_issue_comment(SAMPLE_PRS, "2026-01-02")
+    assert "<!-- changelog:2026-05-26 -->" not in gen.render_issue_comment(SAMPLE_PRS, "2026-01-02")
+
+
+@pytest.mark.unit
+def test_issue_comment_has_heading_and_grouped_bullets() -> None:
+    body = gen.render_issue_comment(SAMPLE_PRS, "2026-05-26")
+    assert "### What shipped — 2026-05-26" in body
+    # Same per-PR bullet shape as README mode (shared helper).
+    assert "- feat(kb): graph retrieval (#501) @alice" in body
+    assert "- fix(runtime): worker leak (#498) @bob" in body
+    # Bucket headers present and in canonical order.
+    headers = [line for line in body.splitlines() if line.startswith("**")]
+    assert headers == ["**Features**", "**Fixes**", "**Docs**", "**Chores**", "**Other**"]
+
+
+@pytest.mark.unit
+def test_issue_comment_matches_readme_bullets() -> None:
+    # The shared helper means issue-mode bullets are identical to README-mode
+    # bullets — no duplicated formatting (CLAUDE.md rule 4).
+    issue_body = gen.render_issue_comment(SAMPLE_PRS, "2026-05-26")
+    readme_block = gen.render_block(SAMPLE_PRS, "2026-05-26")
+    bullets = [line for line in readme_block.splitlines() if line.startswith("- ")]
+    assert bullets  # sanity
+    for bullet in bullets:
+        assert bullet in issue_body
+
+
+@pytest.mark.unit
+def test_issue_comment_is_deterministic() -> None:
+    # PRs in a different order render byte-for-byte identically (sorted within
+    # bucket) — so re-runs don't churn the posted comment.
+    shuffled = list(reversed(SAMPLE_PRS))
+    assert gen.render_issue_comment(SAMPLE_PRS, "2026-05-26") == gen.render_issue_comment(
+        shuffled, "2026-05-26"
+    )
+
+
+@pytest.mark.unit
+def test_issue_comment_empty_day_is_safe() -> None:
+    body = gen.render_issue_comment([], "2026-05-26")
+    # Still well-formed: marker + heading + a clear "nothing" note, no bullets.
+    assert body.startswith("<!-- changelog:2026-05-26 -->\n")
+    assert "### What shipped — 2026-05-26" in body
+    assert "Nothing merged" in body
+    # No PR bullets on a quiet day.
+    assert not any(line.startswith("- ") for line in body.splitlines())
+
+
+@pytest.mark.unit
+def test_main_issue_mode_writes_marker_to_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prs_file = tmp_path / "prs.json"
+    prs_file.write_text(json.dumps(SAMPLE_PRS))
+
+    rc = gen.main(["--format", "issue", "--date", "2026-05-26", "--prs-file", str(prs_file)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("<!-- changelog:2026-05-26 -->\n")
+    assert "### What shipped — 2026-05-26" in out
+    assert "- feat(kb): graph retrieval (#501) @alice" in out
+
+
+@pytest.mark.unit
+def test_main_issue_mode_does_not_touch_readme(tmp_path: Path) -> None:
+    # Issue mode is pure-to-stdout: the README on disk is never modified.
+    readme = tmp_path / "README.md"
+    readme.write_text(INTRO_ONLY_README)
+    prs_file = tmp_path / "prs.json"
+    prs_file.write_text(json.dumps(SAMPLE_PRS))
+
+    rc = gen.main(
+        [
+            "--format",
+            "issue",
+            "--date",
+            "2026-05-26",
+            "--readme",
+            str(readme),
+            "--prs-file",
+            str(prs_file),
+        ]
+    )
+    assert rc == 0
+    assert readme.read_text() == INTRO_ONLY_README
+
+
+@pytest.mark.unit
+def test_main_issue_mode_empty_array_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prs_file = tmp_path / "prs.json"
+    prs_file.write_text("[]")
+
+    rc = gen.main(["--format", "issue", "--date", "2026-05-26", "--prs-file", str(prs_file)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("<!-- changelog:2026-05-26 -->\n")
+    assert "Nothing merged" in out
+
+
+# ---------------------------------------------------------------------------
 # insert_block — section creation + prepend + idempotency
 # ---------------------------------------------------------------------------
 

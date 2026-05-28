@@ -1,47 +1,65 @@
-"""Generate the daily "What's New" digest and prepend it to ``README.md``.
+"""Generate the daily "What's New" digest from merged-PR records.
 
 This is the pure, hermetic core behind the ``daily-changelog`` GitHub Action.
-It takes a list of *already-fetched* merged-PR records and renders a dated
-markdown block into a ``## What's New`` section at the top of the README — so
-github.com/mova-io/mova-cli/tree/main shows yesterday's shipped features.
+It takes a list of *already-fetched* merged-PR records and renders a dated,
+grouped markdown digest. Two output modes share the same per-PR formatting:
+
+* ``--format issue`` (current workflow path): write the digest to **stdout** so
+  the workflow can post it as a comment on a single pinned "What's New" tracking
+  Issue. The block starts with a hidden per-date marker
+  ``<!-- changelog:YYYY-MM-DD -->`` so the workflow can detect (and skip) a
+  date already posted — making re-dispatch idempotent. See the issue-mode design
+  note below for *why* this replaced the old README-on-main approach.
+* ``--format readme`` (default, legacy): prepend the dated block into a
+  ``## What's New`` section at the top of the README in place. Kept for
+  backward-compat and the existing unit tests.
 
 Design — **network stays out of here.** The list of merged PRs is fetched in
 the workflow (``gh pr list ... --json number,title,author,mergedAt``) and piped
 in via stdin (or ``--prs-file``). This module never calls ``gh`` or the network,
-so the whole render+insert pipeline is unit-testable against fixtures and the
-tests are hermetic (CLAUDE.md rule 9, and the "keep network OUT of the
-unit-testable core" constraint).
+so the whole render pipeline is unit-testable against fixtures and the tests are
+hermetic (CLAUDE.md rule 9, and the "keep network OUT of the unit-testable core"
+constraint).
 
-Behavior contract:
+Why the issue-comment mode exists (the no-credential path): the mova-io org
+forbids fine-grained PATs and has "Allow GitHub Actions to create and approve
+pull requests" turned OFF, and ``main`` requires status checks — so neither a
+PAT nor the built-in ``GITHUB_TOKEN`` can land a README change on ``main`` via a
+PR. Posting each day's digest as a comment on a pinned tracking Issue needs only
+``GITHUB_TOKEN`` with ``issues: write`` — zero extra credentials.
+
+Behavior contract (shared by both modes):
 
 * **Group by conventional-commit prefix.** The PR title's ``feat:`` / ``fix:`` /
   ``docs:`` / ``chore:`` prefix decides the bucket; anything else falls into
   "other". Buckets render in a fixed order (feat, fix, docs, chore, other) and
   empty buckets are omitted.
-* **Newest date first.** The dated block (``### YYYY-MM-DD``) is inserted at the
-  *top* of the ``## What's New`` section, just under the heading, so the most
-  recent day is always first.
-* **Idempotent.** Re-running for a date already present in the section is a
-  no-op (the file is not rewritten) — safe to retry a failed workflow run.
-* **Section auto-created.** If ``## What's New`` is absent, it's inserted just
-  under the title/intro (before the first other ``##`` heading), so the very
-  first run bootstraps the section.
-* **Empty day skips cleanly.** An empty PR list writes nothing and exits 0 with
-  a clear "nothing merged" message — a quiet day is not an error.
+* **Deterministic.** PRs are sorted by number within each bucket, so the same
+  input always renders byte-for-byte identical output.
+* **Empty day skips cleanly.** An empty PR list renders nothing and the workflow
+  skips posting — a quiet day is not an error.
+
+README mode adds:
+
+* **Newest date first / idempotent / section auto-created.** The dated block is
+  inserted at the top of ``## What's New`` (created under the intro if absent);
+  re-running for a date already present is a no-op.
 
 CLI (runnable + testable)::
 
+    # Issue mode (current workflow): digest to stdout, redirected to a file.
     gh pr list --state merged \\
-      --search "merged:>=2026-05-26..2026-05-27" \\
+      --search "merged:2026-05-26..2026-05-27" \\
       --json number,title,author,mergedAt \\
-      | python scripts/gen_daily_changelog.py --date 2026-05-26
+      | python scripts/gen_daily_changelog.py --format issue --date 2026-05-26
 
+    # README mode (legacy): edit README.md in place.
     python scripts/gen_daily_changelog.py --date 2026-05-26 --prs-file prs.json
 
 ``--date`` defaults to *yesterday* (UTC); ``--readme`` defaults to ``README.md``
-relative to the repo root. ``--repo`` is accepted (and recorded for context /
-parity with the workflow invocation) but the PR data is always injected, never
-fetched here.
+relative to the repo root (README mode only). ``--repo`` is accepted (and
+recorded for context / parity with the workflow invocation) but the PR data is
+always injected, never fetched here.
 """
 
 from __future__ import annotations
@@ -144,20 +162,22 @@ def _normalize_pr(record: object) -> _PR:
     )
 
 
-def render_block(prs: Iterable[object], date: str) -> str:
-    """Render the dated digest block for ``date`` from merged-PR records.
+def _grouped_bullets(prs: Iterable[object]) -> list[str]:
+    """Render the grouped per-type bullet lines for ``prs`` (no date heading).
 
-    Returns markdown beginning ``### <date>`` followed by per-type grouped
-    bullets (``- <title> (#<num>) @author``), buckets in ``_BUCKET_ORDER``,
-    empty buckets omitted. PRs are sorted by number within each bucket for a
-    stable, deterministic block.
+    Shared by both output modes (README block + issue comment) so the per-PR
+    formatting lives in exactly one place. Returns lines: per-bucket
+    ``**Label**`` headers (in ``_BUCKET_ORDER``, empty buckets omitted) followed
+    by ``- <title> (#<num>) @author`` bullets, separated by blank lines. PRs are
+    sorted by number within each bucket for deterministic output. Any trailing
+    blank line is dropped so the caller controls spacing.
     """
     normalized = [_normalize_pr(p) for p in prs]
     buckets: dict[str, list[_PR]] = {b: [] for b in _BUCKET_ORDER}
     for pr in normalized:
         buckets[classify(pr["title"])].append(pr)
 
-    lines: list[str] = [f"### {date}", ""]
+    lines: list[str] = []
     for bucket in _BUCKET_ORDER:
         items = sorted(buckets[bucket], key=lambda p: p["number"])
         if not items:
@@ -167,10 +187,53 @@ def render_block(prs: Iterable[object], date: str) -> str:
         for pr in items:
             lines.append(f"- {pr['title']} (#{pr['number']}) @{pr['author']}")
         lines.append("")
-    # Drop the trailing blank so insertion spacing is controlled by the caller.
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def render_block(prs: Iterable[object], date: str) -> str:
+    """Render the dated README digest block for ``date`` from merged-PR records.
+
+    Returns markdown beginning ``### <date>`` followed by per-type grouped
+    bullets (``- <title> (#<num>) @author``), buckets in ``_BUCKET_ORDER``,
+    empty buckets omitted. PRs are sorted by number within each bucket for a
+    stable, deterministic block.
+    """
+    lines: list[str] = [f"### {date}", "", *_grouped_bullets(prs)]
     while lines and lines[-1] == "":
         lines.pop()
     return "\n".join(lines)
+
+
+def changelog_marker(date: str) -> str:
+    """The hidden per-date marker line for issue-mode idempotency.
+
+    The workflow checks existing issue comments for this exact line and skips
+    posting if a comment for ``date`` already exists, so re-dispatching the same
+    date never double-posts.
+    """
+    return f"<!-- changelog:{date} -->"
+
+
+def render_issue_comment(prs: Iterable[object], date: str) -> str:
+    """Render the digest as an issue-comment body for ``date``.
+
+    Begins with the hidden ``<!-- changelog:DATE -->`` marker (the idempotency
+    key the workflow matches on), then a ``### What shipped — DATE`` heading and
+    the same grouped per-PR bullets as the README mode. An empty PR list yields
+    just the marker + heading + a "nothing merged" note; the workflow guards on
+    the ``changed`` output so this is normally not posted, but it stays safe.
+    """
+    lines: list[str] = [changelog_marker(date), "", f"### What shipped — {date}", ""]
+    bullets = _grouped_bullets(prs)
+    if bullets:
+        lines.extend(bullets)
+    else:
+        lines.append("_Nothing merged this day._")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
 
 
 def _find_section_bounds(lines: list[str]) -> tuple[int, int] | None:
@@ -312,6 +375,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
+        "--format",
+        choices=("readme", "issue"),
+        default="readme",
+        help=(
+            "Output mode. 'readme' (default): prepend the dated block into "
+            "README.md in place. 'issue': write the digest (with a hidden "
+            "per-date marker) to stdout for posting as a tracking-issue comment."
+        ),
+    )
+    parser.add_argument(
         "--date",
         default=_yesterday_utc(),
         help="Digest date (YYYY-MM-DD). Default: yesterday (UTC).",
@@ -319,7 +392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--readme",
         default=str(DEFAULT_README),
-        help="Path to the README to update. Default: repo-root README.md.",
+        help="Path to the README to update (readme mode). Default: repo-root README.md.",
     )
     parser.add_argument(
         "--repo",
@@ -335,7 +408,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         prs = _load_prs(args.prs_file)
-        run(prs=prs, date=args.date, readme=Path(args.readme), repo=args.repo)
+        if args.format == "issue":
+            # Pure render to stdout — the workflow redirects it to a file and
+            # posts it as a tracking-issue comment. No file is touched here.
+            sys.stdout.write(render_issue_comment(prs, args.date))
+        else:
+            run(prs=prs, date=args.date, readme=Path(args.readme), repo=args.repo)
     except (ChangelogError, json.JSONDecodeError) as exc:
         print(f"daily-changelog: error — {exc}", file=sys.stderr)
         return 1
