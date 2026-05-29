@@ -659,6 +659,52 @@ rule 5).
 
 ---
 
+## Prioritized provider integrations
+
+D3 lists candidate STT/TTS/realtime providers without committing to an order;
+this section records which ones we actually build, when, and why. The seam (D3)
+makes every provider swappable, so this is a *prioritization*, not a lock-in —
+it picks where the first implementation effort goes.
+
+**Prioritization criteria (in order):**
+
+1. **Data-sovereignty fit.** Audio is sensitive. A provider must route audio
+   only to the customer's chosen endpoint with keys in the customer's Key Vault
+   (D6) — which favors Azure-native or self-hostable providers that live inside
+   the tenant's own cloud over ones that force audio out to a third party.
+2. **Streaming latency.** Voice UX dies without low latency; a streaming-first
+   provider with a low latency floor beats a batch-oriented one (D7/D8).
+3. **Onboarding friction.** A provider the customer already pays for or already
+   has in Azure beats a marginally better one that requires fresh procurement.
+4. **Quality.** Naturalness matters most for customer-facing brand voices, and
+   much less for internal task agents — so it ranks last, behind sovereignty,
+   latency, and friction.
+
+**Tiered integration plan:**
+
+| Tier | STT | TTS | Rationale |
+|---|---|---|---|
+| **T1 — "wow" pair (Phase 1)** | Deepgram | Cartesia (Sonic) | Both streaming-first with the lowest latency floor; the snappy, interruptible demo pair. |
+| **T1 — enterprise/sovereignty pair (Phase 1)** | Azure Speech | Azure Neural TTS | One provider covers both, lives in the customer's own Azure subscription, BYOK→Key Vault maps cleanly, strong compliance + broad language coverage; the likely default for real customer deployments. |
+| **T2 — low-friction default** | OpenAI Whisper | OpenAI TTS | Most customers already hold the key (zero procurement); latency not best-in-class, so it's the on-ramp, not the demo star. |
+| **T2 — premium voice** | — | ElevenLabs | Best naturalness for customer-facing brand voices; premium-priced → opt-in per agent, not a default. |
+| **T3 — realtime (Phase 2)** | OpenAI Realtime + Azure OpenAI Realtime (sovereignty-preserving); Gemini Live as fast-follow | (full-duplex voice↔voice, D2b) | Lowest latency floor for new voice-native agents; Azure OpenAI Realtime keeps the sovereignty story intact. |
+| **Telephony (Phase 3)** | Twilio (enterprise ubiquity) + LiveKit (open-source, self-hostable WebRTC — sovereignty-friendly) | (same, over the D4 telephony bridge) | Twilio for enterprise reach; LiveKit for a self-hostable, sovereignty-friendly transport. |
+
+**Concrete recommendation.** Phase 1 builds exactly **two** pairs —
+**Deepgram + Cartesia** (the wow demo) and **Azure Speech + Azure Neural** (the
+enterprise default customers ship on). One pair to impress, one to deploy;
+together they also validate the `SpeechToTextProvider`/`TextToSpeechProvider`
+seams against two very different provider shapes — a streaming specialist vs. an
+Azure-native suite — which is the real test that the adapter abstraction is
+right. Defer OpenAI (T2 default) and ElevenLabs (T2 premium) to fast-follows.
+
+**Caveat.** The voice-provider landscape moves quickly; treat the
+*tiering/criteria* as durable and re-confirm exact latency/pricing/feature
+specifics at build time.
+
+---
+
 ## Cross-references / composition notes
 
 ### Reusing ADR 045 D10 (Sessions) as voice memory
