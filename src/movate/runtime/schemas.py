@@ -350,6 +350,97 @@ class ReadyView(BaseModel):
     wipes the ApiKeyRecord table → operators lose their saved keys."""
 
 
+class CapabilityModelsView(BaseModel):
+    """The ``models`` block of :class:`CapabilitiesView`.
+
+    Describes which providers/models this runtime can reach. ``available``
+    is the catalog the runtime already knows (the same source ``mdk models``
+    /``GET /api/v1/models`` use); ``byok_configured`` lists the provider
+    NAMES the calling tenant has brought a key for — never the key values
+    (ADR 018). ``default`` is the runtime's fleet-default model id, or
+    ``None`` when none is configured.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: list[str]
+    """Every model id the catalog knows (``provider/model``), sorted."""
+    default: str | None = None
+    """The fleet-default model id, or ``None`` if unconfigured."""
+    byok_configured: list[str]
+    """Provider NAMES (e.g. ``["openai", "anthropic"]``) the calling tenant
+    has a stored BYOK key for. Names ONLY — the encrypted key value is never
+    surfaced. Empty when no per-tenant key store / no tenant keys."""
+
+
+class CapabilityLimitsView(BaseModel):
+    """The ``limits`` block of :class:`CapabilitiesView`.
+
+    This tenant's effective operational limits, derived from the runtime's
+    actual rate-limit + batch config (not a hardcoded guess). A field is
+    ``None`` when the corresponding limit is OFF/uncapped in this deploy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rate_limit_per_min: int | None = None
+    """Per-API-key request ceiling per minute, or ``None`` when rate
+    limiting is disabled for this runtime."""
+    tenant_rate_limit_per_min: int | None = None
+    """Per-tenant aggregate request ceiling per minute (item 25), or
+    ``None`` when the per-tenant limiter is OFF (the default)."""
+    max_batch_size: int
+    """Max rows accepted by ``POST /api/v1/agents/{name}/batch`` — the
+    server-enforced ``MDK_BATCH_MAX_ROWS`` cap."""
+
+
+class CapabilitiesView(BaseModel):
+    """``GET /api/v1/capabilities`` response — the runtime's self-description.
+
+    A read-only matrix letting a client (e.g. Mova iO talking to many
+    heterogeneous customer runtimes) learn exactly what THIS runtime version
+    supports, without trial-and-error against every endpoint. Every field is
+    derived from the *deployed* runtime (route introspection / import probing
+    / live config), never a static promise.
+
+    Two views:
+
+    * **Authenticated (``read`` scope)** — the full matrix below.
+    * **Unauthenticated** — a minimal subset (``mdk_version`` + ``api_version``,
+      with the rest ``None``/empty) for health/probe use, so an orchestrator
+      can fingerprint a runtime version before holding a key for it.
+
+    The ``minimal`` flag tells a client which view it received.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mdk_version: str
+    """``movate.__version__`` (CalVer) — the exact build serving this."""
+    api_version: str
+    """The runtime API version this matrix describes (``"v1"``)."""
+    served_at: datetime
+    """UTC timestamp the response was produced."""
+    minimal: bool = False
+    """``True`` for the unauthenticated subset (only ``mdk_version`` +
+    ``api_version`` populated); ``False`` for the full ``read``-scoped view."""
+
+    models: CapabilityModelsView | None = None
+    """Reachable models / providers. ``None`` in the minimal view."""
+    features: dict[str, bool] | None = None
+    """Capability flags the client can branch on. Each is detected from the
+    deployed code (route registered / module importable), NOT hardcoded.
+    ``None`` in the minimal view."""
+    scopes_supported: list[str] | None = None
+    """The runtime's authorization-scope vocabulary. ``None`` in the
+    minimal view."""
+    limits: CapabilityLimitsView | None = None
+    """This tenant's effective limits. ``None`` in the minimal view."""
+    extras_installed: list[str] | None = None
+    """Optional ``pyproject`` extras importable in this image (marker-module
+    probe). ``None`` in the minimal view."""
+
+
 class AgentView(BaseModel):
     """One entry in the registry response.
 

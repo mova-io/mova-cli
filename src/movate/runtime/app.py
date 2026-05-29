@@ -29,7 +29,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 from uuid import uuid4
 
 import yaml
@@ -40,6 +40,7 @@ from fastapi import (
     FastAPI,
     File,
     Header,
+    HTTPException,
     Query,
     Request,
     Response,
@@ -54,6 +55,7 @@ from movate.core.auth import (
     KEY_DEFAULT_ROTATION_GRACE_SECONDS,
     KEY_DEFAULT_TTL_DAYS,
     LEGACY_DEFAULT_SCOPES,
+    SCOPE_READ,
     mint_api_key,
     rotate_key_record,
 )
@@ -229,6 +231,7 @@ from movate.runtime.schemas import (
     CanarySetRequest,
     CanarySideView,
     CanaryView,
+    CapabilitiesView,
     CatalogEntryDetailView,
     CatalogEntryListResponse,
     CatalogEntryVersionView,
@@ -3425,6 +3428,14 @@ def build_app(
     else:
         limiter = InProcessRateLimiter(limit_per_minute=rate_limit_per_minute)
     app.state.rate_limiter = limiter
+    # Resolved per-key ceiling surfaced by GET /api/v1/capabilities. Stash
+    # the int (or None when disabled) so the capability builder reports the
+    # ACTUAL effective limit without reaching into limiter internals.
+    app.state.capability_rate_limit_per_min = (
+        rate_limit_per_minute
+        if rate_limit_per_minute is not None and rate_limit_per_minute > 0
+        else None
+    )
 
     # Per-tenant aggregate rate limiter (item 25) — a SECOND bucket keyed
     # by tenant_id, capping total throughput across all of a tenant's
@@ -3439,6 +3450,11 @@ def build_app(
     else:
         tenant_limiter = InProcessRateLimiter(limit_per_minute=tenant_limit)
     app.state.tenant_rate_limiter = tenant_limiter
+    # Resolved per-tenant aggregate ceiling for GET /api/v1/capabilities.
+    # None when the per-tenant limiter is OFF (the default).
+    app.state.capability_tenant_rate_limit_per_min = (
+        tenant_limit if tenant_limit is not None and tenant_limit > 0 else None
+    )
 
     # Build the LLM response cache once at app construction so entries
     # persist across requests within this replica (mirrors the rate
@@ -9699,6 +9715,83 @@ def build_app(
         if info is None:
             raise not_found("model", model_id)
         return _model_info_to_view(info)
+
+    # ------------------------------------------------------------------
+    # Capability discovery — GET /api/v1/capabilities
+    #
+    # A read-only self-description so a client (e.g. Mova iO fanning out to
+    # many heterogeneous customer runtimes) can learn exactly what THIS
+    # build supports without probing every endpoint. The full matrix needs
+    # the ``read`` scope; an UNAUTHENTICATED minimal subset (version +
+    # api_version only) is allowed for health/probe use.
+    #
+    # Auth is resolved INLINE rather than via the ``_scope("read")``
+    # dependency: that dependency hard-401s a missing bearer, but here a
+    # missing/insufficient bearer must DEGRADE to the minimal view, not
+    # fail. So: no Authorization header → minimal immediately (no storage /
+    # rate-limit touch); a header present → resolve it through ``auth_dep``
+    # (which charges the limiter, as for any authenticated call) and, if it
+    # carries ``read``, serve the full matrix — else fall back to minimal.
+    #
+    # Every field in the full view is derived from the deployed runtime
+    # (route introspection / import probing / live config) by
+    # movate.runtime.capabilities — see that module + the contract test.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/capabilities",
+        response_model=CapabilitiesView,
+        tags=["meta-v1"],
+    )
+    async def v1_capabilities(
+        request: Request,
+        response: Response,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> CapabilitiesView:
+        """Describe what THIS runtime version supports (read-only).
+
+        Returns a capability matrix — reachable models, feature flags
+        (detected from the live route table / importable modules, never a
+        static dict), the scope vocabulary, this tenant's effective limits,
+        and the installed optional extras.
+
+        Auth:
+
+        * **No / bad bearer** → a minimal subset (``mdk_version`` +
+          ``api_version``, ``minimal: true``) for version-fingerprint /
+          probe use. Never 401s.
+        * **Valid bearer with the ``read`` scope** → the full matrix.
+        * **Valid bearer without ``read``** → the minimal subset (the
+          richer fields stay gated, but the caller still gets a usable
+          probe rather than a 403).
+
+        BYOK providers are reported by NAME only — the encrypted key value
+        is never read or surfaced.
+        """
+        from movate.runtime.capabilities import (  # noqa: PLC0415
+            build_capabilities,
+            minimal_capabilities,
+        )
+
+        # No bearer at all → cheap, unauthenticated minimal probe. Don't
+        # touch storage or the rate limiter.
+        if authorization is None:
+            return minimal_capabilities()
+
+        # A bearer is present — resolve it. Any auth failure (bad scheme,
+        # expired/unknown key, rate-limited) degrades to the minimal view
+        # rather than erroring: discovery should stay usable for a probe.
+        try:
+            ctx = await auth_dep(response=response, authorization=authorization)
+        except HTTPException:
+            return minimal_capabilities()
+
+        # Authenticated but lacking ``read`` → minimal (the richer fields
+        # are read-scoped; we don't 403 a discovery probe).
+        if SCOPE_READ not in ctx.scopes:
+            return minimal_capabilities()
+
+        return await build_capabilities(request.app, ctx)
 
     # ------------------------------------------------------------------
     # Run explain (BACKLOG #66) — read-only mirror of ``mdk explain``.
