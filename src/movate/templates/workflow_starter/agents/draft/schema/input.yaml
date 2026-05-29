@@ -1,0 +1,20 @@
+# ============================================================================
+# Draft node — input schema
+# ============================================================================
+# The draft node reads `topic` from the workflow state; the workflow runner
+# projects the workflow state onto this schema before calling the agent.
+
+version: 1
+type: object
+
+title: Draft Node Input
+
+fields:
+
+  topic:
+    type: string
+    description: The subject to draft about.
+    example: The case for spending more time outdoors.
+
+required:
+  - topic

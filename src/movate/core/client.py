@@ -18,21 +18,48 @@ from typing import Any
 
 import httpx
 
-from movate.core.models import JobKind, JobStatus, WorkflowStatus
+from movate.core.models import JobKind, JobStatus, ProjectMemberRole, WorkflowStatus
+from movate.core.webhooks import (
+    WebhookAttemptListView,
+    WebhookCreatedView,
+    WebhookListView,
+    WebhookView,
+)
 from movate.runtime.schemas import (
     AgentListView,
+    AnalyzeAcceptedView,
     BatchAcceptedView,
     BatchListView,
     BatchStatusView,
+    CapabilitiesView,
+    GroundedAnswerView,
     HealthView,
     JobCancelView,
     JobListView,
     JobView,
+    JudgeCommitRequest,
+    JudgeCommitResponse,
+    JudgeGenerateRequest,
+    JudgeGenerateResponse,
+    ObservabilityHealthView,
+    ObservabilityInsightListView,
+    ProjectListResponse,
+    ProjectMemberListView,
+    ProjectMemberView,
+    ProjectView,
     RunAccepted,
     RunSubmission,
     RunView,
+    WorkflowCreateRequest,
+    WorkflowDetailView,
+    WorkflowListResponse,
+    WorkflowPublishedView,
+    WorkflowRevertedView,
+    WorkflowRevertSubmission,
     WorkflowRunListView,
     WorkflowSignalRequest,
+    WorkflowValidationView,
+    WorkflowVersionsView,
 )
 
 
@@ -104,6 +131,23 @@ class MovateClient:
         r = await self._client.get("/agents")
         self._raise_for_status(r)
         return AgentListView.model_validate(r.json())
+
+    async def capabilities(self) -> CapabilitiesView:
+        """``GET /api/v1/capabilities`` — what THIS runtime version supports.
+
+        Read-only self-description: reachable models, feature flags (derived
+        from the deployed route table / importable modules), the scope
+        vocabulary, this tenant's effective limits, and installed extras.
+
+        Sends the bearer (so a ``read``-scoped key gets the full matrix); a
+        keyless/under-scoped caller gets the minimal subset (``minimal:
+        true``) rather than a 401/403 — the endpoint is probe-friendly. We
+        still ``_raise_for_status`` to surface a genuine 5xx / transport
+        error, but the auth-degradation path returns 200.
+        """
+        r = await self._client.get("/api/v1/capabilities")
+        self._raise_for_status(r)
+        return CapabilitiesView.model_validate(r.json())
 
     async def submit_job(
         self,
@@ -178,6 +222,93 @@ class MovateClient:
         r = await self._client.get(f"/runs/{run_id}")
         self._raise_for_status(r)
         return RunView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Observability Intelligence (ADR 047)
+    # ------------------------------------------------------------------
+
+    async def observability_insights(
+        self,
+        *,
+        project_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 90,
+    ) -> ObservabilityInsightListView:
+        """``GET /api/v1/observability/insights`` — daily insight feed."""
+        params: dict[str, str | int] = {"limit": limit}
+        if project_id is not None:
+            params["project_id"] = project_id
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
+        r = await self._client.get("/api/v1/observability/insights", params=params)
+        self._raise_for_status(r)
+        return ObservabilityInsightListView.model_validate(r.json())
+
+    async def observability_health(self, *, project_id: str = "default") -> ObservabilityHealthView:
+        """``GET /api/v1/observability/health`` — latest health score + digest."""
+        r = await self._client.get(
+            "/api/v1/observability/health", params={"project_id": project_id}
+        )
+        self._raise_for_status(r)
+        return ObservabilityHealthView.model_validate(r.json())
+
+    async def observability_ask(
+        self,
+        question: str,
+        *,
+        project_id: str = "default",
+        budget_usd: float = 0.05,
+        mock: bool = False,
+    ) -> GroundedAnswerView:
+        """``POST /api/v1/observability/ask`` — grounded NL answer + citations."""
+        body = {
+            "question": question,
+            "project_id": project_id,
+            "budget_usd": budget_usd,
+            "mock": mock,
+        }
+        r = await self._client.post("/api/v1/observability/ask", json=body)
+        self._raise_for_status(r)
+        return GroundedAnswerView.model_validate(r.json())
+
+    async def observability_troubleshoot(
+        self,
+        symptom: str,
+        *,
+        time_window_days: int = 7,
+        project_id: str = "default",
+        budget_usd: float = 0.05,
+        mock: bool = False,
+    ) -> GroundedAnswerView:
+        """``POST /api/v1/observability/troubleshoot`` — root-cause narrative."""
+        body = {
+            "symptom": symptom,
+            "time_window_days": time_window_days,
+            "project_id": project_id,
+            "budget_usd": budget_usd,
+            "mock": mock,
+        }
+        r = await self._client.post("/api/v1/observability/troubleshoot", json=body)
+        self._raise_for_status(r)
+        return GroundedAnswerView.model_validate(r.json())
+
+    async def observability_analyze(
+        self,
+        *,
+        project_id: str = "default",
+        date: str | None = None,
+        budget_usd: float = 0.10,
+    ) -> AnalyzeAcceptedView:
+        """``POST /api/v1/observability/analyze`` — enqueue an analyst run (admin)."""
+        body: dict[str, Any] = {"project_id": project_id, "budget_usd": budget_usd}
+        if date is not None:
+            body["date"] = date
+        r = await self._client.post("/api/v1/observability/analyze", json=body)
+        self._raise_for_status(r)
+        return AnalyzeAcceptedView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Batch inference (item 17)
@@ -290,6 +421,249 @@ class MovateClient:
         return RunAccepted.model_validate(r.json())
 
     # ------------------------------------------------------------------
+    # Projects (ADR 040)
+    # ------------------------------------------------------------------
+
+    async def create_project(
+        self,
+        *,
+        name: str,
+        description: str | None = None,
+        owner_principal_id: str | None = None,
+    ) -> ProjectView:
+        """``POST /api/v1/projects`` — create a project in the tenant."""
+        body: dict[str, Any] = {"name": name}
+        if description is not None:
+            body["description"] = description
+        if owner_principal_id is not None:
+            body["owner_principal_id"] = owner_principal_id
+        r = await self._client.post("/api/v1/projects", json=body)
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def list_projects(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> ProjectListResponse:
+        """``GET /api/v1/projects`` — tenant-scoped, newest-first."""
+        params: dict[str, str | int] = {
+            "include_archived": "true" if include_archived else "false",
+            "limit": limit,
+        }
+        if after_id is not None:
+            params["after_id"] = after_id
+        r = await self._client.get("/api/v1/projects", params=params)
+        self._raise_for_status(r)
+        return ProjectListResponse.model_validate(r.json())
+
+    async def get_project(self, project_id: str) -> ProjectView:
+        """``GET /api/v1/projects/{id}``."""
+        r = await self._client.get(f"/api/v1/projects/{project_id}")
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        if_match: str | None = None,
+    ) -> ProjectView:
+        """``PUT /api/v1/projects/{id}`` — rename / re-describe.
+
+        ``if_match`` opts into optimistic concurrency (412 on stale).
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        headers = {"If-Match": if_match} if if_match else None
+        r = await self._client.put(f"/api/v1/projects/{project_id}", json=body, headers=headers)
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def archive_project(self, project_id: str) -> ProjectView:
+        """``DELETE /api/v1/projects/{id}`` — soft-delete (archive)."""
+        r = await self._client.delete(f"/api/v1/projects/{project_id}")
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def list_project_members(self, project_id: str) -> ProjectMemberListView:
+        """``GET /api/v1/projects/{id}/members``."""
+        r = await self._client.get(f"/api/v1/projects/{project_id}/members")
+        self._raise_for_status(r)
+        return ProjectMemberListView.model_validate(r.json())
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        *,
+        principal_id: str,
+        role: ProjectMemberRole,
+    ) -> ProjectMemberView:
+        """``POST /api/v1/projects/{id}/members``."""
+        r = await self._client.post(
+            f"/api/v1/projects/{project_id}/members",
+            json={"principal_id": principal_id, "role": role.value},
+        )
+        self._raise_for_status(r)
+        return ProjectMemberView.model_validate(r.json())
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> None:
+        """``DELETE /api/v1/projects/{id}/members/{principal_id}``."""
+        r = await self._client.delete(f"/api/v1/projects/{project_id}/members/{principal_id}")
+        self._raise_for_status(r)
+
+    # ------------------------------------------------------------------
+    # Workflow definitions (ADR 037 D1 — workflow API parity)
+    # ------------------------------------------------------------------
+
+    async def list_workflows(
+        self,
+        *,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> WorkflowListResponse:
+        """``GET /api/v1/workflows`` — workflow definitions for this tenant."""
+        params: dict[str, str | int | bool] = {"limit": limit}
+        if published_only:
+            params["published_only"] = "true"
+        r = await self._client.get("/api/v1/workflows", params=params)
+        self._raise_for_status(r)
+        return WorkflowListResponse.model_validate(r.json())
+
+    async def get_workflow(
+        self,
+        name: str,
+        *,
+        version: str | None = None,
+    ) -> WorkflowDetailView:
+        """``GET /api/v1/workflows/{name}`` — spec + bundle metadata."""
+        params: dict[str, str] = {}
+        if version is not None:
+            params["version"] = version
+        r = await self._client.get(f"/api/v1/workflows/{name}", params=params)
+        self._raise_for_status(r)
+        return WorkflowDetailView.model_validate(r.json())
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        limit: int = 50,
+    ) -> WorkflowVersionsView:
+        """``GET /api/v1/workflows/{name}/versions`` — registry version
+        history, newest-first."""
+        r = await self._client.get(f"/api/v1/workflows/{name}/versions", params={"limit": limit})
+        self._raise_for_status(r)
+        return WorkflowVersionsView.model_validate(r.json())
+
+    async def publish_workflow(
+        self,
+        name: str,
+        *,
+        version: str | None = None,
+    ) -> WorkflowPublishedView:
+        """``POST /api/v1/workflows/{name}/publish`` — promote to published.
+
+        ``version=None`` promotes the current latest."""
+        params: dict[str, str] = {}
+        if version is not None:
+            params["version"] = version
+        r = await self._client.post(f"/api/v1/workflows/{name}/publish", params=params)
+        self._raise_for_status(r)
+        return WorkflowPublishedView.model_validate(r.json())
+
+    async def revert_workflow(
+        self,
+        name: str,
+        *,
+        to_version: str,
+    ) -> WorkflowRevertedView:
+        """``POST /api/v1/workflows/{name}/revert`` — non-destructive rollback."""
+        body = WorkflowRevertSubmission(to_version=to_version)
+        r = await self._client.post(
+            f"/api/v1/workflows/{name}/revert", json=body.model_dump(mode="json")
+        )
+        self._raise_for_status(r)
+        return WorkflowRevertedView.model_validate(r.json())
+
+    async def validate_workflow_spec(
+        self,
+        name: str,
+        *,
+        workflow_yaml: str,
+        files: dict[str, str] | None = None,
+    ) -> WorkflowValidationView:
+        """``POST /api/v1/workflows/{name}/validate/from-spec`` — validate a
+        JSON-body workflow without persisting. Drives ``mdk workflow validate``."""
+        body = WorkflowCreateRequest(workflow_yaml=workflow_yaml, files=files or {})
+        r = await self._client.post(
+            f"/api/v1/workflows/{name}/validate/from-spec",
+            json=body.model_dump(mode="json"),
+        )
+        self._raise_for_status(r)
+        return WorkflowValidationView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Judge Engineer — author + commit evals/judge.yaml
+    # ------------------------------------------------------------------
+
+    async def generate_judge(
+        self,
+        agent: str,
+        *,
+        rubric_dimensions: list[str] | None = None,
+        include_examples: bool = True,
+        model: str | None = None,
+        budget_usd: float = 0.10,
+        mock: bool = False,
+    ) -> JudgeGenerateResponse:
+        """``POST /api/v1/agents/{name}/judge/generate``.
+
+        Synchronous (~few seconds). Returns the full generated YAML +
+        the inferred / supplied dimensions + a rationale. Pass
+        ``mock=True`` for the deterministic MockProvider (no API key
+        needed — used by hermetic tests and ``mdk judge generate
+        --mock``).
+        """
+        body = JudgeGenerateRequest(
+            rubric_dimensions=rubric_dimensions,
+            include_examples=include_examples,
+            model=model,
+            budget_usd=budget_usd,
+        )
+        headers = {"X-MDK-Judge-Engineer-Mock": "1"} if mock else None
+        r = await self._client.post(
+            f"/api/v1/agents/{agent}/judge/generate",
+            json=body.model_dump(mode="json", exclude_none=False),
+            headers=headers,
+        )
+        self._raise_for_status(r)
+        return JudgeGenerateResponse.model_validate(r.json())
+
+    async def commit_judge(self, agent: str, *, judge_yaml: str) -> JudgeCommitResponse:
+        """``POST /api/v1/agents/{name}/judge/commit``.
+
+        Persists the supplied ``judge_yaml`` body at
+        ``<agent_dir>/evals/judge.yaml``. Server re-validates the YAML
+        before writing — a malformed body returns 422 without touching
+        disk.
+        """
+        body = JudgeCommitRequest(judge_yaml=judge_yaml)
+        r = await self._client.post(
+            f"/api/v1/agents/{agent}/judge/commit",
+            json=body.model_dump(mode="json"),
+        )
+        self._raise_for_status(r)
+        return JudgeCommitResponse.model_validate(r.json())
+
+    # ------------------------------------------------------------------
     # Convenience: poll until terminal
     # ------------------------------------------------------------------
 
@@ -324,6 +698,84 @@ class MovateClient:
                 )
             await asyncio.sleep(poll_interval_seconds)
             elapsed += poll_interval_seconds
+
+    # ------------------------------------------------------------------
+    # Webhooks (ADR 035 D2 — outbound delivery management)
+    # ------------------------------------------------------------------
+
+    async def create_webhook(
+        self,
+        *,
+        url: str,
+        kind_filter: list[str],
+        enabled: bool = True,
+    ) -> WebhookCreatedView:
+        """``POST /api/v1/webhooks`` — subscribe to lifecycle events.
+
+        Returns the subscription view plus the plaintext signing
+        ``secret`` — surfaced ONCE on creation. Capture it now; it is
+        irrecoverable from any later call. Requires ``admin``.
+        """
+        body = {"url": url, "kind_filter": kind_filter, "enabled": enabled}
+        r = await self._client.post("/api/v1/webhooks", json=body)
+        self._raise_for_status(r)
+        return WebhookCreatedView.model_validate(r.json())
+
+    async def list_webhooks(self, *, include_disabled: bool = True) -> WebhookListView:
+        """``GET /api/v1/webhooks`` — this tenant's webhook subscriptions.
+
+        Carries ``secret_hint`` (last 4 chars) only; never the full
+        secret. Requires ``read``.
+        """
+        params = {"include_disabled": "true" if include_disabled else "false"}
+        r = await self._client.get("/api/v1/webhooks", params=params)
+        self._raise_for_status(r)
+        return WebhookListView.model_validate(r.json())
+
+    async def get_webhook(self, webhook_id: str) -> WebhookView:
+        """``GET /api/v1/webhooks/{id}`` — single subscription view.
+
+        Tenant-scoped: cross-tenant id 404s. Requires ``read``.
+        """
+        r = await self._client.get(f"/api/v1/webhooks/{webhook_id}")
+        self._raise_for_status(r)
+        return WebhookView.model_validate(r.json())
+
+    async def delete_webhook(self, webhook_id: str) -> None:
+        """``DELETE /api/v1/webhooks/{id}`` — remove a subscription.
+
+        Idempotent (204 even on unknown id). Requires ``admin``.
+        """
+        r = await self._client.delete(f"/api/v1/webhooks/{webhook_id}")
+        self._raise_for_status(r)
+
+    async def set_webhook_enabled(self, webhook_id: str, *, enabled: bool) -> WebhookView:
+        """``PATCH /api/v1/webhooks/{id}`` — toggle the enabled flag.
+
+        Returns the post-update view. Requires ``admin``.
+        """
+        r = await self._client.patch(
+            f"/api/v1/webhooks/{webhook_id}",
+            json={"enabled": enabled},
+        )
+        self._raise_for_status(r)
+        return WebhookView.model_validate(r.json())
+
+    async def list_webhook_attempts(
+        self, webhook_id: str, *, limit: int = 100
+    ) -> WebhookAttemptListView:
+        """``GET /api/v1/webhooks/{id}/attempts`` — recent delivery log.
+
+        Newest-first. Each row has ``status_code`` / ``error_kind`` /
+        ``response_excerpt`` (truncated to ~512 chars). Requires
+        ``read``.
+        """
+        r = await self._client.get(
+            f"/api/v1/webhooks/{webhook_id}/attempts",
+            params={"limit": limit},
+        )
+        self._raise_for_status(r)
+        return WebhookAttemptListView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Internal

@@ -8,6 +8,8 @@ render the OTel metrics mdk **already emits** from the runtime/worker edges
 | File | Surface | Source of the data |
 | --- | --- | --- |
 | `grafana/mdk-golden-signals.json` | Grafana dashboard | Prometheus scraping the OTLP → Prometheus stream |
+| `grafana/mdk-exec-summary.json` | Grafana dashboard (executive single-pane) | Prometheus (spend/runs/SLO) + ADR 047 insights API (health/wins/risks, scaffold-with-note) |
+| `grafana/theme/` | Movate palette + reusable panels + TV/kiosk variant | see `grafana/theme/README.md` |
 | `prometheus/mdk-rules.yaml` | Prometheus recording + alerting rules | same Prometheus |
 | `azure/mdk-golden-signals.workbook.json` | Azure Monitor workbook | OTLP → Azure Monitor (App Insights `App*` tables) |
 
@@ -172,6 +174,37 @@ is present).
 The matching Azure-native runbook layer lives in
 `infra/azure-monitor/workbooks/` (four persona-scoped Workbooks: operator,
 platform, eval-and-drift, tenant-ops). See `docs/azure-monitor-workbooks.md`.
+
+## Executive single-pane + the demo "wow pack"
+
+`grafana/mdk-exec-summary.json` is the **one screen leadership looks at** —
+business-framed, not SRE-framed: fleet health, spend-this-period + an
+end-of-period forecast, adoption (runs + week-over-week), top wins / top risks,
+and a Google-SRE **SLO error-budget burndown**. Few big panels, exec-glance
+layout. The spend / runs / error-budget panels are live from the real OTel
+metrics (`mdk.run.cost_usd`, `mdk.jobs.completed`); the **fleet-health gauge and
+the wins/risks lists read the ADR 047 Observability Intelligence API** and are
+**scaffold-with-note** until that endpoint is on `main` (the dashboard's bottom
+panel documents exactly what's live vs scaffolded). The `grafana/theme/`
+directory holds the Movate brand palette, two reusable panel snippets (cost
+forecast, SLO error budget), and a **TV/kiosk** variant for an ops wall — see
+`grafana/theme/README.md`.
+
+To make every dashboard light up with a believable story for a demo or
+architecture review, seed synthetic telemetry:
+
+```bash
+mdk demo seed --agents 6 --tenants 3 --days 30   # hundreds of runs, evals, anomalies
+# ... point Grafana at the Prometheus scraping the OTLP stream ...
+mdk demo clear                                    # purge when done
+```
+
+Every seeded record is **tagged** (`tenant_id` starts with `demo-`, and the
+run/eval `input` carries `__mdk_demo__: true`) and **fully purgeable** — it
+never co-mingles with real telemetry, and `mdk demo seed` refuses a target
+whose name looks like prod/production unless `--force`. Generation logic lives
+in `src/movate/core/demo/` (pure, deterministic via `--seed`); the CLI wrapper
+is `mdk demo seed` / `mdk demo clear` (`src/movate/cli/demo_cmd.py`).
 
 ## Don't hand-edit metric names here
 

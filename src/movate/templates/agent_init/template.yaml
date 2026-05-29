@@ -1,0 +1,10 @@
+# ADR 028 — discoverability metadata. Surfaced by `mdk templates list/show`
+# and the interactive `mdk init` picker. Each template owns its own metadata
+# so there's no central registry to drift.
+title: Minimal echo agent
+description: String in, string out. The smallest runnable agent — the safest place to start.
+shape: agent
+tags:
+  - starter
+  - minimal
+recommended_for: First time scaffolding an agent — bare-bones reference for the canonical layout.

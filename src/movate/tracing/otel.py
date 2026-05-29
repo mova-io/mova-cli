@@ -257,7 +257,8 @@ def _build_provider_from_env() -> Any:
         ) from exc
 
     exporter_cls = _otlp_exporter_class()
-    resource = Resource.create(_resource_attributes())
+    primary_attrs = _resource_attributes()
+    resource = Resource.create(primary_attrs)
     provider = TracerProvider(resource=resource)
     try:
         # No explicit endpoint/headers kwargs — the SDK reads
@@ -268,6 +269,23 @@ def _build_provider_from_env() -> Any:
     except Exception as exc:
         raise OtelUnavailableError(f"OTLP exporter init failed: {exc}") from exc
     provider.add_span_processor(BatchSpanProcessor(exporter))
+
+    # ADR 039 Phase 2 — opt-in dual export. When MDK_TELEMETRY_ENDPOINT is
+    # set (and MDK_TELEMETRY_CUSTOMER_ID is set alongside it), attach a
+    # SECOND BatchSpanProcessor pointed at Movate's central Collector. The
+    # processor is wrapped in a PII-filtering layer so disallowed
+    # attributes are stripped from the dual stream only — the primary
+    # stream above is untouched. Failure of the dual path (unavailable SDK
+    # imports, exporter init failure, unreachable endpoint) returns None
+    # from the builder, logs one stderr warning, and lets the primary
+    # stream continue. ``cli ⊥ runtime`` boundary preserved.
+    from movate.tracing.dual_export import (  # noqa: PLC0415 - lazy by design
+        build_dual_span_processor,
+    )
+
+    dual_processor = build_dual_span_processor(base_resource_attrs=primary_attrs)
+    if dual_processor is not None:
+        provider.add_span_processor(dual_processor)
     return provider
 
 

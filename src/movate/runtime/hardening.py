@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 
 from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -35,11 +36,62 @@ from movate.runtime.errors import ErrorCode, http_error
 from movate.runtime.request_context import (
     REQUEST_ID_HEADER,
     gen_request_id,
+    get_request_id,
     reset_request_id,
     set_request_id,
 )
 
 logger = logging.getLogger(__name__)
+
+# Economics / cache response headers (additive — every name is NEW, so no
+# existing header is renamed or removed). A client (or an LLM agent driving
+# the API) reads these to track spend + cache effectiveness per response.
+ECONOMICS_HEADER_COST = "X-MDK-Cost-USD"
+ECONOMICS_HEADER_TOKENS_IN = "X-MDK-Tokens-In"
+ECONOMICS_HEADER_TOKENS_OUT = "X-MDK-Tokens-Out"
+ECONOMICS_HEADER_CACHE = "X-MDK-Cache"
+# An ADDITIONAL, MDK-namespaced alias of the existing ``X-Request-Id`` (set by
+# ``RequestIdMiddleware``). The original header is untouched — this just gives
+# clients a uniform ``X-MDK-*`` namespace to read correlation off of.
+ECONOMICS_HEADER_REQUEST_ID = "X-MDK-Request-Id"
+
+# Valid ``X-MDK-Cache`` values. ``hit`` / ``miss`` mean the response cache was
+# consulted; ``none`` means the response path doesn't involve the cache at all
+# (vs. omitting the header entirely, which means "unknown for this response").
+_CACHE_VALUES = frozenset({"hit", "miss", "none"})
+
+# The state attribute handlers stash a :class:`ResponseEconomics` on. Read by
+# :class:`EconomicsHeadersMiddleware`. A free function keeps the contract in
+# one place (handlers import the setter, never poke ``request.state`` raw).
+_ECONOMICS_STATE_ATTR = "mdk_economics"
+
+
+@dataclass(frozen=True)
+class ResponseEconomics:
+    """Per-response economics a handler computed and wants surfaced as headers.
+
+    Every field is OPTIONAL: a handler sets only what it actually knows for
+    THIS response (best-effort rule). A pure read with no LLM spend leaves
+    ``cost_usd`` / token counts ``None`` so the middleware omits those headers
+    rather than emitting a misleading zero. ``cache`` is one of ``hit`` /
+    ``miss`` / ``none`` or ``None`` (unknown → omit).
+    """
+
+    cost_usd: float | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cache: str | None = None
+
+
+def set_response_economics(request: Request, economics: ResponseEconomics) -> None:
+    """Stash economics for the response middleware to read.
+
+    The handler is the only place that knows whether a response incurred cost
+    (and how much), so it computes :class:`ResponseEconomics` and hands it off
+    here; :class:`EconomicsHeadersMiddleware` reads it on the way out. Decouples
+    the cost source (handlers) from the header emission (one middleware)."""
+    setattr(request.state, _ECONOMICS_STATE_ATTR, economics)
+
 
 # D6 — default max request body, in bytes. 25 MiB: comfortably above a normal
 # JSON run/eval payload while still capping the big ones (bundle uploads, KB
@@ -98,6 +150,61 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         finally:
             reset_request_id(token)
         response.headers[REQUEST_ID_HEADER] = request_id
+        return response
+
+
+class EconomicsHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach economics / cache headers to every response (best-effort).
+
+    Reads the optional :class:`ResponseEconomics` a cost-incurring handler
+    stashed on ``request.state`` (via :func:`set_response_economics`) and emits:
+
+    * ``X-MDK-Cost-USD`` — the run/operation cost, when LLM spend occurred.
+    * ``X-MDK-Tokens-In`` / ``X-MDK-Tokens-Out`` — token counts, when known.
+    * ``X-MDK-Cache`` — ``hit`` / ``miss`` / ``none``, when the response cache
+      status is known.
+    * ``X-MDK-Request-Id`` — an MDK-namespaced echo of the correlation id
+      (additive alias of the untouched ``X-Request-Id``), on EVERY response.
+
+    **Best-effort rule (R2):** a value that can't be computed for a given
+    response (a pure read with no spend, a status the cache doesn't apply to)
+    is OMITTED — never emitted as a wrong/zero-means-unknown value. Cost/token
+    headers therefore appear ONLY on responses that actually incurred cost.
+
+    The rate-limit headers (``X-RateLimit-*`` / ``Retry-After``) are NOT this
+    middleware's job — they're already attached on the auth path
+    (``runtime/middleware``) and on 429s (``runtime/errors``); this rides
+    alongside them without touching them.
+
+    Mounted INSIDE ``RequestIdMiddleware`` (so the correlation context is bound
+    before it reads it) but it never raises out: a bad/missing economics object
+    just means fewer headers, never a 500. Headers carry only cost / tokens /
+    cache / a correlation id — never a key, token, or any PII.
+    """
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        response = await call_next(request)
+        # Correlation echo — always available (request-id ctx is bound by the
+        # outer middleware). Additive alias; never overwrites X-Request-Id.
+        request_id = get_request_id()
+        if request_id:
+            response.headers[ECONOMICS_HEADER_REQUEST_ID] = request_id
+
+        economics = getattr(request.state, _ECONOMICS_STATE_ATTR, None)
+        if not isinstance(economics, ResponseEconomics):
+            return response
+
+        # Best-effort: emit a header ONLY when its value is known. None → omit.
+        if economics.cost_usd is not None:
+            # Fixed 6dp so a sub-cent cost isn't rounded to "0.0"; trailing
+            # zeros are fine (a stable, parseable decimal string).
+            response.headers[ECONOMICS_HEADER_COST] = f"{economics.cost_usd:.6f}"
+        if economics.tokens_in is not None:
+            response.headers[ECONOMICS_HEADER_TOKENS_IN] = str(economics.tokens_in)
+        if economics.tokens_out is not None:
+            response.headers[ECONOMICS_HEADER_TOKENS_OUT] = str(economics.tokens_out)
+        if economics.cache in _CACHE_VALUES:
+            response.headers[ECONOMICS_HEADER_CACHE] = economics.cache
         return response
 
 
@@ -202,8 +309,16 @@ class PayloadSizeLimitMiddleware:
 
 __all__ = [
     "DEFAULT_MAX_REQUEST_BYTES",
+    "ECONOMICS_HEADER_CACHE",
+    "ECONOMICS_HEADER_COST",
+    "ECONOMICS_HEADER_REQUEST_ID",
+    "ECONOMICS_HEADER_TOKENS_IN",
+    "ECONOMICS_HEADER_TOKENS_OUT",
     "MAX_REQUEST_BYTES_ENV",
+    "EconomicsHeadersMiddleware",
     "PayloadSizeLimitMiddleware",
     "RequestIdMiddleware",
+    "ResponseEconomics",
     "resolve_max_request_bytes",
+    "set_response_economics",
 ]

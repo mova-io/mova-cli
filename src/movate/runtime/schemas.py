@@ -13,23 +13,38 @@ in import sites and at code review.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from movate.core.models import (
+    AuditFinding,
+    AuditFindingSeverity,
+    AuditRecord,
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     ErrorInfo,
     FeedbackRecord,
     JobKind,
     JobRecord,
     JobStatus,
     Metrics,
+    Project,
+    ProjectMember,
+    ProjectMemberRole,
     RunRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
-from movate.core.reporting import AgentRollup, FailingCase, LatencyPercentiles, Report
+from movate.core.reporting import (
+    AgentRollup,
+    FailingCase,
+    LatencyPercentiles,
+    Report,
+    Usage,
+    UsageRollup,
+)
 
 
 class RunSubmission(BaseModel):
@@ -169,6 +184,104 @@ class RunView(BaseModel):
             workflow_run_id=record.workflow_run_id,
             node_id=record.node_id,
             thread_id=record.thread_id,
+        )
+
+
+class RunEstimatePredictionView(BaseModel):
+    """The numeric prediction band of a :class:`RunEstimateView`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tokens_in: int
+    tokens_out_max: int
+    tokens_out_expected: int
+    cost_usd_min: float
+    cost_usd_expected: float
+    cost_usd_max: float
+    latency_ms_p50: int | None = None
+    latency_ms_p95: int | None = None
+
+
+class RunEstimateBasisView(BaseModel):
+    """How each estimate field was derived — lets a client distinguish a
+    history-informed estimate from a cold-start fallback."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens_method: str
+    out_expected_method: str
+    latency_method: str
+    sample_size: int
+
+
+class RunEstimateBudgetCheckView(BaseModel):
+    """Agent per-run budget comparison (``budget.max_cost_usd_per_run``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    within_per_run_budget: bool
+    per_run_budget_usd: float
+
+
+class RunEstimateView(BaseModel):
+    """``POST /api/v1/agents/{name}/runs?estimate=true`` response.
+
+    A pre-flight cost + latency estimate. NO run is executed, NO job is
+    enqueued, and the tenant is NOT charged (the only operation that can
+    cost money is RAG retrieval embedding, which is opt-in via
+    ``?estimate_retrieval=true`` and reflected in ``retrieval_embedded``).
+
+    ``estimate`` is a constant ``True`` discriminator so a client can tell
+    this shape apart from a :class:`RunView` / :class:`RunAccepted` on the
+    same route. See :mod:`movate.core.run_estimator` for per-field
+    derivation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    estimate: bool = True
+    agent_name: str
+    model: str
+    predicted: RunEstimatePredictionView
+    basis: RunEstimateBasisView
+    budget_check: RunEstimateBudgetCheckView
+    retrieval_embedded: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_estimate(cls, est: Any) -> RunEstimateView:
+        """Build the wire view from a :class:`movate.core.run_estimator.RunEstimate`.
+
+        Typed ``Any`` to keep ``run_estimator`` (a ``core`` module) out of
+        this module's import graph — the runtime imports it lazily at the
+        call site instead.
+        """
+        return cls(
+            estimate=True,
+            agent_name=est.agent_name,
+            model=est.model,
+            predicted=RunEstimatePredictionView(
+                tokens_in=est.predicted.tokens_in,
+                tokens_out_max=est.predicted.tokens_out_max,
+                tokens_out_expected=est.predicted.tokens_out_expected,
+                cost_usd_min=est.predicted.cost_usd_min,
+                cost_usd_expected=est.predicted.cost_usd_expected,
+                cost_usd_max=est.predicted.cost_usd_max,
+                latency_ms_p50=est.predicted.latency_ms_p50,
+                latency_ms_p95=est.predicted.latency_ms_p95,
+            ),
+            basis=RunEstimateBasisView(
+                prompt_tokens_method=est.basis.prompt_tokens_method,
+                out_expected_method=est.basis.out_expected_method,
+                latency_method=est.basis.latency_method,
+                sample_size=est.basis.sample_size,
+            ),
+            budget_check=RunEstimateBudgetCheckView(
+                within_per_run_budget=est.budget_check.within_per_run_budget,
+                per_run_budget_usd=est.budget_check.per_run_budget_usd,
+            ),
+            retrieval_embedded=est.retrieval_embedded,
+            notes=list(est.notes),
         )
 
 
@@ -342,6 +455,97 @@ class ReadyView(BaseModel):
     (Postgres), ``False`` if it doesn't (SQLite in a pod filesystem).
     A ``False`` here on a production deploy means every revision recycle
     wipes the ApiKeyRecord table → operators lose their saved keys."""
+
+
+class CapabilityModelsView(BaseModel):
+    """The ``models`` block of :class:`CapabilitiesView`.
+
+    Describes which providers/models this runtime can reach. ``available``
+    is the catalog the runtime already knows (the same source ``mdk models``
+    /``GET /api/v1/models`` use); ``byok_configured`` lists the provider
+    NAMES the calling tenant has brought a key for — never the key values
+    (ADR 018). ``default`` is the runtime's fleet-default model id, or
+    ``None`` when none is configured.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: list[str]
+    """Every model id the catalog knows (``provider/model``), sorted."""
+    default: str | None = None
+    """The fleet-default model id, or ``None`` if unconfigured."""
+    byok_configured: list[str]
+    """Provider NAMES (e.g. ``["openai", "anthropic"]``) the calling tenant
+    has a stored BYOK key for. Names ONLY — the encrypted key value is never
+    surfaced. Empty when no per-tenant key store / no tenant keys."""
+
+
+class CapabilityLimitsView(BaseModel):
+    """The ``limits`` block of :class:`CapabilitiesView`.
+
+    This tenant's effective operational limits, derived from the runtime's
+    actual rate-limit + batch config (not a hardcoded guess). A field is
+    ``None`` when the corresponding limit is OFF/uncapped in this deploy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rate_limit_per_min: int | None = None
+    """Per-API-key request ceiling per minute, or ``None`` when rate
+    limiting is disabled for this runtime."""
+    tenant_rate_limit_per_min: int | None = None
+    """Per-tenant aggregate request ceiling per minute (item 25), or
+    ``None`` when the per-tenant limiter is OFF (the default)."""
+    max_batch_size: int
+    """Max rows accepted by ``POST /api/v1/agents/{name}/batch`` — the
+    server-enforced ``MDK_BATCH_MAX_ROWS`` cap."""
+
+
+class CapabilitiesView(BaseModel):
+    """``GET /api/v1/capabilities`` response — the runtime's self-description.
+
+    A read-only matrix letting a client (e.g. Mova iO talking to many
+    heterogeneous customer runtimes) learn exactly what THIS runtime version
+    supports, without trial-and-error against every endpoint. Every field is
+    derived from the *deployed* runtime (route introspection / import probing
+    / live config), never a static promise.
+
+    Two views:
+
+    * **Authenticated (``read`` scope)** — the full matrix below.
+    * **Unauthenticated** — a minimal subset (``mdk_version`` + ``api_version``,
+      with the rest ``None``/empty) for health/probe use, so an orchestrator
+      can fingerprint a runtime version before holding a key for it.
+
+    The ``minimal`` flag tells a client which view it received.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mdk_version: str
+    """``movate.__version__`` (CalVer) — the exact build serving this."""
+    api_version: str
+    """The runtime API version this matrix describes (``"v1"``)."""
+    served_at: datetime
+    """UTC timestamp the response was produced."""
+    minimal: bool = False
+    """``True`` for the unauthenticated subset (only ``mdk_version`` +
+    ``api_version`` populated); ``False`` for the full ``read``-scoped view."""
+
+    models: CapabilityModelsView | None = None
+    """Reachable models / providers. ``None`` in the minimal view."""
+    features: dict[str, bool] | None = None
+    """Capability flags the client can branch on. Each is detected from the
+    deployed code (route registered / module importable), NOT hardcoded.
+    ``None`` in the minimal view."""
+    scopes_supported: list[str] | None = None
+    """The runtime's authorization-scope vocabulary. ``None`` in the
+    minimal view."""
+    limits: CapabilityLimitsView | None = None
+    """This tenant's effective limits. ``None`` in the minimal view."""
+    extras_installed: list[str] | None = None
+    """Optional ``pyproject`` extras importable in this image (marker-module
+    probe). ``None`` in the minimal view."""
 
 
 class AgentView(BaseModel):
@@ -1584,6 +1788,139 @@ class HarvestView(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Judge Engineer — author + commit a judge.yaml
+# (POST /api/v1/agents/{name}/judge/{generate,commit})
+# ---------------------------------------------------------------------------
+
+
+class JudgeGenerateRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/generate`` request body.
+
+    All fields are optional — an empty ``{}`` body asks the engineer to
+    infer dimensions from the agent shape, use the default engineer
+    model, and include anchor examples. The generation is sync (~few
+    seconds) and read-only — it does NOT touch the agent's bundle on
+    disk. The follow-up commit endpoint is what writes ``judge.yaml``.
+
+    The shape of the generated YAML is the existing canonical
+    :class:`~movate.core.models.JudgeConfig` (CLAUDE.md rule 5 —
+    judge.yaml is a flagged surface). The dimensions are reflected
+    INSIDE the rubric text, not as a new top-level YAML key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rubric_dimensions: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of scoring dimensions the rubric must cover. "
+            "Each entry is a lowercase snake_case identifier (e.g. "
+            "``accuracy``, ``tone``, ``schema_adherence``). When omitted "
+            "or null, the engineer infers a sensible set from the agent's "
+            "shape (RAG / tool-use / workflow / generic)."
+        ),
+    )
+    include_examples: bool = Field(
+        default=True,
+        description=(
+            "When true (the default) the rubric is anchored with 2-3 "
+            "concrete scored examples drawn from the agent's domain (and "
+            "from the agent's evals dataset when available). False keeps "
+            "the rubric leaner — useful when the agent has no dataset yet."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Optional LiteLLM-style provider/model override for the "
+            "ENGINEER model — the model that authors the rubric. Defaults "
+            "to a strong general-purpose model (currently "
+            "``anthropic/claude-sonnet-4-6``). Distinct from the judge "
+            "model the generated YAML uses at eval time."
+        ),
+    )
+    budget_usd: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "Hard ceiling on the generation call's cost in USD. Typical "
+            "generation is <$0.01; this is a safety valve. Exceeded → "
+            "402 with no commit."
+        ),
+    )
+
+
+class JudgeGenerateResponse(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/generate`` response.
+
+    The ``judge_yaml`` is the complete, validated YAML body — a UI can
+    render it for review, the operator hand-edits if desired, then the
+    edited string POSTs back to ``/judge/commit`` (which re-validates
+    before persisting).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    judge_yaml: str
+    """The full ``judge.yaml`` body as a string. Validated against
+    :class:`~movate.core.models.JudgeConfig` before returning — the
+    eval engine can load this byte-for-byte. Edit and POST to
+    ``/judge/commit`` to persist."""
+    rubric_dimensions: list[str]
+    """The dimensions the rubric covers. Mirrored from the ``Dimensions
+    covered:`` preamble inside the rubric text so a client can render
+    the dimension chip set without re-parsing the markdown."""
+    rationale: str
+    """One or two sentences explaining why these dimensions were picked
+    for this agent. Surfaced to the human reviewer; not persisted."""
+    tokens_used: int = 0
+    """Total tokens (input + output) consumed by the engineer LLM call."""
+    cost_usd: float = 0.0
+    """Best-effort cost of the engineer call in USD, looked up via the
+    pricing table. 0.0 when pricing data is unavailable for the chosen
+    engineer model — the call still happened."""
+
+
+class JudgeCommitRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/commit`` request body.
+
+    The ``judge_yaml`` is the YAML the operator wants persisted at
+    ``<agent_dir>/evals/judge.yaml``. The server re-validates against
+    :class:`~movate.core.models.JudgeConfig` BEFORE writing — a hand
+    edit that breaks the schema can't land. Idempotent: posting the
+    same YAML twice overwrites with the same bytes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    judge_yaml: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The complete ``judge.yaml`` body to persist. Validated "
+            "against :class:`~movate.core.models.JudgeConfig`; a "
+            "malformed body returns 422 without touching disk."
+        ),
+    )
+
+
+class JudgeCommitResponse(BaseModel):
+    """``POST /api/v1/agents/{name}/judge/commit`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    judge_path: str
+    """Where the file landed, as a path RELATIVE to the agent dir
+    (``evals/judge.yaml`` in the canonical layout)."""
+    updated: bool
+    """``True`` when an existing ``judge.yaml`` was overwritten; ``False``
+    when the file was created fresh. Lets the UI surface the right
+    affirmative ("Saved" vs "Created")."""
+
+
+# ---------------------------------------------------------------------------
 # KB upload wire types
 # ---------------------------------------------------------------------------
 
@@ -1625,14 +1962,170 @@ class KbIngestView(BaseModel):
     Aggregate plus per-file detail. Total counts make the success
     summary trivial to render in the playground UI; per-file detail
     lets the operator see exactly which uploads contributed.
+
+    The wire shape is intentionally additive across all four ingest
+    kinds (``upload`` / ``text`` / ``url`` / ``generated``). The
+    multipart upload path populates ``files`` + ``total_chunks_saved``
+    and leaves the new JSON-mode fields at their defaults — byte-for-byte
+    backwards compatible with the pre-JSON-modes client contract. JSON
+    modes populate ``ingest_id`` / ``kind`` / ``chunks_added`` /
+    ``tokens_in`` / ``embedding_cost_usd`` (and ``generated_content``
+    for ``kind="generated"``) so a single response model serves every
+    front-end branch.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     agent_name: str
-    files: list[KbIngestFileResult]
-    total_chunks_saved: int
-    """Sum of chunks_saved across all files — convenience for the UI."""
+    files: list[KbIngestFileResult] = Field(default_factory=list)
+    """Per-file detail. Populated for the multipart ``upload`` kind;
+    a single one-element entry is included for the JSON ``text`` /
+    ``url`` / ``generated`` kinds so the UI can render the same
+    "what was ingested" row regardless of mode."""
+    total_chunks_saved: int = 0
+    """Sum of chunks_saved across all files — convenience for the UI.
+    Equal to ``chunks_added`` for the JSON modes."""
+
+    # --- JSON-mode additive fields (KB ingest kinds: text / url / generated) ---
+    ingest_id: str = ""
+    """Unique id for this ingest operation. Empty string on the legacy
+    multipart path (no id was minted historically); a uuid hex on the
+    JSON paths so callers can correlate with future async-job tracking."""
+    kind: str = "upload"
+    """``"upload"`` (multipart, existing) | ``"text"`` | ``"url"`` |
+    ``"generated"`` (new JSON modes). Lets the UI branch on response."""
+    chunks_added: int = 0
+    """Chunks persisted on this call. Equal to ``total_chunks_saved`` —
+    surfaced separately so the JSON-mode contract matches the spec
+    without forcing JSON callers to read a multipart-specific field."""
+    tokens_in: int = 0
+    """Approximate input tokens consumed by the embedding model for
+    this ingest. Best-effort character / 4 heuristic — the OpenAI
+    embeddings response does not expose token usage, so we estimate.
+    Zero for skipped / empty content."""
+    embedding_cost_usd: float = 0.0
+    """Approximate embedding cost in USD. Derived from ``tokens_in``
+    against the canonical pricing table; ``0.0`` when the model is
+    not priced (unknown model) or no chunks were embedded."""
+    generated_content: str | None = None
+    """The LLM-authored Markdown body. Set ONLY for ``kind="generated"``
+    so the caller can review (and surface in the UI) what was actually
+    embedded. ``None`` for every other kind."""
+
+
+# ---------------------------------------------------------------------------
+# KB JSON ingest modes (text / url / generated) — additive to the existing
+# multipart upload endpoint. The route dispatches on Content-Type: a
+# ``multipart/form-data`` body hits the legacy upload path, an
+# ``application/json`` body is parsed into one of these via the discriminated
+# union. The route + scope are unchanged (``POST /api/v1/agents/{name}/kb``,
+# ``kb:write``) so front-end clients integrated against the existing surface
+# keep working byte-for-byte. See docs/front-end-api.md.
+# ---------------------------------------------------------------------------
+
+# Hard cap on the v1 synchronous-crawl ``max_pages``. Lifted out as a
+# module-level constant so the schema + the handler enforce the same
+# bound — keeps the OpenAPI spec honest about the limit.
+KB_INGEST_URL_MAX_PAGES_CAP = 50
+
+# Hard wall-clock budget (seconds) for the entire URL ingest path in v1
+# (single page or bounded crawl). A crawl whose summed fetches exceed
+# this budget short-circuits — partial pages already ingested are kept,
+# the rest are skipped. Async-job variant for larger crawls is a
+# follow-up.
+KB_INGEST_URL_TIMEOUT_S = 60.0
+
+
+class KbIngestTextRequest(BaseModel):
+    """``kind="text"`` — inline document body authored by the caller.
+
+    The simplest JSON mode: the caller hands the runtime the text to
+    chunk + embed + persist directly. ``title`` is the per-chunk
+    ``source`` label (shows up in ``GET /api/v1/agents/{name}/kb`` so
+    a human can tell which inline doc a chunk came from); ``content``
+    is the body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["text"] = "text"
+    title: str = Field(..., min_length=1, max_length=256)
+    """Short label for the document — becomes the per-chunk ``source``.
+    Required so chunks have a human-readable provenance string."""
+    content: str = Field(..., min_length=1)
+    """The raw text to ingest. Markdown is fine — the paragraph
+    chunker treats ``\\n\\n`` boundaries the same way. Empty / blank
+    content is rejected at the pydantic layer (``min_length=1``); a
+    content body whose chunks all fall below the splitter floor yields
+    a 200 with ``chunks_added=0`` and ``status="empty"`` per-file."""
+
+
+class KbIngestUrlRequest(BaseModel):
+    """``kind="url"`` — fetch a single page (default) or a bounded crawl.
+
+    Reuses the same ``movate.kb.web`` front-end the CLI's
+    ``mdk kb ingest <url>`` does — :func:`movate.kb.web.fetch_and_extract`
+    for the single-page mode, :func:`movate.kb.web.crawl_site` for the
+    bounded same-host crawl. No new extractor or HTTP client.
+
+    Synchronous + bounded by design (v1): ``max_pages`` defaults to 1,
+    is hard-capped at 50, and the crawl is wall-clock-bounded by the
+    endpoint's overall timeout (60s). An async-job variant for larger
+    crawls is a documented follow-up (see PR body).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["url"] = "url"
+    url: str = Field(..., min_length=1, pattern=r"^https?://")
+    """The starting URL. Must be http(s); other schemes are rejected
+    at the pydantic layer."""
+    crawl: bool = False
+    """When true and ``max_pages > 1``, follow same-host ``<a href>``
+    links breadth-first up to ``max_pages``. Defaults to a single-page
+    fetch — the safe default."""
+    max_pages: int = Field(default=1, ge=1, le=KB_INGEST_URL_MAX_PAGES_CAP)
+    """Hard cap on pages fetched. Defaults to 1 (single page);
+    operators opting into a crawl typically set ``crawl=true`` + a
+    small ``max_pages`` (5-25). The 50-page ceiling matches the CLI's
+    safe-default bound and the v1 synchronous-execution budget."""
+
+
+class KbIngestGeneratedRequest(BaseModel):
+    """``kind="generated"`` — LLM authors the document from a description.
+
+    Calls into the agent's configured provider (``bundle.spec.model.provider``)
+    via the existing ``BaseLLMProvider`` seam — so the CUSTOMER's BYOK keys
+    are used, never Movate's. The generated Markdown body is returned in
+    the response (``generated_content``) so the caller can review what
+    was actually embedded; the same body is chunked + embedded through
+    the unchanged ``movate.kb.ingest.ingest_text`` pipeline.
+
+    No new provider is added. The system prompt is fixed (see the
+    handler) and instructs the model to flag uncertainty with
+    ``TODO: confirm with subject matter expert`` rather than
+    hallucinate facts.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["generated"] = "generated"
+    title: str = Field(..., min_length=1, max_length=256)
+    """Short label for the generated document — becomes the per-chunk
+    ``source``. Same role as ``KbIngestTextRequest.title``."""
+    description: str = Field(..., min_length=1)
+    """Free-form description of what the model should write about
+    (e.g. "FAQ covering pricing tiers, upgrade paths, billing cycles,
+    refund policy"). Becomes the user message of the completion."""
+
+
+# Discriminated union for the JSON body — FastAPI parses the right
+# concrete request based on the ``kind`` field. The route's Content-Type
+# inspection chooses between this union and the existing multipart path.
+KbIngestRequest = Annotated[
+    KbIngestTextRequest | KbIngestUrlRequest | KbIngestGeneratedRequest,
+    Field(discriminator="kind"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -2895,4 +3388,1985 @@ class AgentMetricsView(BaseModel):
             ),
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agent catalog (ADR 041) — wire types for /api/v1/catalog/...
+#
+# Three namespaces (movate / private / community) share one read API. The
+# view types are flat / additive — new optional fields can land without a
+# version bump (ADR 041 Resolved decision #3).
+# ---------------------------------------------------------------------------
+
+
+class CatalogRatingsSummaryView(BaseModel):
+    """Aggregate of all ratings for a catalog entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = 0
+    avg: float = 0.0
+
+
+class CatalogEntryView(BaseModel):
+    """Catalog-card payload for one entry.
+
+    ``source`` carries the namespace; ``tenant_id`` is ``None`` for public
+    namespaces (``movate`` / ``community``). The bundle bytes are NOT
+    inlined — fetch a specific version via
+    ``/api/v1/catalog/agents/{slug}/versions/{ver}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    source: str
+    tenant_id: str | None = None
+    latest_version: str
+    name: str
+    title: str
+    description: str
+    tags: list[str] = Field(default_factory=list)
+    shape: str | None = None
+    recommended_for: str | None = None
+    ratings_summary: CatalogRatingsSummaryView = Field(default_factory=CatalogRatingsSummaryView)
+    popularity: int = 0
+    synced_at: str
+
+
+class CatalogEntryDetailView(CatalogEntryView):
+    """Detail view — same shape as the list view today plus a guard for
+    forward-compat fields (e.g. the latest version's digest) without
+    forcing the list path to grow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    latest_version_digest: str | None = None
+    """SHA-256 hex of the latest version's bundle, when available."""
+
+
+class CatalogEntryListResponse(BaseModel):
+    """List view envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[CatalogEntryView]
+    count: int
+    next_after_slug: str | None = None
+    """The slug to pass back as ``?after_slug=`` for the next page.
+    ``None`` when the caller has reached the end (the page returned fewer
+    rows than ``limit``)."""
+
+
+class CatalogEntryVersionView(BaseModel):
+    """One version of a catalog entry. ``bundle_tar`` is base64-encoded
+    on the wire (HTTP/JSON has no native bytes)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    source: str
+    tenant_id: str | None = None
+    version: str
+    digest: str
+    published_at: str
+    deprecated_at: str | None = None
+    bundle_tar_b64: str | None = None
+    """Base64-encoded bundle bytes. Inlined ONLY on the
+    ``/versions/{ver}`` endpoint where the caller asked for it; the
+    list-versions endpoint omits it to keep the response small."""
+
+
+class CatalogSubmitRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/agents`` — create a tenant-private
+    entry. Server forces ``source='private'`` and
+    ``tenant_id=caller_tenant`` regardless of any client-supplied value
+    (ADR 041 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list)
+    shape: str | None = None
+    recommended_for: str | None = None
+    version: str = Field(default="0.1.0")
+    bundle_tar_b64: str = Field(
+        ...,
+        description="Base64-encoded tar of the entry bundle.",
+    )
+
+
+class CatalogPublishVersionRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/agents/{slug}/versions`` — publish a
+    new version of an existing tenant-private entry (ADR 041 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(min_length=1)
+    bundle_tar_b64: str = Field(...)
+
+
+class CatalogRatingRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/agents/{slug}/ratings`` — record a
+    rating against a catalog entry. ``source`` defaults to ``movate`` (the
+    common path); pass ``private`` to rate an internal entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = None
+    source: str = "movate"
+
+
+class CatalogSyncRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/sync`` — trigger a sync.
+
+    ``source`` MUST be ``movate`` for v1 (the only namespace that has an
+    upstream service to sync from). Sending ``private`` is a 400; sending
+    ``community`` is a 501 (the namespace is column-ready but disabled —
+    ADR 041 D7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = "movate"
+
+
+class CatalogSyncResponse(BaseModel):
+    """Sync stub response.
+
+    v1 returns 202 + ``status='stub'`` + the bumped watermark; the
+    production wiring against ``catalog.movate.io`` will swap in behind
+    this same contract (ADR 041 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    status: str
+    """One of:
+
+    * ``"stub"`` — the v1 stub ran (logged + watermark bumped, no upstream
+      fetch).
+    * ``"synced"`` — reserved for the production handler that will replace
+      the stub.
+    """
+    watermark: str
+    """ISO 8601 timestamp of the watermark AFTER this call. Production will
+    set this to the latest entry's ``synced_at`` rather than ``now()``;
+    the v1 stub uses ``now()``."""
+    detail: str
+    """Human note explaining the response. The v1 stub returns a fixed
+    string describing the missing upstream wiring (so an operator running
+    the endpoint by hand sees what's happening)."""
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-graph query API (ADR 046) — read-only, graphology-native.
+#
+# The subgraph / neighbors / stream wire shapes ARE the graphology import
+# contract: ``GraphologyView.model_dump(mode="json")`` feeds straight into
+# a sigma.js client's ``graph.import(...)`` with zero transform. These
+# views are structural pass-throughs over the ``core.graph`` models — kept
+# here so the HTTP surface stays in one place and OpenAPI documents the
+# exact node/edge attribute bag.
+# ---------------------------------------------------------------------------
+
+
+class GraphNodeView(BaseModel):
+    """One graphology node: ``{"key", "attributes": {...}}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphEdgeView(BaseModel):
+    """One graphology edge: ``{"key", "source", "target", "attributes"}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    source: str
+    target: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphologyView(BaseModel):
+    """A graphology import document — the zero-transform sigma.js contract.
+
+    Returned by the windowed-subgraph + neighbors endpoints and emitted as
+    the payload of every SSE growth event. Shape is pinned by
+    ``test_runtime_graph_v1`` so a client never needs a transform layer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[GraphNodeView] = Field(default_factory=list)
+    edges: list[GraphEdgeView] = Field(default_factory=list)
+
+
+class ProvenanceView(BaseModel):
+    """One source-chunk citation for a node detail panel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str
+    url: str | None = None
+    snippet: str | None = None
+    extraction_confidence: float | None = None
+
+
+class NodeDetailView(BaseModel):
+    """``GET /api/v1/graph/nodes/{id}`` response — node detail + provenance."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    key: str
+    label: str
+    type: str
+    description: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+    provenance: list[ProvenanceView] = Field(default_factory=list)
+    neighbor_count: int = 0
+    referenced_by_agents: list[str] = Field(default_factory=list)
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """HATEOAS links; serialized as ``_links`` on the wire. ``expand`` →
+    the neighbors endpoint for this node."""
+
+
+class GraphSearchResult(BaseModel):
+    """One matching node in a ``GET /api/v1/graph/search`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+    type: str
+
+
+class GraphSearchView(BaseModel):
+    """``GET /api/v1/graph/search`` response — matching nodes for fly-to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    results: list[GraphSearchResult] = Field(default_factory=list)
+    count: int = 0
+
+
+class GraphQueryRequest(BaseModel):
+    """``POST /api/v1/graph/query`` body — a bounded traverse/subgraph.
+
+    ``project`` is the agent (graph owner); ``root`` is the node to
+    traverse from. ``depth`` / ``limit`` are bounded server-side
+    regardless of what the client sends (depth ≤ 6 hops, limit ≤ 5000).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: str = Field(..., description="Agent that owns the graph.")
+    root: str = Field(..., description="Node id to traverse from.")
+    mode: str = Field(default="knowledge", description="knowledge | topology.")
+    type: str | None = Field(default=None, description="Optional node-type filter.")
+    depth: int | None = Field(default=None, ge=1, description="Hops; capped server-side at 6.")
+    limit: int | None = Field(
+        default=None, ge=1, description="Node/edge budget; capped server-side at 5000."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observability Intelligence layer (ADR 047) — wire types for the
+# /api/v1/observability/* endpoints. Kept here (not in core/observability) so
+# the HTTP surface evolves independently of the persisted insight model.
+# ---------------------------------------------------------------------------
+
+
+class ObservabilityInsightView(BaseModel):
+    """``GET /api/v1/observability/insights`` row — one daily insight."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    date: str
+    health_score: float
+    anomalies: list[dict[str, Any]] = Field(default_factory=list)
+    top_failures: list[dict[str, Any]] = Field(default_factory=list)
+    usage_rollup: dict[str, Any] = Field(default_factory=dict)
+    trends: dict[str, Any] = Field(default_factory=dict)
+    narrative_digest: str = ""
+    created_at: str
+
+    @classmethod
+    def from_record(cls, insight: Any) -> ObservabilityInsightView:
+        return cls(
+            id=insight.id,
+            project_id=insight.project_id,
+            date=insight.date.isoformat(),
+            health_score=insight.health_score,
+            anomalies=list(insight.anomalies),
+            top_failures=list(insight.top_failures),
+            usage_rollup=dict(insight.usage_rollup),
+            trends=dict(insight.trends),
+            narrative_digest=insight.narrative_digest,
+            created_at=insight.created_at.isoformat(),
+        )
+
+
+class ObservabilityInsightListView(BaseModel):
+    """``GET /api/v1/observability/insights`` envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    insights: list[ObservabilityInsightView] = Field(default_factory=list)
+    count: int
+
+
+class ObservabilityHealthView(BaseModel):
+    """``GET /api/v1/observability/health`` — the latest health score + digest.
+
+    Named ``ObservabilityHealthView`` (not ``HealthView``) to avoid clashing
+    with the existing ``/healthz`` liveness ``HealthView``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str | None = None
+    date: str | None = None
+    health_score: float | None = None
+    narrative_digest: str = ""
+    anomaly_count: int = 0
+    has_insight: bool = False
+    """False when no insight exists yet for the project (cold start)."""
+
+
+class EvidenceView(BaseModel):
+    """One citation backing a grounded answer (ADR 047 — citations mandatory)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    reference: str
+    detail: str = ""
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_record(cls, ev: Any) -> EvidenceView:
+        return cls(
+            kind=str(ev.kind),
+            reference=ev.reference,
+            detail=ev.detail,
+            data=dict(ev.data),
+        )
+
+
+class GroundedAnswerView(BaseModel):
+    """``POST /observability/ask`` + ``/troubleshoot`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
+    evidence: list[EvidenceView] = Field(default_factory=list)
+    confidence: float = 0.0
+    suggested_action: str = ""
+    cost_usd: float = 0.0
+
+    @classmethod
+    def from_record(cls, ans: Any) -> GroundedAnswerView:
+        return cls(
+            answer=ans.answer,
+            evidence=[EvidenceView.from_record(e) for e in ans.evidence],
+            confidence=ans.confidence,
+            suggested_action=ans.suggested_action,
+            cost_usd=ans.cost_usd,
+        )
+
+
+class AskRequest(BaseModel):
+    """``POST /api/v1/observability/ask`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=2000)
+    project_id: str = Field(default="default", max_length=200)
+    budget_usd: float = Field(default=0.05, ge=0.0, le=5.0)
+    """Hard cap on the LLM spend of this query's synthesis call."""
+    mock: bool = False
+    """Use the deterministic MockProvider (no real spend / API key) — the
+    hermetic-test path, mirroring the eval/bench endpoints' ``mock`` flag."""
+
+
+class TroubleshootRequest(BaseModel):
+    """``POST /api/v1/observability/troubleshoot`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symptom: str = Field(min_length=1, max_length=2000)
+    time_window_days: int = Field(default=7, ge=1, le=90)
+    project_id: str = Field(default="default", max_length=200)
+    budget_usd: float = Field(default=0.05, ge=0.0, le=5.0)
+    mock: bool = False
+    """Use the deterministic MockProvider (no real spend / API key)."""
+
+
+class AnalyzeRequest(BaseModel):
+    """``POST /api/v1/observability/analyze`` body (admin — on-demand trigger)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(default="default", max_length=200)
+    date: str | None = None
+    """ISO YYYY-MM-DD. Omitted → the worker analyzes *yesterday* (nightly case)."""
+    budget_usd: float = Field(default=0.10, ge=0.0, le=5.0)
+
+
+class AnalyzeAcceptedView(BaseModel):
+    """``POST /api/v1/observability/analyze`` 202 response — the enqueued job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    kind: str
+    project_id: str
+
+
+# ---------------------------------------------------------------------------
+# Projects (ADR 040) — wire types for the /api/v1/projects + /members surface.
+# Kept here rather than in ``movate.core.models`` so the API contract can
+# evolve independently of the persisted shape (per module docstring).
+# ---------------------------------------------------------------------------
+
+
+class ProjectCreateRequest(BaseModel):
+    """``POST /api/v1/projects`` request body.
+
+    ``name`` is unique within the caller's tenant; the reserved literal
+    ``"default"`` is rejected with 422 (the per-tenant default project is
+    auto-created by storage at first read; clients can't materialize it
+    explicitly). ``owner_principal_id`` defaults to the caller's principal
+    (the API layer fills it from the auth context when omitted) — the API
+    refusal is a friendlier alternative to the storage layer's synthetic
+    ``"tenant-system"`` owner used only for the lazy default project.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    owner_principal_id: str | None = None
+    """Optional explicit owner. Omit to default to the caller's principal
+    (``api_key:<key_id>`` on the opaque-key path, or the OIDC sub claim)."""
+
+
+class ProjectUpdateRequest(BaseModel):
+    """``PUT /api/v1/projects/{id}`` request body — partial update.
+
+    Either or both of ``name`` / ``description`` may be set. An
+    all-``None`` body is a no-op (returns the current row). The reserved
+    name ``"default"`` is rejected; renaming the per-tenant default
+    project is not supported via this endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+
+
+class ProjectView(BaseModel):
+    """``GET /api/v1/projects/{id}`` (and create/update) response.
+
+    Mirror of :class:`Project` with the ``etag`` derived from
+    ``updated_at`` — clients echo it back as ``If-Match`` for optimistic
+    concurrency on PUT (412 on stale).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    tenant_id: str
+    name: str
+    description: str | None = None
+    owner_principal_id: str
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+    etag: str
+    """Opaque concurrency token derived from ``updated_at`` (ISO-8601). A
+    client sends it back as ``If-Match: "<etag>"`` on PUT to opt into
+    optimistic concurrency; absent header → last-write-wins (back-compat
+    with the rest of the runtime)."""
+
+    @classmethod
+    def from_record(cls, p: Project) -> ProjectView:
+        return cls(
+            project_id=p.project_id,
+            tenant_id=p.tenant_id,
+            name=p.name,
+            description=p.description,
+            owner_principal_id=p.owner_principal_id,
+            created_at=p.created_at,
+            updated_at=p.updated_at,
+            archived_at=p.archived_at,
+            etag=_project_etag(p),
+        )
+
+
+class ProjectListResponse(BaseModel):
+    """``GET /api/v1/projects`` response — tenant-scoped, newest-first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    projects: list[ProjectView]
+    count: int
+
+
+class ProjectMemberView(BaseModel):
+    """``GET /api/v1/projects/{id}/members/{principal_id}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    principal_id: str
+    role: ProjectMemberRole
+    added_by: str
+    added_at: datetime
+
+    @classmethod
+    def from_record(cls, m: ProjectMember) -> ProjectMemberView:
+        return cls(
+            project_id=m.project_id,
+            principal_id=m.principal_id,
+            role=m.role,
+            added_by=m.added_by,
+            added_at=m.added_at,
+        )
+
+
+class ProjectMemberListView(BaseModel):
+    """``GET /api/v1/projects/{id}/members`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    members: list[ProjectMemberView]
+    count: int
+
+
+class ProjectMemberAddRequest(BaseModel):
+    """``POST /api/v1/projects/{id}/members`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    principal_id: str = Field(..., min_length=1)
+    role: ProjectMemberRole
+
+
+class ProjectMemberPatchRequest(BaseModel):
+    """``PATCH /api/v1/projects/{id}/members/{principal_id}`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: ProjectMemberRole
+
+
+def _project_etag(p: Project) -> str:
+    """Derive the ``ETag`` value from a project's ``updated_at``.
+
+    ISO-8601 down to microseconds is monotonic per-row (every storage
+    write bumps it) and stable across reads — perfect for an
+    optimistic-concurrency token without standing up a separate version
+    column. Returned bare (no quotes) — :func:`_normalize_if_match`
+    strips client-side decoration.
+    """
+    return p.updated_at.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Unified agent-creation surface
+# ``POST /api/v1/projects/{project_id}/agents`` — single dispatcher endpoint
+# that routes to one of five existing creation paths based on a discriminated
+# union body.
+#
+# Why a separate endpoint vs. extending POST /agents: the five existing
+# creation endpoints (multipart bundle, from-wizard, future from-spec,
+# preview+commit, catalog clone) ship distinct wire shapes that customers
+# have already integrated against. This unified endpoint is an additive
+# convenience layer for the Mova iO Angular UI — it COMPOSES the existing
+# handlers but never duplicates their logic. Backward compat per CLAUDE.md
+# rule 5: every legacy endpoint continues to work byte-for-byte.
+# ---------------------------------------------------------------------------
+
+
+class AgentCreateBundleRequest(BaseModel):
+    """Placeholder for the multipart-bundle JSON discriminator.
+
+    The actual bundle bytes arrive via ``multipart/form-data`` (the
+    file payload is too large for a JSON body). This schema exists so
+    OpenAPI documents the ``source: "bundle"`` shape for callers that
+    inspect the discriminated-union spec; the route handler sniffs
+    ``Content-Type`` and routes multipart requests to the existing
+    bundle path regardless of whether this body is present.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["bundle"] = "bundle"
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Optional name override. When omitted the bundle's ``agent.yaml`` name is used."
+        ),
+    )
+
+
+class AgentCreateSpecRequest(BaseModel):
+    """``source: "spec"`` — caller already authored a full agent spec
+    + prompt + schemas as JSON.
+
+    Use this when the caller has a complete bundle in hand and just
+    wants to persist it without zipping into a multipart upload. The
+    spec dict is YAML-dumped to ``agent.yaml`` and the prompt /
+    schemas are written to their canonical paths. Identical
+    validation gate to the multipart endpoint (``load_agent``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["spec"] = "spec"
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Agent name. Must match ``spec['name']`` when both set.",
+    )
+    spec: dict[str, Any] = Field(
+        ...,
+        description=(
+            "The agent.yaml contents as a Python dict. Must include "
+            "``api_version: movate/v1`` and ``kind: Agent``."
+        ),
+    )
+    prompt: str = Field(..., min_length=1, description="Prompt body, inlined into prompt.md.")
+    schemas: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional explicit ``{input, output}`` JSON-Schema strings. "
+            "When omitted, the spec is expected to carry inline-shorthand "
+            "schemas under ``spec['schema']``."
+        ),
+    )
+
+
+class AgentCreateWizardRequest(BaseModel):
+    """``source: "wizard"`` — wraps the existing ``WizardAgentSubmission``
+    so the discriminated-union body can carry it.
+
+    The wizard form payload field MUST match the shape of
+    :class:`WizardAgentSubmission`; we accept it as ``dict`` here so
+    the dispatcher can re-parse it through the canonical wizard model
+    and reuse the existing translation pipeline byte-for-byte.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["wizard"] = "wizard"
+    wizard_form: dict[str, Any] = Field(
+        ...,
+        description="Wizard form payload — same shape as WizardAgentSubmission.",
+    )
+
+
+class AgentCreateLlmRequest(BaseModel):
+    """``source: "llm"`` — natural-language → agent.
+
+    Composes the scaffold-preview / eval-generator / judge-engineer /
+    unified-KB-ingest pipelines (depending on the optional flags) and
+    streams progress via SSE. Returns 202 + a ``job_id`` so the
+    caller can reconnect to the SSE stream if disconnected.
+
+    All composition targets are optional — when an upstream pipeline
+    isn't deployed, the corresponding stage emits a ``stage_skipped``
+    SSE event with a reason rather than aborting the run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["llm"] = "llm"
+    description: str = Field(
+        ...,
+        min_length=1,
+        description="Natural-language description of what the agent should do.",
+    )
+    shape: str | None = Field(
+        default=None,
+        description=(
+            "Optional shape hint (``rag``, ``tool-use``, ``planner``, ...). "
+            "When omitted the scaffold pipeline auto-detects from the "
+            "description."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description="Optional LiteLLM model id (e.g. ``openai/gpt-4o-mini``).",
+    )
+    rename_to: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional name override; otherwise slugified from description.",
+    )
+    auto_seed_kb: bool = Field(
+        default=False,
+        description="When true, seed a starter KB context via the unified KB ingest endpoint.",
+    )
+    include_evals: bool = Field(
+        default=False,
+        description="When true, generate an eval set via the Eval Generator.",
+    )
+    include_judge: bool = Field(
+        default=False,
+        description="When true, generate a judge agent via the Judge Engineer.",
+    )
+    budget_usd: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Optional cost ceiling for the LLM authoring pipeline.",
+    )
+
+
+class AgentCreateCatalogRequest(BaseModel):
+    """``source: "catalog"`` — clone-and-decouple from the agent catalog.
+
+    Looks up an entry in the movate catalog (or the tenant's private
+    namespace), unpacks the bundle, applies overrides, optionally
+    renames, and persists as a NEW agent — no auto-sync back to the
+    source (ADR 041 D6 decision: catalog clones are decoupled).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["catalog"] = "catalog"
+    slug: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Catalog slug (movate or private namespace).",
+    )
+    version: str | None = Field(
+        default=None,
+        description="Optional version pin; defaults to the catalog entry's latest.",
+    )
+    rename_to: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Rename the cloned agent. Defaults to the catalog slug.",
+    )
+    overrides: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional partial-merge overrides applied to the cloned "
+            "agent.yaml. E.g. ``{'model': {'provider': '...'}}``."
+        ),
+    )
+
+
+# Discriminated-union body — Pydantic v2 picks the right concrete
+# request type from the ``source`` field. We exclude the bundle variant
+# from JSON dispatch because its bytes arrive via multipart; the route
+# handler sniffs ``Content-Type`` and chooses the multipart path first.
+AgentCreateJsonRequest = Annotated[
+    AgentCreateSpecRequest
+    | AgentCreateWizardRequest
+    | AgentCreateLlmRequest
+    | AgentCreateCatalogRequest,
+    Field(discriminator="source"),
+]
+
+
+class AgentCreateAccepted(BaseModel):
+    """Async response for ``source: "llm"`` — 202 Accepted.
+
+    The job runs the multi-stage authoring pipeline behind the scenes;
+    the caller subscribes to ``stream_url`` for SSE progress events
+    and/or polls ``status_url`` for terminal state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status_url: str = Field(
+        ...,
+        description="URL to poll for terminal state (mirrors ``GET /jobs/{job_id}``).",
+    )
+    stream_url: str = Field(
+        ...,
+        description="SSE endpoint streaming the authoring pipeline events.",
+    )
+
+
+class UnifiedAgentCreatedView(BaseModel):
+    """Sync response for non-llm sources.
+
+    Identical to :class:`AgentCreatedView` in shape but adds
+    ``source`` (so the UI can tell which path produced the agent)
+    and ``project_id`` (which project the agent landed in).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["bundle", "spec", "wizard", "catalog"]
+    project_id: str
+    agent_name: str
+    version: str
+    description: str = ""
+    agent_dir: str
+    files_persisted: list[str]
+    published_version: str | None = None
+    changed: bool = True
+    attached: bool = Field(
+        default=False,
+        description=(
+            "Whether the agent was attached to the project via the "
+            "projects-storage layer. ``False`` when the storage "
+            "backend doesn't yet implement ``attach_agent_to_project`` "
+            "(degrades cleanly per the dependency note in the PR body)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Workflow API parity (ADR 037 D1) — wire types for ``/api/v1/workflows``.
+#
+# Mirrors the agent counterparts above row-for-row so the Angular client's
+# generated TypeScript types stay symmetric between the two resource kinds.
+# ``WorkflowSpec`` itself (the YAML schema) is intentionally NOT changed by
+# this PR — the wire types here only describe the registry envelope around
+# the bundle.
+# ---------------------------------------------------------------------------
+
+
+class WorkflowCreateRequest(BaseModel):
+    """``POST /api/v1/workflows`` JSON request body (file-list mode).
+
+    Mirrors :class:`WizardAgentSubmission`'s role for agents — the
+    non-multipart, JSON-friendly creation surface for clients that don't
+    want to deal with multipart-form encoding. The caller passes the raw
+    ``workflow.yaml`` text plus any other files (``schema/state.json``,
+    ``evals/dataset.jsonl``) keyed by relative path.
+
+    Multipart mode (``bundle`` upload OR individual file fields) is
+    served by the same endpoint and documented separately; this is the
+    pure-JSON shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_yaml: str = Field(..., description="The raw text of the workflow.yaml file.")
+    files: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Extra files keyed by canonical relative path (e.g. "
+            "``schema/state.json`` or ``evals/dataset.jsonl``). Workflow "
+            "bundles are narrower than agent bundles — only ``workflow.yaml`` "
+            "is required at the root; sibling files live under ``schema/`` "
+            "or ``evals/``."
+        ),
+    )
+
+
+class WorkflowView(BaseModel):
+    """One entry in the ``GET /api/v1/workflows`` catalog response.
+
+    Discovery shape — name + version + description metadata so the
+    Angular catalog can render a workflow tile without a follow-up
+    ``GET /api/v1/workflows/{name}``. Mirrors :class:`AgentCatalogItemView`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    """The CURRENT latest version (newest by ``created_at``)."""
+    description: str = ""
+    published_version: str | None = None
+    """The version with ``published=True``, when any. Distinct from
+    ``version`` so the UI can show "blessed != latest" drift (ADR 037 D1)."""
+    tags: list[str] = []
+    created_at: datetime
+    """When the latest version was published."""
+
+
+class WorkflowListResponse(BaseModel):
+    """``GET /api/v1/workflows`` response — list of workflows for the tenant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflows: list[WorkflowView]
+    count: int
+
+
+class WorkflowVersionView(BaseModel):
+    """One row in the durable workflow-registry version history.
+
+    Mirrors :class:`AgentVersionView`. Distinct from a workflow RUN —
+    this is the *definition* version history (the registry's immutable
+    ``(name, version)`` rows), surfaced by
+    ``GET /api/v1/workflows/{name}/versions``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    created_by: str | None = None
+    created_at: datetime
+    content_hash: str
+    is_current: bool = False
+    """True for the newest version (the one a versionless resolve picks
+    up). Exactly one row in a non-empty history is current."""
+    is_published: bool = False
+    """True for the version whose ``published`` flag is set (ADR 037 D1).
+    At most one row in a non-empty history is published. Distinct from
+    ``is_current`` so a UI can show "blessed != latest" drift."""
+
+
+class WorkflowVersionsView(BaseModel):
+    """``GET /api/v1/workflows/{name}/versions`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    versions: list[WorkflowVersionView]
+    count: int
+
+
+class WorkflowDetailView(BaseModel):
+    """``GET /api/v1/workflows/{name}`` response.
+
+    The workflow analogue of :class:`AgentDetailView` — everything the
+    Angular workflow-profile view needs in one round-trip. Includes the
+    parsed spec metadata, the canonical files manifest, and the registry
+    audit (``content_hash``, ``created_by``, ``created_at``).
+
+    NOT included (deferred to other endpoints):
+
+    * Run history — that's ``GET /api/v1/workflow-runs?workflow={name}``
+    * Per-node trace — that's ``GET /api/v1/runs/{id}/trace`` (ADR 024)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # --- Identity + metadata ---
+    name: str
+    version: str
+    description: str = ""
+    owner: str = ""
+    tags: list[str] = []
+
+    # --- Spec snapshot ---
+    entrypoint: str
+    """ID of the starting node in the workflow."""
+    state_schema_path: str
+    """Path to the state JSON schema, relative to workflow.yaml."""
+    nodes: list[dict[str, Any]] = []
+    """Parsed nodes from the workflow.yaml (untyped dicts so the wire
+    contract doesn't drift when the discriminated-union spec evolves)."""
+    edges: list[dict[str, Any]] = []
+    """Parsed edges."""
+
+    # --- Registry audit ---
+    content_hash: str
+    created_by: str | None = None
+    created_at: datetime
+    published_version: str | None = None
+    """The currently-published version (ADR 037 D1)."""
+    is_published: bool = False
+    """Whether ``version`` itself is the published one."""
+
+    # --- Canonical layout ---
+    files: list[str]
+    """Sorted list of bundle file paths (e.g. ``["workflow.yaml",
+    "schema/state.json"]``)."""
+
+
+class WorkflowCreatedView(BaseModel):
+    """``POST /api/v1/workflows`` response — canonical layout + spec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    workflow_dir: str
+    files_persisted: list[str]
+    published_version: str | None = None
+    """Registry version now serving as ``latest`` (may differ from
+    ``version`` on a content-vs-version collision — mirrors the agent
+    response). ``None`` only if the registry write was unavailable."""
+    changed: bool = True
+    """Whether this publish wrote new content (False for a no-op re-deploy
+    with byte-identical files)."""
+
+
+class WorkflowUpdatedView(BaseModel):
+    """``PUT /api/v1/workflows/{name}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    workflow_dir: str
+    files_persisted: list[str]
+    previous_version: str
+    published_version: str | None = None
+    changed: bool = True
+
+
+class WorkflowDeletedView(BaseModel):
+    """``DELETE /api/v1/workflows/{name}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    deleted_dir: str
+
+
+class WorkflowRevertSubmission(BaseModel):
+    """``POST /api/v1/workflows/{name}/revert`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_version: str
+    """The existing version to roll back to. 404 if no such version
+    exists for this workflow in this tenant."""
+
+
+class WorkflowRevertedView(BaseModel):
+    """``POST /api/v1/workflows/{name}/revert`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    """The new latest version after the revert."""
+    reverted_from: str
+    """The prior version whose bundle was re-published."""
+    previous_version: str
+    """Version that was latest immediately BEFORE this revert."""
+
+
+class WorkflowPublishedView(BaseModel):
+    """``POST /api/v1/workflows/{name}/publish`` response (ADR 037 D1).
+
+    Confirms the soft promote: the named version's ``published`` flag is
+    now ``True`` and every other version of the same name is now ``False``.
+    ``previous_published_version`` lets the UI label "promoted v0.3.0
+    (was v0.2.1)" without a second round-trip.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    published_version: str
+    previous_published_version: str | None = None
+
+
+class WorkflowValidationIssue(BaseModel):
+    """One finding from ``POST /api/v1/workflows/{name}/validate``.
+
+    Mirrors :class:`AgentValidationIssue` so the Angular UI's chip
+    rendering is symmetric across resources.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    severity: str
+    """One of ``"error"`` or ``"warning"``."""
+    message: str
+    hint: str = ""
+
+
+class WorkflowValidationView(BaseModel):
+    """``POST /api/v1/workflows/{name}/validate`` response.
+
+    Mirrors :class:`AgentValidationView`. Returns the structural-validation
+    findings (Pydantic + compiler — duplicate ids, missing entrypoint,
+    dangling edges). Cost forecast is omitted today (workflows have no
+    fixed token estimate; ADR 029 D4 will add this).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    errors: list[WorkflowValidationIssue]
+    warnings: list[WorkflowValidationIssue]
+
+
+# ---------------------------------------------------------------------------
+# Usage metering (ADR 036 D1) — ``GET /api/v1/usage``
+#
+# The billing-visibility companion to the agent-health ``/api/v1/report``
+# feed: per-tenant counters (requests, tokens, cost) over a time window, with
+# optional by-agent / by-provider breakdowns. Mirrors the ``ReportView`` style
+# (typed Pydantic shell over the ``core.reporting`` dataclasses) so the front
+# end + OpenAPI spec stay rich.
+# ---------------------------------------------------------------------------
+
+
+class UsageRollupView(BaseModel):
+    """A single grouped usage row — one agent, one provider, or the totals.
+
+    ``key`` carries the grouping value: tenant_id for the totals row, the
+    agent name for ``by_agent`` rows, the provider/model id for
+    ``by_provider`` rows. Empty string ``""`` is the deliberate sentinel for
+    older records that didn't capture the value — distinguishable from a
+    genuine "(unknown)" so the front end can render it explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(
+        ...,
+        description=(
+            "Grouping value: tenant_id (totals), agent name (by_agent), or "
+            "provider id (by_provider). '' = older record with no captured value."
+        ),
+    )
+    requests: int = Field(0, description="Count of runs in the window.")
+    tokens_in: int = Field(0, description="Sum of metrics.tokens.input.")
+    tokens_out: int = Field(0, description="Sum of metrics.tokens.output.")
+    cost_usd: float = Field(
+        0.0,
+        description=(
+            "Sum of metrics.cost_usd — the **estimated** cost from pricing.yaml, "
+            "NOT the actual provider invoice (ADR 036 §Risks)."
+        ),
+    )
+
+    @classmethod
+    def from_dataclass(cls, r: UsageRollup) -> UsageRollupView:
+        return cls(
+            key=r.key,
+            requests=r.requests,
+            tokens_in=r.tokens_in,
+            tokens_out=r.tokens_out,
+            cost_usd=r.cost_usd,
+        )
+
+
+class UsageView(BaseModel):
+    """``GET /api/v1/usage`` response (ADR 036 D1).
+
+    Per-tenant usage rollup over the requested time window — the billing /
+    spend-visibility feed. Built from the same per-run records the agent-health
+    report uses (ADR 024 ``RunRecord.metrics``); no new measurement plumbing.
+
+    Tenant scoping: non-admin keys always see their own tenant; admin keys may
+    pass ``tenant=<id>`` to read another tenant's rollup. Empty window → a
+    zeroed rollup (200), not a 500 — billing surfaces a $0 month explicitly.
+
+    NOTE: cost is the **estimated** cost from ``pricing.yaml`` at run time, NOT
+    the actual provider invoice. ADR 036 D3 (billing export) will document the
+    estimate↔actual gap when it ships.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str = Field(..., description="The tenant this rollup describes.")
+    window_days: int = Field(
+        30,
+        description="Time window in days; 0 = all-time. Default 30.",
+    )
+    agent_filter: str | None = Field(
+        None,
+        description="Set when the caller scoped the rollup to a single agent.",
+    )
+    totals: UsageRollupView
+    by_agent: list[UsageRollupView]
+    by_provider: list[UsageRollupView]
+
+    @classmethod
+    def from_usage(cls, usage: Usage) -> UsageView:
+        return cls(
+            tenant_id=usage.tenant_id,
+            window_days=usage.window_days,
+            agent_filter=usage.agent_filter,
+            totals=UsageRollupView.from_dataclass(usage.totals),
+            by_agent=[UsageRollupView.from_dataclass(r) for r in usage.by_agent],
+            by_provider=[UsageRollupView.from_dataclass(r) for r in usage.by_provider],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Describe / preview agent (ADR 032 D1) — wire types for
+# ``POST /api/v1/agents/preview``. The endpoint runs the same LLM-scaffold
+# generate+validate pipeline ``mdk init --llm`` runs (shared in
+# :mod:`movate.core.scaffold_preview`) and returns the candidate WITHOUT
+# committing it to disk or the runtime's storage. The front end commits via
+# the existing ``POST /agents`` / ``POST /agents/from-wizard`` once the
+# operator accepts the preview.
+# ---------------------------------------------------------------------------
+
+
+# Caps applied at the API layer so a misbehaving / malicious client can't drag
+# the endpoint into long requests or oversized provider calls. Description is
+# capped at 4 KB — long enough for a paragraph of intent, well below the
+# meta-prompt budget. Names track AgentSpec's regex (lowercase alphanumeric +
+# hyphens) at the load layer; we only bound length here.
+_DESCRIBE_MAX_DESCRIPTION_CHARS = 4000
+_DESCRIBE_MAX_NAME_LEN = 64
+_DESCRIBE_MAX_MODEL_LEN = 128
+
+
+class DescribeAgentRequest(BaseModel):
+    """``POST /api/v1/agents/preview`` request body (ADR 032 D1).
+
+    Describes an agent in natural language and returns the generated candidate
+    (``agent.yaml`` + ``prompt.md`` + schemas + sample evals + cost forecast)
+    so the Mova iO front end can preview before committing. The endpoint is
+    read-only — nothing is written to disk or to the runtime's storage. The
+    front end commits via the existing ``POST /agents`` / ``POST
+    /agents/from-wizard`` after preview.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(
+        ...,
+        min_length=1,
+        max_length=_DESCRIBE_MAX_DESCRIPTION_CHARS,
+        description=(
+            "Natural-language description of the agent. Capped at "
+            f"{_DESCRIBE_MAX_DESCRIPTION_CHARS} characters at the API "
+            "boundary so an oversized payload fails fast instead of "
+            "ballooning the provider call."
+        ),
+    )
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=_DESCRIBE_MAX_NAME_LEN,
+        description=(
+            "Slug the candidate's agent.yaml will declare. Same charset as "
+            "the canonical AgentSpec (lowercase alphanumeric + hyphens)."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=_DESCRIBE_MAX_MODEL_LEN,
+        description=(
+            "LiteLLM-style model id that DRIVES the scaffold call (e.g. "
+            "``openai/gpt-4o-mini-2024-07-18``). When unset, the runtime "
+            "picks the same default ``mdk init --llm`` uses."
+        ),
+    )
+    target_model: str | None = Field(
+        default=None,
+        max_length=_DESCRIBE_MAX_MODEL_LEN,
+        description=(
+            "Optional model string to embed in the GENERATED agent.yaml's "
+            "``model.provider``. Defaults to ``model`` when unset — useful "
+            "when the operator wants the scaffold driven by a cheap model "
+            "but the resulting agent to run on a more capable one."
+        ),
+    )
+    mock: bool = Field(
+        default=False,
+        description=(
+            "When true, the deterministic ``MockProvider`` is used instead "
+            "of a real LLM call. Useful for an offline preview / "
+            "smoke-test from the UI. No tokens spent; cost is reported as "
+            "the mock's zero usage."
+        ),
+    )
+    dry_run: bool = Field(
+        default=True,
+        description=(
+            "Reserved for forward-compat with a future ``persist`` option. "
+            "Today the endpoint is always read-only — passing ``false`` "
+            "still does not persist; commit via ``POST /agents`` instead. "
+            "The field exists so the front end can pin its intent in the "
+            "request log."
+        ),
+    )
+
+
+class DescribeAgentTokenUsageView(BaseModel):
+    """Token-usage view: input, output, cached-input (rolled over attempts).
+
+    Mirrors :class:`~movate.core.models.TokenUsage` as a flat, OpenAPI-friendly
+    response field so client codegen doesn't need to follow the persisted
+    model.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: int = 0
+    output: int = 0
+    cached_input: int = 0
+
+
+class DescribeAgentResponse(BaseModel):
+    """``POST /api/v1/agents/preview`` response body (ADR 032 D1).
+
+    Carries the validated candidate plus the cost forecast. The candidate is
+    a runnable agent bundle on the wire — the front end renders it
+    (``agent_yaml`` + ``prompt_md`` + schemas + sample evals) and commits via
+    ``POST /agents`` when the operator accepts.
+
+    ``preview`` is always ``true`` for now (the endpoint is read-only). It's
+    surfaced so a future ``persist`` mode (deferred per ADR 032) can flip it
+    to ``false`` without churning the schema.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    preview: bool = Field(
+        True,
+        description=(
+            "Always ``true`` today — the endpoint never persists. Reserved "
+            "for a future persist mode (ADR 032 deferred)."
+        ),
+    )
+    name: str = Field(..., description="Agent slug the candidate declares.")
+    target_model: str = Field(
+        ...,
+        description=(
+            "Model string the candidate's ``agent.yaml`` declares "
+            "(``model.provider``). May differ from the model that drove "
+            "generation."
+        ),
+    )
+    agent_yaml: dict[str, Any] = Field(
+        ...,
+        description="The candidate ``agent.yaml`` contents.",
+    )
+    prompt_md: str = Field(..., description="The candidate Jinja prompt template body.")
+    input_schema: dict[str, Any] = Field(
+        ..., description="JSON Schema 2020-12 for the input contract."
+    )
+    output_schema: dict[str, Any] = Field(
+        ..., description="JSON Schema 2020-12 for the output contract."
+    )
+    sample_evals: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "2-3 sample dataset rows the meta-prompt asks for. Empty list "
+            "is legal but produces a ``missing-evals`` audit finding when "
+            "the committed agent runs ``mdk audit``."
+        ),
+    )
+    tokens: DescribeAgentTokenUsageView = Field(
+        ...,
+        description=(
+            "Token usage rolled across every LLM call (attempt 1 + retry) "
+            "so the cost reflects total spend."
+        ),
+    )
+    cost_usd: float | None = Field(
+        None,
+        description=(
+            "Cost in USD looked up via the shipped pricing table. ``null`` "
+            "when the model isn't in the table — the front end renders "
+            "that as 'N/A' rather than failing the preview."
+        ),
+    )
+    retried: bool = Field(
+        False,
+        description=(
+            "True if attempt 2 fired (a retry happened). The front end may "
+            "use this to flag slightly-flakier-than-usual scaffolds."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Eval generator — ``POST /api/v1/agents/{name}/evals/generate``
+#
+# Wire shapes for the new generator job pattern (review-then-commit). The
+# persisted shape lives in :class:`movate.core.eval_generator.EvalGenerationJob`;
+# these are the HTTP-facing views, kept separate so the wire surface can
+# evolve independently of storage (same convention as JobView vs JobRecord).
+# ---------------------------------------------------------------------------
+
+
+class EvalGenerateRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/evals/generate`` request body.
+
+    Defaults mirror the eval-generator module constants: ``count=20``,
+    all three canonical categories, no judge, no budget cap. ``model``
+    is optional — when omitted, the route handler uses the target
+    agent's declared provider. ``budget_usd`` is a hard server-side
+    ceiling; the pipeline aborts cleanly if cost crosses it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(..., min_length=1, max_length=8000)
+    """Plain-English agent description Claude uses to author the cases."""
+    count: int = Field(default=20, ge=1, le=100)
+    """How many cases to generate. ``100`` is the hard cap; the
+    eval-generator module floors at ``1``."""
+    categories: list[str] | None = Field(default=None)
+    """Categories to include. ``None`` / empty defaults to all three
+    (``happy`` / ``edge`` / ``adversarial``). Unknown categories →
+    422 from the route handler."""
+    include_judge: bool = Field(default=False)
+    """When ``True`` an extra LLM call drafts a ``judge.yaml`` rubric."""
+    model: str | None = Field(default=None)
+    """Optional provider override (LiteLLM-style string). ``None`` ⇒
+    use the target agent's declared model."""
+    budget_usd: float | None = Field(default=None, ge=0.0)
+    """Hard server-side cost ceiling. ``None`` ⇒ no cap."""
+
+
+class GeneratedEvalCaseView(BaseModel):
+    """One generated eval case on the wire.
+
+    Mirrors :class:`movate.core.eval_generator.GeneratedEvalCase`
+    1:1; kept in the runtime schema module so the OpenAPI spec
+    advertises this exact shape to the Angular client.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    category: str
+    input: dict[str, Any]
+    expected: dict[str, Any] | None = None
+    rationale: str
+
+
+class PreviewScoreView(BaseModel):
+    """Informational ``--mock`` pass rate after generation.
+
+    Computed by the route handler running each generated case against
+    the agent under the mock provider. Doesn't fail the job — just
+    surfaces a sanity-check number the operator can use to spot a
+    schema-mismatched case set before they commit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mock_pass_rate: float = Field(..., ge=0.0, le=1.0)
+    tested_against_model: str = "mock"
+
+
+class EvalGenerationResultView(BaseModel):
+    """The terminal ``result`` payload of a completed generation job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cases: list[GeneratedEvalCaseView]
+    judge_yaml: str | None = None
+    preview_score: PreviewScoreView | None = None
+
+
+class EvalGenerateJobView(BaseModel):
+    """``GET /api/v1/jobs/{job_id}`` response for an eval-generation job.
+
+    Separate ``kind`` discriminator (``evals_generate``) from
+    :class:`JobView` so the Angular client can route between job-detail
+    views by the kind alone. The poll path is the same as for queue
+    jobs, but the response shape carries the generated cases (the
+    primary deliverable) instead of a ``result_run_id`` pointer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = "evals_generate"
+    job_id: str
+    agent_name: str
+    status: str  # running | completed | failed
+    progress: float = Field(0.0, ge=0.0, le=1.0)
+    result: EvalGenerationResultView | None = None
+    error: dict[str, Any] | None = None
+    tokens_used: int = 0
+    cost_usd: float = 0.0
+
+
+class EvalGenerateAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/evals/generate`` response (202).
+
+    The client polls ``status_url`` for progress (or subscribes to
+    ``stream_url`` for SSE). ``estimated_seconds`` is a rough hint
+    based on category count + per-call latency — not a guarantee.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: str = "running"
+    estimated_seconds: int
+    status_url: str
+    stream_url: str
+
+
+class EvalCommitRequest(BaseModel):
+    """``POST /api/v1/jobs/{job_id}/commit`` request body.
+
+    ``case_ids`` selective acceptance: ``None`` / omitted ⇒ commit
+    every case in the job. ``commit_judge`` writes the drafted
+    ``judge.yaml`` alongside; ignored when the job didn't draft one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_ids: list[str] | None = None
+    commit_judge: bool = False
+
+
+class EvalCommitView(BaseModel):
+    """``POST /api/v1/jobs/{job_id}/commit`` response.
+
+    Mirrors :class:`movate.storage.base.EvalCommitResult` — flat
+    shape, no envelope, so the Angular client can render the
+    "cases committed" toast directly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    dataset_path: str
+    cases_added: int
+    judge_yaml_updated: bool
+
+
+# ---------------------------------------------------------------------------
+# Failure Pattern Diagnoser (ADR 043 D1)
+#
+# POST /api/v1/agents/{name}/diagnose       eval  (async; returns 202)
+# GET  /api/v1/diagnoses/{diagnosis_id}     read  (poll for the result)
+#
+# Read-only with respect to agent state: the wire layer NEVER carries an
+# apply-side action. The typed-fix discriminated union below mirrors ADR
+# 043's seven fix kinds so the apply step in a later PR can dispatch on
+# ``kind`` without remapping. Adding a new kind here is an ADR 043
+# amendment, not a casual addition.
+# ---------------------------------------------------------------------------
+
+
+class DiagnoseRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/diagnose`` request body.
+
+    Caps + flags are conservative defaults; tightening them keeps the
+    diagnoser's spend predictable for a tenant with a high failure rate.
+    ``budget_usd`` is the HARD cap — the diagnoser short-circuits before
+    the LLM call if the pre-call estimate exceeds it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_days: int = Field(30, ge=1, le=365)
+    """Lookback window. Failures older than this are ignored."""
+    min_failure_count: int = Field(5, ge=1, le=1000)
+    """Cluster floor — clusters smaller than this are dropped client-side
+    when rendering. The diagnoser still considers them so a small but
+    high-confidence cluster (e.g. a confirmed security regression) isn't
+    silently lost."""
+    include_canary_misses: bool = Field(True)
+    include_eval_failures: bool = Field(True)
+    include_drift_detections: bool = Field(True)
+    max_clusters: int = Field(10, ge=1, le=50)
+    """Cap on clusters returned. Bigger numbers cost more tokens."""
+    model: str | None = Field(None)
+    """Optional provider/model override (e.g. ``"openai/gpt-4o-mini"``).
+    Defaults to the runtime's diagnoser default."""
+    budget_usd: float = Field(1.0, gt=0.0, le=100.0)
+    """Hard spend cap. The diagnoser raises if its pre-call estimate
+    exceeds this; the request fails with ``status="error"``."""
+
+
+class DiagnoseAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/diagnose`` response (202).
+
+    The diagnose work runs asynchronously inside the runtime process
+    (FastAPI background task) — no new worker / dispatch path. Poll
+    ``status_url`` until ``status == "completed"`` (or ``"error"``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    """The diagnosis id — usable as ``GET /api/v1/diagnoses/{id}``.
+    Named ``job_id`` on the wire to match the ADR 043 D1 spec."""
+    status: str = "running"
+    status_url: str
+    """Absolute path to poll for the result (``/api/v1/diagnoses/{id}``)."""
+
+
+# ---- Proposed-fix discriminated union (seven typed kinds) -----------------
+
+
+class _ProposedFixBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rationale: str
+    """One-paragraph why-this-fix explanation."""
+    expected_improvement: dict[str, Any] = Field(default_factory=dict)
+    """Optional ``{"metric": str, "delta": number, "based_on": str}``.
+    Empty dict when the diagnoser couldn't estimate (no fabrication)."""
+
+
+class PromptEditDiffView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    before: str = ""
+    after: str = ""
+    patch_text: str = ""
+
+
+class PromptEditFixView(_ProposedFixBase):
+    """Apply a unified diff to the agent's ``prompt.md``."""
+
+    kind: Literal["prompt_edit"] = "prompt_edit"
+    diff: PromptEditDiffView = Field(default_factory=PromptEditDiffView)
+
+
+class KbIngestPayloadView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    """The unified KB-ingest target kind, e.g. ``"url"`` / ``"file"``."""
+    source: str
+
+
+class KbIngestFixView(_ProposedFixBase):
+    """Ingest a new KB source via the unified KB ingest endpoint."""
+
+    kind: Literal["kb_ingest"] = "kb_ingest"
+    payload: KbIngestPayloadView
+
+
+class ContextAddFixView(_ProposedFixBase):
+    """Add a named context body to the agent."""
+
+    kind: Literal["context_add"] = "context_add"
+    name: str
+    body: str
+
+
+class ContextRemoveFixView(_ProposedFixBase):
+    """Remove a named context from the agent."""
+
+    kind: Literal["context_remove"] = "context_remove"
+    name: str
+
+
+class ModelSwapFixView(_ProposedFixBase):
+    """Swap the agent's provider/model to a different one."""
+
+    kind: Literal["model_swap"] = "model_swap"
+    provider: str
+
+
+class TemperatureChangeFixView(_ProposedFixBase):
+    """Adjust the agent's sampling temperature by ``delta``."""
+
+    kind: Literal["temperature_change"] = "temperature_change"
+    delta: float
+
+
+class RetrievalKChangeFixView(_ProposedFixBase):
+    """Adjust the agent's retrieval top-K by ``delta`` (integer)."""
+
+    kind: Literal["retrieval_k_change"] = "retrieval_k_change"
+    delta: int
+
+
+ProposedFixView = (
+    PromptEditFixView
+    | KbIngestFixView
+    | ContextAddFixView
+    | ContextRemoveFixView
+    | ModelSwapFixView
+    | TemperatureChangeFixView
+    | RetrievalKChangeFixView
+)
+
+
+class FailureClusterView(BaseModel):
+    """One root-cause cluster with its typed fix proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    summary: str
+    example_count: int = Field(..., ge=0)
+    example_run_ids: list[str] = Field(default_factory=list)
+    """Representative source ids — run_ids for the RUN/CANARY sources,
+    eval_ids for EVAL/DRIFT. Capped at 5 for response-size hygiene."""
+    confidence: Literal["high", "medium", "low"] = "medium"
+    proposed_fix: ProposedFixView = Field(..., discriminator="kind")
+
+
+class DiagnoseInputSummaryView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_failures_examined: int = Field(..., ge=0)
+    clusters_identified: int = Field(..., ge=0)
+    examples_per_cluster_max: int = Field(..., ge=0)
+
+
+class DiagnoseResultView(BaseModel):
+    """The structured analysis the GET endpoint returns when complete."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_summary: DiagnoseInputSummaryView
+    clusters: list[FailureClusterView] = Field(default_factory=list)
+
+
+class DiagnoseJobView(BaseModel):
+    """``GET /api/v1/diagnoses/{id}`` response.
+
+    Mirror of :class:`DiagnosisRecord` minus ``tenant_id`` (audit-only,
+    never returned over the wire — same convention as ``JobView`` /
+    ``RunView``). ``result`` is populated when ``status == "completed"``;
+    ``error`` is populated when ``status == "error"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["diagnose"] = "diagnose"
+    job_id: str
+    """Mirrors :attr:`DiagnosisRecord.diagnosis_id` on the wire as
+    ``job_id`` to match ADR 043 D1's spec."""
+    agent_name: str
+    status: DiagnosisStatus
+    result: DiagnoseResultView | None = None
+    error: ErrorInfo | None = None
+    tokens_used: int = Field(0, ge=0)
+    cost_usd: float = Field(0.0, ge=0.0)
+    model: str = ""
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    @classmethod
+    def from_record(cls, record: DiagnosisRecord) -> DiagnoseJobView:
+        result_view: DiagnoseResultView | None = None
+        if record.result is not None:
+            # Persisted as an opaque dict so the typed-fix taxonomy can
+            # evolve without a DB migration. Validate at the wire edge
+            # against the discriminated union — anything malformed is a
+            # bug surface (a downgrade of the schema, an operator
+            # manually editing the row) rather than user input.
+            result_view = DiagnoseResultView.model_validate(record.result)
+        return cls(
+            job_id=record.diagnosis_id,
+            agent_name=record.agent,
+            status=record.status,
+            result=result_view,
+            error=record.error,
+            tokens_used=record.tokens_used,
+            cost_usd=record.cost_usd,
+            model=record.model,
+            created_at=record.created_at,
+            completed_at=record.completed_at,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Claude-orchestrated audit endpoints (POST /api/v1/agents/{name}/audit/from-llm
+# + POST /api/v1/projects/{id}/audit/from-llm). Read-only by construction; the
+# Auditor (movate.core.auditor) never mutates the agent registry.
+# ---------------------------------------------------------------------------
+
+
+class AuditRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/audit/from-llm`` request body.
+
+    All fields are optional — an empty body runs every category at the
+    default severity floor against the tenant's default model. The
+    ``categories`` field is validated against the auditor's open
+    vocabulary in :data:`movate.core.auditor.CATEGORIES` server-side;
+    unknown categories are silently dropped (logged at warning).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[str] | None = Field(
+        default=None,
+        description=(
+            "Categories to run. Default is all seven the auditor ships: "
+            "ambiguous_prompts, missing_eval_coverage, security_smells, "
+            "cost_outliers, kb_quality, schema_drift, model_choice."
+        ),
+    )
+    severity_floor: AuditFindingSeverity = Field(
+        default=AuditFindingSeverity.INFO,
+        description="Findings below this severity are filtered out before persistence.",
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Override the audit sub-agents' provider string (LiteLLM-style, "
+            "e.g. 'openai/gpt-4o-mini'). Defaults to the tenant's audit "
+            "model — currently 'openai/gpt-4o-mini'."
+        ),
+    )
+    budget_usd: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Server-side spend cap. ``0.0`` disables the cap. When the "
+            "running spend would exceed this, remaining categories are "
+            "skipped + the audit is marked ``partial=true``."
+        ),
+    )
+
+
+class AuditAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/audit/from-llm`` response (202).
+
+    Async by default — returns immediately with ``job_id`` + the URLs
+    the client polls (``status_url``) and streams progress from
+    (``stream_url``). The final findings live at
+    ``GET /api/v1/audits/{audit_id}`` once the job's ``result_run_id``
+    is populated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: str = "queued"
+    status_url: str
+    """Pre-built ``GET /api/v1/jobs/{job_id}`` URL the client polls."""
+    stream_url: str
+    """Pre-built ``GET /api/v1/jobs/{job_id}/stream`` SSE URL for
+    incremental progress events. Audit-only — non-audit jobs do not
+    expose this endpoint."""
+
+
+class AuditFindingLocationView(BaseModel):
+    """Wire shape for :class:`movate.core.models.AuditFindingLocation`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    line: int | None = None
+    path: str | None = None
+    chunk_id: str | None = None
+
+
+class FindingView(BaseModel):
+    """Wire shape for one :class:`movate.core.models.AuditFinding`.
+
+    Mirrors :class:`AuditFinding`; kept separate so the wire and the
+    durable model can evolve independently (same convention as
+    :class:`JobView` vs :class:`JobRecord`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    category: str
+    severity: AuditFindingSeverity
+    agent_name: str
+    location: AuditFindingLocationView | None = None
+    title: str
+    description: str
+    suggestion: str
+    confidence: str = "medium"
+
+    @classmethod
+    def from_finding(cls, f: AuditFinding) -> FindingView:
+        loc: AuditFindingLocationView | None = None
+        if f.location is not None:
+            loc = AuditFindingLocationView(
+                kind=f.location.kind,
+                line=f.location.line,
+                path=f.location.path,
+                chunk_id=f.location.chunk_id,
+            )
+        return cls(
+            id=f.id,
+            category=f.category,
+            severity=f.severity,
+            agent_name=f.agent_name,
+            location=loc,
+            title=f.title,
+            description=f.description,
+            suggestion=f.suggestion,
+            confidence=f.confidence,
+        )
+
+
+class AuditSummaryView(BaseModel):
+    """Headline counts for one completed audit.
+
+    Both rollups are dicts (open key sets) so adding a new category or
+    severity doesn't require a schema bump on consumers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_findings: int
+    by_category: dict[str, int]
+    by_severity: dict[str, int]
+
+
+class AuditScopeView(BaseModel):
+    """``{"type": "agent" | "project", "id": "..."}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    id: str
+
+
+class AuditJobView(BaseModel):
+    """``GET /api/v1/audits/{audit_id}`` response — the rich, completed view.
+
+    The standard ``GET /api/v1/jobs/{job_id}`` continues to return
+    :class:`JobView` (back-compat); this is the dedicated audit view a
+    completed audit's findings live on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = "audit"
+    audit_id: str
+    scope: AuditScopeView
+    status: str = "completed"
+    categories: list[str]
+    severity_floor: AuditFindingSeverity
+    model: str
+    budget_usd: float
+    findings: list[FindingView]
+    summary: AuditSummaryView
+    partial: bool = False
+    tokens_used: int = 0
+    cost_usd: float = 0.0
+
+    @classmethod
+    def from_record(cls, record: AuditRecord) -> AuditJobView:
+        by_category: dict[str, int] = {}
+        by_severity: dict[str, int] = {}
+        for f in record.findings:
+            by_category[f.category] = by_category.get(f.category, 0) + 1
+            by_severity[f.severity.value] = by_severity.get(f.severity.value, 0) + 1
+        return cls(
+            kind="audit",
+            audit_id=record.audit_id,
+            scope=AuditScopeView(type=record.scope_kind, id=record.scope_id),
+            status="completed",
+            categories=list(record.categories),
+            severity_floor=record.severity_floor,
+            model=record.model,
+            budget_usd=record.budget_usd,
+            findings=[FindingView.from_finding(f) for f in record.findings],
+            summary=AuditSummaryView(
+                total_findings=len(record.findings),
+                by_category=by_category,
+                by_severity=by_severity,
+            ),
+            partial=record.partial,
+            tokens_used=record.tokens_used,
+            cost_usd=record.cost_usd,
         )

@@ -1,0 +1,43 @@
+api_version: movate/v1
+kind: Agent
+
+# TOOL/action (stub) node of the Monitor pattern. Fires ONLY on a breach
+# verdict and may take ONLY allowlisted actions (see ALLOWLIST.md). It is a
+# STUB: it emits the action it WOULD take. Wiring it to a real side-effecting
+# skill is a deliberate, reviewable step gated by the project's SkillPolicy.
+name: monitor-action
+version: 0.1.0
+description: Action (stub) — emits the allowlisted remediation it would take on breach.
+owner: ""
+role: actuator
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 256
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+# GOVERNANCE: tight cap — an action step should be cheap + deterministic.
+budget:
+  max_cost_usd_per_run: 0.05
+
+tags:
+  - pattern:monitor
+  - node:action
+  - action-allowlist
+  - governed

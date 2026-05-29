@@ -1,0 +1,73 @@
+api_version: movate/v1
+kind: Workflow
+
+# =============================================================================
+# Monitor pattern (ADR 038) — observe → VALIDATE/GATE threshold → action (stub)
+# =============================================================================
+# An observer reads a signal into a metric, a VALIDATE/GATE checks it against a
+# threshold, and on BREACH a TOOL/action node fires (a stubbed action). On OK
+# the workflow acknowledges and exits. Designed to be schedule/trigger-driven
+# (see schedule.yaml.example + GOVERNANCE.md).
+#
+# GOVERNANCE:
+#   * ACTION ALLOWLIST: the action node may only perform actions on an explicit
+#     allowlist (declared in agents/action/prompt.md + agents/action/ALLOWLIST.md).
+#     It is a STUB — it emits the action it WOULD take; wiring it to a real
+#     side-effecting skill is a deliberate, reviewable step gated by the
+#     project's SkillPolicy (skills.allowed_side_effects).
+#   * THRESHOLD GATE: the threshold-judge is the VALIDATE/GATE — the only path
+#     to the action node is through a breach verdict.
+#   * AUDIT NOTE: every breach→action is traced (one workflow-root span, each
+#     node nested) and the action node emits an audit-friendly record of what it
+#     did and why.
+#   * BUDGET CAP: every node carries budget.max_cost_usd_per_run.
+#
+# Mock note: under --mock the gate takes the first sorted route key (``breach``),
+# so the smoke exercises the breach→action path (the one that matters).
+
+name: monitor
+version: 0.1.0
+description: >
+  Observe a signal, gate it against a threshold, and on breach invoke an
+  allowlisted action (stub). Schedule/trigger-friendly.
+owner: ""
+
+state_schema: ./state.json
+entrypoint: observer
+
+nodes:
+  # OBSERVER — reads the incoming signal into a comparable metric.
+  - id: observer
+    type: agent
+    ref: ./agents/observer
+  # VALIDATE/GATE — threshold check. The only path to ``action`` is a breach.
+  - id: threshold-gate
+    type: intent-router
+    classifier_agent: ./agents/threshold-judge
+    input_field: metric
+    routes:
+      breach: action
+      ok: no-op
+    fallback: no-op
+  # TOOL/action (stub) — fires only on breach, only allowlisted actions.
+  - id: action
+    type: agent
+    ref: ./agents/action
+  # No-op terminal — acknowledges an in-threshold signal.
+  - id: no-op
+    type: agent
+    ref: ./agents/no-op
+
+edges:
+  - from: observer
+    to: threshold-gate
+
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+tags:
+  - pattern:monitor
+  - governed
+  - schedule-friendly
+  - action-allowlist

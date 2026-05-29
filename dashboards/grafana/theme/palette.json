@@ -1,0 +1,43 @@
+{
+  "$comment": "Movate brand palette for MDK Grafana dashboards. NOT an importable dashboard -- a machine-readable companion to README.md so the same hex values can be referenced from tooling / future dashboards. Grafana has no global 'theme variable' primitive, so the palette is applied per-panel (fieldConfig.color.fixedColor + thresholds[].color). See README.md 'How to apply' + 'How to retrofit'.",
+  "name": "movate",
+  "description": "Movate brand palette for executive + ops-wall MDK dashboards.",
+  "version": 1,
+  "colors": {
+    "primary": "#2D6CDF",
+    "primary_dark": "#1B3A8C",
+    "accent": "#5BC0EB",
+    "success": "#2BB673",
+    "warning": "#F2A93B",
+    "danger": "#D64550",
+    "danger_dark": "#7A1620",
+    "neutral_bg": "#11161D",
+    "neutral_panel": "#1A2129",
+    "text": "#E6EAF0",
+    "muted": "#8A94A6"
+  },
+  "semantic": {
+    "ok": "#2BB673",
+    "degraded": "#F2A93B",
+    "breached": "#D64550",
+    "info": "#2D6CDF",
+    "forecast": "#F2A93B"
+  },
+  "thresholds": {
+    "health_score": [
+      {"color": "#D64550", "value": null},
+      {"color": "#F2A93B", "value": 50},
+      {"color": "#2BB673", "value": 80}
+    ],
+    "success_rate": [
+      {"color": "#D64550", "value": null},
+      {"color": "#F2A93B", "value": 0.9},
+      {"color": "#2BB673", "value": 0.98}
+    ],
+    "error_budget_remaining": [
+      {"color": "#D64550", "value": null},
+      {"color": "#F2A93B", "value": 0.25},
+      {"color": "#2BB673", "value": 0.5}
+    ]
+  }
+}

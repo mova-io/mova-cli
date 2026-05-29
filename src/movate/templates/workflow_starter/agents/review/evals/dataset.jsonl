@@ -1,0 +1,2 @@
+{"input": {"draft": "Short feedback loops are good. They catch problems faster. Teams move faster."}, "expected": {"final": "Short feedback loops catch problems faster and let teams iterate with confidence — small wins that compound into meaningful velocity."}}
+{"input": {"draft": "Walking meetings are better than sitting. People focus more. Ideas flow."}, "expected": {"final": "Walking meetings replace stale rooms with movement and fresh air; they tend to be shorter, more focused, and surface ideas that wouldn't appear in a video grid."}}

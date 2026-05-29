@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["text", "labels"],
+  "properties": {
+    "text": {
+      "type": "string",
+      "description": "The metric to judge."
+    },
+    "labels": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "The allowed verdict labels (breach / ok)."
+    }
+  }
+}

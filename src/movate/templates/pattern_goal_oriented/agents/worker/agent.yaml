@@ -1,0 +1,39 @@
+api_version: movate/v1
+kind: Agent
+
+# WORKER node of the Goal-Oriented pattern. Refines the attempt each iteration.
+# Shared by both unrolled iterations (worker-1, worker-2).
+name: goal-oriented-worker
+version: 0.1.0
+description: Worker — refines the attempt toward the goal on each iteration.
+owner: ""
+role: worker
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.2
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - pattern:goal-oriented
+  - node:worker
+  - governed

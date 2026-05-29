@@ -48,8 +48,10 @@ jobs:
       - name: Sync deps
         # --all-extras pulls in litellm/openai/anthropic/langchain so
         # every runtime is wired for the validate step's
-        # runtime-availability probe.
-        run: uv sync --all-extras --dev
+        # runtime-availability probe. --no-extra airflow: airflow and
+        # playground are declared conflicting (sqlalchemy<2 vs >=2), so
+        # `--all-extras` alone errors; airflow isn't needed for validation.
+        run: uv sync --all-extras --no-extra airflow --dev
 
       - name: Validate every agent
         # `find` rather than hardcoding agent names so adding a new

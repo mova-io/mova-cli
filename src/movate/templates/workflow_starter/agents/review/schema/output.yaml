@@ -1,0 +1,20 @@
+# ============================================================================
+# Review node — output schema
+# ============================================================================
+# The review node returns a polished `final` paragraph that becomes the
+# terminal result of the workflow.
+
+version: 1
+type: object
+
+title: Review Node Output
+
+fields:
+
+  final:
+    type: string
+    description: Polished final paragraph — the terminal workflow output.
+    example: Spending time outdoors lifts mood, improves sleep, and lowers stress — three concrete reasons to step outside today.
+
+required:
+  - final

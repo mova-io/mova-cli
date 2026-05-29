@@ -1,0 +1,8 @@
+title: Lead qualifier
+description: Inbound lead to BANT scoring plus a next-best-action and objections list.
+shape: agent
+tags:
+  - sales
+  - scoring
+  - structured-output
+recommended_for: Scoring inbound sales leads on a fixed rubric and recommending the next motion.

@@ -1,0 +1,23 @@
+# ============================================================================
+# MDK Canonical Schema — Chatbot pattern (output)
+# ============================================================================
+# The output contract IS part of the governance envelope: the executor
+# validates the reply against this schema and fails the run on a
+# non-conforming response.
+
+version: 1
+type: object
+
+title: Chat Turn (Output)
+description: The assistant's reply for this turn.
+
+fields:
+
+  reply:
+    type: markdown
+    description: The assistant's reply for this turn.
+    min_length: 1
+    example: You can export to CSV from Settings → Data → Export → choose CSV.
+
+required:
+  - reply

@@ -8,13 +8,14 @@ will be added in their respective phases.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
 from movate.core.dr_backup import ImportResult
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     _DEFAULT_PROJECT_DESCRIPTION,
@@ -23,11 +24,20 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
+    AuditFinding,
+    AuditFindingSeverity,
+    AuditRecord,
     BatchRecord,
     BenchModelResult,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogEntryVersion,
+    CatalogRatingsSummary,
+    CatalogSource,
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     Entity,
     EntityWithScore,
     ErrorInfo,
@@ -55,9 +65,12 @@ from movate.core.models import (
     TenantProviderKey,
     Trigger,
     TurnRecord,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -428,6 +441,30 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name ON agent_bundles(tenant_id, name)",
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created "
     "ON agent_bundles(tenant_id, name, created_at DESC)",
+    # ADR 037 D1: durable workflow registry. Mirrors agent_bundles row-for-row
+    # so the API CRUD/version/publish surface is symmetric with agents. One
+    # immutable (name, version) row per publish, tenant-scoped; ``files`` is
+    # JSON-encoded TEXT (same strategy as agent_bundles.files). ``published``
+    # is the soft promote/revert flag (ADR 037 D1) — at most one True per
+    # (tenant, name) at any time, enforced by publish_workflow_version. New
+    # table → lands here in the ordered migration list; additive, idempotent
+    # CREATE TABLE IF NOT EXISTS, never an ALTER.
+    """
+    CREATE TABLE IF NOT EXISTS workflow_bundles (
+        name          TEXT NOT NULL,
+        tenant_id     TEXT NOT NULL,
+        version       TEXT NOT NULL,
+        created_by    TEXT,
+        content_hash  TEXT NOT NULL,
+        files         TEXT NOT NULL,
+        published     INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, name, version)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name ON workflow_bundles(tenant_id, name)",
+    "CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name_created "
+    "ON workflow_bundles(tenant_id, name, created_at DESC)",
     # ADR 016 D2: continuous-eval schedules. One row per (tenant, agent) with
     # a cadence; the scheduler tick enqueues EVAL jobs for due rows. Additive
     # + idempotent (CREATE TABLE IF NOT EXISTS) — default-off, no backfill.
@@ -752,6 +789,286 @@ _MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_project_kbs_project ON project_kbs(project_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_kbs_kb_id ON project_kbs(kb_id)",
+    # ADR 041: Agent catalog. Three namespaces (movate / private / community)
+    # in one schema, distinguished by ``source``; the read API joins
+    # ``movate`` + the caller's ``private`` + (future) ``community``. The
+    # ``tenant_id_key`` column is a generated computed key over (tenant_id,
+    # '') so a NULL tenant for public entries still participates in the
+    # composite PRIMARY KEY (sqlite's PK semantics ignore NULL otherwise).
+    # ``tags`` is stored as JSON text (a list[str]) — the gin-equivalent
+    # filter is "JSON_EACH" in queries. ``ratings_summary`` is JSON text.
+    # Bundle bytes live in ``catalog_entry_versions.bundle_tar`` (BLOB).
+    """
+    CREATE TABLE IF NOT EXISTS catalog_entries (
+        slug             TEXT NOT NULL,
+        source           TEXT NOT NULL CHECK (source IN ('movate','private','community')),
+        tenant_id        TEXT,
+        tenant_id_key    TEXT NOT NULL,
+        latest_version   TEXT NOT NULL,
+        name             TEXT NOT NULL,
+        title            TEXT NOT NULL,
+        description      TEXT NOT NULL,
+        tags             TEXT NOT NULL DEFAULT '[]',
+        shape            TEXT,
+        recommended_for  TEXT,
+        ratings_summary  TEXT NOT NULL DEFAULT '{"count": 0, "avg": 0.0}',
+        popularity       INTEGER NOT NULL DEFAULT 0,
+        synced_at        TEXT NOT NULL,
+        PRIMARY KEY (slug, source, tenant_id_key),
+        CHECK (
+            (source = 'private' AND tenant_id IS NOT NULL)
+            OR (source IN ('movate','community') AND tenant_id IS NULL)
+        )
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entries_source_tenant "
+    "ON catalog_entries(source, tenant_id)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entries_shape ON catalog_entries(shape)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entries_synced_at ON catalog_entries(synced_at DESC)",
+    # Per-version table — the bundle bytes live here, fetched lazily on add.
+    # PK (slug, source, version, tenant_id_key) — re-publishing the same
+    # version overwrites the prior row (idempotent re-sync).
+    """
+    CREATE TABLE IF NOT EXISTS catalog_entry_versions (
+        slug          TEXT NOT NULL,
+        version       TEXT NOT NULL,
+        source        TEXT NOT NULL,
+        tenant_id     TEXT,
+        tenant_id_key TEXT NOT NULL,
+        bundle_tar    BLOB NOT NULL,
+        digest        TEXT NOT NULL,
+        published_at  TEXT NOT NULL,
+        deprecated_at TEXT,
+        PRIMARY KEY (slug, source, version, tenant_id_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_versions_slug_source "
+    "ON catalog_entry_versions(slug, source)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_versions_published "
+    "ON catalog_entry_versions(published_at DESC)",
+    # One rating per tenant per entry. Re-rating overwrites in place.
+    """
+    CREATE TABLE IF NOT EXISTS catalog_entry_ratings (
+        slug       TEXT NOT NULL,
+        source     TEXT NOT NULL,
+        tenant_id  TEXT NOT NULL,
+        rating     INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+        comment    TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (slug, source, tenant_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_ratings_slug ON catalog_entry_ratings(slug)",
+    "CREATE INDEX IF NOT EXISTS idx_catalog_entry_ratings_tenant "
+    "ON catalog_entry_ratings(tenant_id)",
+    # Per-source sync watermark. One row per source — the last successful
+    # sync timestamp. Drives the incremental ``?since=`` request to
+    # catalog.movate.io (ADR 041 D4).
+    """
+    CREATE TABLE IF NOT EXISTS catalog_sync_watermark (
+        source           TEXT PRIMARY KEY,
+        last_synced_at   TEXT NOT NULL
+    )
+    """,
+    # ADR 047: observability insights — the overnight analyst's daily,
+    # pre-aggregated telemetry summary per (tenant, project, date). APPEND-ONLY:
+    # a re-run for a day INSERTs a new row (keyed by the unique ``id``); reads
+    # take the latest row per (tenant, project, date). The four JSON columns
+    # (anomalies / top_failures / usage_rollup / trends) are json.dumps'd on
+    # save + json.loads'd on read, same strategy as runs.metrics. Additive new
+    # table (CREATE TABLE IF NOT EXISTS, idempotent) — default-off, no backfill.
+    """
+    CREATE TABLE IF NOT EXISTS observability_insights (
+        id               TEXT PRIMARY KEY,
+        tenant_id        TEXT NOT NULL,
+        project_id       TEXT NOT NULL,
+        date             TEXT NOT NULL,
+        health_score     REAL NOT NULL,
+        anomalies        TEXT NOT NULL,
+        top_failures     TEXT NOT NULL,
+        usage_rollup     TEXT NOT NULL,
+        trends           TEXT NOT NULL,
+        narrative_digest TEXT NOT NULL,
+        created_at       TEXT NOT NULL
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_observability_insights_tpd "
+        "ON observability_insights(tenant_id, project_id, date)"
+    ),
+    # ADR 035 D1 — events outbox. Domain events (run.completed,
+    # agent.published, eval.failed, drift.detected, canary.promoted/demoted,
+    # ...) are recorded at the runtime edges and served by ``GET
+    # /api/v1/events``. Additive new table (CREATE TABLE IF NOT EXISTS,
+    # idempotent) — no row exists unless an emit happened, so non-event
+    # behavior is byte-for-byte unchanged. ``tenant_id NOT NULL`` matches
+    # the rest of the schema (ADR 013/014). ``data`` holds json.dumps(...)
+    # — same TEXT-for-JSON strategy as runs.metrics / kb_chunks.metadata.
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        id          TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        subject     TEXT NOT NULL,
+        data        TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+    )
+    """,
+    # Index for the common time-range list ``WHERE tenant_id=? AND
+    # created_at >=? ORDER BY created_at`` — the default ``GET
+    # /api/v1/events`` shape.
+    ("CREATE INDEX IF NOT EXISTS idx_events_tenant_created ON events(tenant_id, created_at)"),
+    # Index for the kind-filter list ``WHERE tenant_id=? AND kind=? AND
+    # created_at>=?`` — supports the kind-subscribed front-end view that
+    # D2/D3 will also lean on.
+    (
+        "CREATE INDEX IF NOT EXISTS idx_events_tenant_kind_created "
+        "ON events(tenant_id, kind, created_at)"
+    ),
+    # ADR 035 D2 — webhook subscriptions (outbound delivery). One row per
+    # configured subscriber; the secret is STORED (not hashed) so the
+    # worker can re-sign every outbound POST. Additive new table — a row
+    # exists only when the tenant POSTs ``/api/v1/webhooks``, so pre-D2
+    # behavior is byte-for-byte unchanged. ``tenant_id NOT NULL`` matches
+    # the rest of the schema; ``kind_filter`` is a JSON list (TEXT) for
+    # backend portability.
+    """
+    CREATE TABLE IF NOT EXISTS webhooks (
+        id            TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        url           TEXT NOT NULL,
+        kind_filter   TEXT NOT NULL,
+        secret        TEXT NOT NULL,
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks(tenant_id)",
+    # ADR 035 D2 — per-attempt delivery log (one row per
+    # (webhook_id, event_id, attempt_n) triple). Bounded
+    # ``response_excerpt`` keeps a misbehaving subscriber from
+    # ballooning the table.
+    """
+    CREATE TABLE IF NOT EXISTS webhook_attempts (
+        id                TEXT PRIMARY KEY,
+        webhook_id        TEXT NOT NULL,
+        event_id          TEXT NOT NULL,
+        tenant_id         TEXT NOT NULL,
+        attempted_at      TEXT NOT NULL,
+        status_code       INTEGER,
+        response_excerpt  TEXT,
+        error_kind        TEXT NOT NULL,
+        attempt_n         INTEGER NOT NULL
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_webhook_attempts_tenant_at "
+        "ON webhook_attempts(tenant_id, attempted_at)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_webhook_attempts_webhook_at "
+        "ON webhook_attempts(webhook_id, attempted_at)"
+    ),
+    # ADR 035 D2 — per-webhook delivery cursor. One row per subscription
+    # (``webhook_id`` PK); ``last_event_id`` is the most recently
+    # processed event id. Per-webhook cursor (vs a single global one)
+    # avoids re-delivering everyone's events when a new subscriber
+    # signs up.
+    """
+    CREATE TABLE IF NOT EXISTS webhook_cursors (
+        webhook_id    TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        last_event_id TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webhook_cursors_tenant ON webhook_cursors(tenant_id)",
+    # Eval-generation jobs (``mdk eval generate``). Runtime-resident,
+    # SSE-driven; persistence is so the status GET + commit endpoint can
+    # read back what generation produced. Additive new table, idempotent
+    # (CREATE TABLE IF NOT EXISTS) — no row exists unless a caller hit
+    # the generate endpoint. ``result`` is a JSON-encoded
+    # :class:`GenerationResult` (cases + judge + cost) populated when the
+    # pipeline finishes; ``error`` is populated on failure. Both NULL
+    # while ``status='running'``.
+    """
+    CREATE TABLE IF NOT EXISTS eval_generation_jobs (
+        job_id          TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        agent_name      TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        description     TEXT NOT NULL,
+        count_requested INTEGER NOT NULL,
+        categories      TEXT NOT NULL,
+        include_judge   INTEGER NOT NULL DEFAULT 0,
+        model           TEXT NOT NULL,
+        budget_usd      REAL,
+        progress        REAL NOT NULL DEFAULT 0.0,
+        result          TEXT,
+        error           TEXT,
+        tokens_used     INTEGER NOT NULL DEFAULT 0,
+        cost_usd        REAL NOT NULL DEFAULT 0.0,
+        created_at      TEXT NOT NULL,
+        completed_at    TEXT
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_eval_gen_jobs_tenant_created "
+        "ON eval_generation_jobs(tenant_id, created_at DESC)"
+    ),
+    # ADR 043 D1: Failure Pattern Diagnoser results. One row per diagnose
+    # request; upsert on diagnosis_id so the runtime's background task can
+    # transition a row from ``running`` to ``completed`` without a separate
+    # update method. ``request`` / ``result`` are JSON blobs in TEXT (no
+    # native JSON type in sqlite); the typed-fix taxonomy is validated at
+    # the wire edge so adding a new fix kind later doesn't require a
+    # storage migration. Read-only with respect to agent state — persisting
+    # a row never modifies the agent.
+    """
+    CREATE TABLE IF NOT EXISTS diagnoses (
+        diagnosis_id  TEXT PRIMARY KEY,
+        tenant_id     TEXT NOT NULL,
+        agent         TEXT NOT NULL,
+        status        TEXT NOT NULL,
+        request       TEXT NOT NULL,
+        result        TEXT,
+        error         TEXT,
+        tokens_used   INTEGER NOT NULL DEFAULT 0,
+        cost_usd      REAL NOT NULL DEFAULT 0.0,
+        model         TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL,
+        completed_at  TEXT
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_diagnoses_agent_created "
+        "ON diagnoses(tenant_id, agent, created_at DESC)"
+    ),
+    # Claude-orchestrated audit records (read-only audit pipeline). One
+    # immutable row per terminal audit, keyed by audit_id, tenant-scoped at
+    # the row level. ``findings`` + ``categories`` are JSON-encoded TEXT —
+    # same strategy as bench.models / workflow_runs.initial_state. Additive
+    # + idempotent (CREATE TABLE IF NOT EXISTS); no backfill needed.
+    """
+    CREATE TABLE IF NOT EXISTS audits (
+        audit_id        TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        scope_kind      TEXT NOT NULL,
+        scope_id        TEXT NOT NULL,
+        categories      TEXT NOT NULL,
+        severity_floor  TEXT NOT NULL,
+        model           TEXT NOT NULL,
+        budget_usd      REAL NOT NULL,
+        findings        TEXT NOT NULL,
+        partial         INTEGER NOT NULL DEFAULT 0,
+        tokens_used     INTEGER NOT NULL DEFAULT 0,
+        cost_usd        REAL NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_audits_scope_created "
+    "ON audits(tenant_id, scope_id, created_at DESC)",
 ]
 
 
@@ -788,6 +1105,67 @@ def _row_to_entity(r: Any) -> Entity:
         source_chunk_ids=json.loads(r["source_chunk_ids"]) if r["source_chunk_ids"] else [],
         metadata=json.loads(r["metadata"]) if r["metadata"] else None,
         created_at=datetime.fromisoformat(r["created_at"]),
+    )
+
+
+def _tenant_key(tenant_id: str | None) -> str:
+    """Encode ``tenant_id`` into a non-null PK component for catalog tables.
+
+    SQLite's PRIMARY KEY ignores NULL when checking uniqueness, so two
+    public-namespace rows with the same slug + source + NULL tenant_id
+    would silently both insert. Stamping a sentinel (``__public__``)
+    into a non-null companion column keeps the composite PK uniqueness
+    guarantee intact for public entries while preserving ``tenant_id``
+    itself as NULL for the read API."""
+
+    return tenant_id if tenant_id is not None else "__public__"
+
+
+def _enforce_catalog_namespace(source: CatalogSource, tenant_id: str | None) -> None:
+    """The same invariant the DB CHECK constraint enforces — raised early
+    so callers get a clear Python error instead of an opaque SQL one."""
+
+    if source is CatalogSource.PRIVATE:
+        if not tenant_id:
+            raise ValueError("catalog 'private' entries require tenant_id")
+    elif tenant_id is not None:
+        raise ValueError(f"catalog '{source.value}' entries must have tenant_id=None")
+
+
+_RATING_MIN = 1
+_RATING_MAX = 5
+
+
+def _row_to_catalog_entry(r: Any) -> CatalogEntry:
+    summary_raw = r["ratings_summary"]
+    summary = CatalogRatingsSummary.model_validate(json.loads(summary_raw))
+    return CatalogEntry(
+        slug=r["slug"],
+        source=CatalogSource(r["source"]),
+        tenant_id=r["tenant_id"],
+        latest_version=r["latest_version"],
+        name=r["name"],
+        title=r["title"],
+        description=r["description"],
+        tags=json.loads(r["tags"]) if r["tags"] else [],
+        shape=r["shape"],
+        recommended_for=r["recommended_for"],
+        ratings_summary=summary,
+        popularity=int(r["popularity"]),
+        synced_at=datetime.fromisoformat(r["synced_at"]),
+    )
+
+
+def _row_to_catalog_entry_version(r: Any) -> CatalogEntryVersion:
+    return CatalogEntryVersion(
+        slug=r["slug"],
+        version=r["version"],
+        source=CatalogSource(r["source"]),
+        tenant_id=r["tenant_id"],
+        bundle_tar=bytes(r["bundle_tar"]),
+        digest=r["digest"],
+        published_at=datetime.fromisoformat(r["published_at"]),
+        deprecated_at=(datetime.fromisoformat(r["deprecated_at"]) if r["deprecated_at"] else None),
     )
 
 
@@ -1035,6 +1413,96 @@ class SqliteProvider:
             row = await cur.fetchone()
         return _row_to_eval(row) if row else None
 
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — append-only.
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        # INSERT-only (never UPDATE): a re-run for the same day appends a new
+        # row keyed by the unique ``id``; the read methods take the latest.
+        await self._db.execute(
+            """
+            INSERT INTO observability_insights (
+                id, tenant_id, project_id, date, health_score,
+                anomalies, top_failures, usage_rollup, trends,
+                narrative_digest, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                insight.id,
+                insight.tenant_id,
+                insight.project_id,
+                insight.date.isoformat(),
+                insight.health_score,
+                json.dumps(insight.anomalies),
+                json.dumps(insight.top_failures),
+                json.dumps(insight.usage_rollup),
+                json.dumps(insight.trends),
+                insight.narrative_digest,
+                insight.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        # Latest-per-day: ORDER BY created_at DESC LIMIT 1 collapses
+        # append-only re-runs to the newest row. tenant_id in WHERE is the
+        # SQL-layer no-leak enforcement.
+        async with self._db.execute(
+            """
+            SELECT * FROM observability_insights
+            WHERE tenant_id = ? AND project_id = ? AND date = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (tenant_id, project_id, day.isoformat()),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_insight(row) if row else None
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        clauses = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if since is not None:
+            clauses.append("date >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("date <= ?")
+            params.append(until.isoformat())
+        sql = (
+            "SELECT * FROM observability_insights WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY date DESC, created_at DESC"
+        )
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        # Collapse append-only re-runs to the latest row per (project, date).
+        # Rows arrive newest-created first, so the first sighting of a
+        # (project, date) is the latest one.
+        seen: set[tuple[str, str]] = set()
+        out: list[ObservabilityInsight] = []
+        for r in rows:
+            key = (r["project_id"], r["date"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(_row_to_insight(r))
+            if len(out) >= limit:
+                break
+        return out
+
     async def save_bench(self, b: BenchRecord) -> None:
         await self._db.execute(
             "INSERT INTO bench VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1085,6 +1553,69 @@ class SqliteProvider:
         async with self._db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Audit records (Claude-orchestrated read-only audit pipeline).
+    #
+    # One immutable row per terminal audit. Audit data is JSON-encoded
+    # (categories + findings) — same strategy as bench.models /
+    # workflow_runs.initial_state. Read-only on the application side:
+    # the audit pipeline NEVER calls save_agent_bundle / save_kb_chunk /
+    # save_eval; the only write it makes is here.
+    # ------------------------------------------------------------------
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        await self._db.execute(
+            "INSERT INTO audits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                a.audit_id,
+                a.tenant_id,
+                a.scope_kind,
+                a.scope_id,
+                json.dumps(a.categories),
+                a.severity_floor.value,
+                a.model,
+                a.budget_usd,
+                json.dumps([f.model_dump() for f in a.findings]),
+                1 if a.partial else 0,
+                a.tokens_used,
+                a.cost_usd,
+                a.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        async with self._db.execute(
+            "SELECT * FROM audits WHERE audit_id = ? AND tenant_id = ? LIMIT 1",
+            (audit_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_audit(row) if row else None
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        sql = "SELECT * FROM audits"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_audit(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Eval schedules (ADR 016 D2)
@@ -1989,6 +2520,438 @@ class SqliteProvider:
             row = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
             assert row is not None  # invariant after race
             return row
+
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041)
+    # ------------------------------------------------------------------
+
+    async def upsert_catalog_entry(self, entry: CatalogEntry) -> None:
+        _enforce_catalog_namespace(entry.source, entry.tenant_id)
+        tkey = _tenant_key(entry.tenant_id)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entries (
+                slug, source, tenant_id, tenant_id_key, latest_version,
+                name, title, description, tags, shape, recommended_for,
+                ratings_summary, popularity, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug, source, tenant_id_key) DO UPDATE SET
+                latest_version  = excluded.latest_version,
+                name            = excluded.name,
+                title           = excluded.title,
+                description     = excluded.description,
+                tags            = excluded.tags,
+                shape           = excluded.shape,
+                recommended_for = excluded.recommended_for,
+                ratings_summary = excluded.ratings_summary,
+                popularity      = excluded.popularity,
+                synced_at       = excluded.synced_at
+            """,
+            (
+                entry.slug,
+                entry.source.value,
+                entry.tenant_id,
+                tkey,
+                entry.latest_version,
+                entry.name,
+                entry.title,
+                entry.description,
+                json.dumps(list(entry.tags)),
+                entry.shape,
+                entry.recommended_for,
+                json.dumps(entry.ratings_summary.model_dump()),
+                entry.popularity,
+                entry.synced_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        await self._db.execute(
+            "INSERT INTO workflow_bundles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                bundle.name,
+                bundle.tenant_id,
+                bundle.version,
+                bundle.created_by,
+                bundle.content_hash,
+                json.dumps(bundle.files),
+                1 if bundle.published else 0,
+                bundle.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_catalog_entry(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> CatalogEntry | None:
+        # For private, NULL tenant_id can never resolve to a stored row (the
+        # PK uses a non-null tenant_id_key, and the schema CHECK forbids NULL
+        # tenant_id on private). Short-circuit cleanly so callers can pass
+        # tenant_id=None for the public namespaces.
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        async with self._db.execute(
+            "SELECT * FROM catalog_entries "
+            "WHERE slug = ? AND source = ? AND tenant_id_key = ? LIMIT 1",
+            (slug, source.value, tkey),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_catalog_entry(row) if row else None
+
+    async def list_catalog_entries(
+        self,
+        tenant_id: str,
+        *,
+        source_filter: CatalogSource | None = None,
+        tag_filter: str | None = None,
+        shape_filter: str | None = None,
+        q: str | None = None,
+        limit: int = 100,
+        after_slug: str | None = None,
+    ) -> list[CatalogEntry]:
+        # Visibility: movate (any tenant) + private (caller) + community.
+        clauses: list[str] = [
+            "(source = 'movate' OR (source = 'private' AND tenant_id = ?) OR source = 'community')"
+        ]
+        params: list[object] = [tenant_id]
+
+        if source_filter is not None:
+            clauses.append("source = ?")
+            params.append(source_filter.value)
+        if shape_filter is not None:
+            clauses.append("shape = ?")
+            params.append(shape_filter)
+        if tag_filter is not None:
+            # JSON_EACH(tags) iterates the JSON list; the EXISTS subquery
+            # asserts membership.
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(catalog_entries.tags) WHERE json_each.value = ?)"
+            )
+            params.append(tag_filter)
+        if q:
+            needle = f"%{q.lower()}%"
+            clauses.append(
+                "(LOWER(name) LIKE ? OR LOWER(title) LIKE ? OR LOWER(description) LIKE ?)"
+            )
+            params.extend([needle, needle, needle])
+        if after_slug is not None:
+            clauses.append("slug > ?")
+            params.append(after_slug)
+
+        sql = (
+            "SELECT * FROM catalog_entries WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY slug ASC LIMIT ?"
+        )
+        params.append(int(limit))
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_catalog_entry(r) for r in rows]
+
+    async def get_catalog_entry_versions(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> list[CatalogEntryVersion]:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return []
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        async with self._db.execute(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = ? AND source = ? AND tenant_id_key = ? "
+            "ORDER BY published_at DESC",
+            (slug, source.value, tkey),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_catalog_entry_version(r) for r in rows]
+
+    async def get_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion | None:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        async with self._db.execute(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = ? AND source = ? AND version = ? AND tenant_id_key = ? "
+            "LIMIT 1",
+            (slug, source.value, version, tkey),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_catalog_entry_version(row) if row else None
+
+    async def upsert_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        bundle_tar: bytes,
+        digest: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion:
+        _enforce_catalog_namespace(source, tenant_id)
+        tkey = _tenant_key(tenant_id)
+        now = datetime.now(UTC)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entry_versions (
+                slug, version, source, tenant_id, tenant_id_key,
+                bundle_tar, digest, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug, source, version, tenant_id_key) DO UPDATE SET
+                bundle_tar = excluded.bundle_tar,
+                digest     = excluded.digest
+            """,
+            (
+                slug,
+                version,
+                source.value,
+                tenant_id,
+                tkey,
+                bundle_tar,
+                digest,
+                now.isoformat(),
+            ),
+        )
+        await self._db.commit()
+        # Re-read to get the stamped published_at (a first insert uses ``now``
+        # above; a subsequent upsert preserves the original published_at).
+        async with self._db.execute(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = ? AND source = ? AND version = ? AND tenant_id_key = ?",
+            (slug, source.value, version, tkey),
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        return _row_to_catalog_entry_version(row)
+
+    async def record_catalog_rating(
+        self,
+        slug: str,
+        *,
+        tenant_id: str,
+        source: CatalogSource = CatalogSource.MOVATE,
+        rating: int,
+        comment: str | None = None,
+    ) -> CatalogRatingsSummary:
+        if not (_RATING_MIN <= rating <= _RATING_MAX):
+            raise ValueError("rating must be between 1 and 5")
+        now = datetime.now(UTC)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entry_ratings (
+                slug, source, tenant_id, rating, comment, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug, source, tenant_id) DO UPDATE SET
+                rating     = excluded.rating,
+                comment    = excluded.comment,
+                created_at = excluded.created_at
+            """,
+            (slug, source.value, tenant_id, int(rating), comment, now.isoformat()),
+        )
+        # Recompute summary from the ratings table for this (slug, source).
+        async with self._db.execute(
+            "SELECT COUNT(*) AS c, AVG(rating) AS a FROM catalog_entry_ratings "
+            "WHERE slug = ? AND source = ?",
+            (slug, source.value),
+        ) as cur:
+            agg = await cur.fetchone()
+        assert agg is not None  # COUNT(*) always yields a row
+        count = int(agg["c"] or 0)
+        avg = float(agg["a"] or 0.0)
+        summary = CatalogRatingsSummary(count=count, avg=avg)
+        # Update the entry's cached summary in place (public namespace
+        # rows use tenant_id_key='__public__'; we update wherever the slug
+        # exists for this source — both private (per-tenant) and public).
+        await self._db.execute(
+            "UPDATE catalog_entries SET ratings_summary = ? WHERE slug = ? AND source = ?",
+            (json.dumps(summary.model_dump()), slug, source.value),
+        )
+        await self._db.commit()
+        return summary
+
+    async def get_catalog_sync_watermark(self, source: CatalogSource) -> datetime | None:
+        async with self._db.execute(
+            "SELECT last_synced_at FROM catalog_sync_watermark WHERE source = ?",
+            (source.value,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(row["last_synced_at"])
+
+    async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO catalog_sync_watermark (source, last_synced_at)
+            VALUES (?, ?)
+            ON CONFLICT(source) DO UPDATE SET last_synced_at = excluded.last_synced_at
+            """,
+            (source.value, ts.isoformat()),
+        )
+        await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry reads + publish (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        if version is not None:
+            sql = (
+                "SELECT * FROM workflow_bundles "
+                "WHERE name = ? AND tenant_id = ? AND version = ? LIMIT 1"
+            )
+            params: tuple[object, ...] = (name, tenant_id, version)
+        else:
+            sql = (
+                "SELECT * FROM workflow_bundles WHERE name = ? AND tenant_id = ? "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            params = (name, tenant_id)
+        async with self._db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+        return _row_to_workflow_bundle(row) if row else None
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        # Latest version per name, newest-first. Matches the agent_bundles
+        # query shape so a backend swap behaves identically.
+        if published_only:
+            # Narrow to names that have at least one published version, but
+            # still return the *latest* row for the name so the caller can
+            # detect "blessed != latest" drift.
+            sql = """
+                SELECT b.* FROM workflow_bundles b
+                WHERE b.tenant_id = ?
+                  AND b.created_at = (
+                      SELECT MAX(b2.created_at) FROM workflow_bundles b2
+                      WHERE b2.tenant_id = b.tenant_id AND b2.name = b.name
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM workflow_bundles b3
+                      WHERE b3.tenant_id = b.tenant_id
+                        AND b3.name = b.name
+                        AND b3.published = 1
+                  )
+                ORDER BY b.created_at DESC
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT b.* FROM workflow_bundles b
+                WHERE b.tenant_id = ?
+                  AND b.created_at = (
+                      SELECT MAX(b2.created_at) FROM workflow_bundles b2
+                      WHERE b2.tenant_id = b.tenant_id AND b2.name = b.name
+                  )
+                ORDER BY b.created_at DESC
+                LIMIT ?
+            """
+        async with self._db.execute(sql, (tenant_id, limit)) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        async with self._db.execute(
+            "SELECT * FROM workflow_bundles WHERE name = ? AND tenant_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (name, tenant_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        async with self._db.execute(
+            "SELECT * FROM workflow_bundles ORDER BY tenant_id, name, created_at LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            sql = "DELETE FROM workflow_bundles WHERE name = ? AND tenant_id = ? AND version = ?"
+            params: tuple[object, ...] = (name, tenant_id, version)
+        else:
+            sql = "DELETE FROM workflow_bundles WHERE name = ? AND tenant_id = ?"
+            params = (name, tenant_id)
+        cur = await self._db.execute(sql, params)
+        await self._db.commit()
+        return cur.rowcount
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        # ADR 037 D1: at most one row per (tenant, name) is published. Mark
+        # the target, then clear every other version of the same name in the
+        # same tenant. We probe first so the False/404 case is unambiguous.
+        async with self._db.execute(
+            "SELECT 1 FROM workflow_bundles "
+            "WHERE tenant_id = ? AND name = ? AND version = ? LIMIT 1",
+            (tenant_id, name, version),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return False
+        await self._db.execute(
+            "UPDATE workflow_bundles SET published = 1 "
+            "WHERE tenant_id = ? AND name = ? AND version = ?",
+            (tenant_id, name, version),
+        )
+        await self._db.execute(
+            "UPDATE workflow_bundles SET published = 0 "
+            "WHERE tenant_id = ? AND name = ? AND version <> ?",
+            (tenant_id, name, version),
+        )
+        await self._db.commit()
+        return True
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         # Upsert on the workflow_run_id PRIMARY KEY: the runner saves a row
@@ -3362,6 +4325,58 @@ class SqliteProvider:
         return (cur.rowcount or 0) > 0
 
     # ------------------------------------------------------------------
+    # Diagnoses (ADR 043 D1 — Failure Pattern Diagnoser results)
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        # Upsert on diagnosis_id. ON CONFLICT preserves the original
+        # created_at so a follow-up "completed" save doesn't reset the
+        # insert timestamp — same pattern as the upsert helpers above.
+        await self._db.execute(
+            """
+            INSERT INTO diagnoses (
+                diagnosis_id, tenant_id, agent, status, request, result,
+                error, tokens_used, cost_usd, model, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(diagnosis_id) DO UPDATE SET
+                status       = excluded.status,
+                request      = excluded.request,
+                result       = excluded.result,
+                error        = excluded.error,
+                tokens_used  = excluded.tokens_used,
+                cost_usd     = excluded.cost_usd,
+                model        = excluded.model,
+                completed_at = excluded.completed_at
+            """,
+            (
+                record.diagnosis_id,
+                record.tenant_id,
+                record.agent,
+                record.status.value,
+                json.dumps(record.request),
+                json.dumps(record.result) if record.result is not None else None,
+                json.dumps(record.error.model_dump()) if record.error is not None else None,
+                record.tokens_used,
+                record.cost_usd,
+                record.model,
+                record.created_at.isoformat(),
+                record.completed_at.isoformat() if record.completed_at else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        # tenant_id in WHERE is the SQL-layer enforcement — the no-leak
+        # contract (a cross-tenant lookup is indistinguishable from a
+        # missing row).
+        async with self._db.execute(
+            "SELECT * FROM diagnoses WHERE diagnosis_id = ? AND tenant_id = ? LIMIT 1",
+            (diagnosis_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_diagnosis(row) if row else None
+
+    # ------------------------------------------------------------------
     # DR backup/restore (item 26) — delegate to the backend-agnostic
     # orchestration in movate.core.dr_backup (reads/writes only through this
     # Protocol's methods, so the snapshot round-trips across all backends).
@@ -3379,10 +4394,408 @@ class SqliteProvider:
 
         return await import_state(self, snapshot, mode=mode)
 
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events).
+    # ``data`` round-trips as TEXT holding ``json.dumps(...)`` — same
+    # JSON-as-text strategy as runs.metrics. Tenant-scoped on every read.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        await self._db.execute(
+            "INSERT INTO events (id, tenant_id, kind, subject, data, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                event.id,
+                event.tenant_id,
+                event.kind,
+                event.subject,
+                json.dumps(event.data),
+                event.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        clauses: list[str] = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("created_at < ?")
+            params.append(until.isoformat())
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if subject is not None:
+            clauses.append("subject = ?")
+            params.append(subject)
+        # Cursor pagination — skip rows up to and including ``after_id``
+        # in oldest-first order. We look up the cursor row's
+        # ``(created_at, id)`` so the comparison is stable across rows
+        # sharing a timestamp (tie-break on id). An unknown after_id
+        # silently falls back to "from the beginning" — no existence
+        # leak across tenants either, since the cursor lookup is
+        # tenant-scoped.
+        if after_id is not None:
+            async with self._db.execute(
+                "SELECT created_at FROM events WHERE id = ? AND tenant_id = ? LIMIT 1",
+                (after_id, tenant_id),
+            ) as cur:
+                cursor_row = await cur.fetchone()
+            if cursor_row is not None:
+                clauses.append("(created_at, id) > (?, ?)")
+                params.extend([cursor_row["created_at"], after_id])
+        sql = (
+            "SELECT * FROM events WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at ASC, id ASC LIMIT ?"
+        )
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            Event(
+                id=r["id"],
+                tenant_id=r["tenant_id"],
+                kind=r["kind"],
+                subject=r["subject"],
+                data=json.loads(r["data"]) if r["data"] else {},
+                created_at=datetime.fromisoformat(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery). The
+    # ``secret`` is stored verbatim because the worker must re-sign
+    # every outbound delivery with the same key the subscriber
+    # configured (we never echo it back on the wire after create).
+    # ``kind_filter`` is json-encoded (TEXT) for portability.
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        await self._db.execute(
+            "INSERT INTO webhooks "
+            "(id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sub.id,
+                sub.tenant_id,
+                sub.url,
+                json.dumps(sub.kind_filter),
+                sub.secret,
+                1 if sub.enabled else 0,
+                sub.failure_count,
+                sub.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+        return sub
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        sql = "SELECT * FROM webhooks WHERE tenant_id = ?"
+        params: list[object] = [tenant_id]
+        if enabled_only:
+            sql += " AND enabled = 1"
+        sql += " ORDER BY created_at ASC, id ASC"
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_webhook(r) for r in rows]
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        async with self._db.execute(
+            "SELECT * FROM webhooks WHERE id = ? AND tenant_id = ? LIMIT 1",
+            (webhook_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_webhook(row) if row is not None else None
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        # Defensive no-op when neither field is set — same shape as a
+        # PATCH with an empty body.
+        if enabled is None and failure_count is None:
+            return await self.get_webhook(tenant_id, webhook_id)
+        sets: list[str] = []
+        params: list[object] = []
+        if enabled is not None:
+            sets.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        if failure_count is not None:
+            sets.append("failure_count = ?")
+            params.append(failure_count)
+        params.extend([webhook_id, tenant_id])
+        await self._db.execute(
+            f"UPDATE webhooks SET {', '.join(sets)} WHERE id = ? AND tenant_id = ?",
+            params,
+        )
+        await self._db.commit()
+        return await self.get_webhook(tenant_id, webhook_id)
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        cur = await self._db.execute(
+            "DELETE FROM webhooks WHERE id = ? AND tenant_id = ?",
+            (webhook_id, tenant_id),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        await self._db.execute(
+            "INSERT INTO webhook_attempts "
+            "(id, webhook_id, event_id, tenant_id, attempted_at, status_code, "
+            " response_excerpt, error_kind, attempt_n) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt.id,
+                attempt.webhook_id,
+                attempt.event_id,
+                attempt.tenant_id,
+                attempt.attempted_at.isoformat(),
+                attempt.status_code,
+                attempt.response_excerpt,
+                attempt.error_kind,
+                attempt.attempt_n,
+            ),
+        )
+        await self._db.commit()
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        clauses: list[str] = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if webhook_id is not None:
+            clauses.append("webhook_id = ?")
+            params.append(webhook_id)
+        if since is not None:
+            clauses.append("attempted_at >= ?")
+            params.append(since.isoformat())
+        params.append(limit)
+        sql = (
+            "SELECT * FROM webhook_attempts WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY attempted_at DESC, id DESC LIMIT ?"
+        )
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_webhook_attempt(r) for r in rows]
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        async with self._db.execute(
+            "SELECT last_event_id FROM webhook_cursors "
+            "WHERE webhook_id = ? AND tenant_id = ? LIMIT 1",
+            (webhook_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return row["last_event_id"] if row is not None else None
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        now = datetime.now(UTC).isoformat()
+        # SQLite's ``INSERT ... ON CONFLICT DO UPDATE`` — same upsert
+        # idiom as the trigger-deliveries dedup write.
+        await self._db.execute(
+            "INSERT INTO webhook_cursors (webhook_id, tenant_id, last_event_id, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(webhook_id) DO UPDATE SET "
+            "  last_event_id = excluded.last_event_id, "
+            "  updated_at = excluded.updated_at",
+            (webhook_id, tenant_id, last_event_id, now),
+        )
+        await self._db.commit()
+
+    # Eval-generation jobs (``mdk eval generate``)
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: Any) -> None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        assert isinstance(job, EvalGenerationJob)
+        assert self._conn is not None
+        await self._conn.execute(
+            """
+            INSERT INTO eval_generation_jobs (
+                job_id, tenant_id, agent_name, status, description,
+                count_requested, categories, include_judge, model,
+                budget_usd, progress, result, error, tokens_used,
+                cost_usd, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                progress = excluded.progress,
+                result = excluded.result,
+                error = excluded.error,
+                tokens_used = excluded.tokens_used,
+                cost_usd = excluded.cost_usd,
+                completed_at = excluded.completed_at
+            """,
+            (
+                job.job_id,
+                job.tenant_id,
+                job.agent_name,
+                job.status,
+                job.description,
+                job.count,
+                json.dumps(job.categories),
+                1 if job.include_judge else 0,
+                job.model,
+                job.budget_usd,
+                job.progress,
+                json.dumps(job.result) if job.result is not None else None,
+                json.dumps(job.error) if job.error is not None else None,
+                job.tokens_used,
+                job.cost_usd,
+                job.created_at,
+                job.completed_at,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_eval_generation_job(self, job_id: str, *, tenant_id: str) -> Any | None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT * FROM eval_generation_jobs WHERE job_id = ? AND tenant_id = ?",
+            (job_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return EvalGenerationJob(
+            job_id=row["job_id"],
+            tenant_id=row["tenant_id"],
+            agent_name=row["agent_name"],
+            status=row["status"],
+            description=row["description"],
+            count=row["count_requested"],
+            categories=json.loads(row["categories"]),
+            include_judge=bool(row["include_judge"]),
+            model=row["model"],
+            budget_usd=row["budget_usd"],
+            progress=row["progress"],
+            result=json.loads(row["result"]) if row["result"] else None,
+            error=json.loads(row["error"]) if row["error"] else None,
+            tokens_used=row["tokens_used"],
+            cost_usd=row["cost_usd"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Any,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> Any:
+        # Same disk-mutation contract as the in-memory double; the SQL
+        # layer doesn't store the dataset (the agent's evals/dataset.jsonl
+        # lives on the runtime's filesystem). Delegated to a shared helper
+        # so the three backends stay byte-identical on the commit shape.
+        from pathlib import Path  # noqa: PLC0415
+
+        from movate.core.eval_generator import serialize_case_for_dataset  # noqa: PLC0415
+        from movate.storage.base import EvalCommitResult  # noqa: PLC0415
+
+        job = await self.get_eval_generation_job(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise FileNotFoundError(f"eval-generation job {job_id!r} not found")
+        if job.result is None:
+            raise ValueError(f"job {job_id!r} status={job.status!r} — no result to commit")
+        cases = list(job.result.get("cases") or [])
+        if case_ids is not None:
+            wanted = set(case_ids)
+            cases = [c for c in cases if c.get("id") in wanted]
+
+        agent_dir = Path(agents_path) / job.agent_name
+        if not agent_dir.is_dir():
+            raise FileNotFoundError(f"agent dir not found: {agent_dir}")
+        evals_dir = agent_dir / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+        dataset = evals_dir / "dataset.jsonl"
+        prior = dataset.read_bytes() if dataset.exists() else b""
+        if prior and not prior.endswith(b"\n"):
+            prior = prior + b"\n"
+        with dataset.open("wb") as fh:
+            fh.write(prior)
+            for case in cases:
+                fh.write(serialize_case_for_dataset(case))
+
+        judge_updated = False
+        if commit_judge:
+            judge_blob = job.result.get("judge_yaml")
+            if isinstance(judge_blob, str) and judge_blob.strip():
+                (evals_dir / "judge.yaml").write_text(judge_blob, encoding="utf-8")
+                judge_updated = True
+
+        return EvalCommitResult(
+            agent_name=job.agent_name,
+            dataset_path=str(dataset.relative_to(agent_dir.parent)),
+            cases_added=len(cases),
+            judge_yaml_updated=judge_updated,
+        )
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
+
+
+def _row_to_webhook(row: aiosqlite.Row) -> WebhookSubscription:
+    return WebhookSubscription(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        url=row["url"],
+        kind_filter=json.loads(row["kind_filter"]) if row["kind_filter"] else [],
+        secret=row["secret"],
+        enabled=bool(row["enabled"]),
+        failure_count=row["failure_count"] or 0,
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_webhook_attempt(row: aiosqlite.Row) -> WebhookAttempt:
+    return WebhookAttempt(
+        id=row["id"],
+        webhook_id=row["webhook_id"],
+        event_id=row["event_id"],
+        tenant_id=row["tenant_id"],
+        attempted_at=datetime.fromisoformat(row["attempted_at"]),
+        status_code=row["status_code"],
+        response_excerpt=row["response_excerpt"],
+        error_kind=row["error_kind"],
+        attempt_n=row["attempt_n"],
+    )
 
 
 def _row_to_thread(row: aiosqlite.Row) -> ConversationThread:
@@ -3393,6 +4806,27 @@ def _row_to_thread(row: aiosqlite.Row) -> ConversationThread:
         title=row["title"] or "",
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_diagnosis(row: aiosqlite.Row) -> DiagnosisRecord:
+    error_raw = row["error"]
+    error_obj: ErrorInfo | None = None
+    if error_raw:
+        error_obj = ErrorInfo.model_validate(json.loads(error_raw))
+    return DiagnosisRecord(
+        diagnosis_id=row["diagnosis_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        status=DiagnosisStatus(row["status"]),
+        request=json.loads(row["request"]) if row["request"] else {},
+        result=json.loads(row["result"]) if row["result"] else None,
+        error=error_obj,
+        tokens_used=int(row["tokens_used"] or 0),
+        cost_usd=float(row["cost_usd"] or 0.0),
+        model=row["model"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+        completed_at=(datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None),
     )
 
 
@@ -3445,6 +4879,56 @@ def _row_to_project_member(row: aiosqlite.Row) -> ProjectMember:
         role=ProjectMemberRole(row["role"]),
         added_by=row["added_by"],
         added_at=datetime.fromisoformat(row["added_at"]),
+    )
+
+
+def _row_to_insight(row: aiosqlite.Row) -> ObservabilityInsight:
+    return ObservabilityInsight(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        date=date.fromisoformat(row["date"]),
+        health_score=row["health_score"],
+        anomalies=json.loads(row["anomalies"]) if row["anomalies"] else [],
+        top_failures=json.loads(row["top_failures"]) if row["top_failures"] else [],
+        usage_rollup=json.loads(row["usage_rollup"]) if row["usage_rollup"] else {},
+        trends=json.loads(row["trends"]) if row["trends"] else {},
+        narrative_digest=row["narrative_digest"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_workflow_bundle(row: aiosqlite.Row) -> WorkflowBundleRecord:
+    # ADR 037 D1 — sqlite stores ``published`` as INTEGER (0/1); coerce to bool
+    # at the boundary so the Pydantic model carries the typed value.
+    return WorkflowBundleRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        files=json.loads(row["files"]),
+        published=bool(row["published"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_audit(row: aiosqlite.Row) -> AuditRecord:
+    raw_findings = json.loads(row["findings"]) if row["findings"] else []
+    return AuditRecord(
+        audit_id=row["audit_id"],
+        tenant_id=row["tenant_id"],
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        categories=json.loads(row["categories"]) if row["categories"] else [],
+        severity_floor=AuditFindingSeverity(row["severity_floor"]),
+        model=row["model"],
+        budget_usd=float(row["budget_usd"]),
+        findings=[AuditFinding.model_validate(f) for f in raw_findings],
+        partial=bool(row["partial"]),
+        tokens_used=int(row["tokens_used"]),
+        cost_usd=float(row["cost_usd"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 

@@ -1,0 +1,40 @@
+api_version: movate/v1
+kind: Agent
+
+# SUPERVISOR node of the Simulation pattern. Frames the scenario the fixed
+# roster will play out. Governs the simulation: it does NOT spawn participants
+# (the roster is fixed in workflow.yaml).
+name: simulation-supervisor
+version: 0.1.0
+description: Supervisor — frames the scenario the fixed two-participant roster plays out.
+owner: ""
+role: supervisor
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - pattern:simulation
+  - node:supervisor
+  - governed

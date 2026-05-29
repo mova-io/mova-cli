@@ -1,0 +1,2 @@
+{"input": {"text": "error_rate=0.12", "labels": ["breach", "ok"]}, "expected": {"label": "breach"}}
+{"input": {"text": "cpu=41%", "labels": ["breach", "ok"]}, "expected": {"label": "ok"}}
