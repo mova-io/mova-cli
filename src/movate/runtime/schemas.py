@@ -13,7 +13,7 @@ in import sites and at code review.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -3494,3 +3494,256 @@ def _project_etag(p: Project) -> str:
     strips client-side decoration.
     """
     return p.updated_at.isoformat()
+
+
+
+# ---------------------------------------------------------------------------
+# Unified agent-creation surface
+# ``POST /api/v1/projects/{project_id}/agents`` — single dispatcher endpoint
+# that routes to one of five existing creation paths based on a discriminated
+# union body.
+#
+# Why a separate endpoint vs. extending POST /agents: the five existing
+# creation endpoints (multipart bundle, from-wizard, future from-spec,
+# preview+commit, catalog clone) ship distinct wire shapes that customers
+# have already integrated against. This unified endpoint is an additive
+# convenience layer for the Mova iO Angular UI — it COMPOSES the existing
+# handlers but never duplicates their logic. Backward compat per CLAUDE.md
+# rule 5: every legacy endpoint continues to work byte-for-byte.
+# ---------------------------------------------------------------------------
+
+
+class AgentCreateBundleRequest(BaseModel):
+    """Placeholder for the multipart-bundle JSON discriminator.
+
+    The actual bundle bytes arrive via ``multipart/form-data`` (the
+    file payload is too large for a JSON body). This schema exists so
+    OpenAPI documents the ``source: "bundle"`` shape for callers that
+    inspect the discriminated-union spec; the route handler sniffs
+    ``Content-Type`` and routes multipart requests to the existing
+    bundle path regardless of whether this body is present.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["bundle"] = "bundle"
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Optional name override. When omitted the bundle's ``agent.yaml`` name is used."
+        ),
+    )
+
+
+class AgentCreateSpecRequest(BaseModel):
+    """``source: "spec"`` — caller already authored a full agent spec
+    + prompt + schemas as JSON.
+
+    Use this when the caller has a complete bundle in hand and just
+    wants to persist it without zipping into a multipart upload. The
+    spec dict is YAML-dumped to ``agent.yaml`` and the prompt /
+    schemas are written to their canonical paths. Identical
+    validation gate to the multipart endpoint (``load_agent``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["spec"] = "spec"
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Agent name. Must match ``spec['name']`` when both set.",
+    )
+    spec: dict[str, Any] = Field(
+        ...,
+        description=(
+            "The agent.yaml contents as a Python dict. Must include "
+            "``api_version: movate/v1`` and ``kind: Agent``."
+        ),
+    )
+    prompt: str = Field(..., min_length=1, description="Prompt body, inlined into prompt.md.")
+    schemas: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional explicit ``{input, output}`` JSON-Schema strings. "
+            "When omitted, the spec is expected to carry inline-shorthand "
+            "schemas under ``spec['schema']``."
+        ),
+    )
+
+
+class AgentCreateWizardRequest(BaseModel):
+    """``source: "wizard"`` — wraps the existing ``WizardAgentSubmission``
+    so the discriminated-union body can carry it.
+
+    The wizard form payload field MUST match the shape of
+    :class:`WizardAgentSubmission`; we accept it as ``dict`` here so
+    the dispatcher can re-parse it through the canonical wizard model
+    and reuse the existing translation pipeline byte-for-byte.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["wizard"] = "wizard"
+    wizard_form: dict[str, Any] = Field(
+        ...,
+        description="Wizard form payload — same shape as WizardAgentSubmission.",
+    )
+
+
+class AgentCreateLlmRequest(BaseModel):
+    """``source: "llm"`` — natural-language → agent.
+
+    Composes the scaffold-preview / eval-generator / judge-engineer /
+    unified-KB-ingest pipelines (depending on the optional flags) and
+    streams progress via SSE. Returns 202 + a ``job_id`` so the
+    caller can reconnect to the SSE stream if disconnected.
+
+    All composition targets are optional — when an upstream pipeline
+    isn't deployed, the corresponding stage emits a ``stage_skipped``
+    SSE event with a reason rather than aborting the run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["llm"] = "llm"
+    description: str = Field(
+        ...,
+        min_length=1,
+        description="Natural-language description of what the agent should do.",
+    )
+    shape: str | None = Field(
+        default=None,
+        description=(
+            "Optional shape hint (``rag``, ``tool-use``, ``planner``, ...). "
+            "When omitted the scaffold pipeline auto-detects from the "
+            "description."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description="Optional LiteLLM model id (e.g. ``openai/gpt-4o-mini``).",
+    )
+    rename_to: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Optional name override; otherwise slugified from description.",
+    )
+    auto_seed_kb: bool = Field(
+        default=False,
+        description="When true, seed a starter KB context via the unified KB ingest endpoint.",
+    )
+    include_evals: bool = Field(
+        default=False,
+        description="When true, generate an eval set via the Eval Generator.",
+    )
+    include_judge: bool = Field(
+        default=False,
+        description="When true, generate a judge agent via the Judge Engineer.",
+    )
+    budget_usd: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Optional cost ceiling for the LLM authoring pipeline.",
+    )
+
+
+class AgentCreateCatalogRequest(BaseModel):
+    """``source: "catalog"`` — clone-and-decouple from the agent catalog.
+
+    Looks up an entry in the movate catalog (or the tenant's private
+    namespace), unpacks the bundle, applies overrides, optionally
+    renames, and persists as a NEW agent — no auto-sync back to the
+    source (ADR 041 D6 decision: catalog clones are decoupled).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["catalog"] = "catalog"
+    slug: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Catalog slug (movate or private namespace).",
+    )
+    version: str | None = Field(
+        default=None,
+        description="Optional version pin; defaults to the catalog entry's latest.",
+    )
+    rename_to: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Rename the cloned agent. Defaults to the catalog slug.",
+    )
+    overrides: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional partial-merge overrides applied to the cloned "
+            "agent.yaml. E.g. ``{'model': {'provider': '...'}}``."
+        ),
+    )
+
+
+# Discriminated-union body — Pydantic v2 picks the right concrete
+# request type from the ``source`` field. We exclude the bundle variant
+# from JSON dispatch because its bytes arrive via multipart; the route
+# handler sniffs ``Content-Type`` and chooses the multipart path first.
+AgentCreateJsonRequest = Annotated[
+    AgentCreateSpecRequest
+    | AgentCreateWizardRequest
+    | AgentCreateLlmRequest
+    | AgentCreateCatalogRequest,
+    Field(discriminator="source"),
+]
+
+
+class AgentCreateAccepted(BaseModel):
+    """Async response for ``source: "llm"`` — 202 Accepted.
+
+    The job runs the multi-stage authoring pipeline behind the scenes;
+    the caller subscribes to ``stream_url`` for SSE progress events
+    and/or polls ``status_url`` for terminal state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status_url: str = Field(
+        ...,
+        description="URL to poll for terminal state (mirrors ``GET /jobs/{job_id}``).",
+    )
+    stream_url: str = Field(
+        ...,
+        description="SSE endpoint streaming the authoring pipeline events.",
+    )
+
+
+class UnifiedAgentCreatedView(BaseModel):
+    """Sync response for non-llm sources.
+
+    Identical to :class:`AgentCreatedView` in shape but adds
+    ``source`` (so the UI can tell which path produced the agent)
+    and ``project_id`` (which project the agent landed in).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["bundle", "spec", "wizard", "catalog"]
+    project_id: str
+    agent_name: str
+    version: str
+    description: str = ""
+    agent_dir: str
+    files_persisted: list[str]
+    published_version: str | None = None
+    changed: bool = True
+    attached: bool = Field(
+        default=False,
+        description=(
+            "Whether the agent was attached to the project via the "
+            "projects-storage layer. ``False`` when the storage "
+            "backend doesn't yet implement ``attach_agent_to_project`` "
+            "(degrades cleanly per the dependency note in the PR body)."
+        ),
+    )
