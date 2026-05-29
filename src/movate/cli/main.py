@@ -410,7 +410,7 @@ def _main(
 # Develop panel so it surfaces prominently in `mdk --help`.
 app.command("menu", rich_help_panel=PANEL_DEVELOP)(menu_cmd.menu)
 app.command("dev", rich_help_panel=PANEL_DEVELOP)(dev_cmd.dev)
-app.command("demo", rich_help_panel=PANEL_DEVELOP)(demo_cmd.demo)
+app.add_typer(demo_cmd.demo_app, name="demo", rich_help_panel=PANEL_DEVELOP)
 app.command("init", rich_help_panel=PANEL_DEVELOP)(init_cmd.init)
 # `mdk add` — project-aware ergonomic wrapper around `mdk init -t <template>`.
 # Same Develop panel because it's a scaffold command; positioned right after

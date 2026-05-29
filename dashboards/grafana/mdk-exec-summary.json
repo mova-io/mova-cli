@@ -1,0 +1,528 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics (same source as the #518 golden-signal dashboards).",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_INSIGHTS",
+      "label": "Insights API (JSON / Infinity)",
+      "description": "JSON/Infinity datasource pointed at the ADR 047 Observability Intelligence API (GET /api/v1/observability/insights + /health). Feeds the fleet-health gauge, the wins/risks lists, and the narrative. Plugin: yesoreyeram-infinity-datasource. NOTE: ADR 047 is not on main yet -- those panels render their documented-gap state until it ships (see dashboards/grafana/insights/README.md).",
+      "type": "datasource",
+      "pluginId": "yesoreyeram-infinity-datasource",
+      "pluginName": "Infinity"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"},
+    {"type": "datasource", "id": "yesoreyeram-infinity-datasource", "name": "Infinity", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+        "enable": true,
+        "hide": false,
+        "iconColor": "blue",
+        "name": "CalVer deploys",
+        "type": "tags",
+        "target": {
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "format": "timeseries",
+          "root_selector": "deploys",
+          "columns": [
+            {"selector": "deployed_at", "text": "time", "type": "timestamp_epoch_s"},
+            {"selector": "version", "text": "text", "type": "string"},
+            {"selector": "environment", "text": "tags", "type": "string"}
+          ]
+        },
+        "$comment": "CalVer (YYYY.M.D.N) deploy markers from the ADR 047 insights digest. Lets leadership see a spend/latency step-change line up with the release that caused it. mdk demo seed emits deploy events with the same shape so the marker shows during a demo once ADR 047 is wired."
+      }
+    ]
+  },
+  "description": "mdk - executive summary (single pane). The one screen leadership looks at: fleet health, spend-this-period + forecast, adoption, top wins/risks, and SLO error budget. Business-framed, not SRE-framed -- few big panels, exec-glance layout. Spend, forecast, runs, error-budget come from the real OTel metrics (mdk.run.cost_usd, mdk.jobs.completed) on Prometheus; health/wins/risks come from the ADR 047 insights API (scaffold-with-note until that ships). Styled with the Movate palette (dashboards/grafana/theme/). For the deep-dive SRE view see mdk-golden-signals.json (#518); for the narrative view see insights/mdk-daily-insights.json (#555).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {"title": "Deep-dive: golden signals (#518)", "type": "link", "url": "/d/mdk-golden-signals", "targetBlank": true, "icon": "external link"},
+    {"title": "Narrative: daily insights (#555)", "type": "link", "url": "/d/mdk-daily-insights", "targetBlank": true, "icon": "external link"},
+    {"title": "Cost detail", "type": "link", "url": "/d/mdk-cost", "targetBlank": true, "icon": "external link"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 1,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 0},
+      "title": "",
+      "options": {
+        "mode": "markdown",
+        "content": "# Movate MDK — Executive Summary\n\n**The one screen.** Fleet health, spend + forecast, adoption, wins/risks, and SLO error budget for the selected period. Business-framed — the SRE deep-dive is one click away (top-right links). Spend, runs, and error-budget are live from the OTel metrics; **fleet health and the wins/risks lists come from the ADR 047 insights API** (they show a documented-gap state until that endpoint ships — see the note at the bottom). Period selector: top-right time picker (defaults to this month)."
+      }
+    },
+    {
+      "type": "gauge",
+      "id": 10,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 3},
+      "title": "Fleet health",
+      "description": "Composite fleet health_score (0-100) from GET /api/v1/observability/health -- the ADR 047 blend of success rate, latency-vs-baseline, cost-vs-baseline, and eval pass-rate. Worst-of or fleet-mean per the API. Thresholds: red <50, amber 50-79, green >=80. SCAFFOLD-WITH-NOTE: until ADR 047 is on main this renders empty; the metric below (live success rate) is the closest standalone proxy.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#D64550", "value": null},
+              {"color": "#F2A93B", "value": 50},
+              {"color": "#2BB673", "value": 80}
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^health_score$/", "values": false},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/health",
+          "root_selector": "fleet",
+          "columns": [
+            {"selector": "health_score", "text": "health_score", "type": "number"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 11,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 3},
+      "title": "Live success rate (proxy)",
+      "description": "Live fleet success rate from mdk.jobs.completed -- the standalone proxy for fleet health while the ADR 047 health_score gauge (left) is awaiting its endpoint. success / all over the dashboard window. Thresholds match the golden-signal error SLO (10% error => 90% success).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#D64550", "value": null},
+              {"color": "#F2A93B", "value": 0.9},
+              {"color": "#2BB673", "value": 0.98}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total{status=\"success\"}[$__range])) / clamp_min(sum(increase(mdk_jobs_completed_total[$__range])), 1)",
+          "legendFormat": "success rate",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 12,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 3},
+      "title": "Runs this period + WoW",
+      "description": "Adoption headline: total runs (mdk.jobs.completed) over the period, with the week-over-week trend sparkline. The WoW delta badge comes from the same counter compared to the prior 7d window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed", "fixedColor": "#2D6CDF"},
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total[$__range]))",
+          "legendFormat": "runs (period)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "(sum(increase(mdk_jobs_completed_total[7d])) - sum(increase(mdk_jobs_completed_total[7d] offset 7d))) / clamp_min(sum(increase(mdk_jobs_completed_total[7d] offset 7d)), 1)",
+          "legendFormat": "WoW delta",
+          "range": false,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 20,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 11},
+      "title": "Spend this period",
+      "description": "Total LLM spend (mdk.run.cost_usd) over the dashboard period. The headline cost number for leadership. Pairs with the forecast panel to the right.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed", "fixedColor": "#2D6CDF"},
+          "unit": "currencyUSD",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_run_cost_usd_total[$__range]))",
+          "legendFormat": "spend (period)",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 21,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 10, "x": 8, "y": 11},
+      "title": "Spend forecast vs budget (end-of-period projection)",
+      "description": "Cumulative spend (mdk.run.cost_usd) with a linear projection (predict_linear over 30d) extrapolated to the period end, against the $MONTHLY_BUDGET line. The classic 'at this rate you'll hit budget on day X' exec view. See dashboards/grafana/theme/cost-forecast-panel.json for the reusable snippet + the methodology note.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "#2BB673", "value": null}, {"color": "#D64550", "value": 5000}]},
+          "unit": "currencyUSD"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "projected end-of-period"},
+            "properties": [
+              {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}},
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "#F2A93B"}}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_run_cost_usd_total[$__range])) - sum(increase(mdk_run_cost_usd_total[$__rate_interval]))",
+          "legendFormat": "cumulative spend",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(predict_linear(mdk_run_cost_usd_total[7d], 86400 * 30))",
+          "legendFormat": "projected end-of-period",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "vector($monthly_budget)",
+          "legendFormat": "monthly budget",
+          "range": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": 22,
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 11},
+      "title": "Reading the forecast",
+      "options": {
+        "mode": "markdown",
+        "content": "**Spend** = `mdk.run.cost_usd` over the period.\n\n**Forecast** = `predict_linear` over the last 7d, extrapolated 30d. The dashed amber line is where spend lands at the current rate.\n\n**Budget** = the `$monthly_budget` dashboard variable (top of screen). When the dashed line crosses the red budget line, that's your projected breach date.\n\n> Cost is **observed, not paged** (ADR 017 — no cost SLO alert). This panel is the leadership early-warning, not an alert.\n\nReusable snippet: `theme/cost-forecast-panel.json`."
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 30,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 19},
+      "title": "SLO error budget — burndown (this period)",
+      "description": "Google-SRE error-budget burndown. SLO = 99% success (1% error budget). This plots error-budget CONSUMED as a fraction of the period's allowance: observed errors / (allowed-error-rate * total runs). 1.0 = budget exhausted (red line). Keyed to mdk.jobs.completed. See theme/slo-error-budget-panel.json for the reusable snippet + how to retune the SLO target.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "max": 1.2,
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "#2BB673", "value": null}, {"color": "#F2A93B", "value": 0.75}, {"color": "#D64550", "value": 1}]},
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total{status!=\"success\"}[$__range])) / clamp_min((1 - $slo_target) * sum(increase(mdk_jobs_completed_total[$__range])), 1)",
+          "legendFormat": "error budget consumed",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "gauge",
+      "id": 31,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 19},
+      "title": "Error budget remaining",
+      "description": "1 - (error budget consumed), floored at 0. The single number leadership wants: how much of this period's reliability allowance is left. SLO target = $slo_target (default 99%). Green when comfortable, red when exhausted.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "max": 1,
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "#D64550", "value": null}, {"color": "#F2A93B", "value": 0.25}, {"color": "#2BB673", "value": 0.5}]},
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "clamp_min(1 - sum(increase(mdk_jobs_completed_total{status!=\"success\"}[$__range])) / clamp_min((1 - $slo_target) * sum(increase(mdk_jobs_completed_total[$__range])), 1), 0)",
+          "legendFormat": "remaining",
+          "range": false,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": 32,
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 19},
+      "title": "Reading the error budget",
+      "options": {
+        "mode": "markdown",
+        "content": "**SLO** = `$slo_target` success (default **99%**), so the budget is **1% of runs may fail** this period.\n\n**Consumed** = observed errors / allowed errors. **1.0 = budget gone**.\n\n**Remaining** (gauge) = `1 - consumed`, floored at 0.\n\n| Remaining | Meaning |\n| --- | --- |\n| green >50% | comfortable |\n| amber 25-50% | slow down risky changes |\n| red <25% | freeze; protect reliability |\n\nRetune the target with the `$slo_target` variable. Reusable snippet: `theme/slo-error-budget-panel.json`."
+      }
+    },
+    {
+      "type": "table",
+      "id": 40,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 27},
+      "title": "Top 3 wins",
+      "description": "The period's three best outcomes from GET /api/v1/observability/insights (wins[]): canary promotions, pass-rate gains, cost savings. SCAFFOLD-WITH-NOTE: wins[] is delivered by ADR 047 (not on main yet). mdk demo seed emits canary_promotion events shaped for this feed so the panel populates in a demo once ADR 047 is wired.",
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "filterable": false}, "color": {"mode": "fixed", "fixedColor": "#2BB673"}},
+        "overrides": []
+      },
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "root_selector": "wins",
+          "columns": [
+            {"selector": "title", "text": "win", "type": "string"},
+            {"selector": "detail", "text": "detail", "type": "string"},
+            {"selector": "agent", "text": "agent", "type": "string"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 41,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 27},
+      "title": "Top 3 risks",
+      "description": "The period's three biggest risks from GET /api/v1/observability/insights (risks[] -- merged anomalies + drift + top failures, by severity). SCAFFOLD-WITH-NOTE: delivered by ADR 047 (not on main yet). mdk demo seed emits cost_anomaly / latency_anomaly / drift_detected events shaped for this feed.",
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "filterable": false}, "color": {"mode": "fixed", "fixedColor": "#D64550"}},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "severity"},
+            "properties": [
+              {"id": "mappings", "value": [{"type": "value", "options": {"critical": {"color": "#7A1620", "index": 0}, "high": {"color": "#D64550", "index": 1}, "medium": {"color": "#F2A93B", "index": 2}, "low": {"color": "#E9D14A", "index": 3}}}]},
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}}
+            ]
+          }
+        ]
+      },
+      "options": {"showHeader": true, "sortBy": [{"displayName": "severity", "desc": false}]},
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights",
+          "root_selector": "risks",
+          "columns": [
+            {"selector": "severity", "text": "severity", "type": "string"},
+            {"selector": "title", "text": "risk", "type": "string"},
+            {"selector": "explanation", "text": "explanation", "type": "string"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": 90,
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 36},
+      "title": "What's live vs. scaffolded (architecture-review note)",
+      "options": {
+        "mode": "markdown",
+        "content": "**Live today** (real OTel metrics on Prometheus, #518 catalog): Spend this period, Spend forecast vs budget, Runs + WoW, Live success rate, SLO error-budget burndown + remaining. Run `mdk demo seed` to light these up with a believable fleet.\n\n**Scaffold-with-note** (awaiting **ADR 047** Observability Intelligence API, not on `main` yet): Fleet health gauge, Top 3 wins, Top 3 risks. These read `GET /api/v1/observability/{health,insights}` via the Infinity datasource; until ADR 047 ships they render empty (Grafana shows a datasource note on those panels). The seeder emits `deploy` / `canary_promotion` / `cost_anomaly` / `latency_anomaly` / `drift_detected` events shaped for the wins/risks feeds, so they populate end-to-end the moment ADR 047 lands.\n\n**Active-agent count** is intentionally not a panel here: `mdk.run.cost_usd` / `mdk.jobs.completed` carry only `tenant` (not `agent`) per the catalog (`docs/observability.md`), so a fleet-wide distinct-agent count isn't available metric-side — it belongs to the ADR 047 health payload (`active_agents`). Documented gap, not a bug.\n\nPalette + kiosk variant: `dashboards/grafana/theme/`."
+      }
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "executive", "summary", "wow-pack"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Insights API",
+        "multi": false,
+        "name": "DS_INSIGHTS",
+        "options": [],
+        "query": "yesoreyeram-infinity-datasource",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": true, "text": "5000", "value": "5000"},
+        "hide": 0,
+        "label": "Monthly budget ($)",
+        "name": "monthly_budget",
+        "options": [
+          {"selected": true, "text": "5000", "value": "5000"},
+          {"selected": false, "text": "10000", "value": "10000"},
+          {"selected": false, "text": "25000", "value": "25000"}
+        ],
+        "query": "5000,10000,25000",
+        "type": "custom"
+      },
+      {
+        "current": {"selected": true, "text": "0.99", "value": "0.99"},
+        "hide": 0,
+        "label": "SLO target (success)",
+        "name": "slo_target",
+        "options": [
+          {"selected": true, "text": "0.99", "value": "0.99"},
+          {"selected": false, "text": "0.995", "value": "0.995"},
+          {"selected": false, "text": "0.999", "value": "0.999"},
+          {"selected": false, "text": "0.95", "value": "0.95"}
+        ],
+        "query": "0.99,0.995,0.999,0.95",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {"from": "now-30d", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - executive summary",
+  "uid": "mdk-exec-summary",
+  "version": 1,
+  "weekStart": ""
+}
