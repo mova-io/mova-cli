@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.27.39"
+version = "2026.5.28.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -230,24 +230,33 @@ airflow = [
     "apache-airflow>=2.7,<3",
 ]
 playground = [
-    # Chainlit gives us a Python-native chat/form UI for testing
+    # Chainlit gives us a Python-native ChatGPT-like UI for testing
     # deployed agents from a browser. Operators run
-    # ``mdk playground serve --runtime-url ...`` to launch it; the
-    # UI renders an input form per agent (from agent.yaml's input
-    # schema), POSTs to the runtime's /run endpoint, and captures
-    # 👍/👎/comment feedback that the runtime persists to Postgres.
+    # ``mdk playground serve --runtime-url ...`` to launch it: multi-turn
+    # chat with a deployed agent, a past-conversations sidebar (Chainlit's
+    # data layer), file uploads, live streaming, and 👍/👎/comment
+    # feedback that the runtime persists to Postgres.
     #
     # Version range deliberately loose (>=1.3): Chainlit pulls in
     # specific FastAPI / starlette pins that conflict with the
     # [teams] extra at narrower ranges. Operators installing the
     # playground typically install JUST playground (not with teams)
     # — pin tighter only if the floor version surfaces breakage.
+    # >=1.3 also guarantees the data-layer API the history sidebar needs
+    # (``@cl.data_layer`` + ``SQLAlchemyDataLayer``) and the
+    # ``@cl.on_chat_resume`` hook.
     "chainlit>=1.3",
     # httpx is the async HTTP client used to call the runtime API.
     # It's already a transitive dep via FastAPI on the runtime side,
     # but operators running JUST the playground (no runtime) need it
     # explicitly listed.
     "httpx>=0.27",
+    # aiosqlite backs Chainlit's SQLAlchemy data layer over the
+    # zero-config local SQLite threads DB (~/.mdk/playground/threads.db)
+    # that powers the past-conversations sidebar + resume. Pure-Python,
+    # MIT-licensed. (Postgres deployments use the asyncpg/psycopg Chainlit
+    # already pulls in; only the SQLite default needs this explicitly.)
+    "aiosqlite>=0.19",
 ]
 
 [dependency-groups]

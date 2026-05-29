@@ -3329,7 +3329,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.5.27.39"
+version = "2026.5.28.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -3399,6 +3399,7 @@ otel = [
     { name = "opentelemetry-sdk" },
 ]
 playground = [
+    { name = "aiosqlite" },
     { name = "chainlit" },
     { name = "httpx" },
 ]
@@ -3436,6 +3437,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
+    { name = "aiosqlite", marker = "extra == 'playground'", specifier = ">=0.19" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40,<1" },
     { name = "apache-airflow", marker = "extra == 'airflow'", specifier = ">=2.7,<3" },
     { name = "asyncpg", marker = "extra == 'runtime'", specifier = ">=0.29" },

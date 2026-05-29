@@ -12,13 +12,21 @@ Quickstart::
 
     # Against a deployed runtime
     export MOVATE_API_KEY=mvt_live_...
-    mdk playground serve --runtime-url https://movate-prod-api.eastus2... \\
-        --api-key-env MOVATE_API_KEY
+    mdk playground serve --runtime-url https://movate-prod-api.eastus2...
 
-The playground is a Chainlit app under the hood — every feature
-Chainlit ships (👍/👎 widgets, thread persistence, chat history,
-file uploads, OAuth) is available. The wrapper here is just config
-plumbing + a `chainlit run` shell-out.
+The bearer token is read from ``MOVATE_API_KEY`` (or
+``MDK_PLAYGROUND_API_KEY``) by default — never pass it on the command
+line. To point at a different env var, ``export`` it onto
+``MDK_PLAYGROUND_API_KEY`` before launching.
+
+The playground is a ChatGPT-like Chainlit app: multi-turn chat with a
+deployed agent, a past-conversations sidebar (resume prior chats), file
+uploads (text extracted into context, optionally persisted to the
+agent's KB), live token streaming, and 👍/👎/comment feedback. It is
+**capability-aware** — it asks the runtime what it supports
+(``GET /api/v1/capabilities``) and uses server-managed sessions /
+streaming / the feedback API when available, falling back to
+client-managed history + buffered responses otherwise.
 """
 
 from __future__ import annotations
@@ -36,9 +44,10 @@ err = Console(stderr=True)
 playground_app = typer.Typer(
     name="playground",
     help=(
-        "Browser UI for testing deployed agents. Powered by Chainlit. "
-        "Captures 👍/👎/comment feedback and persists to the runtime's "
-        "Postgres + Langfuse for analysis + agent tuning."
+        "ChatGPT-like browser UI for testing deployed agents. Powered by "
+        "Chainlit. Multi-turn chat, a past-conversations sidebar, file "
+        "uploads, live streaming, and 👍/👎/comment feedback persisted to "
+        "the runtime's Postgres + Langfuse for analysis + agent tuning."
     ),
     no_args_is_help=True,
 )
@@ -144,38 +153,80 @@ def serve(
             "useful for CI / container deploys / SSH tunnels."
         ),
     ),
+    no_history: bool = typer.Option(
+        False,
+        "--no-history",
+        help=(
+            "Disable thread persistence (the past-conversations sidebar / "
+            "resume). The playground runs ephemeral — each refresh starts "
+            "a fresh chat. By default threads persist to a local SQLite "
+            "file at ``~/.mdk/playground/threads.db`` (or a Postgres URL "
+            "from ``MDK_PLAYGROUND_THREADS_URL`` / ``DATABASE_URL``)."
+        ),
+    ),
+    persist_uploads: bool = typer.Option(
+        False,
+        "--persist-uploads",
+        help=(
+            "Auto-ingest uploaded files into the agent's KB (instead of "
+            "only holding their text as conversation context). Off by "
+            "default — uploads stay session-scoped and you opt in per "
+            "file via the 'Add to agent's KB permanently' button in the "
+            "chat. ``--persist-uploads`` flips the default to always-ingest."
+        ),
+    ),
 ) -> None:
-    """Launch the Chainlit playground UI for testing deployed agents.
+    """Launch the ChatGPT-like Chainlit playground for testing agents.
 
-    The browser UI lists agents from the configured runtime, lets you
-    submit JSON input for each, displays the structured output, and
-    captures 👍/👎/comment feedback that the runtime persists to
+    The browser UI lists agents from the configured runtime; pick one and
+    chat with it multi-turn. Attach files (text extracted into context,
+    optionally persisted to the agent's KB), resume past conversations
+    from the sidebar, watch tokens stream live (when the runtime supports
+    it), and capture 👍/👎/comment feedback that the runtime persists to
     Postgres (and pushes to Langfuse if configured).
+
+    Capability-aware: the playground asks the runtime what it supports
+    and auto-upgrades to server-managed sessions / streaming / the
+    feedback API when available, falling back to client-managed history +
+    buffered responses otherwise.
     """
     _ensure_chainlit_installed()
     _warn_if_unstable_python()
 
     # Chainlit reads its config from env vars + CLI flags. We export
     # the runtime config under MDK_PLAYGROUND_* so the app module
-    # (``movate.playground.app``) can pick them up at start time.
+    # (``movate.playground.app``) can pick them up at start time. The
+    # bearer token is set on the SERVER process env only — it never
+    # reaches browser JS and is never logged.
     env = os.environ.copy()
     env["MDK_PLAYGROUND_RUNTIME_URL"] = runtime_url
     if api_key:
         env["MDK_PLAYGROUND_API_KEY"] = api_key
+    if no_history:
+        env["MDK_PLAYGROUND_NO_HISTORY"] = "1"
+    if persist_uploads:
+        env["MDK_PLAYGROUND_PERSIST_UPLOADS"] = "1"
 
-    # ``chainlit run`` takes a path to a Python module file. We point
-    # it at our app module's __file__ — works whether installed via
-    # editable install or wheel. The ``-h`` flag suppresses Chainlit's
-    # auto-browser-open (we handle that ourselves to respect
-    # ``--headless``).
-    import movate.playground.app as app_module  # noqa: PLC0415
+    # ``chainlit run`` takes a path to a Python module file. We resolve
+    # the app module's file via importlib *without executing it* — the app
+    # module imports chainlit at top level (by design, for a clear error),
+    # and the actual chainlit import belongs in the child ``chainlit run``
+    # process, not this parent. ``find_spec`` reads the path off the module
+    # spec without running the body.
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.find_spec("movate.playground.app")
+    if spec is None or spec.origin is None:
+        err.print("[red]✗[/red] could not locate the playground app module.")
+        raise typer.Exit(code=1)
+    app_module_file = spec.origin
 
     chainlit_cmd = [
         sys.executable,
         "-m",
         "chainlit",
         "run",
-        app_module.__file__,
+        app_module_file,
         "--host",
         host,
         "--port",
