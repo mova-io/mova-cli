@@ -71,6 +71,13 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
+    # graph (ADR 046) — the sigma.js knowledge-graph explorer. All read.
+    ("GET", "/api/v1/projects/{project_id}/graph"): "read",
+    ("GET", "/api/v1/projects/{project_id}/graph/stream"): "read",
+    ("GET", "/api/v1/graph/nodes/{node_id}"): "read",
+    ("GET", "/api/v1/graph/nodes/{node_id}/neighbors"): "read",
+    ("GET", "/api/v1/graph/search"): "read",
+    ("POST", "/api/v1/graph/query"): "read",
 }
 
 
