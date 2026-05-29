@@ -97,15 +97,44 @@ class Provenance(BaseModel):
     extraction_confidence: float | None = None
 
 
+class NodeNeighbor(BaseModel):
+    """One 1-hop connected entity, as the drill-down panel renders it.
+
+    Each neighbor is a connected graph node (a ticket / SOP / doc / feature
+    / …) reached by a single relation from the focused node. ``relation``
+    is the predicate type of that edge and ``direction`` says whether the
+    focused node is the source (``out``) or target (``in``) — so the panel
+    can group neighbors by relation type *and* render them as clickable
+    links that re-center the graph or open the neighbor's own detail.
+
+    Deliberately lighter than :class:`NodeDetail` (no provenance, no nested
+    neighbors): just enough for one row in the "connected entities" list.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    """The neighbor's node id (``Entity.entity_id``) — the click target."""
+
+    label: str
+    type: str
+    relation: str
+    """The relation/predicate type of the edge to this neighbor."""
+
+    direction: str
+    """``out`` (focused node → neighbor) or ``in`` (neighbor → focused node)."""
+
+
 class NodeDetail(BaseModel):
     """Full detail for a single graph node — the expand-on-demand payload.
 
     Returned by ``GET /api/v1/graph/nodes/{id}``. Carries the node's own
-    attributes, its provenance (source chunks + url + confidence), a
-    neighbor count (so the UI can show "expand → N more" without
-    fetching them), the agents that reference it, and a ``_links.expand``
-    hint pointing at the neighbors endpoint (HATEOAS-style: the client
-    follows the link rather than constructing the URL).
+    attributes, its provenance (source chunks + url + confidence), the
+    1-hop connected entities (``neighbors`` — the drill-down list, each
+    tagged with its relation type + direction), a neighbor count (so the
+    UI can show "expand → N more"), the agents that reference it, and a
+    ``_links.expand`` hint pointing at the neighbors endpoint (HATEOAS-
+    style: the client follows the link rather than constructing the URL).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -120,6 +149,11 @@ class NodeDetail(BaseModel):
     """Free-form node attributes (e.g. ``community``, source metadata)."""
 
     provenance: list[Provenance] = Field(default_factory=list)
+    neighbors: list[NodeNeighbor] = Field(default_factory=list)
+    """The node's 1-hop connected entities, each tagged with the relation
+    type + direction — the drill-down panel's "connected entities" list.
+    Capped at the node budget; empty when the node has no neighbors."""
+
     neighbor_count: int = 0
     referenced_by_agents: list[str] = Field(default_factory=list)
     links: dict[str, str] = Field(default_factory=dict, alias="_links")

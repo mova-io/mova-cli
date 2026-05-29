@@ -37,7 +37,12 @@ def _pad(vec: list[float]) -> list[float]:
 
 
 def _entity(
-    entity_id: str, name: str, type: str = "T", *, source_chunk_ids: list[str] | None = None
+    entity_id: str,
+    name: str,
+    type: str = "T",
+    *,
+    source_chunk_ids: list[str] | None = None,
+    project_id: str | None = None,
 ) -> Entity:
     return Entity(
         entity_id=entity_id,
@@ -49,11 +54,19 @@ def _entity(
         embedding_model="test-embed",
         content_hash=_hash("a1", "t1", name, type),
         source_chunk_ids=source_chunk_ids or [],
+        project_id=project_id,
     )
 
 
 def _relation(
-    rid: str, src: str, dst: str, weight: float = 1.0, *, source_chunk_ids: list[str] | None = None
+    rid: str,
+    src: str,
+    dst: str,
+    weight: float = 1.0,
+    *,
+    type: str = "REL",
+    source_chunk_ids: list[str] | None = None,
+    project_id: str | None = None,
 ) -> Relation:
     return Relation(
         relation_id=rid,
@@ -61,10 +74,11 @@ def _relation(
         agent="a1",
         src_entity_id=src,
         dst_entity_id=dst,
-        type="REL",
+        type=type,
         weight=weight,
-        content_hash=_hash("a1", "t1", src, dst, "REL"),
+        content_hash=_hash("a1", "t1", src, dst, type),
         source_chunk_ids=source_chunk_ids or [],
+        project_id=project_id,
     )
 
 
@@ -116,6 +130,68 @@ async def test_node_detail_provenance_over_persisted_graph(storage: StorageProvi
     assert len(detail.provenance) == 1
     assert detail.provenance[0].url == "docs/x.md"
     assert detail.provenance[0].extraction_confidence == pytest.approx(0.9)
+
+
+async def test_node_detail_neighbors_over_persisted_graph(storage: StorageProvider) -> None:
+    # The drill-down list: connected entities tagged with relation + direction,
+    # built on the SAME 1-hop expansion as the neighbor count. Verifies the
+    # projection over every real backend (memory / sqlite / postgres).
+    await storage.upsert_entity(_entity("hub", "Hub", "Feature"))
+    await storage.upsert_entity(_entity("up", "Upstream", "System"))
+    await storage.upsert_entity(_entity("down", "Downstream", "Doc"))
+    # up -> hub (incoming); hub -> down (outgoing), different relation types.
+    await storage.upsert_relation(_relation("r1", "up", "hub", 0.9, type="FEEDS"))
+    await storage.upsert_relation(_relation("r2", "hub", "down", 0.5, type="DOCUMENTS"))
+
+    detail = await gq.node_detail(storage, agent="a1", tenant_id="t1", node_id="hub")
+    assert detail is not None
+    assert detail.neighbor_count == 2
+    by_key = {n.key: n for n in detail.neighbors}
+    assert by_key["up"].relation == "FEEDS"
+    assert by_key["up"].direction == "in"
+    assert by_key["up"].type == "System"
+    assert by_key["down"].relation == "DOCUMENTS"
+    assert by_key["down"].direction == "out"
+    assert by_key["down"].type == "Doc"
+
+
+async def test_node_detail_no_neighbors_over_persisted_graph(storage: StorageProvider) -> None:
+    await storage.upsert_entity(_entity("solo", "Solo"))
+    detail = await gq.node_detail(storage, agent="a1", tenant_id="t1", node_id="solo")
+    assert detail is not None
+    assert detail.neighbors == []
+    assert detail.neighbor_count == 0
+
+
+async def test_node_detail_project_scoped_over_persisted_graph(storage: StorageProvider) -> None:
+    # project_id (ADR 046 D1) bounds the node AND its 1-hop neighborhood:
+    # a same-agent neighbor in a DIFFERENT project must not leak into the
+    # drill-down, and a node from another project 404s (None).
+    await storage.upsert_entity(_entity("p1n1", "P1 Node", "Feature", project_id="p1"))
+    await storage.upsert_entity(_entity("p1n2", "P1 Neighbor", "Doc", project_id="p1"))
+    await storage.upsert_entity(_entity("p2n1", "P2 Node", "System", project_id="p2"))
+    await storage.upsert_relation(_relation("r1", "p1n1", "p1n2", 0.8, project_id="p1"))
+    # Cross-project edge (same agent) — must be excluded when scoped to p1.
+    await storage.upsert_relation(_relation("r2", "p1n1", "p2n1", 0.9, project_id="p2"))
+
+    scoped = await gq.node_detail(
+        storage, agent="a1", tenant_id="t1", node_id="p1n1", project_id="p1"
+    )
+    assert scoped is not None
+    keys = {n.key for n in scoped.neighbors}
+    assert keys == {"p1n2"}  # p2n1 excluded by project scope
+    assert scoped.neighbor_count == 1
+
+    # A node from a different project is rejected under the p1 scope.
+    rejected = await gq.node_detail(
+        storage, agent="a1", tenant_id="t1", node_id="p2n1", project_id="p1"
+    )
+    assert rejected is None
+
+    # Unscoped (default) keeps the full per-agent neighborhood (both edges).
+    unscoped = await gq.node_detail(storage, agent="a1", tenant_id="t1", node_id="p1n1")
+    assert unscoped is not None
+    assert {n.key for n in unscoped.neighbors} == {"p1n2", "p2n1"}
 
 
 async def test_search_over_persisted_graph(storage: StorageProvider) -> None:

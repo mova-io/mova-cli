@@ -182,6 +182,34 @@ html, body {
 .kv { display: grid; grid-template-columns: minmax(80px, 35%) 1fr; gap: 3px 10px; margin: 0; }
 .kv dt { color: var(--muted); word-break: break-word; }
 .kv dd { margin: 0; word-break: break-word; }
+.relations { font-size: 13px; }
+.relations .rel-group { margin-bottom: 12px; }
+.relations .rel-head {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--accent);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  margin-bottom: 4px;
+}
+.relations .rel-count {
+  margin-left: auto; color: var(--muted);
+  font-size: 11px; letter-spacing: 0;
+}
+.relations .rel-link {
+  display: flex; align-items: center; gap: 7px;
+  padding: 4px 7px; margin: 2px 0;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel-2); color: var(--text);
+  text-decoration: none; cursor: pointer;
+}
+.relations .rel-link:hover { border-color: var(--accent); background: var(--accent-dim); }
+.relations .rel-dir { color: var(--muted); flex: 0 0 auto; }
+.relations .rel-label { flex: 1 1 auto; word-break: break-word; }
+.relations .rel-type {
+  flex: 0 0 auto; color: var(--muted);
+  font-size: 11px; border: 1px solid var(--border);
+  border-radius: 8px; padding: 0 6px;
+}
+
 .provenance { font-size: 13px; }
 .provenance .src { margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
 .provenance .src:last-child { border-bottom: none; }
