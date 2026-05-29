@@ -213,6 +213,7 @@ from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.infra_cmd import infra_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
+from movate.cli.judge_cmd import judge_app  # noqa: E402
 from movate.cli.kb_cmd import kb_app  # noqa: E402
 from movate.cli.keys_cmd import keys_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
@@ -511,6 +512,10 @@ app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
 # test cases + 10-category scorecard. Sibling pattern like eval-gen.
 # Phase 3 will swap bare `mdk eval` to use this flow as the default.
 app.command("eval-scorecard", rich_help_panel=PANEL_RUN)(eval_scorecard_cmd.eval_scorecard)
+# `judge` (generate + commit) — author an evals/judge.yaml from an agent's
+# spec via Claude, with a human-review gate between generate and commit.
+# CLI parity for POST /api/v1/agents/{name}/judge/{generate,commit}.
+app.add_typer(judge_app, name="judge", rich_help_panel=PANEL_RUN)
 # `eval-schedule` (CRUD) + `eval-scheduler-tick` (cron entrypoint) wire the
 # continuous-eval loop (ADR 016 D2). Sibling pattern like eval-gen/eval-scorecard.
 # The tick is meant to be driven by an external cron (Azure: a Container Apps

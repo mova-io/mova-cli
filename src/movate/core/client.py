@@ -36,6 +36,10 @@ from movate.runtime.schemas import (
     JobCancelView,
     JobListView,
     JobView,
+    JudgeCommitRequest,
+    JudgeCommitResponse,
+    JudgeGenerateRequest,
+    JudgeGenerateResponse,
     ObservabilityHealthView,
     ObservabilityInsightListView,
     ProjectListResponse,
@@ -587,6 +591,59 @@ class MovateClient:
         )
         self._raise_for_status(r)
         return WorkflowValidationView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Judge Engineer — author + commit evals/judge.yaml
+    # ------------------------------------------------------------------
+
+    async def generate_judge(
+        self,
+        agent: str,
+        *,
+        rubric_dimensions: list[str] | None = None,
+        include_examples: bool = True,
+        model: str | None = None,
+        budget_usd: float = 0.10,
+        mock: bool = False,
+    ) -> JudgeGenerateResponse:
+        """``POST /api/v1/agents/{name}/judge/generate``.
+
+        Synchronous (~few seconds). Returns the full generated YAML +
+        the inferred / supplied dimensions + a rationale. Pass
+        ``mock=True`` for the deterministic MockProvider (no API key
+        needed — used by hermetic tests and ``mdk judge generate
+        --mock``).
+        """
+        body = JudgeGenerateRequest(
+            rubric_dimensions=rubric_dimensions,
+            include_examples=include_examples,
+            model=model,
+            budget_usd=budget_usd,
+        )
+        headers = {"X-MDK-Judge-Engineer-Mock": "1"} if mock else None
+        r = await self._client.post(
+            f"/api/v1/agents/{agent}/judge/generate",
+            json=body.model_dump(mode="json", exclude_none=False),
+            headers=headers,
+        )
+        self._raise_for_status(r)
+        return JudgeGenerateResponse.model_validate(r.json())
+
+    async def commit_judge(self, agent: str, *, judge_yaml: str) -> JudgeCommitResponse:
+        """``POST /api/v1/agents/{name}/judge/commit``.
+
+        Persists the supplied ``judge_yaml`` body at
+        ``<agent_dir>/evals/judge.yaml``. Server re-validates the YAML
+        before writing — a malformed body returns 422 without touching
+        disk.
+        """
+        body = JudgeCommitRequest(judge_yaml=judge_yaml)
+        r = await self._client.post(
+            f"/api/v1/agents/{agent}/judge/commit",
+            json=body.model_dump(mode="json"),
+        )
+        self._raise_for_status(r)
+        return JudgeCommitResponse.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Convenience: poll until terminal

@@ -241,6 +241,10 @@ from movate.runtime.schemas import (
     JobScheduleSubmission,
     JobScheduleView,
     JobView,
+    JudgeCommitRequest,
+    JudgeCommitResponse,
+    JudgeGenerateRequest,
+    JudgeGenerateResponse,
     KbChunkView,
     KbDeletedView,
     KbIngestFileResult,
@@ -2739,6 +2743,68 @@ async def _ingest_generated(
     )
 
 
+# ---------------------------------------------------------------------------
+# Judge Engineer — sample-case loader + mock-mode helpers
+# ---------------------------------------------------------------------------
+#
+# A canned, schema-valid response so hermetic tests + offline ``mdk judge
+# generate --mock`` work without an LLM call. Mirrors the JSON contract
+# :func:`movate.core.judge_engineer._parse_engineer_response` expects.
+_MOCK_JUDGE_ENGINEER_RESPONSE = (
+    '{"rubric_markdown": "## Mock rubric\\n\\nDeterministic anchor for '
+    "hermetic tests. Scores 1.0 when the actual matches the expected "
+    'on the listed dimensions, 0.5 on near-misses, 0.0 otherwise.\\n", '
+    '"rationale": "mock engineer response — dimensions inferred from the '
+    'agent shape"}'
+)
+
+
+def _engineer_mock_requested(request: Request) -> bool:
+    """True when the caller wants the deterministic MockProvider.
+
+    Read from the ``X-MDK-Judge-Engineer-Mock`` request header so
+    hermetic tests + the ``mdk judge generate --mock`` CLI can opt in
+    without a body-schema change. Defaulted off — production always
+    hits the real engineer model.
+    """
+    return request.headers.get("X-MDK-Judge-Engineer-Mock", "").lower() in {"1", "true", "yes"}
+
+
+def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str, Any]]:
+    """Return up to ``limit`` ``{input, expected}`` rows from the agent's
+    dataset, for anchor examples in the judge rubric.
+
+    Best-effort: a missing / malformed dataset yields ``[]`` (the
+    engineer LLM invents domain-appropriate anchors instead). We do NOT
+    use the canonical ``load_dataset`` path because it raises on
+    missing-dataset, and we want a soft fallback.
+    """
+    spec = bundle.spec
+    if not spec.evals.dataset:
+        return []
+    dataset_path = (bundle.agent_dir / spec.evals.dataset).resolve()
+    if not dataset_path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with dataset_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and "input" in row:
+                    rows.append(row)
+                    if len(rows) >= limit:
+                        break
+    except OSError:
+        return []
+    return rows
+
+
 def build_app(
     storage: StorageProvider,
     *,
@@ -4905,6 +4971,208 @@ def build_app(
             },
         }
     }
+
+    # ------------------------------------------------------------------
+    # Judge Engineer — author + commit an evals/judge.yaml
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/judge/generate",
+        response_model=JudgeGenerateResponse,
+        status_code=200,
+        tags=["agents-v1", "eval"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_generate_agent_judge(
+        name: str,
+        body: JudgeGenerateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JudgeGenerateResponse:
+        """Author a complete ``judge.yaml`` for ``name`` (sync, <5s typical).
+
+        Claude reads the agent's spec (prompt + input/output schemas +
+        any sample cases) and authors a rubric with the requested (or
+        inferred) scoring dimensions. The generated YAML is validated
+        against :class:`~movate.core.models.JudgeConfig` before
+        returning — the eval engine can load it as-is.
+
+        Scope: ``eval`` — generation is a READ over the agent's spec; it
+        does not modify the bundle. The follow-up
+        ``POST /api/v1/agents/{name}/judge/commit`` (scope ``admin``) is
+        what writes the YAML to disk.
+
+        Tenant-scoped: only the authenticated tenant's agent resolution
+        is considered (registry-first, FS fallback).
+
+        Request body fields:
+
+        * ``rubric_dimensions`` — optional list; omitted/null infers
+          from agent shape (RAG / tool-use / workflow / generic).
+        * ``include_examples`` — anchor with 2-3 concrete scored
+          examples (default true).
+        * ``model`` — optional engineer-model override.
+        * ``budget_usd`` — hard ceiling on the generation call.
+
+        Errors:
+
+        * **400** — bad request shape (invalid dimension list).
+        * **401** — missing / bad bearer token.
+        * **402** — generation cost exceeded ``budget_usd``.
+        * **403** — caller lacks the ``eval`` scope.
+        * **404** — agent not found for this tenant.
+        * **422** — engineer LLM returned a malformed rubric (rare; the
+          prompt is JSON-structured).
+        * **500** — engineer LLM call itself failed.
+        """
+        from movate.core.judge_engineer import (  # noqa: PLC0415
+            DEFAULT_ENGINEER_MODEL,
+            JudgeEngineerError,
+            generate_judge,
+        )
+
+        store: StorageProvider = request.app.state.storage
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Pull up to 3 sample cases from the agent's dataset (when one
+        # exists) — used as anchor examples in the rubric. Best-effort:
+        # a missing/malformed dataset yields no samples, which is fine.
+        samples = _load_sample_cases(bundle, limit=3)
+
+        # MockProvider for hermetic tests + offline `mdk judge generate
+        # --mock`. The default path uses LiteLLM. Same shape the eval +
+        # run endpoints use.
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        provider: BaseLLMProvider = (
+            MockProvider(response=_MOCK_JUDGE_ENGINEER_RESPONSE)
+            if _engineer_mock_requested(request)
+            else LiteLLMProvider()
+        )
+
+        try:
+            generated = await generate_judge(
+                bundle=bundle,
+                provider=provider,
+                engineer_model=body.model or DEFAULT_ENGINEER_MODEL,
+                rubric_dimensions=body.rubric_dimensions,
+                include_examples=body.include_examples,
+                samples=samples,
+                budget_usd=body.budget_usd,
+                pricing=load_pricing(),
+            )
+        except JudgeEngineerError as exc:
+            # Map the typed engineer error to HTTP. AgentCreationError
+            # already has a handler that does the right thing for this
+            # status_code shape; reuse it for consistency.
+            raise AgentCreationError(str(exc), status_code=exc.status_code) from exc
+
+        return JudgeGenerateResponse(
+            judge_yaml=generated.judge_yaml,
+            rubric_dimensions=generated.rubric_dimensions,
+            rationale=generated.rationale,
+            tokens_used=generated.tokens_used,
+            cost_usd=generated.cost_usd,
+        )
+
+    @v1.post(
+        "/agents/{name}/judge/commit",
+        response_model=JudgeCommitResponse,
+        status_code=200,
+        tags=["agents-v1", "eval"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_commit_agent_judge(
+        name: str,
+        body: JudgeCommitRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JudgeCommitResponse:
+        """Persist a (possibly hand-edited) ``judge.yaml`` to the agent's
+        bundle.
+
+        The body's ``judge_yaml`` is RE-validated server-side against
+        :class:`~movate.core.models.JudgeConfig` before any byte hits
+        disk — a malformed hand edit can't land. Atomic write: the
+        new file replaces any existing one in one rename.
+
+        Scope: ``admin`` — this mutates the agent bundle. Same
+        scope-classification as ``PUT /api/v1/agents/{name}``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token.
+        * **403** — caller lacks the ``admin`` scope.
+        * **404** — agent not found for this tenant.
+        * **422** — supplied YAML failed schema validation.
+        * **503** — runtime built without an ``agents_path``.
+        """
+        from movate.core.judge_engineer import (  # noqa: PLC0415
+            JudgeEngineerError,
+            validate_judge_yaml,
+        )
+
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/agents/{name}/judge/commit is unavailable",
+                status_code=503,
+            )
+
+        # Resolve the bundle for tenant isolation — a tenant must not be
+        # able to commit a judge into another tenant's agent dir.
+        store: StorageProvider = request.app.state.storage
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Validate BEFORE touching disk.
+        try:
+            validate_judge_yaml(body.judge_yaml)
+        except JudgeEngineerError as exc:
+            raise AgentCreationError(str(exc), status_code=exc.status_code) from exc
+
+        # Atomic write to <agent_dir>/evals/judge.yaml. The agent dir
+        # comes from the FILESYSTEM-resolved bundle (FS fallback) or
+        # the materialized registry bundle (in either case, mutating
+        # the materialized copy alone would be lost on next pod reboot).
+        # Anchor the write to the canonical agents_path so registry-only
+        # agents persist correctly.
+        target_dir = agents_path / name / "evals"
+        target_path = target_dir / "judge.yaml"
+        updated = target_path.exists()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # Stage to a sibling tmp then atomic rename — never leaves a
+        # half-written judge.yaml on disk.
+        import tempfile  # noqa: PLC0415
+
+        fd, tmp_str = tempfile.mkstemp(
+            prefix=".staging-judge-", suffix=".yaml", dir=str(target_dir)
+        )
+        tmp_path = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body.judge_yaml)
+            tmp_path.replace(target_path)
+        except Exception as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise AgentCreationError(
+                f"failed to write judge.yaml: {exc}",
+                status_code=500,
+            ) from exc
+
+        return JudgeCommitResponse(
+            agent_name=name,
+            judge_path="evals/judge.yaml",
+            updated=updated,
+        )
 
     @v1.post(
         "/agents/{name}/kb",
