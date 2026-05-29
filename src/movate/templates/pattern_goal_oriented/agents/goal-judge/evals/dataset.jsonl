@@ -1,0 +1,2 @@
+{"input": {"text": "Your notes, end-to-end encrypted — private by default, synced everywhere.", "labels": ["continue", "satisfied"]}, "expected": {"label": "satisfied"}}
+{"input": {"text": "Private notes.", "labels": ["continue", "satisfied"]}, "expected": {"label": "continue"}}

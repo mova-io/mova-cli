@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["attempt"],
+  "properties": {
+    "attempt": {
+      "type": "string",
+      "description": "The improved attempt."
+    }
+  }
+}

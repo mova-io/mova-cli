@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Simulation workflow state",
+  "description": "Threaded state for the bounded multi-agent simulation pattern.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["scenario"],
+  "properties": {
+    "scenario": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The scenario the fixed roster plays out."
+    },
+    "transcript": {
+      "type": "string",
+      "description": "The running interaction transcript; the JUDGE reads this to decide resolved vs continue."
+    },
+    "outcome": {
+      "type": "string",
+      "description": "The final outcome emitted by a done terminal."
+    }
+  }
+}

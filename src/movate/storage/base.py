@@ -23,18 +23,28 @@ path is enforced by ``check_record``, not the storage method.
 
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
 from typing import Protocol
 
 from movate.core.dr_backup import ImportResult
+from movate.core.eval_generator import EvalGenerationJob
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
     ApiKeyRecord,
+    AuditRecord,
     BatchRecord,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogEntryVersion,
+    CatalogRatingsSummary,
+    CatalogSource,
     ConversationThread,
+    DiagnosisRecord,
     Entity,
     EntityWithScore,
     EvalRecord,
@@ -46,15 +56,38 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    Project,
+    ProjectKbMode,
+    ProjectMember,
+    ProjectMemberRole,
     Relation,
     RunRecord,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
     Trigger,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
+
+
+@dataclass(frozen=True)
+class EvalCommitResult:
+    """What :meth:`StorageProvider.commit_eval_cases` returns on success.
+
+    Carried in the ``POST /jobs/{id}/commit`` response so the caller
+    knows exactly what landed on disk + how many cases were appended
+    (selective acceptance: the response's ``cases_added`` may be less
+    than the job's total when ``case_ids`` was a subset).
+    """
+
+    agent_name: str
+    dataset_path: str
+    cases_added: int
+    judge_yaml_updated: bool
 
 
 class StorageProvider(Protocol):
@@ -82,6 +115,38 @@ class StorageProvider(Protocol):
     async def save_eval(self, e: EvalRecord) -> None: ...
 
     async def save_bench(self, b: BenchRecord) -> None: ...
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        """Persist a completed :class:`AuditRecord`.
+
+        Mirrors :meth:`save_eval` / :meth:`save_bench`: one immutable
+        row per terminal audit, keyed by ``audit_id``, tenant-scoped at
+        the row level. The Claude-orchestrated audit pipeline is the
+        ONLY caller of this method — it is intentionally not exposed
+        on the HTTP write surface (the audit is read-only by
+        construction; the *findings* are the only thing that lands
+        durably, and they land here)."""
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        """Exact lookup by ``audit_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the audit belongs to a
+        different tenant — same no-leak contract as :meth:`get_eval`."""
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        """List audits newest-first, optionally filtered.
+
+        ``scope_id`` narrows to one agent name or project id — set when
+        a caller wants "all audits for this agent". ``tenant_id=None``
+        returns audits across all tenants — operator tooling only,
+        never exposed on the HTTP API.
+        """
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None: ...
 
@@ -1149,6 +1214,127 @@ class StorageProvider(Protocol):
         """
 
     # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1 — workflow API parity)
+    #
+    # The workflow analogue of the agent-bundle surface above. Same shape /
+    # immutability / tenant-scoping guarantees; ``files`` is the workflow's
+    # canonical layout (``workflow.yaml`` + ``schema/state.json`` + anything
+    # else the spec references), JSON-encoded on every backend. Backs the
+    # ``/api/v1/workflows`` CRUD + versioning + publish/revert endpoints
+    # exposed by the runtime so the front end can manage workflow
+    # definitions the same way it manages agents.
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        """Persist one published workflow bundle as an immutable
+        ``(name, tenant_id, version)`` row.
+
+        Each publish writes a new row, so the table is also the version
+        history. Errors on a duplicate ``(name, tenant_id, version)`` —
+        a given version is written exactly once and never mutated.
+        Mirrors :meth:`save_agent_bundle`.
+        """
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        """Fetch one workflow bundle by ``name``, scoped to ``tenant_id``.
+
+        ``version=None`` returns the **latest** version (newest
+        ``created_at``); an explicit ``version`` returns that exact version.
+        Returns ``None`` if no match OR if the workflow belongs to a
+        different tenant — same 404-not-403 no-leak contract as the agent
+        registry.
+        """
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        """List the **latest version per workflow name**, newest-first,
+        scoped to ``tenant_id``.
+
+        One row per distinct ``name`` (the most recently published version
+        of each), ordered by that version's ``created_at`` DESC.
+
+        ``published_only=True`` filters to names whose CURRENT-PUBLISHED
+        version exists — i.e. there is at least one ``published=True`` row
+        for that name; the returned row is still the *latest* (newest
+        ``created_at``) for the name, NOT necessarily the published one,
+        so callers can detect drift between "blessed" and "latest" without
+        a second call. ADR 037 D1.
+        """
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        """List the version history for one workflow ``name``, newest-first,
+        scoped to ``tenant_id``.
+
+        Drives ``GET /api/v1/workflows/{name}/versions``. A cross-tenant or
+        unknown ``name`` returns ``[]`` rather than raising — same no-leak
+        contract as :meth:`list_agent_versions`.
+        """
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        """List **every** published workflow-bundle version, all tenants.
+
+        Operator-only / DR-export style helper analogous to
+        :meth:`list_all_agent_bundles`. Ordered ``(tenant_id, name,
+        created_at)`` for a stable, diff-friendly snapshot.
+        """
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        """Delete workflow bundle rows scoped to ``tenant_id``; return the
+        count deleted.
+
+        ``version=None`` removes all versions of ``name``; an explicit
+        ``version`` removes just that one. Tenant-scoped in WHERE so a
+        cross-tenant or unknown name deletes nothing and returns ``0``.
+        Mirrors :meth:`delete_agent_bundle`.
+        """
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        """Promote ``(name, version)`` to the published version (ADR 037 D1).
+
+        At most one version per ``(tenant_id, name)`` is published at a time:
+        this sets the target's ``published`` to ``True`` and clears every
+        other version of the same name in the same tenant. Returns ``True``
+        when a row matched (the promote happened), ``False`` when the
+        ``(name, version)`` doesn't exist for this tenant (the caller maps
+        ``False`` to a 404 at the API edge).
+
+        Idempotent — re-promoting the same version is a no-op (still
+        returns ``True``). Tenant-scoped in WHERE so a caller can't flip
+        another tenant's flag.
+        """
+
+    # ------------------------------------------------------------------
     # Knowledge graph (GraphRAG) — entities + relations layered over the
     # KB chunks. Storage mirrors kb_chunks: embeddings as JSONB/TEXT float
     # arrays, cosine in Python (pgvector swap stays behind this surface).
@@ -1265,6 +1451,166 @@ class StorageProvider(Protocol):
         rows deleted (entities + relations)."""
 
     # ------------------------------------------------------------------
+    # Agent catalog (ADR 041) — manifest + version table + ratings + sync
+    # watermark. Three namespaces (movate / private / community) share one
+    # schema, distinguished by ``source``. Public namespaces use
+    # ``tenant_id=None``; ``private`` requires a tenant. The read API joins
+    # ``movate`` + the caller's ``private`` + (later) ``community``.
+    # ------------------------------------------------------------------
+
+    async def upsert_catalog_entry(self, entry: CatalogEntry) -> None:
+        """Insert-or-update one catalog entry keyed by
+        ``(slug, source, tenant_id)``.
+
+        Used by both the sync job (writing ``source='movate'`` rows with
+        ``tenant_id=None``) and tenant-private submissions (writing
+        ``source='private'`` rows with the owning ``tenant_id``). Re-upsert
+        refreshes ``latest_version`` / ``title`` / ``description`` / ``tags`` /
+        ``shape`` / ``recommended_for`` / ``ratings_summary`` / ``popularity``
+        and stamps ``synced_at`` — the "last write wins" contract every other
+        upsert in this Protocol uses.
+
+        Storage MUST enforce that ``tenant_id IS NOT NULL`` iff
+        ``source = 'private'`` so the namespace invariant lives at the DB
+        layer, not just the API layer.
+        """
+
+    async def get_catalog_entry(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> CatalogEntry | None:
+        """Exact lookup by ``(slug, source, tenant_id)``.
+
+        For ``private`` queries, ``tenant_id`` MUST be provided; passing
+        ``None`` for ``private`` returns ``None`` (no implicit cross-tenant
+        read). For ``movate`` / ``community`` the lookup ignores
+        ``tenant_id`` because those rows have ``tenant_id = NULL`` server-
+        side. Returns ``None`` when nothing matches — same no-leak contract
+        as the other ``get_*`` methods.
+        """
+
+    async def list_catalog_entries(
+        self,
+        tenant_id: str,
+        *,
+        source_filter: CatalogSource | None = None,
+        tag_filter: str | None = None,
+        shape_filter: str | None = None,
+        q: str | None = None,
+        limit: int = 100,
+        after_slug: str | None = None,
+    ) -> list[CatalogEntry]:
+        """List catalog entries the caller is allowed to see, with filters.
+
+        The visibility join is always:
+
+        * every ``movate`` entry,
+        * every ``private`` entry where ``tenant_id == caller``,
+        * every ``community`` entry (column-ready; v1 returns no community
+          rows because no writes are accepted).
+
+        ``source_filter`` narrows to ONE namespace (still tenant-scoped for
+        ``private``); ``tag_filter`` requires a single tag membership;
+        ``shape_filter`` is exact; ``q`` is a case-insensitive substring
+        match over ``name`` / ``title`` / ``description``. Pagination is by
+        slug cursor: ``after_slug`` returns entries whose slug sorts after
+        the cursor — stable on every backend without a numeric offset.
+        """
+
+    async def get_catalog_entry_versions(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> list[CatalogEntryVersion]:
+        """List every version of one catalog entry, newest-first.
+
+        ``tenant_id`` is required for ``private`` (see
+        :meth:`get_catalog_entry`) and ignored for public namespaces.
+        Returns ``[]`` when the entry doesn't exist or is cross-tenant
+        ``private``.
+
+        Carries ``bundle_tar`` in each row; callers that only need the
+        version metadata slice the field after this returns rather than
+        this Protocol maintaining a thin variant (same convention as
+        ``list_kb_chunks``).
+        """
+
+    async def get_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion | None:
+        """Fetch one specific version, including ``bundle_tar``.
+
+        Drives the download / clone path. ``None`` on a missing version OR
+        a cross-tenant ``private`` lookup — same no-leak contract.
+        """
+
+    async def upsert_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        bundle_tar: bytes,
+        digest: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion:
+        """Insert-or-update one version row.
+
+        A version is logically immutable, but ``upsert`` is the right primitive
+        for an idempotent re-sync: re-fetching the same ``(slug, source,
+        version)`` overwrites ``bundle_tar`` + ``digest`` in place rather than
+        violating the PK. Returns the persisted record (including the storage-
+        stamped ``published_at`` on first insert).
+        """
+
+    async def record_catalog_rating(
+        self,
+        slug: str,
+        *,
+        tenant_id: str,
+        source: CatalogSource = CatalogSource.MOVATE,
+        rating: int,
+        comment: str | None = None,
+    ) -> CatalogRatingsSummary:
+        """Record one tenant's rating for one entry; return the rolled-up
+        summary.
+
+        PK ``(slug, source, tenant_id)`` — re-rating overwrites the prior
+        row (one rating per tenant per entry, last write wins). Updates the
+        entry's ``ratings_summary`` (``count`` + ``avg``) inside the same
+        transaction so a list view reads a consistent rollup without a
+        recompute.
+        """
+
+    async def get_catalog_sync_watermark(self, source: CatalogSource) -> datetime | None:
+        """Return the last sync timestamp for ``source``, or ``None`` if no
+        sync has run.
+
+        Used by the sync handler to request a delta
+        (``?since=<watermark>``) from ``catalog.movate.io``. v1's sync
+        stub still reads + advances the watermark so the production
+        wiring can flip on without changing the API shape.
+        """
+
+    async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
+        """Upsert the watermark row for ``source``.
+
+        Last-write-wins. The sync handler stamps this AFTER persisting the
+        new rows, so a crash mid-sync leaves the watermark unchanged and the
+        next run replays — at-least-once. Idempotent upsert on every backend.
+        """
+
+    # ------------------------------------------------------------------
     # DR backup/restore (item 26) — a portable logical snapshot of the
     # operator-critical, non-reconstructible control-plane state (agent
     # registry, api keys, canary configs, eval/job schedules, per-tenant
@@ -1298,5 +1644,584 @@ class StorageProvider(Protocol):
         safe to re-run. Returns per-entity imported/skipped counts. See
         :func:`movate.core.dr_backup.import_state`.
         """
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040) — tenant-scoped first-class container for agents,
+    # workflows, and KBs. Tables: ``projects``, ``project_members``,
+    # ``project_agents``, ``project_workflows``, ``project_kbs``. All carry
+    # ``tenant_id`` invariants via the project's ``tenant_id`` (the junctions
+    # join through it). Soft-deleted on archive (D6). Default project per
+    # tenant is created lazily by
+    # :meth:`get_or_create_default_project` (D5) and cannot be archived —
+    # ``archive_project`` rejects it at the storage layer in addition to the
+    # API guard.
+    # ------------------------------------------------------------------
+
+    async def create_project(self, project: Project) -> Project:
+        """Insert a brand-new project row.
+
+        Raises :class:`ValueError` on a duplicate ``(tenant_id, name)`` — the
+        unique invariant is per-tenant. The caller is responsible for the
+        owner-member row (the API layer does the dual write); this method
+        only persists the project itself so the storage layer stays a thin
+        adapter seam.
+        """
+
+    async def get_project(self, tenant_id: str, project_id: str) -> Project | None:
+        """Exact lookup by ``project_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the project belongs to a different
+        tenant — same 404-not-403 no-leak contract as every other
+        single-record getter. Archived projects ARE returned so callers can
+        present an "archived" detail view; filter at the listing layer.
+        """
+
+    async def get_project_by_name(self, tenant_id: str, name: str) -> Project | None:
+        """Exact lookup by ``(tenant_id, name)`` — the human-key path.
+
+        Powers the "is this name taken?" check on project create + the
+        default-project resolver. Archived projects are returned (the unique
+        ``(tenant_id, name)`` invariant applies regardless of archive state)
+        so a caller can distinguish "name in use" from "name free".
+        """
+
+    async def list_projects(
+        self,
+        tenant_id: str,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> list[Project]:
+        """List a tenant's projects, newest-first.
+
+        ``include_archived=False`` (the default) hides soft-deleted projects;
+        the front end's archive view flips it. ``after_id`` is a stable
+        keyset cursor — the caller passes the last ``project_id`` from the
+        previous page to fetch the next. Tenant-scoped: results for a wrong
+        tenant are empty (no existence leak).
+        """
+
+    async def update_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Project | None:
+        """Patch a project's mutable fields.
+
+        Only ``name`` and ``description`` are mutable. Either or both may be
+        provided; passing both ``None`` is a no-op that returns the current
+        row. Bumps ``updated_at``. Returns ``None`` if the project doesn't
+        exist OR belongs to a different tenant (same no-leak contract). The
+        unique ``(tenant_id, name)`` invariant is enforced by the backend
+        index — implementations raise :class:`ValueError` on a rename
+        collision.
+        """
+
+    async def archive_project(self, tenant_id: str, project_id: str) -> bool:
+        """Soft-delete a project (D6): set ``archived_at`` to now.
+
+        Idempotent — re-archiving an already-archived project is a no-op
+        that returns ``False`` (no row was newly changed). Tenant-scoped: a
+        wrong-tenant archive is a no-op (returns ``False``). **Rejects the
+        default project**: raises :class:`ValueError` if the target project
+        has ``name == "default"`` — the storage layer enforces this in
+        addition to the API guard so a buggy code path can never lose the
+        default attachment target (D5).
+
+        Attachments (members, junctions) are NOT cascaded — they remain so
+        the project can be un-archived in a future ADR; the listing-side
+        filter on ``archived_at IS NULL`` keeps them invisible meanwhile.
+        """
+
+    # -- Members ---------------------------------------------------------
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        role: ProjectMemberRole,
+        added_by: str,
+    ) -> None:
+        """Insert one member row. Raises :class:`ValueError` on a duplicate
+        ``(project_id, principal_id)`` — membership is at-most-one per
+        principal per project; role changes go through
+        :meth:`update_project_member`."""
+
+    async def list_project_members(self, project_id: str) -> list[ProjectMember]:
+        """List a project's members, ordered ``added_at ASC`` (creation
+        order — owners typically land first). Empty list for an unknown
+        ``project_id`` rather than raising (callers commonly probe before
+        existence checks)."""
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        *,
+        role: ProjectMemberRole,
+    ) -> ProjectMember | None:
+        """Transition a member's role (e.g. viewer → editor → owner).
+
+        Returns the updated :class:`ProjectMember`, or ``None`` if no such
+        member exists on this project. Last-write-wins; the API layer
+        enforces the "at least one owner" invariant on demotion, not the
+        storage layer (so a force-correction path can still flip a stuck
+        row).
+        """
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> bool:
+        """Remove one member. Returns ``True`` if a row was deleted,
+        ``False`` if no matching member existed. Idempotent."""
+
+    async def get_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+    ) -> ProjectMember | None:
+        """Exact lookup by ``(project_id, principal_id)`` — the RBAC path.
+
+        The composed-RBAC check (ADR 040 D4) calls this per request to
+        resolve a principal's project role; implementations should make it
+        cheap (PK lookup). ``None`` if no membership.
+        """
+
+    # -- Agent attachments ----------------------------------------------
+
+    async def attach_agent_to_project(self, project_id: str, agent_name: str) -> None:
+        """Attach an existing agent to a project (M:N, D2).
+
+        Idempotent on ``(project_id, agent_name)``: a duplicate attach is a
+        silent no-op (not an error) so retries are safe. Does NOT validate
+        that ``agent_name`` exists in the agent registry — the API layer
+        does that pre-check, and the storage layer stays a thin adapter.
+        """
+
+    async def detach_agent_from_project(self, project_id: str, agent_name: str) -> bool:
+        """Detach (the inverse of :meth:`attach_agent_to_project`).
+
+        Returns ``True`` if a row was removed, ``False`` if no attachment
+        existed. Does NOT delete the agent itself — its registry row
+        survives, and other projects' attachments are untouched.
+        """
+
+    async def list_project_agents(self, project_id: str) -> list[str]:
+        """List agent names attached to ``project_id``, ordered
+        ``added_at ASC`` (creation order). Empty list for an unknown
+        project."""
+
+    async def list_projects_for_agent(self, tenant_id: str, agent_name: str) -> list[str]:
+        """Reverse lookup: which projects in ``tenant_id`` does this agent
+        attach to?
+
+        Implements D5's implicit-default rule: if the agent has NO
+        ``project_agents`` row in this tenant, returns
+        ``[<default_project_id>]`` (lazily creating the default project if
+        needed). If it has any explicit attachment, returns the list of
+        ``project_id``s — the default project is NOT auto-added on top of
+        explicit attachments.
+        """
+
+    # -- Workflow attachments -------------------------------------------
+
+    async def attach_workflow_to_project(self, project_id: str, workflow_name: str) -> None:
+        """Idempotent attach; same shape as :meth:`attach_agent_to_project`."""
+
+    async def detach_workflow_from_project(self, project_id: str, workflow_name: str) -> bool:
+        """Detach; same shape as :meth:`detach_agent_from_project`."""
+
+    async def list_project_workflows(self, project_id: str) -> list[str]:
+        """List workflow names attached to ``project_id``, ordered
+        ``added_at ASC``."""
+
+    async def list_projects_for_workflow(self, tenant_id: str, workflow_name: str) -> list[str]:
+        """Reverse lookup, default-project fallback identical to
+        :meth:`list_projects_for_agent`."""
+
+    # -- KB attachments --------------------------------------------------
+
+    async def attach_kb_to_project(
+        self,
+        project_id: str,
+        kb_id: str,
+        mode: ProjectKbMode,
+    ) -> None:
+        """Attach a KB to a project with a sharing ``mode`` (D3).
+
+        Idempotent on ``(project_id, kb_id)``: a duplicate attach with the
+        same ``mode`` is a no-op; an attach with a different ``mode``
+        updates the row (a reference share can be later promoted to a
+        copy, mirroring the API's ``POST .../share`` semantics). The
+        "exactly one ``owned`` row per ``kb_id``" invariant is enforced by
+        the API layer on share, not at the storage seam.
+        """
+
+    async def detach_kb_from_project(self, project_id: str, kb_id: str) -> bool:
+        """Detach a KB row. Returns ``True`` if a row was removed, ``False``
+        otherwise. Does NOT delete the KB chunks; the chunks belong to the
+        KB id and live in the ``kb_chunks`` table."""
+
+    async def list_project_kbs(self, project_id: str) -> list[tuple[str, ProjectKbMode]]:
+        """List ``(kb_id, mode)`` pairs attached to ``project_id``, ordered
+        ``added_at ASC``. Empty list for an unknown project."""
+
+    async def list_projects_for_kb(self, tenant_id: str, kb_id: str) -> list[str]:
+        """Reverse lookup: which projects in ``tenant_id`` attach to this KB?
+
+        Unlike agents/workflows, KBs don't implicitly land in the default
+        project — they're project-scoped by their creating project (D3), and
+        ``mode='owned'`` is set explicitly on create. Returns the raw list
+        without the default-project fallback.
+        """
+
+    # -- Default project (D5) -------------------------------------------
+
+    async def get_or_create_default_project(self, tenant_id: str) -> Project:
+        """Return the per-tenant default project, creating it lazily if
+        missing (ADR 040 D5).
+
+        First read after the migration creates a project with
+        ``name == "default"`` owned by the synthetic ``"tenant-system"``
+        principal (movate.core.auth has no separate tenant-admin user
+        registry, so the synthetic principal mirrors the migration text in
+        the ADR). Subsequent reads return the existing row. The default
+        project is a normal project in every respect except that it cannot
+        be archived — :meth:`archive_project` rejects it.
+
+        Idempotent and concurrency-safe: implementations rely on the unique
+        ``(tenant_id, name)`` index so two racing creates collapse to one.
+        """
+
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — one APPEND-ONLY table holding the
+    # overnight analyst's daily, pre-aggregated telemetry summary per
+    # (tenant, project, date). Deliberately append-only: a re-run of the
+    # analyst for a day INSERTS a new row rather than mutating the prior one,
+    # so the daily history is its own audit trail. There is intentionally NO
+    # update method. Reads take the LATEST row per (tenant, project, date)
+    # (newest ``created_at`` wins). ``tenant_id`` is NOT NULL and every read
+    # is tenant-scoped at the SQL layer (no-leak contract).
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        """Append one :class:`ObservabilityInsight` row (insert-only).
+
+        Never updates: re-running the analyst for the same
+        ``(tenant_id, project_id, date)`` inserts a NEW row keyed by the
+        record's unique ``id``. The read methods reconcile duplicates by
+        taking the most-recently-created row per day.
+        """
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        """Return the LATEST insight for ``(tenant_id, project_id, day)``.
+
+        "Latest" = newest ``created_at`` among the (possibly several,
+        append-only) rows for that day. Returns ``None`` when no insight
+        exists OR it belongs to a different tenant — same no-leak contract as
+        every other single-record getter.
+        """
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        """List a tenant's insights, newest-day-first, de-duplicated per day.
+
+        Returns the LATEST row per ``(project_id, date)`` (append-only re-runs
+        collapse to one), ordered by ``date`` descending. Filters AND together:
+        ``project_id`` narrows to one project; ``since`` / ``until`` bound the
+        date range inclusively. Always tenant-scoped (``tenant_id`` is
+        required, not optional) — there is no cross-tenant insights mode, so
+        this is never an operator-only fleet read. ``limit`` defaults to ~90
+        days (a quarter of history).
+        """
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events)
+    #
+    # Domain events ("run.completed", "agent.published", "eval.failed",
+    # "drift.detected", "canary.promoted/demoted", ...) are recorded at
+    # the runtime edges (executor / dispatch / deploy) and exposed via
+    # ``GET /api/v1/events``. D2 (webhook delivery) and D3 (SSE stream)
+    # consume the same outbox in later PRs; D1 just records + exposes.
+    #
+    # Additive table — a row exists only after an emit; nothing else
+    # changes. ``tenant_id`` is **NOT NULL** in the schema (the hard
+    # invariant per ADR 013/014). The emit path MUST be non-blocking on
+    # the primary work (see :func:`movate.runtime.events.emit_event`):
+    # any storage error here is logged and swallowed.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        """Append one :class:`Event` to the outbox.
+
+        Insert-only (events are immutable history); duplicate ``id`` is a
+        hard error (callers mint a fresh uuid per event). Implementations
+        should keep this cheap — the runtime calls it on every terminal
+        transition and the primary path won't wait on it.
+        """
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        """List events for ``tenant_id``, **oldest-first**, with optional filters.
+
+        Oldest-first is the right order for an outbox: consumers (the
+        front end, the future D2/D3 deliverers) read forward in time
+        and the ``after_id`` cursor naturally points to the last id they
+        saw. Returns at most ``limit`` rows; when the result was
+        truncated, the caller passes the LAST row's ``id`` back as
+        ``after_id`` on the next request to continue.
+
+        Filters AND together:
+
+        * ``since`` / ``until`` — UTC inclusive/exclusive window on
+          ``created_at`` (``since <= created_at < until``).
+        * ``kind`` — exact match (e.g. ``"run.completed"``).
+        * ``subject`` — exact match (agent name / run id / etc.).
+        * ``after_id`` — cursor: skip rows up to and including the row
+          with this ``id`` (in oldest-first order). Tolerant of an
+          unknown id (returns from the beginning, no leak).
+
+        Tenant-scoping is the FIRST WHERE clause and is mandatory — no
+        cross-tenant list mode on this method, since the API exposes
+        events directly. Operator cross-tenant queries can run SQL by
+        hand against the table.
+        """
+
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery)
+    #
+    # Additive, default-off: a row exists only when a tenant POSTs
+    # ``/api/v1/webhooks``. The delivery worker
+    # (movate.runtime.webhook_worker) reads these on every drain pass,
+    # matches each new event against ``kind_filter``, and POSTs a signed
+    # JSON payload to ``url``. Each attempt is logged separately in
+    # ``webhook_attempts`` for ops triage; the per-webhook cursor
+    # (``webhook_cursors``) advances after every event the worker has
+    # processed (delivered OR exhausted).
+    #
+    # Tenant invariant: ``tenant_id NOT NULL`` on every webhooks table.
+    # Like the rest of the schema, every single-record fetch is
+    # tenant-scoped — a wrong-tenant id 404s rather than raises.
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        """Insert a freshly-minted subscription row. Errors on duplicate ``id``.
+
+        Returns the persisted row (same instance the caller passed in;
+        backends MAY return a freshly-loaded one if they need to).
+        ``secret`` is stored as-is (we re-sign every delivery; see
+        :mod:`movate.core.webhooks` for why this differs from API keys).
+        """
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        """List subscriptions for ``tenant_id``.
+
+        ``enabled_only`` defaults to ``True`` — the worker's drain path
+        wants live subscribers only. The CRUD/CLI surface passes
+        ``False`` to render disabled rows too.
+        """
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        """Exact lookup by ``webhook_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR the row belongs to a different
+        tenant — same 404-not-403 no-leak contract as the other
+        single-record getters.
+        """
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        """Mutate ``enabled`` and/or ``failure_count`` in place.
+
+        Only the named fields update; passing ``None`` leaves that
+        column untouched. Returns the post-update row, or ``None`` if
+        no row matched (cross-tenant id or unknown). The runtime API
+        only exposes ``enabled`` (``PATCH``); ``failure_count`` is
+        bumped from the delivery worker after a max-retries terminal.
+        """
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        """Delete one subscription by ``(webhook_id, tenant_id)``.
+
+        Idempotent: returns ``True`` on actual deletion, ``False`` on a
+        no-op (unknown / cross-tenant). The matching cursor row in
+        ``webhook_cursors`` and historical attempts in
+        ``webhook_attempts`` are intentionally kept — operators may
+        still want the delivery history of a deleted webhook for
+        audit. (A later GC sweep can remove them; out of scope for D2.)
+        """
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        """Append one row to the delivery-attempts log.
+
+        Insert-only; attempts are immutable history. The worker calls
+        this once per attempt (initial + every retry + the final
+        ``max_retries`` terminal). Storage failures here MUST NOT
+        bring down the delivery loop — the worker wraps + logs.
+        """
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        """List delivery attempts, newest-first, scoped to ``tenant_id``.
+
+        ``webhook_id`` filters to one subscriber (the CLI / API typical
+        path — "show me this webhook's recent failures"). ``since``
+        narrows by ``attempted_at >= since``. ``limit`` is capped by
+        the caller; storage defaults to 100.
+        """
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        """Return the last-delivered event id for ``webhook_id``.
+
+        ``None`` means the worker has never advanced this cursor — the
+        first drain pass treats it as "deliver every event newer than
+        the subscription's ``created_at``" (per-webhook cursor avoids
+        re-delivering historical events when a webhook is added).
+        """
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        """Upsert the cursor row for ``webhook_id`` to ``last_event_id``.
+
+        Atomic insert-or-update keyed by ``(webhook_id)``; tenant scope
+        is denormalized for cheap tenant-bounded reads. The worker
+        advances this AFTER recording the attempt — at-least-once on
+        crash is acceptable (subscribers dedupe on ``X-MDK-Event-Id``).
+        """
+
+    # ------------------------------------------------------------------
+    # Eval-generation jobs (ADR 038 sibling — ``mdk eval generate``)
+    #
+    # A separate kind of async job from the queue-driven JobRecord: an
+    # ``evals/generate`` job is **runtime-resident** (a single FastAPI
+    # process drives it via an asyncio.Task, streaming SSE progress),
+    # not picked up off a worker queue. Persistence is just so the status
+    # GET + commit endpoint can read back what generation produced.
+    #
+    # Additive new table — no row exists unless a caller hit the
+    # generate endpoint, so non-generate behavior is byte-for-byte the
+    # pre-feature path. Tenant-scoped reads + commits follow the standard
+    # 404-not-403 contract.
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: EvalGenerationJob) -> None:
+        """Upsert one eval-generation job keyed by ``job_id``.
+
+        Called twice in the normal lifecycle: once when the
+        ``POST /evals/generate`` route accepts a request (``status=running``,
+        no result), once when the pipeline completes (``status=completed``
+        or ``failed``, ``result`` and ``cost_usd`` populated). The second
+        call replaces the first in place — last write wins.
+        """
+
+    async def get_eval_generation_job(
+        self, job_id: str, *, tenant_id: str
+    ) -> EvalGenerationJob | None:
+        """Fetch one eval-generation job by id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the job belongs to a different
+        tenant — same 404-not-403 contract as :meth:`get_job` so a caller
+        can't probe for other tenants' generation jobs.
+        """
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Path,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> EvalCommitResult:
+        """Atomically append accepted cases to the agent's dataset.
+
+        Reads the generation job by ``(job_id, tenant_id)``, filters its
+        cases to ``case_ids`` (None ⇒ accept ALL), serializes each case
+        as a JSONL line via
+        :func:`movate.core.eval_generator.serialize_case_for_dataset`,
+        and appends them to the agent dir's ``evals/dataset.jsonl`` on
+        disk. When ``commit_judge=True`` AND the job produced a judge,
+        ``evals/judge.yaml`` is also written (atomic, replace-in-place —
+        a re-commit overwrites the judge with the latest draft).
+
+        Storage-layer responsibility: this is the ONLY path that mutates
+        the agent's bundle. Generation alone never touches disk. The
+        agent dir is resolved as ``agents_path / job.agent_name`` —
+        callers (the runtime) pass the configured agents path; tests
+        pass a tmp path.
+
+        Returns an :class:`EvalCommitResult` reporting the dataset path
+        and per-step counts. Raises :class:`FileNotFoundError` if the
+        agent dir doesn't exist (the route handler maps that to 404).
+        """
+
+    # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
+    #
+    # Persisted output of the diagnose endpoint. A row is created with
+    # ``status=running`` when the POST lands and updated (in place,
+    # upsert) when the background task finishes (``completed`` or
+    # ``error``). The structured result is stored as an opaque JSON blob
+    # — the typed-fix taxonomy is validated at the wire edge so future
+    # ADR 043 extensions don't require a storage migration.
+    #
+    # Read-only with respect to agent state: persisting these rows
+    # never touches the agent's prompt / KB / context / model. ADR 043's
+    # apply step (later PR) is the only thing that does.
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        """Upsert a :class:`DiagnosisRecord` keyed by ``diagnosis_id``.
+
+        Idempotent on ``diagnosis_id``: re-saving the same id updates
+        ``status`` / ``result`` / ``error`` / ``tokens_used`` /
+        ``cost_usd`` / ``completed_at`` in place — the background task
+        uses this to transition a row from ``running`` to ``completed``
+        without a separate update method. ``tenant_id`` / ``agent`` /
+        ``created_at`` are preserved across the upsert (insert-time
+        fields are never re-written)."""
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        """Exact lookup by ``diagnosis_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the diagnosis belongs to a
+        different tenant — same 404-not-403 contract as the other
+        single-record getters, so a caller can't probe for the existence
+        of another tenant's diagnoses."""
 
     async def close(self) -> None: ...

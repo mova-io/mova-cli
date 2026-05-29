@@ -1,0 +1,7 @@
+title: Structured-field extractor
+description: Free-form text to strict typed fields with schema enforcement.
+shape: agent
+tags:
+  - extraction
+  - structured-output
+recommended_for: Pulling typed records (contact, intent, urgency) out of unstructured prose.

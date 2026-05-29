@@ -1,0 +1,23 @@
+# ============================================================================
+# MDK Canonical Schema — Chatbot pattern (input)
+# ============================================================================
+
+version: 1
+type: object
+
+title: Chat Turn (Input)
+description: >
+  One end-user turn. The Chatbot pattern's single AGENT node consumes
+  this and produces a reply under the output contract.
+
+fields:
+
+  message:
+    type: markdown
+    description: The user's message for this turn.
+    min_length: 1
+    ui: textarea
+    example: How do I export my data to CSV?
+
+required:
+  - message

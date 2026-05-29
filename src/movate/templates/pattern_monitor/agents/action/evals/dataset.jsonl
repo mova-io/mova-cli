@@ -1,0 +1,2 @@
+{"input": {"metric": "error_rate=0.12", "signal": "120 of 1000 requests 5xx"}, "expected": {"action_taken": "open-incident: error rate 0.12 exceeds 0.05 threshold"}}
+{"input": {"metric": "cpu=93%", "signal": "CPU pegged"}, "expected": {"action_taken": "scale-out: CPU 93% exceeds 85% threshold"}}

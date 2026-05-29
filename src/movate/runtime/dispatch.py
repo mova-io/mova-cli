@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from movate.core.events import EventKind
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle
 from movate.core.models import (
@@ -29,6 +30,7 @@ from movate.core.models import (
 from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
+from movate.runtime.events import emit_event
 from movate.storage.base import StorageProvider
 from movate.tracing import continue_trace_context, record_audit_event, record_run_usage
 
@@ -119,6 +121,10 @@ class WorkerDispatch:
                 return await self._execute_eval(job)
             if job.kind == JobKind.BENCH:
                 return await self._execute_bench(job)
+            if job.kind == JobKind.OBSERVABILITY_ANALYZE:
+                return await self._execute_observability_analyze(job)
+            if job.kind == JobKind.AUDIT:
+                return await self._execute_audit(job)
             return _error(
                 "unknown_kind",
                 f"unsupported JobKind {job.kind!r}",
@@ -300,6 +306,31 @@ class WorkerDispatch:
         record = summary.to_record(tenant_id=job.tenant_id)
         await self._storage.save_eval(record)
 
+        # ADR 035 D1 — emit ``eval.failed`` when this eval landed below
+        # its configured gate. "Failed" here is the user-meaningful
+        # below-gate signal, not a worker crash (the job is still
+        # SUCCESS — the eval ran). gate_mode "mean" compares
+        # mean_score; everything else compares pass_rate. Fire-and-
+        # forget: emit_event NEVER raises into the dispatch path.
+        gate_value = record.mean_score if record.gate_mode == "mean" else record.pass_rate
+        if gate_value < record.threshold:
+            emit_event(
+                self._storage,
+                tenant_id=job.tenant_id,
+                kind=EventKind.EVAL_FAILED,
+                subject=record.agent,
+                data={
+                    "eval_id": record.eval_id,
+                    "agent_version": record.agent_version,
+                    "gate_mode": record.gate_mode,
+                    "score": gate_value,
+                    "threshold": record.threshold,
+                    "pass_rate": record.pass_rate,
+                    "mean_score": record.mean_score,
+                    "sample_count": record.sample_count,
+                },
+            )
+
         # ADR 016 D2 — continuous-eval drift check. Runs when the eval job
         # asks for it: either a scheduled eval (``scheduled=True``, set by
         # the scheduler tick) or any eval that pinned a ``baseline_id``.
@@ -361,6 +392,27 @@ class WorkerDispatch:
             )
             result = detect_drift(record, baseline, tolerance=tolerance)
             logger.info("eval_drift_check %s", result.summary())
+            # ADR 035 D1 — emit ``drift.detected`` when a regression was
+            # found vs. the selected baseline. ``result.regressed`` is
+            # the same single flag that gates the operator alert below;
+            # piggybacking on it means the event fires whenever the
+            # human alert does. No baseline → no regressed (handled
+            # below); fire-and-forget either way.
+            if result.regressed and result.baseline is not None:
+                emit_event(
+                    self._storage,
+                    tenant_id=job.tenant_id,
+                    kind=EventKind.DRIFT_DETECTED,
+                    subject=record.agent,
+                    data={
+                        "eval_id": record.eval_id,
+                        "baseline_eval_id": result.baseline.eval_id,
+                        "agent_version": record.agent_version,
+                        "mean_score_delta": result.mean_score_delta,
+                        "pass_rate_delta": result.pass_rate_delta,
+                        "tolerance": tolerance,
+                    },
+                )
             await alert_on_drift(
                 result,
                 notifier=self._notifier,
@@ -453,6 +505,23 @@ class WorkerDispatch:
                 champion_version=champion_version,
                 reason="drift_regression",
             )
+            # ADR 035 D1 — emit ``canary.demoted`` for the auto-rollback
+            # (the human-initiated demote at the canary/rollback endpoint
+            # emits its own — same kind, different ``data.actor`` /
+            # ``data.reason``). Fire-and-forget.
+            emit_event(
+                self._storage,
+                tenant_id=job.tenant_id,
+                kind=EventKind.CANARY_DEMOTED,
+                subject=config.agent,
+                data={
+                    "challenger_version": config.challenger_version,
+                    "champion_version": champion_version,
+                    "actor": "system:drift",
+                    "reason": "drift_regression",
+                    "eval_id": record.eval_id,
+                },
+            )
             # Structured log event — stable key/value shape for log-based
             # alerting / audit of an automated traffic change.
             logger.warning(
@@ -497,6 +566,76 @@ class WorkerDispatch:
                 record.agent,
                 exc_info=True,
             )
+
+    async def _execute_observability_analyze(self, job: JobRecord) -> DispatchOutcome:
+        """Run the overnight observability analyst (ADR 047).
+
+        ``job.input`` carries ``{project_id, date?, budget_usd?, mock?}``. No
+        agent bundle is resolved — the analyst reads telemetry from storage
+        directly (runs / evals / failures) and appends one
+        :class:`ObservabilityInsight`. ``result_run_id`` carries the produced
+        insight ``id`` (the generic "result identifier", like EVAL→eval_id).
+
+        The single LLM call (the narrative digest) is budget-capped; on a
+        test/mock worker we use MockProvider so no real spend occurs. A bad
+        config (missing project_id) is a non-retryable error; an unexpected
+        crash is retryable.
+        """
+        from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+        from movate.core.observability.analyst import analyze  # noqa: PLC0415
+
+        cfg = job.input
+        project_id = cfg.get("project_id")
+        if not project_id:
+            return _error(
+                "observability_config",
+                "observability analyze requires a 'project_id' in job.input",
+                retryable=False,
+            )
+
+        # Default to *yesterday* (the common nightly case) when no explicit date.
+        raw_date = cfg.get("date")
+        if raw_date:
+            try:
+                day = datetime.fromisoformat(str(raw_date)).date()
+            except ValueError:
+                return _error(
+                    "observability_config",
+                    f"bad 'date' {raw_date!r} — expected ISO YYYY-MM-DD",
+                    retryable=False,
+                )
+        else:
+            day = (datetime.now(UTC) - timedelta(days=1)).date()
+
+        use_mock: bool = self._use_mock_for_eval or bool(cfg.get("mock", False))
+        if use_mock:
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        try:
+            insight = await analyze(
+                job.tenant_id,
+                str(project_id),
+                day,
+                storage=self._storage,
+                llm=provider,
+                budget_usd=float(cfg.get("budget_usd", 0.10)),
+            )
+        except Exception as exc:
+            logger.exception("observability_analyze_unhandled job_id=%s", job.job_id)
+            return _error("internal", str(exc), retryable=True)
+
+        return DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id=insight.id,
+            error=None,
+        )
 
     async def _execute_bench(self, job: JobRecord) -> DispatchOutcome:
         """Run an async multi-model bench job (BACKLOG #64).
@@ -598,6 +737,100 @@ class WorkerDispatch:
         return DispatchOutcome(
             status=JobStatus.SUCCESS,
             result_run_id=record.bench_id,
+            error=None,
+        )
+
+    async def _execute_audit(self, job: JobRecord) -> DispatchOutcome:
+        """Run an async Claude-orchestrated audit job (read-only).
+
+        ``job.input`` carries the audit configuration dict (the same
+        fields as :class:`movate.runtime.schemas.AuditRequest` plus
+        ``scope_kind`` / ``scope_id``). The completed
+        :class:`AuditRecord` is persisted via storage; ``result_run_id``
+        is set to the ``audit_id`` so callers can retrieve it via
+        ``GET /api/v1/audits/{audit_id}``.
+
+        Read-only invariant: the worker dispatch path NEVER calls
+        ``save_agent_bundle`` / ``save_kb_chunk`` / ``save_eval`` /
+        etc. on this code path. The only write is the terminal
+        ``save_audit``. ``test_audit_does_not_modify_agent`` pins this
+        on InMemory storage.
+        """
+        from movate.core.auditor import Auditor  # noqa: PLC0415
+        from movate.core.models import AuditFindingSeverity  # noqa: PLC0415
+
+        cfg = job.input
+        scope_kind = str(cfg.get("scope_kind", "agent"))
+        scope_id = str(cfg.get("scope_id", job.target))
+        categories = cfg.get("categories")
+        if categories is not None and not isinstance(categories, list):
+            categories = None
+        severity_raw = str(cfg.get("severity_floor", "info")).lower()
+        try:
+            severity_floor = AuditFindingSeverity(severity_raw)
+        except ValueError:
+            severity_floor = AuditFindingSeverity.INFO
+        model = str(cfg.get("model") or "openai/gpt-4o-mini")
+        budget_usd = float(cfg.get("budget_usd", 0.0))
+
+        # The auditor consumes the BaseLLMProvider Protocol — use Mock
+        # for hermetic / mocked tests, LiteLLM otherwise. Reuses the
+        # exact same provider-selection policy as the eval/bench paths.
+        if self._use_mock_for_eval or bool(cfg.get("mock", False)):
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        auditor = Auditor(
+            provider=provider,
+            storage=self._storage,
+            model=model,
+            budget_usd=budget_usd,
+            severity_floor=severity_floor,
+        )
+
+        try:
+            if scope_kind == "project":
+                # Project-scoped audit fans out across every agent the
+                # tenant has access to. We use the worker's local fallback
+                # bundle list (the same list resolve_agent_bundle reads)
+                # so the project audit composes with the existing
+                # registry plumbing without a new storage seam.
+                bundles = list(self._agents_fallback)
+                record = await auditor.audit_project(
+                    bundles=bundles,
+                    project_id=scope_id,
+                    tenant_id=job.tenant_id,
+                    categories=categories,
+                )
+            else:
+                bundle = await self._resolve_bundle(job)
+                if bundle is None:
+                    return _error(
+                        "unknown_agent",
+                        f"agent {job.target!r} not registered for tenant {job.tenant_id!r}",
+                        retryable=False,
+                    )
+                record = await auditor.audit_agent(
+                    bundle=bundle,
+                    tenant_id=job.tenant_id,
+                    categories=categories,
+                )
+        except Exception as exc:
+            logger.exception("audit_execute_unhandled job_id=%s", job.job_id)
+            return _error("internal", str(exc), retryable=True)
+
+        await self._storage.save_audit(record)
+        # ``result_run_id`` mirrors the eval/bench convention: the
+        # generic "result identifier" field carries the audit_id so the
+        # API contract for GET /api/v1/audits/{audit_id} is uniform.
+        return DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id=record.audit_id,
             error=None,
         )
 

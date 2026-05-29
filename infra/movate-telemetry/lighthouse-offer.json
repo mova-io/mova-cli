@@ -1,0 +1,105 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "_comment_top": [
+        "ADR 039 Phase 1 — Azure Lighthouse offer customers deploy in THEIR own",
+        "Azure subscription to delegate read access on their MDK Log Analytics",
+        "workspace to Movate's Managed Grafana managed identity.",
+        "",
+        "Customers deploy this template SCOPED TO THEIR LOG ANALYTICS WORKSPACE",
+        "RESOURCE GROUP (not their full subscription) — least privilege per",
+        "ADR 039 D2. The role granted is Monitoring Reader ONLY — read of",
+        "telemetry (AppMetrics / AppTraces / AppDependencies / AppRequests) and",
+        "the workspace's metadata; NOT write, NOT secrets, NOT Key Vault, NOT",
+        "data outside Azure Monitor.",
+        "",
+        "Deploy (customer side):",
+        "  az deployment group create \\",
+        "    --resource-group <their-LA-workspace-rg> \\",
+        "    --template-file lighthouse-offer.json \\",
+        "    --parameters @lighthouse-offer.parameters.example.json",
+        "",
+        "Revoke (customer side, takes effect immediately, no Movate cooperation):",
+        "  az managedservices assignment delete --assignment <assignment-name> \\",
+        "    --scope /subscriptions/<sub>/resourceGroups/<rg>",
+        "",
+        "See docs/movate-telemetry-onboarding.md for the end-to-end runbook."
+    ],
+    "parameters": {
+        "mspOfferName": {
+            "type": "string",
+            "defaultValue": "Movate Product Telemetry (read-only)",
+            "metadata": {
+                "description": "Display name the customer sees in the Azure Portal under 'Service providers' — short, identifies Movate as the delegated provider."
+            }
+        },
+        "mspOfferDescription": {
+            "type": "string",
+            "defaultValue": "Grants Movate's Managed Grafana managed identity Monitoring Reader on this resource group's Log Analytics workspace so Movate can render fleet dashboards (metrics + span metadata only; no prompts, no PII). Per ADR 039.",
+            "metadata": {
+                "description": "Customer-facing description rendered alongside the offer name."
+            }
+        },
+        "movateTenantId": {
+            "type": "string",
+            "metadata": {
+                "description": "Movate's Entra tenant ID — the tenant the Grafana managed identity belongs to. Operator pastes this from the `managedIdentityTenantId` output of managed-grafana.bicep."
+            }
+        },
+        "movateApplicationId": {
+            "type": "string",
+            "metadata": {
+                "description": "Object ID of Movate's Managed Grafana system-assigned managed identity. Operator pastes this from the `managedIdentityApplicationId` (a.k.a. `managedIdentityPrincipalId` — same value) output of managed-grafana.bicep. Lighthouse `principalId` accepts the objectId of the delegated principal in the service-provider tenant."
+            }
+        }
+    },
+    "variables": {
+        "_comment_role": "43d0d8ad-25c7-4714-9337-8ba259a9fe05 = built-in Monitoring Reader. Read of Azure Monitor telemetry only. NO write, NO secrets, NO Key Vault data. Single, narrow role — DO NOT add additional authorizations without an ADR amendment (least-privilege contract from ADR 039 D2 + D3).",
+        "monitoringReaderRoleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/43d0d8ad-25c7-4714-9337-8ba259a9fe05",
+        "registrationName": "[guid('movate-telemetry-phase1', parameters('movateApplicationId'), resourceGroup().id)]"
+    },
+    "resources": [
+        {
+            "_comment": "Lighthouse registrationDefinition — the offer itself. Tenant-scoped resource that customers create in their own subscription. The 2022-10-01 API version is the current GA.",
+            "type": "Microsoft.ManagedServices/registrationDefinitions",
+            "apiVersion": "2022-10-01",
+            "name": "[variables('registrationName')]",
+            "properties": {
+                "registrationDefinitionName": "[parameters('mspOfferName')]",
+                "description": "[parameters('mspOfferDescription')]",
+                "managedByTenantId": "[parameters('movateTenantId')]",
+                "authorizations": [
+                    {
+                        "_comment": "Single authorization, single role. The principalId is the Movate Grafana MI's objectId. principalIdDisplayName is what shows up in the customer's audit trail when Grafana queries fire — operators see WHO is reading.",
+                        "principalId": "[parameters('movateApplicationId')]",
+                        "principalIdDisplayName": "Movate Telemetry (Managed Grafana)",
+                        "roleDefinitionId": "[variables('monitoringReaderRoleDefinitionId')]"
+                    }
+                ]
+            }
+        },
+        {
+            "_comment": "registrationAssignment — binds the above definition to THIS scope (the customer's LA workspace RG, since the template is deployed at resource-group scope). Without this, the definition exists but nothing is delegated. The assignment name is a guid over (resource group, registration definition) for idempotent re-deploys.",
+            "type": "Microsoft.ManagedServices/registrationAssignments",
+            "apiVersion": "2022-10-01",
+            "name": "[guid(resourceGroup().id, variables('registrationName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedServices/registrationDefinitions', variables('registrationName'))]"
+            ],
+            "properties": {
+                "registrationDefinitionId": "[resourceId('Microsoft.ManagedServices/registrationDefinitions', variables('registrationName'))]"
+            }
+        }
+    ],
+    "outputs": {
+        "registrationName": {
+            "type": "string",
+            "value": "[variables('registrationName')]",
+            "_comment": "Echo the generated registration name so the customer can pass it to `az managedservices assignment delete` when revoking."
+        },
+        "delegatedRole": {
+            "type": "string",
+            "value": "Monitoring Reader (43d0d8ad-25c7-4714-9337-8ba259a9fe05) — read of Azure Monitor telemetry only."
+        }
+    }
+}

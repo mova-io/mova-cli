@@ -155,6 +155,31 @@ _GROUP_COLORS: dict[str, str] = {
 }
 
 
+def _role_description(name: str) -> tuple[str, str]:
+    """Resolve (one-liner, feature) for a role catalog row.
+
+    ADR 028 — prefers each template's ``template.yaml`` (the per-template
+    metadata file) over the hardcoded :data:`_ROLE_DESCRIPTIONS` dict so
+    the two never drift. Falls back to the dict when ``template.yaml``
+    is missing/invalid (back-compat per CLAUDE.md rule 5 — a partial
+    template still renders rather than blanking out the row). The
+    ``tags`` from ``template.yaml`` show up in the Highlights column
+    when present so operators see the same use-case taxonomy the
+    ``mdk templates`` view uses.
+    """
+    from movate.templates import (  # noqa: PLC0415
+        TemplateInfoLoadError,
+        load_template_info,
+    )
+
+    try:
+        info = load_template_info(name)
+    except (TemplateInfoLoadError, ValueError):
+        return _ROLE_DESCRIPTIONS.get(name, ("", ""))
+    feature = ", ".join(info.tags) if info.tags else _ROLE_DESCRIPTIONS.get(name, ("", ""))[1]
+    return info.description, feature
+
+
 def _render_role_catalog_numbered(installed: set[str]) -> list[str]:
     """Render the role catalog with [N] numbers for addable (uninstalled) templates.
 
@@ -181,7 +206,7 @@ def _render_role_catalog_numbered(installed: set[str]) -> list[str]:
             color = _GROUP_COLORS.get(group, "white")
             label = group if group != last_group else ""
             label_cell = f"[{color}]{label}[/{color}]" if label else ""
-            desc, feature = _ROLE_DESCRIPTIONS.get(name, ("", ""))
+            desc, feature = _role_description(name)
             if name in installed:
                 table.add_row(
                     "[dim]✓[/dim]",

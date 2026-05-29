@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["action_taken"],
+  "properties": {
+    "action_taken": {
+      "type": "string",
+      "description": "The allowlisted action + justification (audit record)."
+    }
+  }
+}
