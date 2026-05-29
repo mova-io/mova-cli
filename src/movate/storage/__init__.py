@@ -2,10 +2,18 @@
 
 Auto-selection in :func:`build_storage`:
 
-* ``MOVATE_DB_URL`` set and starts with ``postgres://`` /
-  ``postgresql://`` → :class:`PostgresProvider` (v0.5+).
+* ``MOVATE_DB_URL`` (or, as a fallback, ``MOVATE_PG_URL``) set and
+  starting with ``postgres://`` / ``postgresql://`` →
+  :class:`PostgresProvider` (v0.5+). Durable across container restarts.
 * otherwise → :class:`SqliteProvider` at ``MOVATE_DB`` or
   ``~/.movate/local.db``.
+
+The ``MOVATE_PG_URL`` fallback (#122) means a deployment that already
+configures Postgres for the memory store — which reads ``MOVATE_PG_URL``
+(see :mod:`movate.memory.store`) — no longer silently lands on
+ephemeral in-pod SQLite for the api-key store, the recurring source of
+401s after a revision recycle. ``MOVATE_DB_URL`` stays the primary,
+documented variable and wins when both are set.
 
 Postgres dependency is in the ``[runtime]`` extra; importing the
 provider only happens when the env points at it, so users on the
@@ -97,11 +105,35 @@ def selected_backend() -> tuple[str, str, bool] | None:
     return _LAST_SELECTED
 
 
+def _resolve_pg_url() -> str | None:
+    """Resolve a Postgres DSN from the environment, or ``None``.
+
+    Recognizes (in precedence order):
+
+    1. ``MOVATE_DB_URL`` — the canonical, documented storage DSN.
+    2. ``MOVATE_PG_URL`` — the variable the Postgres memory store
+       (:mod:`movate.memory.store`) already reads. Honored as a
+       fallback (#122) so a deployment that wires Postgres for memory
+       doesn't silently leave the api-key store on ephemeral in-pod
+       SQLite — the recurring cause of 401s after a revision recycle.
+
+    Only values that look like an asyncpg DSN (``postgres://`` /
+    ``postgresql://``) qualify; anything else (or unset) yields
+    ``None``, leaving the SQLite path to take over.
+    """
+    for var in ("MOVATE_DB_URL", "MOVATE_PG_URL"):
+        value = os.environ.get(var, "").strip()
+        if value.startswith(("postgres://", "postgresql://")):
+            return value
+    return None
+
+
 def build_storage() -> StorageProvider:
     """Auto-select a StorageProvider based on environment.
 
-    * ``MOVATE_DB_URL`` (e.g. ``postgresql://user:pw@host/db``) →
-      :class:`PostgresProvider`. Production / multi-worker.
+    * ``MOVATE_DB_URL`` (e.g. ``postgresql://user:pw@host/db``), or
+      ``MOVATE_PG_URL`` as a fallback → :class:`PostgresProvider`.
+      Production / multi-worker; durable across container restarts.
     * ``MOVATE_DB`` or default ``~/.movate/local.db`` →
       :class:`SqliteProvider`. Local dev and CI.
 
@@ -114,8 +146,8 @@ def build_storage() -> StorageProvider:
     """
     global _LAST_SELECTED  # noqa: PLW0603
 
-    db_url = os.environ.get("MOVATE_DB_URL")
-    if db_url and db_url.startswith(("postgres://", "postgresql://")):
+    db_url = _resolve_pg_url()
+    if db_url:
         # Lazy import — keeps asyncpg optional for sqlite-only users.
         from movate.storage.postgres import PostgresProvider  # noqa: PLC0415
 
@@ -127,7 +159,14 @@ def build_storage() -> StorageProvider:
         logger.info("storage: PostgresProvider %s", detail)
         return PostgresProvider(dsn=db_url)
 
-    db_path = os.environ.get("MOVATE_DB", "~/.movate/local.db")
+    # Persistent-by-default path. ``~/.movate/local.db`` survives process
+    # restarts on any host with a stable home dir (local dev, a container
+    # with a volume mounted at $HOME/.movate). Trim + empty-guard so a
+    # blank ``MOVATE_DB=`` (a common deploy-template footgun) falls back to
+    # the durable default rather than being used verbatim as a path. We
+    # deliberately never substitute a tempfile here — a temp path would
+    # reintroduce the #122 cold-start key loss.
+    db_path = os.environ.get("MOVATE_DB", "").strip() or "~/.movate/local.db"
     _LAST_SELECTED = ("sqlite", db_path, False)
     # WARN level because the ApiKeyRecord / RunRecord tables in a
     # SQLite file under the container filesystem vanish on every

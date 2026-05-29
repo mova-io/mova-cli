@@ -62,6 +62,8 @@ from movate.core.models import (
     ProjectMemberRole,
     Relation,
     RunRecord,
+    Session,
+    SessionMessage,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -1114,6 +1116,80 @@ class StorageProvider(Protocol):
         is fine — operators delete a thread when they don't want to
         see it anymore, not when they want to nuke the historical
         runs themselves)."""
+
+    # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10) — server-side conversation memory.
+    # A session is a first-class entity (its own ``sessions`` +
+    # ``session_messages`` tables, both ``tenant_id NOT NULL``) that the
+    # run endpoints accept via ``session_id``: prior turns are loaded as
+    # context, the new turn is appended, and a per-session cost rollup is
+    # maintained. Distinct from the older join-key ``conversation_threads``
+    # surface above; the executor stays stateless (history threads in as
+    # input, the turn is appended out).
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session: Session) -> None:
+        """Persist a :class:`Session`. Idempotent (upsert) on
+        ``session_id``: re-saving the same id refreshes the mutable
+        fields (``title``, ``updated_at``, and the rollups
+        ``turn_count`` / ``total_cost_usd`` / ``total_tokens_*``).
+        ``created_at`` is preserved on update."""
+
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> Session | None:
+        """Fetch a session by id, scoped to ``tenant_id``. Returns
+        ``None`` if it doesn't exist OR belongs to a different tenant —
+        never leaks existence across tenants (404-not-403, the same
+        contract as every single-record getter)."""
+
+    async def list_sessions(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[Session]:
+        """List sessions for a tenant, ordered ``updated_at DESC`` so
+        the active conversations float to the top. Optional ``agent``
+        filter for clients that want one agent's sessions."""
+
+    async def append_session_message(self, message: SessionMessage) -> None:
+        """Append one :class:`SessionMessage` to its session.
+
+        Insert-only (each message is immutable). The caller is
+        responsible for also updating the parent session's rollups via
+        :meth:`save_session` — kept as two calls so a backend can wrap
+        them in its own transaction if it chooses, and so the InMemory
+        double mirrors the exact same call pattern."""
+
+    async def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[SessionMessage]:
+        """Fetch a session's messages, ordered ``created_at ASC``
+        (chronological — earliest turn first) so the runtime renders the
+        history straight from the list. Tenant-scoped: a cross-tenant
+        session id returns ``[]`` rather than raising or leaking."""
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        """Hard-delete a session and its messages, scoped to
+        ``tenant_id``. Returns True when a row was deleted, False when
+        no matching session existed (or it belonged to a different
+        tenant — 404-not-403). Run records referenced by the session's
+        messages are left untouched (the session deletion expresses "I
+        don't want this conversation anymore", not "nuke the runs")."""
 
     # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1) — durable, versioned agent bundles.

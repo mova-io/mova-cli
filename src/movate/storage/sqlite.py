@@ -59,6 +59,8 @@ from movate.core.models import (
     ProjectMemberRole,
     Relation,
     RunRecord,
+    Session,
+    SessionMessage,
     SkillCallRecord,
     Subgraph,
     TenantBudget,
@@ -1084,6 +1086,48 @@ _MIGRATIONS = [
     "ON kb_entities(agent, tenant_id, project_id) WHERE project_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_kb_relations_project "
     "ON kb_relations(agent, tenant_id, project_id) WHERE project_id IS NOT NULL",
+    # ADR 045 D10: stateful sessions — server-side conversation memory.
+    # ``sessions`` holds the entity + the per-session rollups; the turns
+    # live in ``session_messages`` (one row per message, content as JSON
+    # TEXT). ``tenant_id NOT NULL`` on both (per-tenant isolation).
+    # Additive + idempotent (CREATE TABLE IF NOT EXISTS); no backfill.
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id       TEXT PRIMARY KEY,
+        tenant_id        TEXT NOT NULL,
+        agent            TEXT NOT NULL,
+        title            TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL,
+        turn_count       INTEGER NOT NULL DEFAULT 0,
+        total_cost_usd   REAL NOT NULL DEFAULT 0,
+        total_tokens_in  INTEGER NOT NULL DEFAULT 0,
+        total_tokens_out INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_sessions_tenant_updated "
+        "ON sessions(tenant_id, updated_at DESC)"
+    ),
+    ("CREATE INDEX IF NOT EXISTS idx_sessions_agent_tenant ON sessions(agent, tenant_id)"),
+    """
+    CREATE TABLE IF NOT EXISTS session_messages (
+        message_id   TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL,
+        tenant_id    TEXT NOT NULL,
+        role         TEXT NOT NULL,
+        content      TEXT NOT NULL,
+        run_id       TEXT,
+        cost_usd     REAL NOT NULL DEFAULT 0,
+        tokens_in    INTEGER NOT NULL DEFAULT 0,
+        tokens_out   INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_session_messages_session "
+        "ON session_messages(session_id, tenant_id, created_at)"
+    ),
 ]
 
 
@@ -4376,6 +4420,142 @@ class SqliteProvider:
         return (cur.rowcount or 0) > 0
 
     # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10)
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session: Session) -> None:
+        # Upsert on session_id — INSERT OR REPLACE matches the Postgres
+        # ON CONFLICT semantics. Preserve created_at on update by reading
+        # the existing row first (INSERT OR REPLACE would otherwise reset
+        # it to the supplied value, but callers always carry the original
+        # created_at on the model so this stays consistent either way).
+        await self._db.execute(
+            """
+            INSERT OR REPLACE INTO sessions
+            (session_id, tenant_id, agent, title, created_at, updated_at,
+             turn_count, total_cost_usd, total_tokens_in, total_tokens_out)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session.session_id,
+                session.tenant_id,
+                session.agent,
+                session.title,
+                session.created_at.isoformat(),
+                session.updated_at.isoformat(),
+                session.turn_count,
+                session.total_cost_usd,
+                session.total_tokens_in,
+                session.total_tokens_out,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> Session | None:
+        async with self._db.execute(
+            "SELECT * FROM sessions WHERE session_id = ? AND tenant_id = ?",
+            (session_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return _row_to_session(row)
+
+    async def list_sessions(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[Session]:
+        clauses = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if agent is not None:
+            clauses.append("agent = ?")
+            params.append(agent)
+        sql = (
+            "SELECT * FROM sessions WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY updated_at DESC LIMIT ?"
+        )
+        params.append(int(limit))
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_session(r) for r in rows]
+
+    async def append_session_message(self, message: SessionMessage) -> None:
+        # Insert-only (messages are immutable). Tenant_id is denormalized
+        # onto the row so message reads stay tenant-scoped without a join.
+        await self._db.execute(
+            """
+            INSERT INTO session_messages
+            (message_id, session_id, tenant_id, role, content, run_id,
+             cost_usd, tokens_in, tokens_out, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message.message_id,
+                message.session_id,
+                message.tenant_id,
+                message.role,
+                json.dumps(message.content),
+                message.run_id,
+                message.cost_usd,
+                message.tokens_in,
+                message.tokens_out,
+                message.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[SessionMessage]:
+        # Chronological order — earliest first. Tenant-scoped via the
+        # WHERE clause (cross-tenant returns []).
+        async with self._db.execute(
+            """
+            SELECT * FROM session_messages
+            WHERE session_id = ? AND tenant_id = ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (session_id, tenant_id, int(limit)),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_session_message(r) for r in rows]
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        # Delete messages first, then the session row. Both tenant-scoped.
+        # The bool reflects whether the SESSION row existed (a session
+        # with no messages still returns True; a cross-tenant id returns
+        # False without touching either table).
+        await self._db.execute(
+            "DELETE FROM session_messages WHERE session_id = ? AND tenant_id = ?",
+            (session_id, tenant_id),
+        )
+        cur = await self._db.execute(
+            "DELETE FROM sessions WHERE session_id = ? AND tenant_id = ?",
+            (session_id, tenant_id),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ------------------------------------------------------------------
     # Diagnoses (ADR 043 D1 — Failure Pattern Diagnoser results)
     # ------------------------------------------------------------------
 
@@ -4857,6 +5037,36 @@ def _row_to_thread(row: aiosqlite.Row) -> ConversationThread:
         title=row["title"] or "",
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_session(row: aiosqlite.Row) -> Session:
+    return Session(
+        session_id=row["session_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        title=row["title"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        turn_count=row["turn_count"],
+        total_cost_usd=row["total_cost_usd"],
+        total_tokens_in=row["total_tokens_in"],
+        total_tokens_out=row["total_tokens_out"],
+    )
+
+
+def _row_to_session_message(row: aiosqlite.Row) -> SessionMessage:
+    return SessionMessage(
+        message_id=row["message_id"],
+        session_id=row["session_id"],
+        tenant_id=row["tenant_id"],
+        role=row["role"],
+        content=json.loads(row["content"]),
+        run_id=row["run_id"],
+        cost_usd=row["cost_usd"],
+        tokens_in=row["tokens_in"],
+        tokens_out=row["tokens_out"],
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 

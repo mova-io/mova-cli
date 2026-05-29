@@ -1849,6 +1849,99 @@ class ConversationThread(BaseModel):
     threads most-recently-active first."""
 
 
+class Session(BaseModel):
+    """A server-managed stateful conversation (ADR 045 D10).
+
+    Sessions provide **server-side conversation memory**: the runtime
+    stores each turn, assembles prior turns as context for the next
+    run, and tracks a per-session cost rollup — so a client does not
+    have to re-send history on every call.
+
+    Relationship to :class:`ConversationThread`: a thread is the older,
+    join-key-only grouping (runs share a ``thread_id``; the runtime
+    re-derives history from ``RunRecord.input``/``output`` on each
+    ``POST /threads/{id}/messages``). A **session** is the ADR 045 D10
+    abstraction: a first-class entity with its own ``session_messages``
+    table, accepted directly on the run endpoints via ``session_id``,
+    and carrying a maintained cost/turn rollup. The two are independent
+    surfaces — D10 does not modify the thread path.
+
+    Storage contract:
+
+    * One session per agent per tenant. ``tenant_id`` is ``NOT NULL`` on
+      both ``sessions`` and ``session_messages`` (per-tenant isolation,
+      ADR 045 R6-adjacent) — a cross-tenant ``session_id`` is invisible
+      (404-not-403, the same contract as every other single-record
+      getter).
+    * ``session_id`` is the public identifier (URL-safe hex uuid).
+    * The conversation turns live in ``session_messages`` (one row per
+      message), each referencing the ``run_id`` that produced an
+      assistant turn — the "reference to run records that compose the
+      session" option in ADR 045 D10. This keeps the executor stateless:
+      the session service threads history *in* as input context and
+      appends the resulting turn *out*; the executor never learns
+      sessions exist.
+
+    Rollups (maintained on append, ADR 045 D10 "per-session cost
+    rollup"): ``turn_count``, ``total_cost_usd``, ``total_tokens_in``,
+    ``total_tokens_out``. These sum the D1 economics across turns so a
+    client can read the conversation's running spend without scanning
+    every message.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    tenant_id: str
+    agent: str
+    title: str = ""
+    """Optional human-readable label for client display."""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    """Refreshed on every appended turn so clients can sort sessions
+    most-recently-active first."""
+    turn_count: int = 0
+    """Number of completed (user→assistant) turns appended so far."""
+    total_cost_usd: float = 0.0
+    """Per-session BYOK cost rollup — sum of each turn's
+    ``RunRecord.metrics.cost_usd``."""
+    total_tokens_in: int = 0
+    """Sum of prompt tokens across turns."""
+    total_tokens_out: int = 0
+    """Sum of completion tokens across turns."""
+
+
+class SessionMessage(BaseModel):
+    """One message in a :class:`Session` (ADR 045 D10).
+
+    A turn is two rows: a ``user`` message (the submitted input) and an
+    ``assistant`` message (the agent's reply). The assistant row carries
+    ``run_id`` + economics so the session both *references the run record*
+    that composed it and surfaces a per-turn cost without a join.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(default_factory=lambda: uuid4().hex)
+    session_id: str
+    tenant_id: str
+    """Denormalized from the parent session so message reads stay
+    tenant-scoped without joining ``sessions`` (per-tenant isolation)."""
+    role: Literal["user", "assistant"]
+    content: dict[str, Any]
+    """The message payload. For a ``user`` row this is the submitted
+    run input dict; for an ``assistant`` row this is the run's output
+    dict (``None`` output is stored as ``{}``)."""
+    run_id: str | None = None
+    """References ``runs.run_id`` for an ``assistant`` turn — the run
+    that produced this reply. ``None`` on the ``user`` row."""
+    cost_usd: float = 0.0
+    """This turn's BYOK cost (assistant row only; 0 on the user row)."""
+    tokens_in: int = 0
+    tokens_out: int = 0
+    created_at: datetime = Field(default_factory=_now)
+
+
 class FailureRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
