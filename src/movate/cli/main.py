@@ -423,6 +423,10 @@ app.add_typer(schema_app, name="schema", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.add_typer(knowledge_app, name="knowledge", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(kb_app, name="kb", rich_help_panel=PANEL_DEVELOP)
+# `graph` inspects a deployed agent's knowledge graph (ADR 046): `show`/`node`
+# query the runtime's graphology query API (#559), and `serve` launches the
+# local read-only sigma.js viewer (#562) that proxies that same API. Lives next
+# to `kb`/`knowledge` since all three operate on the KB-derived graph.
 app.add_typer(graph_app, name="graph", rich_help_panel=PANEL_DEVELOP)
 # `contexts` lists + inspects shared context files wired into agents —
 # the "did my policy.md actually load?" diagnostic. Lives next to `kb`

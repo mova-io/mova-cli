@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mdk graph — knowledge graph viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!--
+    mdk graph serve — read-only knowledge graph viewer (sigma.js + graphology).
+    The bearer key is NEVER present in this page or in app.js. The local `mdk
+    graph serve` process holds it and proxies /api/* calls to the runtime,
+    injecting Authorization server-side. The injected config below carries only
+    the project id + non-secret display hints.
+  -->
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <span class="logo">mdk</span>
+        <span class="title">knowledge graph</span>
+        <span id="target-badge" class="badge"></span>
+      </div>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false" />
+        <ul id="suggestions"></ul>
+      </div>
+      <div class="toolbar">
+        <label class="toggle" title="Color nodes by their type or by detected community">
+          color:
+          <select id="color-mode">
+            <option value="type">by type</option>
+            <option value="community">by community</option>
+          </select>
+        </label>
+        <label class="toggle" title="Scale node size by its degree (number of connections)">
+          <input type="checkbox" id="size-by-degree" checked /> size by degree
+        </label>
+        <label class="toggle live" title="Stream node/edge additions as documents are ingested">
+          <input type="checkbox" id="live-toggle" /> <span class="live-dot"></span> live growth
+        </label>
+      </div>
+    </header>
+
+    <aside id="filters">
+      <h3>Node types</h3>
+      <div id="type-filters" class="type-list"></div>
+      <div class="legend-spacer"></div>
+      <h3>Stats</h3>
+      <dl id="stats">
+        <dt>nodes</dt><dd id="stat-nodes">0</dd>
+        <dt>edges</dt><dd id="stat-edges">0</dd>
+      </dl>
+    </aside>
+
+    <main id="graph-container"></main>
+
+    <section id="detail-panel" class="hidden" aria-hidden="true">
+      <button id="detail-close" title="Close">×</button>
+      <h2 id="detail-label">—</h2>
+      <span id="detail-type" class="detail-type"></span>
+      <button id="expand-btn" class="expand-btn">Expand neighbors ↧</button>
+
+      <h3>Properties</h3>
+      <dl id="detail-props" class="kv"></dl>
+
+      <h3>Provenance</h3>
+      <div id="detail-provenance" class="provenance"></div>
+
+      <h3>Referenced by agents</h3>
+      <ul id="detail-agents" class="agent-list"></ul>
+    </section>
+
+    <div id="status-bar"></div>
+    <div id="banner" class="hidden"></div>
+  </div>
+
+  <!--
+    Vendored, MIT-licensed, served locally (no CDN) so this works air-gapped.
+    Load order matters: graphology (Graph model) → forceatlas2 (layout +
+    FA2Layout worker supervisor) → sigma (WebGL renderer) → app.
+  -->
+  <script src="/static/vendor/graphology.umd.min.js"></script>
+  <script src="/static/vendor/graphology-layout-forceatlas2.umd.js"></script>
+  <script src="/static/vendor/sigma.min.js"></script>
+  <!-- Server-injected, NON-SECRET config (project id + display hints only). -->
+  <script>
+    /* __MDK_GRAPH_CONFIG__ */
+    window.MDK_GRAPH_CONFIG = window.MDK_GRAPH_CONFIG || { project: null, target: "" };
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

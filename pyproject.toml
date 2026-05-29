@@ -250,6 +250,19 @@ playground = [
     "httpx>=0.27",
 ]
 
+# NOTE — the knowledge-graph features (ADR 046) need NO opt-in Python extra.
+#   * `mdk graph show` / `mdk graph node` (#559) read the runtime's graphology
+#     query API; the query layer (src/movate/core/graph/) is pure Python over
+#     the StorageProvider Protocol — no new deps.
+#   * `mdk graph serve` (#562) runs the read-only sigma.js viewer on the stdlib
+#     `http.server` (no web framework) and the already-core `httpx` for the
+#     runtime proxy. Its sigma.js / graphology / graphology-layout-forceatlas2
+#     front-end libs are vendored as MIT static assets under
+#     src/movate/cli/graph_viewer/vendor/ (shipped in the wheel via
+#     `packages = ["src/movate"]`, served locally for air-gapped use — no CDN).
+#     Those JS files are browser assets, not Python deps, so the Python license
+#     gate doesn't apply; their MIT licenses are in graph_viewer/VENDOR_LICENSES.md.
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
