@@ -142,6 +142,8 @@ from movate.runtime.schemas import (
     AgentVersionsView,
     AgentVersionView,
     AgentView,
+    AnalyzeAcceptedView,
+    AnalyzeRequest,
     ApiKeyBulkRevokedView,
     ApiKeyListView,
     ApiKeyMintedView,
@@ -150,6 +152,7 @@ from movate.runtime.schemas import (
     ApiKeyRotatedView,
     ApiKeyRotateRequest,
     ApiKeyView,
+    AskRequest,
     AuthWhoamiView,
     BatchAcceptedView,
     BatchInlineSubmission,
@@ -192,6 +195,7 @@ from movate.runtime.schemas import (
     GraphQueryRequest,
     GraphSearchResult,
     GraphSearchView,
+    GroundedAnswerView,
     HarvestedCaseView,
     HarvestView,
     HealthView,
@@ -216,6 +220,9 @@ from movate.runtime.schemas import (
     ModelCatalogView,
     ModelInfoView,
     NodeDetailView,
+    ObservabilityHealthView,
+    ObservabilityInsightListView,
+    ObservabilityInsightView,
     PricingEntryView,
     PricingView,
     ProviderKeyListView,
@@ -238,6 +245,7 @@ from movate.runtime.schemas import (
     TriggerCreateRequest,
     TriggerListView,
     TriggerView,
+    TroubleshootRequest,
     WizardAgentSubmission,
     WorkflowRunListView,
     WorkflowRunView,
@@ -7575,6 +7583,219 @@ def build_app(
             status="stub",
             watermark=now.isoformat(),
             detail=catalog_sync_stub_detail,
+        )
+
+    # ------------------------------------------------------------------
+    # Observability Intelligence layer (ADR 047). Five routes:
+    #   GET  /observability/insights   (read)  — the append-only insight feed
+    #   GET  /observability/health     (read)  — latest health score + digest
+    #   POST /observability/ask        (read)  — NL question, grounded answer
+    #   POST /observability/troubleshoot (read)— symptom → root-cause narrative
+    #   POST /observability/analyze    (admin) — on-demand analyst trigger
+    #
+    # ask/troubleshoot/insights/health are PURE READS (only save_insight +
+    # the analyst write). The NL detail path runs a FIXED set of read-only,
+    # parameterized query templates — the LLM never authors raw SQL (the
+    # SQL-safety contract lives in movate.core.observability.query). Every
+    # ask/troubleshoot answer carries evidence[] (citations mandatory).
+    # ------------------------------------------------------------------
+
+    def _build_observability_llm(*, mock: bool) -> Any:
+        """Build the LLM the budget-capped NL queries use (LiteLLM default).
+
+        ``mock=True`` uses the deterministic MockProvider (the hermetic-test
+        path, mirroring the eval/bench endpoints). Returns ``None`` if no
+        provider can be built — the query layer then returns a deterministic,
+        still-grounded fallback answer rather than failing the request.
+        """
+        try:
+            if mock:
+                from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+                return MockProvider()
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            return LiteLLMProvider()
+        except Exception:  # pragma: no cover - provider construction is cheap
+            logging.getLogger(__name__).warning(
+                "observability_llm_build_failed — answering without LLM", exc_info=True
+            )
+            return None
+
+    @v1.get(
+        "/observability/insights",
+        response_model=ObservabilityInsightListView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_insights(
+        request: Request,
+        project_id: str | None = Query(default=None),
+        since: str | None = Query(default=None, description="ISO YYYY-MM-DD, inclusive."),
+        until: str | None = Query(default=None, description="ISO YYYY-MM-DD, inclusive."),
+        limit: int = Query(default=90, ge=1, le=365),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityInsightListView:
+        """List this tenant's daily observability insights, newest-day-first.
+
+        Tenant-scoped at the SQL layer (``list_insights`` requires
+        ``tenant_id``). Append-only re-runs collapse to the latest row per day.
+        Pure read.
+        """
+        from datetime import date as _date  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+
+        def _parse(d: str | None) -> Any:
+            if not d:
+                return None
+            try:
+                return _date.fromisoformat(d)
+            except ValueError as exc:
+                raise http_error(
+                    ErrorCode.BAD_REQUEST,
+                    status_code=400,
+                    message=f"bad date {d!r} — expected ISO YYYY-MM-DD",
+                ) from exc
+
+        rows = await store.list_insights(
+            ctx.tenant_id,
+            project_id=project_id,
+            since=_parse(since),
+            until=_parse(until),
+            limit=limit,
+        )
+        views = [ObservabilityInsightView.from_record(r) for r in rows]
+        return ObservabilityInsightListView(insights=views, count=len(views))
+
+    @v1.get(
+        "/observability/health",
+        response_model=ObservabilityHealthView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_health(
+        request: Request,
+        project_id: str = Query(default="default"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityHealthView:
+        """Return the latest health score + digest for a project. Pure read.
+
+        ``has_insight=False`` (cold start) when the analyst hasn't run yet —
+        a clean 200 with nulls, not a 404 (the project may simply be new).
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_insights(ctx.tenant_id, project_id=project_id, limit=1)
+        if not rows:
+            return ObservabilityHealthView(project_id=project_id, has_insight=False)
+        latest = rows[0]
+        return ObservabilityHealthView(
+            project_id=latest.project_id,
+            date=latest.date.isoformat(),
+            health_score=latest.health_score,
+            narrative_digest=latest.narrative_digest,
+            anomaly_count=len(latest.anomalies),
+            has_insight=True,
+        )
+
+    @v1.post(
+        "/observability/ask",
+        response_model=GroundedAnswerView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_ask(
+        body: AskRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GroundedAnswerView:
+        """Answer a natural-language observability question with citations.
+
+        Reads the insights store (fast path) and may run BOUNDED, read-only
+        parameterized query templates (the LLM picks a template + typed params
+        from a CLOSED set — never raw SQL). Budget-capped. Pure read.
+        """
+        from movate.core.observability.query import ask as _ask  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        answer = await _ask(
+            body.question,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            storage=store,
+            llm=_build_observability_llm(mock=body.mock),
+            budget_usd=body.budget_usd,
+        )
+        return GroundedAnswerView.from_record(answer)
+
+    @v1.post(
+        "/observability/troubleshoot",
+        response_model=GroundedAnswerView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_troubleshoot(
+        body: TroubleshootRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GroundedAnswerView:
+        """Correlate deploys + drift + error clusters + recent failures into a
+        root-cause narrative with evidence. Budget-capped. Pure read.
+        """
+        from movate.core.observability.query import troubleshoot as _troubleshoot  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        answer = await _troubleshoot(
+            body.symptom,
+            body.time_window_days,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            storage=store,
+            llm=_build_observability_llm(mock=body.mock),
+            budget_usd=body.budget_usd,
+        )
+        return GroundedAnswerView.from_record(answer)
+
+    @v1.post(
+        "/observability/analyze",
+        response_model=AnalyzeAcceptedView,
+        status_code=202,
+        tags=["observability-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_observability_analyze(
+        body: AnalyzeRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AnalyzeAcceptedView:
+        """Enqueue an on-demand overnight-analyst run (admin scope).
+
+        Enqueues a ``JobKind.OBSERVABILITY_ANALYZE`` job the worker picks up
+        and runs (``dispatch._execute_observability_analyze``). Returns 202
+        with the ``job_id`` — same async protocol as run/eval/bench submits.
+        The nightly cron uses the same JobKind via a JobSchedule (a documented
+        follow-up); this endpoint is the manual trigger.
+        """
+        store: StorageProvider = request.app.state.storage
+        job_input: dict[str, Any] = {
+            "project_id": body.project_id,
+            "budget_usd": body.budget_usd,
+        }
+        if body.date:
+            job_input["date"] = body.date
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.OBSERVABILITY_ANALYZE,
+            target=f"observability:{body.project_id}",
+            status=JobStatus.QUEUED,
+            input=job_input,
+            api_key_id=ctx.api_key_id,
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        return AnalyzeAcceptedView(
+            job_id=job.job_id, kind=job.kind.value, project_id=body.project_id
         )
 
     app.include_router(v1)

@@ -21,13 +21,17 @@ import httpx
 from movate.core.models import JobKind, JobStatus, WorkflowStatus
 from movate.runtime.schemas import (
     AgentListView,
+    AnalyzeAcceptedView,
     BatchAcceptedView,
     BatchListView,
     BatchStatusView,
+    GroundedAnswerView,
     HealthView,
     JobCancelView,
     JobListView,
     JobView,
+    ObservabilityHealthView,
+    ObservabilityInsightListView,
     RunAccepted,
     RunSubmission,
     RunView,
@@ -178,6 +182,93 @@ class MovateClient:
         r = await self._client.get(f"/runs/{run_id}")
         self._raise_for_status(r)
         return RunView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Observability Intelligence (ADR 047)
+    # ------------------------------------------------------------------
+
+    async def observability_insights(
+        self,
+        *,
+        project_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 90,
+    ) -> ObservabilityInsightListView:
+        """``GET /api/v1/observability/insights`` — daily insight feed."""
+        params: dict[str, str | int] = {"limit": limit}
+        if project_id is not None:
+            params["project_id"] = project_id
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
+        r = await self._client.get("/api/v1/observability/insights", params=params)
+        self._raise_for_status(r)
+        return ObservabilityInsightListView.model_validate(r.json())
+
+    async def observability_health(self, *, project_id: str = "default") -> ObservabilityHealthView:
+        """``GET /api/v1/observability/health`` — latest health score + digest."""
+        r = await self._client.get(
+            "/api/v1/observability/health", params={"project_id": project_id}
+        )
+        self._raise_for_status(r)
+        return ObservabilityHealthView.model_validate(r.json())
+
+    async def observability_ask(
+        self,
+        question: str,
+        *,
+        project_id: str = "default",
+        budget_usd: float = 0.05,
+        mock: bool = False,
+    ) -> GroundedAnswerView:
+        """``POST /api/v1/observability/ask`` — grounded NL answer + citations."""
+        body = {
+            "question": question,
+            "project_id": project_id,
+            "budget_usd": budget_usd,
+            "mock": mock,
+        }
+        r = await self._client.post("/api/v1/observability/ask", json=body)
+        self._raise_for_status(r)
+        return GroundedAnswerView.model_validate(r.json())
+
+    async def observability_troubleshoot(
+        self,
+        symptom: str,
+        *,
+        time_window_days: int = 7,
+        project_id: str = "default",
+        budget_usd: float = 0.05,
+        mock: bool = False,
+    ) -> GroundedAnswerView:
+        """``POST /api/v1/observability/troubleshoot`` — root-cause narrative."""
+        body = {
+            "symptom": symptom,
+            "time_window_days": time_window_days,
+            "project_id": project_id,
+            "budget_usd": budget_usd,
+            "mock": mock,
+        }
+        r = await self._client.post("/api/v1/observability/troubleshoot", json=body)
+        self._raise_for_status(r)
+        return GroundedAnswerView.model_validate(r.json())
+
+    async def observability_analyze(
+        self,
+        *,
+        project_id: str = "default",
+        date: str | None = None,
+        budget_usd: float = 0.10,
+    ) -> AnalyzeAcceptedView:
+        """``POST /api/v1/observability/analyze`` — enqueue an analyst run (admin)."""
+        body: dict[str, Any] = {"project_id": project_id, "budget_usd": budget_usd}
+        if date is not None:
+            body["date"] = date
+        r = await self._client.post("/api/v1/observability/analyze", json=body)
+        self._raise_for_status(r)
+        return AnalyzeAcceptedView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Batch inference (item 17)

@@ -64,6 +64,7 @@ _PG_TABLES = (
     "catalog_entry_versions",
     "catalog_entry_ratings",
     "catalog_sync_watermark",
+    "observability_insights",
 )
 
 

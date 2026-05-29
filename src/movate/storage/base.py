@@ -23,7 +23,7 @@ path is enforced by ``check_record``, not the storage method.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Protocol
 
 from movate.core.dr_backup import ImportResult
@@ -63,6 +63,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
 
 
 class StorageProvider(Protocol):
@@ -1715,6 +1716,57 @@ class StorageProvider(Protocol):
 
         Idempotent and concurrency-safe: implementations rely on the unique
         ``(tenant_id, name)`` index so two racing creates collapse to one.
+        """
+
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — one APPEND-ONLY table holding the
+    # overnight analyst's daily, pre-aggregated telemetry summary per
+    # (tenant, project, date). Deliberately append-only: a re-run of the
+    # analyst for a day INSERTS a new row rather than mutating the prior one,
+    # so the daily history is its own audit trail. There is intentionally NO
+    # update method. Reads take the LATEST row per (tenant, project, date)
+    # (newest ``created_at`` wins). ``tenant_id`` is NOT NULL and every read
+    # is tenant-scoped at the SQL layer (no-leak contract).
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        """Append one :class:`ObservabilityInsight` row (insert-only).
+
+        Never updates: re-running the analyst for the same
+        ``(tenant_id, project_id, date)`` inserts a NEW row keyed by the
+        record's unique ``id``. The read methods reconcile duplicates by
+        taking the most-recently-created row per day.
+        """
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        """Return the LATEST insight for ``(tenant_id, project_id, day)``.
+
+        "Latest" = newest ``created_at`` among the (possibly several,
+        append-only) rows for that day. Returns ``None`` when no insight
+        exists OR it belongs to a different tenant — same no-leak contract as
+        every other single-record getter.
+        """
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        """List a tenant's insights, newest-day-first, de-duplicated per day.
+
+        Returns the LATEST row per ``(project_id, date)`` (append-only re-runs
+        collapse to one), ordered by ``date`` descending. Filters AND together:
+        ``project_id`` narrows to one project; ``since`` / ``until`` bound the
+        date range inclusively. Always tenant-scoped (``tenant_id`` is
+        required, not optional) — there is no cross-tenant insights mode, so
+        this is never an operator-only fleet read. ``limit`` defaults to ~90
+        days (a quarter of history).
         """
 
     async def close(self) -> None: ...

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import asyncpg
@@ -77,6 +77,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
 from movate.storage._cosine import rank_chunks_by_cosine as _rank_chunks_by_cosine  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -880,6 +881,30 @@ CREATE TABLE IF NOT EXISTS catalog_sync_watermark (
     source           TEXT PRIMARY KEY,
     last_synced_at   TIMESTAMPTZ NOT NULL
 );
+
+-- ADR 047: observability insights — the overnight analyst's daily,
+-- pre-aggregated telemetry summary per (tenant, project, date). APPEND-ONLY:
+-- a re-run for a day INSERTs a new row (keyed by the unique ``id``); reads take
+-- the latest row per (tenant, project, date) via ORDER BY created_at DESC. The
+-- four JSON columns (anomalies / top_failures / usage_rollup / trends) are
+-- JSONB and round-trip through the connection-level json codec (same as
+-- runs.metrics). Additive new table (CREATE TABLE IF NOT EXISTS, idempotent) —
+-- default-off, no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS observability_insights (
+    id               TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL,
+    project_id       TEXT NOT NULL,
+    date             DATE NOT NULL,
+    health_score     DOUBLE PRECISION NOT NULL,
+    anomalies        JSONB NOT NULL,
+    top_failures     JSONB NOT NULL,
+    usage_rollup     JSONB NOT NULL,
+    trends           JSONB NOT NULL,
+    narrative_digest TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observability_insights_tpd
+    ON observability_insights(tenant_id, project_id, date);
 """
 
 
@@ -1321,6 +1346,90 @@ class PostgresProvider:
             tenant_id,
         )
         return _row_to_eval(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — append-only.
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        # INSERT-only (never UPDATE / ON CONFLICT): a re-run for the same day
+        # appends a new row keyed by the unique ``id``; reads take the latest.
+        # The four JSON columns serialize via the connection-level json codec.
+        await self._db.execute(
+            """
+            INSERT INTO observability_insights (
+                id, tenant_id, project_id, date, health_score,
+                anomalies, top_failures, usage_rollup, trends,
+                narrative_digest, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            """,
+            insight.id,
+            insight.tenant_id,
+            insight.project_id,
+            insight.date,
+            insight.health_score,
+            insight.anomalies,
+            insight.top_failures,
+            insight.usage_rollup,
+            insight.trends,
+            insight.narrative_digest,
+            insight.created_at,
+        )
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        # Latest-per-day: ORDER BY created_at DESC LIMIT 1 collapses append-only
+        # re-runs to the newest row. tenant_id in WHERE is the no-leak gate.
+        row = await self._db.fetchrow(
+            """
+            SELECT * FROM observability_insights
+            WHERE tenant_id = $1 AND project_id = $2 AND date = $3
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            tenant_id,
+            project_id,
+            day,
+        )
+        return _row_to_insight(row) if row else None
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        # DISTINCT ON (project_id, date) collapses append-only re-runs to the
+        # latest row per day server-side (Postgres-specific), then we re-sort
+        # the deduped set newest-day-first and cap to ``limit``.
+        clauses = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if project_id is not None:
+            params.append(project_id)
+            clauses.append(f"project_id = ${len(params)}")
+        if since is not None:
+            params.append(since)
+            clauses.append(f"date >= ${len(params)}")
+        if until is not None:
+            params.append(until)
+            clauses.append(f"date <= ${len(params)}")
+        params.append(limit)
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT * FROM (
+                SELECT DISTINCT ON (project_id, date) *
+                FROM observability_insights
+                WHERE {where}
+                ORDER BY project_id, date, created_at DESC
+            ) latest
+            ORDER BY date DESC
+            LIMIT ${len(params)}
+        """
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_insight(r) for r in rows]
 
     async def list_evals(
         self,
@@ -4099,6 +4208,24 @@ def _row_to_catalog_entry_version(row: asyncpg.Record) -> CatalogEntryVersion:
         digest=row["digest"],
         published_at=row["published_at"],
         deprecated_at=row["deprecated_at"],
+    )
+
+
+def _row_to_insight(row: asyncpg.Record) -> ObservabilityInsight:
+    # The JSONB ↔ dict/list codec (registered in _init_connection) decodes the
+    # four JSON columns; ``date`` / ``created_at`` come back as date/datetime.
+    return ObservabilityInsight(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        date=row["date"],
+        health_score=row["health_score"],
+        anomalies=list(row["anomalies"] or []),
+        top_failures=list(row["top_failures"] or []),
+        usage_rollup=dict(row["usage_rollup"] or {}),
+        trends=dict(row["trends"] or {}),
+        narrative_digest=row["narrative_digest"] or "",
+        created_at=row["created_at"],
     )
 
 

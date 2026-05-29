@@ -2226,6 +2226,15 @@ class JobKind(StrEnum):
     EVAL, ``result_run_id`` carries the produced ``bench_id`` so the
     caller can fetch the completed BenchRecord via
     GET /api/v1/bench/{bench_id}. See BACKLOG item 64."""
+    OBSERVABILITY_ANALYZE = "observability_analyze"
+    """Overnight observability analyst (ADR 047). JobRecord.input carries
+    ``{project_id, date?, budget_usd?}``; the worker runs
+    :func:`movate.core.observability.analyst.analyze` for the (tenant,
+    project, day) and appends one ObservabilityInsight. No agent bundle is
+    loaded — the analyst reads telemetry from storage directly, so this kind
+    needs no registry resolve. ``result_run_id`` carries the produced
+    insight ``id``. The nightly cron can enqueue this via a JobSchedule;
+    ``POST /api/v1/observability/analyze`` triggers it on demand."""
 
 
 class JobRecord(BaseModel):

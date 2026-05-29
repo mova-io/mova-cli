@@ -119,6 +119,8 @@ class WorkerDispatch:
                 return await self._execute_eval(job)
             if job.kind == JobKind.BENCH:
                 return await self._execute_bench(job)
+            if job.kind == JobKind.OBSERVABILITY_ANALYZE:
+                return await self._execute_observability_analyze(job)
             return _error(
                 "unknown_kind",
                 f"unsupported JobKind {job.kind!r}",
@@ -497,6 +499,76 @@ class WorkerDispatch:
                 record.agent,
                 exc_info=True,
             )
+
+    async def _execute_observability_analyze(self, job: JobRecord) -> DispatchOutcome:
+        """Run the overnight observability analyst (ADR 047).
+
+        ``job.input`` carries ``{project_id, date?, budget_usd?, mock?}``. No
+        agent bundle is resolved — the analyst reads telemetry from storage
+        directly (runs / evals / failures) and appends one
+        :class:`ObservabilityInsight`. ``result_run_id`` carries the produced
+        insight ``id`` (the generic "result identifier", like EVAL→eval_id).
+
+        The single LLM call (the narrative digest) is budget-capped; on a
+        test/mock worker we use MockProvider so no real spend occurs. A bad
+        config (missing project_id) is a non-retryable error; an unexpected
+        crash is retryable.
+        """
+        from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+        from movate.core.observability.analyst import analyze  # noqa: PLC0415
+
+        cfg = job.input
+        project_id = cfg.get("project_id")
+        if not project_id:
+            return _error(
+                "observability_config",
+                "observability analyze requires a 'project_id' in job.input",
+                retryable=False,
+            )
+
+        # Default to *yesterday* (the common nightly case) when no explicit date.
+        raw_date = cfg.get("date")
+        if raw_date:
+            try:
+                day = datetime.fromisoformat(str(raw_date)).date()
+            except ValueError:
+                return _error(
+                    "observability_config",
+                    f"bad 'date' {raw_date!r} — expected ISO YYYY-MM-DD",
+                    retryable=False,
+                )
+        else:
+            day = (datetime.now(UTC) - timedelta(days=1)).date()
+
+        use_mock: bool = self._use_mock_for_eval or bool(cfg.get("mock", False))
+        if use_mock:
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        try:
+            insight = await analyze(
+                job.tenant_id,
+                str(project_id),
+                day,
+                storage=self._storage,
+                llm=provider,
+                budget_usd=float(cfg.get("budget_usd", 0.10)),
+            )
+        except Exception as exc:
+            logger.exception("observability_analyze_unhandled job_id=%s", job.job_id)
+            return _error("internal", str(exc), retryable=True)
+
+        return DispatchOutcome(
+            status=JobStatus.SUCCESS,
+            result_run_id=insight.id,
+            error=None,
+        )
 
     async def _execute_bench(self, job: JobRecord) -> DispatchOutcome:
         """Run an async multi-model bench job (BACKLOG #64).

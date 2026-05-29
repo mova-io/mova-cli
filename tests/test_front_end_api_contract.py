@@ -78,6 +78,13 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("GET", "/api/v1/graph/nodes/{node_id}/neighbors"): "read",
     ("GET", "/api/v1/graph/search"): "read",
     ("POST", "/api/v1/graph/query"): "read",
+    # observability intelligence (ADR 047) — read feed/health/ask/troubleshoot
+    # + the admin-only on-demand analyst trigger.
+    ("GET", "/api/v1/observability/insights"): "read",
+    ("GET", "/api/v1/observability/health"): "read",
+    ("POST", "/api/v1/observability/ask"): "read",
+    ("POST", "/api/v1/observability/troubleshoot"): "read",
+    ("POST", "/api/v1/observability/analyze"): "admin",
 }
 
 
