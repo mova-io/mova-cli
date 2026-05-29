@@ -34,6 +34,8 @@ from movate.core.models import (
     ProjectMember,
     ProjectMemberRole,
     RunRecord,
+    Session,
+    SessionMessage,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -2477,6 +2479,34 @@ class AgentRunSubmission(BaseModel):
             "play."
         ),
     )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional stateful-session id (ADR 045 D10). When set, the "
+            "runtime loads the session's prior turns as conversation "
+            "context, runs the agent, then appends this turn to the "
+            "session and updates its cost rollup — server-side memory, so "
+            "the client need not re-send history. The session must already "
+            "exist (POST /api/v1/sessions) and belong to the caller's "
+            "tenant; a missing/cross-tenant id is a 404. **Additive + "
+            "back-compat: omitting session_id is byte-for-byte today's "
+            "stateless behavior.** Session memory is threaded on the "
+            "inline (``?wait=true``) and streaming run paths, which "
+            "complete in-process and can append the turn immediately."
+        ),
+    )
+    memory: Literal["server", "client"] = Field(
+        default="server",
+        description=(
+            "Memory mode when ``session_id`` is set (ADR 045 D10 / R3). "
+            "``server`` (default) = the runtime manages history. "
+            "``client`` = opt out of server-side history assembly and get "
+            "exactly today's stateless behavior; the turn is still "
+            "recorded on the session for the rollup, but prior turns are "
+            "NOT injected as context (the client is managing memory "
+            "itself). Ignored when ``session_id`` is omitted."
+        ),
+    )
 
 
 class BatchInlineSubmission(BaseModel):
@@ -3180,6 +3210,122 @@ class ThreadMessageSubmission(BaseModel):
             "Same semantics as the standalone /run flow."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Stateful sessions (ADR 045 D10) — server-side conversation memory. A
+# session is a first-class entity (distinct from the join-key thread
+# surface above) that the run endpoints accept via ``session_id``. These
+# schemas are the wire envelopes for the /api/v1/sessions endpoints.
+# ---------------------------------------------------------------------------
+
+
+class SessionCreateSubmission(BaseModel):
+    """``POST /api/v1/sessions`` body — open a new server-managed
+    conversation (ADR 045 D10) with one agent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str = Field(
+        ...,
+        description=(
+            "Agent the session targets. Sessions are bound to one agent; "
+            "open a new session to target a different agent."
+        ),
+    )
+    title: str = Field(
+        default="",
+        max_length=256,
+        description="Optional human-readable label for client display.",
+    )
+
+
+class SessionMessageView(BaseModel):
+    """One turn in a session's history (ADR 045 D10)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str
+    role: str
+    content: dict[str, Any]
+    run_id: str | None = None
+    cost_usd: float
+    tokens_in: int
+    tokens_out: int
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, record: SessionMessage) -> SessionMessageView:
+        return cls(
+            message_id=record.message_id,
+            role=record.role,
+            content=record.content,
+            run_id=record.run_id,
+            cost_usd=record.cost_usd,
+            tokens_in=record.tokens_in,
+            tokens_out=record.tokens_out,
+            created_at=record.created_at,
+        )
+
+
+class SessionView(BaseModel):
+    """``POST /api/v1/sessions`` + ``GET /api/v1/sessions/{id}`` response
+    envelope. 1:1 with :class:`movate.core.models.Session` plus an
+    optional ``messages`` array (filled by the get-with-history endpoint,
+    omitted on bare create/list responses). The rollup fields
+    (``turn_count`` + ``total_*``) are the per-session economics rollup
+    ADR 045 D10 mandates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    tenant_id: str
+    agent: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    turn_count: int
+    total_cost_usd: float
+    total_tokens_in: int
+    total_tokens_out: int
+    messages: list[SessionMessageView] | None = Field(
+        default=None,
+        description=(
+            "Chronological turn history (earliest first). Populated by "
+            "GET /api/v1/sessions/{id}; omitted on create + list responses."
+        ),
+    )
+
+    @classmethod
+    def from_record(
+        cls,
+        record: Session,
+        *,
+        messages: list[SessionMessageView] | None = None,
+    ) -> SessionView:
+        return cls(
+            session_id=record.session_id,
+            tenant_id=record.tenant_id,
+            agent=record.agent,
+            title=record.title,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            turn_count=record.turn_count,
+            total_cost_usd=record.total_cost_usd,
+            total_tokens_in=record.total_tokens_in,
+            total_tokens_out=record.total_tokens_out,
+            messages=messages,
+        )
+
+
+class SessionListView(BaseModel):
+    """``GET /api/v1/sessions`` response — paginated session list for a
+    tenant, ``updated_at DESC`` (active conversations first)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sessions: list[SessionView]
+    count: int
 
 
 # ---------------------------------------------------------------------------

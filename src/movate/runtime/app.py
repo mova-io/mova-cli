@@ -86,6 +86,9 @@ from movate.core.models import (
     JobStatus,
     Project,
     ProjectMemberRole,
+    RunRecord,
+    Session,
+    SessionMessage,
     TenantProviderKey,
     Trigger,
     WorkflowBundleRecord,
@@ -344,6 +347,10 @@ from movate.runtime.schemas import (
     RunSubmission,
     RunTraceView,
     RunView,
+    SessionCreateSubmission,
+    SessionListView,
+    SessionMessageView,
+    SessionView,
     SkillCreatedView,
     ThreadCreateSubmission,
     ThreadListView,
@@ -657,6 +664,7 @@ async def _sse_run_stream(
     run_request: Any,
     store: StorageProvider,
     tenant_id: str,
+    on_complete: Callable[[RunRecord], Awaitable[None]] | None = None,
 ) -> Any:
     """Bridge the Executor's *sync* ``on_token`` callback to an *async*
     SSE generator and yield SSE frames.
@@ -727,6 +735,16 @@ async def _sse_run_stream(
                 # the terminal frame carries the canonical RunView shape.
                 record = await store.get_run(response.run_id, tenant_id=tenant_id)
                 if record is not None:
+                    # ADR 045 D10 — fire the optional completion hook (e.g.
+                    # append this turn to a stateful session + refresh its
+                    # rollup) before the terminal frame. Best-effort: a hook
+                    # failure must NOT break the stream the client is reading,
+                    # so it's swallowed (the run itself already persisted).
+                    if on_complete is not None and record.status == JobStatus.SUCCESS:
+                        try:
+                            await on_complete(record)
+                        except Exception:
+                            logger.exception("session_turn_append_failed run_id=%s", record.run_id)
                     view = RunView.from_record(record)
                     yield _sse_frame(
                         "done",
@@ -2627,6 +2645,146 @@ def _apply_history_char_budget(
         else:
             break
     return list(reversed(kept_reverse))
+
+
+# ---------------------------------------------------------------------------
+# Stateful-session memory helpers (ADR 045 D10). The executor stays
+# stateless: these assemble prior turns into the run input as
+# ``conversation_history`` (the SAME key + budget machinery the thread
+# path uses) on the way in, and append the completed turn (user +
+# assistant rows) plus a per-session cost rollup on the way out. The
+# executor never learns sessions exist — preserving control-plane ⊥
+# execution-plane.
+# ---------------------------------------------------------------------------
+
+
+async def _assemble_session_input(
+    store: StorageProvider,
+    *,
+    session_id: str,
+    tenant_id: str,
+    user_input: dict[str, Any],
+    history_turns: int = _THREAD_HISTORY_TURNS,
+    history_char_budget: int = _THREAD_HISTORY_CHAR_BUDGET,
+) -> dict[str, Any]:
+    """Build the run input for a server-memory session turn.
+
+    Loads the session's prior messages, pairs them into
+    ``{input, output}`` turns (chronological), applies the same
+    turn-count + char-budget caps as the thread path, and injects them
+    under ``conversation_history`` — UNLESS the caller already supplied
+    that key (caller-supplied-wins, so an advanced client can pre-format
+    or summarize history itself). Returns a NEW input dict; the caller's
+    dict is untouched.
+    """
+    augmented = dict(user_input)
+    if "conversation_history" in augmented:
+        return augmented
+    messages = await store.list_session_messages(session_id, tenant_id=tenant_id, limit=1000)
+    # Pair user→assistant rows into turns. A turn is complete only when
+    # both rows are present; a trailing lone user row (e.g. a failed
+    # prior run that never appended an assistant reply) is skipped so we
+    # never feed a half-turn as context.
+    turns: list[dict[str, Any]] = []
+    pending_user: dict[str, Any] | None = None
+    for m in messages:
+        if m.role == "user":
+            pending_user = m.content
+        elif m.role == "assistant" and pending_user is not None:
+            turns.append({"input": pending_user, "output": m.content})
+            pending_user = None
+    turns = turns[-history_turns:]
+    augmented["conversation_history"] = _apply_history_char_budget(
+        turns, budget=history_char_budget
+    )
+    return augmented
+
+
+async def _append_session_turn(
+    store: StorageProvider,
+    *,
+    session: Session,
+    user_input: dict[str, Any],
+    run_id: str | None,
+    output: dict[str, Any] | None,
+    cost_usd: float,
+    tokens_in: int,
+    tokens_out: int,
+) -> None:
+    """Persist one completed turn (user + assistant rows) onto the
+    session and refresh its rollups (``turn_count`` + ``total_*``).
+
+    Called after the run completes regardless of memory mode — a
+    ``client``-memory turn is still recorded so the per-session cost
+    rollup stays accurate; only the history-injection on the way in is
+    skipped for client mode. Stores the SUBMITTED input on the user row
+    (NOT the history-augmented input — we don't want the injected
+    ``conversation_history`` to compound across turns)."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    await store.append_session_message(
+        SessionMessage(
+            session_id=session.session_id,
+            tenant_id=session.tenant_id,
+            role="user",
+            content=user_input,
+        )
+    )
+    await store.append_session_message(
+        SessionMessage(
+            session_id=session.session_id,
+            tenant_id=session.tenant_id,
+            role="assistant",
+            content=output or {},
+            run_id=run_id,
+            cost_usd=cost_usd,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+    )
+    updated = session.model_copy(
+        update={
+            "updated_at": datetime.now(UTC),
+            "turn_count": session.turn_count + 1,
+            "total_cost_usd": session.total_cost_usd + cost_usd,
+            "total_tokens_in": session.total_tokens_in + tokens_in,
+            "total_tokens_out": session.total_tokens_out + tokens_out,
+        }
+    )
+    await store.save_session(updated)
+
+
+async def _resolve_run_session(
+    store: StorageProvider,
+    session_id: str | None,
+    *,
+    tenant_id: str,
+    in_process: bool,
+) -> Session | None:
+    """Validate a run's optional ``session_id`` (ADR 045 D10).
+
+    Returns ``None`` when no session is requested (the stateless path).
+    Otherwise loads the session tenant-scoped (404 if missing/cross-tenant
+    — never 403, never leaks existence) and, when ``in_process`` is False
+    (the async/queue path that returns 202 before the run exists), raises a
+    400 because there is no completed turn to append. The inline + stream
+    paths pass ``in_process=True`` and get the session back to thread."""
+    if session_id is None:
+        return None
+    session = await store.get_session(session_id, tenant_id=tenant_id)
+    if session is None:
+        raise not_found("session", session_id)
+    if not in_process:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=400,
+            message=(
+                "session_id requires inline execution (?wait=true) or the "
+                "streaming endpoint (POST /agents/{name}/runs/stream); the "
+                "async/queue path cannot append the turn to the session."
+            ),
+        )
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -6634,6 +6792,15 @@ def build_app(
         if bundle is None:
             raise not_found("agent", name)
 
+        # ADR 045 D10 — stateful sessions. When ``session_id`` is set, the
+        # session must already exist and belong to this tenant (404-not-403),
+        # and the run must be in-process (inline/estimate) so the turn can be
+        # appended. Resolved up front so the 404/400 fires before any spend.
+        # ``None`` (no session_id) is the byte-for-byte stateless path.
+        session = await _resolve_run_session(
+            store, body.session_id, tenant_id=ctx.tenant_id, in_process=(wait or estimate)
+        )
+
         if estimate:
             # Estimate mode — return a pre-flight cost + latency prediction
             # and execute NOTHING. This branch MUST come before the wait /
@@ -6697,7 +6864,21 @@ def build_app(
                 # borrows it.
                 cache=request.app.state.llm_cache,
             )
-            run_request = _RunRequest(agent=name, input=body.input)
+            # ADR 045 D10 — server-managed session memory. With a session and
+            # the default ``memory="server"``, thread the prior turns into the
+            # run input as ``conversation_history`` (the executor stays
+            # stateless — it just sees a richer input). ``memory="client"``
+            # opts out of history injection (the client manages memory itself)
+            # but the turn is still recorded below for the cost rollup.
+            run_input = body.input
+            if session is not None and body.memory == "server":
+                run_input = await _assemble_session_input(
+                    store,
+                    session_id=session.session_id,
+                    tenant_id=ctx.tenant_id,
+                    user_input=body.input,
+                )
+            run_request = _RunRequest(agent=name, input=run_input)
             run_response = await executor.execute(bundle, run_request)
 
             # Surface this run's economics as response headers (additive).
@@ -6729,6 +6910,25 @@ def build_app(
             run_record = await store.get_run(run_response.run_id, tenant_id=ctx.tenant_id)
             response.status_code = 200
             if run_record is not None:
+                # ADR 045 D10 — append this completed turn to the session and
+                # refresh its cost rollup. Recorded regardless of memory mode
+                # (server OR client) so the rollup stays accurate; only the
+                # history *injection* above is server-mode-only. We store the
+                # SUBMITTED input (body.input), not the history-augmented one,
+                # so injected context never compounds across turns. Only
+                # successful runs are appended — a failed/blocked turn would
+                # pollute the conversation history with a non-answer.
+                if session is not None and run_record.status == JobStatus.SUCCESS:
+                    await _append_session_turn(
+                        store,
+                        session=session,
+                        user_input=body.input,
+                        run_id=run_record.run_id,
+                        output=run_record.output,
+                        cost_usd=run_record.metrics.cost_usd,
+                        tokens_in=run_record.metrics.tokens.input,
+                        tokens_out=run_record.metrics.tokens.output,
+                    )
                 return RunView.from_record(run_record)
             # Error path — build a minimal RunView. Status / error /
             # metrics come from the RunResponse; identifiers reflect
@@ -7085,6 +7285,16 @@ def build_app(
         if bundle is None:
             raise not_found("agent", name)
 
+        # ADR 045 D10 — stateful sessions (streaming variant). Same contract
+        # as the inline path: validate the session up front (404-not-403),
+        # thread prior turns in as ``conversation_history`` for server memory,
+        # and append the completed turn via the _sse_run_stream on_complete
+        # hook. The stream is in-process, so ``in_process=True``. ``None`` (no
+        # session_id) = today's stateless stream.
+        session = await _resolve_run_session(
+            store, body.session_id, tenant_id=ctx.tenant_id, in_process=True
+        )
+
         # Lazy imports keep cold-start light for the non-streaming paths.
         from movate.core.executor import Executor  # noqa: PLC0415
         from movate.core.models import RunRequest as _RunRequest  # noqa: PLC0415
@@ -7103,8 +7313,35 @@ def build_app(
             tenant_id=ctx.tenant_id,
             cache=request.app.state.llm_cache,
         )
-        run_request = _RunRequest(agent=name, input=body.input)
+        run_input = body.input
+        if session is not None and body.memory == "server":
+            run_input = await _assemble_session_input(
+                store,
+                session_id=session.session_id,
+                tenant_id=ctx.tenant_id,
+                user_input=body.input,
+            )
+        run_request = _RunRequest(agent=name, input=run_input)
         tenant_id = ctx.tenant_id
+
+        on_complete: Callable[[RunRecord], Awaitable[None]] | None = None
+        if session is not None:
+            captured_session = session
+            captured_input = body.input
+
+            async def _append_turn(record: RunRecord) -> None:
+                await _append_session_turn(
+                    store,
+                    session=captured_session,
+                    user_input=captured_input,
+                    run_id=record.run_id,
+                    output=record.output,
+                    cost_usd=record.metrics.cost_usd,
+                    tokens_in=record.metrics.tokens.input,
+                    tokens_out=record.metrics.tokens.output,
+                )
+
+            on_complete = _append_turn
 
         generator = _sse_run_stream(
             executor=executor,
@@ -7112,6 +7349,7 @@ def build_app(
             run_request=run_request,
             store=store,
             tenant_id=tenant_id,
+            on_complete=on_complete,
         )
         return StreamingResponse(
             generator,
@@ -11000,6 +11238,163 @@ def build_app(
             label=record.label if record is not None else None,
             expires_at=record.expires_at if record is not None else None,
         )
+
+    # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10) — server-side conversation memory.
+    # POST /sessions opens a session; the run endpoints accept its
+    # session_id (prior turns load as context, the new turn is appended,
+    # a per-session cost rollup is maintained); GET /sessions/{id}
+    # returns the full history + rollups. Tenant-scoped via the auth
+    # context; the executor stays stateless (history threads in as input).
+    # Distinct from the conversation-thread surface below.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/sessions",
+        response_model=SessionView,
+        status_code=201,
+        tags=["sessions-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_create_session(
+        body: SessionCreateSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SessionView:
+        """Open a new server-managed conversation (ADR 045 D10).
+
+        Returns the freshly-minted session with a new ``session_id``
+        (URL-safe hex uuid). The client stores this id and passes it as
+        ``session_id`` on subsequent ``POST /api/v1/agents/{name}/runs``
+        (inline ``?wait=true``) or ``.../runs/stream`` calls — the
+        runtime then loads prior turns as context, runs the agent, and
+        appends the new turn (maintaining the per-session cost rollup).
+
+        Sessions are bound to ONE agent (picked here, fixed for the
+        session's life — open a new session to target a different agent).
+
+        Gated on the ``run`` scope (a session is a precursor to running).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — key lacks the ``run`` scope
+        * **422** — invalid body (missing ``agent``, oversize ``title``)
+        """
+        store: StorageProvider = request.app.state.storage
+        session = Session(
+            session_id=uuid4().hex,
+            tenant_id=ctx.tenant_id,
+            agent=body.agent,
+            title=body.title,
+        )
+        await store.save_session(session)
+        return SessionView.from_record(session)
+
+    @v1.get(
+        "/sessions",
+        response_model=SessionListView,
+        tags=["sessions-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_sessions(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> SessionListView:
+        """List sessions for the authenticated tenant, ordered
+        ``updated_at DESC`` (most recently active first).
+
+        Query params:
+
+        * ``?agent=<name>`` — scope to one agent's sessions.
+        * ``?limit=N`` — cap on returned rows (default 100).
+
+        Tenant-scoped — a tenant never sees another tenant's sessions.
+        Rollup fields (``turn_count`` + ``total_*``) are included on each
+        row; the per-turn ``messages`` history is omitted here (fetch it
+        via ``GET /api/v1/sessions/{id}``).
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_sessions(
+            tenant_id=ctx.tenant_id,
+            agent=agent,
+            limit=int(limit),
+        )
+        views = [SessionView.from_record(r) for r in rows]
+        return SessionListView(sessions=views, count=len(views))
+
+    @v1.get(
+        "/sessions/{session_id}",
+        response_model=SessionView,
+        tags=["sessions-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_session(
+        session_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        include_messages: bool = True,
+        messages_limit: int = 1000,
+    ) -> SessionView:
+        """Get a session by id with its full conversation history + the
+        per-session cost rollup (ADR 045 D10).
+
+        When ``include_messages=true`` (the default), the response
+        includes a ``messages`` array sorted ASC by ``created_at`` —
+        earliest turn first so clients render top-to-bottom. Set
+        ``include_messages=false`` for clients that just want the
+        session metadata + rollups (saves the history scan).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — session doesn't exist OR belongs to a different
+          tenant (the 404 NEVER leaks cross-tenant existence — same
+          contract as ``GET /runs/{id}``)
+        """
+        store: StorageProvider = request.app.state.storage
+        session = await store.get_session(session_id, tenant_id=ctx.tenant_id)
+        if session is None:
+            raise not_found("session", session_id)
+
+        messages_view: list[SessionMessageView] | None = None
+        if include_messages:
+            message_records = await store.list_session_messages(
+                session_id, tenant_id=ctx.tenant_id, limit=int(messages_limit)
+            )
+            messages_view = [SessionMessageView.from_record(m) for m in message_records]
+        return SessionView.from_record(session, messages=messages_view)
+
+    @v1.delete(
+        "/sessions/{session_id}",
+        status_code=204,
+        tags=["sessions-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_delete_session(
+        session_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Hard-delete a session and its messages by id.
+
+        Returns 204 No Content on success. Tenant-scoped: a session
+        belonging to a different tenant returns 404 (NEVER 403 — never
+        confirms cross-tenant existence). Run records referenced by the
+        session's messages are left untouched.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — session doesn't exist OR belongs to a different tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        deleted = await store.delete_session(session_id, tenant_id=ctx.tenant_id)
+        if not deleted:
+            raise not_found("session", session_id)
+        return Response(status_code=204)
 
     # ------------------------------------------------------------------
     # Conversation thread management (Tier 10.5, PR-O). The MESSAGES
