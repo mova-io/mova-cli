@@ -1,0 +1,176 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_AZURE_MONITOR",
+      "label": "Azure Monitor (fleet)",
+      "description": "Movate Managed Grafana -> Azure Monitor. Phase 1 cross-tenant via Lighthouse / Phase 2 Movate-owned workspace via opt-in OTLP dual-export.",
+      "type": "datasource",
+      "pluginId": "grafana-azure-monitor-datasource",
+      "pluginName": "Azure Monitor"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "grafana-azure-monitor-datasource", "name": "Azure Monitor", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 96, 96, 1)", "name": "CalVer releases (TODO)", "type": "dashboard", "tags": ["calver", "release"], "description": "annotation source: GitHub Releases API webhook -> Logic App -> AM custom log. TODO post-ADR 039 sign-off."},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 200, 0, 1)", "name": "Incidents (TODO)", "type": "dashboard", "tags": ["incident"], "description": "annotation source: incident webhook -> AM custom log. TODO."}
+    ]
+  },
+  "description": "ADR-039 illustrative -- Movate fleet COST pane: $/customer ranked, tokens by provider, $/run trend, cost outliers. Tagged 'illustrative -- pending ADR 039 sign-off; assumes a customer template variable resolves either via Lighthouse subscription scope (Phase 1) or via the customer OTel attribute (Phase 2)'. Source: mdk.run.tokens / mdk.run.cost_usd (metric-side; tenant only) + agent.execute span (provider, model_override) for the per-provider split (mirrors PR #518's mdk-cost.json reasoning).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {"title": "ADR 039", "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/039-movate-product-telemetry.md", "type": "link", "icon": "doc"},
+    {"title": "Metric/span catalog", "url": "https://github.com/movate/movate-cli/blob/main/docs/observability.md", "type": "link", "icon": "doc"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "Prescriptive runbook for fleet cost.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+      "id": 999,
+      "options": {
+        "mode": "markdown",
+        "content": "### Cost -- runbook\n\n**What this pane answers:** $/customer (ANONYMIZED in the public/share view -- the hashed `customer` value from ADR 039 D4 is what the ranked bar shows), tokens by provider, $/run trend, and cost OUTLIERS by z-score.\n\n**Normal:** $/customer ranking is stable -- top spenders correlate with usage. $/run trend is flat or trending down (model substitution, prompt-shortening wins). No customer sits >2sigma above its own 7-day median.\n\n**If red:**\n* **One customer 3sigma above their own median** -- check `usage.json` for a volume spike, and `health.json` for a retry storm (high non-success rate -> wasted token spend). Cost outliers driven by retries are an ADR 034 dead-letter discipline failure, not a usage signal.\n* **A provider line jumps in 'tokens by provider'** -- check the routing config; a fallback to a more expensive model (e.g. a small-model timeout cascading to a large-model retry) shows here first.\n* **Fleet $/run trends up** -- product-level: model adoption shifted, or new agents are more verbose. Surface in product review.\n\n**Hidden assumptions** (from `docs/observability.md`): `mdk.run.tokens` and `mdk.run.cost_usd` carry ONLY a `tenant` attribute (no `provider`, no `agent`). The provider split MUST come from the `agent.execute` span (`provider` attribute) -- it's not on the metric. Mirror of PR #518's `mdk-cost.json`.\n\n**Cross-refs:** ADR 015 (Langfuse for per-run drilldown), ADR 036 (usage metering + quotas), ADR 034 (DLQ -- retry-cost discipline)."
+      },
+      "transparent": false,
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "id": 100,
+      "panels": [],
+      "title": "$/customer (anonymized) -- mdk.run.cost_usd",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Ranked $/customer over the window. The `customer` label is the hashed identifier from ADR 039 D4; the bar chart is anonymized by design -- joining back to a real customer requires the salt + lookup table, kept out of Grafana.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisPlacement": "auto", "fillOpacity": 80, "lineWidth": 1}, "unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 14, "x": 0, "y": 7},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": ["sum"], "displayMode": "list", "placement": "bottom", "showLegend": false},
+        "orientation": "horizontal",
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.run.cost_usd'\n| extend cust = tostring(Properties['customer'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Spend = sum(ValueSum) by cust\n| top 25 by Spend desc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Top 25 customers by spend (anonymized)",
+      "type": "barchart"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Tokens by provider over time. Built from a JOIN of mdk.run.tokens (volume) with agent.execute (provider attribute) -- mirrors PR #518's mdk-cost.json approach: the provider isn't on the metric, only on the span. Use the agent.execute count as the per-provider weighting basis.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 50, "lineWidth": 1, "stacking": {"mode": "normal"}}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 10, "x": 14, "y": 7},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let providerWeights =\n  AppDependencies\n  | where Name == 'agent.execute'\n  | extend cust = tostring(Properties['customer']), provider = tostring(Properties['provider'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | summarize Runs = count() by bin(TimeGenerated, 1h), cust, provider\n  | extend ProviderShare = todouble(Runs) / todouble(sum(Runs)) ;\nAppMetrics\n| where Name == 'mdk.run.tokens'\n| extend cust = tostring(Properties['customer'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Tokens = sum(ValueSum) by bin(TimeGenerated, 1h), cust\n| join kind=inner providerWeights on $left.TimeGenerated == $right.TimeGenerated, $left.cust == $right.cust\n| project TimeGenerated, provider, ProviderTokens = Tokens * ProviderShare\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Tokens by provider (weighted from agent.execute.provider)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 17},
+      "id": 101,
+      "panels": [],
+      "title": "$/run trend + outliers",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Fleet-wide $/run = total mdk.run.cost_usd / total mdk.jobs.completed (success) per bin. Trending down is good -- model substitution, prompt-shortening, caching wins. Trending up signals model adoption shifted toward more expensive models or new agents that are more verbose.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 14, "x": 0, "y": 18},
+      "id": 3,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let cost =\n  AppMetrics\n  | where Name == 'mdk.run.cost_usd'\n  | extend cust = tostring(Properties['customer'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | summarize Cost = sum(ValueSum) by bin(TimeGenerated, 1h);\nlet runs =\n  AppMetrics\n  | where Name == 'mdk.jobs.completed'\n  | extend cust = tostring(Properties['customer']), status = tostring(Properties['status'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | where status == 'success'\n  | summarize Runs = sum(ValueSum) by bin(TimeGenerated, 1h);\ncost\n| join kind=inner runs on TimeGenerated\n| extend DollarsPerRun = todouble(Cost) / todouble(iff(Runs > 0, Runs, 1))\n| project TimeGenerated, DollarsPerRun\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Fleet $/run trend",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Cost outliers ranked by z-score against the customer's own 7-day median. Catches a customer who spiked relative to themselves -- not the same as 'top spender', which is the bar to the left.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": [{"matcher": {"id": "byName", "options": "ZScore"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 2}, {"color": "red", "value": 3}]}}]}]},
+      "gridPos": {"h": 9, "w": 10, "x": 14, "y": 18},
+      "id": 4,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let lookback = 7d;\nAppMetrics\n| where Name == 'mdk.run.cost_usd'\n| where TimeGenerated > ago(lookback)\n| extend cust = tostring(Properties['customer'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize HourSpend = sum(ValueSum) by bin(TimeGenerated, 1h), cust\n| summarize Mean = avg(HourSpend), Std = stdev(HourSpend), Last = arg_max(TimeGenerated, HourSpend) by cust\n| extend ZScore = (todouble(Last_HourSpend) - Mean) / iff(Std > 0, Std, 1.0)\n| where ZScore > 2\n| project Customer = cust, HourSpend = Last_HourSpend, Mean, Std, ZScore\n| order by ZScore desc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Cost outliers (z-score > 2 over 7d)",
+      "type": "table"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "fleet", "cost", "adr-039", "illustrative"],
+  "templating": {
+    "list": [
+      {"current": {}, "hide": 0, "includeAll": false, "label": "Data source", "multi": false, "name": "DS_AZURE_MONITOR", "options": [], "query": "grafana-azure-monitor-datasource", "refresh": 1, "regex": "", "type": "datasource"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Phase 1: Lighthouse subscription scope. Phase 2: hashed customer OTel resource attribute (ADR 039 D4).", "hide": 0, "includeAll": true, "label": "customer", "multi": true, "name": "customer", "options": [], "query": "AppMetrics | where Name == 'mdk.run.cost_usd' | distinct tostring(Properties['customer'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Distinct deployments per selected customer(s).", "hide": 0, "includeAll": true, "label": "deployment", "multi": true, "name": "deployment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['deployment'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Environment slug.", "hide": 0, "includeAll": true, "label": "environment", "multi": true, "name": "environment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['environment'])", "refresh": 2, "regex": "", "type": "query"}
+    ]
+  },
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Movate fleet -- cost (illustrative, ADR 039)",
+  "uid": "movate-fleet-cost",
+  "version": 1,
+  "weekStart": ""
+}

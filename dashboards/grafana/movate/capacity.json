@@ -1,0 +1,220 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_AZURE_MONITOR",
+      "label": "Azure Monitor (fleet)",
+      "description": "Movate Managed Grafana -> Azure Monitor. Phase 1 cross-tenant via Lighthouse / Phase 2 Movate-owned workspace via opt-in OTLP dual-export.",
+      "type": "datasource",
+      "pluginId": "grafana-azure-monitor-datasource",
+      "pluginName": "Azure Monitor"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "grafana-azure-monitor-datasource", "name": "Azure Monitor", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 96, 96, 1)", "name": "CalVer releases (TODO)", "type": "dashboard", "tags": ["calver", "release"], "description": "annotation source: GitHub Releases API webhook -> Logic App -> AM custom log. TODO post-ADR 039 sign-off."},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 200, 0, 1)", "name": "Incidents (TODO)", "type": "dashboard", "tags": ["incident"], "description": "annotation source: incident webhook -> AM custom log. TODO."}
+    ]
+  },
+  "description": "ADR-039 illustrative -- Movate fleet CAPACITY pane: queue depth + age via mdk.jobs.in_flight (per docs/observability.md, queue depth as a separate metric is NOT emitted today -- mdk.jobs.in_flight is the closest proxy + ADR 034 D3 confirms), worker saturation, pool stats across deployments (mdk.db.pool.size / .idle / .in_use / .waiting / .max), hot-tenants bubble (latency x volume). Tagged 'illustrative -- pending ADR 039 sign-off; assumes a customer template variable resolves either via Lighthouse subscription scope (Phase 1) or via the customer OTel attribute (Phase 2)'.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {"title": "ADR 039", "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/039-movate-product-telemetry.md", "type": "link", "icon": "doc"},
+    {"title": "Metric/span catalog", "url": "https://github.com/movate/movate-cli/blob/main/docs/observability.md", "type": "link", "icon": "doc"},
+    {"title": "ADR 034 (data-plane scalability)", "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/034-data-plane-scalability.md", "type": "link", "icon": "doc"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "Prescriptive runbook for fleet capacity.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+      "id": 999,
+      "options": {
+        "mode": "markdown",
+        "content": "### Capacity + saturation -- runbook\n\n**What this pane answers:** which deployments are SATURATED? In-flight job depth, DB connection-pool occupancy, and a hot-tenants bubble that surfaces latency x volume together.\n\n**Instruments used (all from `METRIC_NAMES`, verified against `docs/observability.md`):**\n* `mdk.jobs.in_flight` -- up-down counter; ADR 034 D3 confirms this is the closest fleet proxy for queue depth today. A dedicated `mdk.queue.depth` is **deferred** per `src/movate/tracing/metrics.py` header (the seam between metrics and the StorageProvider deferred to a later item).\n* `mdk.db.pool.size` / `.idle` / `.in_use` / `.waiting` / `.max` -- observable gauges, no attributes; per-pod identity comes from the OTel `Resource` (e.g. `service.instance.id`). Recorded by `register_pool_metrics()` (ADR 034 D3).\n* Latency from `mdk.job.duration_ms` (ms histogram); volume from `mdk.jobs.completed`.\n\n**Normal:** in-flight tracks the customer's expected concurrency; pool `.in_use` stays well under `.max` (target <80%); `.waiting` is ~0 (a non-zero waiting count means clients are queued for a DB connection -- the canary signal ADR 034 D3 watches for).\n\n**If red:**\n* **`mdk.db.pool.waiting` non-zero on a deployment for >5min** -- DB connection contention. ADR 034 D3's pool gauges are the SLO signal here; page the on-call for that customer's deployment.\n* **`mdk.jobs.in_flight` flat-high while throughput drops** -- stuck worker(s); look for a hung tool call in the per-customer Jaeger / Langfuse drilldown.\n* **One tenant dominates the hot-tenants bubble** (high latency AND high volume) -- not necessarily wrong (it's a heavy user); but if it forces another tenant into the high-latency-low-volume quadrant, the deployment may be under-sized.\n\n**Cross-refs:** ADR 034 (data-plane scalability, the canonical place for pool semantics), ADR 015 (Langfuse drilldown), the per-customer `mdk-queue-and-pool.json` from PR #518 (single-deployment view of the same instruments)."
+      },
+      "transparent": false,
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "id": 100,
+      "panels": [],
+      "title": "Queue depth proxy (mdk.jobs.in_flight)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "mdk.jobs.in_flight per (customer, deployment). Up-down counter -- the LIVE value, not a rate. Per docs/observability.md a dedicated mdk.queue.depth is deferred; in_flight is the fleet proxy ADR 034 D3 endorses.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 7},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.in_flight'\n| extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize InFlight = max(ValueSum) by bin(TimeGenerated, 1m), cust, depl\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight jobs by (customer, deployment) -- queue depth proxy",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "**Scaffold -- needs new instrument.** Per docs/observability.md a dedicated job-age / queue-age histogram is NOT emitted today (the queue.depth note in src/movate/tracing/metrics.py header defers it). Promote to a Markdown banner; the real signal is upstream in mdk.jobs.in_flight + mdk.job.duration_ms.",
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 7},
+      "id": 2,
+      "options": {
+        "mode": "markdown",
+        "content": "### Queue AGE (scaffold) -- needs new instrument\n\n**Needs new instrument:** `mdk.queue.age_ms` (histogram, attributes: `customer`, `deployment`).\n\nNOT emitted today. Per `src/movate/tracing/metrics.py` header, the StorageProvider count/age queries are deferred to keep the metrics module off the storage seam.\n\nUntil it lands, queue-age proxy = `mdk.job.duration_ms` p99 minus the in-runtime processing time -- but the in-runtime time isn't separately instrumented either, so this is genuinely a gap. **See ADR 039 Open Questions** (which is the canonical place to track new instruments needed for the fleet view) and `src/movate/tracing/metrics.py` header for the deferral rationale."
+      },
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+      "id": 101,
+      "panels": [],
+      "title": "DB pool stats across deployments (mdk.db.pool.*)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Pool occupancy ratio = mdk.db.pool.in_use / mdk.db.pool.max per pod, aggregated per (customer, deployment). Per docs/observability.md these gauges carry NO attributes -- per-pod identity comes from the OTel Resource (service.instance.id) on the AppMetrics row.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": 0}, {"color": "orange", "value": 0.7}, {"color": "red", "value": 0.9}]}, "max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 17},
+      "id": 3,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let inuse =\n  AppMetrics\n  | where Name == 'mdk.db.pool.in_use'\n  | extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | summarize InUse = avg(ValueSum) by bin(TimeGenerated, 5m), cust, depl;\nlet maxp =\n  AppMetrics\n  | where Name == 'mdk.db.pool.max'\n  | extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | summarize Max = avg(ValueSum) by bin(TimeGenerated, 5m), cust, depl;\ninuse\n| join kind=inner maxp on TimeGenerated, cust, depl\n| extend Occupancy = todouble(InUse) / todouble(iff(Max > 0, Max, 1))\n| project TimeGenerated, cust, depl, Occupancy\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Pool occupancy (mdk.db.pool.in_use / mdk.db.pool.max)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "mdk.db.pool.waiting per (customer, deployment). Non-zero means clients are queued for a DB connection -- the canary signal ADR 034 D3 watches for. A SUSTAINED non-zero is the page-out condition.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "custom": {"drawStyle": "line", "fillOpacity": 30, "lineWidth": 2, "showPoints": "never"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": 0}, {"color": "orange", "value": 1}, {"color": "red", "value": 5}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 17},
+      "id": 4,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.db.pool.waiting'\n| extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Waiting = max(ValueSum) by bin(TimeGenerated, 1m), cust, depl\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Pool waiting (mdk.db.pool.waiting) -- SLO canary per ADR 034 D3",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Pool size + idle snapshot across the fleet -- a flat table reading the current values of mdk.db.pool.size and mdk.db.pool.idle per (customer, deployment).",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 26},
+      "id": 5,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let recent = ago(5m);\nlet sizes = AppMetrics | where Name == 'mdk.db.pool.size'    | where TimeGenerated > recent | extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']) | where cust in ($customer) or '$customer' == 'All' | summarize Size = avg(ValueSum) by cust, depl;\nlet idle  = AppMetrics | where Name == 'mdk.db.pool.idle'    | where TimeGenerated > recent | extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']) | where cust in ($customer) or '$customer' == 'All' | summarize Idle = avg(ValueSum) by cust, depl;\nlet inu   = AppMetrics | where Name == 'mdk.db.pool.in_use'  | where TimeGenerated > recent | extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']) | where cust in ($customer) or '$customer' == 'All' | summarize InUse = avg(ValueSum) by cust, depl;\nlet mx    = AppMetrics | where Name == 'mdk.db.pool.max'     | where TimeGenerated > recent | extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']) | where cust in ($customer) or '$customer' == 'All' | summarize Max = avg(ValueSum) by cust, depl;\nsizes\n| join kind=fullouter idle on cust, depl\n| join kind=fullouter inu on cust, depl\n| join kind=fullouter mx on cust, depl\n| project Customer = cust, Deployment = depl, Size, Idle, InUse, Max\n| order by Customer asc, Deployment asc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Pool snapshot (size / idle / in_use / max)",
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "id": 102,
+      "panels": [],
+      "title": "Hot tenants -- latency x volume",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Bubble per tenant: x = run volume from mdk.jobs.completed, y = p95 latency from mdk.job.duration_ms. Top-right corner = high-volume + slow tenants (the ones at risk of breaching SLO from sheer pressure).",
+      "fieldConfig": {"defaults": {"custom": {"axisLabel": "p95 latency (ms)", "drawStyle": "points", "pointSize": 8}, "unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 36},
+      "id": 6,
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "let vol =\n  AppMetrics\n  | where Name == 'mdk.jobs.completed'\n  | extend cust = tostring(Properties['customer'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | summarize Volume = sum(ValueSum) by cust;\nlet lat =\n  AppMetrics\n  | where Name == 'mdk.job.duration_ms'\n  | extend cust = tostring(Properties['customer'])\n  | where cust in ($customer) or '$customer' == 'All'\n  | summarize P95 = percentile(ValueSum / ValueCount, 95) by cust;\nvol\n| join kind=inner lat on cust\n| project Tenant = cust, Volume, P95\n| order by Volume desc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Hot tenants -- volume vs p95 latency",
+      "type": "scatter"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "fleet", "capacity", "adr-039", "illustrative"],
+  "templating": {
+    "list": [
+      {"current": {}, "hide": 0, "includeAll": false, "label": "Data source", "multi": false, "name": "DS_AZURE_MONITOR", "options": [], "query": "grafana-azure-monitor-datasource", "refresh": 1, "regex": "", "type": "datasource"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Phase 1: Lighthouse subscription scope. Phase 2: hashed customer OTel resource attribute (ADR 039 D4).", "hide": 0, "includeAll": true, "label": "customer", "multi": true, "name": "customer", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.in_flight' | distinct tostring(Properties['customer'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Distinct deployments per selected customer(s).", "hide": 0, "includeAll": true, "label": "deployment", "multi": true, "name": "deployment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.in_flight' | distinct tostring(Properties['deployment'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Environment slug.", "hide": 0, "includeAll": true, "label": "environment", "multi": true, "name": "environment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['environment'])", "refresh": 2, "regex": "", "type": "query"}
+    ]
+  },
+  "time": {"from": "now-3h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Movate fleet -- capacity + saturation (illustrative, ADR 039)",
+  "uid": "movate-fleet-capacity",
+  "version": 1,
+  "weekStart": ""
+}

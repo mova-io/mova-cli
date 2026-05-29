@@ -1,0 +1,137 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_AZURE_MONITOR",
+      "label": "Azure Monitor (fleet)",
+      "description": "Movate Managed Grafana -> Azure Monitor. Phase 1 cross-tenant via Lighthouse / Phase 2 Movate-owned workspace via opt-in OTLP dual-export.",
+      "type": "datasource",
+      "pluginId": "grafana-azure-monitor-datasource",
+      "pluginName": "Azure Monitor"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "grafana-azure-monitor-datasource", "name": "Azure Monitor", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 96, 96, 1)", "name": "CalVer releases (TODO)", "type": "dashboard", "tags": ["calver", "release"], "description": "annotation source: GitHub Releases API webhook -> Logic App -> AM custom log. TODO post-ADR 039."},
+      {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(255, 200, 0, 1)", "name": "Incidents (TODO)", "type": "dashboard", "tags": ["incident"], "description": "annotation source: incident webhook -> AM custom log. TODO."}
+    ]
+  },
+  "description": "ADR-039 illustrative -- Movate fleet QUALITY pane: eval pass-rate per customer x agent (heatmap), drift detections, canary success rate. Tagged 'illustrative -- pending ADR 039 sign-off; assumes a customer template variable resolves either via Lighthouse subscription scope (Phase 1) or via the customer OTel attribute (Phase 2)'. **Mostly SCAFFOLD today** -- per docs/observability.md eval signals are Langfuse scores (ADR 031 D1), not OTel metrics. Panels carry banner text pointing at ADR 039 Open Questions + ADR 016 D2.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {"title": "ADR 039", "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/039-movate-product-telemetry.md", "type": "link", "icon": "doc"},
+    {"title": "Metric/span catalog", "url": "https://github.com/movate/movate-cli/blob/main/docs/observability.md", "type": "link", "icon": "doc"},
+    {"title": "ADR 016 (judge/drift)", "url": "https://github.com/movate/movate-cli/blob/main/docs/adr/016-continuous-eval-and-drift.md", "type": "link", "icon": "doc"}
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "Pane-level banner: most of this dashboard is SHAPE, not data.",
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 0},
+      "id": 999,
+      "options": {
+        "mode": "markdown",
+        "content": "### Quality + eval -- **Pending eval-metric instrumentation per ADR 016 D2; today these signal via Langfuse -- see `docs/observability.md`.**\n\n**Why this dashboard is mostly scaffold:** per the PR #518 catalog (`docs/observability.md`), eval pass-rate and drift detections are surfaced as **Langfuse scores** (ADR 031 D1), NOT as OTel metrics. There is no `mdk.eval.*` instrument in `src/movate/tracing/metrics.py:METRIC_NAMES`. The dashboards-as-code pattern (ADR 031 D2) requires every dashboard to reference REAL instruments, so we ship the panel SHAPE (so the layout is reviewed) + a banner pointing at the instrumentation gap.\n\n**Two paths to populate (decision in ADR 039 Open Question 2):**\n1. Widen ADR 016 D2 to ALSO emit eval pass-rate / drift as OTel metrics -- adds `mdk.eval.pass_rate`, `mdk.eval.drift_score` etc. to `METRIC_NAMES`. Cleanest from a fleet view (this dashboard becomes real). Costs a small instrumentation PR.\n2. Add Langfuse as a SECOND Grafana data source for the Movate Managed Grafana instance (Langfuse exposes a Prom-compatible scrape endpoint in v3). Cheaper -- no MDK code change -- but adds a second data source, second auth surface, second cross-cloud read path. Less aligned with ADR 020's 'one OTLP pipe' posture.\n\n**Cross-refs:** ADR 016 (continuous eval + drift -- where this layer lives today), ADR 031 D1 (Langfuse-as-primary-quality-surface), ADR 039 Open Question 2.\n\n---\n\n### Runbook (when real data lands)\n\n**Normal:** pass-rate by (customer, agent) >= the customer's contracted SLO (no fleet-wide default). Drift detections per week per customer is a low non-zero (cases ARE harvested; ADR 016 D1). Canary success rate >= 95% across the fleet.\n\n**If red:** a customer's pass-rate drops on a CalVer boundary -- annotate the CalVer (top-of-page annotation) and check the agent's prompts in Langfuse for that customer. A drift-detection spike correlates with a model upgrade or data-source change -- look at `usage.json` provider mix concurrently."
+      },
+      "transparent": false,
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "id": 100,
+      "panels": [],
+      "title": "Eval pass-rate per customer x agent (scaffold)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "**Scaffold -- needs new instrument.** Eval pass-rate today is a Langfuse score, not an OTel metric. See top-of-pane banner.",
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 8},
+      "id": 1,
+      "options": {
+        "mode": "markdown",
+        "content": "### Eval pass-rate (heatmap) -- scaffold\n\n**Needs new instrument:** `mdk.eval.pass_rate` (gauge, attributes: `customer`, `agent`, `agent_version`).\n\nNOT in `METRIC_NAMES` today. See ADR 039 Open Question 2.\n\nWhen the instrument lands, the query is:\n\n```kql\nAppMetrics\n| where Name == 'mdk.eval.pass_rate'\n| extend cust = tostring(Properties['customer']), agent = tostring(Properties['agent'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize PassRate = avg(ValueSum / ValueCount) by cust, agent\n| order by cust, agent\n```\n\nUntil then this pane shows scaffold only -- DO NOT alert off it."
+      },
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 20},
+      "id": 101,
+      "panels": [],
+      "title": "Drift detections (scaffold)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "**Scaffold -- needs new instrument.** Drift today is a Langfuse score, not OTel. See top-of-pane banner.",
+      "gridPos": {"h": 10, "w": 14, "x": 0, "y": 21},
+      "id": 2,
+      "options": {
+        "mode": "markdown",
+        "content": "### Drift detections (timeseries) -- scaffold\n\n**Needs new instrument:** `mdk.eval.drift_score` (gauge, attributes: `customer`, `agent`, `dimension`).\n\nWhen the instrument lands:\n\n```kql\nAppMetrics\n| where Name == 'mdk.eval.drift_score'\n| extend cust = tostring(Properties['customer'])\n| where cust in ($customer) or '$customer' == 'All'\n| summarize avg(ValueSum / ValueCount) by bin(TimeGenerated, 1h), cust\n```\n\nUntil then, drift detection lives in the per-customer Langfuse session view (ADR 015) -- jump from PR #518's `mdk-runtime-overview.json` 'open in Langfuse' link rather than reading off this panel."
+      },
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+      "description": "**Scaffold -- needs new instrument.** Canary success rate today is computable as a sub-slice of mdk.jobs.completed IF the canary deployment carries a distinguishing `deployment` tag (it does, per ADR 020) -- so this one is actually CLOSE to populatable today. Promoted to a real KQL panel below; this is the shape note.",
+      "gridPos": {"h": 10, "w": 10, "x": 14, "y": 21},
+      "id": 3,
+      "options": {
+        "mode": "markdown",
+        "content": "### Canary success rate -- partial\n\nMost-populatable of the three quality panels TODAY because canary is a *deployment-tag*, not an *eval*: the canary deployment carries a distinguishing `deployment` value per ADR 020.\n\nReal query (right-hand panel below):\n\n```kql\nAppMetrics\n| where Name == 'mdk.jobs.completed'\n| extend cust = tostring(Properties['customer']),\n         depl = tostring(Properties['deployment']),\n         status = tostring(Properties['status'])\n| where depl matches regex 'canary|preview'\n| where cust in ($customer) or '$customer' == 'All'\n| summarize Total = sum(ValueSum),\n            Good  = sumif(ValueSum, status == 'success') by cust, depl\n| extend SuccessRate = todouble(Good) / todouble(iff(Total > 0, Total, 1))\n```\n\nThis is *operational* canary health (does the deployment work?), NOT *quality* canary (do the answers stay good?). The quality side still needs the missing eval instrument."
+      },
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+      "description": "Canary deployments' operational success rate from mdk.jobs.completed status mix. Identifies canary by deployment tag (per ADR 020 canary deployments stamp a distinguishing deployment slug).",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}, "unit": "percentunit"}, "overrides": [{"matcher": {"id": "byName", "options": "SuccessRate"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-background", "mode": "gradient"}}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": 0}, {"color": "orange", "value": 0.9}, {"color": "green", "value": 0.95}]}}]}]},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 31},
+      "id": 4,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"},
+          "queryType": "Azure Log Analytics",
+          "azureLogAnalytics": {
+            "query": "AppMetrics\n| where Name == 'mdk.jobs.completed'\n| extend cust = tostring(Properties['customer']), depl = tostring(Properties['deployment']), status = tostring(Properties['status'])\n| where cust in ($customer) or '$customer' == 'All'\n| where depl matches regex 'canary|preview'\n| summarize Total = sum(ValueSum), Good = sumif(ValueSum, status == 'success') by cust, depl\n| extend SuccessRate = todouble(Good) / todouble(iff(Total > 0, Total, 1))\n| project Customer = cust, Deployment = depl, Total, SuccessRate\n| order by SuccessRate asc",
+            "resultFormat": "table"
+          },
+          "refId": "A"
+        }
+      ],
+      "title": "Canary deployment success rate (operational, not quality)",
+      "type": "table"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "fleet", "quality", "adr-039", "illustrative", "scaffold"],
+  "templating": {
+    "list": [
+      {"current": {}, "hide": 0, "includeAll": false, "label": "Data source", "multi": false, "name": "DS_AZURE_MONITOR", "options": [], "query": "grafana-azure-monitor-datasource", "refresh": 1, "regex": "", "type": "datasource"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Phase 1: Lighthouse subscription scope. Phase 2: hashed customer OTel resource attribute (ADR 039 D4).", "hide": 0, "includeAll": true, "label": "customer", "multi": true, "name": "customer", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['customer'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Distinct deployments per selected customer(s).", "hide": 0, "includeAll": true, "label": "deployment", "multi": true, "name": "deployment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['deployment'])", "refresh": 2, "regex": "", "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "All"}, "datasource": {"type": "grafana-azure-monitor-datasource", "uid": "${DS_AZURE_MONITOR}"}, "definition": "Environment slug.", "hide": 0, "includeAll": true, "label": "environment", "multi": true, "name": "environment", "options": [], "query": "AppMetrics | where Name == 'mdk.jobs.completed' | distinct tostring(Properties['environment'])", "refresh": 2, "regex": "", "type": "query"}
+    ]
+  },
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Movate fleet -- quality + eval (illustrative, ADR 039, mostly scaffold)",
+  "uid": "movate-fleet-quality",
+  "version": 1,
+  "weekStart": ""
+}
