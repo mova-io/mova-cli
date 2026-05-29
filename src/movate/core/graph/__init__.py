@@ -32,6 +32,7 @@ from movate.core.graph.models import (
     GraphNode,
     GraphologyDoc,
     NodeDetail,
+    NodeNeighbor,
     NodeSearchHit,
     Provenance,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "GraphNode",
     "GraphologyDoc",
     "NodeDetail",
+    "NodeNeighbor",
     "NodeSearchHit",
     "Provenance",
     "clamp_cap",

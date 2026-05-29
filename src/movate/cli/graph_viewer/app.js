@@ -10,8 +10,12 @@
  * Interaction model (mirrors the sigma.js flagship demo):
  *   1. initial load + ForceAtlas2 layout (in a web worker)
  *   2. search-box autocomplete -> fly camera to node
- *   3. click a node -> focus its neighborhood (reducers dim the rest)
- *   4. double-click a node -> side panel w/ properties + provenance + agents
+ *   3. click a node -> focus its neighborhood (reducers dim the rest) AND
+ *      open the drill-down side panel: properties + relations grouped by
+ *      type + connected entities (tickets/SOPs/docs) as clickable links +
+ *      provenance + referencing agents
+ *   4. click a connected-entity link -> re-center on it (fly + re-drill);
+ *      links for nodes not yet loaded fetch+import them first
  *   5. expand -> fetch neighbors, import, let FA2 settle the new nodes
  *   6. live-growth toggle -> EventSource stream, add nodes/edges as they arrive
  *   7. color-by-type/community, size-by-degree, filter-by-type, zoom/pan
@@ -231,13 +235,13 @@
       return res;
     });
 
-    // Click a node -> focus its neighborhood.
-    renderer.on("clickNode", function (e) { focusNode(e.node); });
+    // Click a node -> focus its neighborhood AND open the drill-down panel.
+    renderer.on("clickNode", function (e) { focusNode(e.node); openDetail(e.node); });
 
-    // Click empty space -> reset the focus.
+    // Click empty space -> reset the focus (panel stays — close it via its ×).
     renderer.on("clickStage", function () { clearFocus(); });
 
-    // Double-click a node -> open the detail panel (and DON'T let sigma zoom).
+    // Double-click still opens the panel but must NOT let sigma zoom.
     renderer.on("doubleClickNode", function (e) {
       e.preventSigmaDefault();   // suppress sigma's default double-click zoom
       openDetail(e.node);
@@ -270,13 +274,14 @@
     focusNode(node);
   }
 
-  // ---- detail panel (double-click) ----------------------------------------
+  // ---- detail panel (drill-down) ------------------------------------------
   function openDetail(node) {
     detailPanel.classList.remove("hidden");
     detailPanel.setAttribute("aria-hidden", "false");
     el("detail-label").textContent = graph.getNodeAttribute(node, "label") || node;
     el("detail-type").textContent = graph.getNodeAttribute(node, "kind") || "node";
     el("detail-props").innerHTML = '<dt class="empty">loading…</dt><dd></dd>';
+    el("detail-relations").innerHTML = '<div class="empty">loading…</div>';
     el("detail-provenance").innerHTML = '<span class="empty">loading…</span>';
     el("detail-agents").innerHTML = "";
     el("expand-btn").disabled = true;
@@ -286,6 +291,7 @@
       .then(function (d) { renderDetail(node, d); })
       .catch(function (err) {
         el("detail-props").innerHTML = '<dt class="empty">' + escapeHtml(err.message) + "</dt><dd></dd>";
+        el("detail-relations").innerHTML = '<div class="empty">unavailable</div>';
         el("detail-provenance").innerHTML = '<span class="empty">unavailable</span>';
         el("expand-btn").disabled = false;
       });
@@ -302,6 +308,8 @@
           return "<dt>" + escapeHtml(k) + "</dt><dd>" + escapeHtml(fmtVal(props[k])) + "</dd>";
         }).join("")
       : '<dt class="empty">no properties</dt><dd></dd>';
+
+    renderRelations(node, d.neighbors || []);
 
     var prov = d.provenance || [];
     el("detail-provenance").innerHTML = prov.length
@@ -324,6 +332,86 @@
       : '<li class="empty">none</li>';
 
     el("expand-btn").disabled = false;
+  }
+
+  // ---- connected entities, grouped by relation type -----------------------
+  // Renders the node's 1-hop neighbors (the runtime's `neighbors[]`) grouped
+  // by relation type. Each connected entity is a clickable link that
+  // re-centers the graph on it and re-drills (drillTo). Graceful when the
+  // node has no neighbors.
+  function renderRelations(node, neighbors) {
+    var box = el("detail-relations");
+    box.innerHTML = "";
+    if (!neighbors.length) {
+      box.innerHTML = '<div class="empty">no connected entities</div>';
+      return;
+    }
+    // Group by relation type, preserving the server's (strongest-first) order.
+    var groups = {};
+    var order = [];
+    neighbors.forEach(function (nb) {
+      var rel = nb.relation || "related";
+      if (!(rel in groups)) { groups[rel] = []; order.push(rel); }
+      groups[rel].push(nb);
+    });
+    order.forEach(function (rel) {
+      var group = groups[rel];
+      var h = document.createElement("div");
+      h.className = "rel-group";
+      var head = document.createElement("div");
+      head.className = "rel-head";
+      head.appendChild(document.createTextNode(rel));
+      var cnt = document.createElement("span");
+      cnt.className = "rel-count"; cnt.textContent = group.length;
+      head.appendChild(cnt);
+      h.appendChild(head);
+      group.forEach(function (nb) {
+        var a = document.createElement("a");
+        a.className = "rel-link";
+        a.href = "#";
+        a.title = (nb.type ? nb.type + " — " : "") +
+          (nb.direction === "in" ? "points to this node" : "this node points to it");
+        var arrow = document.createElement("span");
+        arrow.className = "rel-dir";
+        arrow.textContent = nb.direction === "in" ? "←" : "→";
+        a.appendChild(arrow);
+        var lbl = document.createElement("span");
+        lbl.className = "rel-label"; lbl.textContent = nb.label || nb.key;
+        a.appendChild(lbl);
+        if (nb.type) {
+          var ty = document.createElement("span");
+          ty.className = "rel-type"; ty.textContent = nb.type;
+          a.appendChild(ty);
+        }
+        a.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          drillTo(nb.key, nb.label);
+        });
+        h.appendChild(a);
+      });
+      box.appendChild(h);
+    });
+  }
+
+  // Re-center the graph on a connected entity and re-open its drill-down.
+  // If the node isn't loaded yet (the detail came from the runtime, the
+  // graph window may not include it), fetch+import its neighborhood first
+  // so the camera has something to fly to.
+  function drillTo(key, label) {
+    if (graph.hasNode(key)) { flyTo(key); openDetail(key); return; }
+    status("loading " + (label || key) + "…");
+    api("/api/v1/graph/nodes/" + encodeURIComponent(key) + "/neighbors")
+      .then(function (data) {
+        var before = graph.order;
+        importGraph(data);
+        if (graph.order > before) nudgeLayout();
+        if (graph.hasNode(key)) flyTo(key);
+        openDetail(key);
+      })
+      .catch(function (err) {
+        status("could not open " + (label || key) + ": " + err.message);
+        openDetail(key);  // still show whatever detail the runtime returns
+      });
   }
 
   // ---- expand: fetch + import neighbors ------------------------------------

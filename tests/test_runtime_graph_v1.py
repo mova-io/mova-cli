@@ -57,14 +57,16 @@ def _entity(eid: str, name: str, type: str, *, tenant: str, **kw) -> Entity:
     )
 
 
-def _relation(rid: str, src: str, dst: str, *, tenant: str, weight=1.0, **kw) -> Relation:
+def _relation(
+    rid: str, src: str, dst: str, *, tenant: str, weight=1.0, type: str = "PART_OF", **kw
+) -> Relation:
     return Relation(
         relation_id=rid,
         tenant_id=tenant,
         agent=AGENT,
         src_entity_id=src,
         dst_entity_id=dst,
-        type="PART_OF",
+        type=type,
         weight=weight,
         content_hash=f"h-{tenant}-{rid}",
         **kw,
@@ -228,6 +230,65 @@ async def test_node_detail_provenance(client: TestClient, storage: InMemoryStora
     assert prov[0]["url"] == "https://docs.example.com/auth"
     assert "SAML SSO" in prov[0]["snippet"]
     assert prov[0]["extraction_confidence"] == 0.75
+    # Drill-down: the 1-hop connected entity, tagged with relation + direction.
+    neighbors = body["neighbors"]
+    assert len(neighbors) == 1
+    nb = neighbors[0]
+    assert nb["key"] == "n2"
+    assert nb["label"] == "IdP"
+    assert nb["type"] == "System"
+    assert nb["relation"] == "PART_OF"
+    assert nb["direction"] == "out"  # n1 -> n2
+
+
+async def test_node_detail_neighbors_grouped_and_directed(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """The drill-down panel data: connected entities with relation + direction.
+
+    A node with both an outgoing and an incoming edge of different relation
+    types surfaces both neighbors, each correctly directed — what the panel
+    groups by ``relation`` and renders as clickable links.
+    """
+    tenant, auth = await _mint(storage)
+    await storage.upsert_entity(_entity("hub", "Login Flow", "Feature", tenant=tenant))
+    await storage.upsert_entity(_entity("ticket", "TCK-42", "Ticket", tenant=tenant))
+    await storage.upsert_entity(_entity("sop", "SOP-Auth", "SOP", tenant=tenant))
+    # ticket -> hub (incoming to hub); hub -> sop (outgoing from hub).
+    await storage.upsert_relation(
+        _relation("r1", "ticket", "hub", tenant=tenant, weight=0.9, type="REPORTS")
+    )
+    await storage.upsert_relation(
+        _relation("r2", "hub", "sop", tenant=tenant, weight=0.4, type="DOCUMENTED_BY")
+    )
+
+    resp = client.get("/api/v1/graph/nodes/hub", headers={"Authorization": auth})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["neighbor_count"] == 2
+    by_key = {n["key"]: n for n in body["neighbors"]}
+    assert by_key["ticket"]["relation"] == "REPORTS"
+    assert by_key["ticket"]["direction"] == "in"
+    assert by_key["ticket"]["type"] == "Ticket"
+    assert by_key["sop"]["relation"] == "DOCUMENTED_BY"
+    assert by_key["sop"]["direction"] == "out"
+    assert by_key["sop"]["type"] == "SOP"
+    # Strongest-edge-first ordering (mirrors the windowing cap): REPORTS (0.9)
+    # before DOCUMENTED_BY (0.4).
+    assert [n["key"] for n in body["neighbors"]] == ["ticket", "sop"]
+
+
+async def test_node_detail_no_neighbors_empty_list(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """A node with no edges drills down to an empty (not missing) list."""
+    tenant, auth = await _mint(storage)
+    await storage.upsert_entity(_entity("lonely", "Orphan", "Other", tenant=tenant))
+    resp = client.get("/api/v1/graph/nodes/lonely", headers={"Authorization": auth})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["neighbors"] == []
+    assert body["neighbor_count"] == 0
 
 
 async def test_node_detail_unknown_404(client: TestClient, storage: InMemoryStorage) -> None:
@@ -477,3 +538,35 @@ async def test_graph_search_project_filter(client: TestClient, storage: InMemory
     assert resp.status_code == 200
     keys = {h["key"] for h in resp.json()["results"]}
     assert keys == {"n2"}  # "Auth System" in p1; "Billing" (System) is p2
+
+
+async def test_node_detail_project_scoped_neighbors(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """``?project_id=`` bounds the drill-down node + its neighbors to a project."""
+    tenant, auth = await _mint(storage)
+    await _seed_two_projects(storage, tenant)
+    # Cross-project edge from p1's n1 to p2's n3 (same agent) — must not leak
+    # into the p1-scoped drill-down.
+    await storage.upsert_relation(
+        _relation("e_cross", "n1", "n3", tenant=tenant, weight=0.9, project_id="p2")
+    )
+
+    # Scoped to p1: only the in-project neighbor (n2) surfaces.
+    resp = client.get(
+        "/api/v1/graph/nodes/n1",
+        params={"project_id": "p1"},
+        headers={"Authorization": auth},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {n["key"] for n in body["neighbors"]} == {"n2"}
+    assert body["neighbor_count"] == 1
+
+    # A node in a different project 404s under the p1 scope (no probe leak).
+    resp = client.get(
+        "/api/v1/graph/nodes/n3",
+        params={"project_id": "p1"},
+        headers={"Authorization": auth},
+    )
+    assert resp.status_code == 404

@@ -28,11 +28,12 @@ from enum import StrEnum
 from movate.core.graph.models import (
     GraphologyDoc,
     NodeDetail,
+    NodeNeighbor,
     NodeSearchHit,
     Provenance,
 )
 from movate.core.graph.serialize import to_graphology
-from movate.core.models import Entity, Relation
+from movate.core.models import Entity, Relation, Subgraph
 from movate.storage.base import StorageProvider
 
 # Hard payload caps. ``DEFAULT_CAP`` is the per-request node/edge budget
@@ -241,34 +242,47 @@ async def node_detail(
     agent: str,
     tenant_id: str,
     node_id: str,
+    project_id: str | None = None,
 ) -> NodeDetail | None:
-    """Full detail for one node: properties + provenance + neighbor count.
+    """Full detail for one node: properties + provenance + neighbors.
 
     Returns ``None`` for an unknown or cross-tenant node (the caller maps
     that to a 404 — never a 403, so a tenant can't probe for foreign ids).
+    When ``project_id`` (ADR 046 D1, additive) is set, a node belonging to
+    a different project is also rejected (``None``), and the 1-hop
+    neighborhood is bounded to that project — so the drill-down never leaks
+    a cross-project neighbor. ``None`` (the default) keeps the historical
+    per-agent scope.
 
     Provenance resolves each of the node's ``source_chunk_ids`` to its
     source URL + a text snippet by indexing the agent's chunks once.
-    ``neighbor_count`` and ``referenced_by_agents`` come from a 1-hop
-    expansion (capped) — enough for the UI's "expand → N more" affordance.
+    ``neighbors`` / ``neighbor_count`` / ``referenced_by_agents`` come from
+    a single 1-hop expansion (capped) — the drill-down panel's "connected
+    entities" list (each tagged with its relation type + direction) and the
+    UI's "expand → N more" affordance both fall out of the same traversal.
     """
     entity = await storage.get_entity(node_id, tenant_id=tenant_id)
     if entity is None or entity.agent != agent:
         return None
+    if project_id is not None and entity.project_id != project_id:
+        return None
 
     provenance = await _build_provenance(storage, agent=agent, tenant_id=tenant_id, entity=entity)
 
-    # 1-hop expansion (capped) gives both the neighbor count and a cheap
-    # answer to "which agents reference this node" — for the per-agent
-    # graph that's just this agent, but the shape is forward-compatible
-    # with a future shared/cross-agent graph.
+    # 1-hop expansion (capped) gives the connected entities, the neighbor
+    # count, and a cheap answer to "which agents reference this node" — for
+    # the per-agent graph that's just this agent, but the shape is forward-
+    # compatible with a future shared/cross-agent graph. ``project_id``
+    # (when set) bounds the neighborhood to the same project (no leak).
     sub = await storage.expand_neighbors(
         agent=agent,
         tenant_id=tenant_id,
         entity_ids=[node_id],
         hops=1,
         limit=MAX_CAP,
+        project_id=project_id,
     )
+    neighbors = _one_hop_neighbors(node_id=node_id, sub=sub)
     neighbor_count = max(0, len({e.entity_id for e in sub.entities} - {node_id}))
     referenced_by = sorted({e.agent for e in sub.entities})
 
@@ -283,6 +297,7 @@ async def node_detail(
         description=entity.description,
         properties=properties,
         provenance=provenance,
+        neighbors=neighbors,
         neighbor_count=neighbor_count,
         referenced_by_agents=referenced_by,
         _links={"expand": f"/api/v1/graph/nodes/{entity.entity_id}/neighbors"},
@@ -379,6 +394,45 @@ def _apply_type_filter(
         return entities
     keep = always_keep or set()
     return [e for e in entities if e.type == type_filter or e.entity_id in keep]
+
+
+def _one_hop_neighbors(*, node_id: str, sub: Subgraph) -> list[NodeNeighbor]:
+    """Project a 1-hop ``Subgraph`` into the drill-down panel's neighbor list.
+
+    Walks every relation that touches ``node_id`` and emits one
+    :class:`NodeNeighbor` per *edge* (so two distinct relations to the same
+    entity surface as two rows, grouped client-side by ``relation`` type).
+    ``direction`` is ``out`` when ``node_id`` is the edge source, ``in`` when
+    it is the target. A self-loop (``src == dst == node_id``) is skipped —
+    it has no *connected* entity to render. Strongest edges first (mirrors
+    the windowing cap) so a truncated list keeps the most salient relations.
+
+    Pure over the ``Subgraph`` the storage layer already returned — no extra
+    storage call, so tenant/agent scoping is inherited from the expansion.
+    """
+    by_id = {e.entity_id: e for e in sub.entities}
+    ordered = sorted(sub.relations, key=lambda r: r.weight, reverse=True)
+    out: list[NodeNeighbor] = []
+    for r in ordered:
+        if r.src_entity_id == node_id and r.dst_entity_id != node_id:
+            other, direction = r.dst_entity_id, "out"
+        elif r.dst_entity_id == node_id and r.src_entity_id != node_id:
+            other, direction = r.src_entity_id, "in"
+        else:
+            continue  # not incident to node_id, or a self-loop
+        neighbor = by_id.get(other)
+        if neighbor is None:
+            continue  # edge dangles outside the windowed neighborhood
+        out.append(
+            NodeNeighbor(
+                key=neighbor.entity_id,
+                label=neighbor.name,
+                type=neighbor.type,
+                relation=r.type,
+                direction=direction,
+            )
+        )
+    return out
 
 
 def _cap_relations(

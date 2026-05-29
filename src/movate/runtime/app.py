@@ -979,16 +979,20 @@ async def _resolve_node_detail(
     node_id: str,
     tenant_id: str,
     project: str | None,
+    project_id: str | None = None,
 ) -> NodeDetail | None:
     """Build a :class:`NodeDetail` for ``node_id`` (or None if absent).
 
     Resolves the owning agent first (tenant-scoped, no leak), then defers
-    to the pure ``core.graph`` detail builder for provenance + neighbor
-    counting."""
+    to the pure ``core.graph`` detail builder for provenance + neighbors.
+    ``project_id`` (ADR 046 D1, additive) bounds both the node and its
+    1-hop neighborhood to one project's subgraph (no cross-project leak)."""
     agent = await _resolve_node_agent(store, node_id=node_id, tenant_id=tenant_id, project=project)
     if agent is None:
         return None
-    return await graph_query.node_detail(store, agent=agent, tenant_id=tenant_id, node_id=node_id)
+    return await graph_query.node_detail(
+        store, agent=agent, tenant_id=tenant_id, node_id=node_id, project_id=project_id
+    )
 
 
 async def _search_graph_nodes(
@@ -6476,23 +6480,33 @@ def build_app(
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
         project: str | None = None,
+        project_id: str | None = None,
     ) -> NodeDetailView:
         """Detail for one graph node: properties + provenance + neighbors.
 
         Returns the node's attributes, its ``provenance`` (each source
-        chunk's url + snippet + extraction_confidence), the live neighbor
-        count, the agents that reference it, and ``_links.expand`` (the
-        neighbors endpoint). ``?project=`` scopes the lookup to one
-        agent's graph; omit to search across the tenant's agents.
+        chunk's url + snippet + extraction_confidence), the ``neighbors``
+        (its 1-hop connected entities — tickets/SOPs/docs — each tagged
+        with the relation type + direction, the drill-down panel's
+        clickable list), the live neighbor count, the agents that reference
+        it, and ``_links.expand`` (the neighbors endpoint). ``?project=``
+        scopes the lookup to one agent's graph; omit to search across the
+        tenant's agents. ``?project_id=`` (ADR 046 D1, additive) bounds the
+        node + its neighborhood to one project's subgraph (no leak).
 
         Tenant-scoped at the storage layer — a node owned by another
         tenant 404s (never 403), so a caller can't probe foreign ids.
 
-        Errors: **401** unauthed, **404** unknown / cross-tenant node.
+        Errors: **401** unauthed, **404** unknown / cross-tenant /
+        cross-project node.
         """
         store: StorageProvider = request.app.state.storage
         detail = await _resolve_node_detail(
-            store, node_id=node_id, tenant_id=ctx.tenant_id, project=project
+            store,
+            node_id=node_id,
+            tenant_id=ctx.tenant_id,
+            project=project,
+            project_id=project_id,
         )
         if detail is None:
             raise not_found("graph node", node_id)

@@ -3767,8 +3767,26 @@ class ProvenanceView(BaseModel):
     extraction_confidence: float | None = None
 
 
+class NodeNeighborView(BaseModel):
+    """One 1-hop connected entity in a node-detail drill-down panel.
+
+    ``relation`` is the predicate type of the edge; ``direction`` is
+    ``out`` (focused node → neighbor) or ``in`` (neighbor → focused node).
+    The client groups these by ``relation`` and renders each ``key`` as a
+    clickable link that re-centers the graph / opens the neighbor's detail.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+    type: str
+    relation: str
+    direction: str
+
+
 class NodeDetailView(BaseModel):
-    """``GET /api/v1/graph/nodes/{id}`` response — node detail + provenance."""
+    """``GET /api/v1/graph/nodes/{id}`` response — detail + provenance + neighbors."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -3778,6 +3796,9 @@ class NodeDetailView(BaseModel):
     description: str | None = None
     properties: dict[str, Any] = Field(default_factory=dict)
     provenance: list[ProvenanceView] = Field(default_factory=list)
+    neighbors: list[NodeNeighborView] = Field(default_factory=list)
+    """The node's 1-hop connected entities, each tagged with relation type +
+    direction — the drill-down panel's clickable "connected entities" list."""
     neighbor_count: int = 0
     referenced_by_agents: list[str] = Field(default_factory=list)
     links: dict[str, str] = Field(default_factory=dict, alias="_links")
