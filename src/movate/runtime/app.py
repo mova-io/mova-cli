@@ -85,6 +85,7 @@ from movate.core.reporting import (
     _filter_evals_by_since,
     _filter_runs_by_since,
     build_report,
+    build_usage,
 )
 from movate.core.triggers import (
     DELIVERY_ID_HEADER,
@@ -279,6 +280,7 @@ from movate.runtime.schemas import (
     TriggerView,
     TroubleshootRequest,
     UnifiedAgentCreatedView,
+    UsageView,
     WizardAgentSubmission,
     WorkflowCreatedView,
     WorkflowCreateRequest,
@@ -6101,6 +6103,100 @@ def build_app(
             top_n=top,
         )
         return AgentMetricsView.from_report(name, report)
+
+    # ------------------------------------------------------------------
+    # Per-tenant usage metering (ADR 036 D1). The billing-visibility
+    # companion to the agent-health monitor above — counts requests,
+    # tokens, and (estimated) cost over a window, with optional
+    # by-agent / by-provider breakdowns. Reads the SAME persisted records
+    # ``build_report`` does (ADR 024 ``RunRecord.metrics``); the new
+    # aggregator lives in ``core.reporting`` (``cli ⊥ runtime``). Quota
+    # *enforcement* (ADR 036 D2) is out of scope — D1 ships only the
+    # metering signal + read endpoint.
+    # ------------------------------------------------------------------
+    @v1.get(
+        "/usage",
+        response_model=UsageView,
+        tags=["monitor"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_usage(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        window: int = Query(
+            30,
+            ge=0,
+            le=3650,
+            description=(
+                "Only count runs from the last N days. 0 = all-time; "
+                "default 30 matches the typical billing period."
+            ),
+        ),
+        tenant: str | None = Query(
+            None,
+            description=(
+                "Tenant to read usage for. Non-admin keys ignore this and "
+                "always see their own tenant. Admin keys (scope ``admin``) "
+                "may pass another tenant id to read its rollup."
+            ),
+        ),
+        agent: str | None = Query(
+            None,
+            description=(
+                "Narrow the rollup to a single agent. Counters + breakdowns "
+                "include only this agent's runs."
+            ),
+        ),
+    ) -> UsageView:
+        """Per-tenant usage rollup (ADR 036 D1).
+
+        Returns the tenant's ``requests`` / ``tokens_in`` / ``tokens_out`` /
+        ``cost_usd`` over the requested ``window`` (default 30 days), with
+        optional ``by_agent`` and ``by_provider`` breakdowns. Built from the
+        per-run records the executor already persists (ADR 024) — no new
+        measurement plumbing.
+
+        Tenant scoping:
+
+        * Non-admin keys see only their **own** tenant; the ``tenant`` query
+          param is ignored on the non-admin path (no cross-tenant leak even
+          if a caller guesses an id).
+        * Admin keys (scope ``admin`` in addition to ``read``) may pass
+          ``tenant=<id>`` to read another tenant's rollup; absent the param
+          they default to their own tenant.
+
+        Empty window → a zeroed rollup (200), never a 500 — billing must be
+        able to surface a $0 month explicitly.
+
+        Cost note: this is the **estimated** cost from ``pricing.yaml``, NOT
+        the actual provider invoice (ADR 036 §Risks). D3 billing export will
+        document the estimate↔actual gap.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        # Non-admin keys can NEVER read another tenant. The query param is
+        # silently ignored (rather than 403'd) so a curious front-end probe
+        # doesn't reveal whether the caller has admin — same posture as the
+        # rest of the API (failure-mode rule).
+        target_tenant = tenant if tenant and "admin" in ctx.scopes else ctx.tenant_id
+
+        store: StorageProvider = request.app.state.storage
+        runs = await store.list_runs(
+            agent=agent,
+            tenant_id=target_tenant,
+            limit=_REPORT_FETCH_CAP,
+        )
+        runs = _filter_runs_by_since(runs, window)
+        usage = build_usage(
+            runs,
+            tenant_id=target_tenant,
+            window_days=window,
+            agent_filter=agent,
+        )
+        return UsageView.from_usage(usage)
 
     # ------------------------------------------------------------------
     # Continuous-eval schedules (ADR 016 D2). Additive + default-off.

@@ -68,6 +68,8 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
     ("GET", "/api/v1/report"): "read",
     ("GET", "/api/v1/agents/{name}/metrics"): "read",
+    # usage metering (ADR 036 D1) — per-tenant billing-visibility rollup
+    ("GET", "/api/v1/usage"): "read",
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
