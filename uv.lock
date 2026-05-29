@@ -3405,7 +3405,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.5.29.8"
+version = "2026.5.29.10"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -3498,6 +3498,9 @@ teams = [
     { name = "fastapi" },
     { name = "uvicorn", extra = ["standard"] },
 ]
+voice = [
+    { name = "openai" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -3538,6 +3541,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.50,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40,<2" },
+    { name = "openai", marker = "extra == 'voice'", specifier = ">=1.40,<2" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.25" },
     { name = "opentelemetry-exporter-otlp", marker = "extra == 'otel'", specifier = ">=1.25" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.25" },
@@ -3569,7 +3573,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'runtime'", specifier = ">=0.29" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'teams'", specifier = ">=0.29" },
 ]
-provides-extras = ["runtime", "langfuse", "keychain", "cross-encoder", "ocr", "easyocr", "otel", "dev", "anthropic", "openai", "langchain", "teams", "github", "prefect", "airflow", "playground"]
+provides-extras = ["runtime", "langfuse", "keychain", "cross-encoder", "ocr", "easyocr", "otel", "dev", "anthropic", "openai", "voice", "langchain", "teams", "github", "prefect", "airflow", "playground"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -5015,11 +5019,11 @@ name = "pendulum"
 version = "3.2.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version == '3.12.*'",
-    "python_full_version < '3.12'",
     "python_full_version >= '3.15'",
     "python_full_version == '3.14.*'",
     "python_full_version == '3.13.*'",
+    "python_full_version == '3.12.*'",
+    "python_full_version < '3.12'",
 ]
 dependencies = [
     { name = "python-dateutil", marker = "python_full_version == '3.12.*' or (python_full_version < '3.12' and extra == 'extra-10-movate-cli-playground') or (python_full_version < '3.12' and extra != 'extra-10-movate-cli-airflow') or (python_full_version >= '3.13' and extra == 'extra-10-movate-cli-airflow')" },
