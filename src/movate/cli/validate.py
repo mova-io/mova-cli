@@ -11,7 +11,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -24,6 +24,12 @@ if TYPE_CHECKING:
 from movate.cli._completion import complete_agent_path
 from movate.cli._resolve import walk_up_for_project_root
 from movate.cli._workflow_path import is_workflow_path
+from movate.core.agent_schema_utils import (
+    field_accepts_string_list as _field_accepts_string_list,
+)
+from movate.core.agent_schema_utils import (
+    primary_string_input_fields as _primary_string_input_fields,
+)
 from movate.core.config import PROJECT_MARKER_FILES, load_project_config
 from movate.core.cost_forecast import estimate_eval_cost
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
@@ -781,33 +787,6 @@ def _validate_auto_retrieval(bundle: AgentBundle) -> None:
                 "field whose value seeds the retrieval query.[/dim]"
             )
             raise typer.Exit(code=2)
-
-
-def _field_accepts_string_list(field_schema: dict[str, Any]) -> bool:
-    """True when ``field_schema`` (a compiled JSON Schema fragment) can
-    hold a ``list[string]`` — i.e. ``type: array`` with string items
-    (or unconstrained / string items)."""
-    if not isinstance(field_schema, dict):
-        return False
-    if field_schema.get("type") != "array":
-        return False
-    items = field_schema.get("items")
-    # No item constraint → accepts anything incl. strings.
-    if items is None:
-        return True
-    if isinstance(items, dict):
-        itype = items.get("type")
-        return itype is None or itype == "string"
-    return False
-
-
-def _primary_string_input_fields(input_schema: dict[str, Any]) -> list[str]:
-    """Names of top-level string-typed input fields, for the
-    query_from ambiguity check."""
-    props = input_schema.get("properties", {})
-    return [
-        name for name, sub in props.items() if isinstance(sub, dict) and sub.get("type") == "string"
-    ]
 
 
 def _check_kb_corpus(bundle: AgentBundle) -> None:

@@ -56,9 +56,11 @@ from pathlib import Path
 from typing import Any
 
 import typer
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 
+from movate.core.agent_schema_utils import check_adr023_retrieval as _check_adr023_retrieval
 from movate.core.config import PROJECT_MARKER_FILES as _PROJECT_MARKERS
 from movate.core.paths import project_state_dir
 from movate.templates import get_template_path, list_templates
@@ -1695,155 +1697,106 @@ async def _run_llm_scaffold(
     from movate.cli._progress import spinner  # noqa: PLC0415
     from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
     from movate.core.models import TokenUsage  # noqa: PLC0415
-    from movate.scaffold import (  # noqa: PLC0415
-        LLMScaffoldError,
-        generate_agent_from_description,
-        write_agent_files,
+    from movate.core.scaffold_preview import (  # noqa: PLC0415
+        PreviewFailureMode,
+        PreviewProgressEvent,
+        ScaffoldPreviewError,
+        preview_agent_from_description,
     )
-
-    # Roll token usage across every LLM call (attempt 1 + retry) so the
-    # final cost line reflects total spend. Used by the cost echo +
-    # mdk_init_summary line at the end.
-    total_tokens = TokenUsage()
-    # Track whether a retry actually fired — used by the summary line
-    # so CI dashboards can flag "this scaffold needed correction" runs.
-    retried = False
+    from movate.scaffold import write_agent_files  # noqa: PLC0415
 
     # The model written INTO the generated agent (key-matched), distinct
     # from `llm_model` which DRIVES the scaffold call. See _pick_target_model.
     target_model = _pick_target_model(llm_model=llm_model, mock=mock)
 
+    # Name the model that will run the scaffold so the operator sees what's
+    # being called, and flag the offline mock path so a hung-looking spinner
+    # isn't mistaken for a real (paid) provider call.
+    model_label = f"{llm_model} (mock, offline)" if mock else llm_model
+
     rt = await build_local_runtime(mock=mock)
-    # `generated` is set once an attempt both generates AND validates.
-    generated: Any = None
-    try:
-        # ------------------------------------------------------------------
-        # Unified up-to-2-attempts loop. A single attempt can fail in two
-        # ways:
-        #   (a) generation fails (LLMScaffoldError): provider wire error,
-        #       non-JSON prose, or schema mismatch. The most common real
-        #       LLM failure — it now earns a retry just like (b).
-        #   (b) generation succeeds but load-validation fails: the retry
-        #       feeds the parsed attempt + error back so the model can
-        #       self-correct.
-        # Exit-code contract (preserved from the pre-refactor flow):
-        #   * exit 2 when the FINAL attempt failed at generation
-        #     (LLMScaffoldError) — "hard scaffold failure".
-        #   * exit 1 when the FINAL attempt generated but failed
-        #     load-validation — "retry-validation failure".
-        # ------------------------------------------------------------------
-        # Carry the parsed-but-invalid agent + its error from attempt 1
-        # into attempt 2's feedback retry. Only set when attempt 1
-        # *generated* something (a generation error leaves these None →
-        # attempt 2 re-rolls fresh).
-        feedback_attempt: Any = None
-        feedback_error: str | None = None
-        # The failure mode of the last attempt, so the final error
-        # handling picks the right exit code + message.
-        last_gen_error: str | None = None
-        last_validation_error: str | None = None
 
-        max_attempts = 2
-        for attempt in range(1, max_attempts + 1):
-            is_retry = attempt > 1
-            if is_retry:
-                retried = True
+    # ADR 032 D1 factor-out: the actual generate+validate retry loop now lives
+    # in :func:`movate.core.scaffold_preview.preview_agent_from_description`
+    # — the same callable the runtime's ``POST /api/v1/agents/preview``
+    # endpoint uses. Behavior here is byte-identical to the pre-refactor flow:
+    # up to two attempts, the second feeding the parsed-but-invalid candidate
+    # + validation error back to the model for self-correction. The
+    # per-attempt spinner / between-attempts warning UX is wired through the
+    # progress callback so the operator sees the same console output as before.
 
-            # Name the model that will run the scaffold so the operator
-            # sees what's being called, and flag the offline mock path
-            # so a hung-looking spinner isn't mistaken for a real (paid)
-            # provider call.
-            model_label = f"{llm_model} (mock, offline)" if mock else llm_model
-            spin_msg = (
-                f"retrying '{name}' with {model_label}…"
-                if is_retry
-                else f"scaffolding '{name}' with {model_label}…"
+    # Two-stage spinner: a placeholder for attempt 1 swapped to "retrying…" if
+    # attempt 2 fires. Managed via an ExitStack so the spinner cleans up on
+    # the success path AND on failure.
+    import contextlib  # noqa: PLC0415
+
+    spinner_stack = contextlib.ExitStack()
+
+    def _on_progress(event: PreviewProgressEvent, message: str | None) -> None:
+        """Drive the CLI's Rich console output as the shared pipeline runs.
+
+        Closes over ``spinner_stack`` to swap the per-attempt spinner and
+        ``err_console`` to render the yellow between-attempts warning. Keeps
+        the wire format byte-identical to the pre-refactor flow.
+        """
+        if event is PreviewProgressEvent.ATTEMPT_STARTED:
+            spinner_stack.enter_context(spinner(f"scaffolding '{name}' with {model_label}…"))
+        elif event is PreviewProgressEvent.ATTEMPT_RETRY_STARTED:
+            # Close the attempt-1 spinner and open the attempt-2 one.
+            spinner_stack.close()
+            spinner_stack.enter_context(spinner(f"retrying '{name}' with {model_label}…"))
+        elif event is PreviewProgressEvent.GENERATION_FAILED:
+            err_console.print(
+                f"[yellow]⚠[/yellow] first attempt failed: "
+                f"[dim]{message}[/dim]\n"
+                f"[dim]retrying once (the output was not a valid agent)...[/dim]"
             )
-            try:
-                with spinner(spin_msg):
-                    result = await generate_agent_from_description(
-                        description=description,
-                        name=name,
-                        model=llm_model,
-                        target_model=target_model,
-                        provider=rt.provider,
-                        # Feedback retry ONLY when attempt 1 parsed but
-                        # failed validation. A generation error leaves
-                        # both None → this is a fresh re-roll.
-                        previous_attempt=feedback_attempt,
-                        validation_error=feedback_error,
-                    )
-            except LLMScaffoldError as exc:
-                last_gen_error = str(exc)
-                last_validation_error = None
-                # A generation error yields no parsed object to feed back;
-                # the next attempt (if any) re-rolls fresh.
-                feedback_attempt = None
-                feedback_error = None
-                if is_retry:
-                    break  # both attempts exhausted; handle failure below
-                err_console.print(
-                    f"[yellow]⚠[/yellow] first attempt failed: "
-                    f"[dim]{last_gen_error}[/dim]\n"
-                    f"[dim]retrying once (the output was not a valid agent)...[/dim]"
-                )
-                continue
-
-            total_tokens = _accumulate_tokens(total_tokens, result.tokens)
-            candidate = result.agent
-
-            # Defensive coercions, applied to EVERY generated candidate so
-            # the dir/file/agent-yaml correspondence + key-match hold
-            # regardless of what the LLM emitted:
-            #   * name → the CLI <name> argument (a forgetful LLM might
-            #     echo the few-shot exemplar's name).
-            #   * model.provider → the key-matched target_model so the
-            #     scaffolded agent runs with the operator's key.
-            candidate.agent_yaml["name"] = name
-            model_block = candidate.agent_yaml.get("model")
-            if isinstance(model_block, dict):
-                model_block["provider"] = target_model
-
-            # #127 (PR1): align the emitted agent.yaml field set with a
-            # hand-init'd agent (`templates/agent_init/agent.yaml`) so a
-            # --llm scaffold isn't a thinner artifact than `mdk init`.
-            # Adds sensible defaults for `model.fallback`, `timeouts`,
-            # `budget`, and `tags` HERE (post-generation) rather than asking
-            # the model to invent them — keeps the meta-prompt focused on the
-            # behavioral fields (prompt + schemas + evals) and the operational
-            # knobs consistent across every scaffold. Only fills gaps: a field
-            # the LLM already emitted (e.g. the RAG shape's `tags`) is kept.
-            _apply_canonical_agent_defaults(candidate.agent_yaml, target_model=target_model)
-
-            # Validate by writing to a tempdir and loading.
-            validation_error = _try_validate(candidate, name=name)
-            if validation_error is None:
-                generated = candidate
-                last_gen_error = None
-                last_validation_error = None
-                break  # success
-
-            # Validation failed: stash for the feedback retry (or final fail).
-            last_validation_error = validation_error
-            last_gen_error = None
-            feedback_attempt = candidate
-            feedback_error = validation_error
-            if is_retry:
-                break  # both attempts exhausted; handle failure below
+        elif event is PreviewProgressEvent.VALIDATION_FAILED:
             err_console.print(
                 f"[yellow]⚠[/yellow] first attempt failed validation: "
-                f"[dim]{validation_error}[/dim]\n"
+                f"[dim]{message}[/dim]\n"
                 f"[dim]retrying once with the error fed back to the model...[/dim]"
             )
 
-        # Final failure handling — only reached when both attempts failed.
-        if generated is None:
-            if last_gen_error is not None:
-                # Hard scaffold failure (generation never produced a valid
-                # parsed agent on the final attempt) → exit 2.
-                _save_debug_artifact(name, payload=None, raw_error=last_gen_error)
+    generated: Any = None
+    total_tokens = TokenUsage()
+    retried = False
+    try:
+        try:
+            preview = await preview_agent_from_description(
+                description=description,
+                name=name,
+                provider=rt.provider,
+                model=llm_model,
+                target_model=target_model,
+                progress=_on_progress,
+                # F3 (#112): provision the candidate's declared built-in /
+                # tool-use stubbed skills into the validation tempdir's
+                # project root so a RAG-shape scaffold's ``kb-vector-lookup``
+                # resolves at ``load_agent`` time — identical to what the
+                # committed project gets after a successful preview. The
+                # runtime preview endpoint passes ``None`` (read-only; no
+                # project to provision into). Lambda adapts the CLI
+                # helper's kw-only ``project_root`` to the positional
+                # :class:`SkillProvisioner` shape.
+                skill_provisioner=lambda gen, root: _provision_declared_skills(
+                    gen, project_root=root
+                ),
+            )
+        except ScaffoldPreviewError as exc:
+            # Close any open spinner before we render the failure panel.
+            spinner_stack.close()
+            total_tokens = exc.tokens
+            retried = exc.retried
+            # Preserve the pre-refactor exit-code contract:
+            #   * exit 2 when the FINAL attempt failed at generation
+            #     (LLMScaffoldError) — "hard scaffold failure".
+            #   * exit 1 when the FINAL attempt generated but failed
+            #     load-validation — "retry-validation failure".
+            if exc.mode is PreviewFailureMode.GENERATION:
+                _save_debug_artifact(name, payload=None, raw_error=exc.message)
                 err_console.print(
-                    f"[red]✗[/red] LLM scaffold failed: {last_gen_error}\n"
+                    f"[red]✗[/red] LLM scaffold failed: {exc.message}\n"
                     f"[dim]raw error saved to "
                     f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]"
                 )
@@ -1856,14 +1809,13 @@ async def _run_llm_scaffold(
                     retried=retried,
                 )
                 raise typer.Exit(code=2) from None
-            # Retry-validation failure (final attempt generated but failed
-            # load-validation) → exit 1.
-            _save_debug_artifact(
-                name, payload=feedback_attempt, raw_error=last_validation_error or "unknown"
-            )
+            # PreviewFailureMode.VALIDATION (or the empty-description guard,
+            # which the CLI front-loaded; treat anything else here as a
+            # validation failure for symmetry).
+            _save_debug_artifact(name, payload=exc.partial_agent, raw_error=exc.message)
             err_console.print(
                 f"[red]✗[/red] scaffold failed validation after retry:\n"
-                f"[dim]{last_validation_error}[/dim]\n"
+                f"[dim]{exc.message}[/dim]\n"
                 f"[dim]raw LLM output saved to "
                 f"[bold]{_DEBUG_ARTIFACT_REL.format(name=name)}[/bold][/dim]\n"
                 f"[dim]inspect, fix manually, or re-run with a different "
@@ -1877,8 +1829,14 @@ async def _run_llm_scaffold(
                 ok=False,
                 retried=retried,
             )
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
+        else:
+            spinner_stack.close()
+            generated = preview.agent
+            total_tokens = preview.tokens
+            retried = preview.retried
     finally:
+        spinner_stack.close()
         await shutdown_runtime(rt.storage, rt.tracer)
 
     # Compute cost. Lookups against the pricing table can fail (model
@@ -2637,67 +2595,6 @@ async def _count_retrieved_chunks(storage: Any, *, run_id: str) -> int:
     return total
 
 
-def _check_adr023_retrieval(bundle: Any) -> str | None:
-    """Run the ADR 023 load-time retrieval checks against a loaded bundle.
-
-    Returns ``None`` when the agent either didn't opt into pre-retrieval
-    (``retrieval.auto_into`` unset — the non-grounding path) or opted in
-    correctly; otherwise an error string describing the first
-    misconfiguration, fed back into the retry prompt.
-
-    Reuses the exact pure-logic helpers ``mdk validate`` uses
-    (:func:`_field_accepts_string_list`, :func:`_primary_string_input_fields`)
-    so the scaffold-time contract matches the validate-time contract
-    by construction — a RAG scaffold that passes here passes
-    ``mdk validate``.
-    """
-    import json as _json  # noqa: PLC0415
-
-    from movate.cli.validate import (  # noqa: PLC0415
-        _field_accepts_string_list,
-        _primary_string_input_fields,
-    )
-
-    cfg = bundle.spec.retrieval
-    if not cfg.auto_retrieval_enabled:
-        return None
-
-    auto_into = cfg.auto_into
-
-    # (1) retrieval.skill must be declared on the agent + resolvable.
-    declared = {s.spec.name for s in bundle.skills}
-    if cfg.auto_skill not in declared:
-        return (
-            f"retrieval.skill {cfg.auto_skill!r} is not declared in the agent's "
-            f"skills: {sorted(declared) or 'none'}. Add it to the skills list."
-        )
-
-    # (2) auto_into must name an input field that accepts list[string].
-    props = bundle.input_schema.get("properties", {})
-    field_schema = props.get(auto_into)
-    if field_schema is None:
-        return (
-            f"retrieval.auto_into {auto_into!r} is not a field in the input schema — "
-            f"add a {auto_into}: list[string] field for the retrieved chunks."
-        )
-    if not _field_accepts_string_list(field_schema):
-        return (
-            f"retrieval.auto_into {auto_into!r} must accept a list[string] "
-            f"(the chunk shape), but its schema is {_json.dumps(field_schema)[:160]}."
-        )
-
-    # (3) query_from must be unambiguous when left to the default.
-    if not cfg.query_from:
-        candidates = _primary_string_input_fields(bundle.input_schema)
-        canonical = [c for c in ("query", "question", "text", "message") if c in candidates]
-        if not canonical and len(candidates) != 1:
-            return (
-                "retrieval.query_from is unset and the primary text input field is "
-                f"ambiguous (string fields: {candidates or 'none'}). Set retrieval.query_from."
-            )
-    return None
-
-
 def _save_debug_artifact(name: str, *, payload: Any, raw_error: str) -> None:
     """Stash the failed LLM output to ``.mdk/llm-init-failed-<name>.json``."""
     artifact_path = Path(_DEBUG_ARTIFACT_REL.format(name=name))
@@ -2898,6 +2795,505 @@ def _print_init_summary_line(
         f"retried={str(retried).lower()} "
         f"ok={str(ok).lower()}[/dim]"
     )
+
+
+# ---------------------------------------------------------------------------
+# ADR 029 — workflow authoring (workflow-shape detection + scaffolder)
+# ---------------------------------------------------------------------------
+#
+# The workflow-scaffold path EXTENDS the single-agent `--llm` flow rather
+# than forking it. The workflow planner (a pure-Python step) picks node
+# names + per-node intents from the description, then the existing
+# single-agent generator is called ONCE PER NODE — the per-agent shape
+# selection, schema generation, prompt rendering, and retry policy all
+# stay in their canonical home. workflow.yaml + state.json + the
+# workflow-level eval dataset are synthesized from the union of those
+# per-node payloads.
+#
+# Hard constraints from ADR 029:
+#   * Reuse the single-agent generator. Do NOT fork.
+#   * Do NOT mutate the agent.yaml or workflow.yaml schemas.
+#   * Cap node count at 4 (default) / 6 (max) to prevent runaway LLM cost.
+
+
+def _init_workflow_from_llm(
+    *,
+    name: str,
+    description: str,
+    llm_model: str,
+    target: Path,
+    force: bool,
+    dry_run: bool,
+    mock: bool,
+    max_nodes: int,
+) -> Path:
+    """Scaffold a multi-step workflow from a natural-language description.
+
+    Mirrors :func:`_init_agent_from_llm` but produces a workflow.yaml +
+    state.json + N constituent agents + a workflow-level eval dataset.
+    The per-node agents are generated by calling the SAME
+    :func:`generate_agent_from_description` the single-agent path uses
+    — composition, not duplication.
+
+    Returns the on-disk workflow directory so the caller can run the
+    post-scaffold smoke eval against it.
+    """
+    if not description.strip():
+        err_console.print(
+            "[red]✗[/red] --llm description is empty. "
+            "Pass a non-empty natural-language description of the workflow."
+        )
+        raise typer.Exit(code=2)
+
+    dest = (target / name).resolve()
+    if dest.exists() and not force and not dry_run:
+        err_console.print(
+            f"[red]✗[/red] {dest} already exists "
+            "(use [bold]--force[/bold] to overwrite, or [bold]--dry-run[/bold] "
+            "to preview without writing)"
+        )
+        raise typer.Exit(code=2)
+
+    if not mock and not _has_any_provider_key():
+        err_console.print(
+            "[red]✗[/red] [bold]--llm[/bold] needs a provider API key.\n"
+            "[dim]Set one of: [bold]OPENAI_API_KEY[/bold], "
+            "[bold]ANTHROPIC_API_KEY[/bold], [bold]AZURE_OPENAI_API_KEY[/bold], "
+            "[bold]GEMINI_API_KEY[/bold] in your shell or [bold].env[/bold].\n"
+            "Or re-run with [bold]--mock[/bold] for an offline scaffold "
+            "(uses the deterministic mock provider, no key needed).[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    import asyncio  # noqa: PLC0415
+
+    return asyncio.run(
+        _run_llm_workflow_scaffold(
+            name=name,
+            description=description,
+            llm_model=llm_model,
+            dest=dest,
+            force=force,
+            dry_run=dry_run,
+            mock=mock,
+            max_nodes=max_nodes,
+        )
+    )
+
+
+async def _run_llm_workflow_scaffold(
+    *,
+    name: str,
+    description: str,
+    llm_model: str,
+    dest: Path,
+    force: bool,
+    dry_run: bool,
+    mock: bool,
+    max_nodes: int,
+) -> Path:
+    """Async body of the workflow-scaffold flow.
+
+    Plans the graph (pure Python), runs the single-agent generator once
+    per node, synthesizes the workflow.yaml + state.json + eval dataset,
+    validates by loading the workflow back via :func:`load_workflow_spec`
+    + :func:`compile_workflow`, then writes to ``dest``.
+    """
+    import shutil  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from movate.cli._progress import spinner  # noqa: PLC0415
+    from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+    from movate.core.workflow.compiler import (  # noqa: PLC0415
+        WorkflowCompileError,
+        compile_workflow,
+    )
+    from movate.core.workflow.spec import (  # noqa: PLC0415
+        WorkflowSpecLoadError,
+        load_workflow_spec,
+    )
+    from movate.scaffold import (  # noqa: PLC0415
+        generate_workflow_from_description,
+        write_workflow_files,
+    )
+
+    target_model = _pick_target_model(llm_model=llm_model, mock=mock)
+    rt = await build_local_runtime(mock=mock)
+    try:
+        model_label = f"{llm_model} (mock, offline)" if mock else llm_model
+        with spinner(f"planning + scaffolding workflow '{name}' with {model_label}…"):
+            result = await generate_workflow_from_description(
+                description=description,
+                name=name,
+                model=llm_model,
+                provider=rt.provider,
+                target_model=target_model,
+                max_nodes=max_nodes,
+            )
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+    generated_workflow = result.workflow
+    # Apply canonical defaults to every constituent agent (mirrors the
+    # single-agent path's `_apply_canonical_agent_defaults` step) so the
+    # per-node agent.yaml has the same operational knobs (timeouts,
+    # budget, tags) as a hand-init'd agent.
+    for agent_payload in generated_workflow.nodes:
+        _apply_canonical_agent_defaults(agent_payload.agent_yaml, target_model=target_model)
+
+    # Validate by writing to a tempdir and loading via load_workflow_spec
+    # + compile_workflow. A workflow that compiles cleanly is the closest
+    # thing to a runnable contract — it proves node-id uniqueness, edge
+    # endpoint existence, entrypoint presence, agent refs resolve, and
+    # the state schema loads.
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp_root = Path(raw_tmp) / name
+        try:
+            write_workflow_files(generated_workflow, target_dir=tmp_root)
+            spec, wf_dir = load_workflow_spec(tmp_root / "workflow.yaml")
+            compile_workflow(spec, wf_dir)
+        except (OSError, ValueError, WorkflowSpecLoadError, WorkflowCompileError) as exc:
+            err_console.print(
+                f"[red]✗[/red] generated workflow failed validation: "
+                f"[dim]{exc}[/dim]\n"
+                f"[dim]This is rare under --mock; under a real provider, "
+                f"rephrase the description and retry.[/dim]"
+            )
+            raise typer.Exit(code=1) from exc
+
+        if dry_run:
+            console.print(
+                Panel(
+                    f"[bold]workflow:[/bold] {name}\n"
+                    f"[bold]nodes:[/bold] {', '.join(generated_workflow.node_names)}\n"
+                    f"[bold]edges:[/bold] {len(generated_workflow.nodes) - 1} sequential\n"
+                    f"[bold]eval cases:[/bold] {len(generated_workflow.workflow_evals)}\n"
+                    f"[dim]Preview only — no files written. Re-run without "
+                    f"[bold]--dry-run[/bold] to commit to disk.[/dim]",
+                    title="[yellow]⌕[/yellow] LLM workflow scaffold preview",
+                    title_align="left",
+                    border_style="yellow",
+                )
+            )
+            return dest
+
+        # Commit: copy tempdir contents into ``dest`` atomically.
+        if dest.exists() and force:
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(tmp_root, dest)
+
+    cost_usd = _safe_cost(model=llm_model, tokens=result.tokens)
+    node_names = generated_workflow.node_names
+    body = (
+        f"[bold]name:[/bold] {name}\n"
+        f"[bold]location:[/bold] {dest}\n"
+        f"[bold]nodes:[/bold] {' → '.join(node_names)}\n"
+        f"[bold]agents:[/bold] {len(node_names)} (each at agents/<node>/)\n"
+        f"[bold]eval cases:[/bold] {len(generated_workflow.workflow_evals)}\n"
+    )
+    if cost_usd is not None:
+        body += f"[bold]cost:[/bold] ${cost_usd:.6f}\n"
+    body += (
+        "[dim]scaffolded by --llm · "
+        "review workflow.yaml, state.json, and each agent's prompt.md "
+        "before first real run.[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title="[green]✓[/green] LLM-scaffolded workflow",
+            title_align="left",
+            border_style="green",
+        )
+    )
+
+    _print_init_summary_line(
+        name=name,
+        llm=True,
+        model=llm_model,
+        tokens=result.tokens,
+        ok=True,
+        retried=False,
+    )
+    return dest
+
+
+def _maybe_workflow_smoke_eval(workflow_dir: Path, *, mock: bool, skip: bool) -> None:
+    """Post-scaffold ``--mock`` smoke eval for the just-scaffolded workflow.
+
+    Mirrors :func:`_maybe_eval_baseline` for workflows — runs the eval
+    dataset through :class:`WorkflowEvalRunner` against the mock provider
+    and prints a one-line pass-rate so the operator sees the scaffold
+    isn't degenerate. Best-effort: never changes the exit code on a
+    successfully-scaffolded workflow.
+    """
+    from movate.cli import _console  # noqa: PLC0415
+
+    if skip:
+        _console.hint("[dim]--no-baseline: skipped the post-scaffold workflow smoke eval.[/dim]")
+        return
+    if not mock:
+        _console.hint(
+            "[dim]post-scaffold smoke eval runs under [bold]--mock[/bold] only; "
+            "measure anytime with [bold]mdk eval --mock[/bold] "
+            f"[dim]{workflow_dir}[/dim].[/dim]"
+        )
+        return
+
+    try:
+        passed, total = _run_workflow_smoke_eval(workflow_dir)
+    except Exception as exc:
+        # Soft skip on any failure (provider hiccup, malformed dataset).
+        # A successfully-scaffolded workflow must never exit non-zero
+        # on a smoke that couldn't be measured.
+        _console.hint(
+            f"[dim]smoke eval skipped: {exc} (scaffold is intact; run "
+            f"[bold]mdk eval --mock {workflow_dir}[/bold] to investigate)[/dim]"
+        )
+        return
+    if total == 0:
+        _console.hint("[dim]smoke eval skipped: workflow has no eval cases.[/dim]")
+        return
+    console.print(
+        f"[green]✓[/green] smoke: [bold]{passed}/{total}[/bold] workflow cases pass under --mock"
+    )
+
+
+@dataclass
+class _WorkflowLayout:
+    """Where a workflow-intent ``mdk init --shape workflow`` lands on disk.
+
+    Mirrors :class:`_AgentLayout` but for workflows. The workflow lives
+    under ``<project>/workflows/<name>/`` inside a project, or under
+    ``<target>/<name>/`` standalone (``--bare``).
+    """
+
+    workflow_parent: Path
+    workflow_dir: Path
+    project_root: Path | None
+    created_project: bool
+    snapshot_short: str | None = None
+
+
+def _resolve_workflow_layout(
+    *,
+    name: str,
+    target: Path,
+    bare: bool,
+    force: bool,
+    skip_snapshot: bool,
+    open_editor: bool,
+) -> _WorkflowLayout:
+    """Decide where a workflow-intent ``mdk init`` writes (ADR 029).
+
+    Three context-aware layouts, mirroring :func:`_resolve_agent_layout`
+    but routing into ``workflows/`` instead of ``agents/``:
+
+    1. ``--bare`` → STANDALONE workflow at ``target/<name>/`` (no
+       project wrapper).
+    2. INSIDE a project (``project.yaml`` up the tree from cwd) → ADD
+       the workflow under ``<project>/workflows/<name>/``.
+    3. OUTSIDE a project, not bare → bootstrap a PROJECT at
+       ``target/<name>/`` and place the workflow under
+       ``<project>/workflows/<name>/`` so ``mdk run <name>`` resolves
+       from the project root via :func:`resolve_agent_arg`'s
+       workflow-aware fallback.
+    """
+    if bare:
+        return _WorkflowLayout(
+            workflow_parent=target,
+            workflow_dir=(target / name).resolve(),
+            project_root=None,
+            created_project=False,
+        )
+
+    existing_root = _enclosing_project_root()
+    if existing_root is not None:
+        workflows_dir = existing_root / "workflows"
+        workflows_dir.mkdir(parents=True, exist_ok=True)
+        return _WorkflowLayout(
+            workflow_parent=workflows_dir,
+            workflow_dir=(workflows_dir / name).resolve(),
+            project_root=existing_root,
+            created_project=False,
+        )
+
+    _project_name, project_root, snapshot_short = _init_project(
+        name=name,
+        target=target,
+        force=force,
+        skip_snapshot=skip_snapshot,
+        with_agents=None,
+        quiet=True,
+        open_editor=False,
+    )
+    workflows_dir = project_root / "workflows"
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    return _WorkflowLayout(
+        workflow_parent=workflows_dir,
+        workflow_dir=(workflows_dir / name).resolve(),
+        project_root=project_root,
+        created_project=True,
+        snapshot_short=snapshot_short,
+    )
+
+
+def _render_workflow_next_steps(workflow_dir: Path, *, name: str) -> None:
+    """Render the post-scaffold next-steps panel for a workflow (ADR 029).
+
+    Mirrors :func:`_render_agent_next_steps` — exact, copy-pasteable
+    commands the operator can run next: validate, dev, eval. Resolves
+    the project-relative reference (so ``mdk validate <name>`` works
+    from the project root) when applicable.
+    """
+    from movate.cli._next_steps import mdk_bin_name  # noqa: PLC0415
+
+    project_root = _find_project_root(workflow_dir)
+    ref = name if project_root is not None else str(workflow_dir)
+    mdk = mdk_bin_name()
+    node_count = len(_count_workflow_nodes(workflow_dir))
+    console.print(
+        Panel(
+            f"[bold]Generated {node_count} agents + 1 "
+            f"workflow at[/bold] [cyan]{workflow_dir}[/cyan]\n\n"
+            f"[bold]Next steps:[/bold]\n"
+            f"  [cyan]{mdk} validate {ref}[/cyan]   "
+            f"# load + compile the workflow graph\n"
+            f"  [cyan]{mdk} dev {ref}[/cyan]        "
+            f"# live-reload edit → re-validate → re-eval\n"
+            f"  [cyan]{mdk} eval {ref} --mock[/cyan]  "
+            f"# run the workflow eval dataset offline",
+            title="[green]✓[/green] workflow ready",
+            title_align="left",
+            border_style="green",
+        )
+    )
+
+
+def _count_workflow_nodes(workflow_dir: Path) -> list[str]:
+    """Return the workflow's node ids (empty list on read failure).
+
+    Tolerant: a missing/malformed workflow.yaml returns ``[]`` so the
+    next-steps panel still renders.
+    """
+    try:
+        raw = yaml.safe_load((workflow_dir / "workflow.yaml").read_text())
+    except (OSError, yaml.YAMLError):
+        return []
+    nodes = raw.get("nodes") if isinstance(raw, dict) else None
+    if not isinstance(nodes, list):
+        return []
+    out: list[str] = []
+    for n in nodes:
+        if isinstance(n, dict):
+            node_id = n.get("id")
+            if isinstance(node_id, str) and node_id:
+                out.append(node_id)
+    return out
+
+
+def _run_workflow_smoke_eval(workflow_dir: Path) -> tuple[int, int]:
+    """Execute the workflow's eval dataset under the mock provider.
+
+    Returns ``(passed, total)``. Used by :func:`_maybe_workflow_smoke_eval`
+    + the workflow-authoring tests to confirm the scaffold isn't
+    degenerate. A non-zero passed count is the contract.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from movate.core.eval import (  # noqa: PLC0415
+        WorkflowEvalEngine,
+        load_workflow_dataset,
+    )
+    from movate.core.workflow.compiler import compile_workflow  # noqa: PLC0415
+    from movate.core.workflow.spec import load_workflow_spec  # noqa: PLC0415
+
+    spec, wf_dir = load_workflow_spec(workflow_dir / "workflow.yaml")
+    if spec.evals is None:
+        return (0, 0)
+    evals_spec = spec.evals  # narrow the type from `WorkflowEvalsSpec | None`
+    cases, _ = load_workflow_dataset(wf_dir, evals_spec)
+    if not cases:
+        return (0, 0)
+
+    async def _run() -> tuple[int, int]:
+        from movate.cli._runtime import build_local_runtime, shutdown_runtime  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+        rt = await build_local_runtime(mock=True)
+        try:
+            graph = compile_workflow(spec, wf_dir)
+            # Configure the mock with the union of every constituent
+            # agent's dataset expecteds so each node call returns a
+            # schema-conforming payload — without this the default mock
+            # response (``{"message": "mock response"}``) fails the
+            # per-node strict output schema and every workflow case
+            # bails at node 1. Mirrors the single-agent
+            # ``_configure_mock_for_bundle`` helper in
+            # :mod:`movate.cli.eval`, but folds across all nodes since
+            # the mock provider is shared by the executor across the
+            # whole workflow run.
+            if isinstance(rt.provider, MockProvider):
+                expecteds = _workflow_node_expecteds(wf_dir, spec)
+                if expecteds:
+                    rt.provider.configure_dataset(expecteds)
+            engine = WorkflowEvalEngine(
+                executor=rt.executor,
+                storage=rt.storage,
+                provider=rt.provider,
+                runs_per_case=1,
+                gate_mode="mean",
+            )
+            summary = await engine.run(
+                graph,
+                wf_dir,
+                evals_spec,
+                workflow_name=spec.name,
+                workflow_version=spec.version,
+                threshold=evals_spec.gate,
+            )
+        finally:
+            await shutdown_runtime(rt.storage, rt.tracer)
+        passed = sum(1 for c in summary.cases if c.passed)
+        return (passed, len(summary.cases))
+
+    return asyncio.run(_run())
+
+
+def _workflow_node_expecteds(workflow_dir: Path, spec: Any) -> list[Any]:
+    """Collect every per-node ``evals/dataset.jsonl`` expected output.
+
+    Used by the smoke eval to configure the shared :class:`MockProvider`
+    so each node call in the workflow returns a schema-conforming
+    payload instead of the default ``{"message": "mock response"}`` —
+    same trick :mod:`movate.cli.eval` uses for single-agent eval. Order
+    follows the node order in the spec (entrypoint first), which lines
+    up with the workflow runner's call sequence.
+    """
+    from movate.core.workflow.spec import AgentNodeSpec  # noqa: PLC0415
+    from movate.providers.mock import load_dataset_expecteds  # noqa: PLC0415
+
+    expecteds: list[Any] = []
+    for node in spec.nodes:
+        if not isinstance(node, AgentNodeSpec):
+            continue
+        # Resolve per-node dataset path relative to the workflow dir.
+        agent_dir = (workflow_dir / node.ref).resolve()
+        agent_yaml_path = agent_dir / "agent.yaml"
+        if not agent_yaml_path.exists():
+            continue
+        try:
+            raw = yaml.safe_load(agent_yaml_path.read_text())
+        except (OSError, yaml.YAMLError):
+            continue
+        dataset_decl = raw.get("evals", {}).get("dataset") if isinstance(raw, dict) else None
+        if not dataset_decl:
+            continue
+        dataset_path = (agent_dir / dataset_decl).resolve()
+        if dataset_path.exists():
+            expecteds.extend(load_dataset_expecteds(dataset_path))
+    return expecteds
 
 
 # ---------------------------------------------------------------------------
@@ -3468,6 +3864,34 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
             "[bold]--mock[/bold] measure anytime with [bold]mdk eval --mock[/bold]."
         ),
     ),
+    shape: str | None = typer.Option(
+        None,
+        "--shape",
+        help=(
+            "ADR 029: explicit override for what [bold]--llm[/bold] should "
+            "scaffold. [bold]single-agent[/bold] (a [bold]agent.yaml[/bold] + "
+            "prompt + schemas + evals), [bold]workflow[/bold] (a multi-step "
+            "pipeline: [bold]workflow.yaml[/bold] + state schema + N "
+            "constituent agents + workflow-level evals). Default is "
+            "[bold]auto[/bold] — the planner sniffs the description for "
+            "step markers ([bold]step 1 → step 2[/bold], [bold]→[/bold], "
+            "[bold]then ... then[/bold], [bold]pipeline of[/bold], "
+            "[bold]multi-step[/bold]) and picks. Workflows land under "
+            "[bold]workflows/<name>/[/bold] in a project (or beside the "
+            "current dir with [bold]--bare[/bold])."
+        ),
+    ),
+    workflow_nodes: int | None = typer.Option(
+        None,
+        "--workflow-nodes",
+        help=(
+            "ADR 029: advanced — cap the planner at N constituent agents in "
+            "workflow shape. Default auto (planner picks 2-4 from the "
+            "description); hard ceiling is 6 to keep generation cost "
+            "bounded. Only meaningful with [bold]--shape workflow[/bold] "
+            "(or an auto-detected workflow shape)."
+        ),
+    ),
     open_editor: bool = typer.Option(
         True,
         "--open-editor/--no-open-editor",
@@ -3718,6 +4142,69 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
             llm_model=llm_model,
             llm_model_explicit=(llm_model != _DEFAULT_LLM_MODEL),
         )
+
+        # ADR 029 — workflow shape detection. Explicit --shape wins;
+        # otherwise the planner sniffs the description for step markers
+        # ("step 1 → step 2", "→", "then ... then", "pipeline of",
+        # "multi-step"). When workflow shape is selected, we dispatch
+        # to `_init_workflow_from_llm` which scaffolds a multi-step
+        # pipeline (workflow.yaml + state.json + N agents + evals)
+        # instead of a single agent.
+        from movate.scaffold import detect_workflow_shape  # noqa: PLC0415
+
+        if shape is not None and shape not in ("single-agent", "workflow"):
+            err_console.print(
+                f"[red]✗[/red] [bold]--shape[/bold] must be "
+                f"[bold]single-agent[/bold] or [bold]workflow[/bold] "
+                f"(got [dim]{shape!r}[/dim])."
+            )
+            raise typer.Exit(code=2)
+        if shape == "workflow":
+            use_workflow = True
+        elif shape == "single-agent":
+            use_workflow = False
+        else:
+            use_workflow = detect_workflow_shape(llm)
+        if workflow_nodes is not None and not use_workflow:
+            err_console.print(
+                "[yellow]⚠[/yellow] [bold]--workflow-nodes[/bold] is only "
+                "meaningful with [bold]--shape workflow[/bold] (or an "
+                "auto-detected workflow shape); ignoring."
+            )
+
+        if use_workflow:
+            # Workflows land under `workflows/<name>/` in a project, or
+            # at `<target>/<name>/` for `--bare`. Re-resolve the
+            # scaffold target so we don't drop a workflow into
+            # `agents/<name>/` (which the agent-layout above wired up).
+            workflow_layout = _resolve_workflow_layout(
+                name=name,
+                target=target,
+                bare=bare,
+                force=force,
+                skip_snapshot=skip_snapshot,
+                open_editor=open_editor,
+            )
+            workflow_scaffold_parent = workflow_layout.workflow_parent if not dry_run else target
+            workflow_dir = _init_workflow_from_llm(
+                name=name,
+                description=llm,
+                llm_model=resolved_llm_model,
+                target=workflow_scaffold_parent,
+                force=force,
+                dry_run=dry_run,
+                mock=mock,
+                max_nodes=workflow_nodes or 4,
+            )
+            if dry_run:
+                return
+            # Post-scaffold smoke eval (workflow analogue of F4'). Best-
+            # effort: never changes the exit code on a successfully-
+            # scaffolded workflow.
+            _maybe_workflow_smoke_eval(workflow_dir, mock=mock, skip=no_baseline)
+            _render_workflow_next_steps(workflow_dir, name=name)
+            return
+
         _init_agent_from_llm(
             name=name,
             description=llm,

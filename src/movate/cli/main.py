@@ -144,11 +144,15 @@ from movate.cli import (  # noqa: E402
     _console,
     add_cmd,
     audit_cmd,
+    audit_llm_cmd,
+    capabilities_cmd,
     compose_cmd,
     demo_cmd,
     dev_cmd,
+    diagnose_cmd,
     diff_cmd,
     eval_gen_cmd,
+    eval_generate_cmd,
     eval_harvest_cmd,
     eval_schedule_cmd,
     eval_scorecard_cmd,
@@ -159,6 +163,7 @@ from movate.cli import (  # noqa: E402
     migrate_state_cmd,
     monitor_cmd,
     plan_cmd,
+    project_cmd,
     promote_cmd,
     replay_cmd,
     report_cmd,
@@ -197,6 +202,7 @@ from movate.cli.backup_cmd import export_state_cmd, import_state_cmd  # noqa: E4
 from movate.cli.batch_cmd import batch_app  # noqa: E402
 from movate.cli.benchmark_cmd import benchmark_app  # noqa: E402
 from movate.cli.canary_cmd import canary_app  # noqa: E402
+from movate.cli.catalog_cmd import catalog_app  # noqa: E402
 from movate.cli.ci import ci_app  # noqa: E402
 from movate.cli.config_cmd import config_app  # noqa: E402
 from movate.cli.contexts_cmd import contexts_app  # noqa: E402
@@ -205,20 +211,24 @@ from movate.cli.docs_cmd import docs_app  # noqa: E402
 from movate.cli.doctor import doctor_app  # noqa: E402
 from movate.cli.export_oci_cmd import export_app  # noqa: E402
 from movate.cli.fleet_cmd import fleet_app  # noqa: E402
+from movate.cli.graph_cmd import graph_app  # noqa: E402
 from movate.cli.guardrails_cmd import guardrails_app  # noqa: E402
 from movate.cli.import_lyzr import import_app  # noqa: E402
 from movate.cli.infra_cmd import infra_app  # noqa: E402
 from movate.cli.inspect_cmd import inspect_app  # noqa: E402
 from movate.cli.jobs import jobs_app  # noqa: E402
+from movate.cli.judge_cmd import judge_app  # noqa: E402
 from movate.cli.kb_cmd import kb_app  # noqa: E402
 from movate.cli.keys_cmd import keys_app  # noqa: E402
 from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
 from movate.cli.mcp_cmd import mcp_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.models_cmd import models_app  # noqa: E402
+from movate.cli.observability_cmd import observability_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
+from movate.cli.project_cmd import project_app  # noqa: E402
 from movate.cli.runs import runs_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.schema_cmd import schema_app  # noqa: E402
@@ -229,6 +239,7 @@ from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
+from movate.cli.webhooks_cmd import webhooks_app  # noqa: E402
 from movate.cli.workflow_cmd import workflow_app  # noqa: E402
 from movate.tracing import install_log_correlation  # noqa: E402
 
@@ -411,6 +422,9 @@ app.command("compose", rich_help_panel=PANEL_DEVELOP)(compose_cmd.compose)
 # Sits next to `compose` (multi-agent) and `init` (single agent) since all
 # three answer "how do I scaffold a new thing?"
 app.command("plan", rich_help_panel=PANEL_DEVELOP)(plan_cmd.plan)
+# `project` — manage projects + attach agents. Mirrors the unified
+# runtime create endpoint (POST /api/v1/projects/{id}/agents).
+app.add_typer(project_cmd.project_app, name="project", rich_help_panel=PANEL_DEVELOP)
 # `import state` (item 26) restores a `mdk export state` DR backup of
 # control-plane state — the escape-hatch counterpart to the export.
 import_app.command("state")(import_state_cmd)
@@ -418,10 +432,15 @@ app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
+# `catalog` browses + contributes to the agent catalog over the runtime
+# `/api/v1/catalog/...` surface (ADR 041). Lives in DEVELOP next to
+# `templates` since both surface "reusable starters."
+app.add_typer(catalog_app, name="catalog", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(schema_app, name="schema", rich_help_panel=PANEL_DEVELOP)
 app.command("validate", rich_help_panel=PANEL_DEVELOP)(validate_cmd.validate)
 app.add_typer(knowledge_app, name="knowledge", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(kb_app, name="kb", rich_help_panel=PANEL_DEVELOP)
+app.add_typer(graph_app, name="graph", rich_help_panel=PANEL_DEVELOP)
 # `contexts` lists + inspects shared context files wired into agents —
 # the "did my policy.md actually load?" diagnostic. Lives next to `kb`
 # since both answer "what supporting content does my agent have?".
@@ -493,10 +512,25 @@ app.command("eval-harvest", rich_help_panel=PANEL_RUN)(eval_harvest_cmd.harvest)
 # Sibling (not subcommand) because restructuring `eval` to a Typer
 # sub-app would break ~30 test callsites. See eval_gen_cmd docstring.
 app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
+# `eval-generate` (+ `eval-generate-commit`) wire the runtime API
+# `POST /api/v1/agents/{name}/evals/generate` for the review-then-commit
+# pattern. Sibling pattern (NOT a Typer sub-app under `eval`) because
+# restructuring `eval` would break ~30 test callsites — same call as
+# the eval-gen one above. The two commands hit a deployed runtime over
+# HTTP, while the local `eval-gen` command runs in-process. See the
+# eval_generate_cmd module docstring for the why.
+app.command("eval-generate", rich_help_panel=PANEL_RUN)(eval_generate_cmd.eval_generate)
+app.command("eval-generate-commit", rich_help_panel=PANEL_RUN)(
+    eval_generate_cmd.eval_generate_commit
+)
 # `eval-scorecard` is the Phase 1 of the new eval flow: LLM-generated
 # test cases + 10-category scorecard. Sibling pattern like eval-gen.
 # Phase 3 will swap bare `mdk eval` to use this flow as the default.
 app.command("eval-scorecard", rich_help_panel=PANEL_RUN)(eval_scorecard_cmd.eval_scorecard)
+# `judge` (generate + commit) — author an evals/judge.yaml from an agent's
+# spec via Claude, with a human-review gate between generate and commit.
+# CLI parity for POST /api/v1/agents/{name}/judge/{generate,commit}.
+app.add_typer(judge_app, name="judge", rich_help_panel=PANEL_RUN)
 # `eval-schedule` (CRUD) + `eval-scheduler-tick` (cron entrypoint) wire the
 # continuous-eval loop (ADR 016 D2). Sibling pattern like eval-gen/eval-scorecard.
 # The tick is meant to be driven by an external cron (Azure: a Container Apps
@@ -530,12 +564,21 @@ app.add_typer(trace_app, name="trace", rich_help_panel=PANEL_RUN)
 app.command("submit", rich_help_panel=PANEL_RUN)(submit_cmd.submit)
 app.add_typer(batch_app, name="batch", rich_help_panel=PANEL_RUN)
 app.add_typer(jobs_app, name="jobs", rich_help_panel=PANEL_RUN)
+# `webhooks` (ADR 035 D2) is the outbound sibling of `trigger`: where a
+# trigger lets an external system POST events INTO the runtime, a webhook
+# subscription pushes lifecycle events OUT to a configured URL.
+app.add_typer(webhooks_app, name="webhooks", rich_help_panel=PANEL_RUN)
 # `runs` is the read-only sibling of `jobs`: look up a PAST run's result by
 # id (the run_id a synchronous `mdk run --target` prints). Inline runs persist
 # a RunRecord without a queryable JobRecord, so `jobs list` can't surface them
 # — `runs show <run_id>` closes that gap via the existing GET /runs/{id}.
 app.add_typer(runs_app, name="runs", rich_help_panel=PANEL_RUN)
 app.add_typer(workflow_app, name="workflow", rich_help_panel=PANEL_RUN)
+# `diagnose` (ADR 043 D1) talks to a deployed runtime: cluster recent
+# failures + propose typed fixes. Read-only with respect to the agent —
+# the apply step is a follow-up. Remote panel, since the work happens
+# on the runtime side and the CLI is purely a thin wrapper.
+app.add_typer(diagnose_cmd.diagnose_app, name="diagnose", rich_help_panel=PANEL_RUN)
 
 # ----- Diagnose -------------------------------------------------------------
 
@@ -559,11 +602,20 @@ app.command("pricing", rich_help_panel=PANEL_DIAGNOSE)(pricing_cmd.pricing)
 # Sits alongside `pricing` (per-1k cost table) since both answer
 # "what models can I use and what do they cost?".
 app.add_typer(models_app, name="models", rich_help_panel=PANEL_DIAGNOSE)
+# `capabilities` queries a DEPLOYED runtime ("what does THIS deployment
+# support?") — reachable models, feature flags (route/import-detected),
+# scopes, limits, extras. Sits with `models`/`pricing` as a discovery
+# command, but read against a remote target rather than the local catalog.
+app.command("capabilities", rich_help_panel=PANEL_DIAGNOSE)(capabilities_cmd.capabilities)
 # `costs` reports on historical spend (different from `pricing` which
 # shows the live tariff). Both share the Diagnose panel since they
 # answer adjacent operator questions ("what does this cost?" vs
 # "what HAVE we spent?").
 app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
+# `observability` (ADR 047) — ask the fleet's telemetry questions in natural
+# language with grounded citations, troubleshoot symptoms, and view the
+# overnight analyst's daily health digest. Diagnose-panel sibling to `costs`.
+app.add_typer(observability_app, name="observability", rich_help_panel=PANEL_DIAGNOSE)
 # `report` is the offline rollup (ADR 031 D3) — pass-rate / cost / latency /
 # top-failure aggregates from the LOCAL store. Sits with `costs` + `explain`
 # since all three answer "how are my agents doing?" without remote infra
@@ -603,8 +655,17 @@ app.command("migrate", rich_help_panel=PANEL_MANAGE)(migrate_cmd.migrate)
 app.command("migrate-state", rich_help_panel=PANEL_MANAGE)(migrate_state_cmd.migrate_state)
 app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
+# ``mdk audit-llm`` is the runtime client for the Claude-orchestrated audit
+# endpoint (read-only). Distinct sub-app rather than a flag on ``mdk audit``
+# to keep the static-scanner audit's CLI surface unchanged + back-compat.
+app.add_typer(audit_llm_cmd.audit_llm_app, name="audit-llm", rich_help_panel=PANEL_MANAGE)
 app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
+# `project` exposes ADR 040's tenant-scoped Project CRUD + membership over
+# the deployed runtime's /api/v1/projects* surface. MANAGE panel because
+# it's a roster/lifecycle command (sibling to `tenants` and `agent`); the
+# project-attachment commands (agents/workflows/KBs) ship in later PRs.
+app.add_typer(project_app, name="project", rich_help_panel=PANEL_MANAGE)
 # `agent` surfaces the durable agent registry's version history + rollback
 # (ADR 014 D3). Lives in MANAGE next to `rollback` / `promote` / `tenants`
 # since it's a registry-lifecycle operation, not authoring (that's `dev`).

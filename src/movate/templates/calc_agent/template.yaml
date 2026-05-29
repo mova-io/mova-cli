@@ -1,0 +1,8 @@
+title: Calculator agent (Python skill)
+description: Expression to a numeric result with an explanation. Wired to a Python calculator skill.
+shape: agent
+tags:
+  - tool-use
+  - python-skill
+  - starter
+recommended_for: Learning the Python-skill seam — an agent that hands off arithmetic to a real impl.
