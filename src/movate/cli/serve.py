@@ -81,6 +81,18 @@ def serve(
             "fully-permissive local dev only."
         ),
     ),
+    dev: bool = typer.Option(
+        False,
+        "--dev",
+        help=(
+            "LOCAL-DEV ONLY. Auto-mint + seed a known dev API key on "
+            "startup and print the ready-to-run playground command, so "
+            "testing against this runtime is a single copy-paste. Does NOT "
+            "disable auth — it only seeds a valid key (auth still enforced). "
+            "REFUSED on a non-loopback --host (never seeds a known key on a "
+            "publicly reachable bind). NEVER use in production."
+        ),
+    ),
 ) -> None:
     """Start the movate FastAPI runtime.
 
@@ -97,7 +109,23 @@ def serve(
 
       [dim]# Disable rate limiting (single-tenant dev)[/dim]
       $ movate serve --rate-limit-per-minute 0
+
+      [dim]# Local dev: auto-seed a dev key + print the playground command[/dim]
+      $ movate serve --dev
     """
+    # --dev is local-dev only: it seeds a KNOWN key into storage, so it must
+    # never run on a bind reachable off-box. Refuse before doing any work
+    # (and before printing a key) when --host isn't loopback.
+    if dev and not _is_loopback_host(host):
+        err.print(
+            f"[red]✗[/red] --dev refuses a non-loopback --host "
+            f"(got [bold]{host}[/bold]). It seeds a known dev key for local "
+            f"testing and must never be exposed off-box. Use the loopback "
+            f"default (127.0.0.1) for --dev, or drop --dev and seed a key "
+            f"yourself via MOVATE_SEED_API_KEY for a remote bind."
+        )
+        raise typer.Exit(code=2)
+
     asyncio.run(
         _run_serve(
             host=host,
@@ -107,8 +135,26 @@ def serve(
             log_level=log_level,
             rate_limit_per_minute=rate_limit_per_minute,
             cors_origins=cors_origins,
+            dev=dev,
         )
     )
+
+
+# Loopback hostnames --dev is allowed to bind to. ``localhost`` is included
+# because it's the conventional dev alias even though it resolves via the
+# hosts file; ``::1`` covers IPv6 loopback. Anything else (a routable IP,
+# ``0.0.0.0``, a hostname) is treated as potentially off-box.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True when ``host`` is a recognized loopback bind (case-insensitive).
+
+    Conservative by design: only an explicit loopback literal passes.
+    ``0.0.0.0`` (all interfaces) and any routable address/hostname are
+    rejected so ``--dev`` can't seed a known key on a reachable bind.
+    """
+    return host.strip().lower() in _LOOPBACK_HOSTS
 
 
 async def _run_serve(
@@ -120,6 +166,7 @@ async def _run_serve(
     log_level: str,
     rate_limit_per_minute: int,
     cors_origins: str,
+    dev: bool = False,
 ) -> None:
     """Async entry that owns the loop end-to-end.
 
@@ -154,6 +201,20 @@ async def _run_serve(
     # pool now exists). No-op on SQLite / when metrics are off. Never raises.
     register_pool_observability(storage)
     await _seed_bootstrap_key(storage)
+
+    # --dev (local-only, guarded above): mint + seed a known dev key so the
+    # playground connects in one copy-paste. Auth is NOT disabled — this only
+    # ensures a valid key exists and tells the operator what it is.
+    dev_key: str | None = None
+    dev_key_file: Path | None = None
+    if dev:
+        from movate.cli.dev_key import (  # noqa: PLC0415
+            mint_and_seed_dev_key,
+            write_dev_key_file,
+        )
+
+        dev_key = await mint_and_seed_dev_key(storage)
+        dev_key_file = write_dev_key_file(dev_key)
 
     agents = scan_agents(agents_path)
     if not agents:
@@ -211,6 +272,28 @@ async def _run_serve(
         "[dim]mdk run <agent> '<input>'   →  invoke an agent[/dim]",
         "[dim]mdk logs --last             →  inspect last run[/dim]",
     ]
+    if dev and dev_key is not None:
+        from movate.cli.dev_key import playground_command  # noqa: PLC0415
+
+        _pg_cmd = playground_command(dev_key, host=host, port=port)
+        _file_line = (
+            f"[dim]also written to {dev_key_file}[/dim]"
+            if dev_key_file is not None
+            else "[dim](could not write .mdk/dev-runtime-key; copy from above)[/dim]"
+        )
+        _body_lines += [
+            "",
+            "[bold yellow]⚠ --dev: seeded a KNOWN dev key for LOCAL testing.[/bold yellow]",
+            "[yellow]  Auth is still enforced (this is a convenience, not a bypass).[/yellow]",
+            "[yellow]  NEVER use --dev in production or on a public bind.[/yellow]",
+            "",
+            f"  dev key:  [bold]{dev_key}[/bold]",
+            _file_line,
+            "",
+            "  [dim]copy this ONE line into a second terminal — the "
+            "playground just connects:[/dim]",
+            f"  [bold cyan]{_pg_cmd}[/bold cyan]",
+        ]
     err.print(
         Panel(
             "\n".join(_body_lines),
