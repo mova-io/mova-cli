@@ -143,12 +143,29 @@ from movate.runtime.agent_resolver import (
     publish_agent_bundle,
     resolve_agent_bundle,
 )
-from movate.runtime.errors import ErrorCode, auth_required, conflict, http_error, not_found
+from movate.runtime.errors import (
+    ErrorBody,
+    ErrorCode,
+    ErrorResponse,
+    auth_required,
+    conflict,
+    enrich_error_fields,
+    http_error,
+    not_found,
+)
 from movate.runtime.events import emit_event
 from movate.runtime.hardening import (
+    ECONOMICS_HEADER_CACHE,
+    ECONOMICS_HEADER_COST,
+    ECONOMICS_HEADER_REQUEST_ID,
+    ECONOMICS_HEADER_TOKENS_IN,
+    ECONOMICS_HEADER_TOKENS_OUT,
+    EconomicsHeadersMiddleware,
     PayloadSizeLimitMiddleware,
     RequestIdMiddleware,
+    ResponseEconomics,
     resolve_max_request_bytes,
+    set_response_economics,
 )
 from movate.runtime.long_poll import (
     HEADER_POLL_TIMEOUT,
@@ -3376,6 +3393,16 @@ def build_app(
     app.state.max_request_bytes = max_body
     app.add_middleware(PayloadSizeLimitMiddleware, max_bytes=max_body)
 
+    # Economics / cache response headers (additive). Reads the optional
+    # ``ResponseEconomics`` a cost-incurring handler stashed on request.state
+    # and emits ``X-MDK-Cost-USD`` / ``-Tokens-In`` / ``-Tokens-Out`` /
+    # ``-Cache`` (best-effort: omit unknown) plus an ``X-MDK-Request-Id`` echo.
+    # Mounted INSIDE request-id (added before it) so the correlation context is
+    # bound when it reads it; OUTSIDE the payload guard is irrelevant (it only
+    # touches the response). Always on — zero cost when no economics were set
+    # (it just adds the correlation echo).
+    app.add_middleware(EconomicsHeadersMiddleware)
+
     # CORS — required for browser-side callers (the Mova iO Angular
     # app). Allow-list resolved from the explicit kwarg, then env vars,
     # then empty (= middleware not mounted). The wildcard ``"*"`` is
@@ -3409,6 +3436,14 @@ def build_app(
                 # Per-request correlation id (ADR 033 D2) — let browser JS
                 # read it so a client can surface / report it on errors.
                 REQUEST_ID_HEADER,
+                # Economics / cache headers (additive) — let the browser client
+                # show spend + cache effectiveness per response. Cost/token
+                # headers are present only on cost-incurring responses.
+                ECONOMICS_HEADER_COST,
+                ECONOMICS_HEADER_TOKENS_IN,
+                ECONOMICS_HEADER_TOKENS_OUT,
+                ECONOMICS_HEADER_CACHE,
+                ECONOMICS_HEADER_REQUEST_ID,
             ],
         )
 
@@ -6663,6 +6698,27 @@ def build_app(
             )
             run_request = _RunRequest(agent=name, input=body.input)
             run_response = await executor.execute(bundle, run_request)
+
+            # Surface this run's economics as response headers (additive).
+            # Inline ``?wait=true`` is the ONLY agent-run path that incurs LLM
+            # spend inside an API response (the async path returns 202 before
+            # any spend). Cost/tokens come straight from the executor's metrics.
+            # Cache status: when the configured backend is the NoOp default
+            # this response definitively does NOT involve the response cache
+            # → ``none``; with a real backend the per-completion hit/miss isn't
+            # surfaced to this layer, so we OMIT it (best-effort: never guess).
+            _cache_backend = getattr(request.app.state.llm_cache, "name", None)
+            _cache_status = "none" if _cache_backend == "noop" else None
+            set_response_economics(
+                request,
+                ResponseEconomics(
+                    cost_usd=run_response.metrics.cost_usd,
+                    tokens_in=run_response.metrics.tokens.input,
+                    tokens_out=run_response.metrics.tokens.output,
+                    cache=_cache_status,
+                ),
+            )
+
             # Try to fetch the persisted RunRecord. On success the
             # executor always persists; on error it persists a
             # FailureRecord instead (no RunRecord). We handle both:
@@ -13099,13 +13155,19 @@ def build_app(
     async def _agent_creation_error_handler(
         _request: Request, exc: AgentCreationError
     ) -> JSONResponse:
+        code = _agent_creation_error_code(exc.status_code)
         return JSONResponse(
             status_code=exc.status_code,
             content={
                 "detail": {
                     "error": {
-                        "code": _agent_creation_error_code(exc.status_code),
+                        "code": code,
                         "message": str(exc),
+                        # Self-teaching (additive): same registry the central
+                        # envelope uses, so these custom-handler codes carry
+                        # consistent docs_url / fix_hint / retriable. Unknown
+                        # code → {} → byte-identical to the prior body.
+                        **enrich_error_fields(code),
                     }
                 }
             },
@@ -13119,13 +13181,16 @@ def build_app(
     async def _skill_creation_error_handler(
         _request: Request, exc: SkillCreationError
     ) -> JSONResponse:
+        code = _agent_creation_error_code(exc.status_code)
         return JSONResponse(
             status_code=exc.status_code,
             content={
                 "detail": {
                     "error": {
-                        "code": _agent_creation_error_code(exc.status_code),
+                        "code": code,
                         "message": str(exc),
+                        # Self-teaching (additive) — see the agent handler above.
+                        **enrich_error_fields(code),
                     }
                 }
             },
@@ -13158,6 +13223,13 @@ def build_app(
     # ``KbIngest{Text,Url,Generated}Request`` shapes the front end
     # POSTs. See ``test_kb_ingest_exposes_three_json_modes`` in
     # ``tests/test_front_end_api_contract.py``.
+    #
+    # ADR 033 D7 (response-envelope ergonomics) layers a SECOND additive
+    # patch on top of this one: the error envelope (``ErrorResponse`` /
+    # ``ErrorBody``) isn't a per-endpoint ``response_model`` so FastAPI
+    # never emits it. Both patches are idempotent + non-clobbering and
+    # chain through ``_default_openapi`` → ``_patched_openapi`` → the
+    # error-schema wrapper so neither set of schemas is lost.
     # ------------------------------------------------------------------
     from fastapi.openapi.utils import get_openapi  # noqa: PLC0415
 
@@ -13183,6 +13255,15 @@ def build_app(
                 for ref_name, ref_schema in (model_schema.pop("$defs", {}) or {}).items():
                     components.setdefault(ref_name, ref_schema)
                 components[model_cls.__name__] = model_schema
+        # ADR 033 D7: also graft the error-envelope models in (additive,
+        # only if absent) so the documented error shape — including the
+        # optional self-teaching fields — reaches the generated TS client.
+        for model in (ErrorBody, ErrorResponse):
+            name = model.__name__
+            if name not in components:
+                components[name] = model.model_json_schema(
+                    ref_template="#/components/schemas/{model}"
+                )
         app.openapi_schema = schema
         return schema
 
