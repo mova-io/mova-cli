@@ -54,6 +54,21 @@ OBSERVABILITY_KEY_ENV_VARS: tuple[str, ...] = (
     "LANGFUSE_BASE_URL",
 )
 
+# Voice provider keys — speech adapters (ADR 048/049, the ``[voice]`` extra).
+# Set via ``mdk auth login deepgram`` / ``cartesia`` and consumed by the
+# Deepgram STT / Cartesia TTS adapters (and the auth-picker ``✓`` marker).
+# Kept SEPARATE from PROVIDER_KEY_ENV_VARS on purpose: those are LLM-chat
+# provider keys that gate ``_has_any_provider_key`` ("can this machine run a
+# text agent?") — a voice key can't run the text agent, so folding it in
+# there would wrongly answer "yes". They still need the same
+# autoload-from-credentials-file treatment (so operators don't re-export
+# each shell), so they go through ``ALL_AUTOLOADED_ENV_VARS`` below — the
+# same pattern the notification / observability groups use.
+VOICE_KEY_ENV_VARS: tuple[str, ...] = (
+    "DEEPGRAM_API_KEY",
+    "CARTESIA_API_KEY",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -62,6 +77,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *PROVIDER_KEY_ENV_VARS,
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
+    *VOICE_KEY_ENV_VARS,
 )
 
 
