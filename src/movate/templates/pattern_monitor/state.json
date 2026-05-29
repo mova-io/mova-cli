@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Monitor workflow state",
+  "description": "Threaded state for the observe → gate → action pattern.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["signal"],
+  "properties": {
+    "signal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The raw incoming signal to observe (e.g. a metric reading, a log line)."
+    },
+    "metric": {
+      "type": "string",
+      "description": "The observer's normalized metric, fed to the threshold gate."
+    },
+    "action_taken": {
+      "type": "string",
+      "description": "What the action node did (or would do); the audit record on breach."
+    },
+    "status": {
+      "type": "string",
+      "description": "Terminal status note (e.g. 'ok' from the no-op terminal)."
+    }
+  }
+}

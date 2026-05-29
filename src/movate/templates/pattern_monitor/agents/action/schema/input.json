@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "metric": {
+      "type": "string",
+      "description": "The metric that breached the threshold."
+    },
+    "signal": {
+      "type": "string",
+      "description": "The original signal, for context."
+    }
+  }
+}

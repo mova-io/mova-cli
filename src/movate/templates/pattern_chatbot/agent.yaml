@@ -1,0 +1,66 @@
+api_version: movate/v1
+kind: Agent
+
+# =============================================================================
+# Chatbot pattern (ADR 038) — INPUT → AGENT → OUTPUT
+# =============================================================================
+# The simplest governable pattern: ONE agent answering a single turn under a
+# strict output contract. No tools, no loop, no fan-out — the governance here
+# is the budget cap + the enforced output schema. Everything richer (loops,
+# fan-out, judges, supervisors) lives in the other four pattern templates.
+#
+# GOVERNANCE BOUNDS (see GOVERNANCE.md):
+#   * budget.max_cost_usd_per_run — HARD per-run cost cap (single LLM call).
+#   * model.params.max_tokens     — output token bound.
+#   * schema/output.yaml          — output contract enforced by the executor;
+#                                   a non-conforming reply fails the run.
+#   * objectives[].threshold      — eval-gate the response must clear
+#                                   (mdk eval --gate / --objective).
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: |
+  Single-agent conversational assistant — the Chatbot agent-pattern (ADR 038).
+  One ``message`` in → one ``reply`` out, under an enforced output schema and a
+  hard per-run budget cap. The governable baseline pattern.
+owner: ""
+role: chatbot
+persona: "Helpful, concise conversational assistant — answers in 1-3 sentences."
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    # Token bound — part of the governance envelope (caps output size).
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+# GOVERNANCE: hard per-run cost cap. The executor stops the run if a single
+# turn would exceed this. Tighten it for cost-sensitive deployments.
+budget:
+  max_cost_usd_per_run: 0.10
+
+# GOVERNANCE: a measurable success criterion the eval-gate scores against.
+objectives:
+  - id: helpful-reply
+    description: Reply is on-topic, concise, and grounded (no invented facts).
+    threshold: 0.7
+
+tags:
+  - pattern:chatbot
+  - governed
+  - single-agent

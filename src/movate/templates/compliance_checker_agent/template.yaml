@@ -1,0 +1,8 @@
+title: Compliance checker
+description: Text plus a ruleset to violations (rule id, excerpt, severity, suggested rewording).
+shape: agent
+tags:
+  - compliance
+  - rules
+  - structured-output
+recommended_for: Gating marketing or regulated copy against a caller-supplied rule set.

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "scenario": {
+      "type": "string",
+      "description": "The scenario being played out."
+    },
+    "transcript": {
+      "type": "string",
+      "description": "The interaction transcript so far."
+    }
+  }
+}

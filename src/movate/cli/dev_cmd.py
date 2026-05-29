@@ -134,6 +134,21 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         raise typer.Exit(code=2)
     agent_name = agent_dir.name
 
+    # ADR 029 — workflow recognition. When the resolved path is a
+    # workflow (has `workflow.yaml`), dispatch to the workflow live
+    # loop: watch the workflow file + each agent dir, re-validate +
+    # re-eval on change. Keeps the plumbing small — single-agent dev
+    # is the dominant path.
+    from movate.cli._workflow_path import is_workflow_path  # noqa: PLC0415
+
+    if is_workflow_path(agent_dir):
+        _run_workflow_dev_loop(
+            agent_dir,
+            mock=mock,
+            poll_interval=poll_interval,
+        )
+        return
+
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if not interactive:
         _print_noninteractive_guide(agent_dir, agent_name, target)
@@ -236,7 +251,9 @@ def _resolve_or_scaffold(
     # are first-class via the resolver's existing-path-wins rule.
     try:
         resolved = resolve_agent_arg(agent)
-        if (resolved / "agent.yaml").is_file():
+        # ADR 029: accept both agent.yaml AND workflow.yaml here; the
+        # workflow loop branches off in `dev()` after this returns.
+        if (resolved / "agent.yaml").is_file() or (resolved / "workflow.yaml").is_file():
             return resolved.resolve()
     except FileNotFoundError:
         pass
@@ -1096,6 +1113,164 @@ def _print_noninteractive_guide(agent_dir: Path, agent_name: str, target: str | 
         f"--target {deploy_target}   [dim](if the agent uses a knowledge base)[/dim]"
     )
     stdout.print(f"\nmdk_dev_summary: agent={agent_name} dir={agent_dir} interactive=false")
+
+
+# ---------------------------------------------------------------------------
+# Workflow dev loop (ADR 029)
+# ---------------------------------------------------------------------------
+#
+# ``mdk dev <workflow>`` watches the workflow.yaml + every constituent
+# agent dir + the state schema. On a change it re-validates (load_spec +
+# compile_workflow) and re-runs the workflow's eval dataset under
+# ``--mock`` so the operator sees the impact immediately. Keeps the
+# plumbing intentionally small — the single-agent loop is the dominant
+# path and we don't want to fork it.
+
+
+def _run_workflow_dev_loop(
+    workflow_dir: Path,
+    *,
+    mock: bool,
+    poll_interval: float,
+) -> None:
+    """Live-reload loop for a workflow target.
+
+    Watches ``workflow.yaml``, the state schema, every agent's
+    ``agent.yaml`` + ``prompt.md`` + schemas, and the workflow eval
+    dataset. On any change, re-validates the spec + re-runs the eval
+    dataset (under ``--mock`` by default). Ctrl-C exits.
+    """
+    import time  # noqa: PLC0415
+
+    stdout.print(f"\n[bold]mdk dev[/bold] (workflow) · [bold]{workflow_dir.name}[/bold]")
+    stdout.print(f"[dim]workflow: {workflow_dir / 'workflow.yaml'}[/dim]")
+    stdout.print("[dim]watching workflow.yaml + agents/ for changes; Ctrl-C to exit[/dim]")
+
+    # Initial validate + eval pass so the operator sees a baseline.
+    _validate_and_eval_workflow(workflow_dir, mock=mock)
+
+    watched = _workflow_watched_paths(workflow_dir)
+    snapshot = _snapshot_workflow_mtimes(watched)
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not interactive:
+        stdout.print(
+            f"mdk_dev_workflow_summary: workflow={workflow_dir.name} "
+            f"dir={workflow_dir} interactive=false"
+        )
+        return
+
+    try:
+        while True:
+            time.sleep(poll_interval)
+            current = _snapshot_workflow_mtimes(watched)
+            if current != snapshot:
+                stdout.print("\n[dim]── change detected ──[/dim]")
+                _validate_and_eval_workflow(workflow_dir, mock=mock)
+                # Re-compute watched paths — an edit may have added/
+                # removed a node-agent dir.
+                watched = _workflow_watched_paths(workflow_dir)
+                snapshot = _snapshot_workflow_mtimes(watched)
+    except KeyboardInterrupt:
+        stdout.print("\n[dim]exiting workflow dev loop[/dim]")
+
+
+def _workflow_watched_paths(workflow_dir: Path) -> list[Path]:
+    """Return every file the workflow depends on (best-effort).
+
+    Includes ``workflow.yaml`` itself, the state schema, every node
+    agent's ``agent.yaml`` + ``prompt.md`` + ``schema/*.yaml``, and the
+    workflow eval dataset. A file that doesn't exist is silently
+    dropped — we surface failures via the validate/eval pass, not via
+    a missing-file error in the watcher.
+    """
+    paths: list[Path] = []
+    wf_yaml = workflow_dir / "workflow.yaml"
+    if wf_yaml.exists():
+        paths.append(wf_yaml)
+    # State schema + workflow evals (relative to workflow.yaml).
+    for rel in ("state.json", "state.yaml", "evals/dataset.jsonl"):
+        p = workflow_dir / rel
+        if p.exists():
+            paths.append(p)
+    # Per-node agents under agents/<name>/.
+    agents_root = workflow_dir / "agents"
+    if agents_root.is_dir():
+        for agent_dir in sorted(agents_root.iterdir()):
+            if not agent_dir.is_dir():
+                continue
+            for rel in (
+                "agent.yaml",
+                "prompt.md",
+                "schema/input.yaml",
+                "schema/output.yaml",
+                "evals/dataset.jsonl",
+            ):
+                p = agent_dir / rel
+                if p.exists():
+                    paths.append(p)
+    return paths
+
+
+def _snapshot_workflow_mtimes(paths: list[Path]) -> dict[Path, float]:
+    """``{path: mtime}`` snapshot. Missing → -1.0 so deletes register."""
+    out: dict[Path, float] = {}
+    for p in paths:
+        try:
+            out[p] = p.stat().st_mtime
+        except FileNotFoundError:
+            out[p] = -1.0
+    return out
+
+
+def _validate_and_eval_workflow(workflow_dir: Path, *, mock: bool) -> None:
+    """One validate + (under --mock) re-eval pass for the workflow.
+
+    Both steps are best-effort: a failure prints the error and
+    returns. The loop keeps going so the operator can fix and retry.
+    """
+    from movate.core.workflow.compiler import (  # noqa: PLC0415
+        WorkflowCompileError,
+        compile_workflow,
+    )
+    from movate.core.workflow.spec import (  # noqa: PLC0415
+        WorkflowSpecLoadError,
+        load_workflow_spec,
+    )
+
+    try:
+        spec, wf_dir = load_workflow_spec(workflow_dir / "workflow.yaml")
+        compile_workflow(spec, wf_dir)
+    except (WorkflowSpecLoadError, WorkflowCompileError, OSError, ValueError) as exc:
+        err.print(f"[red]✗[/red] workflow validation failed: [dim]{exc}[/dim]")
+        return
+    stdout.print(
+        f"[green]✓[/green] workflow [bold]{spec.name}[/bold] compiled "
+        f"({len(spec.nodes)} nodes, {len(spec.edges)} edges)"
+    )
+
+    if not mock:
+        stdout.print(
+            f"[dim]hint: run [bold]{mdk_bin_name()} eval {workflow_dir}[/bold] "
+            f"to measure the dataset.[/dim]"
+        )
+        return
+
+    try:
+        from movate.cli.init import _run_workflow_smoke_eval  # noqa: PLC0415
+
+        passed, total = _run_workflow_smoke_eval(workflow_dir)
+    except Exception as exc:
+        # Soft skip on any failure — the live loop must keep going so
+        # the operator can edit + retry.
+        err.print(f"[yellow]⚠[/yellow] smoke eval skipped: {exc}")
+        return
+    if total == 0:
+        stdout.print("[dim]smoke eval skipped: workflow has no eval cases.[/dim]")
+        return
+    stdout.print(
+        f"[green]✓[/green] smoke: [bold]{passed}/{total}[/bold] workflow cases pass under --mock"
+    )
 
 
 __all__ = ["dev"]

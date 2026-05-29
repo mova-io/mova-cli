@@ -1,34 +1,44 @@
-"""``mdk playground`` — Chainlit-based UI for testing deployed agents.
+"""``mdk playground`` — ChatGPT-like Chainlit UI for testing agents.
 
 Boot with::
 
-    mdk playground serve --runtime-url https://movate-prod-api.eastus2... \\
-        --api-key $MOVATE_API_KEY
+    mdk playground serve --runtime-url https://movate-prod-api.eastus2...
 
 Operators get a browser UI that:
 
-1. Lists agents available on the configured runtime (calls ``GET /api/v1/agents``).
-2. Renders an input form per agent from the agent's input JSON schema.
-3. POSTs to ``/run`` and displays the structured output.
-4. Captures 👍/👎/comment feedback via Chainlit's built-in widget.
-5. Persists feedback to the runtime's Postgres via
-   ``POST /runs/{run_id}/feedback``, which then (best-effort)
-   mirrors the score to Langfuse for cross-linking traces.
+1. Lists agents on the configured runtime (``GET /api/v1/agents``) +
+   detects the runtime's capabilities (``GET /api/v1/capabilities``).
+2. Holds a multi-turn conversation with the picked agent — server-managed
+   sessions when available, else client-managed (re-sent transcript) to
+   the stateless run endpoint.
+3. Persists conversation threads (Chainlit data layer) for a
+   past-conversations sidebar + resume.
+4. Accepts file uploads — text extracted via the shared KB parser into
+   conversation context, optionally persisted to the agent's KB.
+5. Streams tokens live when the runtime advertises it; else buffered.
+6. Captures 👍/👎/comment feedback, routed to the feedback API when
+   advertised, else the runtime's existing persistence path (Postgres
+   + best-effort Langfuse mirror).
 
 The module is laid out as:
 
 * :mod:`movate.playground.client` — async HTTP client to the runtime.
-* :mod:`movate.playground.adapter` — read agent.yaml's input schema,
-  generate a Chainlit form, dispatch ``mdk submit``-equivalent calls.
-* :mod:`movate.playground.app` — the Chainlit decorators
-  (``@cl.on_chat_start``, ``@cl.on_message``, etc.) that bind the
-  adapter to the UI. This file is the one Chainlit's ``chainlit run``
-  command loads as the app entry point.
+* :mod:`movate.playground.capabilities` — capability discovery (pure).
+* :mod:`movate.playground.conversation` — conversation backends + context
+  assembly + feedback routing (pure).
+* :mod:`movate.playground.uploads` — upload→context adapter reusing the
+  shared KB text extractor (pure).
+* :mod:`movate.playground.sse` — SSE frame parsing for streaming (pure).
+* :mod:`movate.playground.state` — data-layer path resolution (pure).
+* :mod:`movate.playground.app` — the Chainlit decorators that bind the
+  pure logic to the UI. The file ``chainlit run`` loads.
 
-Chainlit is an optional dependency under the ``[playground]`` extra —
-the rest of MDK works without it. The CLI command
-(:mod:`movate.cli.playground`) prints a friendly error when the
-extra isn't installed.
+The ``*.client`` module and every ``(pure)`` module import WITHOUT
+Chainlit, so they're unit-testable on a no-extras install; only
+:mod:`~movate.playground.app` requires it. Chainlit is an optional
+dependency under the ``[playground]`` extra — the rest of MDK works
+without it. The CLI command (:mod:`movate.cli.playground`) prints a
+friendly error when the extra isn't installed.
 """
 
 from __future__ import annotations

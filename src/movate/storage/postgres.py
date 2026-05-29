@@ -24,22 +24,35 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import asyncpg
 
 from movate.core.dr_backup import ImportResult
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
+    _DEFAULT_PROJECT_DESCRIPTION,
+    _DEFAULT_PROJECT_NAME,
+    _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
+    AuditFinding,
+    AuditFindingSeverity,
+    AuditRecord,
     BatchRecord,
     BenchModelResult,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogEntryVersion,
+    CatalogRatingsSummary,
+    CatalogSource,
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     Entity,
     EntityWithScore,
     ErrorInfo,
@@ -55,6 +68,10 @@ from movate.core.models import (
     KbChunk,
     KbChunkWithScore,
     Metrics,
+    Project,
+    ProjectKbMode,
+    ProjectMember,
+    ProjectMemberRole,
     Relation,
     RunRecord,
     SkillCallRecord,
@@ -63,9 +80,12 @@ from movate.core.models import (
     TenantProviderKey,
     Trigger,
     TurnRecord,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 from movate.storage._cosine import rank_chunks_by_cosine as _rank_chunks_by_cosine  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -209,6 +229,27 @@ CREATE TABLE IF NOT EXISTS bench (
 );
 CREATE INDEX IF NOT EXISTS idx_bench_agent_created
     ON bench(agent, created_at DESC);
+
+-- Claude-orchestrated audit records (read-only audit pipeline). Findings +
+-- categories are JSONB. One immutable row per terminal audit, tenant-scoped
+-- at the row level. Additive + idempotent — backfill not needed.
+CREATE TABLE IF NOT EXISTS audits (
+    audit_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    scope_kind      TEXT NOT NULL,
+    scope_id        TEXT NOT NULL,
+    categories      JSONB NOT NULL,
+    severity_floor  TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    budget_usd      DOUBLE PRECISION NOT NULL,
+    findings        JSONB NOT NULL,
+    partial         BOOLEAN NOT NULL DEFAULT FALSE,
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audits_scope_created
+    ON audits(tenant_id, scope_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_run_id   TEXT PRIMARY KEY,
@@ -480,6 +521,29 @@ CREATE INDEX IF NOT EXISTS idx_agent_bundles_name
 CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created
     ON agent_bundles(tenant_id, name, created_at DESC);
 
+-- ADR 037 D1: durable workflow registry. Workflow analogue of agent_bundles —
+-- one immutable (name, version) row per publish, tenant-scoped, ``files`` is
+-- JSONB. ``published`` is the operator promote/revert flag (ADR 037 D1) —
+-- at most one True per (tenant, name) at any time (enforced application-side
+-- by publish_workflow_version, mirroring the agent registry's "no schema
+-- constraint, behavior-enforced" pattern). Additive new table (CREATE TABLE
+-- IF NOT EXISTS, re-run idempotently on every init) — no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS workflow_bundles (
+    name          TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    created_by    TEXT,
+    content_hash  TEXT NOT NULL,
+    files         JSONB NOT NULL,
+    published     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name
+    ON workflow_bundles(tenant_id, name);
+CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name_created
+    ON workflow_bundles(tenant_id, name, created_at DESC);
+
 -- ADR 016 D2: continuous-eval schedules. One row per (tenant, agent) with a
 -- cadence; the scheduler tick enqueues EVAL jobs for due rows. Additive new
 -- table (CREATE TABLE IF NOT EXISTS, idempotent on every init) — default-off,
@@ -708,6 +772,325 @@ CREATE TABLE IF NOT EXISTS tenant_provider_keys (
     updated_at  TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_id, provider)
 );
+
+-- ADR 040 — Projects as a first-class cloud entity. Five additive,
+-- idempotent (CREATE TABLE IF NOT EXISTS) tables. No existing column is
+-- modified, no ALTER on existing tables; the front end's project UX
+-- composes onto this without any back-compat hazard. ``tenant_id NOT NULL``
+-- is the invariant on ``projects``; members + junctions derive the tenant
+-- via the project's row (joined when needed) so the tenant-isolation story
+-- stays single-sourced. Soft delete via ``archived_at`` (D6); a default-
+-- per-tenant row is created lazily by ``get_or_create_default_project``
+-- (D5) and the unique ``(tenant_id, name)`` index keeps two racing creates
+-- collapsing to one.
+CREATE TABLE IF NOT EXISTS projects (
+    project_id           TEXT PRIMARY KEY,
+    tenant_id            TEXT NOT NULL,
+    name                 TEXT NOT NULL,
+    description          TEXT,
+    owner_principal_id   TEXT NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL,
+    archived_at          TIMESTAMPTZ,
+    UNIQUE (tenant_id, name)
+);
+-- Listing filter (D6 — hide archived) + tenant scope.
+CREATE INDEX IF NOT EXISTS idx_projects_tenant_archived
+    ON projects(tenant_id, archived_at);
+
+-- Member CRUD: PK is (project_id, principal_id); the secondary index covers
+-- the RBAC "members of project X with role Y" filter the API composes on.
+CREATE TABLE IF NOT EXISTS project_members (
+    project_id    TEXT NOT NULL,
+    principal_id  TEXT NOT NULL,
+    role          TEXT NOT NULL CHECK (role IN ('viewer','editor','owner')),
+    added_by      TEXT NOT NULL,
+    added_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, principal_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_members_project_role
+    ON project_members(project_id, role);
+
+-- Agent attachment junction (D2 — M:N). Indices cover both directions:
+-- forward ("agents attached to project X") + reverse ("projects this agent
+-- belongs to" — D5 implicit-default check).
+CREATE TABLE IF NOT EXISTS project_agents (
+    project_id  TEXT NOT NULL,
+    agent_name  TEXT NOT NULL,
+    added_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, agent_name)
+);
+CREATE INDEX IF NOT EXISTS idx_project_agents_project
+    ON project_agents(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_agents_agent_name
+    ON project_agents(agent_name);
+
+-- Workflow attachment junction (D2 — M:N). Mirror of project_agents.
+CREATE TABLE IF NOT EXISTS project_workflows (
+    project_id     TEXT NOT NULL,
+    workflow_name  TEXT NOT NULL,
+    added_at       TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, workflow_name)
+);
+CREATE INDEX IF NOT EXISTS idx_project_workflows_project
+    ON project_workflows(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_workflows_workflow_name
+    ON project_workflows(workflow_name);
+
+-- KB attachment junction (D3). Carries the share mode (owned /
+-- shared_reference / shared_copy). The "exactly one ``owned`` row per
+-- kb_id" invariant is enforced by the API layer on share, not at the
+-- storage seam — keeps the table portable.
+CREATE TABLE IF NOT EXISTS project_kbs (
+    project_id  TEXT NOT NULL,
+    kb_id       TEXT NOT NULL,
+    mode        TEXT NOT NULL CHECK (mode IN ('owned','shared_reference','shared_copy')),
+    added_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (project_id, kb_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_kbs_project ON project_kbs(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_kbs_kb_id ON project_kbs(kb_id);
+
+-- ADR 041: Agent catalog. Three namespaces (movate / private / community)
+-- in one schema, distinguished by ``source``. The read API joins
+-- ``movate`` + the caller's ``private`` + (future) ``community``.
+-- Postgres ignores NULL in unique constraints, so a non-null
+-- ``tenant_id_key`` column (set to the sentinel ``__public__`` for public
+-- namespaces) preserves PK uniqueness while keeping ``tenant_id`` itself
+-- NULL on the wire. The CHECK constraint enforces the namespace ↔
+-- tenant_id invariant at the DB layer. Additive new table (CREATE TABLE
+-- IF NOT EXISTS, idempotent on every init) — default-off, no ALTER, no
+-- backfill.
+CREATE TABLE IF NOT EXISTS catalog_entries (
+    slug             TEXT NOT NULL,
+    source           TEXT NOT NULL CHECK (source IN ('movate','private','community')),
+    tenant_id        TEXT,
+    tenant_id_key    TEXT NOT NULL,
+    latest_version   TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    tags             JSONB NOT NULL DEFAULT '[]'::jsonb,
+    shape            TEXT,
+    recommended_for  TEXT,
+    ratings_summary  JSONB NOT NULL DEFAULT '{"count": 0, "avg": 0.0}'::jsonb,
+    popularity       INTEGER NOT NULL DEFAULT 0,
+    synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (slug, source, tenant_id_key),
+    CHECK (
+        (source = 'private' AND tenant_id IS NOT NULL)
+        OR (source IN ('movate','community') AND tenant_id IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_entries_source_tenant
+    ON catalog_entries(source, tenant_id);
+-- GIN on tags (jsonb) for "?tag=foo" membership filters.
+CREATE INDEX IF NOT EXISTS idx_catalog_entries_tags
+    ON catalog_entries USING GIN (tags);
+CREATE INDEX IF NOT EXISTS idx_catalog_entries_shape
+    ON catalog_entries(shape);
+CREATE INDEX IF NOT EXISTS idx_catalog_entries_synced_at
+    ON catalog_entries(synced_at DESC);
+
+-- One version per (slug, source, tenant_id_key, version). bundle_tar is
+-- the actual entry contents — opaque BYTEA from the catalog service's
+-- perspective (ADR 041 D4).
+CREATE TABLE IF NOT EXISTS catalog_entry_versions (
+    slug          TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    tenant_id     TEXT,
+    tenant_id_key TEXT NOT NULL,
+    bundle_tar    BYTEA NOT NULL,
+    digest        TEXT NOT NULL,
+    published_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deprecated_at TIMESTAMPTZ,
+    PRIMARY KEY (slug, source, version, tenant_id_key)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_entry_versions_slug_source
+    ON catalog_entry_versions(slug, source);
+CREATE INDEX IF NOT EXISTS idx_catalog_entry_versions_published
+    ON catalog_entry_versions(published_at DESC);
+
+-- One rating per tenant per entry. Re-rating overwrites in place.
+CREATE TABLE IF NOT EXISTS catalog_entry_ratings (
+    slug       TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    tenant_id  TEXT NOT NULL,
+    rating     SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment    TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (slug, source, tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_entry_ratings_slug
+    ON catalog_entry_ratings(slug);
+CREATE INDEX IF NOT EXISTS idx_catalog_entry_ratings_tenant
+    ON catalog_entry_ratings(tenant_id);
+
+-- Per-source watermark. One row per source — the last successful sync
+-- timestamp. Drives ``?since=`` deltas against catalog.movate.io (ADR 041 D4).
+CREATE TABLE IF NOT EXISTS catalog_sync_watermark (
+    source           TEXT PRIMARY KEY,
+    last_synced_at   TIMESTAMPTZ NOT NULL
+);
+
+-- ADR 047: observability insights — the overnight analyst's daily,
+-- pre-aggregated telemetry summary per (tenant, project, date). APPEND-ONLY:
+-- a re-run for a day INSERTs a new row (keyed by the unique ``id``); reads take
+-- the latest row per (tenant, project, date) via ORDER BY created_at DESC. The
+-- four JSON columns (anomalies / top_failures / usage_rollup / trends) are
+-- JSONB and round-trip through the connection-level json codec (same as
+-- runs.metrics). Additive new table (CREATE TABLE IF NOT EXISTS, idempotent) —
+-- default-off, no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS observability_insights (
+    id               TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL,
+    project_id       TEXT NOT NULL,
+    date             DATE NOT NULL,
+    health_score     DOUBLE PRECISION NOT NULL,
+    anomalies        JSONB NOT NULL,
+    top_failures     JSONB NOT NULL,
+    usage_rollup     JSONB NOT NULL,
+    trends           JSONB NOT NULL,
+    narrative_digest TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observability_insights_tpd
+    ON observability_insights(tenant_id, project_id, date);
+
+-- ADR 035 D1: events outbox. Domain events (run.completed,
+-- agent.published, eval.failed, drift.detected, canary.promoted/demoted,
+-- ...) are recorded at the runtime edges and served by GET
+-- /api/v1/events. Additive new table (CREATE TABLE IF NOT EXISTS,
+-- idempotent on every init) — no row exists unless an emit happened, so
+-- non-event behavior is byte-for-byte unchanged. ``tenant_id NOT NULL``
+-- matches the rest of the schema (ADR 013/014). ``data`` is JSONB so
+-- future consumers (D2 webhooks, D3 SSE) can filter on payload fields
+-- if needed; D1's read API only filters on (tenant_id, kind, subject,
+-- created_at).
+CREATE TABLE IF NOT EXISTS events (
+    id          TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL
+);
+-- Default list shape: ``WHERE tenant_id=? AND created_at >=? ORDER BY
+-- created_at`` (the last-24h default in GET /api/v1/events).
+CREATE INDEX IF NOT EXISTS idx_events_tenant_created
+    ON events(tenant_id, created_at);
+-- Kind-filtered list: ``WHERE tenant_id=? AND kind=? AND created_at>=?``
+-- (the typed-subscription shape D2/D3 will lean on).
+CREATE INDEX IF NOT EXISTS idx_events_tenant_kind_created
+    ON events(tenant_id, kind, created_at);
+
+-- ADR 035 D2 — webhook subscriptions (outbound delivery). One row per
+-- configured subscriber. ``secret`` is STORED (not hashed) because the
+-- delivery worker must re-sign every outbound POST with the same key
+-- the subscriber configured — we never echo it back on the wire after
+-- the one-time create response. ``kind_filter`` is a JSONB list (use
+-- ``["*"]`` for "all kinds"). Additive — no row exists unless the
+-- tenant POSTs ``/api/v1/webhooks``, so pre-D2 behavior is byte-for-
+-- byte unchanged.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id            TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    url           TEXT NOT NULL,
+    kind_filter   JSONB NOT NULL,
+    secret        TEXT NOT NULL,
+    enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks(tenant_id);
+
+-- ADR 035 D2 — per-attempt delivery log. One row per
+-- (webhook_id, event_id, attempt_n) triple. ``response_excerpt`` is
+-- truncated server-side (worker bounds it to ~512 chars before
+-- insert) so a misbehaving subscriber can't blow up storage with
+-- megabytes per attempt. ``status_code`` and ``response_excerpt`` are
+-- NULL when the attempt never received an HTTP response (timeout /
+-- connection error).
+CREATE TABLE IF NOT EXISTS webhook_attempts (
+    id                TEXT PRIMARY KEY,
+    webhook_id        TEXT NOT NULL,
+    event_id          TEXT NOT NULL,
+    tenant_id         TEXT NOT NULL,
+    attempted_at      TIMESTAMPTZ NOT NULL,
+    status_code       INTEGER,
+    response_excerpt  TEXT,
+    error_kind        TEXT NOT NULL,
+    attempt_n         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_attempts_tenant_at
+    ON webhook_attempts(tenant_id, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_attempts_webhook_at
+    ON webhook_attempts(webhook_id, attempted_at);
+
+-- ADR 035 D2 — per-webhook delivery cursor. ``webhook_id`` is PK so
+-- the upsert is cheap; per-webhook (rather than global) cursor avoids
+-- re-delivering everyone's events when a new subscriber signs up.
+-- ``tenant_id`` is denormalized for cheap tenant-bounded reads.
+CREATE TABLE IF NOT EXISTS webhook_cursors (
+    webhook_id    TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    last_event_id TEXT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_cursors_tenant ON webhook_cursors(tenant_id);
+-- Eval-generation jobs (``mdk eval generate``). Runtime-resident,
+-- SSE-driven; persistence is so the status GET + commit endpoint can
+-- read back what generation produced. Additive new table (CREATE TABLE
+-- IF NOT EXISTS, idempotent) — no row exists unless a caller hit the
+-- generate endpoint, so non-generate behavior is byte-for-byte the
+-- pre-feature path. ``result`` is a JSONB :class:`GenerationResult`
+-- (cases + judge + cost) populated when the pipeline finishes;
+-- ``error`` is populated on failure. Both NULL while status='running'.
+CREATE TABLE IF NOT EXISTS eval_generation_jobs (
+    job_id          TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent_name      TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    count_requested INTEGER NOT NULL,
+    categories      JSONB NOT NULL,
+    include_judge   BOOLEAN NOT NULL DEFAULT FALSE,
+    model           TEXT NOT NULL,
+    budget_usd      DOUBLE PRECISION,
+    progress        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    result          JSONB,
+    error           JSONB,
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    created_at      TIMESTAMPTZ NOT NULL,
+    completed_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_eval_gen_jobs_tenant_created
+    ON eval_generation_jobs(tenant_id, created_at DESC);
+-- ADR 043 D1 — Failure Pattern Diagnoser results. One row per diagnose
+-- request; upsert (ON CONFLICT) on diagnosis_id so the runtime's background
+-- task can transition a row from ``running`` to ``completed`` without a
+-- separate update method. ``request`` / ``result`` / ``error`` are JSONB
+-- columns; the typed-fix taxonomy is validated at the wire edge so adding a
+-- new fix kind later doesn't require a storage migration. Read-only with
+-- respect to agent state — persisting a row never modifies the agent.
+CREATE TABLE IF NOT EXISTS diagnoses (
+    diagnosis_id  TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    agent         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    request       JSONB NOT NULL,
+    result        JSONB,
+    error         JSONB,
+    tokens_used   INTEGER NOT NULL DEFAULT 0,
+    cost_usd      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    model         TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL,
+    completed_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_diagnoses_agent_created
+    ON diagnoses(tenant_id, agent, created_at DESC);
 """
 
 
@@ -987,6 +1370,55 @@ class PostgresProvider:
         )
 
     # ------------------------------------------------------------------
+    # Diagnoses (ADR 043 D1 — Failure Pattern Diagnoser results)
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        # Upsert keyed by diagnosis_id. ON CONFLICT preserves the
+        # original created_at — the runtime's background task uses this
+        # to transition the row from ``running`` to ``completed`` (or
+        # ``error``) without re-stamping the insert timestamp.
+        await self._db.execute(
+            """
+            INSERT INTO diagnoses (
+                diagnosis_id, tenant_id, agent, status, request, result,
+                error, tokens_used, cost_usd, model, created_at, completed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            )
+            ON CONFLICT (diagnosis_id) DO UPDATE SET
+                status       = EXCLUDED.status,
+                request      = EXCLUDED.request,
+                result       = EXCLUDED.result,
+                error        = EXCLUDED.error,
+                tokens_used  = EXCLUDED.tokens_used,
+                cost_usd     = EXCLUDED.cost_usd,
+                model        = EXCLUDED.model,
+                completed_at = EXCLUDED.completed_at
+            """,
+            record.diagnosis_id,
+            record.tenant_id,
+            record.agent,
+            record.status.value,
+            record.request,
+            record.result,
+            record.error.model_dump() if record.error else None,
+            record.tokens_used,
+            record.cost_usd,
+            record.model,
+            record.created_at,
+            record.completed_at,
+        )
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM diagnoses WHERE diagnosis_id = $1 AND tenant_id = $2",
+            diagnosis_id,
+            tenant_id,
+        )
+        return _row_to_diagnosis(row) if row else None
+
+    # ------------------------------------------------------------------
     # DR backup/restore (item 26) — delegate to the backend-agnostic
     # orchestration in movate.core.dr_backup (reads/writes only through this
     # Protocol's methods, so the snapshot round-trips across all backends).
@@ -1003,6 +1435,88 @@ class PostgresProvider:
         from movate.core.dr_backup import import_state  # noqa: PLC0415
 
         return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events). ``data``
+    # round-trips as JSONB via the per-connection codec registered in
+    # ``_init_connection`` — handler passes/receives plain dicts.
+    # Tenant-scoped on every read.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        await self._db.execute(
+            "INSERT INTO events (id, tenant_id, kind, subject, data, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event.id,
+            event.tenant_id,
+            event.kind,
+            event.subject,
+            event.data,
+            event.created_at,
+        )
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        clauses: list[str] = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if since is not None:
+            params.append(since)
+            clauses.append(f"created_at >= ${len(params)}")
+        if until is not None:
+            params.append(until)
+            clauses.append(f"created_at < ${len(params)}")
+        if kind is not None:
+            params.append(kind)
+            clauses.append(f"kind = ${len(params)}")
+        if subject is not None:
+            params.append(subject)
+            clauses.append(f"subject = ${len(params)}")
+        # Cursor pagination — resolve the cursor row's (created_at, id)
+        # so the comparison is stable when multiple events share a
+        # timestamp (id as tie-breaker). Tenant-scoped cursor lookup so
+        # an after_id from another tenant silently falls back to "from
+        # the beginning" (no existence leak).
+        if after_id is not None:
+            cursor_at = await self._db.fetchval(
+                "SELECT created_at FROM events WHERE id = $1 AND tenant_id = $2",
+                after_id,
+                tenant_id,
+            )
+            if cursor_at is not None:
+                params.append(cursor_at)
+                ts_idx = len(params)
+                params.append(after_id)
+                id_idx = len(params)
+                clauses.append(f"(created_at, id) > (${ts_idx}, ${id_idx})")
+        params.append(limit)
+        limit_idx = len(params)
+        sql = (
+            "SELECT id, tenant_id, kind, subject, data, created_at "
+            "FROM events WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY created_at ASC, id ASC LIMIT ${limit_idx}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [
+            Event(
+                id=r["id"],
+                tenant_id=r["tenant_id"],
+                kind=r["kind"],
+                subject=r["subject"],
+                data=r["data"] or {},
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Runs
@@ -1150,6 +1664,90 @@ class PostgresProvider:
         )
         return _row_to_eval(row) if row else None
 
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — append-only.
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        # INSERT-only (never UPDATE / ON CONFLICT): a re-run for the same day
+        # appends a new row keyed by the unique ``id``; reads take the latest.
+        # The four JSON columns serialize via the connection-level json codec.
+        await self._db.execute(
+            """
+            INSERT INTO observability_insights (
+                id, tenant_id, project_id, date, health_score,
+                anomalies, top_failures, usage_rollup, trends,
+                narrative_digest, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            """,
+            insight.id,
+            insight.tenant_id,
+            insight.project_id,
+            insight.date,
+            insight.health_score,
+            insight.anomalies,
+            insight.top_failures,
+            insight.usage_rollup,
+            insight.trends,
+            insight.narrative_digest,
+            insight.created_at,
+        )
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        # Latest-per-day: ORDER BY created_at DESC LIMIT 1 collapses append-only
+        # re-runs to the newest row. tenant_id in WHERE is the no-leak gate.
+        row = await self._db.fetchrow(
+            """
+            SELECT * FROM observability_insights
+            WHERE tenant_id = $1 AND project_id = $2 AND date = $3
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            tenant_id,
+            project_id,
+            day,
+        )
+        return _row_to_insight(row) if row else None
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        # DISTINCT ON (project_id, date) collapses append-only re-runs to the
+        # latest row per day server-side (Postgres-specific), then we re-sort
+        # the deduped set newest-day-first and cap to ``limit``.
+        clauses = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if project_id is not None:
+            params.append(project_id)
+            clauses.append(f"project_id = ${len(params)}")
+        if since is not None:
+            params.append(since)
+            clauses.append(f"date >= ${len(params)}")
+        if until is not None:
+            params.append(until)
+            clauses.append(f"date <= ${len(params)}")
+        params.append(limit)
+        where = " AND ".join(clauses)
+        sql = f"""
+            SELECT * FROM (
+                SELECT DISTINCT ON (project_id, date) *
+                FROM observability_insights
+                WHERE {where}
+                ORDER BY project_id, date, created_at DESC
+            ) latest
+            ORDER BY date DESC
+            LIMIT ${len(params)}
+        """
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_insight(r) for r in rows]
+
     async def list_evals(
         self,
         *,
@@ -1227,6 +1825,67 @@ class PostgresProvider:
         sql = f"SELECT * FROM bench {where} ORDER BY created_at DESC LIMIT ${len(params)}"
         rows = await self._db.fetch(sql, *params)
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Audit records (Claude-orchestrated read-only audit pipeline). See
+    # base.py for the read-only contract — this provider's writes are
+    # gated to ``save_audit`` only.
+    # ------------------------------------------------------------------
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO audits (
+                audit_id, tenant_id, scope_kind, scope_id, categories,
+                severity_floor, model, budget_usd, findings, partial,
+                tokens_used, cost_usd, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+            )
+            """,
+            a.audit_id,
+            a.tenant_id,
+            a.scope_kind,
+            a.scope_id,
+            a.categories,
+            a.severity_floor.value,
+            a.model,
+            a.budget_usd,
+            [f.model_dump() for f in a.findings],
+            a.partial,
+            a.tokens_used,
+            a.cost_usd,
+            a.created_at,
+        )
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM audits WHERE audit_id = $1 AND tenant_id = $2",
+            audit_id,
+            tenant_id,
+        )
+        return _row_to_audit(row) if row else None
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            params.append(tenant_id)
+            clauses.append(f"tenant_id = ${len(params)}")
+        if scope_id is not None:
+            params.append(scope_id)
+            clauses.append(f"scope_id = ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        sql = f"SELECT * FROM audits {where} ORDER BY created_at DESC LIMIT ${len(params)}"
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_audit(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Eval schedules (ADR 016 D2)
@@ -1794,6 +2453,765 @@ class PostgresProvider:
             )
         # asyncpg returns a command tag like "DELETE <n>".
         return int(status.split()[-1])
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040)
+    # ------------------------------------------------------------------
+
+    async def create_project(self, project: Project) -> Project:
+        try:
+            await self._db.execute(
+                """
+                INSERT INTO projects (
+                    project_id, tenant_id, name, description,
+                    owner_principal_id, created_at, updated_at, archived_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                project.project_id,
+                project.tenant_id,
+                project.name,
+                project.description,
+                project.owner_principal_id,
+                project.created_at,
+                project.updated_at,
+                project.archived_at,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(
+                f"project ({project.tenant_id!r}, {project.name!r}) already exists"
+            ) from exc
+        return project
+
+    async def get_project(self, tenant_id: str, project_id: str) -> Project | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM projects WHERE project_id = $1 AND tenant_id = $2",
+            project_id,
+            tenant_id,
+        )
+        return _row_to_project(row) if row else None
+
+    async def get_project_by_name(self, tenant_id: str, name: str) -> Project | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM projects WHERE tenant_id = $1 AND name = $2",
+            tenant_id,
+            name,
+        )
+        return _row_to_project(row) if row else None
+
+    async def list_projects(
+        self,
+        tenant_id: str,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> list[Project]:
+        clauses = ["tenant_id = $1"]
+        params: list[object] = [tenant_id]
+        if not include_archived:
+            clauses.append("archived_at IS NULL")
+        if after_id is not None:
+            cursor_row = await self._db.fetchrow(
+                "SELECT created_at, project_id FROM projects WHERE project_id = $1",
+                after_id,
+            )
+            if cursor_row is not None:
+                params.append(cursor_row["created_at"])
+                params.append(cursor_row["project_id"])
+                clauses.append(f"(created_at, project_id) < (${len(params) - 1}, ${len(params)})")
+        params.append(limit)
+        sql = (
+            "SELECT * FROM projects WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY created_at DESC, project_id DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_project(r) for r in rows]
+
+    async def update_project(
+        self,
+        tenant_id: str,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Project | None:
+        if name is None and description is None:
+            return await self.get_project(tenant_id, project_id)
+        sets = ["updated_at = $1"]
+        params: list[object] = [datetime.now(UTC)]
+        if name is not None:
+            params.append(name)
+            sets.append(f"name = ${len(params)}")
+        if description is not None:
+            params.append(description)
+            sets.append(f"description = ${len(params)}")
+        params.append(project_id)
+        params.append(tenant_id)
+        sql = (
+            f"UPDATE projects SET {', '.join(sets)} "
+            f"WHERE project_id = ${len(params) - 1} AND tenant_id = ${len(params)}"
+        )
+        try:
+            status = await self._db.execute(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(
+                f"project name {name!r} already exists in tenant {tenant_id!r}"
+            ) from exc
+        # asyncpg returns "UPDATE <n>" — int 0 means no row matched.
+        if int(status.split()[-1]) == 0:
+            return None
+        return await self.get_project(tenant_id, project_id)
+
+    async def archive_project(self, tenant_id: str, project_id: str) -> bool:
+        existing = await self.get_project(tenant_id, project_id)
+        if existing is None:
+            return False
+        if existing.name == _DEFAULT_PROJECT_NAME:
+            raise ValueError(f"default project for tenant {tenant_id!r} cannot be archived")
+        if existing.archived_at is not None:
+            return False
+        now = datetime.now(UTC)
+        status = await self._db.execute(
+            "UPDATE projects SET archived_at = $1, updated_at = $1 "
+            "WHERE project_id = $2 AND tenant_id = $3 AND archived_at IS NULL",
+            now,
+            project_id,
+            tenant_id,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        role: ProjectMemberRole,
+        added_by: str,
+    ) -> None:
+        try:
+            await self._db.execute(
+                "INSERT INTO project_members "
+                "(project_id, principal_id, role, added_by, added_at) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                project_id,
+                principal_id,
+                role.value,
+                added_by,
+                datetime.now(UTC),
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(f"member {principal_id!r} already on project {project_id!r}") from exc
+
+    async def list_project_members(self, project_id: str) -> list[ProjectMember]:
+        rows = await self._db.fetch(
+            "SELECT * FROM project_members WHERE project_id = $1 "
+            "ORDER BY added_at ASC, principal_id ASC",
+            project_id,
+        )
+        return [_row_to_project_member(r) for r in rows]
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+        *,
+        role: ProjectMemberRole,
+    ) -> ProjectMember | None:
+        status = await self._db.execute(
+            "UPDATE project_members SET role = $1 WHERE project_id = $2 AND principal_id = $3",
+            role.value,
+            project_id,
+            principal_id,
+        )
+        if int(status.split()[-1]) == 0:
+            return None
+        return await self.get_project_member(project_id, principal_id)
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_members WHERE project_id = $1 AND principal_id = $2",
+            project_id,
+            principal_id,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def get_project_member(
+        self,
+        project_id: str,
+        principal_id: str,
+    ) -> ProjectMember | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM project_members WHERE project_id = $1 AND principal_id = $2",
+            project_id,
+            principal_id,
+        )
+        return _row_to_project_member(row) if row else None
+
+    async def attach_agent_to_project(self, project_id: str, agent_name: str) -> None:
+        await self._db.execute(
+            "INSERT INTO project_agents (project_id, agent_name, added_at) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            project_id,
+            agent_name,
+            datetime.now(UTC),
+        )
+
+    async def detach_agent_from_project(self, project_id: str, agent_name: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_agents WHERE project_id = $1 AND agent_name = $2",
+            project_id,
+            agent_name,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def list_project_agents(self, project_id: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT agent_name FROM project_agents WHERE project_id = $1 "
+            "ORDER BY added_at ASC, agent_name ASC",
+            project_id,
+        )
+        return [r["agent_name"] for r in rows]
+
+    async def list_projects_for_agent(self, tenant_id: str, agent_name: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT pa.project_id FROM project_agents pa "
+            "JOIN projects p ON p.project_id = pa.project_id "
+            "WHERE p.tenant_id = $1 AND pa.agent_name = $2 "
+            "ORDER BY pa.added_at ASC, pa.project_id ASC",
+            tenant_id,
+            agent_name,
+        )
+        if rows:
+            return [r["project_id"] for r in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_workflow_to_project(self, project_id: str, workflow_name: str) -> None:
+        await self._db.execute(
+            "INSERT INTO project_workflows (project_id, workflow_name, added_at) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            project_id,
+            workflow_name,
+            datetime.now(UTC),
+        )
+
+    async def detach_workflow_from_project(self, project_id: str, workflow_name: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_workflows WHERE project_id = $1 AND workflow_name = $2",
+            project_id,
+            workflow_name,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def list_project_workflows(self, project_id: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT workflow_name FROM project_workflows WHERE project_id = $1 "
+            "ORDER BY added_at ASC, workflow_name ASC",
+            project_id,
+        )
+        return [r["workflow_name"] for r in rows]
+
+    async def list_projects_for_workflow(self, tenant_id: str, workflow_name: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT pw.project_id FROM project_workflows pw "
+            "JOIN projects p ON p.project_id = pw.project_id "
+            "WHERE p.tenant_id = $1 AND pw.workflow_name = $2 "
+            "ORDER BY pw.added_at ASC, pw.project_id ASC",
+            tenant_id,
+            workflow_name,
+        )
+        if rows:
+            return [r["project_id"] for r in rows]
+        default_project = await self.get_or_create_default_project(tenant_id)
+        return [default_project.project_id]
+
+    async def attach_kb_to_project(
+        self,
+        project_id: str,
+        kb_id: str,
+        mode: ProjectKbMode,
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO project_kbs (project_id, kb_id, mode, added_at) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT(project_id, kb_id) DO UPDATE SET mode = EXCLUDED.mode",
+            project_id,
+            kb_id,
+            mode.value,
+            datetime.now(UTC),
+        )
+
+    async def detach_kb_from_project(self, project_id: str, kb_id: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM project_kbs WHERE project_id = $1 AND kb_id = $2",
+            project_id,
+            kb_id,
+        )
+        return int(status.split()[-1]) > 0
+
+    async def list_project_kbs(self, project_id: str) -> list[tuple[str, ProjectKbMode]]:
+        rows = await self._db.fetch(
+            "SELECT kb_id, mode FROM project_kbs WHERE project_id = $1 "
+            "ORDER BY added_at ASC, kb_id ASC",
+            project_id,
+        )
+        return [(r["kb_id"], ProjectKbMode(r["mode"])) for r in rows]
+
+    async def list_projects_for_kb(self, tenant_id: str, kb_id: str) -> list[str]:
+        rows = await self._db.fetch(
+            "SELECT pk.project_id FROM project_kbs pk "
+            "JOIN projects p ON p.project_id = pk.project_id "
+            "WHERE p.tenant_id = $1 AND pk.kb_id = $2 "
+            "ORDER BY pk.added_at ASC, pk.project_id ASC",
+            tenant_id,
+            kb_id,
+        )
+        return [r["project_id"] for r in rows]
+
+    async def get_or_create_default_project(self, tenant_id: str) -> Project:
+        existing = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+        if existing is not None:
+            return existing
+        project = Project(
+            tenant_id=tenant_id,
+            name=_DEFAULT_PROJECT_NAME,
+            description=_DEFAULT_PROJECT_DESCRIPTION,
+            owner_principal_id=_TENANT_SYSTEM_PRINCIPAL,
+        )
+        try:
+            return await self.create_project(project)
+        except ValueError:
+            row = await self.get_project_by_name(tenant_id, _DEFAULT_PROJECT_NAME)
+            assert row is not None  # invariant after race
+            return row
+
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041)
+    # ------------------------------------------------------------------
+
+    async def upsert_catalog_entry(self, entry: CatalogEntry) -> None:
+        _enforce_catalog_namespace(entry.source, entry.tenant_id)
+        tkey = _tenant_key(entry.tenant_id)
+        await self._db.execute(
+            """
+            INSERT INTO catalog_entries (
+                slug, source, tenant_id, tenant_id_key, latest_version,
+                name, title, description, tags, shape, recommended_for,
+                ratings_summary, popularity, synced_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (slug, source, tenant_id_key) DO UPDATE SET
+                latest_version  = EXCLUDED.latest_version,
+                name            = EXCLUDED.name,
+                title           = EXCLUDED.title,
+                description     = EXCLUDED.description,
+                tags            = EXCLUDED.tags,
+                shape           = EXCLUDED.shape,
+                recommended_for = EXCLUDED.recommended_for,
+                ratings_summary = EXCLUDED.ratings_summary,
+                popularity     = EXCLUDED.popularity,
+                synced_at       = EXCLUDED.synced_at
+            """,
+            entry.slug,
+            entry.source.value,
+            entry.tenant_id,
+            tkey,
+            entry.latest_version,
+            entry.name,
+            entry.title,
+            entry.description,
+            list(entry.tags),
+            entry.shape,
+            entry.recommended_for,
+            entry.ratings_summary.model_dump(),
+            entry.popularity,
+            entry.synced_at,
+        )
+
+    async def get_catalog_entry(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> CatalogEntry | None:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        row = await self._db.fetchrow(
+            "SELECT * FROM catalog_entries WHERE slug = $1 AND source = $2 AND tenant_id_key = $3",
+            slug,
+            source.value,
+            tkey,
+        )
+        return _row_to_catalog_entry(row) if row else None
+
+    async def list_catalog_entries(
+        self,
+        tenant_id: str,
+        *,
+        source_filter: CatalogSource | None = None,
+        tag_filter: str | None = None,
+        shape_filter: str | None = None,
+        q: str | None = None,
+        limit: int = 100,
+        after_slug: str | None = None,
+    ) -> list[CatalogEntry]:
+        clauses: list[str] = [
+            "(source = 'movate' OR (source = 'private' AND tenant_id = $1) OR source = 'community')"
+        ]
+        params: list[Any] = [tenant_id]
+
+        def _next() -> str:
+            return f"${len(params) + 1}"
+
+        if source_filter is not None:
+            clauses.append(f"source = {_next()}")
+            params.append(source_filter.value)
+        if shape_filter is not None:
+            clauses.append(f"shape = {_next()}")
+            params.append(shape_filter)
+        if tag_filter is not None:
+            clauses.append(f"tags @> {_next()}::jsonb")
+            params.append(json.dumps([tag_filter]))
+        if q:
+            needle = f"%{q.lower()}%"
+            n = _next()
+            clauses.append(
+                f"(LOWER(name) LIKE {n} OR LOWER(title) LIKE {n} OR LOWER(description) LIKE {n})"
+            )
+            params.append(needle)
+        if after_slug is not None:
+            clauses.append(f"slug > {_next()}")
+            params.append(after_slug)
+
+        sql = (
+            "SELECT * FROM catalog_entries WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY slug ASC LIMIT {_next()}"
+        )
+        params.append(int(limit))
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_catalog_entry(r) for r in rows]
+
+    async def get_catalog_entry_versions(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> list[CatalogEntryVersion]:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return []
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        rows = await self._db.fetch(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = $1 AND source = $2 AND tenant_id_key = $3 "
+            "ORDER BY published_at DESC",
+            slug,
+            source.value,
+            tkey,
+        )
+        return [_row_to_catalog_entry_version(r) for r in rows]
+
+    async def get_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion | None:
+        if source is CatalogSource.PRIVATE and tenant_id is None:
+            return None
+        tkey = _tenant_key(tenant_id if source is CatalogSource.PRIVATE else None)
+        row = await self._db.fetchrow(
+            "SELECT * FROM catalog_entry_versions "
+            "WHERE slug = $1 AND source = $2 AND version = $3 AND tenant_id_key = $4",
+            slug,
+            source.value,
+            version,
+            tkey,
+        )
+        return _row_to_catalog_entry_version(row) if row else None
+
+    async def upsert_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        bundle_tar: bytes,
+        digest: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion:
+        _enforce_catalog_namespace(source, tenant_id)
+        tkey = _tenant_key(tenant_id)
+        now = datetime.now(UTC)
+        row = await self._db.fetchrow(
+            """
+            INSERT INTO catalog_entry_versions (
+                slug, version, source, tenant_id, tenant_id_key,
+                bundle_tar, digest, published_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (slug, source, version, tenant_id_key) DO UPDATE SET
+                bundle_tar = EXCLUDED.bundle_tar,
+                digest     = EXCLUDED.digest
+            RETURNING *
+            """,
+            slug,
+            version,
+            source.value,
+            tenant_id,
+            tkey,
+            bundle_tar,
+            digest,
+            now,
+        )
+        assert row is not None
+        return _row_to_catalog_entry_version(row)
+
+    async def record_catalog_rating(
+        self,
+        slug: str,
+        *,
+        tenant_id: str,
+        source: CatalogSource = CatalogSource.MOVATE,
+        rating: int,
+        comment: str | None = None,
+    ) -> CatalogRatingsSummary:
+        if not (_RATING_MIN <= rating <= _RATING_MAX):
+            raise ValueError("rating must be between 1 and 5")
+        async with self._db.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO catalog_entry_ratings (
+                    slug, source, tenant_id, rating, comment, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (slug, source, tenant_id) DO UPDATE SET
+                    rating     = EXCLUDED.rating,
+                    comment    = EXCLUDED.comment,
+                    created_at = EXCLUDED.created_at
+                """,
+                slug,
+                source.value,
+                tenant_id,
+                int(rating),
+                comment,
+                datetime.now(UTC),
+            )
+            agg = await conn.fetchrow(
+                "SELECT COUNT(*) AS c, AVG(rating)::float AS a FROM catalog_entry_ratings "
+                "WHERE slug = $1 AND source = $2",
+                slug,
+                source.value,
+            )
+            count = int(agg["c"] or 0)
+            avg = float(agg["a"] or 0.0)
+            summary = CatalogRatingsSummary(count=count, avg=avg)
+            await conn.execute(
+                "UPDATE catalog_entries SET ratings_summary = $1 WHERE slug = $2 AND source = $3",
+                summary.model_dump(),
+                slug,
+                source.value,
+            )
+        return summary
+
+    async def get_catalog_sync_watermark(self, source: CatalogSource) -> datetime | None:
+        row = await self._db.fetchrow(
+            "SELECT last_synced_at FROM catalog_sync_watermark WHERE source = $1",
+            source.value,
+        )
+        if row is None:
+            return None
+        ts: datetime = row["last_synced_at"]
+        return ts
+
+    async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO catalog_sync_watermark (source, last_synced_at)
+            VALUES ($1, $2)
+            ON CONFLICT (source) DO UPDATE SET last_synced_at = EXCLUDED.last_synced_at
+            """,
+            source.value,
+            ts,
+        )
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO workflow_bundles (
+                name, tenant_id, version, created_by, content_hash,
+                files, published, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8
+            )
+            """,
+            bundle.name,
+            bundle.tenant_id,
+            bundle.version,
+            bundle.created_by,
+            bundle.content_hash,
+            bundle.files,
+            bundle.published,
+            bundle.created_at,
+        )
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        if version is not None:
+            row = await self._db.fetchrow(
+                "SELECT * FROM workflow_bundles "
+                "WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            row = await self._db.fetchrow(
+                "SELECT * FROM workflow_bundles WHERE name = $1 AND tenant_id = $2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                name,
+                tenant_id,
+            )
+        return _row_to_workflow_bundle(row) if row else None
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        # Latest version per name, newest-first: DISTINCT ON the name picks
+        # each name's most-recent row, then the outer sort orders by that
+        # row's created_at DESC. Mirrors list_agents in postgres.py.
+        if published_only:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (name) * FROM workflow_bundles
+                    WHERE tenant_id = $1
+                      AND name IN (
+                          SELECT DISTINCT name FROM workflow_bundles
+                          WHERE tenant_id = $1 AND published = TRUE
+                      )
+                    ORDER BY name, created_at DESC
+                ) latest
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                limit,
+            )
+        else:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (name) * FROM workflow_bundles
+                    WHERE tenant_id = $1
+                    ORDER BY name, created_at DESC
+                ) latest
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                limit,
+            )
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM workflow_bundles WHERE name = $1 AND tenant_id = $2 "
+            "ORDER BY created_at DESC LIMIT $3",
+            name,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM workflow_bundles ORDER BY tenant_id, name, created_at LIMIT $1",
+            limit,
+        )
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            status = await self._db.execute(
+                "DELETE FROM workflow_bundles WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            status = await self._db.execute(
+                "DELETE FROM workflow_bundles WHERE name = $1 AND tenant_id = $2",
+                name,
+                tenant_id,
+            )
+        return int(status.split()[-1])
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        # ADR 037 D1: at most one published row per (tenant, name). Use a
+        # transaction so the promote + clear-others is atomic — a concurrent
+        # publish can't leave two rows flagged. The exists-probe distinguishes
+        # 404 (no such version) from a successful idempotent re-promote.
+        async with self._db.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT 1 FROM workflow_bundles "
+                "WHERE tenant_id = $1 AND name = $2 AND version = $3",
+                tenant_id,
+                name,
+                version,
+            )
+            if row is None:
+                return False
+            await conn.execute(
+                "UPDATE workflow_bundles SET published = TRUE "
+                "WHERE tenant_id = $1 AND name = $2 AND version = $3",
+                tenant_id,
+                name,
+                version,
+            )
+            await conn.execute(
+                "UPDATE workflow_bundles SET published = FALSE "
+                "WHERE tenant_id = $1 AND name = $2 AND version <> $3",
+                tenant_id,
+                name,
+                version,
+            )
+            return True
 
     # ------------------------------------------------------------------
     # Workflow runs
@@ -3097,10 +4515,346 @@ class PostgresProvider:
         )
         return status.endswith(" 1") if isinstance(status, str) else False
 
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery). ``secret``
+    # is stored verbatim so the worker can re-sign every outbound POST
+    # (echoed on the wire only on the create response). ``kind_filter``
+    # round-trips through the JSONB codec registered in
+    # ``_init_connection`` — handler passes/receives plain Python lists.
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        await self._db.execute(
+            "INSERT INTO webhooks "
+            "(id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            sub.id,
+            sub.tenant_id,
+            sub.url,
+            sub.kind_filter,
+            sub.secret,
+            sub.enabled,
+            sub.failure_count,
+            sub.created_at,
+        )
+        return sub
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        clauses: list[str] = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if enabled_only:
+            clauses.append("enabled = TRUE")
+        sql = (
+            "SELECT id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at "
+            "FROM webhooks WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC, id ASC"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_webhook(r) for r in rows]
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        row = await self._db.fetchrow(
+            "SELECT id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at "
+            "FROM webhooks WHERE id = $1 AND tenant_id = $2",
+            webhook_id,
+            tenant_id,
+        )
+        return _row_to_webhook(row) if row is not None else None
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        if enabled is None and failure_count is None:
+            return await self.get_webhook(tenant_id, webhook_id)
+        sets: list[str] = []
+        params: list[Any] = []
+        if enabled is not None:
+            params.append(enabled)
+            sets.append(f"enabled = ${len(params)}")
+        if failure_count is not None:
+            params.append(failure_count)
+            sets.append(f"failure_count = ${len(params)}")
+        params.append(webhook_id)
+        id_idx = len(params)
+        params.append(tenant_id)
+        tenant_idx = len(params)
+        await self._db.execute(
+            f"UPDATE webhooks SET {', '.join(sets)} "
+            f"WHERE id = ${id_idx} AND tenant_id = ${tenant_idx}",
+            *params,
+        )
+        return await self.get_webhook(tenant_id, webhook_id)
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM webhooks WHERE id = $1 AND tenant_id = $2",
+            webhook_id,
+            tenant_id,
+        )
+        return status.endswith(" 1") if isinstance(status, str) else False
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        await self._db.execute(
+            "INSERT INTO webhook_attempts "
+            "(id, webhook_id, event_id, tenant_id, attempted_at, status_code, "
+            " response_excerpt, error_kind, attempt_n) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            attempt.id,
+            attempt.webhook_id,
+            attempt.event_id,
+            attempt.tenant_id,
+            attempt.attempted_at,
+            attempt.status_code,
+            attempt.response_excerpt,
+            attempt.error_kind,
+            attempt.attempt_n,
+        )
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        clauses: list[str] = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if webhook_id is not None:
+            params.append(webhook_id)
+            clauses.append(f"webhook_id = ${len(params)}")
+        if since is not None:
+            params.append(since)
+            clauses.append(f"attempted_at >= ${len(params)}")
+        params.append(limit)
+        sql = (
+            "SELECT id, webhook_id, event_id, tenant_id, attempted_at, status_code, "
+            "       response_excerpt, error_kind, attempt_n "
+            "FROM webhook_attempts WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY attempted_at DESC, id DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_webhook_attempt(r) for r in rows]
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        # asyncpg.fetchval returns ``Any``; explicit cast keeps mypy happy
+        # without disabling no-any-return wholesale on this file.
+        value = await self._db.fetchval(
+            "SELECT last_event_id FROM webhook_cursors WHERE webhook_id = $1 AND tenant_id = $2",
+            webhook_id,
+            tenant_id,
+        )
+        return value if value is None else str(value)
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        # Postgres ``INSERT ... ON CONFLICT ... DO UPDATE`` upsert. The
+        # cursor is keyed on ``webhook_id``; ``tenant_id`` is
+        # denormalized on the row so a tenant-scoped read stays cheap.
+        await self._db.execute(
+            "INSERT INTO webhook_cursors (webhook_id, tenant_id, last_event_id, updated_at) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (webhook_id) DO UPDATE SET "
+            "  last_event_id = EXCLUDED.last_event_id, "
+            "  updated_at = EXCLUDED.updated_at",
+            webhook_id,
+            tenant_id,
+            last_event_id,
+            datetime.now(UTC),
+        )
+
+    # Eval-generation jobs (``mdk eval generate``)
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: Any) -> None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        assert isinstance(job, EvalGenerationJob)
+        # The JSONB codec on the pool round-trips dict ↔ JSONB, but
+        # `categories` is a list — asyncpg's JSONB encoder handles lists
+        # too via json.dumps. ``created_at`` / ``completed_at`` arrive
+        # as ISO strings from the EvalGenerationJob dataclass (it's
+        # frozen + json-safe); we cast to datetime so TIMESTAMPTZ accepts
+        # them. NULL preserved when absent.
+        created_at = _parse_iso(job.created_at) if job.created_at else datetime.now(UTC)
+        completed_at = _parse_iso(job.completed_at) if job.completed_at else None
+        await self._db.execute(
+            """
+            INSERT INTO eval_generation_jobs (
+                job_id, tenant_id, agent_name, status, description,
+                count_requested, categories, include_judge, model,
+                budget_usd, progress, result, error, tokens_used,
+                cost_usd, created_at, completed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17
+            )
+            ON CONFLICT (job_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                progress = EXCLUDED.progress,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                tokens_used = EXCLUDED.tokens_used,
+                cost_usd = EXCLUDED.cost_usd,
+                completed_at = EXCLUDED.completed_at
+            """,
+            job.job_id,
+            job.tenant_id,
+            job.agent_name,
+            job.status,
+            job.description,
+            job.count,
+            list(job.categories),
+            job.include_judge,
+            job.model,
+            job.budget_usd,
+            job.progress,
+            job.result,
+            job.error,
+            job.tokens_used,
+            job.cost_usd,
+            created_at,
+            completed_at,
+        )
+
+    async def get_eval_generation_job(self, job_id: str, *, tenant_id: str) -> Any | None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        row = await self._db.fetchrow(
+            "SELECT * FROM eval_generation_jobs WHERE job_id = $1 AND tenant_id = $2",
+            job_id,
+            tenant_id,
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        return EvalGenerationJob(
+            job_id=d["job_id"],
+            tenant_id=d["tenant_id"],
+            agent_name=d["agent_name"],
+            status=d["status"],
+            description=d["description"],
+            count=d["count_requested"],
+            categories=list(d["categories"] or []),
+            include_judge=d["include_judge"],
+            model=d["model"],
+            budget_usd=d["budget_usd"],
+            progress=d["progress"],
+            result=d.get("result"),
+            error=d.get("error"),
+            tokens_used=d["tokens_used"],
+            cost_usd=d["cost_usd"],
+            created_at=d["created_at"].isoformat() if d.get("created_at") else "",
+            completed_at=d["completed_at"].isoformat() if d.get("completed_at") else None,
+        )
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Any,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> Any:
+        from pathlib import Path  # noqa: PLC0415
+
+        from movate.core.eval_generator import serialize_case_for_dataset  # noqa: PLC0415
+        from movate.storage.base import EvalCommitResult  # noqa: PLC0415
+
+        job = await self.get_eval_generation_job(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise FileNotFoundError(f"eval-generation job {job_id!r} not found")
+        if job.result is None:
+            raise ValueError(f"job {job_id!r} status={job.status!r} — no result to commit")
+        cases = list(job.result.get("cases") or [])
+        if case_ids is not None:
+            wanted = set(case_ids)
+            cases = [c for c in cases if c.get("id") in wanted]
+
+        agent_dir = Path(agents_path) / job.agent_name
+        if not agent_dir.is_dir():
+            raise FileNotFoundError(f"agent dir not found: {agent_dir}")
+        evals_dir = agent_dir / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+        dataset = evals_dir / "dataset.jsonl"
+        prior = dataset.read_bytes() if dataset.exists() else b""
+        if prior and not prior.endswith(b"\n"):
+            prior = prior + b"\n"
+        with dataset.open("wb") as fh:
+            fh.write(prior)
+            for case in cases:
+                fh.write(serialize_case_for_dataset(case))
+
+        judge_updated = False
+        if commit_judge:
+            judge_blob = job.result.get("judge_yaml")
+            if isinstance(judge_blob, str) and judge_blob.strip():
+                (evals_dir / "judge.yaml").write_text(judge_blob, encoding="utf-8")
+                judge_updated = True
+
+        return EvalCommitResult(
+            agent_name=job.agent_name,
+            dataset_path=str(dataset.relative_to(agent_dir.parent)),
+            cases_added=len(cases),
+            judge_yaml_updated=judge_updated,
+        )
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse a stored ISO-8601 timestamp back into a tz-aware ``datetime``.
+
+    Used by the eval-generation save path: the
+    :class:`EvalGenerationJob` dataclass carries created_at / completed_at
+    as ISO strings (it's serializable through the JSONB result blob), but
+    the postgres column is ``TIMESTAMPTZ`` which asyncpg wants as a
+    ``datetime``. Accepts both ``...Z`` and ``+00:00`` suffixes.
+    """
+    s = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
 
 # ---------------------------------------------------------------------------
 # Row → model converters
 # ---------------------------------------------------------------------------
+
+
+def _row_to_webhook(row: asyncpg.Record) -> WebhookSubscription:
+    return WebhookSubscription(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        url=row["url"],
+        # JSONB codec decoded this to a Python list already.
+        kind_filter=list(row["kind_filter"] or []),
+        secret=row["secret"],
+        enabled=bool(row["enabled"]),
+        failure_count=row["failure_count"] or 0,
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_webhook_attempt(row: asyncpg.Record) -> WebhookAttempt:
+    return WebhookAttempt(
+        id=row["id"],
+        webhook_id=row["webhook_id"],
+        event_id=row["event_id"],
+        tenant_id=row["tenant_id"],
+        attempted_at=row["attempted_at"],
+        status_code=row["status_code"],
+        response_excerpt=row["response_excerpt"],
+        error_kind=row["error_kind"],
+        attempt_n=row["attempt_n"],
+    )
 
 
 def _row_to_run(row: asyncpg.Record) -> RunRecord:
@@ -3148,6 +4902,29 @@ def _row_to_thread(row: asyncpg.Record) -> ConversationThread:
     )
 
 
+def _row_to_diagnosis(row: asyncpg.Record) -> DiagnosisRecord:
+    request_blob = row["request"]
+    result_blob = row["result"]
+    error_blob = row["error"]
+    error_obj: ErrorInfo | None = None
+    if error_blob is not None:
+        error_obj = ErrorInfo.model_validate(dict(error_blob))
+    return DiagnosisRecord(
+        diagnosis_id=row["diagnosis_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        status=DiagnosisStatus(row["status"]),
+        request=dict(request_blob) if request_blob else {},
+        result=dict(result_blob) if result_blob is not None else None,
+        error=error_obj,
+        tokens_used=row["tokens_used"] or 0,
+        cost_usd=float(row["cost_usd"] or 0.0),
+        model=row["model"] or "",
+        created_at=row["created_at"],
+        completed_at=row["completed_at"],
+    )
+
+
 def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
     return BenchRecord(
         bench_id=row["bench_id"],
@@ -3160,6 +4937,24 @@ def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
         runs_per_model=row["runs_per_model"],
         gate_mode=row["gate_mode"],
         models=[BenchModelResult.model_validate(m) for m in row["models"]],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_audit(row: asyncpg.Record) -> AuditRecord:
+    return AuditRecord(
+        audit_id=row["audit_id"],
+        tenant_id=row["tenant_id"],
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        categories=list(row["categories"]),
+        severity_floor=AuditFindingSeverity(row["severity_floor"]),
+        model=row["model"],
+        budget_usd=float(row["budget_usd"]),
+        findings=[AuditFinding.model_validate(f) for f in row["findings"]],
+        partial=bool(row["partial"]),
+        tokens_used=int(row["tokens_used"]),
+        cost_usd=float(row["cost_usd"]),
         created_at=row["created_at"],
     )
 
@@ -3255,6 +5050,127 @@ def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
         created_by=row["created_by"],
         content_hash=row["content_hash"],
         files=dict(row["files"]),
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_project(row: asyncpg.Record) -> Project:
+    return Project(
+        project_id=row["project_id"],
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        description=row["description"],
+        owner_principal_id=row["owner_principal_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        archived_at=row["archived_at"],
+    )
+
+
+def _row_to_project_member(row: asyncpg.Record) -> ProjectMember:
+    return ProjectMember(
+        project_id=row["project_id"],
+        principal_id=row["principal_id"],
+        role=ProjectMemberRole(row["role"]),
+        added_by=row["added_by"],
+        added_at=row["added_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agent catalog (ADR 041) — row converters + namespace invariant
+# ---------------------------------------------------------------------------
+
+
+_RATING_MIN = 1
+_RATING_MAX = 5
+
+
+def _tenant_key(tenant_id: str | None) -> str:
+    """Public-namespace sentinel so the composite PK uniqueness is enforced
+    even when ``tenant_id`` itself is NULL (Postgres ignores NULL in unique
+    constraints by default)."""
+
+    return tenant_id if tenant_id is not None else "__public__"
+
+
+def _enforce_catalog_namespace(source: CatalogSource, tenant_id: str | None) -> None:
+    """Same invariant the DB CHECK enforces, raised early for a clear error."""
+
+    if source is CatalogSource.PRIVATE:
+        if not tenant_id:
+            raise ValueError("catalog 'private' entries require tenant_id")
+    elif tenant_id is not None:
+        raise ValueError(f"catalog '{source.value}' entries must have tenant_id=None")
+
+
+def _row_to_catalog_entry(row: asyncpg.Record) -> CatalogEntry:
+    raw_summary = row["ratings_summary"]
+    if isinstance(raw_summary, str):
+        raw_summary = json.loads(raw_summary)
+    summary = CatalogRatingsSummary.model_validate(raw_summary or {})
+    raw_tags = row["tags"]
+    if isinstance(raw_tags, str):
+        raw_tags = json.loads(raw_tags)
+    return CatalogEntry(
+        slug=row["slug"],
+        source=CatalogSource(row["source"]),
+        tenant_id=row["tenant_id"],
+        latest_version=row["latest_version"],
+        name=row["name"],
+        title=row["title"],
+        description=row["description"],
+        tags=list(raw_tags or []),
+        shape=row["shape"],
+        recommended_for=row["recommended_for"],
+        ratings_summary=summary,
+        popularity=int(row["popularity"]),
+        synced_at=row["synced_at"],
+    )
+
+
+def _row_to_catalog_entry_version(row: asyncpg.Record) -> CatalogEntryVersion:
+    return CatalogEntryVersion(
+        slug=row["slug"],
+        version=row["version"],
+        source=CatalogSource(row["source"]),
+        tenant_id=row["tenant_id"],
+        bundle_tar=bytes(row["bundle_tar"]),
+        digest=row["digest"],
+        published_at=row["published_at"],
+        deprecated_at=row["deprecated_at"],
+    )
+
+
+def _row_to_insight(row: asyncpg.Record) -> ObservabilityInsight:
+    # The JSONB ↔ dict/list codec (registered in _init_connection) decodes the
+    # four JSON columns; ``date`` / ``created_at`` come back as date/datetime.
+    return ObservabilityInsight(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        date=row["date"],
+        health_score=row["health_score"],
+        anomalies=list(row["anomalies"] or []),
+        top_failures=list(row["top_failures"] or []),
+        usage_rollup=dict(row["usage_rollup"] or {}),
+        trends=dict(row["trends"] or {}),
+        narrative_digest=row["narrative_digest"] or "",
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_workflow_bundle(row: asyncpg.Record) -> WorkflowBundleRecord:
+    # ADR 037 D1 — JSONB ``files`` decoded by the per-connection codec, same
+    # as agent_bundles. ``published`` is a real BOOLEAN column in postgres.
+    return WorkflowBundleRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        files=dict(row["files"]),
+        published=bool(row["published"]),
         created_at=row["created_at"],
     )
 

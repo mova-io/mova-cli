@@ -54,7 +54,14 @@ jobs:
         run: uv lock --check
 
       - name: Sync deps
-        run: uv sync --all-extras --dev
+        # --no-extra airflow: the `airflow` and `playground` extras are
+        # declared conflicting (apache-airflow pins sqlalchemy<2 while
+        # Chainlit's data layer needs sqlalchemy>=2), so `--all-extras`
+        # alone errors. Drop airflow here — its integration tests fake the
+        # `airflow` module rather than importing the real package, so the
+        # suite runs green without it. The playground extra (and its
+        # sqlalchemy 2.x) is what we actually need installed for CI.
+        run: uv sync --all-extras --no-extra airflow --dev
 
       - name: Lint
         run: uv run ruff check src tests
@@ -115,7 +122,10 @@ jobs:
         run: uv python install 3.11
 
       - name: Sync deps
-        run: uv sync --all-extras --dev
+        # --no-extra airflow: airflow/playground are declared conflicting
+        # (sqlalchemy<2 vs >=2); airflow's tests fake the module, so the
+        # suite runs without the real package. See the main test job above.
+        run: uv sync --all-extras --no-extra airflow --dev
 
       - name: Run storage conformance suite + PG-specific tests
         env:

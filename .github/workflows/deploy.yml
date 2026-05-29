@@ -112,7 +112,10 @@ jobs:
         run: uv python install 3.11
 
       - name: Sync deps
-        run: uv sync --all-extras --dev
+        # --no-extra airflow: airflow/playground are declared conflicting
+        # (sqlalchemy<2 vs >=2), so `--all-extras` alone errors. airflow is
+        # an opt-in orchestrator adapter not exercised by the deploy path.
+        run: uv sync --all-extras --no-extra airflow --dev
 
       - name: Hydrate ~/.movate/config.yaml from environment secrets
         env:

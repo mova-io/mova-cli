@@ -1,0 +1,39 @@
+api_version: movate/v1
+kind: Agent
+
+# Participant A — one of the TWO fixed-roster participants in the Simulation
+# pattern. Plays its role for one turn and appends to the transcript.
+name: simulation-participant-a
+version: 0.1.0
+description: Participant A — plays its role for one turn and appends to the transcript.
+owner: ""
+role: participant
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.4
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - pattern:simulation
+  - node:participant
+  - governed

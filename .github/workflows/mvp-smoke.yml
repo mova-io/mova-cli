@@ -53,8 +53,11 @@ jobs:
       - name: Install movate-cli with runtime extra
         # `[runtime]` pulls fastapi/uvicorn/asyncpg/bcrypt/python-multipart
         # — same install path operators use post-PR #80's preflight.
+        # --no-extra airflow: airflow/playground are declared conflicting
+        # (sqlalchemy<2 vs >=2), so `--all-extras` alone errors; airflow
+        # isn't part of the smoke path.
         run: |
-          uv sync --all-extras
+          uv sync --all-extras --no-extra airflow
 
       # -----------------------------------------------------------------
       # The smoke path — each step exits non-zero if any cmd fails.

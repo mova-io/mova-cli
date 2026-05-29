@@ -1,0 +1,2 @@
+{"input": {"scenario": "A customer disputes a duplicate charge; a support agent must resolve it."}, "expected": {"transcript": "SETUP: Customer reports a duplicate $40 charge; support agent to investigate and resolve."}}
+{"input": {"scenario": "Two engineers negotiate the scope of a hotfix under time pressure."}, "expected": {"transcript": "SETUP: A production bug needs a hotfix; two engineers must agree on minimal scope."}}

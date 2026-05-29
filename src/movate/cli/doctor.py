@@ -203,6 +203,12 @@ _TRACING_KEYS = (
     ("OTEL_EXPORTER_OTLP_HEADERS", "OTel headers"),
     ("OTEL_EXPORTER_OTLP_PROTOCOL", "OTel protocol"),
     ("OTEL_SERVICE_NAME", "OTel service.name"),
+    # ADR 039 Phase 2 — opt-in dual export to Movate's central Collector.
+    # Off by default; the dedicated phase-2 row below summarizes overall
+    # state and the per-var rows here let operators see at a glance which
+    # half is set.
+    ("MDK_TELEMETRY_ENDPOINT", "Movate central Collector OTLP endpoint (Phase 2)"),
+    ("MDK_TELEMETRY_CUSTOMER_ID", "opaque customer id (hash) for Phase 2"),
 )
 
 
@@ -472,6 +478,14 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     except Exception as exc:  # pragma: no cover - diagnostic only
         _add("resolved tracer", f"[red]error: {exc}[/red]")
 
+    # ADR 039 Phase 2 — opt-in dual OTLP export to Movate's central
+    # Collector. Off by default; when MDK_TELEMETRY_ENDPOINT is set we
+    # surface the configured endpoint + a short prefix of the customer-id
+    # hash (NEVER the full ID; the hash already obscures the customer
+    # name, and we still avoid printing it in full so a screenshot of
+    # `mdk doctor` doesn't leak it).
+    _render_phase2_telemetry_section(_add)
+
     _add("", "")
 
     # Runtime bearer keys (MDK_<TARGET>_KEY) — presence, source, and the
@@ -584,6 +598,70 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # context is a separate concern), and at least one fixable issue.
     if target is None and (counts["missing"] > 0 or counts["error"] > 0):
         _maybe_offer_fix(no_prompt=no_fix_prompt)
+
+
+def _render_phase2_telemetry_section(_add: Any) -> None:
+    """ADR 039 Phase 2 telemetry doctor check.
+
+    A single row that reports the state of the **opt-in** dual-export
+    feature:
+
+    * ``MDK_TELEMETRY_ENDPOINT`` unset → ``ok (off)``: Phase 2 is disabled
+      and the row is informational. This is the default for every customer
+      deployment.
+    * Endpoint set + ``MDK_TELEMETRY_CUSTOMER_ID`` set → ``ok``: prints the
+      endpoint + an 8-char prefix of the customer-id hash (never the full
+      ID — a screenshot of doctor output should not leak a customer ID even
+      though the value is already hashed by the operator).
+    * Endpoint set + customer-id unset → ⚠ ``missing``: the runtime will
+      log a warning at next provider init and skip Phase 2 (primary export
+      unaffected). Surfaces the misconfig before the operator hits it.
+
+    The check intentionally does **not** probe the Movate endpoint's
+    reachability — that lives behind a cross-tenant network and probing
+    from a customer host would be misleading. The runtime fail-soft path
+    handles unreachability silently.
+    """
+    from movate.tracing.dual_export import (  # noqa: PLC0415 - lazy by design
+        ENV_TELEMETRY_CUSTOMER_ID,
+        ENV_TELEMETRY_ENDPOINT,
+        telemetry_customer_id,
+        telemetry_endpoint,
+    )
+
+    endpoint = telemetry_endpoint()
+    if not endpoint:
+        _add(
+            "phase 2 telemetry",
+            _ok("off")
+            + " [dim](MDK_TELEMETRY_ENDPOINT unset — default; per-tenant export only)[/dim]",
+        )
+        return
+
+    customer = telemetry_customer_id()
+    if not customer:
+        _add(
+            "phase 2 telemetry",
+            _missing(
+                f"endpoint set ({endpoint}) but {ENV_TELEMETRY_CUSTOMER_ID} is unset — "
+                "dual export disabled. Set both, or unset the endpoint to silence this."
+            ),
+        )
+        return
+
+    # Never print the full customer-id, even though it's a hash. 8 chars is
+    # enough to recognize "this is the value I configured" without
+    # publishing the whole identifier into a doctor screenshot.
+    prefix = customer[:8]
+    _add(
+        "phase 2 telemetry",
+        _ok(f"{endpoint} [dim]customer={prefix}…[/dim]"),
+    )
+    _add(
+        "",
+        f"[dim]{ENV_TELEMETRY_ENDPOINT} sends a minimized copy of metrics + spans to "
+        "Movate's Collector (no prompts, no PII; see docs/observability.md).[/dim]",
+    )
 
 
 def _render_runtime_keys_section(_add: Any) -> None:
@@ -1090,7 +1168,20 @@ def _render_explanations() -> None:
         ("Provider API keys", [k for k in EXPLANATIONS if k.endswith("_API_KEY")]),
         (
             "Tracing",
-            [k for k in EXPLANATIONS if k.startswith(("LANGFUSE_", "OTEL_", "MOVATE_TRACER"))],
+            [
+                k
+                for k in EXPLANATIONS
+                if k.startswith(
+                    (
+                        "LANGFUSE_",
+                        "OTEL_",
+                        "MOVATE_TRACER",
+                        "MOVATE_TRACE_SINK",
+                        # ADR 039 Phase 2 — opt-in dual export envs.
+                        "MDK_TELEMETRY_",
+                    )
+                )
+            ],
         ),
         (
             "Storage & project",

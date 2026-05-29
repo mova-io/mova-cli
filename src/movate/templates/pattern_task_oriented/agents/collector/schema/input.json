@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "request": {
+      "type": "string",
+      "description": "The original request."
+    },
+    "task_a_result": {
+      "type": "string",
+      "description": "Output of task branch A."
+    },
+    "task_b_result": {
+      "type": "string",
+      "description": "Output of task branch B."
+    }
+  }
+}

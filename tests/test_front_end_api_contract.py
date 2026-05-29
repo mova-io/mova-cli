@@ -40,6 +40,10 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # init / add — create + catalog the agent
     ("POST", "/api/v1/agents"): "admin",
     ("POST", "/api/v1/agents/from-wizard"): "admin",
+    # ADR 032 D1 — describe-then-preview-then-commit authoring path.
+    # Read-only preview that spends LLM tokens; ``admin`` matches the wizard
+    # create endpoint (the other LLM-spending agent-authoring route).
+    ("POST", "/api/v1/agents/preview"): "admin",
     ("POST", "/api/v1/skills"): "admin",
     ("GET", "/api/v1/agents"): "read",
     ("GET", "/api/v1/agents/{name}"): "read",
@@ -65,12 +69,84 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/agents/{name}/evals"): "eval",
     ("GET", "/api/v1/evals"): "read",
     ("GET", "/api/v1/evals/{eval_id}"): "read",
+    # kb ingest — multipart (existing) + JSON (new modes: text / url /
+    # generated) share this same route + scope (the route dispatches on
+    # Content-Type internally). Pinning it here so a future rename /
+    # scope change is caught by the front-end contract guard.
+    ("POST", "/api/v1/agents/{name}/kb"): "kb:write",
+    # judge engineer — Claude authors a judge.yaml; commit is the
+    # human-review-gated mutation that writes evals/judge.yaml.
+    ("POST", "/api/v1/agents/{name}/judge/generate"): "eval",
+    ("POST", "/api/v1/agents/{name}/judge/commit"): "admin",
+    # eval generator (review-then-commit) — author a dataset from a
+    # plain-English description, stream SSE progress, commit selected
+    # cases atomically to the agent's dataset on disk. The /jobs/{id}
+    # status endpoint (already pinned above) returns the generator
+    # job view when the id is in the eval-generation table.
+    ("POST", "/api/v1/agents/{name}/evals/generate"): "eval",
+    ("GET", "/api/v1/jobs/{job_id}/stream"): "read",
+    ("POST", "/api/v1/jobs/{job_id}/commit"): "admin",
+    # ADR 043 D1 — Failure Pattern Diagnoser (read-only diagnose phase).
+    ("POST", "/api/v1/agents/{name}/diagnose"): "eval",
+    ("GET", "/api/v1/diagnoses/{diagnosis_id}"): "read",
     # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
     ("GET", "/api/v1/report"): "read",
     ("GET", "/api/v1/agents/{name}/metrics"): "read",
+    # usage metering (ADR 036 D1) — per-tenant billing-visibility rollup
+    ("GET", "/api/v1/usage"): "read",
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
+    # graph (ADR 046) — the sigma.js knowledge-graph explorer. All read.
+    ("GET", "/api/v1/projects/{project_id}/graph"): "read",
+    ("GET", "/api/v1/projects/{project_id}/graph/stream"): "read",
+    ("GET", "/api/v1/graph/nodes/{node_id}"): "read",
+    ("GET", "/api/v1/graph/nodes/{node_id}/neighbors"): "read",
+    ("GET", "/api/v1/graph/search"): "read",
+    ("POST", "/api/v1/graph/query"): "read",
+    # observability intelligence (ADR 047) — read feed/health/ask/troubleshoot
+    # + the admin-only on-demand analyst trigger.
+    ("GET", "/api/v1/observability/insights"): "read",
+    ("GET", "/api/v1/observability/health"): "read",
+    ("POST", "/api/v1/observability/ask"): "read",
+    ("POST", "/api/v1/observability/troubleshoot"): "read",
+    ("POST", "/api/v1/observability/analyze"): "admin",
+    # events — ADR 035 D1 events outbox (read-only feed)
+    ("GET", "/api/v1/events"): "read",
+    # projects (ADR 040) — tenant-scoped containers + membership.
+    # Create/update/archive + member-mutations: ``admin`` scope OR the
+    # project ``owner`` role (the role check is per-request in the
+    # handler; the scope gate pinned here is the static signal the
+    # contract test can read off the route).
+    ("POST", "/api/v1/projects"): "admin",
+    ("GET", "/api/v1/projects"): "read",
+    ("GET", "/api/v1/projects/{project_id}"): "read",
+    ("PUT", "/api/v1/projects/{project_id}"): None,
+    ("DELETE", "/api/v1/projects/{project_id}"): None,
+    ("GET", "/api/v1/projects/{project_id}/members"): "read",
+    ("POST", "/api/v1/projects/{project_id}/members"): None,
+    ("GET", "/api/v1/projects/{project_id}/members/{principal_id}"): "read",
+    ("PATCH", "/api/v1/projects/{project_id}/members/{principal_id}"): None,
+    ("DELETE", "/api/v1/projects/{project_id}/members/{principal_id}"): None,
+    # ADR 037 D1: workflow definition CRUD/version/publish (parity with agents).
+    ("POST", "/api/v1/workflows"): "admin",
+    ("GET", "/api/v1/workflows"): "read",
+    ("GET", "/api/v1/workflows/{name}"): "read",
+    ("PUT", "/api/v1/workflows/{name}"): "admin",
+    ("DELETE", "/api/v1/workflows/{name}"): "admin",
+    ("GET", "/api/v1/workflows/{name}/versions"): "read",
+    ("POST", "/api/v1/workflows/{name}/validate"): "read",
+    ("POST", "/api/v1/workflows/{name}/publish"): "admin",
+    ("POST", "/api/v1/workflows/{name}/revert"): "admin",
+    # webhooks — ADR 035 D2 outbound delivery (CRUD + attempts feed)
+    ("POST", "/api/v1/webhooks"): "admin",
+    ("GET", "/api/v1/webhooks"): "read",
+    ("GET", "/api/v1/webhooks/{webhook_id}"): "read",
+    ("PATCH", "/api/v1/webhooks/{webhook_id}"): "admin",
+    ("DELETE", "/api/v1/webhooks/{webhook_id}"): "admin",
+    ("GET", "/api/v1/webhooks/{webhook_id}/attempts"): "read",
+    # events — ADR 035 D3 SSE event stream (read-only push)
+    ("GET", "/api/v1/events/stream"): "read",
 }
 
 
@@ -167,6 +243,53 @@ def test_generated_openapi_exposes_front_end_paths(app) -> None:
         if entry is None or method.lower() not in entry:
             missing.append(f"{method} {path}")
     assert not missing, f"OpenAPI spec missing front-end paths/methods: {missing}"
+
+
+def test_kb_ingest_exposes_three_json_modes(app) -> None:
+    """``POST /api/v1/agents/{name}/kb`` retains its multipart contract AND
+    exposes three additive JSON ingest kinds (``text``/``url``/``generated``).
+
+    Pins the load-bearing request-schema shapes so an accidental rename
+    of a discriminator field — or an accidental REMOVAL of one of the
+    kinds — surfaces here, alongside the route/scope guards above.
+    The route + scope contract (one ``POST`` with ``kb:write``) is
+    unchanged: see the ``EXPECTED_ROUTES`` entry for ``/api/v1/agents/
+    {name}/kb``.
+    """
+    schemas = app.openapi()["components"]["schemas"]
+
+    # All three JSON-mode request bodies are advertised by the spec.
+    for cls in ("KbIngestTextRequest", "KbIngestUrlRequest", "KbIngestGeneratedRequest"):
+        assert cls in schemas, f"missing JSON ingest schema: {cls}"
+
+    # Each carries its discriminator literal + required fields.
+    text_props = schemas["KbIngestTextRequest"]["properties"]
+    assert text_props["kind"].get("const") == "text" or text_props["kind"].get("enum") == ["text"]
+    assert {"title", "content"}.issubset(set(text_props))
+    assert set(schemas["KbIngestTextRequest"].get("required", [])) >= {"title", "content"}
+
+    url_props = schemas["KbIngestUrlRequest"]["properties"]
+    assert url_props["kind"].get("const") == "url" or url_props["kind"].get("enum") == ["url"]
+    assert {"url", "crawl", "max_pages"}.issubset(set(url_props))
+
+    gen_props = schemas["KbIngestGeneratedRequest"]["properties"]
+    assert gen_props["kind"].get("const") == "generated" or gen_props["kind"].get("enum") == [
+        "generated"
+    ]
+    assert {"title", "description"}.issubset(set(gen_props))
+
+    # The response advertises the additive JSON-mode fields so the
+    # Angular client codegens types for them.
+    view_props = schemas["KbIngestView"]["properties"]
+    for field in (
+        "ingest_id",
+        "kind",
+        "chunks_added",
+        "tokens_in",
+        "embedding_cost_usd",
+        "generated_content",
+    ):
+        assert field in view_props, f"KbIngestView missing additive field: {field}"
 
 
 def test_wizard_create_is_structured_not_llm(app) -> None:

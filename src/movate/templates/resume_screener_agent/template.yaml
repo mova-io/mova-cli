@@ -1,0 +1,8 @@
+title: Resume screener
+description: Job description plus resume to a match score, strengths, gaps, and interview questions.
+shape: agent
+tags:
+  - hr
+  - scoring
+  - structured-output
+recommended_for: Comparing a resume against a JD on a fixed rubric for screener-stage hiring.

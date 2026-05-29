@@ -1,0 +1,33 @@
+# =============================================================================
+# Monitor pattern — sample schedule / trigger wiring (ADR 017 D2)
+# =============================================================================
+# The Monitor pattern is meant to run on a cadence (or on an event). mdk does
+# this with the GENERIC scheduler/trigger primitives — there is no bespoke
+# monitor daemon. Schedules/triggers are created via the CLI (they persist in
+# .mdk state), so this file is REFERENCE, not a loaded config. Copy the command
+# that fits your deployment.
+#
+# Reference shape (mirrors the Schedule model fields):
+schedule:
+  name: monitor-every-5m
+  kind: workflow
+  target: monitor            # the scaffolded workflow's name
+  cadence_seconds: 300       # run the tick → enqueue every 5 minutes
+  enabled: true
+  input:
+    signal: "<your latest signal reading>"   # the workflow's initial_state
+
+# Create it (cadence-driven):
+#   mdk schedule set monitor --kind workflow --cadence 5m \
+#     --input '{"signal": "<latest reading>"}'
+#
+# Then run the tick from any external cron (a Container Apps Job on Azure, or a
+# crontab line locally) — it enqueues a run for every schedule that is due:
+#   mdk scheduler-tick
+#
+# Event-driven instead of cadence? Use a trigger (fires on a signal rather than
+# a clock):
+#   mdk trigger create monitor --kind workflow \
+#     --input-defaults '{"signal": "<latest reading>"}'
+#
+# See: mdk schedule --help , mdk trigger --help

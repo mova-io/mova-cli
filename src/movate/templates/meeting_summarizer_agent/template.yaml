@@ -1,0 +1,7 @@
+title: Meeting summarizer
+description: Transcript to decisions, action items, blockers, and follow-ups.
+shape: agent
+tags:
+  - summarization
+  - structured-output
+recommended_for: Turning meeting transcripts into a structured, scannable digest.

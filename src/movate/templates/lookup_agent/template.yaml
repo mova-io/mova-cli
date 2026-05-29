@@ -1,0 +1,8 @@
+title: HTTP lookup agent (REST skill)
+description: User ID plus question to a direct answer. Wired to an HTTP skill (JSONPlaceholder).
+shape: agent
+tags:
+  - tool-use
+  - http-skill
+  - starter
+recommended_for: Learning the HTTP-skill seam — an agent calling a REST API and reasoning over the response.
