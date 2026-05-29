@@ -30,11 +30,27 @@ from movate.scaffold.llm_scaffold import (
     generate_agent_from_description,
     write_agent_files,
 )
+from movate.scaffold.workflow_scaffold import (
+    GeneratedWorkflow,
+    PlannedNode,
+    WorkflowGenerationResult,
+    detect_workflow_shape,
+    generate_workflow_from_description,
+    plan_workflow_graph,
+    write_workflow_files,
+)
 
 __all__ = [
     "GeneratedAgent",
+    "GeneratedWorkflow",
     "GenerationResult",
     "LLMScaffoldError",
+    "PlannedNode",
+    "WorkflowGenerationResult",
+    "detect_workflow_shape",
     "generate_agent_from_description",
+    "generate_workflow_from_description",
+    "plan_workflow_graph",
     "write_agent_files",
+    "write_workflow_files",
 ]
