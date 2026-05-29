@@ -203,13 +203,18 @@ def test_select_backend_sessions_when_advertised() -> None:
 
 
 async def test_client_managed_backend_resends_transcript() -> None:
-    """Client-managed re-sends prior turns + docs in the run input."""
+    """Client-managed re-sends PRIOR turns + the new message in the input.
+
+    Contract: ``state`` holds prior turns only; the current message is
+    passed as ``user_message`` and must NOT be double-counted in the
+    re-sent ``conversation`` block (the caller appends it after).
+    """
     client = _FakeClient()
     backend = ClientManagedBackend(client=client)
     state = ConversationState()
     state.add_user("first question")
     state.add_assistant("first answer", run_id="r0")
-    state.add_user("second question")  # the current turn
+    # NOTE: the current turn is NOT pre-added — the caller appends it after.
 
     result = await backend.send_turn(
         agent="bot",
@@ -222,10 +227,10 @@ async def test_client_managed_backend_resends_transcript() -> None:
     assert result.run_id == "r1"
     assert result.status == "success"
     assert result.output_text == "hi"
-    # The submitted input carried the running transcript.
     submit = next(c for name, c in client.calls if name == "submit_run")
     convo = submit["input"]["conversation"]
-    assert [t["role"] for t in convo] == ["user", "assistant", "user"]
+    # Prior turns only — the new message rides in `message`, not the transcript.
+    assert [t["role"] for t in convo] == ["user", "assistant"]
     assert submit["input"]["message"] == "second question"
 
 

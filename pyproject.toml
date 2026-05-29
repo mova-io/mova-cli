@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.28.1"
+version = "2026.5.28.2"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -251,11 +251,19 @@ playground = [
     # but operators running JUST the playground (no runtime) need it
     # explicitly listed.
     "httpx>=0.27",
-    # aiosqlite backs Chainlit's SQLAlchemy data layer over the
-    # zero-config local SQLite threads DB (~/.mdk/playground/threads.db)
-    # that powers the past-conversations sidebar + resume. Pure-Python,
-    # MIT-licensed. (Postgres deployments use the asyncpg/psycopg Chainlit
-    # already pulls in; only the SQLite default needs this explicitly.)
+    # Chainlit's SQLAlchemyDataLayer (the past-conversations sidebar +
+    # resume) needs SQLAlchemy's async engine — Chainlit declares the data
+    # layer but does not pull SQLAlchemy in itself. ``[asyncio]`` brings
+    # greenlet for the async-driver bridge. MIT-licensed. Floor at 1.4 (the
+    # first release with ``sqlalchemy.ext.asyncio``) so the constraint
+    # stays compatible with the version other extras (e.g. orchestrators /
+    # airflow) already pin — this is an opt-in extra, not a global bump.
+    "sqlalchemy[asyncio]>=1.4",
+    # aiosqlite is the async SQLite driver SQLAlchemy uses for the
+    # zero-config local threads DB (~/.mdk/playground/threads.db) that
+    # powers the past-conversations sidebar + resume. Pure-Python, MIT-
+    # licensed. (Postgres deployments use the asyncpg Chainlit already
+    # pulls in; only the SQLite default needs this explicitly.)
     "aiosqlite>=0.19",
 ]
 

@@ -344,9 +344,12 @@ async def _handle_uploads(message: cl.Message) -> None:
         elements = elements[: caps.max_upload_count]
 
     for el in elements:
-        name = getattr(el, "name", None) or os.path.basename(el.path)
+        # ``path`` is guaranteed non-None by the filter above; bind it to a
+        # str local so the open()/basename calls are type-clean.
+        path = str(el.path)
+        name = getattr(el, "name", None) or os.path.basename(path)
         try:
-            with open(el.path, "rb") as fh:
+            with open(path, "rb") as fh:
                 content = fh.read()
         except OSError as exc:
             await cl.Message(content=f"❌ Could not read {name!r}: {exc}").send()
@@ -506,8 +509,12 @@ async def on_message(message: cl.Message) -> None:
     base_input = _parse_structured_input(user_text)
     # The human-readable message: the JSON itself when structured, else prose.
     display_text = user_text
-    convo.add_user(display_text)
     docs = uploads.context_documents()
+
+    # Contract: the backend receives ``state`` carrying PRIOR turns only +
+    # the new message separately (``user_message``). The current user turn
+    # is appended AFTER the call so it isn't double-counted in the
+    # re-sent transcript. The assistant turn is appended on completion.
 
     # Streaming path — render tokens live as they arrive.
     if caps.run_streaming:
@@ -544,6 +551,9 @@ async def on_message(message: cl.Message) -> None:
     text = result.output_text or "_(no output)_"
     if result.status not in {"success", "unknown"}:
         text = f"⚠ status `{result.status}`\n\n{text}"
+    # Record the completed exchange (user + assistant) for the next turn's
+    # context + feedback attachment.
+    convo.add_user(display_text)
     convo.add_assistant(result.output_text, run_id=result.run_id)
     cl.user_session.set("last_run_id", result.run_id)
 
@@ -576,7 +586,7 @@ async def _run_streaming(
     run_input = build_run_input(
         user_message=user_text,
         base_input=base_input,
-        turns=convo.turns[:-1],  # prior turns only (current user turn already appended)
+        turns=convo.turns,  # prior turns only (current turn appended after)
         documents=docs,
     )
     msg = cl.Message(content="")
@@ -604,8 +614,10 @@ async def _run_streaming(
         return
 
     # Reconstruct the assistant text — prefer the terminal output's text
-    # field; fall back to the concatenated token deltas.
+    # field; fall back to the concatenated token deltas. Record the
+    # completed exchange (user + assistant) now that the turn is done.
     assistant_text = extract_output_text(final_output) or "".join(collected)
+    convo.add_user(user_text)
     convo.add_assistant(assistant_text, run_id=run_id)
     cl.user_session.set("last_run_id", run_id)
     if status not in {"success", "unknown"} and not collected:

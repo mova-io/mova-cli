@@ -3329,7 +3329,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.5.28.1"
+version = "2026.5.28.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -3402,6 +3402,7 @@ playground = [
     { name = "aiosqlite" },
     { name = "chainlit" },
     { name = "httpx" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 prefect = [
     { name = "prefect" },
@@ -3483,6 +3484,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "sentence-transformers", marker = "extra == 'cross-encoder'", specifier = ">=2.7,<4" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'playground'", specifier = ">=1.4" },
     { name = "structlog", specifier = ">=24.1" },
     { name = "typer", specifier = ">=0.12" },
     { name = "types-jsonschema", marker = "extra == 'dev'" },
