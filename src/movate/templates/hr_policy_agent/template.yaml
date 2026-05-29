@@ -1,0 +1,9 @@
+title: HR policy assistant
+description: Employee question to a grounded policy answer with citations and escalation flag.
+shape: agent
+tags:
+  - hr
+  - rag
+  - grounded
+  - citations
+recommended_for: Answering employee policy questions from a multi-format KB (MD, HTML, PDF, DOCX).

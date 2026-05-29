@@ -1,0 +1,2 @@
+{"input": {"topic": "Why short feedback loops matter in software"}, "expected": {"draft": "Short feedback loops let engineers catch mistakes while context is still fresh. They compound: faster iteration uncovers more issues per hour, which sharpens the team's intuition about what to build next."}}
+{"input": {"topic": "The case for walking meetings"}, "expected": {"draft": "Walking meetings replace stale conference rooms with movement and fresh air. They tend to be shorter, more focused, and produce ideas that wouldn't surface in a video grid."}}

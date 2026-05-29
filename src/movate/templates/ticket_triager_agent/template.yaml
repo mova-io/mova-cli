@@ -1,0 +1,8 @@
+title: Support ticket triager
+description: Ticket to category, priority, routing queue, and a draft reply. Multi-field enums.
+shape: agent
+tags:
+  - support
+  - classification
+  - structured-output
+recommended_for: Front-line support routing that needs deterministic priority + a starter reply.

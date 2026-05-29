@@ -1,0 +1,8 @@
+title: Text-to-SQL writer
+description: NL question plus schema to a SQL query and a plain-English explanation.
+shape: agent
+tags:
+  - sql
+  - schema-as-context
+  - structured-output
+recommended_for: Generating read-only SQL for a known schema with an explanation operators can review.

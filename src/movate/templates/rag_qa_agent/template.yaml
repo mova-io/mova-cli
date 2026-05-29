@@ -1,0 +1,9 @@
+title: Grounded Q&A (RAG)
+description: Question plus retrieved context to a grounded answer with citation indices.
+shape: agent
+tags:
+  - rag
+  - q-and-a
+  - grounded
+  - citations
+recommended_for: Answering from a corpus you own, with traceable citations back to source passages.

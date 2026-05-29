@@ -1,0 +1,21 @@
+# ============================================================================
+# Review node — input schema
+# ============================================================================
+# The review node reads `draft` from the workflow state (produced by the
+# upstream draft node). The workflow runner projects state onto this schema
+# automatically.
+
+version: 1
+type: object
+
+title: Review Node Input
+
+fields:
+
+  draft:
+    type: string
+    description: First-pass draft produced by the upstream draft node.
+    example: Outdoors is good for you. Helps sleep and mood.
+
+required:
+  - draft

@@ -1,0 +1,7 @@
+title: Length-bounded summarizer
+description: Text plus a max-word target to a concise summary with a word-count check.
+shape: agent
+tags:
+  - summarization
+  - bounded-output
+recommended_for: Producing short summaries with a strict word budget you can eval against.
