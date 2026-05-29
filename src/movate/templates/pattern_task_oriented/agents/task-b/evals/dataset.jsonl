@@ -1,0 +1,2 @@
+{"input": {"plan": "task-b weighs the laptops for video-editing workloads", "request": "Compare two laptops for video editing."}, "expected": {"task_b_result": "For video editing, Laptop X wins: more RAM and a stronger GPU shorten render times."}}
+{"input": {"plan": "task-b drafts the announcement tweet", "request": "Draft a launch email and a tweet."}, "expected": {"task_b_result": "Big news: our new feature is live. Faster, simpler, and built on your feedback. Try it today!"}}

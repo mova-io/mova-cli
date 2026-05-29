@@ -1,0 +1,2 @@
+{"input": {"request": "Compare two laptops and recommend one for video editing."}, "expected": {"plan": "task-a researches the two laptops' specs; task-b weighs them for video-editing workloads."}}
+{"input": {"request": "Draft a launch email and a tweet for our new feature."}, "expected": {"plan": "task-a drafts the launch email; task-b drafts the announcement tweet."}}

@@ -1,0 +1,21 @@
+# LLM-as-judge for the Chatbot pattern. Rename to ``judge.yaml`` to enable.
+#
+# Exact-match won't work — reply wording varies by run. This rubric scores
+# semantic quality instead. It is also the inline eval-gate the pattern's
+# governance leans on (the run is gated on this score at CI time).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual reply against the expected reply for helpfulness, accuracy,
+  and brevity. Penalize hallucinated facts and over-long answers.
+    1.0 = on-topic, accurate, concise (1-3 sentences for simple asks)
+    0.5 = on-topic but verbose, OR partially correct
+    0.0 = wrong, hallucinated, off-topic, or unsafe
+
+threshold: 0.7

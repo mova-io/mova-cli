@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "plan": {
+      "type": "string",
+      "description": "The supervisor's plan."
+    },
+    "request": {
+      "type": "string",
+      "description": "The original request, for context."
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{"input": {"message": "Hey there! What can you help me with?"}, "expected": {"reply": "Hi! I can answer questions, explain things, and help you think through problems. What's on your mind?"}}
+{"input": {"message": "What's the weather like in Chicago right now?"}, "expected": {"reply": "I don't have access to real-time weather data, so I can't tell you current conditions in Chicago. Try weather.com or your phone's weather app for an up-to-date forecast."}}
+{"input": {"message": "Summarize what a vector database is in one sentence."}, "expected": {"reply": "A vector database stores data as numeric embeddings and retrieves items by similarity, which is what powers semantic search and RAG."}}
+{"input": {"message": "Can you write me a Python one-liner to reverse a string?"}, "expected": {"reply": "Sure: reversed_str = my_string[::-1]"}}
+{"input": {"message": "What's the capital of Australia?"}, "expected": {"reply": "Canberra is the capital of Australia — a common surprise, since many people guess Sydney or Melbourne."}}
+{"input": {"message": "I'm feeling overwhelmed by my to-do list. Any advice?"}, "expected": {"reply": "Try picking just the single most important task and working on it for 25 minutes — momentum on one thing usually makes the rest feel smaller."}}
+{"input": {"message": "What's the current price of Bitcoin?"}, "expected": {"reply": "I don't have access to live market data, so I can't give you the current Bitcoin price. Check a live exchange like Coinbase or a tracker like CoinGecko."}}
+{"input": {"message": "Explain HTTP status code 404 simply."}, "expected": {"reply": "A 404 means the server couldn't find the page or resource you asked for — the address exists but there's nothing there."}}

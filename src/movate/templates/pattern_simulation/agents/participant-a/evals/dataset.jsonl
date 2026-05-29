@@ -1,0 +1,2 @@
+{"input": {"scenario": "A customer disputes a duplicate charge.", "transcript": "SETUP: duplicate $40 charge."}, "expected": {"transcript": "SETUP: duplicate $40 charge.\nA: I see two $40 charges on the same day — I'll check if one is a pending auth."}}
+{"input": {"scenario": "Two engineers negotiate a hotfix scope.", "transcript": "SETUP: production bug, hotfix needed."}, "expected": {"transcript": "SETUP: production bug, hotfix needed.\nA: Let's ship the smallest revert that stops the bleeding, then fix properly."}}

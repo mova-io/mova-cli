@@ -1,0 +1,41 @@
+api_version: movate/v1
+kind: Agent
+
+# SUPERVISOR node of the Task-Oriented pattern. Decomposes the request into the
+# FIXED set of two task branches. Governance: per-run budget cap + token bound.
+name: task-oriented-planner
+version: 0.1.0
+description: Planner/SUPERVISOR — decomposes a request into the fixed, capped task set.
+owner: ""
+role: supervisor
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+# GOVERNANCE: per-branch budget cap. The sum across all four nodes is the
+# workflow's effective ceiling (see GOVERNANCE.md).
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - pattern:task-oriented
+  - node:supervisor
+  - governed

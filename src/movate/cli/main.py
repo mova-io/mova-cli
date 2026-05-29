@@ -225,6 +225,7 @@ from movate.cli.mcp_cmd import mcp_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.models_cmd import models_app  # noqa: E402
 from movate.cli.observability_cmd import observability_app  # noqa: E402
+from movate.cli.patterns_cmd import app as patterns_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
@@ -432,6 +433,9 @@ app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
+# `patterns` surfaces the governed agent-pattern templates (ADR 038) that
+# `mdk init --pattern <name>` scaffolds.
+app.add_typer(patterns_app, name="patterns", rich_help_panel=PANEL_DEVELOP)
 # `catalog` browses + contributes to the agent catalog over the runtime
 # `/api/v1/catalog/...` surface (ADR 041). Lives in DEVELOP next to
 # `templates` since both surface "reusable starters."

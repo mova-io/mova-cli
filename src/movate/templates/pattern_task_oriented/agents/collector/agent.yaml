@@ -1,0 +1,38 @@
+api_version: movate/v1
+kind: Agent
+
+# Collector node — aggregates the two task-branch outputs into the final answer.
+name: task-oriented-collector
+version: 0.1.0
+description: Collector — aggregates the capped task-branch outputs into the final answer.
+owner: ""
+role: collector
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - pattern:task-oriented
+  - node:collector
+  - governed

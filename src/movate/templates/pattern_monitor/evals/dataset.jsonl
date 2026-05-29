@@ -1,0 +1,2 @@
+{"input": {"signal": "Last 5 min: 120 of 1000 requests returned 5xx."}, "expected": {"action_taken": "open-incident: error rate exceeds threshold"}}
+{"input": {"signal": "Queue depth climbed to 4200 messages."}, "expected": {"action_taken": "scale-out: queue depth exceeds threshold"}}

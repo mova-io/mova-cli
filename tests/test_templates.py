@@ -541,9 +541,28 @@ def _bundled_agent_template_dirs() -> list[Path]:
     ``agent.yaml`` — registered shapes, role templates, and any
     reference-only dirs (e.g. ``roles/sql-writer``). Skill (``skill.yaml``)
     and tool (``tool.yaml``) templates are deliberately excluded: the
-    canonical AGENT layout doesn't apply to them."""
+    canonical AGENT layout doesn't apply to them.
+
+    Agent-PATTERN WORKFLOW node agents (``pattern_*/agents/**``, ADR 038) are
+    also excluded: they are constituent NODES of a workflow bundle, not
+    standalone scaffoldable agents, and intentionally use permissive raw JSON
+    Schema (``additionalProperties: true``) so a single mock response can
+    satisfy every node, with the eval-gate + judge at the WORKFLOW level rather
+    than per node. The single-agent ``pattern_chatbot`` (no nested ``agents/``)
+    is a real scaffoldable agent and DOES conform — it is not excluded."""
+
+    def _is_workflow_node_agent(rel_parts: tuple[str, ...]) -> bool:
+        # A workflow-pattern node agent lives at ``pattern_*/agents/<node>/`` —
+        # its relative path has a ``pattern_*`` component AND an ``agents``
+        # component. The single-agent ``pattern_chatbot`` has neither nesting.
+        return any(part.startswith("pattern_") for part in rel_parts) and "agents" in rel_parts
+
     return sorted(
-        (p.parent for p in TEMPLATES_DIR.rglob("agent.yaml")),
+        (
+            p.parent
+            for p in TEMPLATES_DIR.rglob("agent.yaml")
+            if not _is_workflow_node_agent(p.parent.relative_to(TEMPLATES_DIR).parts)
+        ),
         key=lambda d: d.relative_to(TEMPLATES_DIR).as_posix(),
     )
 

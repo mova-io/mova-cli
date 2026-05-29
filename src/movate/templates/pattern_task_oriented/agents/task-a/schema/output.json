@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["task_a_result"],
+  "properties": {
+    "task_a_result": {
+      "type": "string",
+      "description": "Result of task branch A."
+    }
+  }
+}

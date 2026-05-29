@@ -1,0 +1,20 @@
+# LLM-as-judge for the Goal-Oriented workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final ``result`` against the expected result for goal-satisfaction.
+# Used as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final result against the expected result for whether it
+  achieves the stated goal.
+    1.0 = result clearly achieves the goal
+    0.5 = result partially achieves the goal
+    0.0 = result does not achieve the goal, or is off-topic/hallucinated
+
+threshold: 0.7
