@@ -244,3 +244,10 @@ def node(
                 str(p.get("snippet") or "—"),
             )
         console.print(table)
+
+
+# Attach the `mdk graph serve` sigma.js viewer command (#562) onto this group.
+# Imported at the bottom — after `graph_app` is defined — so `movate.cli.graph`
+# can import `graph_app` back from this module without a circular-import error.
+# The import is purely for its registration side effect (`@graph_app.command`).
+from movate.cli import graph as _graph_serve  # noqa: E402,F401
