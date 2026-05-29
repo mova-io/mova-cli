@@ -34,6 +34,11 @@ class ErrorCode(StrEnum):
     # Additive: a NEW stable code, distinct from BAD_REQUEST so a client can
     # special-case "shrink the payload" without string-matching the message.
     PAYLOAD_TOO_LARGE = "payload_too_large"
+    # ADR 036 D2 — per-tenant aggregate quota (tokens / requests / cost over
+    # a billing window) was hit; the request is refused with 429. Distinct
+    # from ``RATE_LIMITED`` (burst requests/sec) so a client can special-case
+    # "you've used your daily / monthly budget" vs "slow down".
+    QUOTA_EXCEEDED = "quota_exceeded"
 
 
 class ErrorBody(BaseModel):

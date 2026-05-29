@@ -79,6 +79,11 @@ from movate.core.provider_keys import (
     mint_tenant_provider_key,
     normalize_provider,
 )
+from movate.core.quotas import (
+    QuotaConfig,
+    RouteClass,
+    load_quota_config,
+)
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.core.reporting import (
     Report,
@@ -131,6 +136,7 @@ from movate.runtime.hardening import (
 from movate.runtime.middleware import (
     AuthContext,
     make_auth_dependency,
+    make_quota_dependency,
     require_scope,
 )
 from movate.runtime.registry import scan_agents
@@ -881,6 +887,24 @@ def _resolve_tenant_rate_limit(explicit: int | None) -> int | None:
             "per-tenant rate limiting stays OFF",
             raw,
         )
+        return None
+
+
+def _resolve_quota_config() -> QuotaConfig | None:
+    """Load the per-tenant quota config at app build time (ADR 036 D2).
+
+    Wraps :func:`load_quota_config` so a malformed ``quotas.yaml`` can't
+    take the runtime down at boot — instead we log loud and degrade open
+    (no enforcement). The CLI's ``mdk tenants quota`` surface uses the
+    bare :func:`load_quota_config` so operator-side misconfig is loud
+    rather than silently swallowed.
+    """
+    try:
+        return load_quota_config()
+    except Exception:
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning("quota_config_load_failed", exc_info=True)
         return None
 
 
@@ -2465,6 +2489,29 @@ def build_app(
     def _scope(*needed: str) -> Any:
         return Depends(require_scope(auth_dep, *needed))
 
+    # Per-tenant quota admission (ADR 036 D2). Opt-in: when no ``quotas.yaml``
+    # is configured (the default), ``quota_config`` is ``None`` and the
+    # dependency below is a pure pass-through — every existing customer sees
+    # byte-for-byte zero behavior change. With a config present, write routes
+    # (``POST`` to /agents-runs / /kb / /evals) gate on the configured daily-
+    # token / daily-request / monthly-cost ceilings, with the per-(tenant,
+    # route_class) decision cached for ``QUOTA_CACHE_TTL_S`` (60s default).
+    # Tests inject a config by monkeypatching ``load_quota_config`` (see
+    # ``tests/test_runtime_quotas_mw.py``).
+    quota_config: QuotaConfig | None = _resolve_quota_config()
+    app.state.quota_config = quota_config
+    _quota_factory = make_quota_dependency(storage, auth_dep, config=quota_config)
+    app.state.quota_factory = _quota_factory
+
+    def _quota(route_class: RouteClass) -> Any:
+        """Per-route quota gate. ``Depends(_quota(RouteClass.RUNS))`` etc.
+
+        Pairs alongside ``_scope("run")`` on the write routes; the two
+        share FastAPI's per-request dependency cache so the auth decision
+        is computed exactly once.
+        """
+        return Depends(_quota_factory(route_class))
+
     # ------------------------------------------------------------------
     # /healthz — unauthed liveness probe
     # ------------------------------------------------------------------
@@ -2602,7 +2649,7 @@ def build_app(
         response_model=RunAccepted,
         tags=["jobs"],
         status_code=202,
-        dependencies=[_scope("run")],
+        dependencies=[_scope("run"), _quota(RouteClass.RUNS)],
     )
     async def submit_run(
         body: RunSubmission,
@@ -4131,7 +4178,7 @@ def build_app(
         response_model=KbIngestView,
         status_code=200,
         tags=["agents-v1", "kb"],
-        dependencies=[_scope("kb:write")],
+        dependencies=[_scope("kb:write"), _quota(RouteClass.KB_INGEST)],
     )
     async def v1_upload_agent_kb(
         name: str,
@@ -4524,7 +4571,7 @@ def build_app(
         "/agents/{name}/kb/reindex",
         response_model=KbReindexView,
         tags=["agents-v1", "kb"],
-        dependencies=[_scope("kb:write")],
+        dependencies=[_scope("kb:write"), _quota(RouteClass.KB_INGEST)],
     )
     async def v1_reindex_agent_kb(
         name: str,
@@ -5080,7 +5127,7 @@ def build_app(
         # oneOf in OpenAPI so the Angular client can branch.
         response_model=RunAccepted | RunView,
         tags=["agents-v1"],
-        dependencies=[_scope("run")],
+        dependencies=[_scope("run"), _quota(RouteClass.RUNS)],
     )
     async def v1_agent_run(
         name: str,
@@ -5797,7 +5844,7 @@ def build_app(
         response_model=EvalAcceptedView,
         status_code=202,
         tags=["evals-v1"],
-        dependencies=[_scope("eval")],
+        dependencies=[_scope("eval"), _quota(RouteClass.EVALS)],
     )
     async def v1_kick_off_eval(
         name: str,
