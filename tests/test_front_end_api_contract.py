@@ -85,6 +85,8 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/observability/ask"): "read",
     ("POST", "/api/v1/observability/troubleshoot"): "read",
     ("POST", "/api/v1/observability/analyze"): "admin",
+    # events — ADR 035 D1 events outbox (read-only feed)
+    ("GET", "/api/v1/events"): "read",
 }
 
 

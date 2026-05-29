@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from movate.core.events import EventKind
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle
 from movate.core.models import (
@@ -29,6 +30,7 @@ from movate.core.models import (
 from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
+from movate.runtime.events import emit_event
 from movate.storage.base import StorageProvider
 from movate.tracing import continue_trace_context, record_audit_event, record_run_usage
 
@@ -302,6 +304,31 @@ class WorkerDispatch:
         record = summary.to_record(tenant_id=job.tenant_id)
         await self._storage.save_eval(record)
 
+        # ADR 035 D1 — emit ``eval.failed`` when this eval landed below
+        # its configured gate. "Failed" here is the user-meaningful
+        # below-gate signal, not a worker crash (the job is still
+        # SUCCESS — the eval ran). gate_mode "mean" compares
+        # mean_score; everything else compares pass_rate. Fire-and-
+        # forget: emit_event NEVER raises into the dispatch path.
+        gate_value = record.mean_score if record.gate_mode == "mean" else record.pass_rate
+        if gate_value < record.threshold:
+            emit_event(
+                self._storage,
+                tenant_id=job.tenant_id,
+                kind=EventKind.EVAL_FAILED,
+                subject=record.agent,
+                data={
+                    "eval_id": record.eval_id,
+                    "agent_version": record.agent_version,
+                    "gate_mode": record.gate_mode,
+                    "score": gate_value,
+                    "threshold": record.threshold,
+                    "pass_rate": record.pass_rate,
+                    "mean_score": record.mean_score,
+                    "sample_count": record.sample_count,
+                },
+            )
+
         # ADR 016 D2 — continuous-eval drift check. Runs when the eval job
         # asks for it: either a scheduled eval (``scheduled=True``, set by
         # the scheduler tick) or any eval that pinned a ``baseline_id``.
@@ -363,6 +390,27 @@ class WorkerDispatch:
             )
             result = detect_drift(record, baseline, tolerance=tolerance)
             logger.info("eval_drift_check %s", result.summary())
+            # ADR 035 D1 — emit ``drift.detected`` when a regression was
+            # found vs. the selected baseline. ``result.regressed`` is
+            # the same single flag that gates the operator alert below;
+            # piggybacking on it means the event fires whenever the
+            # human alert does. No baseline → no regressed (handled
+            # below); fire-and-forget either way.
+            if result.regressed and result.baseline is not None:
+                emit_event(
+                    self._storage,
+                    tenant_id=job.tenant_id,
+                    kind=EventKind.DRIFT_DETECTED,
+                    subject=record.agent,
+                    data={
+                        "eval_id": record.eval_id,
+                        "baseline_eval_id": result.baseline.eval_id,
+                        "agent_version": record.agent_version,
+                        "mean_score_delta": result.mean_score_delta,
+                        "pass_rate_delta": result.pass_rate_delta,
+                        "tolerance": tolerance,
+                    },
+                )
             await alert_on_drift(
                 result,
                 notifier=self._notifier,
@@ -454,6 +502,23 @@ class WorkerDispatch:
                 challenger_version=config.challenger_version,
                 champion_version=champion_version,
                 reason="drift_regression",
+            )
+            # ADR 035 D1 — emit ``canary.demoted`` for the auto-rollback
+            # (the human-initiated demote at the canary/rollback endpoint
+            # emits its own — same kind, different ``data.actor`` /
+            # ``data.reason``). Fire-and-forget.
+            emit_event(
+                self._storage,
+                tenant_id=job.tenant_id,
+                kind=EventKind.CANARY_DEMOTED,
+                subject=config.agent,
+                data={
+                    "challenger_version": config.challenger_version,
+                    "champion_version": champion_version,
+                    "actor": "system:drift",
+                    "reason": "drift_regression",
+                    "eval_id": record.eval_id,
+                },
             )
             # Structured log event — stable key/value shape for log-based
             # alerting / audit of an automated traffic change.

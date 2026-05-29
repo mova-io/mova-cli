@@ -15,6 +15,7 @@ from typing import Any
 import aiosqlite
 
 from movate.core.dr_backup import ImportResult
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     _DEFAULT_PROJECT_DESCRIPTION,
@@ -863,6 +864,35 @@ _MIGRATIONS = [
     (
         "CREATE INDEX IF NOT EXISTS idx_observability_insights_tpd "
         "ON observability_insights(tenant_id, project_id, date)"
+    ),
+    # ADR 035 D1 — events outbox. Domain events (run.completed,
+    # agent.published, eval.failed, drift.detected, canary.promoted/demoted,
+    # ...) are recorded at the runtime edges and served by ``GET
+    # /api/v1/events``. Additive new table (CREATE TABLE IF NOT EXISTS,
+    # idempotent) — no row exists unless an emit happened, so non-event
+    # behavior is byte-for-byte unchanged. ``tenant_id NOT NULL`` matches
+    # the rest of the schema (ADR 013/014). ``data`` holds json.dumps(...)
+    # — same TEXT-for-JSON strategy as runs.metrics / kb_chunks.metadata.
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        id          TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        subject     TEXT NOT NULL,
+        data        TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+    )
+    """,
+    # Index for the common time-range list ``WHERE tenant_id=? AND
+    # created_at >=? ORDER BY created_at`` — the default ``GET
+    # /api/v1/events`` shape.
+    ("CREATE INDEX IF NOT EXISTS idx_events_tenant_created ON events(tenant_id, created_at)"),
+    # Index for the kind-filter list ``WHERE tenant_id=? AND kind=? AND
+    # created_at>=?`` — supports the kind-subscribed front-end view that
+    # D2/D3 will also lean on.
+    (
+        "CREATE INDEX IF NOT EXISTS idx_events_tenant_kind_created "
+        "ON events(tenant_id, kind, created_at)"
     ),
 ]
 
@@ -3909,6 +3939,88 @@ class SqliteProvider:
         from movate.core.dr_backup import import_state  # noqa: PLC0415
 
         return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events).
+    # ``data`` round-trips as TEXT holding ``json.dumps(...)`` — same
+    # JSON-as-text strategy as runs.metrics. Tenant-scoped on every read.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        await self._db.execute(
+            "INSERT INTO events (id, tenant_id, kind, subject, data, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                event.id,
+                event.tenant_id,
+                event.kind,
+                event.subject,
+                json.dumps(event.data),
+                event.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        clauses: list[str] = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("created_at < ?")
+            params.append(until.isoformat())
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if subject is not None:
+            clauses.append("subject = ?")
+            params.append(subject)
+        # Cursor pagination — skip rows up to and including ``after_id``
+        # in oldest-first order. We look up the cursor row's
+        # ``(created_at, id)`` so the comparison is stable across rows
+        # sharing a timestamp (tie-break on id). An unknown after_id
+        # silently falls back to "from the beginning" — no existence
+        # leak across tenants either, since the cursor lookup is
+        # tenant-scoped.
+        if after_id is not None:
+            async with self._db.execute(
+                "SELECT created_at FROM events WHERE id = ? AND tenant_id = ? LIMIT 1",
+                (after_id, tenant_id),
+            ) as cur:
+                cursor_row = await cur.fetchone()
+            if cursor_row is not None:
+                clauses.append("(created_at, id) > (?, ?)")
+                params.extend([cursor_row["created_at"], after_id])
+        sql = (
+            "SELECT * FROM events WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at ASC, id ASC LIMIT ?"
+        )
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            Event(
+                id=r["id"],
+                tenant_id=r["tenant_id"],
+                kind=r["kind"],
+                subject=r["subject"],
+                data=json.loads(r["data"]) if r["data"] else {},
+                created_at=datetime.fromisoformat(r["created_at"]),
+            )
+            for r in rows
+        ]
 
     async def close(self) -> None:
         if self._conn is not None:

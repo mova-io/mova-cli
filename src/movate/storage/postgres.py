@@ -30,6 +30,7 @@ from typing import Any
 import asyncpg
 
 from movate.core.dr_backup import ImportResult
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     _DEFAULT_PROJECT_DESCRIPTION,
@@ -905,6 +906,33 @@ CREATE TABLE IF NOT EXISTS observability_insights (
 );
 CREATE INDEX IF NOT EXISTS idx_observability_insights_tpd
     ON observability_insights(tenant_id, project_id, date);
+
+-- ADR 035 D1: events outbox. Domain events (run.completed,
+-- agent.published, eval.failed, drift.detected, canary.promoted/demoted,
+-- ...) are recorded at the runtime edges and served by GET
+-- /api/v1/events. Additive new table (CREATE TABLE IF NOT EXISTS,
+-- idempotent on every init) — no row exists unless an emit happened, so
+-- non-event behavior is byte-for-byte unchanged. ``tenant_id NOT NULL``
+-- matches the rest of the schema (ADR 013/014). ``data`` is JSONB so
+-- future consumers (D2 webhooks, D3 SSE) can filter on payload fields
+-- if needed; D1's read API only filters on (tenant_id, kind, subject,
+-- created_at).
+CREATE TABLE IF NOT EXISTS events (
+    id          TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL
+);
+-- Default list shape: ``WHERE tenant_id=? AND created_at >=? ORDER BY
+-- created_at`` (the last-24h default in GET /api/v1/events).
+CREATE INDEX IF NOT EXISTS idx_events_tenant_created
+    ON events(tenant_id, created_at);
+-- Kind-filtered list: ``WHERE tenant_id=? AND kind=? AND created_at>=?``
+-- (the typed-subscription shape D2/D3 will lean on).
+CREATE INDEX IF NOT EXISTS idx_events_tenant_kind_created
+    ON events(tenant_id, kind, created_at);
 """
 
 
@@ -1200,6 +1228,88 @@ class PostgresProvider:
         from movate.core.dr_backup import import_state  # noqa: PLC0415
 
         return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events). ``data``
+    # round-trips as JSONB via the per-connection codec registered in
+    # ``_init_connection`` — handler passes/receives plain dicts.
+    # Tenant-scoped on every read.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        await self._db.execute(
+            "INSERT INTO events (id, tenant_id, kind, subject, data, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event.id,
+            event.tenant_id,
+            event.kind,
+            event.subject,
+            event.data,
+            event.created_at,
+        )
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        clauses: list[str] = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if since is not None:
+            params.append(since)
+            clauses.append(f"created_at >= ${len(params)}")
+        if until is not None:
+            params.append(until)
+            clauses.append(f"created_at < ${len(params)}")
+        if kind is not None:
+            params.append(kind)
+            clauses.append(f"kind = ${len(params)}")
+        if subject is not None:
+            params.append(subject)
+            clauses.append(f"subject = ${len(params)}")
+        # Cursor pagination — resolve the cursor row's (created_at, id)
+        # so the comparison is stable when multiple events share a
+        # timestamp (id as tie-breaker). Tenant-scoped cursor lookup so
+        # an after_id from another tenant silently falls back to "from
+        # the beginning" (no existence leak).
+        if after_id is not None:
+            cursor_at = await self._db.fetchval(
+                "SELECT created_at FROM events WHERE id = $1 AND tenant_id = $2",
+                after_id,
+                tenant_id,
+            )
+            if cursor_at is not None:
+                params.append(cursor_at)
+                ts_idx = len(params)
+                params.append(after_id)
+                id_idx = len(params)
+                clauses.append(f"(created_at, id) > (${ts_idx}, ${id_idx})")
+        params.append(limit)
+        limit_idx = len(params)
+        sql = (
+            "SELECT id, tenant_id, kind, subject, data, created_at "
+            "FROM events WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY created_at ASC, id ASC LIMIT ${limit_idx}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [
+            Event(
+                id=r["id"],
+                tenant_id=r["tenant_id"],
+                kind=r["kind"],
+                subject=r["subject"],
+                data=r["data"] or {},
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Runs

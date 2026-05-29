@@ -27,6 +27,7 @@ from datetime import date, datetime
 from typing import Protocol
 
 from movate.core.dr_backup import ImportResult
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
@@ -1767,6 +1768,67 @@ class StorageProvider(Protocol):
         required, not optional) — there is no cross-tenant insights mode, so
         this is never an operator-only fleet read. ``limit`` defaults to ~90
         days (a quarter of history).
+        """
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events)
+    #
+    # Domain events ("run.completed", "agent.published", "eval.failed",
+    # "drift.detected", "canary.promoted/demoted", ...) are recorded at
+    # the runtime edges (executor / dispatch / deploy) and exposed via
+    # ``GET /api/v1/events``. D2 (webhook delivery) and D3 (SSE stream)
+    # consume the same outbox in later PRs; D1 just records + exposes.
+    #
+    # Additive table — a row exists only after an emit; nothing else
+    # changes. ``tenant_id`` is **NOT NULL** in the schema (the hard
+    # invariant per ADR 013/014). The emit path MUST be non-blocking on
+    # the primary work (see :func:`movate.runtime.events.emit_event`):
+    # any storage error here is logged and swallowed.
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        """Append one :class:`Event` to the outbox.
+
+        Insert-only (events are immutable history); duplicate ``id`` is a
+        hard error (callers mint a fresh uuid per event). Implementations
+        should keep this cheap — the runtime calls it on every terminal
+        transition and the primary path won't wait on it.
+        """
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        """List events for ``tenant_id``, **oldest-first**, with optional filters.
+
+        Oldest-first is the right order for an outbox: consumers (the
+        front end, the future D2/D3 deliverers) read forward in time
+        and the ``after_id`` cursor naturally points to the last id they
+        saw. Returns at most ``limit`` rows; when the result was
+        truncated, the caller passes the LAST row's ``id`` back as
+        ``after_id`` on the next request to continue.
+
+        Filters AND together:
+
+        * ``since`` / ``until`` — UTC inclusive/exclusive window on
+          ``created_at`` (``since <= created_at < until``).
+        * ``kind`` — exact match (e.g. ``"run.completed"``).
+        * ``subject`` — exact match (agent name / run id / etc.).
+        * ``after_id`` — cursor: skip rows up to and including the row
+          with this ``id`` (in oldest-first order). Tolerant of an
+          unknown id (returns from the beginning, no leak).
+
+        Tenant-scoping is the FIRST WHERE clause and is mandatory — no
+        cross-tenant list mode on this method, since the API exposes
+        events directly. Operator cross-tenant queries can run SQL by
+        hand against the table.
         """
 
     async def close(self) -> None: ...

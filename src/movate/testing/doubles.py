@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from movate.core.dr_backup import ImportResult
+from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     _DEFAULT_PROJECT_DESCRIPTION,
@@ -125,6 +126,9 @@ class InMemoryStorage:
         # for a day appends another row; reads take the latest per
         # (tenant, project, date).
         self.insights: list[ObservabilityInsight] = []
+        # ADR 035 D1: events outbox. Appended in record_event order;
+        # list_events sorts oldest-first by (created_at, id).
+        self.events: list[Event] = []
 
     async def init(self) -> None:
         return None
@@ -1836,6 +1840,45 @@ class InMemoryStorage:
                 latest[key] = i
         ordered = sorted(latest.values(), key=lambda i: i.date, reverse=True)
         return ordered[:limit]
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1 — durable lifecycle events).
+    # ------------------------------------------------------------------
+
+    async def record_event(self, event: Event) -> None:
+        self.events.append(event)
+
+    async def list_events(
+        self,
+        tenant_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        kind: str | None = None,
+        subject: str | None = None,
+        limit: int = 200,
+        after_id: str | None = None,
+    ) -> list[Event]:
+        rows = [e for e in self.events if e.tenant_id == tenant_id]
+        if since is not None:
+            rows = [e for e in rows if e.created_at >= since]
+        if until is not None:
+            rows = [e for e in rows if e.created_at < until]
+        if kind is not None:
+            rows = [e for e in rows if e.kind == kind]
+        if subject is not None:
+            rows = [e for e in rows if e.subject == subject]
+        # Oldest-first with id as a stable tie-breaker (matches the DB
+        # backends' ORDER BY created_at ASC, id ASC).
+        rows = sorted(rows, key=lambda e: (e.created_at, e.id))
+        if after_id is not None:
+            # Skip up to and including the cursor row's position. An
+            # unknown / cross-tenant id falls back to "from the
+            # beginning" (no existence leak).
+            cursor = next((e for e in rows if e.id == after_id), None)
+            if cursor is not None:
+                rows = [e for e in rows if (e.created_at, e.id) > (cursor.created_at, cursor.id)]
+        return rows[:limit]
 
     async def close(self) -> None:
         return None
