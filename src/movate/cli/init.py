@@ -61,7 +61,14 @@ from rich.panel import Panel
 
 from movate.core.config import PROJECT_MARKER_FILES as _PROJECT_MARKERS
 from movate.core.paths import project_state_dir
-from movate.templates import get_template_path, list_templates
+from movate.templates import (
+    PATTERN_TEMPLATES,
+    get_pattern_path,
+    get_template_path,
+    list_patterns,
+    list_templates,
+    pattern_is_workflow,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -3307,6 +3314,198 @@ def _finish_agent_init(
 
 
 # ---------------------------------------------------------------------------
+# Agent-pattern scaffolding (ADR 038) — `mdk init --pattern <name>`
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_pattern(
+    *,
+    pattern: str,
+    name: str,
+    target: Path,
+    bare: bool,
+    force: bool,
+    skip_snapshot: bool,
+    open_editor: bool,
+    mock: bool,
+    no_baseline: bool,
+) -> None:
+    """Scaffold a governed agent-pattern template (ADR 038).
+
+    Two shapes:
+
+    * **chatbot** (single agent) → routed through the SAME context-aware agent
+      layout + post-scaffold tail as ``mdk init -t``: it bootstraps/joins a
+      project (or ``--bare`` standalone), substitutes ``__AGENT_NAME__``, runs
+      the ``--mock`` eval baseline, and renders the next-steps panel.
+    * **workflow patterns** (task-oriented / goal-oriented / monitor /
+      simulation) → scaffolded as a self-contained WORKFLOW bundle under
+      ``<project>/workflows/<name>/`` (or ``<target>/<name>/`` with ``--bare``).
+      The bundle ships its own nested ``agents/`` so nothing is relocated.
+    """
+    if not pattern_is_workflow(pattern):
+        # Single-agent pattern (chatbot). Reuse the agent layout machinery so it
+        # behaves exactly like `mdk init -t`: project bootstrap, baseline, panel.
+        layout = _resolve_agent_layout(
+            name=name,
+            target=target,
+            bare=bare,
+            force=force,
+            skip_snapshot=skip_snapshot,
+            open_editor=open_editor,
+        )
+        _scaffold_pattern_agent(pattern=pattern, name=name, dest=layout.agent_dir, force=force)
+        console.print(
+            f"[green]✓[/green] scaffolded [bold]{pattern}[/bold] pattern "
+            f"(single agent) at [bold]{layout.agent_dir}[/bold]"
+        )
+        _finish_agent_init(
+            layout, name=name, open_editor=open_editor, mock=mock, no_baseline=no_baseline
+        )
+        return
+
+    # Workflow pattern → scaffold a self-contained bundle.
+    _scaffold_pattern_workflow(
+        pattern=pattern,
+        name=name,
+        target=target,
+        bare=bare,
+        force=force,
+        skip_snapshot=skip_snapshot,
+        open_editor=open_editor,
+    )
+
+
+def _scaffold_pattern_agent(*, pattern: str, name: str, dest: Path, force: bool) -> None:
+    """Copy a single-agent pattern template to ``dest`` + substitute the name."""
+    src = get_pattern_path(pattern)
+    if dest.exists() and not force:
+        err_console.print(f"[red]✗[/red] {dest} already exists (use --force to overwrite)")
+        raise typer.Exit(code=2)
+    if dest.exists() and force:
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    yaml_path = dest / "agent.yaml"
+    yaml_path.write_text(yaml_path.read_text().replace("__AGENT_NAME__", name))
+
+
+def _scaffold_pattern_workflow(
+    *,
+    pattern: str,
+    name: str,
+    target: Path,
+    bare: bool,
+    force: bool,
+    skip_snapshot: bool,
+    open_editor: bool,
+) -> None:
+    """Scaffold a workflow-pattern bundle (ADR 038).
+
+    Resolves where the bundle lands by the same context rules as agents, but
+    workflows live under ``workflows/`` rather than ``agents/``:
+
+    * ``--bare`` → ``<target>/<name>/`` standalone (no project wrapper).
+    * inside a project → ``<project>/workflows/<name>/``.
+    * outside a project → bootstrap a project at ``<target>/<name>/`` and place
+      the bundle under ``<project>/workflows/<name>/``.
+
+    The bundle is self-contained (its own nested ``agents/``), so no skill /
+    agent relocation is needed. The workflow's ``name:`` field is set to the
+    operator-provided name so ``mdk run <name>`` resolves it from the project.
+    """
+    src = get_pattern_path(pattern)
+    project_root: Path | None
+    created_project = False
+
+    if bare:
+        bundle_parent = target
+        project_root = None
+    else:
+        existing_root = _enclosing_project_root()
+        if existing_root is not None:
+            project_root = existing_root
+        else:
+            _pn, project_root, _snap = _init_project(
+                name=name,
+                target=target,
+                force=force,
+                skip_snapshot=skip_snapshot,
+                with_agents=None,
+                quiet=True,
+                open_editor=False,
+            )
+            created_project = True
+        bundle_parent = project_root / "workflows"
+        bundle_parent.mkdir(parents=True, exist_ok=True)
+
+    dest = (bundle_parent / name).resolve()
+    if dest.exists() and not force:
+        err_console.print(f"[red]✗[/red] {dest} already exists (use --force to overwrite)")
+        raise typer.Exit(code=2)
+    if dest.exists() and force:
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+
+    # Set the workflow's name to the operator-provided name (the template ships
+    # a generic pattern name) so `mdk run <name>` resolves it.
+    wf_yaml = dest / "workflow.yaml"
+    _set_workflow_name(wf_yaml, name)
+
+    _desc, _is_wf, one_liner, topology = PATTERN_TEMPLATES[pattern]
+    console.print(
+        f"[green]✓[/green] scaffolded [bold]{pattern}[/bold] pattern "
+        f"(workflow) at [bold]{dest}[/bold]"
+    )
+    body = (
+        f"[bold]Pattern:[/bold]  [cyan]{pattern}[/cyan]  [dim]{topology}[/dim]\n"
+        f"[bold]Bundle:[/bold]   [bold cyan]{dest}[/bold cyan]\n"
+        f"[dim]{one_liner}[/dim]\n\n"
+        f"[bold]Governance:[/bold] see [cyan]{dest / 'GOVERNANCE.md'}[/cyan] "
+        "(bounds, budgets, eval-gate, bounded-vs-swarm rationale).\n\n"
+        "[bold]Next steps:[/bold]\n"
+        f"  [dim]$[/dim] [bold]mdk validate {dest}[/bold]"
+        "   [dim]# compile + governance check[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk run {dest} '{{...}}' --mock[/bold]"
+        "   [dim]# zero-cost smoke[/dim]\n"
+        f"  [dim]$[/dim] [bold]mdk eval {dest} --mock[/bold]"
+        "   [dim]# gate the dataset offline[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title=f"[green]✓[/green] {pattern} pattern ready",
+            title_align="left",
+            border_style="green",
+        )
+    )
+
+    open_path = project_root if project_root is not None else dest
+    if created_project or project_root is None:
+        _launch_editor(open_path, open_editor=open_editor)
+
+
+def _set_workflow_name(wf_yaml: Path, name: str) -> None:
+    """Rewrite the ``name:`` field in a scaffolded ``workflow.yaml`` to ``name``.
+
+    The pattern templates ship a generic workflow name (e.g. ``task-oriented``);
+    we set it to the operator's name so the workflow resolves under
+    ``mdk run <name>`` / ``mdk eval <name>``. Surgical line-replace (not a YAML
+    round-trip) so the heavily-commented template body + ordering are preserved.
+    Best-effort: a parse miss leaves the template name (harmless — the workflow
+    still runs by path).
+    """
+    text = wf_yaml.read_text()
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        # Top-level `name:` only (no leading whitespace) — node ids are indented.
+        if line.startswith("name:"):
+            newline = "\n" if line.endswith("\n") else ""
+            lines[i] = f"name: {name}{newline}"
+            break
+    wf_yaml.write_text("".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Entry point — dispatches between project + agent modes
 # ---------------------------------------------------------------------------
 
@@ -3351,6 +3550,19 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
             "[bold]mdk init <name>[/bold] (no [bold]-t[/bold], no [bold]--llm[/bold]) "
             "outside a project just bootstraps the project with an empty "
             "[bold]agents/[/bold]."
+        ),
+    ),
+    pattern: str | None = typer.Option(
+        None,
+        "--pattern",
+        help=(
+            "Scaffold a GOVERNED agent-pattern template (ADR 038). One of: "
+            f"{', '.join(list_patterns())}. Sugar that resolves to the matching "
+            "pattern template — [bold]chatbot[/bold] scaffolds a single agent; the "
+            "others scaffold a WORKFLOW bundle (workflow.yaml + nested agents/) "
+            "under [bold]workflows/<name>/[/bold]. Each bakes in bounds + budgets "
+            "+ eval-gates. See [bold]mdk patterns list[/bold]. Mutually exclusive "
+            "with [bold]-t[/bold]/[bold]--llm[/bold]."
         ),
     ),
     target: Path = typer.Option(
@@ -3554,6 +3766,47 @@ def init(  # noqa: PLR0912 — front-door dispatcher; mode branches read clearer
       [bold]mdk authoring audit[/bold] / [bold]replay[/bold] — the copilot's
         reversible-action audit log.
     """
+    # --pattern (ADR 038): scaffold a governed agent-pattern. It is ADDITIVE
+    # sugar that resolves to the matching pattern template. Handle it FIRST and
+    # return — it is its own scaffold shape (single-agent for chatbot, a
+    # workflow bundle for the rest) and must not fall through to the
+    # template/llm/project dispatch below. Mutually exclusive with -t/--llm
+    # (those pick a different starting point) — fail loud rather than guess.
+    if pattern is not None:
+        if pattern not in PATTERN_TEMPLATES:
+            err_console.print(
+                f"[red]✗[/red] unknown pattern {pattern!r}.\n"
+                f"[dim]available patterns: {', '.join(list_patterns())} "
+                "(see [bold]mdk patterns list[/bold])[/dim]"
+            )
+            raise typer.Exit(code=2)
+        if template is not None or llm is not None or description is not None:
+            err_console.print(
+                "[red]✗[/red] [bold]--pattern[/bold] is mutually exclusive with "
+                "[bold]-t[/bold]/[bold]--template[/bold] and [bold]--llm[/bold] "
+                "(and a positional description).\n"
+                "[dim]A pattern IS a complete template — pick one or the other.[/dim]"
+            )
+            raise typer.Exit(code=2)
+        if not name:
+            err_console.print(
+                "[red]✗[/red] name required for [bold]--pattern[/bold].\n"
+                f"[dim]e.g. [bold]mdk init my-bot --pattern {pattern}[/bold][/dim]"
+            )
+            raise typer.Exit(code=2)
+        _dispatch_pattern(
+            pattern=pattern,
+            name=name,
+            target=target,
+            bare=bare,
+            force=force,
+            skip_snapshot=skip_snapshot,
+            open_editor=open_editor,
+            mock=mock,
+            no_baseline=no_baseline,
+        )
+        return
+
     # Mutual-exclusion guard: --llm only makes sense in agent mode.
     # Project mode is just a movate.yaml + .gitignore + empty agents/ —
     # nothing for an LLM to scaffold. Point the operator at agent mode

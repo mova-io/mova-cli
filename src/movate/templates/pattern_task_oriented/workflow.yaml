@@ -1,0 +1,73 @@
+api_version: movate/v1
+kind: Workflow
+
+# =============================================================================
+# Task-Oriented pattern (ADR 038) — bounded SUPERVISOR fan-out → collect
+# =============================================================================
+# A planner/SUPERVISOR node decomposes the request into a FIXED, capped set of
+# task branches, each handled by a typed task agent, then a collector node
+# aggregates the results.
+#
+# GOVERNANCE — bounded fan-out (the headline of this pattern):
+#   * FIXED ROSTER / FAN-OUT CAP: exactly TWO task nodes (task-a, task-b) are
+#     wired. The supervisor may NOT spawn more — the branch count is a
+#     structural bound, not a runtime suggestion. To widen it, an author edits
+#     this file (a reviewable change), they cannot let the model expand it.
+#   * TOTAL BUDGET CAP: each node carries its own budget.max_cost_usd_per_run;
+#     the per-branch caps sum to the workflow's effective ceiling. See
+#     GOVERNANCE.md for the arithmetic.
+#   * TYPED + TRACED: every node is a typed agent node; the runner opens one
+#     workflow-root span and nests each node under it (full interaction trace).
+#   * EVAL-GATE: the evals: stanza below gates the whole workflow at CI time.
+#
+# Topology note: the native runner (ADR 017) walks a linear DAG and
+# validate_linear rejects true parallel fan-out edges (those land in a later
+# phase). We therefore model the bounded fan-out as a linear
+# supervisor → task-a → task-b → collector chain: the cap (two task nodes) and
+# the collect step are real and reviewable; the branches execute in sequence
+# rather than concurrently. The GOVERNANCE is identical either way.
+
+name: task-oriented
+version: 0.1.0
+description: >
+  Bounded supervisor fan-out: a planner decomposes a request into a fixed,
+  capped set of task branches, each run by a typed task agent, then collected.
+owner: ""
+
+state_schema: ./state.json
+entrypoint: supervisor
+
+nodes:
+  # SUPERVISOR (delegation) — decomposes the goal into the fixed task set.
+  - id: supervisor
+    type: agent
+    ref: ./agents/planner
+  # Task branch A — one of the TWO capped branches.
+  - id: task-a
+    type: agent
+    ref: ./agents/task-a
+  # Task branch B — the second (and last) capped branch.
+  - id: task-b
+    type: agent
+    ref: ./agents/task-b
+  # Collector — aggregates the branch outputs into the final answer.
+  - id: collector
+    type: agent
+    ref: ./agents/collector
+
+edges:
+  - from: supervisor
+    to: task-a
+  - from: task-a
+    to: task-b
+  - from: task-b
+    to: collector
+
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+tags:
+  - pattern:task-oriented
+  - governed
+  - bounded-fan-out

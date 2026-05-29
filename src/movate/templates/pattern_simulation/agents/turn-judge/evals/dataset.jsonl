@@ -1,0 +1,2 @@
+{"input": {"text": "A: I'll check the charge.\nB: Confirmed, it's a pending auth, no real double charge.", "labels": ["continue", "resolved"]}, "expected": {"label": "resolved"}}
+{"input": {"text": "A: I'll check the charge.", "labels": ["continue", "resolved"]}, "expected": {"label": "continue"}}

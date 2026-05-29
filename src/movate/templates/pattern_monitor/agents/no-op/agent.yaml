@@ -1,0 +1,39 @@
+api_version: movate/v1
+kind: Agent
+
+# No-op terminal of the Monitor pattern. Reached when the metric is within
+# threshold — acknowledges and stops (no action fired).
+name: monitor-no-op
+version: 0.1.0
+description: No-op terminal — acknowledges an in-threshold signal; no action taken.
+owner: ""
+role: actuator
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 64
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.02
+
+tags:
+  - pattern:monitor
+  - node:no-op
+  - governed

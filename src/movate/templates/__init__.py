@@ -131,6 +131,83 @@ ROLE_TEMPLATES: dict[str, str] = {
 }
 
 
+# Agent-pattern templates (ADR 038) — surfaced by ``mdk init --pattern <name>``
+# and ``mdk patterns list``. These are GOVERNED realizations of the functional
+# agent patterns: each bakes in bounds (budgets, fan-out caps, max-iterations /
+# turn caps), eval-gates, and full tracing, composed from the EXISTING workflow
+# primitives (ADR 017) — never a new engine.
+#
+# Two shapes:
+#   * "chatbot" is a single AGENT (INPUT → AGENT → OUTPUT) — scaffolds an agent
+#     dir (agent.yaml + prompt + schemas + dataset + judge), same on-disk shape
+#     as the TEMPLATES above (so ``mdk run``/``eval`` work on it directly).
+#   * the other four are WORKFLOW bundles (workflow.yaml + state.json + nested
+#     agents/ + workflow-level dataset/judge) — scaffold a workflow dir.
+#
+# Each entry: (relative dir, is_workflow, one-line description, topology).
+PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
+    "chatbot": (
+        "pattern_chatbot",
+        False,
+        "Single governed agent answering one turn under an enforced output contract.",
+        "INPUT → AGENT → OUTPUT",
+    ),
+    "task-oriented": (
+        "pattern_task_oriented",
+        True,
+        "Bounded supervisor fan-out: a planner decomposes into a fixed, capped task set, then collects.",  # noqa: E501
+        "SUPERVISOR → task-a → task-b → collector",
+    ),
+    "goal-oriented": (
+        "pattern_goal_oriented",
+        True,
+        "Bounded supervisor loop: a worker iterates while a JUDGE/GATE checks the goal, exiting on satisfaction or a max-iterations cap.",  # noqa: E501
+        "SUPERVISOR → (worker → JUDGE/GATE) x2 → done",
+    ),
+    "monitor": (
+        "pattern_monitor",
+        True,
+        "Observe a signal, VALIDATE/GATE it against a threshold, and on breach fire an allowlisted action (stub). Schedule/trigger-friendly.",  # noqa: E501
+        "observer → VALIDATE/GATE → {action | no-op}",
+    ),
+    "simulation": (
+        "pattern_simulation",
+        True,
+        "Bounded multi-agent simulation: a FIXED roster of two participants under a supervisor, hard-capped turns, terminating JUDGE. NOT a swarm.",  # noqa: E501
+        "SUPERVISOR → (A → B → JUDGE) x2 → done",
+    ),
+}
+
+
+def list_patterns() -> list[str]:
+    """Sorted list of agent-pattern names (``mdk init --pattern <name>``)."""
+    return sorted(PATTERN_TEMPLATES.keys())
+
+
+def get_pattern_path(name: str) -> Path:
+    """Resolve a pattern name to its packaged directory.
+
+    Raises ``ValueError`` with the available list if ``name`` is unknown.
+    """
+    entry = PATTERN_TEMPLATES.get(name)
+    if entry is None:
+        raise ValueError(
+            f"unknown pattern {name!r}; available patterns: {', '.join(list_patterns())}"
+        )
+    path = TEMPLATES_DIR / entry[0]
+    if not path.is_dir():  # pragma: no cover — install-time invariant
+        raise FileNotFoundError(f"pattern {name!r} dir missing on disk: {path}")
+    return path
+
+
+def pattern_is_workflow(name: str) -> bool:
+    """True if the named pattern scaffolds a WORKFLOW bundle (vs a single agent)."""
+    entry = PATTERN_TEMPLATES.get(name)
+    if entry is None:
+        raise ValueError(f"unknown pattern {name!r}")
+    return entry[1]
+
+
 def list_templates() -> list[str]:
     """Sorted list of (shape) template names."""
     return sorted(TEMPLATES.keys())
@@ -172,10 +249,14 @@ def get_template_path(name: str) -> Path:
 
 
 __all__ = [
+    "PATTERN_TEMPLATES",
     "ROLE_TEMPLATES",
     "TEMPLATES",
     "TEMPLATES_DIR",
+    "get_pattern_path",
     "get_template_path",
+    "list_patterns",
     "list_roles",
     "list_templates",
+    "pattern_is_workflow",
 ]
