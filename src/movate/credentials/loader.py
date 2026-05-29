@@ -54,6 +54,23 @@ OBSERVABILITY_KEY_ENV_VARS: tuple[str, ...] = (
     "LANGFUSE_BASE_URL",
 )
 
+# Voice-provider env vars (ADR 048/049). Set via ``mdk auth login
+# azure-speech`` (or by hand) and consumed by the voice adapters in
+# ``movate.voice`` (the Azure Speech STT/TTS pair reads key+region). Kept
+# SEPARATE from PROVIDER_KEY_ENV_VARS because those are LLM-provider keys the
+# auth-status table live-verifies against an LLM metadata endpoint — voice
+# creds aren't LLM keys and have no such probe, so they autoload like the
+# notification group but are not LLM-verified.
+#
+# Azure Speech needs a key AND a region (the region is a non-secret routing
+# value, but it autoloads the same way so operators don't re-export it each
+# shell). Distinct from AZURE_OPENAI_API_KEY (Azure OpenAI chat/embeddings) —
+# Azure Speech is a different Azure resource with its own key.
+VOICE_KEY_ENV_VARS: tuple[str, ...] = (
+    "AZURE_SPEECH_KEY",
+    "AZURE_SPEECH_REGION",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -62,6 +79,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *PROVIDER_KEY_ENV_VARS,
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
+    *VOICE_KEY_ENV_VARS,
 )
 
 

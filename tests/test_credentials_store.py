@@ -440,11 +440,15 @@ class TestAuthStatus:
     ) -> None:
         # Bundle F added Notifications rows (TELEGRAM_BOT_TOKEN +
         # TELEGRAM_CHAT_ID + MOVATE_DEPLOY_WEBHOOK) to the status
-        # table. Strip those too so the no-keys baseline is clean.
+        # table; the voice PR (ADR 048/049) added a Voice section
+        # (AZURE_SPEECH_KEY + AZURE_SPEECH_REGION). Strip those too so
+        # the no-keys baseline is clean.
         for key in (
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "MOVATE_DEPLOY_WEBHOOK",
+            "AZURE_SPEECH_KEY",
+            "AZURE_SPEECH_REGION",
         ):
             monkeypatch.delenv(key, raising=False)
         # PR #112 added a Runtime Targets section to `mdk auth status`
@@ -458,11 +462,11 @@ class TestAuthStatus:
             assert env_var in result.stdout
         assert "not set" in result.stdout.lower()
         # Greppable summary line: 5 provider env vars + 3 notification
-        # env vars = 8 unset total (no runtime targets configured in
-        # the isolated config path).
+        # env vars + 2 voice env vars = 10 unset total (no runtime
+        # targets configured in the isolated config path).
         assert "mdk_auth_status_summary:" in result.stdout
         assert "set=0" in result.stdout
-        assert "unset=8" in result.stdout
+        assert "unset=10" in result.stdout
 
     def test_set_keys_show_as_set(
         self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
@@ -471,6 +475,8 @@ class TestAuthStatus:
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "MOVATE_DEPLOY_WEBHOOK",
+            "AZURE_SPEECH_KEY",
+            "AZURE_SPEECH_REGION",
         ):
             monkeypatch.delenv(key, raising=False)
         # PR #112 — isolate user config path so the Runtime Targets
@@ -497,6 +503,6 @@ class TestAuthStatus:
         autoload_credentials()
         result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
-        # One key set, seven unset (4 LLM + 3 notification).
+        # One key set, nine unset (4 LLM + 3 notification + 2 voice).
         assert "set=1" in result.stdout
-        assert "unset=7" in result.stdout
+        assert "unset=9" in result.stdout

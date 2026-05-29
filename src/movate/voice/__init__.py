@@ -13,6 +13,10 @@ Phase 1 scope (pipeline mode only):
 * OpenAI reference adapters (:class:`OpenAIWhisperSTT` / :class:`OpenAITTS`)
   in :mod:`movate.voice.openai_speech`, with the ``openai`` SDK imported
   lazily so a default install is unaffected (ADR 048 D9);
+* Azure Speech adapters (:class:`AzureSpeechSTT` / :class:`AzureNeuralTTS`) in
+  :mod:`movate.voice.azure_speech` — the T1 enterprise/sovereignty pair against
+  the customer's own Azure subscription, with the Azure Speech SDK imported
+  lazily (same posture as the OpenAI pair);
 * test doubles (:class:`FakeSTT` / :class:`FakeTTS`) in
   :mod:`movate.voice.doubles`;
 * the pipeline driver (:func:`run_voice_pipeline`) in
@@ -23,12 +27,14 @@ seam + speech-to-speech mode (ADR 048 D2b / Phase 2), telephony (Phase 3), and
 the agility layer (router / bench / drift — ADR 049).
 
 The Protocols + chunk types + doubles + pipeline are import-cheap (no optional
-deps). The OpenAI adapters import ``openai`` lazily; importing them by name
-here does **not** trigger that import until the class is constructed.
+deps). The OpenAI and Azure adapters import their provider SDKs lazily;
+importing them by name here does **not** trigger that import until the class is
+constructed.
 """
 
 from __future__ import annotations
 
+from movate.voice.azure_speech import AzureNeuralTTS, AzureSpeechSTT
 from movate.voice.base import (
     AudioChunk,
     AudioCodec,
@@ -43,6 +49,8 @@ from movate.voice.pipeline import VoicePipelineResult, run_voice_pipeline
 __all__ = [
     "AudioChunk",
     "AudioCodec",
+    "AzureNeuralTTS",
+    "AzureSpeechSTT",
     "FakeSTT",
     "FakeTTS",
     "OpenAITTS",

@@ -854,6 +854,11 @@ _PROVIDERS_PROMPT_NAME = {
     # Same UX surface as the LLM providers because operators expect
     # "set up the integration once" to look the same regardless.
     "telegram": "Telegram bot (deploy notifications)",
+    # Azure Speech is the T1 voice provider (ADR 048/049) — STT + TTS against
+    # the customer's own Azure subscription. Needs a key AND a region, so it
+    # has its own multi-value login path (like telegram). DISTINCT from the
+    # `azure` (Azure OpenAI) provider above — different Azure resource + key.
+    "azure-speech": "Azure Speech (voice STT + TTS)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -869,6 +874,13 @@ _PROVIDER_TO_ENV_VAR = {
 # provider table above. Same auth-login UX surface either way.
 _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 
+# Azure Speech needs TWO values (subscription key + region) — same multi-value
+# pattern as telegram, dispatched to its own code path. Kept out of
+# `_PROVIDER_TO_ENV_VAR` (single-key LLM table) for the same reason telegram is:
+# its env vars don't fit the one-key-per-provider shape, and it isn't an LLM
+# provider the picker should live-verify against an LLM endpoint.
+_VOICE_PROVIDERS = frozenset({"azure-speech"})
+
 
 @auth_app.command("login")
 def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
@@ -878,7 +890,8 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "Provider to set the API key for: "
             "[bold]openai[/bold], [bold]anthropic[/bold], "
             "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
-            "or [bold]telegram[/bold]. Omit to pick interactively."
+            "[bold]telegram[/bold], or [bold]azure-speech[/bold] (voice). "
+            "Omit to pick interactively."
         ),
     ),
     key: str = typer.Option(
@@ -992,8 +1005,16 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_telegram(key=key, no_verify=no_verify, save_to=save_to)
         return
 
+    # Azure Speech is the voice (STT+TTS) provider — needs key + region, not a
+    # single key. Its own multi-value path, same as telegram.
+    if provider in _VOICE_PROVIDERS:
+        _login_azure_speech(key=key, save_to=save_to)
+        return
+
     if provider not in _PROVIDER_TO_ENV_VAR:
-        valid = ", ".join(sorted(set(_PROVIDER_TO_ENV_VAR) | _TELEGRAM_PROVIDERS))
+        valid = ", ".join(
+            sorted(set(_PROVIDER_TO_ENV_VAR) | _TELEGRAM_PROVIDERS | _VOICE_PROVIDERS)
+        )
         error(f"unknown provider {provider!r}. Valid: {valid}")
         raise typer.Exit(code=2)
 
@@ -1376,6 +1397,30 @@ def _migrate_backend(*, src_name: str, dst_name: str, remove_source: bool) -> No
     )
 
 
+def _add_simple_cred_row(
+    table: Table,
+    counts: dict[str, int],
+    *,
+    env_var: str,
+    unset_hint: str,
+) -> None:
+    """Append one confirmed-set/unset credential row to the `auth status` table.
+
+    Shared by the Notifications + Voice groups, which are confirmed-set-only
+    (no live verify — they aren't LLM keys with a metadata probe). ``✓ set``
+    when resolvable from any source, else ``⊘ not set`` with ``unset_hint``;
+    bumps ``counts`` so the summary line stays accurate."""
+    from movate.credentials import key_source  # noqa: PLC0415
+
+    src = key_source(env_var)
+    if src == "unset":
+        counts["unset"] += 1
+        table.add_row(env_var, "[yellow]⊘ not set[/yellow]", "—", unset_hint)
+    else:
+        counts["ok"] += 1
+        table.add_row(env_var, "[green]✓ set[/green]", src.replace("_", " "), "")
+
+
 @auth_app.command("status")
 def status(
     verify: bool = typer.Option(
@@ -1488,6 +1533,7 @@ def status(
     # Separator + notifications group. `mdk deploy --notify` reads
     # these env vars; surface them in the status table so operators
     # know whether notifications will fire BEFORE attempting a deploy.
+    # Rendered confirmed-set-only (no live verify) via the shared row helper.
     table.add_row("", "", "", "")
     table.add_row("[bold]Notifications[/bold]", "", "[dim]for mdk deploy --notify[/dim]", "")
     for env_var, hint_text in (
@@ -1495,23 +1541,21 @@ def status(
         ("TELEGRAM_CHAT_ID", "run [bold]mdk auth login telegram[/bold]"),
         ("MOVATE_DEPLOY_WEBHOOK", "set in your shell for Slack/Teams/Discord/etc."),
     ):
-        src = key_source(env_var)
-        if src == "unset":
-            counts["unset"] += 1
-            table.add_row(
-                env_var,
-                "[yellow]⊘ not set[/yellow]",
-                "—",
-                hint_text,
-            )
-        else:
-            counts["ok"] += 1
-            table.add_row(
-                env_var,
-                "[green]✓ set[/green]",
-                src.replace("_", " "),
-                "",
-            )
+        _add_simple_cred_row(table, counts, env_var=env_var, unset_hint=hint_text)
+
+    # Separator + voice group (ADR 048/049). The Azure Speech voice adapters
+    # read these; surface them so operators know whether voice is wired. Not
+    # live-verified (not an LLM key; a probe needs the optional SDK + a billable
+    # call) — confirmed-set only, same as the notifications group.
+    table.add_row("", "", "", "")
+    table.add_row("[bold]Voice[/bold]", "", "[dim]for mdk[voice] adapters[/dim]", "")
+    for env_var in ("AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"):
+        _add_simple_cred_row(
+            table,
+            counts,
+            env_var=env_var,
+            unset_hint="run [bold]mdk auth login azure-speech[/bold]",
+        )
 
     stdout.print(table)
     stdout.print()
@@ -2236,6 +2280,14 @@ def _provider_is_configured(provider: str) -> bool:
             key_source("TELEGRAM_BOT_TOKEN") != "unset"
             and key_source("TELEGRAM_CHAT_ID") != "unset"
         )
+    if provider == "azure-speech":
+        # Azure Speech needs BOTH a subscription key AND a region (ADR 048/049).
+        # Show "configured" only when both are set — a key without a region (or
+        # vice versa) can't actually call the service.
+        return (
+            key_source("AZURE_SPEECH_KEY") != "unset"
+            and key_source("AZURE_SPEECH_REGION") != "unset"
+        )
     env_var = _PROVIDER_TO_ENV_VAR.get(provider)
     if env_var is None:
         return False
@@ -2286,6 +2338,13 @@ def _provider_status(provider: str) -> ProviderState:
     # Telegram check stays cheap — no HTTP call.
     if provider == "telegram":
         return "verified" if _provider_is_configured("telegram") else "unset"
+
+    # Azure Speech isn't an LLM provider (no `verify_provider_key` probe). Treat
+    # it like telegram: ``verified`` when both key+region are set, else
+    # ``unset``. A live STT/TTS probe would cost an Azure call + needs the
+    # optional SDK, so we keep the picker cheap and confirm-set only.
+    if provider == "azure-speech":
+        return "verified" if _provider_is_configured("azure-speech") else "unset"
 
     if not _provider_is_configured(provider):
         return "unset"
@@ -2403,6 +2462,7 @@ def _prompt_for_provider() -> str:
         ("gemini", _PROVIDERS_PROMPT_NAME["gemini"]),
         ("lyzr", _PROVIDERS_PROMPT_NAME["lyzr"]),
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
+        ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
     # Live-verify every configured provider in parallel BEFORE rendering
@@ -2540,6 +2600,82 @@ def _login_telegram(*, key: str | None, no_verify: bool, save_to: str) -> None:
         with dotenv.open("a") as fh:
             fh.write(f"TELEGRAM_BOT_TOKEN={token}\n")
             fh.write(f"TELEGRAM_CHAT_ID={chat_id}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_azure_speech(*, key: str | None, save_to: str) -> None:
+    """Guided Azure Speech (voice) setup — STT + TTS (ADR 048/049).
+
+    Azure Speech needs TWO values, BOTH set here (distinct from the single-key
+    LLM providers and from ``azure`` / Azure OpenAI):
+
+      * ``AZURE_SPEECH_KEY`` — the Speech resource's subscription key (BYOK —
+        the customer's OWN Azure subscription; in production this is sourced
+        from Key Vault, ADR 018).
+      * ``AZURE_SPEECH_REGION`` — the Speech resource region (e.g. ``eastus``),
+        a non-secret routing value Azure Speech also requires.
+
+    No live verification: a verify call would need the optional Azure Speech
+    SDK (``mdk[voice]``) AND a billable round-trip; the adapters surface a
+    clear error at first use if the pair is wrong. Persists to
+    ``~/.movate/credentials`` (default) or project ``.env`` via the same
+    save-to dispatch as the LLM-provider flow.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    # The --key flag could carry the subscription key, but we still need the
+    # region interactively. Accept --key as the key when passed (CI ergonomics),
+    # otherwise prompt for it hidden.
+    if key is not None and not key.strip():
+        error("empty key — aborted.")
+        raise typer.Exit(code=2)
+
+    hint(
+        "[dim]Azure Speech setup (your OWN Azure subscription):\n"
+        "  1. In the Azure portal, create (or open) a [bold]Speech[/bold] resource\n"
+        "  2. Copy [bold]KEY 1[/bold] from its [bold]Keys and Endpoint[/bold] blade\n"
+        "  3. Note the resource [bold]Location/Region[/bold] (e.g. [bold]eastus[/bold])[/dim]"
+    )
+    speech_key = (
+        key.strip()
+        if key is not None
+        else typer.prompt(
+            "Azure Speech subscription key", hide_input=True, confirmation_prompt=False
+        ).strip()
+    )
+    if not speech_key:
+        error("empty key — aborted.")
+        raise typer.Exit(code=2)
+    region = typer.prompt("Azure Speech region (e.g. eastus)").strip()
+    if not region:
+        error("empty region — aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("AZURE_SPEECH_KEY", speech_key)
+        store.set("AZURE_SPEECH_REGION", region)
+        success(
+            f"saved [bold]AZURE_SPEECH_KEY[/bold] + "
+            f"[bold]AZURE_SPEECH_REGION[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+        hint(
+            "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
+            "up these for the Azure Speech voice adapters. Install the SDK with "
+            "[bold]uv add 'movate-cli[voice]'[/bold] to use them.[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"AZURE_SPEECH_KEY={speech_key}\n")
+            fh.write(f"AZURE_SPEECH_REGION={region}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.29.10"
+version = "2026.5.29.14"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -193,6 +193,24 @@ voice = [
     # ElevenLabs (premium voice), and any audio lib (e.g. numpy/soundfile for
     # resampling, a VAD) only if/when edge transcoding or barge-in needs it.
     "openai>=1.40,<2",
+    # T1 enterprise/sovereignty pair (ADR 048/049): Azure Speech STT + Azure
+    # Neural TTS, run against the CUSTOMER's OWN Azure subscription (data
+    # residency / BYOK → Key Vault). Imported LAZILY in
+    # movate.voice.azure_speech, so a default install (and an install that
+    # picks the OpenAI voice pair) never loads it.
+    #
+    # LICENSE NOTE (CLAUDE.md rule 8 / docs/license-posture.md): unlike the
+    # `openai` SDK (Apache-2.0) this SDK ships under the MICROSOFT SOFTWARE
+    # LICENSE TERMS (PyPI classifier "Other/Proprietary License") — NOT a
+    # permissive OSS license. It is acceptable here ONLY because it is strictly
+    # OPT-IN: the `voice` extra is NOT in the license gate's SHIPPED_EXTRAS
+    # (scripts/check_licenses.py only scopes runtime+langfuse), so it is not
+    # part of the default customer deliverable and is not policed by the gate.
+    # An operator who adds `mdk[voice]` and constructs the Azure adapters is
+    # opting into Microsoft's terms for their own Azure subscription. Do NOT
+    # promote this dep into core / SHIPPED_EXTRAS without an ADR + license
+    # sign-off (the gate would correctly reject it there).
+    "azure-cognitiveservices-speech>=1.40,<2",
 ]
 langchain = [
     "langchain-core>=0.3,<1",
@@ -432,6 +450,13 @@ module = [
     # keeps mypy on `src` clean whether or not the extras are installed.
     "prefect.*",
     "airflow.*",
+    # Azure Speech SDK — optional [voice] extra (T1 enterprise voice pair,
+    # ADR 048/049). No type stubs shipped; imported LAZILY inside
+    # movate.voice.azure_speech, so mypy on `src` stays clean whether or not
+    # the extra is installed.
+    "azure.cognitiveservices.speech.*",
+    "azure.cognitiveservices.*",
+    "azure.*",
 ]
 ignore_missing_imports = true
 

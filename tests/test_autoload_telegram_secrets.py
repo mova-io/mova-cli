@@ -31,6 +31,7 @@ from movate.credentials.loader import (
     NOTIFICATION_KEY_ENV_VARS,
     OBSERVABILITY_KEY_ENV_VARS,
     PROVIDER_KEY_ENV_VARS,
+    VOICE_KEY_ENV_VARS,
 )
 
 runner = CliRunner(mix_stderr=False)
@@ -61,12 +62,13 @@ class TestAutoloadedRegistry:
 
     def test_all_autoloaded_is_union(self) -> None:
         """ALL_AUTOLOADED_ENV_VARS should be the union of the provider,
-        notification, and observability groups. Catches accidental
+        notification, observability, and voice groups. Catches accidental
         dropping when any list is edited in isolation."""
         expected = (
             set(PROVIDER_KEY_ENV_VARS)
             | set(NOTIFICATION_KEY_ENV_VARS)
             | set(OBSERVABILITY_KEY_ENV_VARS)
+            | set(VOICE_KEY_ENV_VARS)
         )
         assert set(ALL_AUTOLOADED_ENV_VARS) == expected
 
