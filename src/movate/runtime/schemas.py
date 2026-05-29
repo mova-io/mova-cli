@@ -178,6 +178,104 @@ class RunView(BaseModel):
         )
 
 
+class RunEstimatePredictionView(BaseModel):
+    """The numeric prediction band of a :class:`RunEstimateView`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tokens_in: int
+    tokens_out_max: int
+    tokens_out_expected: int
+    cost_usd_min: float
+    cost_usd_expected: float
+    cost_usd_max: float
+    latency_ms_p50: int | None = None
+    latency_ms_p95: int | None = None
+
+
+class RunEstimateBasisView(BaseModel):
+    """How each estimate field was derived — lets a client distinguish a
+    history-informed estimate from a cold-start fallback."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens_method: str
+    out_expected_method: str
+    latency_method: str
+    sample_size: int
+
+
+class RunEstimateBudgetCheckView(BaseModel):
+    """Agent per-run budget comparison (``budget.max_cost_usd_per_run``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    within_per_run_budget: bool
+    per_run_budget_usd: float
+
+
+class RunEstimateView(BaseModel):
+    """``POST /api/v1/agents/{name}/runs?estimate=true`` response.
+
+    A pre-flight cost + latency estimate. NO run is executed, NO job is
+    enqueued, and the tenant is NOT charged (the only operation that can
+    cost money is RAG retrieval embedding, which is opt-in via
+    ``?estimate_retrieval=true`` and reflected in ``retrieval_embedded``).
+
+    ``estimate`` is a constant ``True`` discriminator so a client can tell
+    this shape apart from a :class:`RunView` / :class:`RunAccepted` on the
+    same route. See :mod:`movate.core.run_estimator` for per-field
+    derivation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    estimate: bool = True
+    agent_name: str
+    model: str
+    predicted: RunEstimatePredictionView
+    basis: RunEstimateBasisView
+    budget_check: RunEstimateBudgetCheckView
+    retrieval_embedded: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_estimate(cls, est: Any) -> RunEstimateView:
+        """Build the wire view from a :class:`movate.core.run_estimator.RunEstimate`.
+
+        Typed ``Any`` to keep ``run_estimator`` (a ``core`` module) out of
+        this module's import graph — the runtime imports it lazily at the
+        call site instead.
+        """
+        return cls(
+            estimate=True,
+            agent_name=est.agent_name,
+            model=est.model,
+            predicted=RunEstimatePredictionView(
+                tokens_in=est.predicted.tokens_in,
+                tokens_out_max=est.predicted.tokens_out_max,
+                tokens_out_expected=est.predicted.tokens_out_expected,
+                cost_usd_min=est.predicted.cost_usd_min,
+                cost_usd_expected=est.predicted.cost_usd_expected,
+                cost_usd_max=est.predicted.cost_usd_max,
+                latency_ms_p50=est.predicted.latency_ms_p50,
+                latency_ms_p95=est.predicted.latency_ms_p95,
+            ),
+            basis=RunEstimateBasisView(
+                prompt_tokens_method=est.basis.prompt_tokens_method,
+                out_expected_method=est.basis.out_expected_method,
+                latency_method=est.basis.latency_method,
+                sample_size=est.basis.sample_size,
+            ),
+            budget_check=RunEstimateBudgetCheckView(
+                within_per_run_budget=est.budget_check.within_per_run_budget,
+                per_run_budget_usd=est.budget_check.per_run_budget_usd,
+            ),
+            retrieval_embedded=est.retrieval_embedded,
+            notes=list(est.notes),
+        )
+
+
 class JobListView(BaseModel):
     """``GET /jobs`` response — envelope around a page of JobViews.
 
