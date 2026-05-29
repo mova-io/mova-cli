@@ -320,7 +320,27 @@ async def _seed_bootstrap_key(storage: StorageProvider) -> None:
         # effective_scopes). Operators rotate to narrowly-scoped keys ASAP.
         scopes=["fleet-admin"],
     )
-    await storage.save_api_key(record)
+    try:
+        await storage.save_api_key(record)
+    except Exception:  # narrowed by the re-check below
+        # Concurrent cold-start race (#122 / rule 10 "duplicate jobs"): on a
+        # fresh, scaled deploy several pods boot at once, each finds no row in
+        # the get_api_key() check above, and each races the same insert.
+        # ``save_api_key`` is intentionally insert-only (so ``auth create-key``
+        # errors loudly on a genuine duplicate), so the losing pods hit a
+        # uniqueness violation here. That is benign for the SEED: the winning
+        # pod already persisted the identical bootstrap key. Re-read and, if a
+        # fleet-admin row now exists, treat it as success rather than crashing
+        # startup. Anything else (the row still absent, or a non-race error)
+        # re-raises — a real failure must still surface loudly.
+        existing = await storage.get_api_key(parsed.key_id)
+        if existing is not None and SCOPE_FLEET_ADMIN in existing.scopes:
+            err.print(
+                f"[dim]bootstrap key {parsed.key_id} seeded concurrently by "
+                f"another worker — skipping (scope: fleet-admin)[/dim]"
+            )
+            return
+        raise
     err.print(
         f"[dim]seeded bootstrap key {parsed.key_id} (scope: fleet-admin) "
         f"from MOVATE_SEED_API_KEY[/dim]"
