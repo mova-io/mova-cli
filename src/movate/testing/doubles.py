@@ -8,7 +8,7 @@ satisfy mypy strict against ``StorageProvider`` / ``Tracer`` /
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from movate.core.dr_backup import ImportResult
@@ -40,6 +40,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
 from movate.providers.base import (
     BaseLLMProvider,
     CompletionRequest,
@@ -87,6 +88,10 @@ class InMemoryStorage:
         # → the job_id the first async submit enqueued.
         self.run_submissions: dict[tuple[str, str], str] = {}
         self.canary_configs: list[CanaryConfig] = []
+        # ADR 047: append-only observability insights. A re-run of the analyst
+        # for a day appends another row; reads take the latest per
+        # (tenant, project, date).
+        self.insights: list[ObservabilityInsight] = []
 
     async def init(self) -> None:
         return None
@@ -1243,6 +1248,52 @@ class InMemoryStorage:
         from movate.core.dr_backup import import_state  # noqa: PLC0415
 
         return await import_state(self, snapshot, mode=mode)
+
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — append-only.
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        # Append-only: never replace an existing row. Reads dedupe per day.
+        self.insights.append(insight)
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        candidates = [
+            i
+            for i in self.insights
+            if i.tenant_id == tenant_id and i.project_id == project_id and i.date == day
+        ]
+        if not candidates:
+            return None
+        # Latest-per-day: newest created_at wins.
+        return max(candidates, key=lambda i: i.created_at)
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        rows = [i for i in self.insights if i.tenant_id == tenant_id]
+        if project_id is not None:
+            rows = [i for i in rows if i.project_id == project_id]
+        if since is not None:
+            rows = [i for i in rows if i.date >= since]
+        if until is not None:
+            rows = [i for i in rows if i.date <= until]
+        # Collapse append-only re-runs to the latest row per (project, date).
+        latest: dict[tuple[str, date], ObservabilityInsight] = {}
+        for i in rows:
+            key = (i.project_id, i.date)
+            if key not in latest or i.created_at > latest[key].created_at:
+                latest[key] = i
+        ordered = sorted(latest.values(), key=lambda i: i.date, reverse=True)
+        return ordered[:limit]
 
     async def close(self) -> None:
         return None

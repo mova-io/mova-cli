@@ -8,7 +8,7 @@ will be added in their respective phases.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.observability.models import ObservabilityInsight
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -664,6 +665,32 @@ _MIGRATIONS = [
     # breakdown is coherent (a turn's skill children are persisted too).
     "ALTER TABLE runs ADD COLUMN skill_calls TEXT",
     "ALTER TABLE runs ADD COLUMN turns TEXT",
+    # ADR 047: observability insights — the overnight analyst's daily,
+    # pre-aggregated telemetry summary per (tenant, project, date). APPEND-ONLY:
+    # a re-run for a day INSERTs a new row (keyed by the unique ``id``); reads
+    # take the latest row per (tenant, project, date). The four JSON columns
+    # (anomalies / top_failures / usage_rollup / trends) are json.dumps'd on
+    # save + json.loads'd on read, same strategy as runs.metrics. Additive new
+    # table (CREATE TABLE IF NOT EXISTS, idempotent) — default-off, no backfill.
+    """
+    CREATE TABLE IF NOT EXISTS observability_insights (
+        id               TEXT PRIMARY KEY,
+        tenant_id        TEXT NOT NULL,
+        project_id       TEXT NOT NULL,
+        date             TEXT NOT NULL,
+        health_score     REAL NOT NULL,
+        anomalies        TEXT NOT NULL,
+        top_failures     TEXT NOT NULL,
+        usage_rollup     TEXT NOT NULL,
+        trends           TEXT NOT NULL,
+        narrative_digest TEXT NOT NULL,
+        created_at       TEXT NOT NULL
+    )
+    """,
+    (
+        "CREATE INDEX IF NOT EXISTS idx_observability_insights_tpd "
+        "ON observability_insights(tenant_id, project_id, date)"
+    ),
 ]
 
 
@@ -946,6 +973,96 @@ class SqliteProvider:
         ) as cur:
             row = await cur.fetchone()
         return _row_to_eval(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Observability insights (ADR 047) — append-only.
+    # ------------------------------------------------------------------
+
+    async def save_insight(self, insight: ObservabilityInsight) -> None:
+        # INSERT-only (never UPDATE): a re-run for the same day appends a new
+        # row keyed by the unique ``id``; the read methods take the latest.
+        await self._db.execute(
+            """
+            INSERT INTO observability_insights (
+                id, tenant_id, project_id, date, health_score,
+                anomalies, top_failures, usage_rollup, trends,
+                narrative_digest, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                insight.id,
+                insight.tenant_id,
+                insight.project_id,
+                insight.date.isoformat(),
+                insight.health_score,
+                json.dumps(insight.anomalies),
+                json.dumps(insight.top_failures),
+                json.dumps(insight.usage_rollup),
+                json.dumps(insight.trends),
+                insight.narrative_digest,
+                insight.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_insight(
+        self, tenant_id: str, project_id: str, day: date
+    ) -> ObservabilityInsight | None:
+        # Latest-per-day: ORDER BY created_at DESC LIMIT 1 collapses
+        # append-only re-runs to the newest row. tenant_id in WHERE is the
+        # SQL-layer no-leak enforcement.
+        async with self._db.execute(
+            """
+            SELECT * FROM observability_insights
+            WHERE tenant_id = ? AND project_id = ? AND date = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (tenant_id, project_id, day.isoformat()),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_insight(row) if row else None
+
+    async def list_insights(
+        self,
+        tenant_id: str,
+        *,
+        project_id: str | None = None,
+        since: date | None = None,
+        until: date | None = None,
+        limit: int = 90,
+    ) -> list[ObservabilityInsight]:
+        clauses = ["tenant_id = ?"]
+        params: list[object] = [tenant_id]
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if since is not None:
+            clauses.append("date >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("date <= ?")
+            params.append(until.isoformat())
+        sql = (
+            "SELECT * FROM observability_insights WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY date DESC, created_at DESC"
+        )
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        # Collapse append-only re-runs to the latest row per (project, date).
+        # Rows arrive newest-created first, so the first sighting of a
+        # (project, date) is the latest one.
+        seen: set[tuple[str, str]] = set()
+        out: list[ObservabilityInsight] = []
+        for r in rows:
+            key = (r["project_id"], r["date"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(_row_to_insight(r))
+            if len(out) >= limit:
+                break
+        return out
 
     async def save_bench(self, b: BenchRecord) -> None:
         await self._db.execute(
@@ -2984,6 +3101,22 @@ def _row_to_agent_bundle(row: aiosqlite.Row) -> AgentBundleRecord:
         created_by=row["created_by"],
         content_hash=row["content_hash"],
         files=json.loads(row["files"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_insight(row: aiosqlite.Row) -> ObservabilityInsight:
+    return ObservabilityInsight(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        date=date.fromisoformat(row["date"]),
+        health_score=row["health_score"],
+        anomalies=json.loads(row["anomalies"]) if row["anomalies"] else [],
+        top_failures=json.loads(row["top_failures"]) if row["top_failures"] else [],
+        usage_rollup=json.loads(row["usage_rollup"]) if row["usage_rollup"] else {},
+        trends=json.loads(row["trends"]) if row["trends"] else {},
+        narrative_digest=row["narrative_digest"] or "",
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 

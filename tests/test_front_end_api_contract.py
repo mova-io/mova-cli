@@ -71,6 +71,13 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # auth — how the front end discovers + mints scoped keys
     ("GET", "/api/v1/auth/me"): None,
     ("POST", "/api/v1/auth/keys"): "admin",
+    # observability intelligence (ADR 047) — read feed/health/ask/troubleshoot
+    # + the admin-only on-demand analyst trigger.
+    ("GET", "/api/v1/observability/insights"): "read",
+    ("GET", "/api/v1/observability/health"): "read",
+    ("POST", "/api/v1/observability/ask"): "read",
+    ("POST", "/api/v1/observability/troubleshoot"): "read",
+    ("POST", "/api/v1/observability/analyze"): "admin",
 }
 
 

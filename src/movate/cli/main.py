@@ -216,6 +216,7 @@ from movate.cli.knowledge_cmd import knowledge_app  # noqa: E402
 from movate.cli.mcp_cmd import mcp_app  # noqa: E402
 from movate.cli.memory_cmd import memory_app  # noqa: E402
 from movate.cli.models_cmd import models_app  # noqa: E402
+from movate.cli.observability_cmd import observability_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
@@ -564,6 +565,10 @@ app.add_typer(models_app, name="models", rich_help_panel=PANEL_DIAGNOSE)
 # answer adjacent operator questions ("what does this cost?" vs
 # "what HAVE we spent?").
 app.add_typer(costs_app, name="costs", rich_help_panel=PANEL_DIAGNOSE)
+# `observability` (ADR 047) — ask the fleet's telemetry questions in natural
+# language with grounded citations, troubleshoot symptoms, and view the
+# overnight analyst's daily health digest. Diagnose-panel sibling to `costs`.
+app.add_typer(observability_app, name="observability", rich_help_panel=PANEL_DIAGNOSE)
 # `report` is the offline rollup (ADR 031 D3) — pass-rate / cost / latency /
 # top-failure aggregates from the LOCAL store. Sits with `costs` + `explain`
 # since all three answer "how are my agents doing?" without remote infra

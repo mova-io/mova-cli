@@ -2896,3 +2896,159 @@ class AgentMetricsView(BaseModel):
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
         )
+
+
+# ---------------------------------------------------------------------------
+# Observability Intelligence layer (ADR 047) — wire types for the
+# /api/v1/observability/* endpoints. Kept here (not in core/observability) so
+# the HTTP surface evolves independently of the persisted insight model.
+# ---------------------------------------------------------------------------
+
+
+class ObservabilityInsightView(BaseModel):
+    """``GET /api/v1/observability/insights`` row — one daily insight."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    project_id: str
+    date: str
+    health_score: float
+    anomalies: list[dict[str, Any]] = Field(default_factory=list)
+    top_failures: list[dict[str, Any]] = Field(default_factory=list)
+    usage_rollup: dict[str, Any] = Field(default_factory=dict)
+    trends: dict[str, Any] = Field(default_factory=dict)
+    narrative_digest: str = ""
+    created_at: str
+
+    @classmethod
+    def from_record(cls, insight: Any) -> ObservabilityInsightView:
+        return cls(
+            id=insight.id,
+            project_id=insight.project_id,
+            date=insight.date.isoformat(),
+            health_score=insight.health_score,
+            anomalies=list(insight.anomalies),
+            top_failures=list(insight.top_failures),
+            usage_rollup=dict(insight.usage_rollup),
+            trends=dict(insight.trends),
+            narrative_digest=insight.narrative_digest,
+            created_at=insight.created_at.isoformat(),
+        )
+
+
+class ObservabilityInsightListView(BaseModel):
+    """``GET /api/v1/observability/insights`` envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    insights: list[ObservabilityInsightView] = Field(default_factory=list)
+    count: int
+
+
+class ObservabilityHealthView(BaseModel):
+    """``GET /api/v1/observability/health`` — the latest health score + digest.
+
+    Named ``ObservabilityHealthView`` (not ``HealthView``) to avoid clashing
+    with the existing ``/healthz`` liveness ``HealthView``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str | None = None
+    date: str | None = None
+    health_score: float | None = None
+    narrative_digest: str = ""
+    anomaly_count: int = 0
+    has_insight: bool = False
+    """False when no insight exists yet for the project (cold start)."""
+
+
+class EvidenceView(BaseModel):
+    """One citation backing a grounded answer (ADR 047 — citations mandatory)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    reference: str
+    detail: str = ""
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_record(cls, ev: Any) -> EvidenceView:
+        return cls(
+            kind=str(ev.kind),
+            reference=ev.reference,
+            detail=ev.detail,
+            data=dict(ev.data),
+        )
+
+
+class GroundedAnswerView(BaseModel):
+    """``POST /observability/ask`` + ``/troubleshoot`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
+    evidence: list[EvidenceView] = Field(default_factory=list)
+    confidence: float = 0.0
+    suggested_action: str = ""
+    cost_usd: float = 0.0
+
+    @classmethod
+    def from_record(cls, ans: Any) -> GroundedAnswerView:
+        return cls(
+            answer=ans.answer,
+            evidence=[EvidenceView.from_record(e) for e in ans.evidence],
+            confidence=ans.confidence,
+            suggested_action=ans.suggested_action,
+            cost_usd=ans.cost_usd,
+        )
+
+
+class AskRequest(BaseModel):
+    """``POST /api/v1/observability/ask`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=2000)
+    project_id: str = Field(default="default", max_length=200)
+    budget_usd: float = Field(default=0.05, ge=0.0, le=5.0)
+    """Hard cap on the LLM spend of this query's synthesis call."""
+    mock: bool = False
+    """Use the deterministic MockProvider (no real spend / API key) — the
+    hermetic-test path, mirroring the eval/bench endpoints' ``mock`` flag."""
+
+
+class TroubleshootRequest(BaseModel):
+    """``POST /api/v1/observability/troubleshoot`` body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symptom: str = Field(min_length=1, max_length=2000)
+    time_window_days: int = Field(default=7, ge=1, le=90)
+    project_id: str = Field(default="default", max_length=200)
+    budget_usd: float = Field(default=0.05, ge=0.0, le=5.0)
+    mock: bool = False
+    """Use the deterministic MockProvider (no real spend / API key)."""
+
+
+class AnalyzeRequest(BaseModel):
+    """``POST /api/v1/observability/analyze`` body (admin — on-demand trigger)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(default="default", max_length=200)
+    date: str | None = None
+    """ISO YYYY-MM-DD. Omitted → the worker analyzes *yesterday* (nightly case)."""
+    budget_usd: float = Field(default=0.10, ge=0.0, le=5.0)
+
+
+class AnalyzeAcceptedView(BaseModel):
+    """``POST /api/v1/observability/analyze`` 202 response — the enqueued job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    kind: str
+    project_id: str
