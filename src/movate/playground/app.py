@@ -98,6 +98,11 @@ from movate.playground.targets import (
     decode_targets,
 )
 from movate.playground.uploads import UploadOutcome, UploadStore, adapt_upload
+from movate.playground.voice import (
+    VoiceNotEnabledError,
+    VoiceWSClient,
+    collect_audio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +115,10 @@ _K_BACKEND = "backend"
 _K_CONVO = "conversation_state"
 _K_UPLOADS = "upload_store"
 _K_TARGET = "target_name"
+# Voice mode (opt-in; default OFF). The voice WS client is session-scoped; the
+# per-turn chunk counter lets on_audio_end skip a no-audio recording.
+_K_VOICE_CLIENT = "voice_client"
+_K_VOICE_CHUNKS = "voice_chunks"
 
 # Configured targets for multi-target mode, decoded ONCE at import from the
 # env var the CLI launcher sets (:data:`TARGETS_ENV_VAR`). Empty list →
@@ -163,6 +172,22 @@ def _auto_persist_uploads() -> bool:
     always-ingest.
     """
     return os.environ.get("MDK_PLAYGROUND_PERSIST_UPLOADS", "") in {"1", "true", "True"}
+
+
+def _voice_enabled() -> bool:
+    """Whether voice mode is enabled for this playground (``--voice``).
+
+    OFF by default — the launcher exports ``MDK_PLAYGROUND_VOICE=1`` only when
+    the operator passes ``--voice``. With it OFF the audio callbacks below are
+    never registered, so the text playground is byte-for-byte unchanged.
+    Read at import time so registration matches the launch flag.
+    """
+    return os.environ.get("MDK_PLAYGROUND_VOICE", "") in {"1", "true", "True"}
+
+
+# Resolved ONCE at import (the child ``chainlit run`` process reads the env the
+# launcher set). Gates whether the audio callbacks are registered at all.
+_VOICE_ENABLED: bool = _voice_enabled()
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +343,16 @@ def _capability_banner(caps: RuntimeCapabilities) -> str:
     """One-line summary of how this chat will behave, for the operator."""
     memory = "server sessions" if caps.sessions else "client-managed history"
     stream = "streaming" if caps.run_streaming else "buffered"
+    voice = ""
+    if _VOICE_ENABLED:
+        # Voice mode is on for this launch. ``caps.voice`` is only a hint (the
+        # capabilities probe can't see the WS route), so we phrase it as
+        # available + note the graceful-degrade rather than a hard promise.
+        advertised = " (advertised)" if caps.voice else ""
+        voice = f" · 🎙 **voice mode on**{advertised} — use the mic to talk"
     return (
         f"_Memory: **{memory}** · responses: **{stream}** · "
-        f"uploads up to {caps.max_upload_mb} MB, {caps.max_upload_count} files_"
+        f"uploads up to {caps.max_upload_mb} MB, {caps.max_upload_count} files{voice}_"
     )
 
 
@@ -787,6 +819,190 @@ async def _run_streaming(
         msg.content = f"⚠ status `{status}`"
     msg.actions = _feedback_actions(run_id)
     await msg.update()
+
+
+# ---------------------------------------------------------------------------
+# Voice mode (opt-in; default OFF — registered only when --voice was passed)
+#
+# Mic audio → WS /api/v1/agents/{name}/voice → STT → the unchanged agent →
+# TTS → audio back. Chainlit fires three callbacks per recording:
+#   on_audio_start  — open the voice WS to the bound agent on the SELECTED
+#                     target (reusing the same base URL + bearer the text path
+#                     uses) and send the per-turn ``config`` frame.
+#   on_audio_chunk  — forward each mic frame to the runtime as a binary frame.
+#   on_audio_end    — send ``end``, then consume the turn: render partial /
+#                     final transcripts + the agent's streamed answer into one
+#                     live bubble, and play the returned TTS audio via cl.Audio.
+# A runtime without the voice route degrades to a friendly "voice not enabled"
+# message (VoiceNotEnabledError) rather than crashing the UI.
+# ---------------------------------------------------------------------------
+
+
+def _voice_client_for_session() -> VoiceWSClient | None:
+    """Build a :class:`VoiceWSClient` for the bound agent on this session's target.
+
+    Reuses the SAME runtime URL + bearer token the text path resolved (the
+    selected chat-profile target in multi-target mode, else the single-runtime
+    env vars) by reading them off the session's :class:`PlaygroundClient`
+    config — so voice talks to exactly the runtime the operator picked, with
+    that runtime's credentials. Returns ``None`` when no agent is bound yet.
+    """
+    agent_name = cl.user_session.get(_K_AGENT)
+    client: PlaygroundClient | None = cl.user_session.get(_K_CLIENT)
+    if not agent_name or client is None:
+        return None
+    cfg = client._config  # the playground's own config dataclass (URL + key)
+    return VoiceWSClient(runtime_url=cfg.runtime_url, agent=agent_name, token=cfg.api_key)
+
+
+async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
+    """Consume one voice turn off ``ws``, streaming text into ``msg`` + playing TTS.
+
+    Renders ``transcript.partial`` as a live "(listening) …" caption, replaces
+    it with the bold final transcript once endpointed, streams ``agent.token``
+    deltas under it, and on completion attaches the synthesized audio as a
+    ``cl.Audio`` element (auto-played) plus the 👍/👎 feedback actions. An
+    ``error`` frame is surfaced inline; the text answer (if any already
+    streamed) is preserved so a TTS-stage failure still leaves the reply
+    readable (the runtime degrades text-first, ADR 048 D8).
+    """
+    transcript = ""
+    answer_parts: list[str] = []
+    audio_frames: list[Any] = []
+    run_id: str | None = None
+
+    def _compose(caption: str) -> str:
+        head = f"🎙 _{caption}_" if caption else ""
+        body = "".join(answer_parts)
+        return f"{head}\n\n{body}" if head and body else head or body
+
+    async for frame in ws.iter_turn():
+        if frame.is_partial:
+            msg.content = _compose(f"(listening) {frame.text}")
+            await msg.update()
+        elif frame.is_final_transcript:
+            transcript = frame.text
+            msg.content = _compose(f"you said: “{transcript}”")
+            await msg.update()
+        elif frame.is_agent_token:
+            answer_parts.append(frame.text)
+            msg.content = _compose(f"you said: “{transcript}”" if transcript else "")
+            await msg.update()
+        elif frame.is_audio:
+            audio_frames.append(frame)
+        elif frame.is_error:
+            stage = frame.data.get("stage", "?")
+            message = frame.data.get("message", "voice error")
+            answer_parts.append(f"\n\n❌ voice {stage} error: {message}")
+            msg.content = _compose(f"you said: “{transcript}”" if transcript else "")
+            await msg.update()
+        elif frame.is_done:
+            run_id = frame.data.get("run_id") or None
+
+    # Play the synthesized audio back (one element, auto-played). Falls through
+    # silently when TTS produced nothing (e.g. a degraded text-only turn).
+    audio_bytes = collect_audio(audio_frames)
+    elements: list[Any] = []
+    if audio_bytes:
+        mime = _voice_mime(audio_frames)
+        elements.append(cl.Audio(content=audio_bytes, name="reply", mime=mime, auto_play=True))
+    msg.elements = elements
+    msg.actions = _feedback_actions(run_id)
+    if run_id:
+        cl.user_session.set("last_run_id", run_id)
+    await msg.update()
+
+
+def _voice_mime(audio_frames: list[Any]) -> str:
+    """Best-effort MIME for the synthesized audio from the first frame's codec.
+
+    The runtime tags each ``tts.audio`` header with ``codec`` (``pcm16`` /
+    ``opus`` / ``mulaw``). Browsers play raw PCM poorly, but ``cl.Audio``
+    wraps a player around the bytes; we map the codec to a sensible container
+    hint and default to ``audio/wav`` (the OpenAI TTS reference adapter emits
+    WAV-framed PCM) so the common path plays.
+    """
+    codec = ""
+    if audio_frames:
+        codec = str(audio_frames[0].data.get("codec", ""))
+    return {"opus": "audio/ogg", "mulaw": "audio/basic"}.get(codec, "audio/wav")
+
+
+if _VOICE_ENABLED:
+
+    @cl.on_audio_start  # pragma: no cover - requires chainlit audio at runtime
+    async def on_audio_start() -> bool:
+        """Open the voice WS for the bound agent at the start of a recording.
+
+        Returns ``True`` to let Chainlit proceed streaming mic chunks; ``False``
+        aborts the recording (no agent bound, or the runtime can't do voice) so
+        we never buffer audio we can't deliver. A connect failure shows the
+        friendly "voice not enabled" hint.
+        """
+        ws = _voice_client_for_session()
+        if ws is None:
+            await cl.Message(
+                content="🎙 Pick an agent first, then use the mic to talk to it."
+            ).send()
+            return False
+        try:
+            await ws.connect()
+            await ws.send_config(mock=os.environ.get("MDK_PLAYGROUND_VOICE_MOCK", "") == "1")
+        except VoiceNotEnabledError as exc:
+            await cl.Message(
+                content=(
+                    "🔇 Voice isn't enabled on this runtime "
+                    f"(`{ws.runtime_url}`). The agent still works in text — "
+                    "just type. \n\n_Details: "
+                    f"{type(exc).__name__}: {exc}_"
+                )
+            ).send()
+            return False
+        cl.user_session.set(_K_VOICE_CLIENT, ws)
+        cl.user_session.set(_K_VOICE_CHUNKS, 0)
+        return True
+
+    @cl.on_audio_chunk  # pragma: no cover - requires chainlit audio at runtime
+    async def on_audio_chunk(chunk: Any) -> None:
+        """Forward one mic audio chunk to the runtime as a binary WS frame."""
+        ws: VoiceWSClient | None = cl.user_session.get(_K_VOICE_CLIENT)
+        if ws is None:
+            return
+        data = getattr(chunk, "data", None)
+        if not data:
+            return
+        try:
+            await ws.send_audio(bytes(data))
+            cl.user_session.set(_K_VOICE_CHUNKS, cl.user_session.get(_K_VOICE_CHUNKS, 0) + 1)
+        except Exception:
+            # A mid-stream socket drop — stop forwarding; on_audio_end reports it.
+            cl.user_session.set(_K_VOICE_CLIENT, None)
+
+    @cl.on_audio_end  # pragma: no cover - requires chainlit audio at runtime
+    async def on_audio_end() -> None:
+        """End the utterance, run the turn, render the transcript + play TTS."""
+        ws: VoiceWSClient | None = cl.user_session.get(_K_VOICE_CLIENT)
+        cl.user_session.set(_K_VOICE_CLIENT, None)
+        if ws is None:
+            await cl.Message(
+                content="🔇 The voice connection dropped before the turn ran. Try again."
+            ).send()
+            return
+        if not cl.user_session.get(_K_VOICE_CHUNKS, 0):
+            # No audio captured (e.g. an instant stop) — nothing to transcribe.
+            await ws.aclose()
+            await cl.Message(content="🎙 No audio captured — hold the mic and speak.").send()
+            return
+        msg = cl.Message(content="🎙 _(processing)_")
+        await msg.send()
+        try:
+            await ws.end_turn()
+            await _render_voice_turn(ws, msg)
+        except Exception as exc:
+            msg.content = f"❌ Voice turn failed: {type(exc).__name__}: {exc}"
+            await msg.update()
+        finally:
+            await ws.aclose()
 
 
 # ---------------------------------------------------------------------------

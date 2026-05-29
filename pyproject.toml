@@ -310,6 +310,13 @@ playground = [
     # NOTE: aiosqlite (the async SQLite driver) is already a CORE dep
     # (see [project].dependencies) — no need to repeat it here.
     "greenlet>=3.0",
+    # Voice mode (opt-in ``mdk playground serve --voice``) opens a client
+    # WebSocket to the runtime's ``WS /api/v1/agents/{name}/voice`` route to
+    # stream mic audio + receive TTS. httpx has no WS client, so we use the
+    # ``websockets`` library. It's usually present transitively (uvicorn[standard]),
+    # but we import it DIRECTLY (movate.playground.voice), so declare it
+    # explicitly here. BSD-3-Clause — permissive, passes the license gate.
+    "websockets>=12.0",
 ]
 
 [dependency-groups]
