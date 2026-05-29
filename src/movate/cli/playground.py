@@ -14,10 +14,25 @@ Quickstart::
     export MOVATE_API_KEY=mvt_live_...
     mdk playground serve --runtime-url https://movate-prod-api.eastus2...
 
+    # Across ALL configured targets (dev/staging/prod) — a chat-profile
+    # picker per target; pick a target, then its agents
+    mdk config add-target dev   --url http://... --key-env MDK_DEV_KEY
+    mdk config add-target prod  --url https://... --key-env MDK_PROD_KEY
+    mdk playground serve              # auto: targets configured, no --runtime-url
+
 The bearer token is read from ``MOVATE_API_KEY`` (or
 ``MDK_PLAYGROUND_API_KEY``) by default — never pass it on the command
 line. To point at a different env var, ``export`` it onto
 ``MDK_PLAYGROUND_API_KEY`` before launching.
+
+**Multi-target mode** activates automatically when deployment targets
+are registered in ``~/.movate/config.yaml`` (``mdk config list-targets``)
+AND no explicit ``--runtime-url`` / ``--api-key`` is given: the UI shows
+one Chainlit chat profile per target (label = name + URL), and selecting
+one points that session at the target's runtime + per-target bearer token
+(resolved from its ``key_env``). Pass ``--runtime-url`` (or ``--no-targets``)
+to force the original single-runtime flow; ``--all-targets`` forces
+multi-target explicitly.
 
 The playground is a ChatGPT-like Chainlit app: multi-turn chat with a
 deployed agent, a past-conversations sidebar (resume prior chats), file
@@ -35,10 +50,149 @@ import os
 import subprocess
 import sys
 
+import click
 import typer
 from rich.console import Console
 
+from movate.playground.targets import (
+    TARGETS_ENV_VAR,
+    PlaygroundTarget,
+    encode_targets,
+    resolve_targets_from_config,
+)
+
 err = Console(stderr=True)
+
+
+def _explicit_runtime_override(ctx: typer.Context) -> bool:
+    """Did the operator explicitly pin a single runtime (URL or key)?
+
+    Multi-target mode (chat-profile-per-target) must NEVER pre-empt the
+    original single-runtime flow. So we treat ANY explicit ``--runtime-url``
+    / ``--api-key`` — whether on the command line OR via the
+    ``MDK_PLAYGROUND_*`` / ``MOVATE_*`` env vars — as "the operator wants
+    one runtime", and stay in single-runtime mode. Click's
+    ``get_parameter_source`` distinguishes an explicit value from the
+    option's default, which is exactly the signal we need (a bare
+    ``mdk playground serve`` leaves both at DEFAULT).
+    """
+    explicit = {click.core.ParameterSource.COMMANDLINE, click.core.ParameterSource.ENVIRONMENT}
+    return any(ctx.get_parameter_source(param) in explicit for param in ("runtime_url", "api_key"))
+
+
+def _resolve_target_mode(
+    ctx: typer.Context,
+    *,
+    all_targets: bool,
+    no_targets: bool,
+) -> tuple[bool, list[PlaygroundTarget]]:
+    """Decide single-runtime vs multi-target and resolve the target list.
+
+    Precedence (first match wins):
+
+    1. ``--no-targets`` → always single-runtime.
+    2. an explicit ``--runtime-url`` / ``--api-key`` → single-runtime
+       (back-compat: the operator pinned one runtime; never surprise them
+       with a picker). ``--all-targets`` here is a soft no-op (warned).
+    3. ``--all-targets`` → multi-target; errors if none are registered.
+    4. auto: targets configured AND no explicit override → multi-target.
+
+    Anything else stays single-runtime (today's behavior). Returns
+    ``(multi_target, targets)`` — ``targets`` is empty in single-runtime
+    mode. Exits 2 on a contradictory flag combination.
+    """
+    if all_targets and no_targets:
+        err.print("[red]✗[/red] pass at most one of --all-targets / --no-targets.")
+        raise typer.Exit(code=2)
+
+    if no_targets:
+        return False, []
+
+    if _explicit_runtime_override(ctx):
+        if all_targets:
+            err.print(
+                "[yellow]⚠[/yellow] --all-targets ignored: an explicit "
+                "--runtime-url / --api-key pins a single runtime."
+            )
+        return False, []
+
+    targets = _load_playground_targets()
+    if all_targets and not targets:
+        err.print(
+            "[red]✗[/red] --all-targets given but no targets are "
+            "registered. Add one with [bold]mdk config add-target[/bold]."
+        )
+        raise typer.Exit(code=2)
+    # Auto-on when targets exist; --all-targets forces the same path.
+    return bool(targets), targets
+
+
+def _load_playground_targets() -> list[PlaygroundTarget]:
+    """Read configured targets from ``~/.movate/config.yaml`` + resolve keys.
+
+    Reuses the SAME loader ``mdk config list-targets`` uses
+    (:func:`movate.core.user_config.load_user_config`) — no reinvented
+    config parsing. Per-target bearer tokens resolve from each target's
+    ``key_env`` env var, which ``movate.credentials.loader`` already
+    autoloads from ``~/.movate/credentials`` at CLI startup. Targets with
+    a missing key are KEPT (with ``key_available=False``) so the picker can
+    show them disabled with a hint rather than silently dropping them.
+    """
+    from movate.core.user_config import load_user_config  # noqa: PLC0415
+
+    cfg = load_user_config()
+    return resolve_targets_from_config(cfg.targets)
+
+
+def _print_launch_banner(
+    *,
+    multi_target: bool,
+    targets: list[PlaygroundTarget],
+    runtime_url: str,
+    api_key: str | None,
+    host: str,
+    port: int,
+) -> None:
+    """Print the startup banner to stderr (never echoes the bearer token).
+
+    Two shapes: a per-target summary (multi-target mode) listing each
+    registered runtime + whether its key resolved, or the original
+    single-runtime line + auth hint. Only target NAMES / URLs / key_env
+    *names* are printed — never a resolved key value.
+    """
+    if multi_target and targets:
+        ready = sum(1 for t in targets if t.key_available)
+        err.print(
+            f"[bold cyan]MDK playground[/bold cyan] → multi-target "
+            f"([bold]{len(targets)}[/bold] target(s), [bold]{ready}[/bold] "
+            f"with a key), UI on [bold]http://{host}:{port}[/bold]"
+        )
+        for t in targets:
+            mark = "[green]●[/green]" if t.key_available else "[yellow]○[/yellow]"
+            note = "" if t.key_available else f" [dim](no key — set {t.key_env})[/dim]"
+            err.print(f"  {mark} [bold]{t.name}[/bold] → {t.url}{note}")
+        err.print(
+            "[dim]Pick a target in the chat-profile selector, then an "
+            "agent. Pass --runtime-url to pin a single runtime instead.[/dim]"
+        )
+        return
+
+    err.print(
+        f"[bold cyan]MDK playground[/bold cyan] → "
+        f"runtime [bold]{runtime_url}[/bold], "
+        f"UI on [bold]http://{host}:{port}[/bold]"
+    )
+    if api_key:
+        err.print(
+            "[dim]Auth: using bearer token from env. "
+            "Operators sign in via the runtime's standard auth flow.[/dim]"
+        )
+    else:
+        err.print(
+            "[yellow]⚠[/yellow] no API key set — only works for runtimes "
+            "started without auth (local dev / staging). For production "
+            "set [bold]MOVATE_API_KEY[/bold] or pass [bold]--api-key[/bold]."
+        )
 
 
 playground_app = typer.Typer(
@@ -105,6 +259,7 @@ def _warn_if_unstable_python() -> None:
 
 @playground_app.command("serve")
 def serve(
+    ctx: typer.Context,
     runtime_url: str = typer.Option(
         "http://127.0.0.1:8000",
         "--runtime-url",
@@ -112,7 +267,9 @@ def serve(
         help=(
             "Base URL of the runtime to test against. Defaults to "
             "the local ``mdk serve`` default. For a deployed runtime, "
-            "pass the ACA URL (e.g. https://...azurecontainerapps.io)."
+            "pass the ACA URL (e.g. https://...azurecontainerapps.io). "
+            "Passing this (or its env var) pins a SINGLE runtime and "
+            "disables the multi-target chat-profile picker."
         ),
     ),
     api_key: str | None = typer.Option(
@@ -175,6 +332,27 @@ def serve(
             "chat. ``--persist-uploads`` flips the default to always-ingest."
         ),
     ),
+    all_targets: bool = typer.Option(
+        False,
+        "--all-targets",
+        help=(
+            "Force multi-target mode: surface ONE chat profile per "
+            "target registered in ``~/.movate/config.yaml`` (the same "
+            "targets ``mdk config list-targets`` shows). Pick a target, "
+            "then its agents. This is the AUTO default when targets are "
+            "configured and no ``--runtime-url`` is given; the flag makes "
+            "it explicit (and errors if no targets are registered)."
+        ),
+    ),
+    no_targets: bool = typer.Option(
+        False,
+        "--no-targets",
+        help=(
+            "Force single-runtime mode even when targets are configured "
+            "— talk only to ``--runtime-url`` (default: the local "
+            "runtime). Skips the chat-profile target picker."
+        ),
+    ),
 ) -> None:
     """Launch the ChatGPT-like Chainlit playground for testing agents.
 
@@ -193,6 +371,10 @@ def serve(
     _ensure_chainlit_installed()
     _warn_if_unstable_python()
 
+    multi_target, targets = _resolve_target_mode(
+        ctx, all_targets=all_targets, no_targets=no_targets
+    )
+
     # Chainlit reads its config from env vars + CLI flags. We export
     # the runtime config under MDK_PLAYGROUND_* so the app module
     # (``movate.playground.app``) can pick them up at start time. The
@@ -206,6 +388,16 @@ def serve(
         env["MDK_PLAYGROUND_NO_HISTORY"] = "1"
     if persist_uploads:
         env["MDK_PLAYGROUND_PERSIST_UPLOADS"] = "1"
+    # Multi-target: hand the resolved target list (URL + key_env + the
+    # already-resolved bearer token) to the app via one JSON env var.
+    # Its presence is what flips the app into chat-profile mode; absence
+    # keeps the original single-runtime path byte-for-byte unchanged.
+    if multi_target and targets:
+        env[TARGETS_ENV_VAR] = encode_targets(targets)
+    else:
+        # Defensive: never let a stale value leak from the parent env into
+        # a single-runtime launch.
+        env.pop(TARGETS_ENV_VAR, None)
 
     # ``chainlit run`` takes a path to a Python module file. We resolve
     # the app module's file via importlib *without executing it* — the app
@@ -235,22 +427,14 @@ def serve(
     if headless:
         chainlit_cmd.append("--headless")
 
-    err.print(
-        f"[bold cyan]MDK playground[/bold cyan] → "
-        f"runtime [bold]{runtime_url}[/bold], "
-        f"UI on [bold]http://{host}:{port}[/bold]"
+    _print_launch_banner(
+        multi_target=multi_target,
+        targets=targets,
+        runtime_url=runtime_url,
+        api_key=api_key,
+        host=host,
+        port=port,
     )
-    if api_key:
-        err.print(
-            "[dim]Auth: using bearer token from env. "
-            "Operators sign in via the runtime's standard auth flow.[/dim]"
-        )
-    else:
-        err.print(
-            "[yellow]⚠[/yellow] no API key set — only works for runtimes "
-            "started without auth (local dev / staging). For production "
-            "set [bold]MOVATE_API_KEY[/bold] or pass [bold]--api-key[/bold]."
-        )
 
     try:
         subprocess.run(chainlit_cmd, env=env, check=True)
