@@ -92,6 +92,11 @@ from movate.playground.conversation import (
     select_backend,
 )
 from movate.playground.state import resolve_data_layer_config
+from movate.playground.targets import (
+    TARGETS_ENV_VAR,
+    PlaygroundTarget,
+    decode_targets,
+)
 from movate.playground.uploads import UploadOutcome, UploadStore, adapt_upload
 
 logger = logging.getLogger(__name__)
@@ -104,6 +109,28 @@ _K_AGENT_DETAIL = "agent_detail"
 _K_BACKEND = "backend"
 _K_CONVO = "conversation_state"
 _K_UPLOADS = "upload_store"
+_K_TARGET = "target_name"
+
+# Configured targets for multi-target mode, decoded ONCE at import from the
+# env var the CLI launcher sets (:data:`TARGETS_ENV_VAR`). Empty list →
+# single-runtime mode (the original behavior): no chat-profile picker, the
+# client is built from MDK_PLAYGROUND_RUNTIME_URL / _API_KEY as before.
+_TARGETS: list[PlaygroundTarget] = decode_targets(os.environ.get(TARGETS_ENV_VAR))
+
+
+def _targets_by_name() -> dict[str, PlaygroundTarget]:
+    """Index the configured targets by name (for chat-profile lookup)."""
+    return {t.name: t for t in _TARGETS}
+
+
+def _client_from_target(target: PlaygroundTarget) -> PlaygroundClient:
+    """Build a runtime client pinned to one configured target.
+
+    The target carries its OWN resolved bearer token (read from its
+    ``key_env`` by the launcher), so each profile talks to its runtime
+    with its own credentials — no global key assumption.
+    """
+    return PlaygroundClient(PlaygroundClientConfig(runtime_url=target.url, api_key=target.api_key))
 
 
 def _client_from_env() -> PlaygroundClient:
@@ -194,19 +221,73 @@ if _DATA_LAYER_CFG.enabled:
 
 
 # ---------------------------------------------------------------------------
+# Chat profiles (multi-target mode). Registered at import time when the CLI
+# launcher handed us configured targets — one profile per target. Selecting a
+# profile pins the session to THAT target's runtime + key (see _init_session).
+# Absent in single-runtime mode, so the original no-picker flow is unchanged.
+# ---------------------------------------------------------------------------
+
+if _TARGETS:
+
+    @cl.set_chat_profiles  # pragma: no cover - requires chainlit at runtime
+    async def _chat_profiles(_user: Any = None) -> list[Any]:
+        """One chat profile per configured target (name + URL label).
+
+        A target whose key is missing still appears (so the operator sees
+        every registered runtime) but its description flags the absent key;
+        :func:`start` then shows a friendly "no key" message instead of
+        letting a 401 surface as a stack trace.
+        """
+        return [
+            cl.ChatProfile(
+                name=t.name,
+                markdown_description=t.profile_description(),
+                default=(idx == 0),
+            )
+            for idx, t in enumerate(_TARGETS)
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Session setup helpers
 # ---------------------------------------------------------------------------
+
+
+def _selected_target() -> PlaygroundTarget | None:
+    """Return the target for this session's selected chat profile, if any.
+
+    In multi-target mode Chainlit stores the chosen profile's name under
+    ``chat_profile``; we map it back to the configured
+    :class:`PlaygroundTarget`. Returns ``None`` in single-runtime mode (no
+    targets configured) or when the selection doesn't match a known target
+    (e.g. resumed thread from a different config) — callers fall back to
+    the env-based single-runtime client.
+    """
+    if not _TARGETS:
+        return None
+    selected = cl.user_session.get("chat_profile")
+    if not selected:
+        return None
+    return _targets_by_name().get(str(selected))
 
 
 async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
     """Create the client + detect capabilities, store both in the session.
 
-    Capability detection runs ONCE per chat. A runtime that predates the
-    capabilities endpoint (404) degrades to the all-off default —
-    client-managed memory, buffered responses, legacy feedback — i.e.
-    today's behavior. Never raises on a missing endpoint.
+    The client is pinned to the selected chat profile's target in
+    multi-target mode, else built from the single-runtime env vars
+    (unchanged original behavior). Capability detection runs ONCE per
+    chat. A runtime that predates the capabilities endpoint (404) degrades
+    to the all-off default — client-managed memory, buffered responses,
+    legacy feedback — i.e. today's behavior. Never raises on a missing
+    endpoint.
     """
-    client = _client_from_env()
+    target = _selected_target()
+    if target is not None:
+        client = _client_from_target(target)
+        cl.user_session.set(_K_TARGET, target.name)
+    else:
+        client = _client_from_env()
     cl.user_session.set(_K_CLIENT, client)
     try:
         raw_caps = await client.get_capabilities()
@@ -243,6 +324,20 @@ def _capability_banner(caps: RuntimeCapabilities) -> str:
     )
 
 
+def _is_auth_error(exc: Exception) -> bool:
+    """Heuristic: does ``exc`` look like a 401/403 from the runtime?
+
+    The client raises ``httpx.HTTPStatusError`` whose ``.response`` carries
+    the status code. We read it structurally (no httpx import here) so an
+    auth failure can be surfaced as a friendly "no key" message rather than
+    a raw stack trace. Anything we can't classify returns False (handled by
+    the generic error path).
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status in {401, 403}
+
+
 # ---------------------------------------------------------------------------
 # Chat lifecycle
 # ---------------------------------------------------------------------------
@@ -250,25 +345,68 @@ def _capability_banner(caps: RuntimeCapabilities) -> str:
 
 @cl.on_chat_start
 async def start() -> None:
-    """Detect capabilities, then show the agent picker on session start."""
+    """Detect capabilities, then show the agent picker on session start.
+
+    In multi-target mode the session is already pinned (via the selected
+    chat profile) to one target's runtime + key. A target with no
+    resolvable key short-circuits to a friendly hint — we never fire a
+    request that's guaranteed to 401.
+    """
+    target = _selected_target()
+    if target is not None and not target.key_available:
+        await cl.Message(
+            content=(
+                f"🔒 No key for target **{target.name}** "
+                f"(`{target.url}`). Set the `{target.key_env}` env var to "
+                "this target's bearer token, then reload — "
+                "e.g. `mdk auth login` or `export "
+                f"{target.key_env}=...`. Pick a different target from the "
+                "profile selector to continue meanwhile."
+            )
+        ).send()
+        return
+
     client, caps = await _init_session()
 
     try:
         agents = await client.list_agents()
     except Exception as exc:
+        if _is_auth_error(exc) and target is not None:
+            await cl.Message(
+                content=(
+                    f"🔒 Authentication failed for target **{target.name}** "
+                    f"(`{target.url}`). The key in `{target.key_env}` is "
+                    "missing, wrong, or expired — set it to a valid bearer "
+                    "token and reload."
+                )
+            ).send()
+            return
+        if _is_auth_error(exc):
+            await cl.Message(
+                content=(
+                    "🔒 Authentication failed (401/403). Set a valid bearer "
+                    "token via `MOVATE_API_KEY` / `--api-key` and reload."
+                )
+            ).send()
+            return
+        hint = (
+            "``MDK_PLAYGROUND_RUNTIME_URL`` points at it."
+            if target is None
+            else f"target **{target.name}** (`{target.url}`) is reachable."
+        )
         await cl.Message(
             content=(
                 f"❌ Could not reach the runtime: {type(exc).__name__}: {exc}\n\n"
-                "Check that the runtime is running and that "
-                "``MDK_PLAYGROUND_RUNTIME_URL`` points at it."
+                f"Check that the runtime is running and that {hint}"
             )
         ).send()
         return
 
     if not agents:
+        scope = f" on target **{target.name}**" if target is not None else ""
         await cl.Message(
             content=(
-                "⚠ The runtime has no agents registered. "
+                f"⚠ The runtime has no agents registered{scope}. "
                 "Use ``mdk add <role>`` to scaffold one, then "
                 "``mdk deploy --target <env>`` to publish it."
             )
@@ -284,10 +422,11 @@ async def start() -> None:
         )
         for a in agents
     ]
+    where = f" on target **{target.name}** (`{target.url}`)" if target is not None else ""
     await cl.Message(
         content=(
-            f"**MDK playground** — {len(agents)} agent(s) available on this "
-            "runtime. Pick one, then just start chatting.\n\n"
+            f"**MDK playground** — {len(agents)} agent(s) available{where}. "
+            "Pick one, then just start chatting.\n\n"
             f"{_capability_banner(caps)}"
         ),
         actions=actions,

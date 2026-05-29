@@ -26,10 +26,35 @@ from typer.testing import CliRunner
 
 from movate.cli import playground
 from movate.cli.main import app
+from movate.playground.targets import TARGETS_ENV_VAR, PlaygroundTarget, decode_targets
 
 runner = CliRunner(mix_stderr=False)
 
 pytestmark = pytest.mark.unit
+
+
+def _stub_launch(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Stub the chainlit preflight + subprocess launch; capture child env.
+
+    Returns the dict the launch path populates so a test can assert what
+    the child ``chainlit run`` process would see (env contract) without
+    actually spawning chainlit.
+    """
+    monkeypatch.setattr(playground, "_ensure_chainlit_installed", lambda: None)
+    monkeypatch.setattr(playground, "_warn_if_unstable_python", lambda: None)
+    captured_env: dict[str, str] = {}
+
+    def fake_run(cmd: list[str], env: dict[str, str], check: bool) -> object:
+        captured_env.update(env)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr(playground.subprocess, "run", fake_run)
+    return captured_env
+
 
 # Invoke through the full ``mdk`` app so the test mirrors the real
 # ``mdk playground serve`` invocation (the standalone single-command
@@ -76,6 +101,13 @@ def test_help_lists_new_flags() -> None:
     help_text = _help_text()
     assert "--no-history" in help_text
     assert "--persist-uploads" in help_text
+
+
+def test_help_lists_target_flags() -> None:
+    """The multi-target opt-in/opt-out flags are part of the help contract."""
+    help_text = _help_text()
+    assert "--all-targets" in help_text
+    assert "--no-targets" in help_text
 
 
 def test_help_keeps_core_flags() -> None:
@@ -183,3 +215,120 @@ def test_no_history_flag_sets_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0
     assert captured_env.get("MDK_PLAYGROUND_NO_HISTORY") == "1"
     assert captured_env.get("MDK_PLAYGROUND_PERSIST_UPLOADS") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Multi-target mode — single-runtime back-compat + target hand-off
+# ---------------------------------------------------------------------------
+
+_DEV = PlaygroundTarget(name="dev", url="http://dev", key_env="MDK_DEV_KEY", api_key="dev-tok")
+_PROD = PlaygroundTarget(name="prod", url="https://prod", key_env="MDK_PROD_KEY", api_key=None)
+
+
+def _fake_targets(monkeypatch: pytest.MonkeyPatch, targets: list[PlaygroundTarget]) -> None:
+    """Make the launcher see ``targets`` as the configured target list."""
+    monkeypatch.setattr(playground, "_load_playground_targets", lambda: list(targets))
+
+
+def test_no_targets_configured_stays_single_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No registered targets → original single-runtime launch, no target env."""
+    captured_env = _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [])
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+
+    result = runner.invoke(app, [*_SERVE, "--headless"])
+    assert result.exit_code == 0
+    assert TARGETS_ENV_VAR not in captured_env
+    assert captured_env.get("MDK_PLAYGROUND_RUNTIME_URL") == "http://127.0.0.1:8000"
+
+
+def test_auto_multi_target_when_targets_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Targets configured + no explicit --runtime-url → multi-target hand-off."""
+    captured_env = _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [_DEV, _PROD])
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+
+    result = runner.invoke(app, [*_SERVE, "--headless"])
+    assert result.exit_code == 0
+    decoded = decode_targets(captured_env.get(TARGETS_ENV_VAR))
+    assert {t.name for t in decoded} == {"dev", "prod"}
+    assert {t.name for t in decoded if t.key_available} == {"dev"}
+
+
+def test_explicit_runtime_url_disables_multi_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Back-compat: an explicit --runtime-url pins single-runtime even with
+    targets configured — no target picker, no target env var."""
+    captured_env = _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [_DEV, _PROD])
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+
+    result = runner.invoke(app, [*_SERVE, "--runtime-url", "http://pinned:9000", "--headless"])
+    assert result.exit_code == 0
+    assert TARGETS_ENV_VAR not in captured_env
+    assert captured_env.get("MDK_PLAYGROUND_RUNTIME_URL") == "http://pinned:9000"
+
+
+def test_runtime_url_via_env_disables_multi_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit runtime URL via env var also pins single-runtime."""
+    captured_env = _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [_DEV, _PROD])
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+
+    result = runner.invoke(
+        app, [*_SERVE, "--headless"], env={"MDK_PLAYGROUND_RUNTIME_URL": "http://from-env:8000"}
+    )
+    assert result.exit_code == 0
+    assert TARGETS_ENV_VAR not in captured_env
+
+
+def test_no_targets_flag_forces_single_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--no-targets forces single-runtime even when targets are configured."""
+    captured_env = _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [_DEV, _PROD])
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+
+    result = runner.invoke(app, [*_SERVE, "--no-targets", "--headless"])
+    assert result.exit_code == 0
+    assert TARGETS_ENV_VAR not in captured_env
+
+
+def test_all_targets_errors_when_none_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--all-targets with no registered targets → exit 2 + a helpful hint."""
+    _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [])
+    printed: list[str] = []
+    monkeypatch.setattr(
+        playground.err, "print", lambda *a, **k: printed.append(" ".join(map(str, a)))
+    )
+
+    result = runner.invoke(app, [*_SERVE, "--all-targets", "--headless"])
+    assert result.exit_code == 2
+    assert any("no targets" in line.lower() for line in printed)
+
+
+def test_all_targets_and_no_targets_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Passing both contradictory flags → exit 2."""
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+    result = runner.invoke(app, [*_SERVE, "--all-targets", "--no-targets", "--headless"])
+    assert result.exit_code == 2
+
+
+def test_multi_target_banner_never_echoes_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-target startup banner prints names/URLs/key_env — never a key."""
+    secret = "dev-SUPERSECRET-token"
+    dev = PlaygroundTarget(name="dev", url="http://dev", key_env="MDK_DEV_KEY", api_key=secret)
+    captured_env = _stub_launch(monkeypatch)
+    _fake_targets(monkeypatch, [dev])
+    printed: list[str] = []
+    monkeypatch.setattr(
+        playground.err, "print", lambda *a, **k: printed.append(" ".join(map(str, a)))
+    )
+
+    result = runner.invoke(app, [*_SERVE, "--headless"])
+    assert result.exit_code == 0
+    # The secret is in the child env (server-side) but never in the banner.
+    assert secret in captured_env.get(TARGETS_ENV_VAR, "")
+    assert all(secret not in line for line in printed)
+    assert secret not in result.stdout
+    assert secret not in (result.stderr or "")

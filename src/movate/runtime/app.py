@@ -27,6 +27,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -45,6 +46,8 @@ from fastapi import (
     Request,
     Response,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -176,6 +179,7 @@ from movate.runtime.long_poll import (
 )
 from movate.runtime.middleware import (
     AuthContext,
+    authenticate_websocket,
     make_auth_dependency,
     make_quota_dependency,
     require_scope,
@@ -475,6 +479,129 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
     carry a one- or two-token ``text`` delta.
     """
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'), default=str)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Voice WS message protocol (ADR 048 D4)
+#
+# The voice transport is full-duplex (audio both ways), so it uses a WebSocket
+# rather than SSE. The wire is a small typed envelope set: JSON control frames
+# (a ``type`` discriminator + payload) plus BINARY frames for raw audio.
+#
+#   client → server
+#     {"type": "config", ...}      (optional, first) — input_key / language /
+#                                    voice_id / codec for THIS turn
+#     <binary frame>               an inbound audio chunk (pcm16 by default)
+#     {"type": "end"}              the caller finished the utterance → run the turn
+#
+#   server → client
+#     {"type": "transcript.partial", "text": ...}   streaming partial (STT)
+#     {"type": "transcript.final",   "text": ...}   endpointed utterance
+#     {"type": "agent.token",        "text": ...}   streamed agent token (D11)
+#     <binary frame>                                synthesized audio (tts.audio)
+#     {"type": "usage", ...}                        end-of-turn meter (ADR 036)
+#     {"type": "error", "message","code","stage"}   a stage failure + degrade
+#     {"type": "done", "run_id","status"}           terminal for the turn
+#
+# Binary audio-out frames are sent as raw bytes (not base64-in-JSON) so the
+# audio path stays cheap; the JSON ``tts.audio`` metadata is folded into a
+# small header frame the client correlates by order. Keeping the protocol here
+# (one helper) means the route and any future telephony bridge stay identical.
+# ---------------------------------------------------------------------------
+
+# WS close code for an auth/scope failure on the voice socket. 1008 =
+# "policy violation" (RFC 6455) — the WS analogue of an HTTP 401/403.
+_WS_POLICY_VIOLATION = 1008
+
+
+def _voice_ctrl(type_: str, **payload: Any) -> dict[str, Any]:
+    """Build one server→client JSON control frame for the voice WS.
+
+    Single source of truth for the control-frame shape so the route and tests
+    agree on the wire (a ``type`` discriminator + a flat payload)."""
+    return {"type": type_, **payload}
+
+
+@dataclass
+class _VoiceTurnConfig:
+    """Per-turn settings the client may set via a ``config`` frame.
+
+    Defaults reproduce the zero-change promise (the common single-text-field
+    agent, tenant-default voice). ``mock`` mirrors the SSE run-stream route's
+    ``body.mock`` so a turn can run offline without a live LLM key.
+    """
+
+    input_key: str = "text"
+    language: str | None = None
+    voice_id: str = ""
+    mock: bool = False
+
+
+async def _collect_voice_turn(
+    websocket: WebSocket, config: _VoiceTurnConfig
+) -> tuple[list[bytes], bool]:
+    """Read one turn off the socket: binary audio frames + control frames,
+    until an ``end`` (run the turn) or ``close`` (end the session).
+
+    Mutates ``config`` in place from any ``config`` frame. Returns
+    ``(audio_frames, closed)`` where ``closed`` is ``True`` when the client
+    asked to end the session (the route should return). Raises
+    :class:`WebSocketDisconnect` if the client hangs up.
+    """
+    audio_frames: list[bytes] = []
+    while True:
+        message = await websocket.receive()
+        if message.get("type") == "websocket.disconnect":
+            raise WebSocketDisconnect(message.get("code", 1000))
+        if (data := message.get("bytes")) is not None:
+            audio_frames.append(data)
+            continue
+        text = message.get("text")
+        if text is None:
+            continue
+        try:
+            ctrl = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        ctrl_type = ctrl.get("type")
+        if ctrl_type == "config":
+            config.input_key = str(ctrl.get("input_key") or config.input_key)
+            config.language = ctrl.get("language") or config.language
+            config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
+            config.mock = bool(ctrl.get("mock", config.mock))
+        elif ctrl_type == "end":
+            return audio_frames, False
+        elif ctrl_type == "close":
+            return audio_frames, True
+
+
+async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
+    """Serialize one :class:`movate.voice.pipeline.VoiceEvent` onto the socket
+    per the ADR 048 D4 wire protocol.
+
+    Audio events go out as a small JSON header (codec / sample rate / byte
+    count) followed by the raw binary frame — no base64, so the audio path
+    stays cheap. Every other event is a single JSON control frame.
+    """
+    if event.kind == "tts.audio" and event.audio is not None:
+        await websocket.send_json(
+            _voice_ctrl(
+                "tts.audio",
+                codec=event.audio.codec,
+                sample_rate=event.audio.sample_rate,
+                bytes=len(event.audio.data),
+            )
+        )
+        await websocket.send_bytes(event.audio.data)
+    elif event.kind == "error":
+        await websocket.send_json(
+            _voice_ctrl("error", message=event.message, code=event.code, stage=event.stage)
+        )
+    elif event.kind == "done":
+        await websocket.send_json(_voice_ctrl("done", run_id=event.run_id, status=event.status))
+    else:
+        # transcript.partial / transcript.final / agent.token
+        await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
 
 
 # ---------------------------------------------------------------------------
@@ -3499,6 +3626,27 @@ def build_app(
     # a backend — unset → zero behavior change. In-process per-replica
     # in v1.x; shared backends slot in behind the CacheProvider later.
     app.state.llm_cache = build_cache()
+
+    # Voice (ADR 048 D3) — factories the WS /voice route calls to build the
+    # per-connection STT/TTS adapters. Default to the Phase-1 OpenAI reference
+    # adapters, imported lazily so a runtime without mdk[voice] pays nothing at
+    # build time (the import only fires if a voice socket is opened). Exposed on
+    # state so a deployment can swap in a different provider behind the seam
+    # (the ADR 049 router's future wire-in point) and so tests inject fakes —
+    # without touching the route. Each factory takes no args and returns a fresh
+    # adapter per connection.
+    def _default_voice_stt() -> Any:
+        from movate.voice import OpenAIWhisperSTT  # noqa: PLC0415
+
+        return OpenAIWhisperSTT()
+
+    def _default_voice_tts() -> Any:
+        from movate.voice import OpenAITTS  # noqa: PLC0415
+
+        return OpenAITTS()
+
+    app.state.voice_stt_factory = _default_voice_stt
+    app.state.voice_tts_factory = _default_voice_tts
 
     # ADR 035 D3 — per-tenant SSE subscriber accounting. A simple
     # ``{tenant_id: count}`` dict, lock-guarded for the increment/cap
@@ -13134,6 +13282,142 @@ def build_app(
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # ------------------------------------------------------------------
+    # WS /api/v1/agents/{name}/voice — Pipeline voice (ADR 048 D4, Phase 1)
+    #
+    # Full-duplex voice for ANY agent: audio in → STT → the UNCHANGED text
+    # Executor (the same run path the SSE stream route uses) → TTS → audio out.
+    # Pipeline mode only (no realtime / telephony — those are Phase 2/3).
+    #
+    # Auth: a WebSocket can't carry an HTTP 401/403 body once the handshake is
+    # in flight, so we authenticate via ``authenticate_websocket`` (same
+    # core/auth primitives as the HTTP dependency) over the ``?token=`` query
+    # param and close with 1008 on failure / missing ``run`` scope. Counts as
+    # a streaming connection conceptually (ADR 045 D9); the per-tenant SSE cap
+    # wiring is deferred for the WS path and noted in the PR.
+    # ------------------------------------------------------------------
+    @v1.websocket("/agents/{name}/voice")
+    async def v1_agent_voice(websocket: WebSocket, name: str) -> None:
+        """Speak to ``{name}`` over a full-duplex WebSocket (pipeline mode).
+
+        See the "Voice WS message protocol" block at the top of this module
+        for the framed envelope set. One connection serves one or more turns:
+        the client streams binary audio frames then a ``{"type":"end"}``
+        control frame to run a turn; the server replies with
+        ``transcript.*`` / ``agent.token`` / binary ``tts.audio`` (each
+        preceded by a small JSON header) / ``done`` (or ``error``) and then
+        listens for the next turn until the socket closes.
+
+        The agent stage is the **unchanged Executor** — this route never
+        edits ``core/executor.py``; it calls ``run_voice_pipeline`` which in
+        turn calls ``executor.execute(..., on_token=...)``, exactly like the
+        SSE run-stream route (ADR 048 R2 — zero change to existing agents).
+        """
+        store: StorageProvider = websocket.app.state.storage
+
+        # ── Auth (1008 close on failure; the HTTP path's 401/403 analogue) ──
+        token = websocket.query_params.get("token")
+        if not token:
+            # Also accept ``Authorization: Bearer`` if the client set it on the
+            # handshake (browsers can't, but server-side clients can).
+            header = websocket.headers.get("authorization", "")
+            scheme, _, raw = header.partition(" ")
+            if scheme.lower() == "bearer":
+                token = raw or None
+        ctx = await authenticate_websocket(store, token)
+        if ctx is None:
+            await websocket.close(code=_WS_POLICY_VIOLATION, reason="auth required")
+            return
+        if "run" not in ctx.scopes:
+            await websocket.close(code=_WS_POLICY_VIOLATION, reason="missing run scope")
+            return
+
+        # ── Resolve the agent (same routing as the run/stream paths) ──
+        canary = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        chosen_version = choose_version(canary, thread_id=None)
+        agents_reg: list[AgentBundle] = websocket.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=chosen_version, fallback=agents_reg
+        )
+        if bundle is None:
+            # Accept then close so the client gets a clear reason rather than a
+            # bare handshake rejection (a 404 has no WS equivalent pre-accept).
+            await websocket.accept()
+            await websocket.send_json(
+                _voice_ctrl(
+                    "error",
+                    message=f"agent {name!r} not found",
+                    code="not_found",
+                    stage="resolve",
+                )
+            )
+            await websocket.close(code=_WS_POLICY_VIOLATION, reason="agent not found")
+            return
+
+        await websocket.accept()
+
+        # ── Wire the UNCHANGED Executor + the speech adapters ──
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+        from movate.voice import run_voice_pipeline  # noqa: PLC0415
+        from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+
+        # Phase-1 reference adapters, built from the app-state factories
+        # (default: OpenAI Whisper STT + OpenAI TTS). A tenant swaps providers
+        # (Deepgram / ElevenLabs) by registering a different factory behind the
+        # same seam — the route is provider-agnostic (ADR 048 D3). BYOK key
+        # resolution (ADR 018) is the documented next wire-up; for now adapters
+        # read OPENAI_API_KEY (their SDK default) when no per-call key is passed.
+        stt = websocket.app.state.voice_stt_factory()
+        tts = websocket.app.state.voice_tts_factory()
+
+        # Config persists across turns in a session; a per-turn ``config`` frame
+        # can override it before that turn's ``end``.
+        config = _VoiceTurnConfig()
+        try:
+            while True:
+                audio_frames, closed = await _collect_voice_turn(websocket, config)
+                if closed:
+                    return
+
+                # ── Drive STT → unchanged Executor → TTS, stream the events ──
+                # `mock` drives the agent stage with MockProvider — the same
+                # offline hook the SSE run-stream route exposes via `body.mock`.
+                provider: BaseLLMProvider = MockProvider() if config.mock else LiteLLMProvider()
+                executor = Executor(
+                    provider=provider,
+                    pricing=load_pricing(),
+                    storage=store,
+                    tracer=build_tracer(),
+                    tenant_id=ctx.tenant_id,
+                    cache=websocket.app.state.llm_cache,
+                )
+
+                async def _audio_in(frames: list[bytes] = audio_frames) -> AsyncIterator[Any]:
+                    for raw_bytes in frames:
+                        yield _AudioChunk(data=raw_bytes)
+
+                async for event in run_voice_pipeline(
+                    audio_in=_audio_in(),
+                    stt=stt,
+                    tts=tts,
+                    executor=executor,
+                    bundle=bundle,
+                    tenant_id=ctx.tenant_id,
+                    input_key=config.input_key,
+                    language=config.language,
+                    voice_id=config.voice_id,
+                ):
+                    await _send_voice_event(websocket, event)
+        except WebSocketDisconnect:
+            # Client hung up — nothing to clean up beyond the executor task,
+            # which run_voice_pipeline reaps in its own finally. Normal exit.
+            return
 
     app.include_router(v1)
 

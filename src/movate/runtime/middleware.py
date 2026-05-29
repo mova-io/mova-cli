@@ -336,6 +336,70 @@ async def _safe_touch(storage: StorageProvider, key_id: str, tenant_id: str) -> 
 
 
 # ----------------------------------------------------------------------
+# WebSocket auth (ADR 048 D4 — the voice transport)
+#
+# FastAPI's HTTP auth dependency raises ``HTTPException`` to produce a 401/403
+# body. A WebSocket has no HTTP response body once the handshake starts — the
+# handler must instead *close the socket* with a policy code. So WS routes
+# can't reuse ``auth_dependency`` directly; this helper composes the SAME
+# ``core/auth`` primitives (parse → lookup → check → scopes) and returns an
+# ``AuthContext`` or ``None`` (let the handler close on ``None``). It mirrors
+# the OIDC early-return path in ``auth_dependency``: no rate-limit bucket and
+# no last_used touch on the failure path — those are tied to the HTTP request
+# lifecycle, not the long-lived socket.
+# ----------------------------------------------------------------------
+
+
+async def authenticate_websocket(
+    storage: StorageProvider,
+    token: str | None,
+) -> AuthContext | None:
+    """Authenticate a WebSocket bearer ``token`` (from the ``?token=`` query
+    param or the connect frame). Returns an :class:`AuthContext` on success,
+    ``None`` on any failure — the caller closes the socket with a policy code
+    (1008). Never raises an HTTP exception (there is no HTTP response to carry
+    it once the WS handshake is in flight).
+
+    Accepts both bearer shapes the HTTP path accepts: an OIDC JWT (when
+    ``MOVATE_OIDC_ISSUER`` is configured) and the portable opaque ``mvt_*``
+    key. Scope enforcement is the caller's job (the voice route requires the
+    ``run`` scope) — this returns the resolved scopes for that check.
+    """
+    if not token:
+        logger.info("ws_auth_failure reason=missing_token")
+        return None
+
+    oidc_cfg = oidc_config()
+    if oidc_cfg is not None and looks_like_jwt(token):
+        try:
+            return validate_oidc_token(token, oidc_cfg)
+        except OidcValidationError as exc:
+            logger.info("ws_auth_failure reason=%s", exc.reason)
+            return None
+
+    try:
+        parsed = parse_api_key(token)
+    except ApiKeyParseError:
+        logger.info("ws_auth_failure reason=parse_error")
+        return None
+
+    record = await storage.get_api_key(parsed.key_id)
+    failure = check_record(parsed, record)
+    if failure is not None:
+        logger.info("ws_auth_failure reason=%s", failure.reason)
+        return None
+
+    assert record is not None
+    await _safe_touch(storage, record.key_id, record.tenant_id)
+    return AuthContext(
+        tenant_id=record.tenant_id,
+        api_key_id=record.key_id,
+        env=record.env.value,
+        scopes=frozenset(effective_scopes(record)),
+    )
+
+
+# ----------------------------------------------------------------------
 # Quota admission (ADR 036 D2)
 # ----------------------------------------------------------------------
 
