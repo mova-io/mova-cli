@@ -260,6 +260,36 @@ _TRACING_EXPLANATIONS: dict[str, CheckExplanation] = {
         ),
         fix="export OTEL_SERVICE_NAME=mdk-prod",
     ),
+    # ADR 039 Phase 2 — opt-in dual export to Movate's central Collector.
+    "MDK_TELEMETRY_ENDPOINT": CheckExplanation(
+        what="OTLP endpoint URL for Movate's central Collector (ADR 039 Phase 2).",
+        why=(
+            "Opt-in second OTLP exporter. When set, MDK ships a minimized "
+            "copy of metrics + spans to Movate for fleet visibility — IN "
+            "ADDITION to the customer's primary Azure Monitor sink. Off by "
+            "default. No prompts, no completions, no PII (allow-listed)."
+        ),
+        failure_impact=(
+            "Unset = Phase 2 disabled (default; only the primary in-tenant "
+            "stream is emitted). Set but unreachable = primary unaffected, "
+            "one warning logged, dual stream silently retries."
+        ),
+        fix="export MDK_TELEMETRY_ENDPOINT=https://otel.movate.example:4318",
+    ),
+    "MDK_TELEMETRY_CUSTOMER_ID": CheckExplanation(
+        what="Opaque per-customer identifier (hash, NOT a name) for ADR 039 Phase 2.",
+        why=(
+            "Stamped as the `customer` Resource attribute on the "
+            "dual-exported stream so Movate can group fleet emissions by "
+            "customer without learning the customer's real name. Required "
+            "when MDK_TELEMETRY_ENDPOINT is set."
+        ),
+        failure_impact=(
+            "Missing while endpoint is set = Phase 2 disabled (half-configured "
+            "refused). Primary export unaffected; one warning logged at startup."
+        ),
+        fix="export MDK_TELEMETRY_CUSTOMER_ID=$(echo -n 'acme' | shasum -a 256 | cut -c1-16)",
+    ),
 }
 
 

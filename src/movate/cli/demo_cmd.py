@@ -1,11 +1,21 @@
-"""``mdk demo`` — one-command runnable demo project (Sprint P).
+"""``mdk demo`` — runnable demo project + the dashboard "wow pack" seeder.
 
-Generates a complete, working FAQ agent + dataset + project structure
-in 60 seconds. Different from ``mdk init`` (which scaffolds an empty
-template into an existing project): ``mdk demo`` is the "from zero"
-hello-world for sales demos, onboarding, and operator first-touch.
+Two responsibilities live under ``mdk demo``:
 
-Default output::
+* **``mdk demo`` (no subcommand) / the project scaffold** — generates a
+  complete, working FAQ agent + dataset + project structure in 60 seconds.
+  Different from ``mdk init`` (which scaffolds an empty template into an
+  existing project): this is the "from zero" hello-world for sales demos,
+  onboarding, and operator first-touch. Backward-compatible: ``mdk demo`` and
+  ``mdk demo my-dir`` behave exactly as before.
+
+* **``mdk demo seed`` / ``mdk demo clear``** — populate (and purge) a runtime
+  with realistic synthetic telemetry so every in-repo dashboard lights up with
+  a believable story (the "wow pack"). The generation logic is pure + lives in
+  :mod:`movate.core.demo`; this command only wraps it with persistence, the
+  safety/prod guard, and operator UX (CLAUDE.md boundary: ``cli`` ⊥ ``core``).
+
+Scaffold output::
 
   demo-faq/
     movate.yaml                 # project config
@@ -26,13 +36,17 @@ parameterize which template directory gets copied in; the
 
 from __future__ import annotations
 
+import asyncio
 import shutil
+from collections.abc import Coroutine
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 
 console = Console()
 err_console = Console(stderr=True)
@@ -184,7 +198,7 @@ def _write_project_files(target: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def demo(
+def scaffold(
     directory: str = typer.Argument(
         "demo-faq",
         help="Directory to create the demo in (default: ./demo-faq).",
@@ -294,3 +308,304 @@ def demo(
     # Avoid lint warning about unused list — operators can inspect via
     # follow-up commands; the panel above is the canonical summary.
     _ = project_files
+
+
+# ---------------------------------------------------------------------------
+# `mdk demo seed` / `mdk demo clear` — the dashboard "wow pack" seeder.
+#
+# Generation logic is pure + lives in movate.core.demo; this layer wraps it
+# with persistence (batch inserts through the StorageProvider Protocol), the
+# safety/prod guard, and operator UX. Keeping the seam here honors the
+# cli ⊥ core/runtime boundary (CLAUDE.md rule 6): nothing in core/demo imports
+# storage or async.
+# ---------------------------------------------------------------------------
+
+# Refuse to seed/clear a target whose name looks like production unless the
+# operator passes --force. Substring match on the normalized target name.
+_PROD_MARKERS = ("prod", "production")
+
+# Batch size for inserts. The StorageProvider Protocol exposes per-record
+# save_* methods (no bulk API today), so "batching" here means wrapping N
+# saves in one connection lifecycle + a bounded concurrency gather so a few
+# thousand rows insert in seconds rather than serially. Kept modest to avoid
+# overwhelming SQLite's single writer.
+_INSERT_CONCURRENCY = 16
+
+
+def _looks_like_prod(target: str) -> bool:
+    """True if ``target`` contains a prod marker (case-insensitive)."""
+    lowered = target.lower()
+    return any(marker in lowered for marker in _PROD_MARKERS)
+
+
+async def _gather_bounded(coros: list[Coroutine[Any, Any, Any]], *, limit: int) -> None:
+    """Run ``coros`` with at most ``limit`` in flight at once.
+
+    SQLite serializes writes anyway, but the bounded gather keeps the Postgres
+    path from opening an unbounded number of concurrent statements while still
+    being dramatically faster than a serial loop for the local demo.
+    """
+    sem = asyncio.Semaphore(limit)
+
+    async def _run(coro: Coroutine[Any, Any, Any]) -> None:
+        async with sem:
+            await coro
+
+    await asyncio.gather(*[_run(c) for c in coros])
+
+
+def seed(
+    target: str = typer.Option(
+        "local",
+        "--target",
+        help=(
+            "Logical name of the environment being seeded (used only for the "
+            "prod-name safety guard + the summary). The actual storage backend "
+            "is selected by MOVATE_DB_URL / MOVATE_DB as usual."
+        ),
+    ),
+    agents: int = typer.Option(6, "--agents", "-a", min=1, max=8, help="Number of demo agents."),
+    tenants: int = typer.Option(3, "--tenants", "-t", min=1, max=6, help="Number of demo tenants."),
+    days: int = typer.Option(30, "--days", "-d", min=1, max=120, help="Days of history to span."),
+    seed_value: int = typer.Option(
+        1337, "--seed", help="RNG seed — same seed reproduces the same data."
+    ),
+    clear_first: bool = typer.Option(
+        False, "--clear-first", help="Purge existing demo data before seeding."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Required to seed a target whose name looks like prod/production.",
+    ),
+) -> None:
+    """Populate the runtime with realistic synthetic telemetry (the "wow pack").
+
+    Generates [bold]demo-tagged[/bold] RunRecords, EvalRecords and
+    FailureRecords across agents x tenants x time — varied cost/latency/tokens,
+    a trending eval pass-rate with [bold]one agent drifting[/bold], and two
+    injected anomalies (a cost spike + a latency regression after a deploy) so
+    the anomaly + narrative dashboard panels have a story to tell.
+
+    [bold]Safety.[/bold] Every seeded row is tagged: its tenant_id starts with
+    [cyan]demo-[/cyan] and its input carries a [cyan]__mdk_demo__[/cyan] marker.
+    [bold]mdk demo clear[/bold] purges exactly those rows. Seeding a target
+    whose name contains [red]prod[/red]/[red]production[/red] is refused unless
+    you pass [bold]--force[/bold].
+
+    [bold]Examples:[/bold]
+
+      [dim]$ mdk demo seed                              # 6 agents, 3 tenants, 30 days[/dim]
+      [dim]$ mdk demo seed --agents 4 --days 14         # smaller fleet[/dim]
+      [dim]$ mdk demo seed --clear-first --seed 42      # reproducible reset[/dim]
+    """
+    from movate.core.demo import SeedConfig, generate_bundle  # noqa: PLC0415
+    from movate.storage import build_storage  # noqa: PLC0415
+
+    if _looks_like_prod(target) and not force:
+        err_console.print(
+            f"[red]✗[/red] target {target!r} looks like production. "
+            "[dim]Seeding synthetic data into prod is refused. Pass "
+            "[bold]--force[/bold] only if you are certain.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    cfg = SeedConfig(agents=agents, tenants=tenants, days=days, seed=seed_value)
+    bundle = generate_bundle(cfg)
+
+    storage = build_storage()
+
+    async def _persist() -> int:
+        await storage.init()
+        try:
+            cleared = 0
+            if clear_first:
+                cleared = await _purge_demo(storage)
+            # Runs + failures + evals — batch through the Protocol's save_*.
+            await _gather_bounded(
+                [storage.save_run(r) for r in bundle.runs], limit=_INSERT_CONCURRENCY
+            )
+            await _gather_bounded(
+                [storage.save_failure(f) for f in bundle.failures], limit=_INSERT_CONCURRENCY
+            )
+            await _gather_bounded(
+                [storage.save_eval(e) for e in bundle.evals], limit=_INSERT_CONCURRENCY
+            )
+            return cleared
+        finally:
+            await storage.close()
+
+    cleared = asyncio.run(_persist())
+
+    # Summary table + storyline.
+    table = Table(title="mdk demo seed — synthetic fleet", title_justify="left")
+    table.add_column("metric", style="cyan")
+    table.add_column("value", justify="right")
+    s = bundle.stats
+    table.add_row("runs", f"{s['runs']:,}")
+    table.add_row("evals", f"{s['evals']:,}")
+    table.add_row("failures", f"{s['failures']:,}")
+    table.add_row("agents x tenants", f"{s['agents']} x {s['tenants']}")
+    table.add_row("days of history", str(days))
+    table.add_row("success rate", f"{s['success_rate_pct']}%")
+    table.add_row("total synthetic spend", f"${s['total_cost_usd']:,.2f}")
+    table.add_row("total tokens", f"{s['total_tokens']:,}")
+    if clear_first:
+        table.add_row("purged first", f"{cleared:,} demo rows")
+    console.print(table)
+
+    console.print(
+        Panel(
+            f"[bold]Storyline:[/bold] {bundle.narrative}\n\n"
+            f"[bold]Events ({len(bundle.events)}):[/bold]\n"
+            + "\n".join(
+                f"  • [dim]{e.at:%Y-%m-%d}[/dim] [yellow]{e.kind}[/yellow] — {e.detail}"
+                for e in bundle.events
+            )
+            + "\n\n[dim]All rows tagged tenant=demo-* + input.__mdk_demo__=true. "
+            "Purge anytime with [bold]mdk demo clear[/bold].[/dim]",
+            title="[green]✓[/green] Dashboards seeded",
+            title_align="left",
+            border_style="green",
+        )
+    )
+
+
+def clear(
+    target: str = typer.Option(
+        "local",
+        "--target",
+        help="Logical environment name (prod-guard + summary only).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Required to clear a target whose name looks like prod/production.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Purge ALL demo-seeded telemetry (and nothing else).
+
+    Deletes exactly the rows whose ``tenant_id`` starts with [cyan]demo-[/cyan]
+    — the marker [bold]mdk demo seed[/bold] stamps on every record it creates.
+    Real telemetry (any tenant without the prefix) is never touched.
+    """
+    from movate.storage import build_storage  # noqa: PLC0415
+
+    if _looks_like_prod(target) and not force:
+        err_console.print(
+            f"[red]✗[/red] target {target!r} looks like production. "
+            "[dim]Pass [bold]--force[/bold] to proceed.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    if not yes:
+        confirmed = typer.confirm(
+            "Delete all demo-tagged telemetry (tenant=demo-*)? Real data is untouched."
+        )
+        if not confirmed:
+            console.print("[dim]Aborted — nothing deleted.[/dim]")
+            raise typer.Exit(code=0)
+
+    storage = build_storage()
+
+    async def _run() -> int:
+        await storage.init()
+        try:
+            return await _purge_demo(storage)
+        finally:
+            await storage.close()
+
+    deleted = asyncio.run(_run())
+    console.print(
+        Panel(
+            f"Deleted [bold]{deleted:,}[/bold] demo-tagged rows (runs, evals, failures).",
+            title="[green]✓[/green] Demo data cleared",
+            title_align="left",
+            border_style="green",
+        )
+    )
+
+
+async def _purge_demo(storage: object) -> int:
+    """Delete every demo-tagged row across the storage backend.
+
+    Demo data is identified solely by the ``demo-`` tenant prefix. The
+    StorageProvider Protocol has no "delete run/eval by id" method (runs are
+    immutable history by design), so the purge DELETEs directly against the
+    backend's tables, scoped to ``tenant_id LIKE 'demo-%'`` — the one place
+    this command has to know the backend's table shape. The WHERE clause is the
+    hard guarantee that only synthetic rows are touched. We reuse the already-
+    ``init()``-ed connection/pool (do NOT open a second handle — a separate
+    sqlite connection would deadlock on the writer lock).
+
+    ``storage`` is typed ``object`` because the StorageProvider Protocol
+    deliberately exposes no raw-SQL surface; this helper reaches past it on
+    purpose. Returns the number of rows deleted across the seeded tables.
+    """
+    from movate.core.demo import DEMO_TENANT_PREFIX  # noqa: PLC0415
+
+    like = f"{DEMO_TENANT_PREFIX}%"
+    # Only the tables the seeder writes to (runs, failures, evals). Each carries
+    # a tenant_id column.
+    tables = ("runs", "failures", "evals")
+    backend = type(storage).__name__
+
+    # SQLite path — reuse the live connection opened by init().
+    conn = getattr(storage, "_conn", None)
+    if backend == "SqliteProvider" and conn is not None:
+        deleted = 0
+        for tbl in tables:
+            # `tbl` comes only from the fixed `tables` literal allow-list above,
+            # never from user input — the f-string interpolation is safe.
+            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
+            deleted += max(0, cur.rowcount or 0)
+        await conn.commit()
+        return deleted
+
+    # Postgres path — acquire from the live pool.
+    pool = getattr(storage, "_pool", None)
+    if backend == "PostgresProvider" and pool is not None:
+        deleted = 0
+        async with pool.acquire() as pg:
+            for tbl in tables:
+                # `tbl` is from the fixed allow-list above — safe interpolation.
+                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
+                # asyncpg returns a status string like "DELETE 42".
+                deleted += int(status.split()[-1]) if status else 0
+        return deleted
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Typer wiring. `mdk demo` (bare) scaffolds the demo project (backward
+# compatible); `mdk demo new <dir>` is the explicit scaffold-to-a-directory
+# form; `mdk demo seed` / `mdk demo clear` are the wow-pack seeder.
+# ---------------------------------------------------------------------------
+
+demo_app = typer.Typer(
+    no_args_is_help=False,
+    help=(
+        "Demo project scaffold + the dashboard 'wow pack' seeder.\n\n"
+        "Run bare ('mdk demo') to scaffold a runnable FAQ project; "
+        "'mdk demo seed' to populate dashboards with synthetic telemetry."
+    ),
+)
+
+
+@demo_app.callback(invoke_without_command=True)
+def _demo_callback(ctx: typer.Context) -> None:
+    """Scaffold the default demo project when invoked with no subcommand.
+
+    Preserves the historical ``mdk demo`` behavior (creates ``./demo-faq``).
+    For a custom directory use ``mdk demo new <dir>``.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    scaffold(directory="demo-faq", force=False, dry_run=False)
+
+
+demo_app.command("new")(scaffold)
+demo_app.command("seed")(seed)
+demo_app.command("clear")(clear)

@@ -1,0 +1,70 @@
+{
+  "$comment": "REUSABLE PANEL SNIPPET (not a full dashboard). Drop into any dashboard's panels[] and fix up `id` + `gridPos`. Google-SRE error-budget burndown over mdk.jobs.completed. SLO = $slo_target success (define a `slo_target` dashboard variable, default 0.99). Plots error-budget CONSUMED = observed errors / (allowed-error-rate * total runs); 1.0 = budget exhausted. Pair with the 'remaining' gauge below (in the same file -- it's the second object in panels[]). Retune the SLO by changing $slo_target. Keyed only to mdk.jobs.completed (real #518 catalog metric). Movate palette (theme/palette.json). Mirrors panels id 30 + 31 in mdk-exec-summary.json.",
+  "burndown_panel": {
+    "type": "timeseries",
+    "id": 9200,
+    "title": "SLO error budget — burndown",
+    "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+    "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+    "description": "Error-budget consumed as a fraction of this period's allowance. SLO = $slo_target success. 0 = none used; 1.0 = budget exhausted (red line). Keyed to mdk.jobs.completed.",
+    "fieldConfig": {
+      "defaults": {
+        "color": {"mode": "palette-classic"},
+        "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+        "max": 1.2,
+        "min": 0,
+        "thresholds": {"mode": "absolute", "steps": [{"color": "#2BB673", "value": null}, {"color": "#F2A93B", "value": 0.75}, {"color": "#D64550", "value": 1}]},
+        "unit": "percentunit"
+      },
+      "overrides": []
+    },
+    "options": {
+      "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+      "tooltip": {"mode": "multi", "sort": "desc"}
+    },
+    "targets": [
+      {
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "editorMode": "code",
+        "expr": "sum(increase(mdk_jobs_completed_total{status!=\"success\"}[$__range])) / clamp_min((1 - $slo_target) * sum(increase(mdk_jobs_completed_total[$__range])), 1)",
+        "legendFormat": "error budget consumed",
+        "range": true,
+        "refId": "A"
+      }
+    ]
+  },
+  "remaining_gauge": {
+    "type": "gauge",
+    "id": 9201,
+    "title": "Error budget remaining",
+    "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+    "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+    "description": "1 - (error budget consumed), floored at 0. SLO target = $slo_target.",
+    "fieldConfig": {
+      "defaults": {
+        "color": {"mode": "thresholds"},
+        "max": 1,
+        "min": 0,
+        "thresholds": {"mode": "absolute", "steps": [{"color": "#D64550", "value": null}, {"color": "#F2A93B", "value": 0.25}, {"color": "#2BB673", "value": 0.5}]},
+        "unit": "percentunit"
+      },
+      "overrides": []
+    },
+    "options": {
+      "orientation": "auto",
+      "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+      "showThresholdLabels": false,
+      "showThresholdMarkers": true
+    },
+    "targets": [
+      {
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "editorMode": "code",
+        "expr": "clamp_min(1 - sum(increase(mdk_jobs_completed_total{status!=\"success\"}[$__range])) / clamp_min((1 - $slo_target) * sum(increase(mdk_jobs_completed_total[$__range])), 1), 0)",
+        "legendFormat": "remaining",
+        "range": false,
+        "refId": "A"
+      }
+    ]
+  }
+}

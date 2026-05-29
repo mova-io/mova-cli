@@ -1,0 +1,20 @@
+# LLM-as-judge for the Simulation workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final outcome against the expected outcome. Used as the CI
+# eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the simulation's final outcome against the expected outcome for whether
+  the bounded interaction reached a sensible resolution.
+    1.0 = outcome matches the expected resolution
+    0.5 = outcome is plausible but partial / off in detail
+    0.0 = outcome is wrong, incoherent, or hallucinated
+
+threshold: 0.7

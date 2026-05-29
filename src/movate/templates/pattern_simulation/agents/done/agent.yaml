@@ -1,0 +1,40 @@
+api_version: movate/v1
+kind: Agent
+
+# DONE terminal of the Simulation pattern. Emits the final outcome once the
+# bounded simulation ends (JUDGE ``resolved`` OR the turn cap). Shared by all
+# three terminals.
+name: simulation-done
+version: 0.1.0
+description: Done terminal — summarizes the simulation outcome when it ends.
+owner: ""
+role: collector
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.0
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+tags:
+  - pattern:simulation
+  - node:done
+  - governed

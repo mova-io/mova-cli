@@ -53,7 +53,7 @@ console = Console(stderr=True)
 _default_output_format: Run = Run.TEXT if sys.stdout.isatty() else Run.JSON
 
 
-def run(
+def run(  # noqa: PLR0912 — flat mode-dispatch (remote/replay/estimate/workflow/agent) reads better than nested helpers
     path: Path = typer.Argument(
         ...,
         help="Path to an agent or workflow directory.",
@@ -110,6 +110,27 @@ def run(
         help=(
             "After the run, print a table of KB chunks retrieved by any "
             "kb-vector-lookup skill calls. Useful for debugging retrieval quality."
+        ),
+    ),
+    estimate: bool = typer.Option(
+        False,
+        "--estimate",
+        help=(
+            "Predict the cost + latency of this run WITHOUT executing it. "
+            "Prints an estimate table (no LLM call, no job enqueued, no charge). "
+            "The estimate reflects this agent's real assembled prompt + real "
+            "historical runs. Works locally and against a deployed --target. "
+            "RAG agents exclude retrieved-chunk tokens unless "
+            "--estimate-retrieval is also passed (small embedding cost)."
+        ),
+    ),
+    estimate_retrieval: bool = typer.Option(
+        False,
+        "--estimate-retrieval",
+        help=(
+            "With --estimate, run the agent's retrieval so retrieved-chunk "
+            "tokens are folded into the estimate. Embeds the query (small "
+            "cost). No effect on non-RAG agents or without --estimate."
         ),
     ),
     output_format: Run = typer.Option(
@@ -170,6 +191,15 @@ def run(
                 "remote runtime owns the RunRecord history."
             )
             raise typer.Exit(code=2)
+        if estimate:
+            _dispatch_remote_agent_estimate(
+                agent_name=str(path),
+                raw=input_flag or input_arg,
+                target=target,
+                estimate_retrieval=estimate_retrieval,
+                output_format=output_format,
+            )
+            return
         if stream:
             _dispatch_remote_agent_stream(
                 agent_name=str(path),
@@ -213,6 +243,21 @@ def run(
             )
             raise typer.Exit(code=2)
         _dispatch_replay(path, replay_id, mock=mock, output_format=output_format)
+        return
+
+    if estimate:
+        if is_workflow_path(path):
+            console.print(
+                "[red]✗[/red] --estimate supports agents only; workflow cost "
+                "prediction is not available."
+            )
+            raise typer.Exit(code=2)
+        _dispatch_agent_estimate(
+            path,
+            input_flag or input_arg,
+            estimate_retrieval=estimate_retrieval,
+            output_format=output_format,
+        )
         return
 
     if is_workflow_path(path):
@@ -265,6 +310,184 @@ def _dispatch_agent(
         _run_local_agent(
             bundle, payload, output_format=output_format, mock=mock, stream=stream, trace=trace
         )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cost prediction (--estimate) — no run executes
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_agent_estimate(
+    path: Path,
+    raw: str | None,
+    *,
+    estimate_retrieval: bool,
+    output_format: Run,
+) -> None:
+    """Estimate the cost + latency of a local agent run WITHOUT executing it.
+
+    Loads the bundle, coerces the input the same way a real local run
+    does, then calls :func:`movate.core.run_estimator.estimate_run` against
+    the local runtime's storage (for historical stats). Prints the estimate
+    table (TEXT) or the JSON estimate (JSON). No LLM call, no job, no charge.
+    """
+    try:
+        bundle = load_agent(path)
+    except AgentLoadError as exc:
+        console.print(f"[red]✗ load failed:[/red] {exc}")
+        _maybe_suggest_fuzzy(path)
+        raise typer.Exit(code=2) from None
+
+    if raw is None:
+        _suggest_dataset_example(bundle)
+        raise typer.Exit(code=2)
+    payload = _coerce_agent_input(raw, bundle)
+
+    asyncio.run(
+        _run_local_estimate(
+            bundle, payload, estimate_retrieval=estimate_retrieval, output_format=output_format
+        )
+    )
+
+
+async def _run_local_estimate(
+    bundle: AgentBundle,
+    payload: dict[str, Any],
+    *,
+    estimate_retrieval: bool,
+    output_format: Run,
+) -> None:
+    from movate.core.run_estimator import estimate_run  # noqa: PLC0415
+
+    # A non-mock runtime so the executor's retrieval seam embeds against
+    # real backends when --estimate-retrieval is on. The estimator NEVER
+    # calls .execute(), so no completion happens regardless.
+    rt = await build_local_runtime(mock=False)
+    try:
+        est = await estimate_run(
+            bundle,
+            payload,
+            storage=rt.storage,
+            tenant_id="local",
+            executor=rt.executor,
+            estimate_retrieval=estimate_retrieval,
+        )
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+
+    _render_estimate(est_dict=_estimate_to_dict(est), output_format=output_format)
+
+
+def _estimate_to_dict(est: Any) -> dict[str, Any]:
+    """Flatten a :class:`movate.core.run_estimator.RunEstimate` into the
+    same JSON shape the runtime returns (``RunEstimateView``), so the local
+    + remote renderers share one code path."""
+    return {
+        "estimate": True,
+        "agent_name": est.agent_name,
+        "model": est.model,
+        "predicted": {
+            "tokens_in": est.predicted.tokens_in,
+            "tokens_out_max": est.predicted.tokens_out_max,
+            "tokens_out_expected": est.predicted.tokens_out_expected,
+            "cost_usd_min": est.predicted.cost_usd_min,
+            "cost_usd_expected": est.predicted.cost_usd_expected,
+            "cost_usd_max": est.predicted.cost_usd_max,
+            "latency_ms_p50": est.predicted.latency_ms_p50,
+            "latency_ms_p95": est.predicted.latency_ms_p95,
+        },
+        "basis": {
+            "prompt_tokens_method": est.basis.prompt_tokens_method,
+            "out_expected_method": est.basis.out_expected_method,
+            "latency_method": est.basis.latency_method,
+            "sample_size": est.basis.sample_size,
+        },
+        "budget_check": {
+            "within_per_run_budget": est.budget_check.within_per_run_budget,
+            "per_run_budget_usd": est.budget_check.per_run_budget_usd,
+        },
+        "retrieval_embedded": est.retrieval_embedded,
+        "notes": list(est.notes),
+    }
+
+
+def _render_estimate(*, est_dict: dict[str, Any], output_format: Run) -> None:
+    """Render a RunEstimateView-shaped dict.
+
+    JSON mode → dump the estimate to stdout (pipe-friendly).
+    TEXT mode → a rich table to stdout + a one-line greppable summary to
+    stderr. NO run executed — the rendering makes that explicit.
+    """
+    if output_format != Run.TEXT:
+        sys.stdout.write(json.dumps(est_dict, indent=2, default=str) + "\n")
+        _emit_estimate_summary(est_dict)
+        return
+
+    pred = est_dict.get("predicted", {})
+    basis = est_dict.get("basis", {})
+    budget = est_dict.get("budget_check", {})
+
+    table = Table(
+        title=f"Cost estimate — {est_dict.get('agent_name', '?')} ({est_dict.get('model', '?')})",
+        show_header=True,
+        title_style="bold",
+    )
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+
+    def _ms(v: Any) -> str:
+        return f"{v} ms" if v is not None else "[dim]unavailable[/dim]"
+
+    table.add_row("tokens in", str(pred.get("tokens_in")))
+    table.add_row("tokens out (expected)", str(pred.get("tokens_out_expected")))
+    table.add_row("tokens out (max)", str(pred.get("tokens_out_max")))
+    table.add_row("cost min (USD)", f"${pred.get('cost_usd_min')}")
+    table.add_row("cost expected (USD)", f"${pred.get('cost_usd_expected')}")
+    table.add_row("cost max (USD)", f"${pred.get('cost_usd_max')}")
+    table.add_row("latency p50", _ms(pred.get("latency_ms_p50")))
+    table.add_row("latency p95", _ms(pred.get("latency_ms_p95")))
+
+    within = budget.get("within_per_run_budget")
+    budget_cell = (
+        f"[green]within[/green] (≤ ${budget.get('per_run_budget_usd')})"
+        if within
+        else f"[red]OVER[/red] (> ${budget.get('per_run_budget_usd')})"
+    )
+    table.add_row("per-run budget", budget_cell)
+
+    # rich.Console(stderr=True) is our `console`; estimate output is the
+    # command's primary product, so the table goes to stdout instead.
+    Console().print(table)
+
+    # Basis line — how the estimate was derived (stderr; honors --quiet).
+    _console.hint(
+        f"[dim]basis: prompt={basis.get('prompt_tokens_method')} "
+        f"out={basis.get('out_expected_method')} "
+        f"latency={basis.get('latency_method')} "
+        f"(n={basis.get('sample_size')} historical runs)[/dim]"
+    )
+    if est_dict.get("retrieval_embedded"):
+        _console.hint("[dim]→ retrieval embedded for this estimate (small cost)[/dim]")
+    for note in est_dict.get("notes", []):
+        _console.hint(f"[dim]note: {note}[/dim]")
+    _console.hint("[dim]→ NO run executed — this is an estimate only.[/dim]")
+    _emit_estimate_summary(est_dict)
+
+
+def _emit_estimate_summary(est_dict: dict[str, Any]) -> None:
+    """Greppable one-line summary (stderr) mirroring mdk_run_summary so CI
+    can scrape estimates the same way it scrapes runs."""
+    pred = est_dict.get("predicted", {})
+    budget = est_dict.get("budget_check", {})
+    sys.stderr.write(
+        f"mdk_estimate_summary: agent={est_dict.get('agent_name')} "
+        f"model={est_dict.get('model')} "
+        f"tokens_in={pred.get('tokens_in')} "
+        f"cost_expected={pred.get('cost_usd_expected')} "
+        f"cost_max={pred.get('cost_usd_max')} "
+        f"within_budget={str(budget.get('within_per_run_budget')).lower()} "
+        f"executed=false\n"
     )
 
 
@@ -1204,6 +1427,101 @@ def _dispatch_remote_agent(  # noqa: PLR0912 — flat HTTP error mapping reads b
         # P4 — mock + schema-error hint (only on that combination).
         _maybe_mock_schema_hint(error_type=err.get("type") if err else None, mock=mock)
         raise typer.Exit(code=1)
+
+
+def _dispatch_remote_agent_estimate(
+    *,
+    agent_name: str,
+    raw: str | None,
+    target: str,
+    estimate_retrieval: bool,
+    output_format: Run,
+) -> None:
+    """Estimate a deployed agent's run cost + latency WITHOUT executing it.
+
+    Resolves the target the same way :func:`_dispatch_remote_agent` does,
+    then POSTs to ``/api/v1/agents/<name>/runs?estimate=true`` and renders
+    the returned :class:`movate.runtime.schemas.RunEstimateView`. No run
+    executes server-side; the endpoint returns 200 with the estimate.
+    """
+    import os  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    from movate.core.user_config import UserConfigError, resolve_target  # noqa: PLC0415
+
+    name = Path(agent_name).name or agent_name
+
+    try:
+        target_name, target_cfg = resolve_target(target)
+    except UserConfigError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    _console.echo_remote_context(
+        target_name, target_cfg, action="estimate", suppress=output_format != Run.TEXT
+    )
+
+    api_key = os.environ.get(target_cfg.key_env, "").strip()
+    if not api_key:
+        console.print(
+            f"[red]✗[/red] env var ${target_cfg.key_env} is empty. "
+            f"Run [bold]mdk auth save-runtime-key {target_name} <key>[/bold] "
+            f"to persist + autoload, or [bold]export {target_cfg.key_env}=mvt_live_...[/bold]."
+        )
+        raise typer.Exit(code=2)
+
+    if raw is None:
+        console.print(
+            "[red]✗[/red] provide input as a positional arg or via --input "
+            "(remote estimates require JSON input; no schema available client-side)."
+        )
+        raise typer.Exit(code=2)
+
+    payload = _coerce_remote_agent_input(raw, name)
+    base_url = target_cfg.url.rstrip("/")
+    timeout = httpx.Timeout(60.0, connect=10.0)
+
+    params = {"estimate": "true"}
+    if estimate_retrieval:
+        params["estimate_retrieval"] = "true"
+
+    console.print(
+        f"[dim]→ estimating [bold]{name}[/bold] on [bold]{target_name}[/bold] "
+        f"({target_cfg.url}) — no run will execute …[/dim]"
+    )
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                f"{base_url}/api/v1/agents/{name}/runs",
+                params=params,
+                json={"input": payload},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        console.print(f"[red]✗ network error:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    if response.status_code != _HTTP_OK:
+        try:
+            body_json = response.json()
+        except ValueError:
+            body_json = {"raw": response.text[:300]}
+        console.print(
+            f"[red]✗ HTTP {response.status_code}[/red] from {target_cfg.url}: {body_json}"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        est_dict = response.json()
+    except ValueError as exc:
+        console.print(f"[red]✗ runtime returned non-JSON body:[/red] {exc}")
+        raise typer.Exit(code=1) from None
+
+    _render_estimate(est_dict=est_dict, output_format=output_format)
 
 
 def _coerce_remote_agent_input(raw: str, agent_name: str) -> dict[str, Any]:

@@ -1,0 +1,56 @@
+# ============================================================================
+# MDK Workflow Starter — draft -> review
+# ============================================================================
+# A 2-node multi-step pipeline showing the canonical workflow.yaml structure
+# (ADR 017): state_schema, entrypoint, agent nodes, and sequential edges.
+# The starter referenced by ADR 028 D2 — copy this directory, swap in your
+# own agents and state shape, and `mdk run` / `mdk eval` work immediately.
+#
+# Flow:
+#   draft   — drafts a piece of content from a `topic` (state.draft)
+#   review  — reviews the draft, returning a polished `final` (state.final)
+#
+# Both nodes read + write to the workflow state defined in ./state.json.
+# Add a third node + a new edge to extend; flip to conditional or HUMAN
+# nodes once you've outgrown the linear shape.
+
+api_version: movate/v1
+kind: Workflow
+
+name: workflow-starter
+version: 0.1.0
+description: |
+  Two-step draft to review pipeline demonstrating workflow.yaml shape,
+  state threading between agents, and a workflow-eval dataset.
+owner: ""
+
+# JSON Schema for the shared state. Each node may add new keys; the schema
+# is enforced once at entry (initial_state) and then nodes are free to merge.
+state_schema: ./state.json
+
+# Entrypoint node id — workflow runs start here.
+entrypoint: draft
+
+# Optional workflow-eval stanza (ADR 008). Lets `mdk eval <workflow-dir>`
+# find the dataset + gate without extra flags.
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+nodes:
+  - id: draft
+    type: agent
+    # Relative to this workflow.yaml's parent dir.
+    ref: ./agents/draft
+
+  - id: review
+    type: agent
+    ref: ./agents/review
+
+edges:
+  - from: draft
+    to: review
+
+tags:
+  - starter
+  - workflow

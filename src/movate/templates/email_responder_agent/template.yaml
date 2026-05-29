@@ -1,0 +1,8 @@
+title: Email responder
+description: Tone- and length-aware drafted reply with a needs-review flag.
+shape: agent
+tags:
+  - email
+  - drafting
+  - policy-aware
+recommended_for: Drafting replies with explicit tone/intent controls and a human-review fallback.

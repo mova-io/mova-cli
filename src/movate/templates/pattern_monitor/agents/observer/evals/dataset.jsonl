@@ -1,0 +1,2 @@
+{"input": {"signal": "Last 5 min: 120 of 1000 requests returned 5xx."}, "expected": {"metric": "error_rate=0.12"}}
+{"input": {"signal": "CPU utilization steady at 41 percent."}, "expected": {"metric": "cpu=41%"}}

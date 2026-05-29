@@ -417,12 +417,177 @@ def report_to_json(report: Report) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Usage metering (ADR 036 D1)
+#
+# Per-tenant rollup of *requests*, *tokens*, and *cost* over a time window —
+# the billing-visibility companion to the agent-health :func:`build_report`.
+# Reuses the same in-memory aggregation pattern + the per-run records already
+# captured (ADR 024). No new measurement plumbing; this is purely a reducer
+# over runs the storage layer hands back. Quota *enforcement* (ADR 036 D2) is
+# out of scope here — D1 ships only the metering signal + read endpoint.
+#
+# Design rules:
+#
+# * Pure / backend-agnostic — same as :func:`build_report`. ``cli ⊥ runtime``.
+# * Empty input → a zeroed :class:`Usage` (never a divide-by-zero / crash).
+# * Records missing token / cost / provider degrade to "no contribution"
+#   rather than poisoning the rollup (older rows may have ``0`` / ``""``).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UsageRollup:
+    """A single grouped usage row (one agent, one provider, or the whole window).
+
+    ``key`` carries the grouping value (agent name / provider id / etc.) so the
+    same dataclass renders every breakdown. Empty string ``""`` is the
+    deliberate sentinel for "no signal" (e.g. an older run that didn't record a
+    provider) — the front end can render it as "(unknown)" without ambiguity.
+    """
+
+    key: str
+    requests: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class Usage:
+    """Per-tenant usage rollup over a time window (ADR 036 D1).
+
+    The HTTP response (``GET /api/v1/usage``) and any future ``mdk usage`` CLI
+    render this same shape. ``by_agent`` / ``by_provider`` are the optional
+    breakdowns — included by default so the front end can drill in without a
+    second round-trip; pass empty lists to suppress.
+    """
+
+    tenant_id: str
+    window_days: int
+    agent_filter: str | None
+    totals: UsageRollup
+    by_agent: list[UsageRollup]
+    by_provider: list[UsageRollup]
+
+
+def build_usage(
+    runs: list[RunRecord],
+    *,
+    tenant_id: str,
+    window_days: int = 0,
+    agent_filter: str | None = None,
+    include_by_agent: bool = True,
+    include_by_provider: bool = True,
+) -> Usage:
+    """Reduce ``runs`` into per-tenant usage counters + optional breakdowns.
+
+    Pure: no I/O, no time-windowing (caller pre-filters with
+    :func:`_filter_runs_by_since`, same as :func:`build_report`). Empty
+    ``runs`` → a zeroed :class:`Usage` (200 path; never a 500).
+
+    Counters:
+
+    * ``requests`` — count of runs in the window. Every persisted ``RunRecord``
+      contributes regardless of ``status`` (a safety-blocked / error run *was*
+      a request; billing has to see it).
+    * ``tokens_in`` / ``tokens_out`` — sum of ``metrics.tokens.input`` /
+      ``metrics.tokens.output``. ``cached_input`` is intentionally NOT counted
+      (it's the provider's cache hit, not new tokenization).
+    * ``cost_usd`` — sum of ``metrics.cost_usd``. Already includes per-turn
+      LLM cost + per-skill cost (ADR 024 — skills add to the same field).
+
+    Note on cost: this is the **estimated** cost from ``pricing.yaml`` at run
+    time, NOT the actual provider invoice. The ADR (036 §Risks) calls out the
+    estimate↔actual gap — D3 billing export will document it. We surface the
+    estimate as-is here.
+    """
+    totals_requests = 0
+    totals_tokens_in = 0
+    totals_tokens_out = 0
+    totals_cost = 0.0
+
+    # Per-grouping accumulators. Use dict to preserve discovery + sort later.
+    by_agent_buckets: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"requests": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+    )
+    by_provider_buckets: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"requests": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
+    )
+
+    for run in runs:
+        metrics = run.metrics
+        tokens_in = int(metrics.tokens.input or 0) if metrics.tokens else 0
+        tokens_out = int(metrics.tokens.output or 0) if metrics.tokens else 0
+        cost = float(metrics.cost_usd or 0.0)
+
+        totals_requests += 1
+        totals_tokens_in += tokens_in
+        totals_tokens_out += tokens_out
+        totals_cost += cost
+
+        if include_by_agent:
+            agent_key = run.agent or ""
+            ab = by_agent_buckets[agent_key]
+            ab["requests"] += 1
+            ab["tokens_in"] += tokens_in
+            ab["tokens_out"] += tokens_out
+            ab["cost_usd"] += cost
+
+        if include_by_provider:
+            # Prefer the per-call ``metrics.provider`` (set by the executor for
+            # the actual model used); fall back to the record's top-level
+            # ``provider`` field. Empty string = older record without a
+            # captured provider — surface it as a distinct bucket rather than
+            # silently dropping it (failure-mode rule).
+            provider_key = metrics.provider or run.provider or ""
+            pb = by_provider_buckets[provider_key]
+            pb["requests"] += 1
+            pb["tokens_in"] += tokens_in
+            pb["tokens_out"] += tokens_out
+            pb["cost_usd"] += cost
+
+    def _sort_rollups(buckets: dict[str, dict[str, float]]) -> list[UsageRollup]:
+        # Highest cost first — operator/billing scans for top spend; ties
+        # broken by key for deterministic output.
+        out = [
+            UsageRollup(
+                key=k,
+                requests=int(v["requests"]),
+                tokens_in=int(v["tokens_in"]),
+                tokens_out=int(v["tokens_out"]),
+                cost_usd=float(v["cost_usd"]),
+            )
+            for k, v in buckets.items()
+        ]
+        out.sort(key=lambda r: (-r.cost_usd, r.key))
+        return out
+
+    return Usage(
+        tenant_id=tenant_id,
+        window_days=window_days,
+        agent_filter=agent_filter,
+        totals=UsageRollup(
+            key=tenant_id,
+            requests=totals_requests,
+            tokens_in=totals_tokens_in,
+            tokens_out=totals_tokens_out,
+            cost_usd=totals_cost,
+        ),
+        by_agent=_sort_rollups(by_agent_buckets) if include_by_agent else [],
+        by_provider=_sort_rollups(by_provider_buckets) if include_by_provider else [],
+    )
+
+
 __all__ = [
     "FAILED_STATUSES",
     "AgentRollup",
     "FailingCase",
     "LatencyPercentiles",
     "Report",
+    "Usage",
+    "UsageRollup",
     "build_report",
+    "build_usage",
     "report_to_json",
 ]

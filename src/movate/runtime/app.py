@@ -20,14 +20,32 @@ and ``movate serve`` CLI binding (uvicorn integration).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
+import logging
 import os
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, cast
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, File, Header, Query, Request, Response, UploadFile
+import yaml
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -37,11 +55,13 @@ from movate.core.auth import (
     KEY_DEFAULT_ROTATION_GRACE_SECONDS,
     KEY_DEFAULT_TTL_DAYS,
     LEGACY_DEFAULT_SCOPES,
+    SCOPE_READ,
     mint_api_key,
     rotate_key_record,
 )
 from movate.core.cache import build_cache
 from movate.core.canary import aggregate_side, choose_version
+from movate.core.events import EventKind, EventListView, EventView
 from movate.core.graph import query as graph_query
 from movate.core.graph.models import GraphologyDoc, NodeDetail, NodeSearchHit
 from movate.core.graph.query import GraphMode
@@ -52,14 +72,23 @@ from movate.core.models import (
     BatchRecord,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogRatingsSummary,
+    CatalogSource,
+    DiagnosisRecord,
+    DiagnosisStatus,
+    ErrorInfo,
     EvalRecord,
     EvalSchedule,
     JobKind,
     JobRecord,
     JobSchedule,
     JobStatus,
+    Project,
+    ProjectMemberRole,
     TenantProviderKey,
     Trigger,
+    WorkflowBundleRecord,
     WorkflowStatus,
 )
 from movate.core.provider_keys import (
@@ -67,12 +96,18 @@ from movate.core.provider_keys import (
     mint_tenant_provider_key,
     normalize_provider,
 )
+from movate.core.quotas import (
+    QuotaConfig,
+    RouteClass,
+    load_quota_config,
+)
 from movate.core.rate_limit import InProcessRateLimiter, NoOpRateLimiter, RateLimiter
 from movate.core.reporting import (
     Report,
     _filter_evals_by_since,
     _filter_runs_by_since,
     build_report,
+    build_usage,
 )
 from movate.core.triggers import (
     DELIVERY_ID_HEADER,
@@ -82,6 +117,17 @@ from movate.core.triggers import (
     mint_trigger,
     verify_signature,
 )
+from movate.core.webhooks import (
+    WebhookAttemptListView,
+    WebhookAttemptView,
+    WebhookCreatedView,
+    WebhookCreateRequest,
+    WebhookListView,
+    WebhookSubscription,
+    WebhookUpdateRequest,
+    WebhookView,
+)
+from movate.core.workflow.spec import WorkflowSpecLoadError, load_workflow_spec
 from movate.runtime.agent_creation import (
     AgentCreationError,
     persist_bundle,
@@ -97,15 +143,41 @@ from movate.runtime.agent_resolver import (
     publish_agent_bundle,
     resolve_agent_bundle,
 )
-from movate.runtime.errors import ErrorCode, auth_required, conflict, http_error, not_found
+from movate.runtime.errors import (
+    ErrorBody,
+    ErrorCode,
+    ErrorResponse,
+    auth_required,
+    conflict,
+    enrich_error_fields,
+    http_error,
+    not_found,
+)
+from movate.runtime.events import emit_event
 from movate.runtime.hardening import (
+    ECONOMICS_HEADER_CACHE,
+    ECONOMICS_HEADER_COST,
+    ECONOMICS_HEADER_REQUEST_ID,
+    ECONOMICS_HEADER_TOKENS_IN,
+    ECONOMICS_HEADER_TOKENS_OUT,
+    EconomicsHeadersMiddleware,
     PayloadSizeLimitMiddleware,
     RequestIdMiddleware,
+    ResponseEconomics,
     resolve_max_request_bytes,
+    set_response_economics,
+)
+from movate.runtime.long_poll import (
+    HEADER_POLL_TIMEOUT,
+    HEADER_WAIT_CLAMPED,
+    MAX_WAIT_SECONDS,
+    DurationParseError,
+    long_poll_job,
 )
 from movate.runtime.middleware import (
     AuthContext,
     make_auth_dependency,
+    make_quota_dependency,
     require_scope,
 )
 from movate.runtime.registry import scan_agents
@@ -114,10 +186,17 @@ from movate.runtime.request_context import (
     install_request_id_logging,
 )
 from movate.runtime.schemas import (
+    KB_INGEST_URL_MAX_PAGES_CAP,
+    KB_INGEST_URL_TIMEOUT_S,
     AgentCatalogItemView,
     AgentCatalogView,
     AgentCommitView,
+    AgentCreateAccepted,
+    AgentCreateCatalogRequest,
     AgentCreatedView,
+    AgentCreateLlmRequest,
+    AgentCreateSpecRequest,
+    AgentCreateWizardRequest,
     AgentDatasetInfo,
     AgentDatasetUploadView,
     AgentDeletedView,
@@ -137,6 +216,8 @@ from movate.runtime.schemas import (
     AgentVersionsView,
     AgentVersionView,
     AgentView,
+    AnalyzeAcceptedView,
+    AnalyzeRequest,
     ApiKeyBulkRevokedView,
     ApiKeyListView,
     ApiKeyMintedView,
@@ -145,6 +226,10 @@ from movate.runtime.schemas import (
     ApiKeyRotatedView,
     ApiKeyRotateRequest,
     ApiKeyView,
+    AskRequest,
+    AuditAcceptedView,
+    AuditJobView,
+    AuditRequest,
     AuthWhoamiView,
     BatchAcceptedView,
     BatchInlineSubmission,
@@ -163,7 +248,30 @@ from movate.runtime.schemas import (
     CanarySetRequest,
     CanarySideView,
     CanaryView,
+    CapabilitiesView,
+    CatalogEntryDetailView,
+    CatalogEntryListResponse,
+    CatalogEntryVersionView,
+    CatalogEntryView,
+    CatalogPublishVersionRequest,
+    CatalogRatingRequest,
+    CatalogRatingsSummaryView,
+    CatalogSubmitRequest,
+    CatalogSyncRequest,
+    CatalogSyncResponse,
+    DescribeAgentRequest,
+    DescribeAgentResponse,
+    DescribeAgentTokenUsageView,
+    DiagnoseAcceptedView,
+    DiagnoseJobView,
+    DiagnoseRequest,
     EvalAcceptedView,
+    EvalCommitRequest,
+    EvalCommitView,
+    EvalGenerateAcceptedView,
+    EvalGenerateJobView,
+    EvalGenerateRequest,
+    EvalGenerationResultView,
     EvalListView,
     EvalScheduleListView,
     EvalScheduleSubmission,
@@ -173,10 +281,12 @@ from movate.runtime.schemas import (
     FeedbackListView,
     FeedbackSubmission,
     FeedbackView,
+    GeneratedEvalCaseView,
     GraphologyView,
     GraphQueryRequest,
     GraphSearchResult,
     GraphSearchView,
+    GroundedAnswerView,
     HarvestedCaseView,
     HarvestView,
     HealthView,
@@ -186,9 +296,16 @@ from movate.runtime.schemas import (
     JobScheduleSubmission,
     JobScheduleView,
     JobView,
+    JudgeCommitRequest,
+    JudgeCommitResponse,
+    JudgeGenerateRequest,
+    JudgeGenerateResponse,
     KbChunkView,
     KbDeletedView,
     KbIngestFileResult,
+    KbIngestGeneratedRequest,
+    KbIngestTextRequest,
+    KbIngestUrlRequest,
     KbIngestView,
     KbListView,
     KbReindexSubmission,
@@ -201,14 +318,27 @@ from movate.runtime.schemas import (
     ModelCatalogView,
     ModelInfoView,
     NodeDetailView,
+    ObservabilityHealthView,
+    ObservabilityInsightListView,
+    ObservabilityInsightView,
+    PreviewScoreView,
     PricingEntryView,
     PricingView,
+    ProjectCreateRequest,
+    ProjectListResponse,
+    ProjectMemberAddRequest,
+    ProjectMemberListView,
+    ProjectMemberPatchRequest,
+    ProjectMemberView,
+    ProjectUpdateRequest,
+    ProjectView,
     ProviderKeyListView,
     ProviderKeySetRequest,
     ProviderKeyView,
     ReadyView,
     ReportView,
     RunAccepted,
+    RunEstimateView,
     RunExplainLlmCallView,
     RunExplainView,
     RunSubmission,
@@ -223,20 +353,116 @@ from movate.runtime.schemas import (
     TriggerCreateRequest,
     TriggerListView,
     TriggerView,
+    TroubleshootRequest,
+    UnifiedAgentCreatedView,
+    UsageView,
     WizardAgentSubmission,
+    WorkflowCreatedView,
+    WorkflowCreateRequest,
+    WorkflowDeletedView,
+    WorkflowDetailView,
+    WorkflowListResponse,
+    WorkflowPublishedView,
+    WorkflowRevertedView,
+    WorkflowRevertSubmission,
     WorkflowRunListView,
     WorkflowRunView,
     WorkflowSignalRequest,
+    WorkflowUpdatedView,
+    WorkflowValidationIssue,
+    WorkflowValidationView,
+    WorkflowVersionsView,
+    WorkflowVersionView,
+    WorkflowView,
 )
 from movate.runtime.skill_creation import (
     SkillCreationError,
     persist_skill_bundle,
 )
+from movate.runtime.unified_create import (
+    attach_to_project,
+    clone_from_catalog,
+    llm_authoring_stream,
+    spec_to_bundle_files,
+)
+from movate.runtime.workflow_persistence import PublishResult as WorkflowPublishResult
+from movate.runtime.workflow_persistence import (
+    WorkflowPersistenceError,
+    persist_workflow_bundle,
+    publish_workflow_bundle,
+    soft_delete_workflow,
+)
+from movate.runtime.workflow_persistence import (
+    bundle_files_from_dir as workflow_bundle_files_from_dir,
+)
+from movate.runtime.workflow_persistence import (
+    mint_revert_version as mint_workflow_revert_version,
+)
+from movate.runtime.workflow_persistence import (
+    unzip_bundle as unzip_workflow_bundle,
+)
 from movate.storage.base import StorageProvider
-from movate.tracing import inject_current_trace_context, record_audit_event
+from movate.tracing import (
+    dec_sse_connections,
+    inc_sse_connections,
+    inject_current_trace_context,
+    record_audit_event,
+)
 
 if TYPE_CHECKING:
     from movate.providers.model_catalog import ModelInfo
+
+
+logger = logging.getLogger(__name__)
+
+
+def _serialize_proposed_fix(fix: Any) -> dict[str, Any]:
+    """Serialize a :class:`movate.core.diagnoser.ProposedFix` for storage.
+
+    Translates the internal taxonomy (``kind`` + opaque ``payload``)
+    onto the wire shape the GET endpoint's ``DiagnoseJobView`` validates
+    against — a flat dict whose fields depend on ``kind``:
+
+    * ``prompt_edit`` → ``{"kind": "prompt_edit", "diff": {...}, "rationale": ...}``
+    * ``kb_ingest`` → ``{"kind": "kb_ingest", "payload": {...}, ...}``
+    * ``context_add`` / ``context_remove`` / ``model_swap`` /
+      ``temperature_change`` / ``retrieval_k_change`` → ``{"kind": ..., <field>: ...}``
+
+    The shape MUST match :data:`movate.runtime.schemas.ProposedFixView`
+    exactly so a follow-up ``GET`` round-trips through Pydantic without
+    a discriminator-mismatch error. Any drift here is a wire-contract
+    bug surface — handle that by extending both the diagnoser taxonomy
+    AND this serializer in lockstep.
+    """
+    base: dict[str, Any] = {
+        "kind": fix.kind,
+        "rationale": fix.rationale,
+        "expected_improvement": dict(fix.expected_improvement),
+    }
+    payload = dict(fix.payload)
+    if fix.kind == "prompt_edit":
+        base["diff"] = {
+            "before": payload.get("before", ""),
+            "after": payload.get("after", ""),
+            "patch_text": payload.get("patch_text", ""),
+        }
+    elif fix.kind == "kb_ingest":
+        base["payload"] = {
+            "kind": str(payload.get("kind", "")),
+            "source": str(payload.get("source", "")),
+        }
+    elif fix.kind == "context_add":
+        base["name"] = str(payload.get("name", ""))
+        base["body"] = str(payload.get("body", ""))
+    elif fix.kind == "context_remove":
+        base["name"] = str(payload.get("name", ""))
+    elif fix.kind == "model_swap":
+        base["provider"] = str(payload.get("provider", ""))
+    elif fix.kind == "temperature_change":
+        base["delta"] = float(payload.get("delta", 0.0))
+    elif fix.kind == "retrieval_k_change":
+        base["delta"] = int(payload.get("delta", 0))
+    return base
 
 
 def _sse_frame(event: str, data: dict[str, Any]) -> str:
@@ -249,6 +475,179 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
     carry a one- or two-token ``text`` delta.
     """
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'), default=str)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# ADR 035 D3 — SSE event-stream tuning.
+#
+# The polling interval is the cost dial: at one query per active
+# connection per ``_EVENTS_SSE_POLL_INTERVAL_S`` we trade tail latency
+# (median push lag ≈ half the interval) for storage load (queries/sec ≈
+# active_connections / interval). 500ms keeps the perceived push lag
+# under ~half a second while costing two queries per active subscriber
+# per second — acceptable for D3 in front of an outbox that's read-light
+# vs. write-heavy. A Postgres ``LISTEN/NOTIFY`` upgrade is the documented
+# replacement when scale demands it.
+#
+# The heartbeat keeps proxies (Azure Front Door / App Gateway / nginx)
+# from closing an idle connection. 15s is well under the typical 30-60s
+# idle-timeout floor and small enough that a client's reconnect logic
+# kicks in quickly when the connection actually dies.
+#
+# The per-tenant connection cap is advisory: it prevents one runaway
+# client from owning every worker slot. 50 is a soft ceiling — well
+# above any expected legitimate fan-out (a single browser tab uses one)
+# and well below the uvicorn worker concurrency. Operators override via
+# ``MDK_EVENTS_SSE_MAX_PER_TENANT``.
+# ---------------------------------------------------------------------------
+_EVENTS_SSE_POLL_INTERVAL_S: float = 0.5
+_EVENTS_SSE_HEARTBEAT_INTERVAL_S: float = 15.0
+_EVENTS_SSE_MAX_PER_TENANT_DEFAULT: int = 50
+# Outbox page size for each storage poll (replay AND live). Bounded so a
+# long backlog doesn't materialise in memory all at once; matches the
+# ``list_events.limit`` cap the storage layer documents (1000). 100 hits
+# the sweet spot for a typical fan-out (a busy tenant sees < 100 events
+# between 500ms polls).
+_EVENTS_SSE_PAGE_SIZE: int = 100
+
+
+def _events_sse_max_per_tenant() -> int:
+    """Resolve the per-tenant connection cap from env, else the default.
+
+    Env wins (operator override at deploy-time); falls back to the
+    in-code default. A bad value (non-int / <=0) silently falls back so
+    a misconfigured deploy doesn't turn the cap off entirely.
+    """
+    raw = os.environ.get("MDK_EVENTS_SSE_MAX_PER_TENANT", "").strip()
+    if not raw:
+        return _EVENTS_SSE_MAX_PER_TENANT_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return _EVENTS_SSE_MAX_PER_TENANT_DEFAULT
+    return n if n > 0 else _EVENTS_SSE_MAX_PER_TENANT_DEFAULT
+
+
+def _events_sse_event_frame(view: EventView) -> str:
+    """Format one outbox-event SSE frame: ``id: <id>\\ndata: <json>\\n\\n``.
+
+    Single source of truth shared by the replay + live phases so a
+    rename of the wire shape can't drift between them. The ``id:`` line
+    is mandatory — it's what SSE clients echo back as ``Last-Event-ID``
+    on a reconnect to resume from the right cursor.
+    """
+    payload = view.model_dump(mode="json")
+    return f"id: {view.id}\ndata: {json.dumps(payload, separators=(',', ':'), default=str)}\n\n"
+
+
+async def _events_sse_generator(
+    *,
+    store: StorageProvider,
+    target_tenant: str,
+    kind: str | None,
+    subject: str | None,
+    since: datetime | None,
+    last_event_id: str | None,
+    poll_interval_s: float,
+    heartbeat_interval_s: float,
+    is_disconnected: Callable[[], Awaitable[bool]],
+) -> AsyncIterator[str]:
+    """Yield SSE frames from the events outbox until the client disconnects.
+
+    Extracted as a top-level async generator (not a closure inside the
+    endpoint) so unit tests can drive it directly with an injected
+    ``is_disconnected`` predicate — TestClient can't gracefully shut
+    down a long-poll SSE stream, but a direct-drive test can flip a flag
+    and assert the generator unwinds cleanly. Same code path runs in
+    production: the endpoint wraps this in a ``StreamingResponse``.
+
+    Behavior is the contract documented on the endpoint:
+
+    * **Replay** when ``since`` (timestamp) OR ``last_event_id`` (cursor)
+      is set — page through the outbox in 100-row batches, emit each
+      event, advance the cursor, then fall through to live mode.
+      ``last_event_id`` wins when both are set (id is exact).
+    * **Live** otherwise — snap a UTC-now anchor, poll the outbox every
+      ``poll_interval_s`` for newer events, emit them, advance the
+      cursor.
+    * **Heartbeat** — every ``heartbeat_interval_s`` (measured against
+      the wall clock between polls), emit a ``:keepalive\\n\\n`` SSE
+      comment line so idle proxies don't drop the connection.
+    * **Disconnect** — between iterations, the predicate is awaited;
+      ``True`` exits the generator cleanly. ``asyncio.CancelledError``
+      from the server-side cancel is re-raised after no extra work.
+
+    Tenant-scoping is the caller's responsibility (``target_tenant`` is
+    plumbed into every ``list_events`` call). ``tenant_id NOT NULL`` is
+    the storage-layer invariant.
+    """
+    # Replay cursor: prefer Last-Event-ID (id-keyed) over `since`
+    # (timestamp-keyed); id is exact, timestamps can tie.
+    after_id: str | None = last_event_id
+    replay_since: datetime | None = since if (since is not None and after_id is None) else None
+    # Live cursor: high-water mark on the last emitted id. Seeded from
+    # Last-Event-ID if present; initialised on the first live tick
+    # otherwise. ``live_since`` is the "events recorded after now"
+    # anchor when there's no id cursor yet.
+    live_after_id: str | None = after_id
+    live_since: datetime = datetime.now(UTC)
+
+    last_heartbeat = asyncio.get_event_loop().time()
+
+    try:
+        # ---- Phase 1: replay (skipped on the live-only path) ----
+        if replay_since is not None or after_id is not None:
+            while True:
+                if await is_disconnected():
+                    return
+                batch = await store.list_events(
+                    target_tenant,
+                    since=replay_since,
+                    kind=kind,
+                    subject=subject,
+                    limit=_EVENTS_SSE_PAGE_SIZE,
+                    after_id=after_id,
+                )
+                if not batch:
+                    break
+                for ev in batch:
+                    yield _events_sse_event_frame(EventView.from_record(ev))
+                    after_id = ev.id
+                    live_after_id = ev.id
+                # Less than a full page → backlog drained; flip to live.
+                if len(batch) < _EVENTS_SSE_PAGE_SIZE:
+                    break
+
+        # ---- Phase 2: live ----
+        while True:
+            if await is_disconnected():
+                return
+
+            # Heartbeat: SSE comment so idle proxies don't drop us.
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat >= heartbeat_interval_s:
+                yield ":keepalive\n\n"
+                last_heartbeat = now
+
+            batch = await store.list_events(
+                target_tenant,
+                since=None if live_after_id is not None else live_since,
+                kind=kind,
+                subject=subject,
+                limit=_EVENTS_SSE_PAGE_SIZE,
+                after_id=live_after_id,
+            )
+            for ev in batch:
+                yield _events_sse_event_frame(EventView.from_record(ev))
+                live_after_id = ev.id
+
+            # Cooperative sleep — keeps the loop free + lets the
+            # disconnect check + heartbeat tick at a predictable cadence.
+            await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        # Client disconnect / server shutdown — unwind cleanly. Re-raise
+        # so the ASGI server's cancellation contract is honored.
+        raise
 
 
 async def _sse_run_stream(
@@ -520,6 +919,329 @@ async def _sse_graph_growth_stream(
     yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
 
 
+def _default_sibling_path(
+    explicit: Path | None,
+    agents_path: Path | None,
+    *,
+    name: str,
+    at_parent: bool = False,
+) -> Path | None:
+    """Resolve an optional path that defaults to a sibling of ``agents_path``.
+
+    Used to wire ``skills_path`` (defaults to ``<agents_path>/skills``) and
+    ``workflows_path`` (defaults to ``<agents_path>/../workflows`` —
+    ``at_parent=True``). Returns ``None`` only when no explicit path was
+    given AND ``agents_path`` is also missing (typical for a unit-test
+    runtime that doesn't persist anything to disk).
+    """
+    if explicit is not None:
+        return explicit
+    if agents_path is None:
+        return None
+    if at_parent:
+        return agents_path.parent / name
+    return agents_path / name
+
+
+async def _run_eval_generation(
+    *,
+    store: StorageProvider,
+    bundle: AgentBundle,
+    job: Any,
+    model: str,
+    event_queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+    streams_map: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]],
+) -> None:
+    """Drive one eval-generation pipeline + persist the terminal status.
+
+    Lives at module level (not nested inside ``build_app``) so the
+    asyncio.Task that runs it doesn't hold the build_app closure alive.
+    Pushes :func:`movate.core.eval_generator.generate_eval_cases`'s
+    progress events onto ``event_queue`` for the SSE endpoint to drain.
+
+    Always pops the queue from ``streams_map`` on exit so a finished
+    job's SSE replay path falls through to the persisted record (the
+    GET status endpoint serves that case). Never raises — every
+    failure mode lands as a ``failed`` status on the persisted job.
+    """
+    from movate.core.eval_generator import (  # noqa: PLC0415
+        BudgetExceededError,
+        GenerationFailedError,
+        generate_eval_cases,
+    )
+    from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+    from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+    # Provider selection: mock when the agent's model spec is the mock,
+    # otherwise LiteLLM. Mirrors the choice in ``v1_agent_run_stream``.
+    # The mock provider returns deterministic content so test-mode jobs
+    # produce empty results (no JSON object in the reply) — which is the
+    # correct contract for "hermetic CI": no real LLM call, no cost.
+    provider_impl: Any = (
+        MockProvider() if model.startswith("mock") or "mock" in model.lower() else LiteLLMProvider()
+    )
+
+    def _on_event(event: str, data: dict[str, Any]) -> None:
+        try:
+            event_queue.put_nowait((event, data))
+        except asyncio.QueueFull:
+            # Buffer full = a slow client. Drop the event silently rather
+            # than block the pipeline. The terminal frame is what matters;
+            # the persisted record carries the cumulative state anyway.
+            log = __import__("logging").getLogger(__name__)
+            log.debug("eval_gen: SSE buffer full, dropping event=%s", event)
+
+    error_payload: dict[str, Any] | None = None
+    result_payload: dict[str, Any] | None = None
+    final_status = "completed"
+    try:
+        result = await generate_eval_cases(
+            bundle=bundle,
+            description=job.description,
+            provider_impl=provider_impl,
+            model=model,
+            count=job.count,
+            categories=list(job.categories),
+            include_judge=job.include_judge,
+            budget_usd=job.budget_usd,
+            on_event=_on_event,
+        )
+        result_payload = result.to_dict()
+        # ── Smoke preview score (mock pass rate) ──
+        # Run every generated case against the agent under the mock
+        # provider so the operator gets a quick "does the case shape
+        # match" signal BEFORE they commit. Failures don't fail the
+        # job — the score just stays None.
+        try:
+            preview = await _smoke_preview_score(bundle, result.cases)
+            if preview is not None:
+                result_payload["preview_score"] = preview
+                _on_event("preview_eval", {"mock_pass_rate": preview["mock_pass_rate"]})
+        except Exception:  # never fail the job on a preview hiccup
+            __import__("logging").getLogger(__name__).debug(
+                "eval_gen: preview-score step failed", exc_info=True
+            )
+    except BudgetExceededError as exc:
+        final_status = "failed"
+        error_payload = {
+            "code": "budget_exceeded",
+            "message": str(exc),
+            "spent": exc.spent,
+            "ceiling": exc.ceiling,
+        }
+        _on_event("error", {"message": str(exc)})
+    except GenerationFailedError as exc:
+        final_status = "failed"
+        error_payload = {"code": "generation_failed", "message": str(exc)}
+        _on_event("error", {"message": str(exc)})
+    except Exception as exc:  # last-ditch — never bubble
+        final_status = "failed"
+        error_payload = {"code": "internal_error", "message": str(exc)}
+        _on_event("error", {"message": str(exc)})
+    finally:
+        # Persist the terminal state. Construct a fresh EvalGenerationJob
+        # rather than mutating the frozen dataclass.
+        from dataclasses import replace  # noqa: PLC0415
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        completed_at = datetime.now(UTC).isoformat()
+        updated = replace(
+            job,
+            status=final_status,
+            result=result_payload,
+            error=error_payload,
+            tokens_used=(result_payload or {}).get("tokens_used", 0) if result_payload else 0,
+            cost_usd=(result_payload or {}).get("cost_usd", 0.0) if result_payload else 0.0,
+            progress=1.0 if final_status == "completed" else job.progress,
+            completed_at=completed_at,
+        )
+        try:
+            await store.save_eval_generation_job(updated)
+        except Exception:
+            __import__("logging").getLogger(__name__).warning(
+                "eval_gen: failed to persist terminal status job_id=%s", job.job_id, exc_info=True
+            )
+        # Drop the queue + task ref so the SSE endpoint's not-running
+        # replay path takes over for any late-arriving subscriber. The
+        # task ref is the one stashed by the route handler to keep us
+        # alive against asyncio's GC.
+        streams_map.pop(job.job_id, None)
+        streams_map.pop(f"_task_{job.job_id}", None)
+
+
+async def _smoke_preview_score(bundle: AgentBundle, cases: list[Any]) -> dict[str, Any] | None:
+    """Run generated cases against the agent under the mock provider.
+
+    Pure smoke check: confirms each generated input passes the agent's
+    input schema (already validated by the pipeline) and that the
+    mock-mode Executor can produce a structurally-valid output for it.
+    The "pass rate" is the fraction of cases that ran to completion
+    without an error — NOT a semantic correctness check (that's what
+    the real eval engine + ``--mock`` is for, post-commit).
+
+    Returns ``None`` if there are no cases to score; otherwise
+    ``{"mock_pass_rate": float, "tested_against_model": "mock"}``.
+    Never raises.
+    """
+    if not cases:
+        return None
+    from movate.core.executor import Executor  # noqa: PLC0415
+    from movate.core.models import RunRequest  # noqa: PLC0415
+    from movate.providers.mock import MockProvider  # noqa: PLC0415
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+    from movate.testing import InMemoryStorage  # noqa: PLC0415
+    from movate.tracing import build_tracer  # noqa: PLC0415
+
+    # Use an ephemeral in-memory store so the smoke runs don't pollute
+    # the real audit trail. Same pattern the test fixtures use.
+    ephemeral = InMemoryStorage()
+    await ephemeral.init()
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=load_pricing(),
+        storage=ephemeral,
+        tracer=build_tracer(),
+        tenant_id="__preview__",
+    )
+    passes = 0
+    for case in cases:
+        try:
+            resp = await executor.execute(
+                bundle, RunRequest(agent=bundle.spec.name, input=case.input)
+            )
+            if getattr(resp, "status", None) != "error":
+                passes += 1
+        except Exception:
+            continue
+    rate = passes / len(cases) if cases else 0.0
+    return {"mock_pass_rate": round(rate, 4), "tested_against_model": "mock"}
+
+
+async def _sse_audit_job_stream(
+    *,
+    store: StorageProvider,
+    job: JobRecord,
+    tenant_id: str,
+) -> Any:
+    """SSE generator for a Claude-orchestrated audit job.
+
+    Audit jobs run on the worker dispatch path; this stream is a
+    *polling-based* progress bridge — it polls the job + the
+    associated :class:`AuditRecord` and emits SSE events as the worker
+    drives the audit forward. The category fan-out happens inside the
+    worker; the runtime side stays purely read-only.
+
+    Two modes:
+
+    * **Live**: the job is still queued/running when the client subscribes.
+      The generator polls the job at a fixed cadence and emits
+      ``category_complete`` events derived from the partial findings
+      the worker writes as it progresses (the auditor accumulates
+      findings before persisting them as one final ``AuditRecord``, so
+      the partial-progress signal in v1 is coarse — we emit a single
+      ``agent_complete`` event when the job hits SUCCESS and the final
+      ``completed`` frame from the AuditRecord).
+    * **Already terminal**: the job is already in a terminal state when
+      the client subscribes. The generator emits the final
+      ``agent_complete`` + ``completed`` events immediately + closes,
+      so SSE replay never blocks.
+
+    Failure: a terminal job with ``status=error`` emits a single
+    ``error`` SSE frame + closes — the client can still poll
+    ``GET /api/v1/jobs/{job_id}`` for the structured error payload.
+
+    The v1 progress granularity is a known limitation: the worker side
+    doesn't expose a writable progress channel to the API pod (no
+    pub/sub bus today), so cross-pod live ``category_complete`` events
+    are deferred to a future PR that pairs the dispatch path with a
+    redis/notify bus. The wire shape ships now so callers don't have
+    to migrate later.
+    """
+    poll_interval = 0.5  # seconds between job status checks (live mode)
+    max_polls = 240  # cap at ~2 minutes; an audit longer than that is unusual
+
+    polls = 0
+    while polls < max_polls:
+        record = await store.get_job(job.job_id, tenant_id=tenant_id)
+        if record is None:
+            # Job vanished between subscribe + first poll → emit an error
+            # and close. Defensive against a (highly unusual) DELETE.
+            yield _sse_frame("error", {"message": "job_disappeared", "code": "not_found"})
+            return
+        if record.status == JobStatus.SUCCESS:
+            # Terminal SUCCESS — emit the final agent_complete + completed
+            # frames from the persisted AuditRecord.
+            audit_id = record.result_run_id
+            audit_record = None
+            if audit_id:
+                audit_record = await store.get_audit(audit_id, tenant_id=tenant_id)
+            if audit_record is not None:
+                # One ``category_complete`` event per actually-run category
+                # so client-side counters increment as expected. Order
+                # follows AuditRecord.categories (the auditor stamps the
+                # declared order at construction).
+                running_count = 0
+                by_cat: dict[str, int] = {}
+                for f in audit_record.findings:
+                    by_cat[f.category] = by_cat.get(f.category, 0) + 1
+                for cat in audit_record.categories:
+                    running_count += by_cat.get(cat, 0)
+                    yield _sse_frame(
+                        "category_complete",
+                        {
+                            "category": cat,
+                            "findings_so_far": running_count,
+                        },
+                    )
+                yield _sse_frame(
+                    "agent_complete",
+                    {
+                        "agent_name": audit_record.scope_id,
+                        "findings_for_agent": len(audit_record.findings),
+                    },
+                )
+                yield _sse_frame(
+                    "completed",
+                    {
+                        "total_findings": len(audit_record.findings),
+                        "cost_usd": audit_record.cost_usd,
+                        "partial": audit_record.partial,
+                    },
+                )
+            else:
+                # Job marked success but no audit record — shouldn't happen
+                # in practice (the worker writes both atomically). Emit a
+                # bare ``completed`` so the client still gets a terminal frame.
+                yield _sse_frame(
+                    "completed",
+                    {"total_findings": 0, "cost_usd": 0.0, "partial": True},
+                )
+            return
+        if record.status in (
+            JobStatus.ERROR,
+            JobStatus.SAFETY_BLOCKED,
+            JobStatus.DEAD_LETTER,
+            JobStatus.CANCELLED,
+        ):
+            err = record.error
+            yield _sse_frame(
+                "error",
+                {
+                    "message": err.message if err else "audit failed",
+                    "code": err.type if err else record.status.value,
+                },
+            )
+            return
+        # Still queued / running — wait and poll again.
+        await asyncio.sleep(poll_interval)
+        polls += 1
+    # Polling cap hit — emit a soft error so clients don't hang forever.
+    yield _sse_frame(
+        "error",
+        {"message": "audit_poll_timeout", "code": "timeout"},
+    )
+
+
 def _github_is_enabled() -> bool:
     """Whether the GitHub integration is turned on.
 
@@ -585,6 +1307,24 @@ def _resolve_tenant_rate_limit(explicit: int | None) -> int | None:
             "per-tenant rate limiting stays OFF",
             raw,
         )
+        return None
+
+
+def _resolve_quota_config() -> QuotaConfig | None:
+    """Load the per-tenant quota config at app build time (ADR 036 D2).
+
+    Wraps :func:`load_quota_config` so a malformed ``quotas.yaml`` can't
+    take the runtime down at boot — instead we log loud and degrade open
+    (no enforcement). The CLI's ``mdk tenants quota`` surface uses the
+    bare :func:`load_quota_config` so operator-side misconfig is loud
+    rather than silently swallowed.
+    """
+    try:
+        return load_quota_config()
+    except Exception:
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning("quota_config_load_failed", exc_info=True)
         return None
 
 
@@ -716,7 +1456,7 @@ async def _dual_write_agent_to_registry(
     """
     try:
         files = bundle_files_from_dir(agent_dir)
-        return await publish_agent_bundle(
+        result = await publish_agent_bundle(
             storage,
             name=agent_dir.name,
             tenant_id=tenant_id,
@@ -735,6 +1475,206 @@ async def _dual_write_agent_to_registry(
             exc_info=True,
         )
         return None
+
+    # ADR 035 D1 — emit ``agent.published`` only on a content-changed
+    # publish (``result.published is True``). A no-op re-deploy of
+    # byte-identical content does NOT emit (it's not a new state on the
+    # registry — same audit-meaningful discipline as the registry
+    # itself, which skips the duplicate history row). Fire-and-forget.
+    if result.published:
+        emit_event(
+            storage,
+            tenant_id=tenant_id,
+            kind=EventKind.AGENT_PUBLISHED,
+            subject=agent_dir.name,
+            data={
+                "version": result.version,
+                "content_hash": result.content_hash,
+                "previous_version": result.previous_version,
+                "created_by": created_by,
+            },
+        )
+    return result
+
+
+async def _unified_create_persist_and_attach(
+    request: Request,
+    files: dict[str, bytes],
+    *,
+    project_id: str,
+    source: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Shared tail for spec / wizard / catalog sources.
+
+    Persists ``files`` to ``agents_path``, refreshes the in-memory
+    registry, dual-writes to the durable registry, and attaches to
+    ``project_id``. Returns the unified response view.
+
+    Pure factoring — every byte that lands on disk goes through the
+    same persist / publish / scan path the canonical endpoints use.
+    """
+    result = persist_bundle(files, agents_path=agents_path)
+    request.app.state.agents = scan_agents(agents_path)
+    store: StorageProvider = request.app.state.storage
+    published = await _dual_write_agent_to_registry(
+        store,
+        result.agent_dir,
+        tenant_id=ctx.tenant_id,
+        version=result.bundle.spec.version,
+        created_by=ctx.api_key_id,
+    )
+    attachment = await attach_to_project(
+        store,
+        project_id=project_id,
+        agent_name=result.bundle.spec.name,
+        tenant_id=ctx.tenant_id,
+    )
+    return UnifiedAgentCreatedView(
+        source=source,  # type: ignore[arg-type]
+        project_id=project_id,
+        agent_name=result.bundle.spec.name,
+        version=result.bundle.spec.version,
+        description=result.bundle.spec.description,
+        agent_dir=result.agent_dir.name,
+        files_persisted=result.files_persisted,
+        published_version=published.version if published is not None else None,
+        changed=published.published if published is not None else True,
+        attached=attachment.attached,
+    )
+
+
+async def _unified_create_spec(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Handle ``source: "spec"`` — translate spec JSON → bundle bytes."""
+    try:
+        req = AgentCreateSpecRequest.model_validate(body_dict)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'spec' request body: {exc}",
+            status_code=422,
+        ) from exc
+    files = spec_to_bundle_files(req)
+    return await _unified_create_persist_and_attach(
+        request,
+        files,
+        project_id=project_id,
+        source="spec",
+        ctx=ctx,
+        agents_path=agents_path,
+    )
+
+
+async def _unified_create_wizard(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Handle ``source: "wizard"`` — re-parse the wizard_form through
+    the canonical WizardAgentSubmission model and run the same
+    translation the existing /agents/from-wizard endpoint uses."""
+    try:
+        req = AgentCreateWizardRequest.model_validate(body_dict)
+        wizard_submission = WizardAgentSubmission.model_validate(req.wizard_form)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'wizard' request body: {exc}",
+            status_code=422,
+        ) from exc
+    files = wizard_to_bundle_files(wizard_submission)
+    return await _unified_create_persist_and_attach(
+        request,
+        files,
+        project_id=project_id,
+        source="wizard",
+        ctx=ctx,
+        agents_path=agents_path,
+    )
+
+
+async def _unified_create_catalog(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> UnifiedAgentCreatedView:
+    """Handle ``source: "catalog"`` — clone-and-decouple from the
+    agent catalog."""
+    try:
+        req = AgentCreateCatalogRequest.model_validate(body_dict)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'catalog' request body: {exc}",
+            status_code=422,
+        ) from exc
+    store: StorageProvider = request.app.state.storage
+    cloned = await clone_from_catalog(store, req=req, tenant_id=ctx.tenant_id)
+    return await _unified_create_persist_and_attach(
+        request,
+        cloned.files,
+        project_id=project_id,
+        source="catalog",
+        ctx=ctx,
+        agents_path=agents_path,
+    )
+
+
+async def _unified_create_llm(
+    request: Request,
+    body_dict: dict[str, Any],
+    project_id: str,
+    ctx: AuthContext,
+    agents_path: Path,
+) -> Any:
+    """Handle ``source: "llm"`` — async pipeline, returns 202 +
+    stream_url. The SSE pipeline COMPOSES scaffold-preview / KB
+    ingest / eval-gen / judge-engineer; missing upstreams emit
+    ``stage_skipped`` events rather than failing the whole job.
+
+    We mint a ``job_id`` synchronously and return it immediately
+    so the caller can subscribe to the SSE stream. The stream
+    itself is served by ``GET /api/v1/projects/{project_id}/agents/
+    create-stream/{job_id}`` (see route below).
+    """
+    try:
+        req = AgentCreateLlmRequest.model_validate(body_dict)
+    except Exception as exc:
+        raise AgentCreationError(
+            f"invalid 'llm' request body: {exc}",
+            status_code=422,
+        ) from exc
+    job_id = str(uuid4())
+    # Cache the request on app.state so the SSE GET can pick it up.
+    # In a multi-replica deploy this would go through storage; for the
+    # local-serve + single-pod case the in-memory cache is enough.
+    pending: dict[str, dict[str, Any]] = (
+        getattr(request.app.state, "_pending_llm_create", None) or {}
+    )
+    pending[job_id] = {
+        "req": req,
+        "project_id": project_id,
+        "tenant_id": ctx.tenant_id,
+        "agents_path": str(agents_path),
+    }
+    request.app.state._pending_llm_create = pending
+    base_url = str(request.base_url).rstrip("/")
+    return JSONResponse(
+        status_code=202,
+        content=AgentCreateAccepted(
+            job_id=job_id,
+            status_url=f"{base_url}/jobs/{job_id}",
+            stream_url=(f"{base_url}/api/v1/projects/{project_id}/agents/create-stream/{job_id}"),
+        ).model_dump(mode="json"),
+    )
 
 
 def _normalize_if_match(raw: str) -> str:
@@ -1048,6 +1988,419 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
     )
 
 
+# ---------------------------------------------------------------------------
+# Workflow API parity helpers (ADR 037 D1) — the workflow-side analogues of
+# the agent helpers above. Kept module-level (not under build_app) so the
+# test suite can import them directly.
+# ---------------------------------------------------------------------------
+
+
+async def _collect_workflow_bundle_files(
+    *,
+    body: WorkflowCreateRequest | None,
+    workflow_yaml: UploadFile | None,
+    state_schema: UploadFile | None,
+    dataset: UploadFile | None,
+    bundle: UploadFile | None,
+) -> dict[str, bytes]:
+    """Normalize the three create-modes (JSON / multipart fields / zipped
+    bundle) into a single ``{rel_path: bytes}`` dict.
+
+    Exactly one mode must be supplied; multiple modes → 400. Mirrors
+    :func:`_collect_bundle_files` for agents.
+    """
+    modes_set = sum(
+        1
+        for v in (
+            body,
+            workflow_yaml,
+            bundle,
+        )
+        if v is not None
+    )
+    if modes_set == 0:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=400,
+            message=(
+                "POST/PUT /api/v1/workflows requires one of: a JSON body, an "
+                "individual workflow_yaml multipart field, or a zipped bundle "
+                "field"
+            ),
+        )
+    if modes_set > 1:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=400,
+            message=(
+                "POST/PUT /api/v1/workflows accepts exactly one of: JSON body, "
+                "individual fields, or zipped bundle — pick ONE"
+            ),
+        )
+
+    if bundle is not None:
+        return unzip_workflow_bundle(await bundle.read())
+
+    if body is not None:
+        files: dict[str, bytes] = {"workflow.yaml": body.workflow_yaml.encode("utf-8")}
+        for rel, content in body.files.items():
+            files[rel] = content.encode("utf-8")
+        return files
+
+    # Individual-fields mode.
+    assert workflow_yaml is not None  # narrowed by the modes_set guard above
+    files = {"workflow.yaml": await workflow_yaml.read()}
+    if state_schema is not None:
+        files["schema/state.json"] = await state_schema.read()
+    if dataset is not None:
+        files["evals/dataset.jsonl"] = await dataset.read()
+    return files
+
+
+async def _dual_write_workflow_to_registry(
+    storage: StorageProvider,
+    workflow_dir: Path,
+    *,
+    tenant_id: str,
+    version: str,
+    created_by: str | None,
+) -> WorkflowPublishResult | None:
+    """Publish a freshly-persisted workflow dir into the durable registry.
+
+    Mirrors :func:`_dual_write_agent_to_registry`. Best-effort: a registry
+    failure must not fail the persist — the FS write is still live for
+    local serve. Always returns ``None`` on failure (logged) so the caller
+    can render the response cleanly.
+    """
+    try:
+        files = workflow_bundle_files_from_dir(workflow_dir)
+        return await publish_workflow_bundle(
+            storage,
+            name=workflow_dir.name,
+            tenant_id=tenant_id,
+            version=version,
+            files=files,
+            created_by=created_by,
+        )
+    except Exception:
+        import logging  # noqa: PLC0415
+
+        logging.getLogger(__name__).warning(
+            "workflow_registry_publish_failed name=%s tenant_id=%s version=%s",
+            workflow_dir.name,
+            tenant_id,
+            version,
+            exc_info=True,
+        )
+        return None
+
+
+async def _check_workflow_if_match(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+    if_match: str,
+) -> None:
+    """Enforce ``If-Match`` optimistic concurrency on workflow PUT.
+
+    Mirrors :func:`_check_agent_if_match`: matches either the current
+    latest version's ``version`` OR its ``content_hash``. A missing
+    registry row is treated as a match (the on-disk bundle exists but the
+    registry is empty — local-serve case).
+    """
+    current = await storage.get_workflow_bundle(name, tenant_id=tenant_id)
+    if current is None:
+        return
+    expected = _normalize_if_match(if_match)
+    if expected in (current.version, current.content_hash):
+        return
+    raise conflict(
+        f"workflow {name!r} was updated concurrently: If-Match {expected!r} "
+        f"no longer matches the current version {current.version!r} — re-fetch "
+        f"and retry",
+    )
+
+
+async def _do_validate_workflow(
+    *,
+    request: Request,
+    name: str,
+    body: WorkflowCreateRequest | None,
+    workflow_yaml: UploadFile | None,
+    state_schema: UploadFile | None,
+    bundle: UploadFile | None,
+    ctx: AuthContext,
+) -> WorkflowValidationView:
+    """Shared validate body — runs the parse/compile path on either the
+    supplied bundle (any mode) or the on-disk bundle when nothing is
+    supplied (multipart-only convenience for "is the current bundle still
+    valid?")."""
+    _ = ctx.tenant_id  # future per-tenant isolation
+    workflows_path: Path | None = request.app.state.workflows_path
+    any_input = (
+        body is not None
+        or workflow_yaml is not None
+        or state_schema is not None
+        or bundle is not None
+    )
+    if not any_input:
+        if workflows_path is None or not (workflows_path / name).is_dir():
+            raise not_found("workflow", name)
+        try:
+            load_workflow_spec(workflows_path / name)
+        except WorkflowSpecLoadError as exc:
+            return _validation_failed(str(exc))
+        return WorkflowValidationView(passed=True, errors=[], warnings=[])
+    try:
+        files = await _collect_workflow_bundle_files(
+            body=body,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            dataset=None,
+            bundle=bundle,
+        )
+    except WorkflowPersistenceError as exc:
+        return _validation_failed(str(exc))
+
+    import tempfile as _tempfile  # noqa: PLC0415
+
+    from movate.runtime.workflow_persistence import _write_files  # noqa: PLC0415
+
+    staging = Path(_tempfile.mkdtemp(prefix=f".validate-{name}-"))
+    try:
+        _write_files(staging, files)
+        try:
+            load_workflow_spec(staging)
+        except WorkflowSpecLoadError as exc:
+            return _validation_failed(str(exc))
+    finally:
+        import shutil as _shutil  # noqa: PLC0415
+
+        _shutil.rmtree(staging, ignore_errors=True)
+    return WorkflowValidationView(passed=True, errors=[], warnings=[])
+
+
+async def _do_update_workflow(
+    *,
+    request: Request,
+    name: str,
+    body: WorkflowCreateRequest | None,
+    workflow_yaml: UploadFile | None,
+    state_schema: UploadFile | None,
+    dataset: UploadFile | None,
+    bundle: UploadFile | None,
+    if_match: str | None,
+    ctx: AuthContext,
+) -> WorkflowUpdatedView:
+    """Shared PUT body for the multipart + JSON-body workflow update
+    endpoints. Single point of truth so the two routes never diverge.
+    """
+    workflows_path: Path | None = request.app.state.workflows_path
+    if workflows_path is None:
+        raise WorkflowPersistenceError(
+            "runtime was built without a workflows_path; "
+            "PUT /api/v1/workflows/{name} is unavailable",
+            status_code=503,
+        )
+    store: StorageProvider = request.app.state.storage
+    existing = await store.get_workflow_bundle(name, tenant_id=ctx.tenant_id)
+    on_disk = (workflows_path / name).is_dir()
+    if existing is None and not on_disk:
+        raise not_found("workflow", name)
+    previous_version = existing.version if existing is not None else "<unknown>"
+    if if_match is not None:
+        await _check_workflow_if_match(store, name, tenant_id=ctx.tenant_id, if_match=if_match)
+    files = await _collect_workflow_bundle_files(
+        body=body,
+        workflow_yaml=workflow_yaml,
+        state_schema=state_schema,
+        dataset=dataset,
+        bundle=bundle,
+    )
+    try:
+        yaml_name = yaml.safe_load(files["workflow.yaml"])["name"]
+    except Exception as exc:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=f"workflow.yaml could not be parsed: {exc}",
+        ) from exc
+    if yaml_name != name:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=(
+                f"workflow.yaml name {yaml_name!r} does not match the URL path parameter {name!r}"
+            ),
+        )
+    result = persist_workflow_bundle(files, workflows_path=workflows_path, on_conflict="replace")
+    published = await _dual_write_workflow_to_registry(
+        store,
+        result.workflow_dir,
+        tenant_id=ctx.tenant_id,
+        version=result.spec.version,
+        created_by=ctx.api_key_id,
+    )
+    return WorkflowUpdatedView(
+        name=result.spec.name,
+        version=result.spec.version,
+        description=result.spec.description,
+        workflow_dir=result.workflow_dir.name,
+        files_persisted=result.files_persisted,
+        previous_version=previous_version,
+        published_version=published.version if published is not None else None,
+        changed=published.published if published is not None else True,
+    )
+
+
+async def _resolve_published_version(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+) -> str | None:
+    """Return the version flagged ``published=True`` for ``(name, tenant)``,
+    or ``None`` when nothing is published.
+
+    Walks the version history newest-first; at most one row has the flag set
+    so this terminates quickly. Pure-helper — exposed here so list / publish /
+    delete handlers can label the response uniformly.
+    """
+    history = await storage.list_workflow_versions(name, tenant_id=tenant_id, limit=1000)
+    for row in history:
+        if row.published:
+            return row.version
+    return None
+
+
+async def _demote_workflow_published(
+    storage: StorageProvider,
+    name: str,
+    *,
+    tenant_id: str,
+) -> None:
+    """No-op hook for now — the DELETE handler invokes this so a future
+    "explicit unpublish-all" Protocol method can land without touching
+    every call site.
+
+    ADR 037 D1 design call: a soft-delete preserves the entire version
+    history (the contract the API documents — "DELETE preserves versions").
+    A registry row's ``published`` flag is intentionally NOT cleared on
+    delete: the row remains the immutable record of "this is what was
+    published when soft-delete happened." After a soft-delete, the
+    workflow disappears from the **filesystem** catalog (the API
+    surfaces "are there registry rows" as the existence signal, but a
+    versionless GET still returns the registry's latest). Operators
+    who want to fully remove a workflow + its history use a separate
+    operator-level path (out of scope for this PR — durable revoke is
+    its own ADR seam).
+
+    Kept as a function (not inlined) so the DELETE handler reads cleanly
+    and a future "really unpublish" Protocol primitive can replace this
+    body without disturbing the route.
+    """
+    _ = storage, name, tenant_id  # documented no-op
+
+
+def _peek_workflow_yaml_tags(files: dict[str, str]) -> tuple[list[str], str]:
+    """Extract ``tags`` + ``description`` from a bundle's workflow.yaml.
+
+    Lightweight YAML parse used by the catalog list view so it can render
+    metadata without re-loading + compiling the full spec for every row.
+    Returns ``([], "")`` on any parse failure — the list view degrades
+    gracefully rather than 500-ing on a corrupt row.
+    """
+    raw = files.get("workflow.yaml")
+    if not raw:
+        return [], ""
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return [], ""
+    if not isinstance(doc, dict):
+        return [], ""
+    tags = doc.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    description = doc.get("description") or ""
+    if not isinstance(description, str):
+        description = ""
+    return [str(t) for t in tags], description
+
+
+def _render_workflow_detail(record: WorkflowBundleRecord) -> WorkflowDetailView:
+    """Build the ``WorkflowDetailView`` from a registry record.
+
+    Pure function — parses the bundle's ``workflow.yaml`` for the spec
+    metadata + nodes/edges; tolerates malformed YAML (returns empty
+    nodes/edges rather than 500). The full Pydantic validation happened at
+    publish time, so a registry row is by construction parseable; the
+    defensive branches exist for forward-compat (a future schema bump that
+    a stale handler hasn't learned to read).
+    """
+    files_sorted = sorted(record.files.keys())
+    raw = record.files.get("workflow.yaml", "")
+    description = ""
+    owner = ""
+    tags: list[str] = []
+    entrypoint = ""
+    state_schema_path = ""
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        doc = None
+    if isinstance(doc, dict):
+        description = str(doc.get("description") or "")
+        owner = str(doc.get("owner") or "")
+        raw_tags = doc.get("tags") or []
+        if isinstance(raw_tags, list):
+            tags = [str(t) for t in raw_tags]
+        entrypoint = str(doc.get("entrypoint") or "")
+        state_schema_path = str(doc.get("state_schema") or "")
+        raw_nodes = doc.get("nodes") or []
+        if isinstance(raw_nodes, list):
+            nodes = [n if isinstance(n, dict) else {"value": n} for n in raw_nodes]
+        raw_edges = doc.get("edges") or []
+        if isinstance(raw_edges, list):
+            edges = [e if isinstance(e, dict) else {"value": e} for e in raw_edges]
+
+    return WorkflowDetailView(
+        name=record.name,
+        version=record.version,
+        description=description,
+        owner=owner,
+        tags=tags,
+        entrypoint=entrypoint,
+        state_schema_path=state_schema_path,
+        nodes=nodes,
+        edges=edges,
+        content_hash=record.content_hash,
+        created_by=record.created_by,
+        created_at=record.created_at,
+        published_version=record.version if record.published else None,
+        is_published=record.published,
+        files=files_sorted,
+    )
+
+
+def _validation_failed(message: str) -> WorkflowValidationView:
+    """Build a ``WorkflowValidationView`` from a single error message."""
+    return WorkflowValidationView(
+        passed=False,
+        errors=[
+            WorkflowValidationIssue(
+                code="invalid_workflow_spec",
+                severity="error",
+                message=message,
+            )
+        ],
+        warnings=[],
+    )
+
+
 # How many prior turns to inject into a threaded message's input
 # under ``conversation_history`` (PR-R). 20 turns at ~500 tokens each
 # is ~10k tokens of context — comfortable for modern models, leaves
@@ -1276,12 +2629,597 @@ def _apply_history_char_budget(
     return list(reversed(kept_reverse))
 
 
+# ---------------------------------------------------------------------------
+# KB ingest handlers — one per ingest kind (upload / text / url / generated).
+# Each takes the resolved agent ``name`` + the AuthContext + Request, calls
+# into the shared ``movate.kb.ingest.ingest_text`` pipeline with the
+# appropriate text source, and returns a KbIngestView. Lifted out of the
+# route function so each kind is independently testable and so the route
+# itself stays a thin Content-Type dispatcher.
+# ---------------------------------------------------------------------------
+
+# Rough token-estimation ratio for the OpenAI embedding API. The
+# embeddings endpoint does NOT return token usage on the wire, so we
+# approximate as ``chars / 4`` — accurate to ~10% for English prose
+# which is sufficient for a billing/audit display ("you spent ~$0.002
+# on this ingest"). Exposed as a module constant so the cost-derivation
+# helper + the wire docstring stay in sync.
+_KB_INGEST_CHARS_PER_TOKEN = 4
+
+
+def _kb_estimate_embedding_cost(
+    *,
+    text_chars: int,
+    embedding_model: str,
+) -> tuple[int, float]:
+    """Estimate ``(tokens_in, cost_usd)`` for embedding ``text_chars`` chars.
+
+    Reads the canonical packaged pricing table (ADR 024) for the cost
+    side; an unknown / unpriced model yields ``cost_usd=0.0`` rather
+    than crashing — a missing price is a documented degrade (see
+    :func:`movate.providers.pricing.load_pricing`). The token estimate
+    is a deliberate ``chars // 4`` heuristic — see the module constant
+    comment above for the rationale.
+    """
+    if text_chars <= 0:
+        return 0, 0.0
+    tokens = text_chars // _KB_INGEST_CHARS_PER_TOKEN
+    try:
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        pricing = load_pricing()
+        entry = pricing.models.get(embedding_model)
+        if entry is None:
+            return tokens, 0.0
+        # Embedding pricing is input-only — the canonical packaged
+        # table stores per-1k rates; we estimate ``input_per_1k`` over
+        # ``tokens / 1000``. An unpriced model (or an LLM whose entry
+        # lacks an input rate) degrades to ``0.0`` rather than crashing.
+        cost = (tokens / 1000.0) * float(entry.input_per_1k)
+        return tokens, round(cost, 6)
+    except Exception:
+        # Pricing is best-effort metadata for the wire — never the
+        # blocker for a successful ingest. Suppress and report zero.
+        return tokens, 0.0
+
+
+def _kb_ingest_view_from_summary(
+    *,
+    agent_name: str,
+    kind: str,
+    source: str,
+    summary: Any,  # IngestSummary | None
+    tokens_in: int,
+    cost_usd: float,
+    generated_content: str | None = None,
+) -> KbIngestView:
+    """Build the wire response from a single-source ingest summary."""
+    from uuid import uuid4  # noqa: PLC0415
+
+    ingest_id = uuid4().hex
+    if summary is None:
+        # Empty content / nothing-to-embed — return a 200 with an
+        # ``empty`` file row + zero counts. Same semantics as the
+        # multipart path's per-file ``status="empty"``.
+        return KbIngestView(
+            agent_name=agent_name,
+            files=[KbIngestFileResult(source=source, status="empty")],
+            total_chunks_saved=0,
+            ingest_id=ingest_id,
+            kind=kind,
+            chunks_added=0,
+            tokens_in=tokens_in,
+            embedding_cost_usd=cost_usd,
+            generated_content=generated_content,
+        )
+    return KbIngestView(
+        agent_name=agent_name,
+        files=[
+            KbIngestFileResult(
+                source=source,
+                status="ingested",
+                chunks_total=summary.chunks_total,
+                chunks_saved=summary.chunks_saved,
+                embedding_model=summary.embedding_model,
+            )
+        ],
+        total_chunks_saved=summary.chunks_saved,
+        ingest_id=ingest_id,
+        kind=kind,
+        chunks_added=summary.chunks_saved,
+        tokens_in=tokens_in,
+        embedding_cost_usd=cost_usd,
+        generated_content=generated_content,
+    )
+
+
+async def _ingest_upload(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+) -> KbIngestView:
+    """Multipart upload — the existing kind ``"upload"`` path.
+
+    Preserved BYTE-FOR-BYTE from the pre-JSON-modes implementation so
+    front-end teams already integrated against ``POST /api/v1/agents/
+    {name}/kb`` with ``multipart/form-data`` are unaffected. The only
+    delta from the old path is that we now read the form ourselves
+    (FastAPI's ``File(...)`` binding requires a parameter on the route
+    function, and the route now only takes ``request: Request``).
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+    from starlette.datastructures import UploadFile as _StarletteUploadFile  # noqa: PLC0415
+
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text  # noqa: PLC0415
+    from movate.kb.parsers import (  # noqa: PLC0415
+        is_supported_extension,
+        parse_document,
+    )
+
+    form = await request.form()
+    # Starlette's UploadFile is the base; FastAPI's is a subclass —
+    # ``isinstance`` against the Starlette class catches both. The
+    # cast to FastAPI's ``UploadFile`` keeps the rest of the function
+    # typed against the FastAPI type the existing helpers expect.
+    files: list[UploadFile] = [
+        cast(UploadFile, v) for v in form.getlist("files") if isinstance(v, _StarletteUploadFile)
+    ]
+
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "no files in the multipart form; supply one or more "
+                "``files`` fields (.md / .markdown / .txt)."
+            ),
+        )
+
+    store: StorageProvider = request.app.state.storage
+
+    per_file: list[KbIngestFileResult] = []
+    total_saved = 0
+    total_chars = 0
+    last_embed_model = ""
+    for upload in files:
+        raw_name = (upload.filename or "").lstrip("/")
+        basename = Path(raw_name).name
+        if not basename:
+            per_file.append(KbIngestFileResult(source="<unnamed>", status="skipped"))
+            continue
+        if not is_supported_extension(basename):
+            per_file.append(KbIngestFileResult(source=basename, status="skipped"))
+            continue
+        raw = await upload.read()
+        parse_result = parse_document(basename, raw)
+        if parse_result is None:
+            per_file.append(KbIngestFileResult(source=basename, status="skipped"))
+            continue
+        summary = await ingest_text(
+            storage=store,
+            text=parse_result.text,
+            source=basename,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            embedding_model=embedding_model(),
+            ocr=parse_result.ocr_used,
+        )
+        if summary is None:
+            per_file.append(KbIngestFileResult(source=basename, status="empty"))
+            continue
+        total_saved += summary.chunks_saved
+        total_chars += len(parse_result.text)
+        last_embed_model = summary.embedding_model
+        per_file.append(
+            KbIngestFileResult(
+                source=basename,
+                status="ingested",
+                chunks_total=summary.chunks_total,
+                chunks_saved=summary.chunks_saved,
+                embedding_model=summary.embedding_model,
+            )
+        )
+
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=total_chars,
+        embedding_model=last_embed_model,
+    )
+    # Multipart path keeps the legacy response shape — empty
+    # ``ingest_id`` / ``kind="upload"`` so existing clients that ignore
+    # the new fields see no behavior change. Cost/tokens are populated
+    # additively so callers that DO read them get the same audit data
+    # the JSON paths surface.
+    return KbIngestView(
+        agent_name=name,
+        files=per_file,
+        total_chunks_saved=total_saved,
+        ingest_id="",
+        kind="upload",
+        chunks_added=total_saved,
+        tokens_in=tokens_in,
+        embedding_cost_usd=cost_usd,
+        generated_content=None,
+    )
+
+
+async def _ingest_json(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+) -> KbIngestView:
+    """Parse the JSON body, route to the right kind-specific handler.
+
+    Raises 422 on a missing/invalid body via Pydantic's validation
+    error (mapped to FastAPI's normal RequestValidationError surface).
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+    from pydantic import TypeAdapter, ValidationError  # noqa: PLC0415
+
+    from movate.runtime.schemas import KbIngestRequest  # noqa: PLC0415
+
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}") from exc
+
+    adapter: TypeAdapter[Any] = TypeAdapter(KbIngestRequest)
+    try:
+        parsed = adapter.validate_python(body)
+    except ValidationError as exc:
+        # Surface as 422 — the standard FastAPI shape for body
+        # validation errors. Hand-rolling the dispatch means we own
+        # the error path, so we re-raise with a 422 the same way the
+        # framework would have.
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    if isinstance(parsed, KbIngestTextRequest):
+        return await _ingest_text(name, request, ctx, parsed)
+    if isinstance(parsed, KbIngestUrlRequest):
+        return await _ingest_url(name, request, ctx, parsed)
+    if isinstance(parsed, KbIngestGeneratedRequest):
+        return await _ingest_generated(name, request, ctx, parsed)
+    # Discriminator covers all three; this branch is unreachable.
+    raise HTTPException(status_code=422, detail=f"unknown ingest kind: {body!r}")
+
+
+async def _ingest_text(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+    body: KbIngestTextRequest,
+) -> KbIngestView:
+    """``kind="text"`` — chunk + embed + persist the inline body."""
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text as _ingest_text_fn  # noqa: PLC0415
+
+    store: StorageProvider = request.app.state.storage
+    embed_model = embedding_model()
+    summary = await _ingest_text_fn(
+        storage=store,
+        text=body.content,
+        source=body.title,
+        agent=name,
+        tenant_id=ctx.tenant_id,
+        embedding_model=embed_model,
+    )
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=len(body.content),
+        embedding_model=summary.embedding_model if summary else embed_model,
+    )
+    return _kb_ingest_view_from_summary(
+        agent_name=name,
+        kind="text",
+        source=body.title,
+        summary=summary,
+        tokens_in=tokens_in,
+        cost_usd=cost_usd,
+    )
+
+
+async def _ingest_url(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+    body: KbIngestUrlRequest,
+) -> KbIngestView:
+    """``kind="url"`` — single page (default) or bounded same-host crawl.
+
+    Reuses :func:`movate.kb.web.fetch_and_extract` / :func:`crawl_site`
+    — no new extractor or HTTP client. Synchronous + bounded in v1
+    (see :data:`KB_INGEST_URL_MAX_PAGES_CAP` / :data:`KB_INGEST_URL_TIMEOUT_S`);
+    async-job variant for larger crawls is a documented follow-up.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text as _ingest_text_fn  # noqa: PLC0415
+    from movate.kb.web import (  # noqa: PLC0415
+        WebFetchError,
+        crawl_site,
+        fetch_and_extract,
+    )
+
+    store: StorageProvider = request.app.state.storage
+    embed_model = embedding_model()
+
+    # Enforce the schema's max_pages cap defensively in case a future
+    # change to the request model loosens it without updating the
+    # handler.
+    max_pages = min(body.max_pages, KB_INGEST_URL_MAX_PAGES_CAP)
+
+    if not body.crawl or max_pages <= 1:
+        # Single-page mode.
+        try:
+            text = fetch_and_extract(body.url, timeout_s=KB_INGEST_URL_TIMEOUT_S)
+        except WebFetchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        summary = await _ingest_text_fn(
+            storage=store,
+            text=text,
+            source=body.url,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            embedding_model=embed_model,
+        )
+        tokens_in, cost_usd = _kb_estimate_embedding_cost(
+            text_chars=len(text),
+            embedding_model=summary.embedding_model if summary else embed_model,
+        )
+        return _kb_ingest_view_from_summary(
+            agent_name=name,
+            kind="url",
+            source=body.url,
+            summary=summary,
+            tokens_in=tokens_in,
+            cost_usd=cost_usd,
+        )
+
+    # Crawl mode — bounded same-host BFS. Per-page timeout budgeted so
+    # the overall wall-clock stays under KB_INGEST_URL_TIMEOUT_S even
+    # in the worst-case fan-out (sequential by design — see
+    # crawl_site's docstring).
+    per_page_timeout = max(2.0, KB_INGEST_URL_TIMEOUT_S / max_pages)
+    crawl_result = crawl_site(
+        body.url,
+        max_pages=max_pages,
+        timeout_s=per_page_timeout,
+    )
+
+    per_file: list[KbIngestFileResult] = []
+    total_saved = 0
+    total_chars = 0
+    last_embed_model = embed_model
+    for page in crawl_result.pages:
+        summary = await _ingest_text_fn(
+            storage=store,
+            text=page.text,
+            source=page.url,
+            agent=name,
+            tenant_id=ctx.tenant_id,
+            embedding_model=embed_model,
+        )
+        if summary is None:
+            per_file.append(KbIngestFileResult(source=page.url, status="empty"))
+            continue
+        total_saved += summary.chunks_saved
+        total_chars += len(page.text)
+        last_embed_model = summary.embedding_model
+        per_file.append(
+            KbIngestFileResult(
+                source=page.url,
+                status="ingested",
+                chunks_total=summary.chunks_total,
+                chunks_saved=summary.chunks_saved,
+                embedding_model=summary.embedding_model,
+            )
+        )
+    for skipped_url, _reason in crawl_result.skipped:
+        per_file.append(KbIngestFileResult(source=skipped_url, status="skipped"))
+
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=total_chars,
+        embedding_model=last_embed_model,
+    )
+    from uuid import uuid4  # noqa: PLC0415
+
+    return KbIngestView(
+        agent_name=name,
+        files=per_file,
+        total_chunks_saved=total_saved,
+        ingest_id=uuid4().hex,
+        kind="url",
+        chunks_added=total_saved,
+        tokens_in=tokens_in,
+        embedding_cost_usd=cost_usd,
+        generated_content=None,
+    )
+
+
+# ``kind="generated"`` — fixed system prompt instructing the LLM to flag
+# unknowns rather than hallucinate. Plain string at module scope so the
+# tests can import + assert on it without standing the runtime stack up.
+KB_INGEST_GENERATED_SYSTEM_PROMPT = (
+    "You are authoring a knowledge-base document. Write a clear, "
+    "structured Markdown document of ~1500 words on the topic described. "
+    "Use headings and bullet points. Do not invent facts; if you don't "
+    "know something, write 'TODO: confirm with subject matter expert' "
+    "instead."
+)
+
+
+async def _ingest_generated(
+    name: str,
+    request: Request,
+    ctx: AuthContext,
+    body: KbIngestGeneratedRequest,
+) -> KbIngestView:
+    """``kind="generated"`` — LLM authors the document, then chunk + embed.
+
+    Uses the agent's configured provider (``bundle.spec.model.provider``)
+    via the existing :class:`BaseLLMProvider` seam — so the customer's
+    BYOK keys are used, never Movate's. Returns the generated content
+    in ``generated_content`` for review.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from movate.kb.embed import embedding_model  # noqa: PLC0415
+    from movate.kb.ingest import ingest_text as _ingest_text_fn  # noqa: PLC0415
+    from movate.providers.base import CompletionRequest, Message  # noqa: PLC0415
+
+    store: StorageProvider = request.app.state.storage
+    agents: list[AgentBundle] = request.app.state.agents
+    # Already 404'd in the route function on unknown agent; fetch the
+    # bundle to read its declared model.provider. Filesystem fallback
+    # is fine here — generated ingest does not need the durable
+    # registry copy, just the model string.
+    bundle = next((b for b in agents if b.spec.name == name), None)
+    if bundle is None:
+        raise not_found("agent", name)
+
+    # Build the provider via the same seam ``mdk init --llm`` and the
+    # planner use — see ``movate.scaffold.llm_scaffold`` / planner.py.
+    # NOT a new provider — :class:`LiteLLMProvider` is the existing
+    # default that honours per-tenant BYOK keys via env / pricing.
+    provider_override = getattr(request.app.state, "kb_generated_provider", None)
+    if provider_override is not None:
+        # Test seam: lets the suite stub the provider without monkey-
+        # patching the import. Production never sets this.
+        provider = provider_override
+    else:
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+        provider = LiteLLMProvider()
+
+    completion_request = CompletionRequest(
+        provider=bundle.spec.model.provider,
+        messages=[
+            Message(role="system", content=KB_INGEST_GENERATED_SYSTEM_PROMPT),
+            Message(
+                role="user",
+                content=(f"Title: {body.title}\n\nTopic / description:\n{body.description}"),
+            ),
+        ],
+        params={"temperature": 0.2, "max_tokens": 4096},
+    )
+    try:
+        response = await provider.complete(completion_request)
+    except Exception as exc:
+        # Provider auth / wire / timeout — surface as 502 (upstream
+        # provider unreachable), mirroring the embedding-error case.
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM provider call failed for generated ingest: {exc}",
+        ) from exc
+
+    generated = response.text or ""
+    if not generated.strip():
+        # The model returned an empty body — treat as "nothing
+        # ingestible". 200 with status=empty rather than 502 so the UI
+        # can show "the model didn't produce content" cleanly.
+        return _kb_ingest_view_from_summary(
+            agent_name=name,
+            kind="generated",
+            source=body.title,
+            summary=None,
+            tokens_in=0,
+            cost_usd=0.0,
+            generated_content=generated,
+        )
+
+    embed_model = embedding_model()
+    summary = await _ingest_text_fn(
+        storage=store,
+        text=generated,
+        source=body.title,
+        agent=name,
+        tenant_id=ctx.tenant_id,
+        embedding_model=embed_model,
+    )
+    tokens_in, cost_usd = _kb_estimate_embedding_cost(
+        text_chars=len(generated),
+        embedding_model=summary.embedding_model if summary else embed_model,
+    )
+    return _kb_ingest_view_from_summary(
+        agent_name=name,
+        kind="generated",
+        source=body.title,
+        summary=summary,
+        tokens_in=tokens_in,
+        cost_usd=cost_usd,
+        generated_content=generated,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Judge Engineer — sample-case loader + mock-mode helpers
+# ---------------------------------------------------------------------------
+#
+# A canned, schema-valid response so hermetic tests + offline ``mdk judge
+# generate --mock`` work without an LLM call. Mirrors the JSON contract
+# :func:`movate.core.judge_engineer._parse_engineer_response` expects.
+_MOCK_JUDGE_ENGINEER_RESPONSE = (
+    '{"rubric_markdown": "## Mock rubric\\n\\nDeterministic anchor for '
+    "hermetic tests. Scores 1.0 when the actual matches the expected "
+    'on the listed dimensions, 0.5 on near-misses, 0.0 otherwise.\\n", '
+    '"rationale": "mock engineer response — dimensions inferred from the '
+    'agent shape"}'
+)
+
+
+def _engineer_mock_requested(request: Request) -> bool:
+    """True when the caller wants the deterministic MockProvider.
+
+    Read from the ``X-MDK-Judge-Engineer-Mock`` request header so
+    hermetic tests + the ``mdk judge generate --mock`` CLI can opt in
+    without a body-schema change. Defaulted off — production always
+    hits the real engineer model.
+    """
+    return request.headers.get("X-MDK-Judge-Engineer-Mock", "").lower() in {"1", "true", "yes"}
+
+
+def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str, Any]]:
+    """Return up to ``limit`` ``{input, expected}`` rows from the agent's
+    dataset, for anchor examples in the judge rubric.
+
+    Best-effort: a missing / malformed dataset yields ``[]`` (the
+    engineer LLM invents domain-appropriate anchors instead). We do NOT
+    use the canonical ``load_dataset`` path because it raises on
+    missing-dataset, and we want a soft fallback.
+    """
+    spec = bundle.spec
+    if not spec.evals.dataset:
+        return []
+    dataset_path = (bundle.agent_dir / spec.evals.dataset).resolve()
+    if not dataset_path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with dataset_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and "input" in row:
+                    rows.append(row)
+                    if len(rows) >= limit:
+                        break
+    except OSError:
+        return []
+    return rows
+
+
 def build_app(
     storage: StorageProvider,
     *,
     agents: list[AgentBundle] | None = None,
     agents_path: Path | None = None,
     skills_path: Path | None = None,
+    workflows_path: Path | None = None,
     rate_limit_per_minute: int | None = 60,
     tenant_rate_limit_per_minute: int | None = None,
     cors_allowed_origins: list[str] | None = None,
@@ -1337,7 +3275,6 @@ def build_app(
     # ``mdk serve`` without durable storage), and never raises (a seed
     # failure must not block the runtime from coming up — the FS fallback
     # still serves those agents).
-    from collections.abc import AsyncIterator  # noqa: PLC0415
     from contextlib import asynccontextmanager  # noqa: PLC0415
 
     @asynccontextmanager
@@ -1403,12 +3340,16 @@ def build_app(
     # fallback (``agent_dir.parent`` when no project marker is found)
     # resolves to the same directory. Explicit skills_path overrides —
     # used by tests and operators who keep skills on a sibling volume.
-    if skills_path is not None:
-        app.state.skills_path = skills_path
-    elif agents_path is not None:
-        app.state.skills_path = agents_path / "skills"
-    else:
-        app.state.skills_path = None
+    # ADR 037 D1: where new workflows (POST /api/v1/workflows) land on disk.
+    # Defaults to a sibling ``workflows/`` next to ``agents_path`` so the
+    # bundled-deploy convention "agents/, workflows/, skills/" Just Works.
+    # ``None`` (no agents_path either) means the workflow CRUD endpoints
+    # return 503 — same back-compat as agents (test configurations may pass
+    # neither; mdk serve always passes both).
+    app.state.skills_path = _default_sibling_path(skills_path, agents_path, name="skills")
+    app.state.workflows_path = _default_sibling_path(
+        workflows_path, agents_path, name="workflows", at_parent=True
+    )
     # GitHub integration (item 78 / ADR 007). Built lazily when
     # ``MDK_GITHUB_ENABLED=1`` so the typical runtime (no GitHub) pays
     # no cost. Tests pass a pre-built mock through ``github_client``.
@@ -1453,6 +3394,16 @@ def build_app(
     app.state.max_request_bytes = max_body
     app.add_middleware(PayloadSizeLimitMiddleware, max_bytes=max_body)
 
+    # Economics / cache response headers (additive). Reads the optional
+    # ``ResponseEconomics`` a cost-incurring handler stashed on request.state
+    # and emits ``X-MDK-Cost-USD`` / ``-Tokens-In`` / ``-Tokens-Out`` /
+    # ``-Cache`` (best-effort: omit unknown) plus an ``X-MDK-Request-Id`` echo.
+    # Mounted INSIDE request-id (added before it) so the correlation context is
+    # bound when it reads it; OUTSIDE the payload guard is irrelevant (it only
+    # touches the response). Always on — zero cost when no economics were set
+    # (it just adds the correlation echo).
+    app.add_middleware(EconomicsHeadersMiddleware)
+
     # CORS — required for browser-side callers (the Mova iO Angular
     # app). Allow-list resolved from the explicit kwarg, then env vars,
     # then empty (= middleware not mounted). The wildcard ``"*"`` is
@@ -1486,6 +3437,14 @@ def build_app(
                 # Per-request correlation id (ADR 033 D2) — let browser JS
                 # read it so a client can surface / report it on errors.
                 REQUEST_ID_HEADER,
+                # Economics / cache headers (additive) — let the browser client
+                # show spend + cache effectiveness per response. Cost/token
+                # headers are present only on cost-incurring responses.
+                ECONOMICS_HEADER_COST,
+                ECONOMICS_HEADER_TOKENS_IN,
+                ECONOMICS_HEADER_TOKENS_OUT,
+                ECONOMICS_HEADER_CACHE,
+                ECONOMICS_HEADER_REQUEST_ID,
             ],
         )
 
@@ -1506,6 +3465,14 @@ def build_app(
     else:
         limiter = InProcessRateLimiter(limit_per_minute=rate_limit_per_minute)
     app.state.rate_limiter = limiter
+    # Resolved per-key ceiling surfaced by GET /api/v1/capabilities. Stash
+    # the int (or None when disabled) so the capability builder reports the
+    # ACTUAL effective limit without reaching into limiter internals.
+    app.state.capability_rate_limit_per_min = (
+        rate_limit_per_minute
+        if rate_limit_per_minute is not None and rate_limit_per_minute > 0
+        else None
+    )
 
     # Per-tenant aggregate rate limiter (item 25) — a SECOND bucket keyed
     # by tenant_id, capping total throughput across all of a tenant's
@@ -1520,6 +3487,11 @@ def build_app(
     else:
         tenant_limiter = InProcessRateLimiter(limit_per_minute=tenant_limit)
     app.state.tenant_rate_limiter = tenant_limiter
+    # Resolved per-tenant aggregate ceiling for GET /api/v1/capabilities.
+    # None when the per-tenant limiter is OFF (the default).
+    app.state.capability_tenant_rate_limit_per_min = (
+        tenant_limit if tenant_limit is not None and tenant_limit > 0 else None
+    )
 
     # Build the LLM response cache once at app construction so entries
     # persist across requests within this replica (mirrors the rate
@@ -1527,6 +3499,16 @@ def build_app(
     # a backend — unset → zero behavior change. In-process per-replica
     # in v1.x; shared backends slot in behind the CacheProvider later.
     app.state.llm_cache = build_cache()
+
+    # ADR 035 D3 — per-tenant SSE subscriber accounting. A simple
+    # ``{tenant_id: count}`` dict, lock-guarded for the increment/cap
+    # check + decrement edges so a burst of opens can't race past the
+    # ceiling. In-process per-replica (mirrors the rate-limiter
+    # lifecycle); cross-replica accounting is the same future Redis
+    # seam. Initialised here so the dict identity persists across
+    # requests for the replica's lifetime.
+    app.state.events_sse_connections = {}
+    app.state.events_sse_lock = asyncio.Lock()
 
     auth_dep = make_auth_dependency(
         storage, rate_limiter=limiter, tenant_rate_limiter=tenant_limiter
@@ -1541,6 +3523,29 @@ def build_app(
     # terse.
     def _scope(*needed: str) -> Any:
         return Depends(require_scope(auth_dep, *needed))
+
+    # Per-tenant quota admission (ADR 036 D2). Opt-in: when no ``quotas.yaml``
+    # is configured (the default), ``quota_config`` is ``None`` and the
+    # dependency below is a pure pass-through — every existing customer sees
+    # byte-for-byte zero behavior change. With a config present, write routes
+    # (``POST`` to /agents-runs / /kb / /evals) gate on the configured daily-
+    # token / daily-request / monthly-cost ceilings, with the per-(tenant,
+    # route_class) decision cached for ``QUOTA_CACHE_TTL_S`` (60s default).
+    # Tests inject a config by monkeypatching ``load_quota_config`` (see
+    # ``tests/test_runtime_quotas_mw.py``).
+    quota_config: QuotaConfig | None = _resolve_quota_config()
+    app.state.quota_config = quota_config
+    _quota_factory = make_quota_dependency(storage, auth_dep, config=quota_config)
+    app.state.quota_factory = _quota_factory
+
+    def _quota(route_class: RouteClass) -> Any:
+        """Per-route quota gate. ``Depends(_quota(RouteClass.RUNS))`` etc.
+
+        Pairs alongside ``_scope("run")`` on the write routes; the two
+        share FastAPI's per-request dependency cache so the auth decision
+        is computed exactly once.
+        """
+        return Depends(_quota_factory(route_class))
 
     # ------------------------------------------------------------------
     # /healthz — unauthed liveness probe
@@ -1679,7 +3684,7 @@ def build_app(
         response_model=RunAccepted,
         tags=["jobs"],
         status_code=202,
-        dependencies=[_scope("run")],
+        dependencies=[_scope("run"), _quota(RouteClass.RUNS)],
     )
     async def submit_run(
         body: RunSubmission,
@@ -1776,14 +3781,53 @@ def build_app(
     async def get_job(
         job_id: str,
         request: Request,
+        response: Response,
         ctx: AuthContext = Depends(auth_dep),
+        wait: str | None = Query(
+            default=None,
+            description=(
+                "Long-poll duration, e.g. '30s' or '2m' (bare integers are "
+                "seconds). When set, the request BLOCKS until the job reaches "
+                "a terminal state or this duration elapses, whichever comes "
+                "first — instead of returning the current state immediately. "
+                "Already-terminal jobs return at once regardless. On timeout "
+                "the current (non-terminal) state is returned with HTTP 200 "
+                f"and the '{HEADER_POLL_TIMEOUT}: true' header so the client "
+                "knows to poll again. Capped at the server max "
+                f"({int(MAX_WAIT_SECONDS)}s); a larger value is clamped and "
+                f"the enforced max is reported in the '{HEADER_WAIT_CLAMPED}' "
+                "header. Omitting 'wait' preserves the original "
+                "return-immediately behaviour."
+            ),
+            examples=["30s"],
+        ),
     ) -> JobView:
         """Return job state. Tenant-scoped at the SQL layer
         (``get_job(..., tenant_id=...)`` filters in WHERE) so a
         cross-tenant lookup returns ``None`` and we 404 — never 403,
-        which would leak the existence of the id."""
+        which would leak the existence of the id.
+
+        Optional ``wait`` long-polls until the job is terminal (see the
+        param doc / :func:`movate.runtime.long_poll.long_poll_job`). Non-busy
+        and cross-process correct: a bounded storage re-poll, not an
+        in-process event the (possibly separate) worker replica can't signal.
+        """
         store: StorageProvider = request.app.state.storage
-        record = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        try:
+            record = await long_poll_job(
+                job_id=job_id,
+                tenant_id=ctx.tenant_id,
+                store=store,
+                request=request,
+                response=response,
+                wait_raw=wait,
+            )
+        except DurationParseError as exc:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=str(exc),
+            ) from exc
         if record is None:
             raise not_found("job", job_id)
         return JobView.from_record(record)
@@ -2255,6 +4299,381 @@ def build_app(
             files_persisted=result.files_persisted,
             published_version=published.version if published is not None else None,
             changed=published.published if published is not None else True,
+        )
+
+    # ------------------------------------------------------------------
+    # Unified agent-creation surface (ADR 042 — Bundle Composer +
+    # additive convenience layer for Mova iO Angular).
+    #
+    # Single dispatcher endpoint that routes to one of five existing
+    # creation paths based on a discriminated-union JSON body OR a
+    # multipart upload. Every legacy endpoint
+    # (POST /agents, /agents/from-wizard, etc.) continues to work
+    # byte-for-byte — this endpoint COMPOSES them, never replaces.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/projects/{project_id}/agents",
+        tags=["agents-v1", "projects-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_agent_unified(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        # Multipart-form fields — populated by FastAPI ONLY when the
+        # Content-Type is multipart/form-data. JSON bodies pass through
+        # all-None defaults; we re-read the raw body below for those.
+        agent_yaml: UploadFile | None = File(default=None),
+        prompt: UploadFile | None = File(default=None),
+        input_schema: UploadFile | None = File(default=None),
+        output_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        contexts: list[UploadFile] = File(default=[]),
+        kb: list[UploadFile] = File(default=[]),
+        bundle: UploadFile | None = File(default=None),
+    ) -> Any:
+        """Unified create — five sources, one route.
+
+        Routes internally to the right pipeline based on either:
+
+        * **multipart/form-data** → ``source: "bundle"`` path
+          (same code the canonical ``POST /api/v1/agents`` runs).
+        * **application/json** → parse the body's ``source``
+          discriminator and dispatch:
+
+          - ``source: "spec"`` → spec JSON → bundle bytes →
+            ``persist_bundle``.
+          - ``source: "wizard"`` → ``wizard_to_bundle_files`` →
+            ``persist_bundle`` (identical to ``POST /agents/from-wizard``).
+          - ``source: "llm"`` → 202 + ``stream_url`` SSE pipeline.
+          - ``source: "catalog"`` → catalog lookup → unpack →
+            apply overrides → ``persist_bundle``.
+
+        All sync paths attach the freshly-persisted agent to
+        ``project_id`` via the storage Protocol's
+        ``attach_agent_to_project`` method when present. When the
+        projects-storage layer isn't yet deployed, the response
+        carries ``attached=false`` and the endpoint still returns
+        200 — the agent IS persisted regardless.
+
+        Errors:
+
+        * **400** — both multipart bytes and JSON body supplied
+        * **404** — project doesn't exist (when projects-storage rejects)
+        * **422** — JSON body fails discriminated-union parse OR
+          bundle fails validation
+        * **503** — required upstream pipeline not deployed (catalog
+          read API; llm-source preserves the SSE pipeline and emits
+          ``stage_skipped`` instead)
+        """
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/projects/{project_id}/agents is unavailable",
+                status_code=503,
+            )
+
+        content_type = (request.headers.get("content-type") or "").lower()
+        is_multipart = content_type.startswith("multipart/")
+
+        # ---- multipart path → source: "bundle" ----
+        if is_multipart:
+            files = await _collect_bundle_files(
+                agent_yaml=agent_yaml,
+                prompt=prompt,
+                input_schema=input_schema,
+                output_schema=output_schema,
+                dataset=dataset,
+                bundle=bundle,
+                contexts=contexts,
+                kb=kb,
+            )
+            # Reuse the same skills-split logic the canonical endpoint
+            # uses — keeps the on-disk shape identical.
+            agent_files, skills_per_name = split_skills_from_bundle(files)
+            if skills_per_name:
+                skills_path: Path | None = request.app.state.skills_path
+                if skills_path is None:
+                    raise AgentCreationError(
+                        "bundle ships skills/ entries but the runtime "
+                        "was built without a skills_path",
+                        status_code=503,
+                    )
+                for skill_name, skill_files in skills_per_name.items():
+                    if "skill.yaml" not in skill_files:
+                        continue
+                    persist_skill_bundle(skill_files, skills_path=skills_path)
+                    _ = skill_name
+            result = persist_bundle(agent_files, agents_path=agents_path)
+            request.app.state.agents = scan_agents(agents_path)
+            store: StorageProvider = request.app.state.storage
+            published = await _dual_write_agent_to_registry(
+                store,
+                result.agent_dir,
+                tenant_id=ctx.tenant_id,
+                version=result.bundle.spec.version,
+                created_by=ctx.api_key_id,
+            )
+            attachment = await attach_to_project(
+                store,
+                project_id=project_id,
+                agent_name=result.bundle.spec.name,
+                tenant_id=ctx.tenant_id,
+            )
+            return UnifiedAgentCreatedView(
+                source="bundle",
+                project_id=project_id,
+                agent_name=result.bundle.spec.name,
+                version=result.bundle.spec.version,
+                description=result.bundle.spec.description,
+                agent_dir=result.agent_dir.name,
+                files_persisted=result.files_persisted,
+                published_version=published.version if published is not None else None,
+                changed=published.published if published is not None else True,
+                attached=attachment.attached,
+            )
+
+        # ---- JSON path → parse discriminator ----
+        try:
+            raw_body = await request.body()
+            if not raw_body:
+                raise AgentCreationError(
+                    "POST /api/v1/projects/{project_id}/agents requires "
+                    "either multipart/form-data or a JSON body",
+                    status_code=400,
+                )
+            body_dict = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise AgentCreationError(
+                f"could not parse JSON body: {exc}",
+                status_code=422,
+            ) from exc
+
+        source = body_dict.get("source")
+        if source == "spec":
+            return await _unified_create_spec(request, body_dict, project_id, ctx, agents_path)
+        if source == "wizard":
+            return await _unified_create_wizard(request, body_dict, project_id, ctx, agents_path)
+        if source == "llm":
+            return await _unified_create_llm(request, body_dict, project_id, ctx, agents_path)
+        if source == "catalog":
+            return await _unified_create_catalog(request, body_dict, project_id, ctx, agents_path)
+        raise AgentCreationError(
+            f"unknown ``source``: {source!r}; expected one of "
+            "'bundle' (multipart), 'spec', 'wizard', 'llm', 'catalog'",
+            status_code=422,
+        )
+
+    @v1.get(
+        "/projects/{project_id}/agents/create-stream/{job_id}",
+        tags=["agents-v1", "projects-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_agent_llm_stream(
+        project_id: str,
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> StreamingResponse:
+        """SSE stream for the ``source: "llm"`` async authoring pipeline.
+
+        The 202 response from the POST endpoint carries the
+        ``stream_url`` pointing here; the caller subscribes
+        immediately to receive ``stage_*`` events as each pipeline
+        stage runs. When the request's job_id isn't in the pending
+        queue, returns 404 — the caller raced past the cache or the
+        runtime restarted.
+        """
+        pending: dict[str, dict[str, Any]] = (
+            getattr(request.app.state, "_pending_llm_create", None) or {}
+        )
+        entry = pending.pop(job_id, None)
+        if entry is None:
+            raise not_found("llm-create job", job_id)
+
+        # Enforce tenant + project scope: the cached entry must match the
+        # path params and auth context.
+        if entry.get("tenant_id") != ctx.tenant_id:
+            raise not_found("llm-create job", job_id)
+        if entry.get("project_id") != project_id:
+            raise not_found("llm-create job", job_id)
+
+        req: AgentCreateLlmRequest = entry["req"]
+        agents_path_str: str = entry["agents_path"]
+        store: StorageProvider = request.app.state.storage
+
+        async def _stream() -> Any:
+            async for frame in llm_authoring_stream(
+                req=req,
+                project_id=project_id,
+                job_id=job_id,
+                storage=store,
+                agents_path=Path(agents_path_str) if agents_path_str else None,
+                tenant_id=ctx.tenant_id,
+            ):
+                yield frame
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+
+    # ------------------------------------------------------------------
+    # Describe / preview agent (ADR 032 D1). The Mova iO front end's
+    # "describe → preview → commit" authoring flow calls this endpoint to
+    # turn a natural-language description into a candidate bundle WITHOUT
+    # persisting it. The shared generate+validate pipeline
+    # (``core/scaffold_preview.preview_agent_from_description``) is the
+    # same one ``mdk init --llm`` runs — one source of truth, no drift.
+    #
+    # Scope: ``admin`` — the endpoint spends LLM tokens (the
+    # WizardAgentSubmission / LLM-spending routes above also gate on
+    # ``admin``; see ADR 013 L2). Tenant-scoped via ``ctx.tenant_id``.
+    # Bounded request via a runtime timeout so a slow provider can't drag
+    # the request out.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/preview",
+        response_model=DescribeAgentResponse,
+        tags=["agents-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_describe_agent(
+        body: DescribeAgentRequest,
+        # ``_scope("admin")`` in the route's dependencies handles auth +
+        # scope check; the handler itself doesn't need the AuthContext.
+        # Pattern mirrors the few other admin-scoped, storage-less endpoints
+        # in this module. Tenant-scoped at the auth layer (a tenant's
+        # admin key sees only its own previews), even though the response
+        # itself carries no tenant-specific data.
+        _ctx: AuthContext = Depends(auth_dep),
+    ) -> DescribeAgentResponse:
+        """Generate + validate a candidate agent from a natural-language
+        description (ADR 032 D1).
+
+        Read-only describe / preview path: the request body's ``description``
+        (plus optional ``name``, ``model``, ``target_model``, ``mock`` flag)
+        is run through the same LLM-scaffold pipeline ``mdk init --llm``
+        uses. The candidate is returned to the caller; **NOTHING is written
+        to disk or to the runtime's storage**. The front end commits via the
+        existing ``POST /agents`` / ``POST /agents/from-wizard`` after
+        showing the preview.
+
+        The pipeline (``movate.core.scaffold_preview``) runs the same
+        generate → defensive-coerce → canonical-defaults → load-validate →
+        ADR 023 retrieval check → sample-evals schema check loop the CLI
+        runs, with one retry on a validation failure (feeding the
+        parsed-but-invalid candidate + error back so the model can
+        self-correct). On success the response carries the candidate plus a
+        token + USD cost forecast (looked up via the shipped pricing
+        table). On failure the response surfaces a 422 with the typed
+        validation error.
+
+        LLM spend: scoped on ``admin`` (matches the other
+        agent-creation routes that spend LLM tokens, e.g. the wizard create
+        path). Tenant-scoped via the auth context. The provider seam is the
+        shipped ``BaseLLMProvider`` — ``LiteLLMProvider`` for real calls,
+        ``MockProvider`` when ``mock=true`` (offline, no API key needed).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — authenticated but key lacks the ``admin`` scope
+        * **422** — body shape failure (FastAPI handles) OR the LLM
+          produced a candidate that failed validation after one retry
+        * **502** — the provider call itself failed (wire error, non-JSON
+          response) after one retry
+        * **504** — the provider call exceeded the runtime preview timeout
+        """
+        # Lazy imports — keep cold-start light. The non-LLM endpoints don't
+        # need to drag the provider stack in.
+        from movate.core.scaffold_preview import (  # noqa: PLC0415
+            PreviewFailureMode,
+            ScaffoldPreviewError,
+            preview_agent_from_description,
+        )
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+        # Default model matches ``mdk init --llm`` (``cli/init.py``:
+        # ``_DEFAULT_LLM_MODEL``) so the CLI and the API agree on what a
+        # description-only request scaffolds. A real client can pin
+        # ``model`` for cost / capability trade-offs.
+        chosen_model = body.model or "openai/gpt-4o-mini-2024-07-18"
+
+        # ``mock=true`` → deterministic MockProvider (sub-second, no API
+        # keys). Otherwise LiteLLMProvider, which honors the provider keys
+        # configured in the runtime's env / per-tenant key store. The same
+        # provider seam ``mdk init --llm`` uses (``BaseLLMProvider``).
+        provider: BaseLLMProvider = MockProvider() if body.mock else LiteLLMProvider()
+
+        try:
+            preview = await preview_agent_from_description(
+                description=body.description,
+                name=body.name,
+                provider=provider,
+                model=chosen_model,
+                target_model=body.target_model,
+                # 60s ceiling on the provider call so a slow LLM can't drag
+                # the request out. Generous: the meta-prompt typically
+                # returns in 3-15s. Two attempts at 30s each fit within the
+                # budget. asyncio.TimeoutError → 504 below.
+                timeout_seconds=60.0,
+                # ADR 032 D1: the endpoint never has a project root in
+                # scope, so a candidate that declares an unresolvable
+                # skill fails validation cleanly here.
+                skill_provisioner=None,
+            )
+        except ScaffoldPreviewError as exc:
+            # Map the typed failure mode → the right HTTP status. We surface
+            # the operator-facing error string (same one the CLI feeds back
+            # to its retry); no provider key / internal stack traces leak.
+            if exc.mode is PreviewFailureMode.EMPTY_DESCRIPTION:
+                raise http_error(
+                    ErrorCode.BAD_REQUEST,
+                    status_code=422,
+                    message=exc.message,
+                ) from exc
+            if exc.mode is PreviewFailureMode.GENERATION:
+                # Provider call failed after one retry — treat as a
+                # bad-gateway since the failure is the LLM provider, not
+                # the caller's payload.
+                raise http_error(
+                    ErrorCode.INTERNAL,
+                    status_code=502,
+                    message=f"LLM scaffold generation failed: {exc.message}",
+                ) from exc
+            # PreviewFailureMode.VALIDATION — the model produced a parseable
+            # candidate that fails load-validation. The caller's
+            # description is the proximate cause (it's pushing the model
+            # to emit something that doesn't validate), so 422 is right.
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=f"generated candidate failed validation: {exc.message}",
+            ) from exc
+        except TimeoutError as exc:
+            raise http_error(
+                ErrorCode.INTERNAL,
+                status_code=504,
+                message="LLM scaffold timed out (preview ceiling exceeded)",
+            ) from exc
+
+        return DescribeAgentResponse(
+            preview=True,
+            name=body.name,
+            target_model=preview.target_model,
+            agent_yaml=preview.agent.agent_yaml,
+            prompt_md=preview.agent.prompt_md,
+            input_schema=preview.agent.input_schema,
+            output_schema=preview.agent.output_schema,
+            sample_evals=list(preview.agent.sample_evals),
+            tokens=DescribeAgentTokenUsageView(
+                input=preview.tokens.input,
+                output=preview.tokens.output,
+                cached_input=preview.tokens.cached_input,
+            ),
+            cost_usd=preview.cost_usd,
+            retried=preview.retried,
         )
 
     @v1.post(
@@ -2766,6 +5185,25 @@ def build_app(
         )
         await store.save_agent_bundle(reverted)
 
+        # ADR 035 D1 — emit ``agent.reverted`` (the revert is a forward-
+        # append publish at the registry, ADR 014 D3, so an ``agent.
+        # published`` is conceptually possible too; we emit the dedicated
+        # ``reverted`` kind only — front ends/webhooks subscribing to
+        # publishes care about new content, not re-publishes of prior
+        # versions). Fire-and-forget.
+        emit_event(
+            store,
+            tenant_id=ctx.tenant_id,
+            kind=EventKind.AGENT_REVERTED,
+            subject=name,
+            data={
+                "version": new_version,
+                "reverted_from": target_version,
+                "previous_version": previous_version,
+                "created_by": ctx.api_key_id,
+            },
+        )
+
         return AgentRevertedView(
             name=name,
             version=new_version,
@@ -2969,153 +5407,347 @@ def build_app(
             ],
         )
 
+    # Build the OpenAPI extras up-front so the spec advertises the
+    # JSON-mode request bodies even though the route function reads
+    # the body manually (FastAPI's body-binding only supports ONE
+    # body source per route, but the front-end client-codegen needs
+    # to see ALL four body shapes). We register the three JSON request
+    # types as schema components and reference them in a oneOf, plus
+    # the legacy multipart form description, so the generated TS
+    # types include them.
+    _kb_ingest_openapi_extra: dict[str, Any] = {
+        "requestBody": {
+            "description": (
+                "KB ingest body. The route dispatches on Content-Type: "
+                "`multipart/form-data` hits the legacy upload path "
+                "(kind=upload); `application/json` is parsed as one of "
+                "the three discriminated kinds below "
+                "(`text`/`url`/`generated`)."
+            ),
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                            }
+                        },
+                    }
+                },
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/KbIngestTextRequest"},
+                            {"$ref": "#/components/schemas/KbIngestUrlRequest"},
+                            {"$ref": "#/components/schemas/KbIngestGeneratedRequest"},
+                        ],
+                        "discriminator": {"propertyName": "kind"},
+                    }
+                },
+            },
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Judge Engineer — author + commit an evals/judge.yaml
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/judge/generate",
+        response_model=JudgeGenerateResponse,
+        status_code=200,
+        tags=["agents-v1", "eval"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_generate_agent_judge(
+        name: str,
+        body: JudgeGenerateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JudgeGenerateResponse:
+        """Author a complete ``judge.yaml`` for ``name`` (sync, <5s typical).
+
+        Claude reads the agent's spec (prompt + input/output schemas +
+        any sample cases) and authors a rubric with the requested (or
+        inferred) scoring dimensions. The generated YAML is validated
+        against :class:`~movate.core.models.JudgeConfig` before
+        returning — the eval engine can load it as-is.
+
+        Scope: ``eval`` — generation is a READ over the agent's spec; it
+        does not modify the bundle. The follow-up
+        ``POST /api/v1/agents/{name}/judge/commit`` (scope ``admin``) is
+        what writes the YAML to disk.
+
+        Tenant-scoped: only the authenticated tenant's agent resolution
+        is considered (registry-first, FS fallback).
+
+        Request body fields:
+
+        * ``rubric_dimensions`` — optional list; omitted/null infers
+          from agent shape (RAG / tool-use / workflow / generic).
+        * ``include_examples`` — anchor with 2-3 concrete scored
+          examples (default true).
+        * ``model`` — optional engineer-model override.
+        * ``budget_usd`` — hard ceiling on the generation call.
+
+        Errors:
+
+        * **400** — bad request shape (invalid dimension list).
+        * **401** — missing / bad bearer token.
+        * **402** — generation cost exceeded ``budget_usd``.
+        * **403** — caller lacks the ``eval`` scope.
+        * **404** — agent not found for this tenant.
+        * **422** — engineer LLM returned a malformed rubric (rare; the
+          prompt is JSON-structured).
+        * **500** — engineer LLM call itself failed.
+        """
+        from movate.core.judge_engineer import (  # noqa: PLC0415
+            DEFAULT_ENGINEER_MODEL,
+            JudgeEngineerError,
+            generate_judge,
+        )
+
+        store: StorageProvider = request.app.state.storage
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Pull up to 3 sample cases from the agent's dataset (when one
+        # exists) — used as anchor examples in the rubric. Best-effort:
+        # a missing/malformed dataset yields no samples, which is fine.
+        samples = _load_sample_cases(bundle, limit=3)
+
+        # MockProvider for hermetic tests + offline `mdk judge generate
+        # --mock`. The default path uses LiteLLM. Same shape the eval +
+        # run endpoints use.
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+        provider: BaseLLMProvider = (
+            MockProvider(response=_MOCK_JUDGE_ENGINEER_RESPONSE)
+            if _engineer_mock_requested(request)
+            else LiteLLMProvider()
+        )
+
+        try:
+            generated = await generate_judge(
+                bundle=bundle,
+                provider=provider,
+                engineer_model=body.model or DEFAULT_ENGINEER_MODEL,
+                rubric_dimensions=body.rubric_dimensions,
+                include_examples=body.include_examples,
+                samples=samples,
+                budget_usd=body.budget_usd,
+                pricing=load_pricing(),
+            )
+        except JudgeEngineerError as exc:
+            # Map the typed engineer error to HTTP. AgentCreationError
+            # already has a handler that does the right thing for this
+            # status_code shape; reuse it for consistency.
+            raise AgentCreationError(str(exc), status_code=exc.status_code) from exc
+
+        return JudgeGenerateResponse(
+            judge_yaml=generated.judge_yaml,
+            rubric_dimensions=generated.rubric_dimensions,
+            rationale=generated.rationale,
+            tokens_used=generated.tokens_used,
+            cost_usd=generated.cost_usd,
+        )
+
+    @v1.post(
+        "/agents/{name}/judge/commit",
+        response_model=JudgeCommitResponse,
+        status_code=200,
+        tags=["agents-v1", "eval"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_commit_agent_judge(
+        name: str,
+        body: JudgeCommitRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JudgeCommitResponse:
+        """Persist a (possibly hand-edited) ``judge.yaml`` to the agent's
+        bundle.
+
+        The body's ``judge_yaml`` is RE-validated server-side against
+        :class:`~movate.core.models.JudgeConfig` before any byte hits
+        disk — a malformed hand edit can't land. Atomic write: the
+        new file replaces any existing one in one rename.
+
+        Scope: ``admin`` — this mutates the agent bundle. Same
+        scope-classification as ``PUT /api/v1/agents/{name}``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token.
+        * **403** — caller lacks the ``admin`` scope.
+        * **404** — agent not found for this tenant.
+        * **422** — supplied YAML failed schema validation.
+        * **503** — runtime built without an ``agents_path``.
+        """
+        from movate.core.judge_engineer import (  # noqa: PLC0415
+            JudgeEngineerError,
+            validate_judge_yaml,
+        )
+
+        agents_path: Path | None = request.app.state.agents_path
+        if agents_path is None:
+            raise AgentCreationError(
+                "runtime was built without an agents_path; "
+                "POST /api/v1/agents/{name}/judge/commit is unavailable",
+                status_code=503,
+            )
+
+        # Resolve the bundle for tenant isolation — a tenant must not be
+        # able to commit a judge into another tenant's agent dir.
+        store: StorageProvider = request.app.state.storage
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(store, name, tenant_id=ctx.tenant_id, fallback=agents)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Validate BEFORE touching disk.
+        try:
+            validate_judge_yaml(body.judge_yaml)
+        except JudgeEngineerError as exc:
+            raise AgentCreationError(str(exc), status_code=exc.status_code) from exc
+
+        # Atomic write to <agent_dir>/evals/judge.yaml. The agent dir
+        # comes from the FILESYSTEM-resolved bundle (FS fallback) or
+        # the materialized registry bundle (in either case, mutating
+        # the materialized copy alone would be lost on next pod reboot).
+        # Anchor the write to the canonical agents_path so registry-only
+        # agents persist correctly.
+        target_dir = agents_path / name / "evals"
+        target_path = target_dir / "judge.yaml"
+        updated = target_path.exists()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # Stage to a sibling tmp then atomic rename — never leaves a
+        # half-written judge.yaml on disk.
+        import tempfile  # noqa: PLC0415
+
+        fd, tmp_str = tempfile.mkstemp(
+            prefix=".staging-judge-", suffix=".yaml", dir=str(target_dir)
+        )
+        tmp_path = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body.judge_yaml)
+            tmp_path.replace(target_path)
+        except Exception as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise AgentCreationError(
+                f"failed to write judge.yaml: {exc}",
+                status_code=500,
+            ) from exc
+
+        return JudgeCommitResponse(
+            agent_name=name,
+            judge_path="evals/judge.yaml",
+            updated=updated,
+        )
+
     @v1.post(
         "/agents/{name}/kb",
         response_model=KbIngestView,
         status_code=200,
         tags=["agents-v1", "kb"],
-        dependencies=[_scope("kb:write")],
+        dependencies=[_scope("kb:write"), _quota(RouteClass.KB_INGEST)],
+        openapi_extra=_kb_ingest_openapi_extra,
     )
     async def v1_upload_agent_kb(
         name: str,
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
-        files: list[UploadFile] = File(default=[]),
     ) -> KbIngestView:
-        """Ingest one or more KB documents into an agent's knowledge
-        base (Tier 10 RAG enhancement, PR-D).
+        """Ingest content into an agent's knowledge base.
 
-        Accepts a ``multipart/form-data`` upload with a repeating
-        ``files`` field. Each file is split into paragraph chunks,
-        embedded via the configured embedding model, and persisted
-        via the storage layer's :func:`save_kb_chunk` (deduped on the
-        ``(agent, tenant_id, content_hash)`` constraint — re-uploading
-        the same document is a no-op).
+        FOUR ingest kinds, dispatched on the request's ``Content-Type``:
 
-        Supported extensions: ``.md``, ``.markdown``, ``.txt``,
-        ``.pdf`` (text-based; scanned-image PDFs need OCR, deferred
-        to a future extras flag), ``.docx`` (Word documents; legacy
-        binary .doc not supported — convert to .docx first),
-        ``.html`` / ``.htm`` (extracted main-article content via
-        Readability — strips nav / sidebar / ads). Files with
-        unsupported extensions OR parser failures (corrupt PDF,
-        non-UTF-8 text, encrypted PDF, malformed DOCX, empty HTML)
-        get ``status="skipped"`` in the per-file result but the
-        overall upload still returns 200 — the operator sees the
-        mix instead of getting a 400 that blocks the whole batch.
+        * **``multipart/form-data``** — the *existing* upload path
+          (kind ``"upload"``). Accepts one or more ``files`` parts; each
+          file is split into paragraph chunks, embedded via the
+          configured embedding model, and persisted via the storage
+          layer's :func:`save_kb_chunk` (deduped on the
+          ``(agent, tenant_id, content_hash)`` constraint). Supported
+          extensions: ``.md`` / ``.markdown`` / ``.txt`` / ``.pdf`` /
+          ``.docx`` / ``.html`` / ``.htm``. Parser failures /
+          unsupported extensions get ``status="skipped"`` in the
+          per-file result; the overall upload still returns 200 so
+          one bad file never blocks the whole batch.
 
-        Wraps the same ingest path as ``mdk kb ingest`` (see
-        :func:`movate.kb.ingest.ingest_text`); this endpoint exists so
-        the Chainlit playground (and the future Angular Agent Console)
-        can offer a drag-drop upload without requiring an SSH
-        connection to a project directory.
+        * **``application/json``** with ``kind: "text"`` — inline
+          document body: ``{"kind": "text", "title": "...",
+          "content": "..."}``. The content is chunked + embedded
+          + persisted with ``title`` as the per-chunk source.
+
+        * **``application/json``** with ``kind: "url"`` — fetch a single
+          page (default) or a bounded same-host crawl:
+          ``{"kind": "url", "url": "...", "crawl": false, "max_pages": 1}``.
+          Reuses :func:`movate.kb.web.fetch_and_extract` (single page)
+          or :func:`movate.kb.web.crawl_site` (BFS crawl) — the same
+          extractor the CLI's ``mdk kb ingest <url>`` uses. v1 is
+          synchronous + bounded (``max_pages`` hard-capped at
+          :data:`KB_INGEST_URL_MAX_PAGES_CAP`, wall-clock at
+          :data:`KB_INGEST_URL_TIMEOUT_S` seconds); larger crawls are
+          a documented async-job follow-up.
+
+        * **``application/json``** with ``kind: "generated"`` — LLM
+          authors the document from a description:
+          ``{"kind": "generated", "title": "...", "description": "..."}``.
+          Calls the agent's configured provider (i.e. the customer's
+          BYOK keys, never Movate's) through the existing
+          :class:`BaseLLMProvider` seam with a fixed system prompt
+          instructing the model to flag uncertainty rather than
+          hallucinate facts. The generated Markdown is returned in
+          ``generated_content`` so the caller can review what was
+          embedded.
+
+        All four kinds chunk → embed → persist through the same
+        :func:`movate.kb.ingest.ingest_text` pipeline; only the *source
+        of text* differs. Returns the additive :class:`KbIngestView`
+        (the multipart path keeps its byte-for-byte response shape;
+        JSON modes populate the additional ``ingest_id`` / ``kind`` /
+        ``chunks_added`` / ``tokens_in`` / ``embedding_cost_usd`` /
+        ``generated_content`` fields).
 
         Errors:
 
-        * **400** — empty multipart form (no ``files`` field)
+        * **400** — empty multipart form (no ``files`` field) /
+          malformed JSON body shape
         * **401** — missing / bad bearer token
         * **404** — agent not found
-        * **502** — embedding API unreachable
+        * **422** — JSON body missing a required field for its kind
+          (e.g. ``kind="text"`` without ``content``)
+        * **502** — embedding API or LLM provider unreachable
         """
-        from movate.kb.embed import embedding_model  # noqa: PLC0415
-        from movate.kb.ingest import ingest_text  # noqa: PLC0415
-
-        if not files:
-            from fastapi import HTTPException  # noqa: PLC0415
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "no files in the multipart form; supply one or more "
-                    "``files`` fields (.md / .markdown / .txt)."
-                ),
-            )
-
         # 404 on unknown agent — same surface as other agent endpoints.
+        # Done up front so every dispatch branch shares it.
         agents: list[AgentBundle] = request.app.state.agents
         agent_names = {b.spec.name for b in agents}
         if name not in agent_names:
             raise not_found("agent", name)
 
-        store: StorageProvider = request.app.state.storage
-
-        # Dispatch table for per-extension parsers lives in
-        # ``movate.kb.parsers`` — extends to PDF (PR-G) and future
-        # DOCX / HTML without touching the endpoint code.
-        from movate.kb.parsers import (  # noqa: PLC0415 — lazy: KB upload path only
-            is_supported_extension,
-            parse_document,
-        )
-
-        per_file: list[KbIngestFileResult] = []
-        total_saved = 0
-        for upload in files:
-            raw_name = (upload.filename or "").lstrip("/")
-            basename = Path(raw_name).name
-            if not basename:
-                # Unnamed multipart part — skip silently with a
-                # placeholder source so the operator sees something.
-                per_file.append(
-                    KbIngestFileResult(
-                        source="<unnamed>",
-                        status="skipped",
-                    )
-                )
-                continue
-            if not is_supported_extension(basename):
-                per_file.append(
-                    KbIngestFileResult(
-                        source=basename,
-                        status="skipped",
-                    )
-                )
-                continue
-            raw = await upload.read()
-            parse_result = parse_document(basename, raw)
-            if parse_result is None:
-                # Parser returned None — corrupt PDF, non-UTF8 .txt,
-                # encrypted PDF, scanned-image PDF, etc. Skip the
-                # file rather than 400'ing the whole batch.
-                per_file.append(
-                    KbIngestFileResult(
-                        source=basename,
-                        status="skipped",
-                    )
-                )
-                continue
-            summary = await ingest_text(
-                storage=store,
-                text=parse_result.text,
-                source=basename,
-                agent=name,
-                tenant_id=ctx.tenant_id,
-                embedding_model=embedding_model(),
-                ocr=parse_result.ocr_used,
-            )
-            if summary is None:
-                per_file.append(
-                    KbIngestFileResult(
-                        source=basename,
-                        status="empty",
-                    )
-                )
-                continue
-            total_saved += summary.chunks_saved
-            per_file.append(
-                KbIngestFileResult(
-                    source=basename,
-                    status="ingested",
-                    chunks_total=summary.chunks_total,
-                    chunks_saved=summary.chunks_saved,
-                    embedding_model=summary.embedding_model,
-                )
-            )
-
-        return KbIngestView(
-            agent_name=name,
-            files=per_file,
-            total_chunks_saved=total_saved,
-        )
+        # Dispatch on Content-Type. FastAPI's normal body-binding can't
+        # do this (a route function only declares ONE body source), so
+        # we read the header ourselves and parse the appropriate body
+        # in the chosen handler. Keeps the multipart path byte-for-byte
+        # the same as before.
+        content_type = (request.headers.get("content-type") or "").lower()
+        if content_type.startswith("multipart/"):
+            return await _ingest_upload(name, request, ctx)
+        if content_type.startswith("application/json"):
+            return await _ingest_json(name, request, ctx)
+        # Other content types: most front-end clients will hit one of
+        # the two above. Treat unknown as multipart for the existing
+        # error shape — the multipart parser will fail with a clean
+        # 400 ("no files in the multipart form") on a bogus body.
+        return await _ingest_upload(name, request, ctx)
 
     @v1.get(
         "/agents/{name}/kb",
@@ -3367,7 +5999,7 @@ def build_app(
         "/agents/{name}/kb/reindex",
         response_model=KbReindexView,
         tags=["agents-v1", "kb"],
-        dependencies=[_scope("kb:write")],
+        dependencies=[_scope("kb:write"), _quota(RouteClass.KB_INGEST)],
     )
     async def v1_reindex_agent_kb(
         name: str,
@@ -3919,11 +6551,12 @@ def build_app(
     @v1.post(
         "/agents/{name}/runs",
         # Union response: 202 + RunAccepted in async mode (default);
-        # 200 + RunView when ?wait=true. FastAPI auto-generates a
+        # 200 + RunView when ?wait=true; 200 + RunEstimateView when
+        # ?estimate=true (NO run executed). FastAPI auto-generates a
         # oneOf in OpenAPI so the Angular client can branch.
-        response_model=RunAccepted | RunView,
+        response_model=RunAccepted | RunView | RunEstimateView,
         tags=["agents-v1"],
-        dependencies=[_scope("run")],
+        dependencies=[_scope("run"), _quota(RouteClass.RUNS)],
     )
     async def v1_agent_run(
         name: str,
@@ -3932,8 +6565,10 @@ def build_app(
         response: Response,
         ctx: AuthContext = Depends(auth_dep),
         wait: bool = False,
-    ) -> RunAccepted | RunView:
-        """Run an agent. Two modes:
+        estimate: bool = False,
+        estimate_retrieval: bool = False,
+    ) -> RunAccepted | RunView | RunEstimateView:
+        """Run an agent. Three modes:
 
         * **Default (?wait=false):** queue a job for the worker pool
           to claim. Returns 202 + ``{job_id, status: queued}``. Angular
@@ -3947,6 +6582,17 @@ def build_app(
           end-to-end. Trade-off: the request blocks for the full
           agent duration (typically a few seconds for one LLM call;
           can be longer with tool-use loops).
+
+        * **Estimate mode (?estimate=true):** return a pre-flight cost +
+          latency ``RunEstimateView`` (200) and execute NOTHING — no LLM
+          call, no job enqueued, no charge. The estimate reflects THIS
+          agent's real assembled prompt + real historical runs (see
+          :mod:`movate.core.run_estimator`). For a RAG agent, retrieved-
+          chunk tokens are folded in only when ``?estimate_retrieval=true``
+          (an embedding for the retrieval query — small cost; OFF by
+          default to keep the estimate zero-LLM-cost). ``estimate`` takes
+          precedence over ``wait`` — the body is the same as a normal run.
+          Gated on the same ``run`` scope as a real run.
 
         URL-anchored variant of ``POST /run`` — the agent name comes
         from the path, ``kind=AGENT`` is implicit. REST-clean for
@@ -3988,6 +6634,41 @@ def build_app(
         if bundle is None:
             raise not_found("agent", name)
 
+        if estimate:
+            # Estimate mode — return a pre-flight cost + latency prediction
+            # and execute NOTHING. This branch MUST come before the wait /
+            # async paths so it never enqueues a job, never builds a
+            # provider that completes, never persists a run, never charges.
+            # The estimator may embed for RAG retrieval ONLY when
+            # estimate_retrieval=true (and the agent uses auto-retrieval);
+            # to support that we build an Executor purely as a retrieval
+            # seam (no .execute() is ever called).
+            from movate.core.executor import Executor  # noqa: PLC0415
+            from movate.core.run_estimator import estimate_run  # noqa: PLC0415
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+            from movate.tracing import build_tracer  # noqa: PLC0415
+
+            retrieval_executor: Executor | None = None
+            if estimate_retrieval and bundle.spec.retrieval.auto_retrieval_enabled:
+                retrieval_executor = Executor(
+                    provider=LiteLLMProvider(),
+                    pricing=load_pricing(),
+                    storage=store,
+                    tracer=build_tracer(),
+                    tenant_id=ctx.tenant_id,
+                )
+            est = await estimate_run(
+                bundle,
+                body.input,
+                storage=store,
+                tenant_id=ctx.tenant_id,
+                executor=retrieval_executor,
+                estimate_retrieval=estimate_retrieval,
+            )
+            response.status_code = 200
+            return RunEstimateView.from_estimate(est)
+
         if wait:
             # Inline mode — same Executor stack the worker uses.
             # Lazy imports keep cold-start light for the async path.
@@ -4018,6 +6699,27 @@ def build_app(
             )
             run_request = _RunRequest(agent=name, input=body.input)
             run_response = await executor.execute(bundle, run_request)
+
+            # Surface this run's economics as response headers (additive).
+            # Inline ``?wait=true`` is the ONLY agent-run path that incurs LLM
+            # spend inside an API response (the async path returns 202 before
+            # any spend). Cost/tokens come straight from the executor's metrics.
+            # Cache status: when the configured backend is the NoOp default
+            # this response definitively does NOT involve the response cache
+            # → ``none``; with a real backend the per-completion hit/miss isn't
+            # surfaced to this layer, so we OMIT it (best-effort: never guess).
+            _cache_backend = getattr(request.app.state.llm_cache, "name", None)
+            _cache_status = "none" if _cache_backend == "noop" else None
+            set_response_economics(
+                request,
+                ResponseEconomics(
+                    cost_usd=run_response.metrics.cost_usd,
+                    tokens_in=run_response.metrics.tokens.input,
+                    tokens_out=run_response.metrics.tokens.output,
+                    cache=_cache_status,
+                ),
+            )
+
             # Try to fetch the persisted RunRecord. On success the
             # executor always persists; on error it persists a
             # FailureRecord instead (no RunRecord). We handle both:
@@ -4484,21 +7186,81 @@ def build_app(
     # ------------------------------------------------------------------
     @v1.get(
         "/jobs/{job_id}",
-        response_model=JobView,
+        # No fixed response_model — this endpoint returns one of two
+        # shapes depending on the job's kind: ``JobView`` for queue
+        # jobs (agent / workflow / eval / bench), or
+        # ``EvalGenerateJobView`` for the eval-generator's
+        # runtime-resident jobs. FastAPI's union response_model would
+        # add discriminator constraints we don't actually need on the
+        # wire (the ``kind`` field is the discriminator). The OpenAPI
+        # entry stays for both as a documented union.
         tags=["jobs-v1"],
         dependencies=[_scope("read")],
+        responses={
+            200: {
+                "model": JobView,
+                "description": "Queue job (agent / workflow / eval / bench).",
+            },
+        },
     )
     async def v1_get_job(
         job_id: str,
         request: Request,
+        response: Response,
         ctx: AuthContext = Depends(auth_dep),
-    ) -> JobView:
+        wait: str | None = Query(
+            default=None,
+            description=(
+                "Long-poll duration, e.g. '30s' or '2m' (bare integers are "
+                "seconds). When set, the request BLOCKS until the job is "
+                "terminal or this duration elapses. On timeout returns the "
+                f"current state with HTTP 200 + '{HEADER_POLL_TIMEOUT}: true'. "
+                f"Capped at the server max ({int(MAX_WAIT_SECONDS)}s); a larger "
+                f"value is clamped and reported via '{HEADER_WAIT_CLAMPED}'. "
+                "Omit to return immediately (legacy behaviour). Ignored for "
+                "``evgen_*`` eval-generation jobs (always return-immediately)."
+            ),
+            examples=["30s"],
+        ),
+    ) -> Any:
         """Versioned alias of ``GET /jobs/{job_id}``.
 
-        Delegates to the unversioned :func:`get_job` handler — identical
-        ``read`` scope, ``JobView`` response, and tenant-scoping (404 on
-        cross-tenant access, never 403)."""
-        return await get_job(job_id, request, ctx)
+        Routes by job_id format: ``evgen_*`` ids land in the
+        eval-generation table (returning :class:`EvalGenerateJobView`);
+        everything else delegates to the queue ``JobView`` path. Both
+        responses use the same ``read`` scope + 404-not-403 tenant
+        gating — the discriminator is the response's ``kind`` field
+        (``evals_generate`` vs. ``agent`` / ``workflow`` / ``eval``). The
+        queue path also honours the ``wait`` long-poll query param."""
+        if job_id.startswith("evgen_"):
+            store: StorageProvider = request.app.state.storage
+            ev_job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
+            if ev_job is None:
+                raise not_found("job", job_id)
+            result_view: EvalGenerationResultView | None = None
+            if ev_job.result is not None:
+                cases_payload = ev_job.result.get("cases") or []
+                preview_payload = ev_job.result.get("preview_score")
+                result_view = EvalGenerationResultView(
+                    cases=[GeneratedEvalCaseView(**c) for c in cases_payload],
+                    judge_yaml=ev_job.result.get("judge_yaml"),
+                    preview_score=(
+                        PreviewScoreView(**preview_payload)
+                        if isinstance(preview_payload, dict)
+                        else None
+                    ),
+                )
+            return EvalGenerateJobView(
+                job_id=ev_job.job_id,
+                agent_name=ev_job.agent_name,
+                status=ev_job.status,
+                progress=ev_job.progress,
+                result=result_view,
+                error=ev_job.error,
+                tokens_used=ev_job.tokens_used,
+                cost_usd=ev_job.cost_usd,
+            )
+        return await get_job(job_id, request, response, ctx, wait=wait)
 
     @v1.post(
         "/jobs/{job_id}/cancel",
@@ -4640,7 +7402,7 @@ def build_app(
         response_model=EvalAcceptedView,
         status_code=202,
         tags=["evals-v1"],
-        dependencies=[_scope("eval")],
+        dependencies=[_scope("eval"), _quota(RouteClass.EVALS)],
     )
     async def v1_kick_off_eval(
         name: str,
@@ -4803,6 +7565,704 @@ def build_app(
         views = [_eval_record_to_view(r) for r in records]
         return EvalListView(evals=views, count=len(views))
 
+    # Eval generator (review-then-commit pattern). Three endpoints:
+    #
+    # * ``POST /agents/{name}/evals/generate``  — accept a description,
+    #   spin up the pipeline as an asyncio.Task, persist the job,
+    #   return 202 + status/stream URLs.
+    # * ``GET /jobs/{job_id}/stream``           — SSE feed of progress
+    #   events the running task pushes through a per-job queue.
+    # * ``POST /jobs/{job_id}/commit``          — atomic dataset append.
+    #
+    # The status read piggybacks on ``GET /api/v1/jobs/{job_id}`` (which
+    # already exists for queue jobs); we route the lookup by trying the
+    # eval-generation table first, falling back to the queue.
+    #
+    # Why runtime-resident (not the queue worker): generation is a
+    # human-in-the-loop authoring flow — the caller is watching the
+    # progress SSE in their browser. Queueing it would push the
+    # progress events back through a separate channel for the same
+    # lifetime, with no operational benefit. The pattern mirrors
+    # ``POST /agents/{name}/runs/stream`` (which is also driven by an
+    # asyncio.Task + a queue, not the worker).
+    # ------------------------------------------------------------------
+
+    # Per-process map of running generation jobs → asyncio.Queue carrying
+    # progress events. The SSE endpoint pulls from this queue; a missing
+    # entry means the job already finished (the client polls GET
+    # /jobs/{id} for the result instead of streaming). Set on app state
+    # so this dict is shared across all routes inside this build_app
+    # closure without leaking to module level (tests get a fresh map
+    # per app build).
+    app.state.eval_gen_streams = {}
+
+    @v1.post(
+        "/agents/{name}/evals/generate",
+        response_model=EvalGenerateAcceptedView,
+        status_code=202,
+        tags=["evals-v1"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_eval_generate(
+        name: str,
+        body: EvalGenerateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> EvalGenerateAcceptedView:
+        """Author an eval dataset from a plain-English agent description.
+
+        Asynchronous: returns 202 + ``job_id`` immediately. The
+        caller either polls ``GET /api/v1/jobs/{job_id}`` for the
+        completed result OR subscribes to
+        ``GET /api/v1/jobs/{job_id}/stream`` for live SSE progress
+        (``category_complete`` / ``judge_drafted`` / ``preview_eval``
+        / ``completed`` events).
+
+        The generation pipeline lives in :mod:`movate.core.eval_generator`
+        and runs as an asyncio.Task on this process. Categories,
+        ``count`` (max 100), ``include_judge``, and the optional
+        ``budget_usd`` ceiling are validated at the edge; an unknown
+        category or out-of-range count returns 422 BEFORE the job is
+        persisted (so a malformed request never shows up in
+        ``GET /jobs``).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — agent not in the registry
+        * **422** — request shape failure (count out of range, unknown
+          category, etc.)
+        """
+        from movate.core.eval_generator import (  # noqa: PLC0415
+            EvalGenerationJob,
+            validate_categories,
+            validate_count,
+        )
+
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == name), None)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        # Edge validation — surface bad shape as 422 BEFORE persisting
+        # anything. The pipeline's defense-in-depth re-checks too, so a
+        # direct in-process caller can't bypass them.
+        try:
+            count = validate_count(body.count)
+            categories = list(validate_categories(body.categories))
+        except ValueError as exc:
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        store: StorageProvider = request.app.state.storage
+        model_str = body.model or bundle.spec.model.provider
+        job_id = f"evgen_{uuid4().hex[:24]}"
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        now_iso = datetime.now(UTC).isoformat()
+
+        job = EvalGenerationJob(
+            job_id=job_id,
+            tenant_id=ctx.tenant_id,
+            agent_name=name,
+            status="running",
+            description=body.description,
+            count=count,
+            categories=categories,
+            include_judge=body.include_judge,
+            model=model_str,
+            budget_usd=body.budget_usd,
+            progress=0.0,
+            created_at=now_iso,
+        )
+        await store.save_eval_generation_job(job)
+
+        # Per-job queue for SSE event fan-out. The pipeline pushes events
+        # via on_event; the SSE endpoint drains them. Bounded so a slow
+        # client can't OOM us: events older than the buffer are dropped
+        # (the operator still gets the terminal `completed` frame off
+        # the GET /jobs/{id} result).
+        event_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=256)
+        request.app.state.eval_gen_streams[job_id] = event_queue
+
+        # Background task drives the pipeline + persists the terminal
+        # status. NOT awaited here — the 202 response must fire while
+        # the work continues. Stash a reference on app.state so the
+        # event loop's GC can't reap the task before it finishes
+        # (asyncio docs: keep a strong ref to every long-running task).
+        bg_task = asyncio.create_task(
+            _run_eval_generation(
+                store=store,
+                bundle=bundle,
+                job=job,
+                model=model_str,
+                event_queue=event_queue,
+                streams_map=request.app.state.eval_gen_streams,
+            )
+        )
+        # `_run_eval_generation`'s finally pops the queue from
+        # streams_map; we set the task as a sibling key so it stays
+        # alive until that finally runs, then drops out of scope.
+        request.app.state.eval_gen_streams[f"_task_{job_id}"] = bg_task
+
+        # Rough estimate: ~3-5s/case for a typical provider, scaled by
+        # whether the judge step is included. Not a guarantee — the SSE
+        # `completed` event tells the truth.
+        per_case_s = 4
+        judge_s = 8 if body.include_judge else 0
+        estimated_seconds = count * per_case_s + judge_s
+
+        return EvalGenerateAcceptedView(
+            job_id=job_id,
+            status="running",
+            estimated_seconds=estimated_seconds,
+            status_url=f"/api/v1/jobs/{job_id}",
+            stream_url=f"/api/v1/jobs/{job_id}/stream",
+        )
+
+    @v1.get(
+        "/jobs/{job_id}/stream",
+        tags=["jobs-v1"],
+        dependencies=[_scope("read")],
+        # No response_model — raw SSE byte stream (text/event-stream).
+    )
+    async def v1_eval_generate_stream(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> StreamingResponse:
+        """SSE feed of job progress, dispatched by job-id format.
+
+        ``evgen_*`` ids stream eval-generation progress (this handler's
+        primary path); every other id falls through to the audit-job
+        SSE stream (ADR 043 — audit jobs run on the worker dispatch
+        path and replay their terminal state). Both share the one
+        ``GET /jobs/{job_id}/stream`` route + ``read`` scope; the
+        discriminator is the id prefix so the front end uses a single
+        endpoint regardless of job kind.
+
+        Eval-generation frame shape (one ``data: <json>\\n\\n`` per event):
+
+        * ``{"event": "category_complete", "category": str, "cases_so_far": int}``
+        * ``{"event": "judge_drafted", "preview": str}`` (only with ``include_judge=true``)
+        * ``{"event": "preview_eval", "mock_pass_rate": float}``
+        * ``{"event": "completed", "case_count": int, "cost_usd": float}``
+        * ``{"event": "error", "message": str}`` (on failure)
+
+        Same tenant gating as the GET job endpoint: a cross-tenant job
+        id returns 404 (no leak of existence). When the SSE stream is
+        opened AFTER the job has already finished, this endpoint
+        replays the terminal event from the persisted result so the
+        client always sees a final frame.
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # Non-eval-generation ids dispatch to the audit-job SSE stream.
+        if not job_id.startswith("evgen_"):
+            audit_job = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+            if audit_job is None or audit_job.kind != JobKind.AUDIT:
+                raise not_found("job", job_id)
+            return StreamingResponse(
+                _sse_audit_job_stream(store=store, job=audit_job, tenant_id=ctx.tenant_id),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # Tenant-scoped existence check — also handles the
+        # "job finished before client connected" replay path.
+        job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
+        if job is None:
+            raise not_found("job", job_id)
+
+        streams_map = getattr(request.app.state, "eval_gen_streams", {})
+        queue = streams_map.get(job_id)
+
+        async def _stream() -> Any:
+            # Already-finished replay: send one terminal frame + close.
+            if queue is None:
+                if job.status == "failed":
+                    msg = (job.error or {}).get("message", "failed")
+                    yield _sse_frame("error", {"message": msg})
+                else:
+                    yield _sse_frame(
+                        "completed",
+                        {
+                            "case_count": len((job.result or {}).get("cases") or []),
+                            "cost_usd": job.cost_usd,
+                        },
+                    )
+                return
+            # Live-task path: drain the queue until a terminal event
+            # arrives. The pipeline always emits a ``completed`` or
+            # ``error`` frame as its final push.
+            while True:
+                event, data = await queue.get()
+                yield _sse_frame(event, data)
+                if event in ("completed", "error"):
+                    return
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @v1.post(
+        "/jobs/{job_id}/commit",
+        response_model=EvalCommitView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_eval_generate_commit(
+        job_id: str,
+        body: EvalCommitRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> EvalCommitView:
+        """Atomically commit selected generated cases to the agent's dataset.
+
+        The ONLY mutation path for the eval generator — generation alone
+        never touches the agent bundle on disk. Selective acceptance:
+        ``case_ids=None`` commits every case; ``case_ids=[...]`` appends
+        only the named ones. ``commit_judge=True`` (when the job drafted
+        a judge) writes ``evals/judge.yaml`` alongside the dataset.
+
+        Gated on the ``admin`` scope (this writes to the agent bundle —
+        same scope that POSTs / PUTs an agent).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — token lacks the ``admin`` scope
+        * **404** — job not found for this tenant, or agent dir missing
+        * **409** — job not yet ``completed`` (no result to commit)
+        """
+        store: StorageProvider = request.app.state.storage
+        # Tenant-scope check first so a cross-tenant 404 doesn't leak
+        # into a 409 by accident.
+        job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
+        if job is None:
+            raise not_found("job", job_id)
+        if job.status != "completed":
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"job {job_id!r} status={job.status!r} — only completed jobs can be committed"
+                ),
+            )
+
+        try:
+            result = await store.commit_eval_cases(
+                job_id,
+                tenant_id=ctx.tenant_id,
+                agents_path=request.app.state.agents_path,
+                case_ids=body.case_ids,
+                commit_judge=body.commit_judge,
+            )
+        except FileNotFoundError as exc:
+            raise not_found("agent", job.agent_name) from exc
+        except ValueError as exc:
+            from fastapi import HTTPException  # noqa: PLC0415
+
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return EvalCommitView(
+            agent_name=result.agent_name,
+            dataset_path=result.dataset_path,
+            cases_added=result.cases_added,
+            judge_yaml_updated=result.judge_yaml_updated,
+        )
+
+    # ------------------------------------------------------------------
+    # Failure Pattern Diagnoser (ADR 043 D1) — the foundational diagnose
+    # step of the Self-Improving Agent Loop. Reads recent failures for
+    # an agent (failed runs, eval misses, drift detections, optional
+    # canary misses), clusters them by failure mode using Claude, and
+    # proposes a TYPED fix per cluster. READ-ONLY with respect to agent
+    # state: this endpoint NEVER modifies the agent — that's ADR 043's
+    # apply step in a later PR.
+    #
+    # Async by design: a background task runs the diagnoser while the
+    # caller polls ``GET /api/v1/diagnoses/{id}``. We deliberately did
+    # NOT add a JobKind.DIAGNOSE — the diagnose phase is read-only,
+    # cheap, and runtime-only; threading it through the worker /
+    # dispatch path would be over-engineered for the single-call
+    # nature of the work.
+    # ------------------------------------------------------------------
+
+    _diagnoser_default_model = "openai/gpt-4o-mini"
+
+    @v1.post(
+        "/agents/{name}/diagnose",
+        response_model=DiagnoseAcceptedView,
+        status_code=202,
+        tags=["diagnose-v1"],
+        dependencies=[_scope("eval")],
+    )
+    async def v1_diagnose_agent(
+        name: str,
+        body: DiagnoseRequest,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> DiagnoseAcceptedView:
+        """Cluster recent failures + propose typed fixes (ADR 043 D1).
+
+        Always async — returns 202 with a ``job_id`` (= diagnosis id) and
+        a ``status_url`` pointing to ``GET /api/v1/diagnoses/{id}``. The
+        diagnoser runs in a FastAPI background task; the row is
+        persisted as ``status="running"`` here and updated to
+        ``status="completed"`` (or ``"error"``) once the task finishes.
+
+        **Read-only with respect to agent state.** The endpoint NEVER
+        modifies the agent's prompt / KB / context / model. It only
+        produces a structured analysis. ADR 043's separate apply step
+        (later PR) is the only thing that mutates an agent based on
+        these proposals.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — token lacks the ``eval`` scope
+        * **404** — agent not in the registry for this tenant
+        """
+        from movate.core.diagnose_sources import collect_failures  # noqa: PLC0415
+
+        # 404 if the agent isn't known to this runtime. Match the
+        # harvest endpoint's existence check: an ``agents_path/<name>``
+        # directory OR a registry row for this tenant counts as
+        # "exists" — the diagnose phase only needs the NAME to scope
+        # failure lookups; it never loads the bundle (no prompt /
+        # config read).
+        store: StorageProvider = request.app.state.storage
+        agents_path: Path | None = request.app.state.agents_path
+        agent_known = False
+        if agents_path is not None and (agents_path / name).is_dir():
+            agent_known = True
+        if not agent_known:
+            agents: list[AgentBundle] = request.app.state.agents
+            if any(b.spec.name == name for b in agents):
+                agent_known = True
+        if not agent_known:
+            registry_row = await store.get_agent_bundle(name, tenant_id=ctx.tenant_id)
+            if registry_row is not None:
+                agent_known = True
+        if not agent_known:
+            raise not_found("agent", name)
+
+        diagnosis_id = str(uuid4())
+        # Persist the row in ``running`` state immediately so an
+        # operator polling right after POST sees a valid record (vs.
+        # a 404 race window if the BG task hadn't started saving yet).
+        running_record = DiagnosisRecord(
+            diagnosis_id=diagnosis_id,
+            tenant_id=ctx.tenant_id,
+            agent=name,
+            status=DiagnosisStatus.RUNNING,
+            request=body.model_dump(),
+            model=body.model or _diagnoser_default_model,
+        )
+        await store.save_diagnosis(running_record)
+
+        # Snapshot what the background task needs — request-scoped state
+        # (the AuthContext, the FastAPI Request) is gone by the time the
+        # task runs, so we capture the small flat tuple of inputs here.
+        async def _run_diagnose() -> None:
+            from movate.core.diagnoser import (  # noqa: PLC0415
+                Diagnoser,
+                DiagnoserBudgetExceeded,
+                DiagnoserParseError,
+            )
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            failures: list[Any] = []
+            error: ErrorInfo | None = None
+            result_payload: dict[str, Any] | None = None
+            tokens_used = 0
+            cost_usd = 0.0
+            try:
+                failures = await collect_failures(
+                    store,
+                    agent=name,
+                    tenant_id=ctx.tenant_id,
+                    window_days=body.window_days,
+                    include_runs=True,
+                    include_eval_failures=body.include_eval_failures,
+                    include_drift_detections=body.include_drift_detections,
+                    include_canary_misses=body.include_canary_misses,
+                )
+                provider = LiteLLMProvider()
+                diagnoser = Diagnoser(
+                    provider=provider,
+                    model=body.model or _diagnoser_default_model,
+                    budget_usd=body.budget_usd,
+                    max_clusters=body.max_clusters,
+                )
+                result = await diagnoser.diagnose(failures)
+                tokens_used = result.tokens_used
+                cost_usd = result.cost_usd
+
+                # min_failure_count is enforced HERE (not in the
+                # diagnoser) so the cluster summaries the model
+                # produces aren't silently dropped before we
+                # persist — operators can see the floor was hit if
+                # the result is empty.
+                kept_clusters = [
+                    c for c in result.clusters if c.example_count >= body.min_failure_count
+                ]
+                result_payload = {
+                    "input_summary": {
+                        "total_failures_examined": result.total_failures_examined,
+                        "clusters_identified": len(kept_clusters),
+                        "examples_per_cluster_max": result.examples_per_cluster_max,
+                    },
+                    "clusters": [
+                        {
+                            "id": c.id,
+                            "summary": c.summary,
+                            "example_count": c.example_count,
+                            "example_run_ids": c.example_ids,
+                            "confidence": c.confidence,
+                            "proposed_fix": _serialize_proposed_fix(c.proposed_fix),
+                        }
+                        for c in kept_clusters
+                    ],
+                }
+                final_status = DiagnosisStatus.COMPLETED
+            except DiagnoserBudgetExceeded as exc:
+                error = ErrorInfo(type="budget_exceeded", message=str(exc))
+                final_status = DiagnosisStatus.ERROR
+            except DiagnoserParseError as exc:
+                error = ErrorInfo(type="parse_error", message=str(exc))
+                final_status = DiagnosisStatus.ERROR
+            except Exception as exc:
+                logger.exception(
+                    "diagnose_unhandled diagnosis_id=%s agent=%s",
+                    diagnosis_id,
+                    name,
+                )
+                error = ErrorInfo(type="internal", message=str(exc))
+                final_status = DiagnosisStatus.ERROR
+
+            completed_record = DiagnosisRecord(
+                diagnosis_id=diagnosis_id,
+                tenant_id=ctx.tenant_id,
+                agent=name,
+                status=final_status,
+                request=body.model_dump(),
+                result=result_payload,
+                error=error,
+                tokens_used=tokens_used,
+                cost_usd=cost_usd,
+                model=body.model or _diagnoser_default_model,
+                completed_at=datetime.now(UTC),
+            )
+            await store.save_diagnosis(completed_record)
+
+        background_tasks.add_task(_run_diagnose)
+
+        return DiagnoseAcceptedView(
+            job_id=diagnosis_id,
+            status="running",
+            status_url=f"/api/v1/diagnoses/{diagnosis_id}",
+        )
+
+    @v1.get(
+        "/diagnoses/{diagnosis_id}",
+        response_model=DiagnoseJobView,
+        tags=["diagnose-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_diagnosis(
+        diagnosis_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> DiagnoseJobView:
+        """Poll a diagnose job's status + structured result.
+
+        Tenant-scoped at the storage layer (a cross-tenant id probe
+        returns 404, never 403, to avoid leaking that the id exists).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — no diagnosis record matches the id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_diagnosis(diagnosis_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("diagnosis", diagnosis_id)
+        return DiagnoseJobView.from_record(record)
+
+    # ------------------------------------------------------------------
+    # Claude-orchestrated audit endpoints (BACKLOG audit-llm).
+    #
+    # Read-only by construction (the dispatch path NEVER calls
+    # save_agent_bundle / save_kb_chunk / save_eval). Two POST endpoints
+    # (agent-scoped + project-scoped) enqueue a JobKind.AUDIT job;
+    # findings land in a separate AuditRecord retrievable via
+    # GET /api/v1/audits/{audit_id}. SSE progress lives on
+    # GET /api/v1/jobs/{job_id}/stream (audit-only — the standard job
+    # poll endpoint remains JobView for back-compat).
+    # ------------------------------------------------------------------
+
+    def _build_audit_status_urls(job_id: str) -> tuple[str, str]:
+        """Mirror the pattern used elsewhere — the response surfaces a
+        pre-built URL so the client doesn't reconstruct it. Versioned
+        prefix on both so they continue to work if the URL contract
+        evolves."""
+        return (
+            f"/api/v1/jobs/{job_id}",
+            f"/api/v1/jobs/{job_id}/stream",
+        )
+
+    @v1.post(
+        "/agents/{name}/audit/from-llm",
+        response_model=AuditAcceptedView,
+        status_code=202,
+        tags=["audit-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_audit_agent_from_llm(
+        name: str,
+        body: AuditRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuditAcceptedView:
+        """Kick off a read-only Claude-orchestrated audit of one agent.
+
+        Returns 202 + ``job_id`` immediately. Poll ``status_url`` or
+        stream ``stream_url`` for progress; once the job is terminal
+        with ``status=success``, fetch the rich findings from
+        ``GET /api/v1/audits/{job.result_run_id}``.
+
+        The audit is READ-ONLY: it never mutates the agent registry,
+        prompt, contexts, schemas, or eval dataset. A regression test
+        (``test_audit_does_not_modify_agent``) pins this on InMemory
+        storage.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == name), None)
+        if bundle is None:
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        job = JobRecord(
+            job_id=f"audit_{uuid4().hex[:24]}",
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.AUDIT,
+            target=name,
+            input={
+                "scope_kind": "agent",
+                "scope_id": name,
+                "categories": body.categories,
+                "severity_floor": body.severity_floor.value,
+                "model": body.model,
+                "budget_usd": body.budget_usd,
+            },
+            api_key_id=ctx.api_key_id,
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        status_url, stream_url = _build_audit_status_urls(job.job_id)
+        return AuditAcceptedView(
+            job_id=job.job_id,
+            status="queued",
+            status_url=status_url,
+            stream_url=stream_url,
+        )
+
+    @v1.post(
+        "/projects/{project_id}/audit/from-llm",
+        response_model=AuditAcceptedView,
+        status_code=202,
+        tags=["audit-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_audit_project_from_llm(
+        project_id: str,
+        body: AuditRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuditAcceptedView:
+        """Kick off a read-only project-wide audit.
+
+        The auditor fans out across every agent the runtime knows about
+        and aggregates findings into one :class:`AuditRecord` keyed by
+        ``project_id``. ``cost_outliers`` is computed across the whole
+        project (mean + stddev), so cross-agent outliers are surfaced
+        in this scope but not in the per-agent scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        job = JobRecord(
+            job_id=f"audit_{uuid4().hex[:24]}",
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.AUDIT,
+            target=project_id,
+            input={
+                "scope_kind": "project",
+                "scope_id": project_id,
+                "categories": body.categories,
+                "severity_floor": body.severity_floor.value,
+                "model": body.model,
+                "budget_usd": body.budget_usd,
+            },
+            api_key_id=ctx.api_key_id,
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        status_url, stream_url = _build_audit_status_urls(job.job_id)
+        return AuditAcceptedView(
+            job_id=job.job_id,
+            status="queued",
+            status_url=status_url,
+            stream_url=stream_url,
+        )
+
+    @v1.get(
+        "/audits/{audit_id}",
+        response_model=AuditJobView,
+        tags=["audit-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_audit(
+        audit_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AuditJobView:
+        """Retrieve the rich findings view of a completed audit.
+
+        Tenant-scoped at the storage layer (cross-tenant id probes
+        return 404, never 403) — same no-leak contract as
+        ``GET /api/v1/evals/{eval_id}``.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **404** — no audit record matches the id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_audit(audit_id, tenant_id=ctx.tenant_id)
+        if record is None:
+            raise not_found("audit", audit_id)
+        return AuditJobView.from_record(record)
+
+    # NOTE: audit-job SSE streaming is served by the unified
+    # ``GET /jobs/{job_id}/stream`` handler (``v1_eval_generate_stream``)
+    # which dispatches non-``evgen_`` ids to ``_sse_audit_job_stream``.
+    # A second route registration on the same path would shadow the
+    # unified dispatcher, so the audit handler is intentionally not
+    # registered separately here (avoids the route collision that 404'd
+    # audit-job streams when the eval-generation handler matched first).
+
     # ------------------------------------------------------------------
     # Aggregate monitor feed (ADR 032 D2). Two read-scoped endpoints that
     # expose the SAME rollup ``mdk report`` computes (``core.reporting``) over
@@ -4946,6 +8406,100 @@ def build_app(
             top_n=top,
         )
         return AgentMetricsView.from_report(name, report)
+
+    # ------------------------------------------------------------------
+    # Per-tenant usage metering (ADR 036 D1). The billing-visibility
+    # companion to the agent-health monitor above — counts requests,
+    # tokens, and (estimated) cost over a window, with optional
+    # by-agent / by-provider breakdowns. Reads the SAME persisted records
+    # ``build_report`` does (ADR 024 ``RunRecord.metrics``); the new
+    # aggregator lives in ``core.reporting`` (``cli ⊥ runtime``). Quota
+    # *enforcement* (ADR 036 D2) is out of scope — D1 ships only the
+    # metering signal + read endpoint.
+    # ------------------------------------------------------------------
+    @v1.get(
+        "/usage",
+        response_model=UsageView,
+        tags=["monitor"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_usage(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        window: int = Query(
+            30,
+            ge=0,
+            le=3650,
+            description=(
+                "Only count runs from the last N days. 0 = all-time; "
+                "default 30 matches the typical billing period."
+            ),
+        ),
+        tenant: str | None = Query(
+            None,
+            description=(
+                "Tenant to read usage for. Non-admin keys ignore this and "
+                "always see their own tenant. Admin keys (scope ``admin``) "
+                "may pass another tenant id to read its rollup."
+            ),
+        ),
+        agent: str | None = Query(
+            None,
+            description=(
+                "Narrow the rollup to a single agent. Counters + breakdowns "
+                "include only this agent's runs."
+            ),
+        ),
+    ) -> UsageView:
+        """Per-tenant usage rollup (ADR 036 D1).
+
+        Returns the tenant's ``requests`` / ``tokens_in`` / ``tokens_out`` /
+        ``cost_usd`` over the requested ``window`` (default 30 days), with
+        optional ``by_agent`` and ``by_provider`` breakdowns. Built from the
+        per-run records the executor already persists (ADR 024) — no new
+        measurement plumbing.
+
+        Tenant scoping:
+
+        * Non-admin keys see only their **own** tenant; the ``tenant`` query
+          param is ignored on the non-admin path (no cross-tenant leak even
+          if a caller guesses an id).
+        * Admin keys (scope ``admin`` in addition to ``read``) may pass
+          ``tenant=<id>`` to read another tenant's rollup; absent the param
+          they default to their own tenant.
+
+        Empty window → a zeroed rollup (200), never a 500 — billing must be
+        able to surface a $0 month explicitly.
+
+        Cost note: this is the **estimated** cost from ``pricing.yaml``, NOT
+        the actual provider invoice (ADR 036 §Risks). D3 billing export will
+        document the estimate↔actual gap.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        # Non-admin keys can NEVER read another tenant. The query param is
+        # silently ignored (rather than 403'd) so a curious front-end probe
+        # doesn't reveal whether the caller has admin — same posture as the
+        # rest of the API (failure-mode rule).
+        target_tenant = tenant if tenant and "admin" in ctx.scopes else ctx.tenant_id
+
+        store: StorageProvider = request.app.state.storage
+        runs = await store.list_runs(
+            agent=agent,
+            tenant_id=target_tenant,
+            limit=_REPORT_FETCH_CAP,
+        )
+        runs = _filter_runs_by_since(runs, window)
+        usage = build_usage(
+            runs,
+            tenant_id=target_tenant,
+            window_days=window,
+            agent_filter=agent,
+        )
+        return UsageView.from_usage(usage)
 
     # ------------------------------------------------------------------
     # Continuous-eval schedules (ADR 016 D2). Additive + default-off.
@@ -5937,6 +9491,21 @@ def build_app(
             mode=mode,
             previous_champion=previous_champion,
         )
+        # ADR 035 D1 — emit ``canary.promoted`` for the human-initiated
+        # promotion. The auto-rollback path emits its own ``canary.
+        # demoted`` from dispatch._maybe_auto_rollback. Fire-and-forget.
+        emit_event(
+            store,
+            tenant_id=ctx.tenant_id,
+            kind=EventKind.CANARY_PROMOTED,
+            subject=name,
+            data={
+                "promoted_version": target,
+                "previous_champion": previous_champion,
+                "mode": mode,
+                "actor": ctx.api_key_id,
+            },
+        )
         return CanaryPromotedView(
             agent=name,
             promoted_version=target,
@@ -5991,6 +9560,21 @@ def build_app(
             actor=ctx.api_key_id,
             tenant_id=ctx.tenant_id,
             target=f"{name}@{target if target is not None else '<latest>'}",
+        )
+        # ADR 035 D1 — emit ``canary.demoted`` for the human-initiated
+        # rollback (same kind as the drift-auto-rollback path; ``actor``
+        # discriminates). Fire-and-forget.
+        emit_event(
+            store,
+            tenant_id=ctx.tenant_id,
+            kind=EventKind.CANARY_DEMOTED,
+            subject=name,
+            data={
+                "challenger_version": config.challenger_version,
+                "champion_version": target,
+                "actor": ctx.api_key_id,
+                "reason": "manual_rollback",
+            },
         )
         return CanaryPromotedView(
             agent=name,
@@ -6230,6 +9814,83 @@ def build_app(
         return _model_info_to_view(info)
 
     # ------------------------------------------------------------------
+    # Capability discovery — GET /api/v1/capabilities
+    #
+    # A read-only self-description so a client (e.g. Mova iO fanning out to
+    # many heterogeneous customer runtimes) can learn exactly what THIS
+    # build supports without probing every endpoint. The full matrix needs
+    # the ``read`` scope; an UNAUTHENTICATED minimal subset (version +
+    # api_version only) is allowed for health/probe use.
+    #
+    # Auth is resolved INLINE rather than via the ``_scope("read")``
+    # dependency: that dependency hard-401s a missing bearer, but here a
+    # missing/insufficient bearer must DEGRADE to the minimal view, not
+    # fail. So: no Authorization header → minimal immediately (no storage /
+    # rate-limit touch); a header present → resolve it through ``auth_dep``
+    # (which charges the limiter, as for any authenticated call) and, if it
+    # carries ``read``, serve the full matrix — else fall back to minimal.
+    #
+    # Every field in the full view is derived from the deployed runtime
+    # (route introspection / import probing / live config) by
+    # movate.runtime.capabilities — see that module + the contract test.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/capabilities",
+        response_model=CapabilitiesView,
+        tags=["meta-v1"],
+    )
+    async def v1_capabilities(
+        request: Request,
+        response: Response,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> CapabilitiesView:
+        """Describe what THIS runtime version supports (read-only).
+
+        Returns a capability matrix — reachable models, feature flags
+        (detected from the live route table / importable modules, never a
+        static dict), the scope vocabulary, this tenant's effective limits,
+        and the installed optional extras.
+
+        Auth:
+
+        * **No / bad bearer** → a minimal subset (``mdk_version`` +
+          ``api_version``, ``minimal: true``) for version-fingerprint /
+          probe use. Never 401s.
+        * **Valid bearer with the ``read`` scope** → the full matrix.
+        * **Valid bearer without ``read``** → the minimal subset (the
+          richer fields stay gated, but the caller still gets a usable
+          probe rather than a 403).
+
+        BYOK providers are reported by NAME only — the encrypted key value
+        is never read or surfaced.
+        """
+        from movate.runtime.capabilities import (  # noqa: PLC0415
+            build_capabilities,
+            minimal_capabilities,
+        )
+
+        # No bearer at all → cheap, unauthenticated minimal probe. Don't
+        # touch storage or the rate limiter.
+        if authorization is None:
+            return minimal_capabilities()
+
+        # A bearer is present — resolve it. Any auth failure (bad scheme,
+        # expired/unknown key, rate-limited) degrades to the minimal view
+        # rather than erroring: discovery should stay usable for a probe.
+        try:
+            ctx = await auth_dep(response=response, authorization=authorization)
+        except HTTPException:
+            return minimal_capabilities()
+
+        # Authenticated but lacking ``read`` → minimal (the richer fields
+        # are read-scoped; we don't 403 a discovery probe).
+        if SCOPE_READ not in ctx.scopes:
+            return minimal_capabilities()
+
+        return await build_capabilities(request.app, ctx)
+
+    # ------------------------------------------------------------------
     # Run explain (BACKLOG #66) — read-only mirror of ``mdk explain``.
     # The decision chain for a stored run, tenant-scoped at the storage
     # layer (a cross-tenant id returns 404, never 403). The record→dict
@@ -6282,6 +9943,585 @@ def build_app(
             error=chain["error"],
             skill_calls=chain.get("skill_calls"),
             skill_calls_hint=chain.get("skill_calls_hint"),
+        )
+
+    # ------------------------------------------------------------------
+    # Workflow definitions (ADR 037 D1) — workflow API parity.
+    #
+    # Workflow analogue of the agent CRUD/version/publish/revert surface
+    # above. The wire shape mirrors agents row-for-row: same scopes (read /
+    # admin), same If-Match optimistic-concurrency on PUT, same versions
+    # endpoint pattern, same error envelope. The bundle layout is narrower
+    # (just workflow.yaml + state schema + optional evals/dataset), so the
+    # multipart form has fewer fields, and validation runs the Pydantic +
+    # compiler path rather than the prompt linter. This is the runtime
+    # surface backing the front end's workflow profile / catalog views.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/workflows",
+        response_model=WorkflowCreatedView,
+        status_code=201,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_workflow(
+        request: Request,
+        # Multipart fields. The route accepts EITHER individual files OR a
+        # single zipped bundle; the choice is detected in the handler. A
+        # pure-JSON sibling endpoint at ``/workflows/from-spec`` covers
+        # callers that don't want multipart encoding (mirrors agents'
+        # ``POST /api/v1/agents/from-wizard``).
+        workflow_yaml: UploadFile | None = File(default=None),
+        state_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        bundle: UploadFile | None = File(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowCreatedView:
+        """Create a new workflow from a multipart-form bundle.
+
+        Mirrors ``POST /api/v1/agents``: two multipart input modes (pick ONE):
+
+        1. **Individual multipart files** — ``workflow_yaml`` + optional
+           ``state_schema`` + optional ``dataset``.
+        2. **Zipped bundle** — single ``bundle`` field carrying the canonical
+           workflow layout (workflow.yaml + schema/ + evals/).
+
+        For pure-JSON callers, see ``POST /api/v1/workflows/from-spec``.
+
+        Persists to ``<workflows_path>/<name>/`` and writes an immutable row
+        to the durable registry (ADR 037 D1).
+
+        Errors:
+
+        * **400** — neither mode supplied OR multiple modes supplied
+        * **409** — workflow with this name already exists; use PUT to update
+        * **422** — bundle failed validation (parse / Pydantic / compiler)
+        * **503** — runtime was built without a ``workflows_path``
+        """
+        workflows_path: Path | None = request.app.state.workflows_path
+        if workflows_path is None:
+            raise WorkflowPersistenceError(
+                "runtime was built without a workflows_path; POST /api/v1/workflows is unavailable",
+                status_code=503,
+            )
+
+        files = await _collect_workflow_bundle_files(
+            body=None,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            dataset=dataset,
+            bundle=bundle,
+        )
+
+        result = persist_workflow_bundle(files, workflows_path=workflows_path)
+
+        store: StorageProvider = request.app.state.storage
+        published = await _dual_write_workflow_to_registry(
+            store,
+            result.workflow_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.spec.version,
+            created_by=ctx.api_key_id,
+        )
+
+        return WorkflowCreatedView(
+            name=result.spec.name,
+            version=result.spec.version,
+            description=result.spec.description,
+            workflow_dir=result.workflow_dir.name,
+            files_persisted=result.files_persisted,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
+        )
+
+    @v1.post(
+        "/workflows/from-spec",
+        response_model=WorkflowCreatedView,
+        status_code=201,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_workflow_from_spec(
+        body: WorkflowCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowCreatedView:
+        """Create a new workflow from a JSON body (no multipart).
+
+        Sibling of the multipart ``POST /api/v1/workflows`` — same persist
+        path + response shape, JSON wire format. Mirrors the role
+        ``POST /api/v1/agents/from-wizard`` plays for agents: a clean
+        no-multipart shape for Angular and other JSON-only clients.
+        """
+        workflows_path: Path | None = request.app.state.workflows_path
+        if workflows_path is None:
+            raise WorkflowPersistenceError(
+                "runtime was built without a workflows_path; "
+                "POST /api/v1/workflows/from-spec is unavailable",
+                status_code=503,
+            )
+
+        files = await _collect_workflow_bundle_files(
+            body=body,
+            workflow_yaml=None,
+            state_schema=None,
+            dataset=None,
+            bundle=None,
+        )
+
+        result = persist_workflow_bundle(files, workflows_path=workflows_path)
+
+        store: StorageProvider = request.app.state.storage
+        published = await _dual_write_workflow_to_registry(
+            store,
+            result.workflow_dir,
+            tenant_id=ctx.tenant_id,
+            version=result.spec.version,
+            created_by=ctx.api_key_id,
+        )
+
+        return WorkflowCreatedView(
+            name=result.spec.name,
+            version=result.spec.version,
+            description=result.spec.description,
+            workflow_dir=result.workflow_dir.name,
+            files_persisted=result.files_persisted,
+            published_version=published.version if published is not None else None,
+            changed=published.published if published is not None else True,
+        )
+
+    @v1.get(
+        "/workflows",
+        response_model=WorkflowListResponse,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflows(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> WorkflowListResponse:
+        """List workflows for the caller's tenant, newest-first.
+
+        ``?published_only=true`` narrows to workflows that have at least one
+        published version (ADR 037 D1). The returned row is still the
+        *latest* version of each name — the ``published_version`` field
+        on each item names the version flagged as published, so a UI can
+        render "blessed v0.2.0 (latest v0.3.0)" drift without a second
+        round-trip.
+
+        Tenant-scoped — other tenants' workflows are invisible.
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_workflows(
+            tenant_id=ctx.tenant_id,
+            published_only=published_only,
+            limit=limit,
+        )
+        items: list[WorkflowView] = []
+        for row in rows:
+            tags, description = _peek_workflow_yaml_tags(row.files)
+            # Look up the published version (if any) for this name. One extra
+            # cheap query per row — keeps list_workflows' API minimal.
+            published_version = await _resolve_published_version(
+                store, row.name, tenant_id=ctx.tenant_id
+            )
+            items.append(
+                WorkflowView(
+                    name=row.name,
+                    version=row.version,
+                    description=description,
+                    published_version=published_version,
+                    tags=tags,
+                    created_at=row.created_at,
+                )
+            )
+        return WorkflowListResponse(workflows=items, count=len(items))
+
+    @v1.get(
+        "/workflows/{name}",
+        response_model=WorkflowDetailView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_workflow(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> WorkflowDetailView:
+        """Return the parsed spec + bundle metadata for a single workflow.
+
+        ``?version=<v>`` returns that exact registry version (404 if not
+        found for this tenant); omitting ``?version`` returns the current
+        latest. Tenant-scoped — a cross-tenant lookup is 404, not 403.
+
+        Sets a strong ``ETag`` carrying the current version so an Angular
+        client can pass it as ``If-Match`` on a subsequent PUT for
+        optimistic concurrency (mirrors the agent endpoint).
+        """
+        store: StorageProvider = request.app.state.storage
+        record = await store.get_workflow_bundle(name, tenant_id=ctx.tenant_id, version=version)
+        if record is None:
+            raise not_found(
+                "workflow",
+                f"{name}@{version}" if version else name,
+            )
+        return _render_workflow_detail(record)
+
+    @v1.get(
+        "/workflows/{name}/versions",
+        response_model=WorkflowVersionsView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_versions(
+        name: str,
+        request: Request,
+        limit: int = 50,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowVersionsView:
+        """List the durable-registry version history for one workflow.
+
+        Newest-first. The newest row is flagged ``is_current``; the version
+        with ``published=True`` (if any) is flagged ``is_published``.
+        Mirrors :func:`v1_list_agent_versions`.
+        """
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_workflow_versions(name, tenant_id=ctx.tenant_id, limit=limit)
+        items = [
+            WorkflowVersionView(
+                version=r.version,
+                created_by=r.created_by,
+                created_at=r.created_at,
+                content_hash=r.content_hash,
+                is_current=(i == 0),
+                is_published=r.published,
+            )
+            for i, r in enumerate(records)
+        ]
+        return WorkflowVersionsView(name=name, versions=items, count=len(items))
+
+    @v1.put(
+        "/workflows/{name}",
+        response_model=WorkflowUpdatedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_update_workflow(
+        name: str,
+        request: Request,
+        workflow_yaml: UploadFile | None = File(default=None),
+        state_schema: UploadFile | None = File(default=None),
+        dataset: UploadFile | None = File(default=None),
+        bundle: UploadFile | None = File(default=None),
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowUpdatedView:
+        """Replace an existing workflow bundle in-place (multipart).
+
+        Accepts the same multipart modes as POST. The path ``{name}`` must
+        match the uploaded ``workflow.yaml``'s ``name`` field; mismatches
+        are rejected with 422. For JSON-body callers see
+        ``PUT /api/v1/workflows/{name}/from-spec``.
+
+        **Optimistic concurrency** — opt-in via ``If-Match``. Send the
+        version or ``content_hash`` the caller believes is current; if it
+        no longer matches the registry's latest for this tenant, 409
+        ("someone else updated this; re-fetch"). Absent ``If-Match`` →
+        last-write-wins (back-compat).
+
+        Errors:
+
+        * **400** — neither mode supplied OR multiple modes supplied
+        * **404** — workflow ``{name}`` is not registered (never created)
+        * **409** — ``If-Match`` precondition is stale
+        * **422** — bundle failed validation OR workflow_yaml.name ≠ path
+        * **503** — runtime built without a ``workflows_path``
+        """
+        return await _do_update_workflow(
+            request=request,
+            name=name,
+            body=None,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            dataset=dataset,
+            bundle=bundle,
+            if_match=if_match,
+            ctx=ctx,
+        )
+
+    @v1.put(
+        "/workflows/{name}/from-spec",
+        response_model=WorkflowUpdatedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_update_workflow_from_spec(
+        name: str,
+        body: WorkflowCreateRequest,
+        request: Request,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowUpdatedView:
+        """Replace an existing workflow from a JSON body (no multipart).
+
+        Sibling of the multipart ``PUT /api/v1/workflows/{name}``. Same
+        If-Match semantics, same 404/409/422 behavior.
+        """
+        return await _do_update_workflow(
+            request=request,
+            name=name,
+            body=body,
+            workflow_yaml=None,
+            state_schema=None,
+            dataset=None,
+            bundle=None,
+            if_match=if_match,
+            ctx=ctx,
+        )
+
+    @v1.delete(
+        "/workflows/{name}",
+        response_model=WorkflowDeletedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_workflow(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowDeletedView:
+        """Soft-delete a workflow.
+
+        Moves the on-disk bundle to ``.deleted-<name>-<timestamp>/`` (no
+        rmtree — recoverable out-of-band) AND clears the registry's
+        ``published`` flag from every version of this name. Versions
+        themselves are PRESERVED — the history stays intact so an operator
+        can revert later if the delete was a mistake.
+
+        Errors:
+
+        * **404** — workflow dir doesn't exist at the runtime's
+          workflows_path AND no registry rows match
+        * **503** — runtime built without a ``workflows_path``
+        """
+        workflows_path: Path | None = request.app.state.workflows_path
+        if workflows_path is None:
+            raise WorkflowPersistenceError(
+                "runtime was built without a workflows_path; "
+                "DELETE /api/v1/workflows/{name} is unavailable",
+                status_code=503,
+            )
+        store: StorageProvider = request.app.state.storage
+        # Soft-delete on disk if the dir exists. If only the registry has it,
+        # we still clear the published flag below so the catalog reflects
+        # the delete.
+        deleted_dir_name = ""
+        on_disk = (workflows_path / name).is_dir()
+        if on_disk:
+            result = soft_delete_workflow(name, workflows_path=workflows_path)
+            deleted_dir_name = result.deleted_dir.name
+        else:
+            # Registry-only delete: 404 if nothing exists for this tenant.
+            registry_versions = await store.list_workflow_versions(
+                name, tenant_id=ctx.tenant_id, limit=1
+            )
+            if not registry_versions:
+                raise not_found("workflow", name)
+            deleted_dir_name = f"<registry-only:{name}>"
+
+        # Demote any published version so the front-end catalog
+        # (?published_only=true) stops surfacing this name immediately.
+        # Versions are preserved — operators can revert.
+        await _demote_workflow_published(store, name, tenant_id=ctx.tenant_id)
+
+        return WorkflowDeletedView(
+            name=name,
+            deleted_dir=deleted_dir_name,
+        )
+
+    @v1.post(
+        "/workflows/{name}/validate",
+        response_model=WorkflowValidationView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_validate_workflow(
+        name: str,
+        request: Request,
+        workflow_yaml: UploadFile | None = File(default=None),
+        state_schema: UploadFile | None = File(default=None),
+        bundle: UploadFile | None = File(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowValidationView:
+        """Validate a workflow bundle WITHOUT persisting (multipart).
+
+        Runs the same Pydantic + compiler path persist would run — duplicate
+        node ids, unknown entrypoint, dangling edges, missing/malformed
+        state schema. Returns ``passed=True`` when the spec is structurally
+        valid. Cost forecast is intentionally omitted today (workflows have
+        no single-token estimate; ADR 029 D4 will add this).
+
+        If no multipart file is supplied, validates the currently-persisted
+        bundle on disk (so the UI can pre-validate the latest registered
+        workflow before opening the editor). For JSON-body validation see
+        ``POST /api/v1/workflows/{name}/validate/from-spec``.
+
+        ``read`` scope — pure inspection, no mutation.
+        """
+        return await _do_validate_workflow(
+            request=request,
+            name=name,
+            body=None,
+            workflow_yaml=workflow_yaml,
+            state_schema=state_schema,
+            bundle=bundle,
+            ctx=ctx,
+        )
+
+    @v1.post(
+        "/workflows/{name}/validate/from-spec",
+        response_model=WorkflowValidationView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_validate_workflow_from_spec(
+        name: str,
+        body: WorkflowCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowValidationView:
+        """Validate a workflow bundle from a JSON body (no multipart)."""
+        return await _do_validate_workflow(
+            request=request,
+            name=name,
+            body=body,
+            workflow_yaml=None,
+            state_schema=None,
+            bundle=None,
+            ctx=ctx,
+        )
+
+    @v1.post(
+        "/workflows/{name}/publish",
+        response_model=WorkflowPublishedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_publish_workflow(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> WorkflowPublishedView:
+        """Promote a version to "published" (ADR 037 D1).
+
+        Soft promote on the durable registry: sets ``published=True`` on
+        the target version and clears every other version of the same name
+        in this tenant. ``?version=<v>`` selects the version; omit it to
+        publish the current LATEST (newest ``created_at``).
+
+        Idempotent — re-promoting the same version is a no-op. The
+        response carries the prior published version (if any) so the UI
+        can label the transition.
+
+        Errors:
+
+        * **404** — no such version for this workflow in this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        target_version = version
+        # Versionless → promote the current latest.
+        if target_version is None:
+            latest = await store.get_workflow_bundle(name, tenant_id=ctx.tenant_id)
+            if latest is None:
+                raise not_found("workflow", name)
+            target_version = latest.version
+
+        # Look up the previously-published version BEFORE we flip it.
+        previous_published = await _resolve_published_version(store, name, tenant_id=ctx.tenant_id)
+        ok = await store.publish_workflow_version(
+            name, tenant_id=ctx.tenant_id, version=target_version
+        )
+        if not ok:
+            raise not_found("workflow version", f"{name}@{target_version}")
+        return WorkflowPublishedView(
+            name=name,
+            published_version=target_version,
+            previous_published_version=(
+                previous_published if previous_published != target_version else None
+            ),
+        )
+
+    @v1.post(
+        "/workflows/{name}/revert",
+        response_model=WorkflowRevertedView,
+        tags=["workflows-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_revert_workflow(
+        name: str,
+        request: Request,
+        body: WorkflowRevertSubmission | None = None,
+        to_version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WorkflowRevertedView:
+        """Revert a workflow to a prior version (non-destructive).
+
+        Fetches the bundle for ``to_version`` and re-publishes it FORWARD
+        as a new latest version — a fresh ``save_workflow_bundle`` row
+        with a new ``created_at`` / ``created_by`` and the same ``files``.
+        No version is ever deleted or rewritten.
+
+        ``to_version`` may be supplied in the JSON body OR as a query
+        param; the body wins when both are present. Mirrors the agent
+        revert endpoint.
+
+        Errors:
+
+        * **400** — no ``to_version`` supplied
+        * **404** — no such ``to_version`` for this workflow in this tenant
+        """
+        target_version = body.to_version if body is not None else to_version
+        if not target_version:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    'revert requires a target version: send {"to_version": "..."} '
+                    "in the body or ?to_version=..."
+                ),
+            )
+        store: StorageProvider = request.app.state.storage
+        target = await store.get_workflow_bundle(
+            name, tenant_id=ctx.tenant_id, version=target_version
+        )
+        if target is None:
+            raise not_found("workflow version", f"{name}@{target_version}")
+
+        history = await store.list_workflow_versions(name, tenant_id=ctx.tenant_id, limit=1000)
+        previous_version = history[0].version if history else target_version
+        existing_versions = {r.version for r in history}
+        new_version = mint_workflow_revert_version(target_version, existing_versions)
+
+        reverted = WorkflowBundleRecord(
+            name=target.name,
+            tenant_id=target.tenant_id,
+            version=new_version,
+            created_by=ctx.api_key_id,
+            content_hash=target.content_hash,
+            files=target.files,
+            published=False,
+        )
+        await store.save_workflow_bundle(reverted)
+        return WorkflowRevertedView(
+            name=name,
+            version=new_version,
+            reverted_from=target_version,
+            previous_version=previous_version,
         )
 
     # ------------------------------------------------------------------
@@ -7087,6 +11327,1814 @@ def build_app(
 
         return RunAccepted(job_id=job.job_id, status=job.status)
 
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041). Three namespaces (movate / private /
+    # community) under one read API; tenant-private writes land in the
+    # caller's tenant; the sync handler is a STUB in v1 (preserves the
+    # contract for future activation against catalog.movate.io).
+    # ------------------------------------------------------------------
+
+    import logging  # noqa: PLC0415
+
+    catalog_logger = logging.getLogger("movate.runtime.catalog")
+
+    catalog_sync_stub_detail = (
+        "Production sync from catalog.movate.io will be wired by the "
+        "Movate-side service. The stub logged the intent, advanced the "
+        "watermark, and returned 202 — no upstream fetch occurred."
+    )
+
+    def _parse_catalog_source(value: str) -> CatalogSource:
+        try:
+            return CatalogSource(value)
+        except ValueError:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    f"unknown catalog source {value!r}; expected one of movate/private/community"
+                ),
+            ) from None
+
+    def _decode_bundle_tar(b64: str) -> bytes:
+        try:
+            return base64.b64decode(b64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=f"bundle_tar_b64 is not valid base64: {exc}",
+            ) from None
+
+    def _catalog_entry_to_view(entry: CatalogEntry) -> CatalogEntryView:
+        return CatalogEntryView(
+            slug=entry.slug,
+            source=entry.source.value,
+            tenant_id=entry.tenant_id,
+            latest_version=entry.latest_version,
+            name=entry.name,
+            title=entry.title,
+            description=entry.description,
+            tags=list(entry.tags),
+            shape=entry.shape,
+            recommended_for=entry.recommended_for,
+            ratings_summary=CatalogRatingsSummaryView(
+                count=entry.ratings_summary.count,
+                avg=entry.ratings_summary.avg,
+            ),
+            popularity=entry.popularity,
+            synced_at=entry.synced_at.isoformat(),
+        )
+
+    @v1.get(
+        "/catalog/agents",
+        response_model=CatalogEntryListResponse,
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_catalog_entries(
+        request: Request,
+        source: str | None = Query(default=None),
+        tag: str | None = Query(default=None),
+        shape: str | None = Query(default=None),
+        q: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        after_slug: str | None = Query(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryListResponse:
+        """List catalog entries visible to the caller (ADR 041 D2 / D5).
+
+        Visibility join: all ``movate`` entries + the caller's
+        ``private`` entries + (future) ``community`` (always empty in v1
+        because writes to that namespace are blocked).
+
+        Filters (all ANDed):
+
+        * ``source`` — narrow to one namespace.
+        * ``tag``    — single-tag membership match.
+        * ``shape``  — exact (ADR 028 shape taxonomy).
+        * ``q``      — case-insensitive substring over name / title / description.
+
+        Pagination: pass the slug of the last entry you saw as
+        ``after_slug``; ``next_after_slug`` in the response is the cursor
+        for the next page (``None`` once the end is reached).
+
+        Errors:
+
+        * **400** — bad ``source`` value
+        * **401** — bad bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        source_filter = _parse_catalog_source(source) if source else None
+        entries = await store.list_catalog_entries(
+            ctx.tenant_id,
+            source_filter=source_filter,
+            tag_filter=tag,
+            shape_filter=shape,
+            q=q,
+            limit=limit,
+            after_slug=after_slug,
+        )
+        views = [_catalog_entry_to_view(e) for e in entries]
+        next_cursor = views[-1].slug if len(views) >= limit else None
+        return CatalogEntryListResponse(
+            entries=views,
+            count=len(views),
+            next_after_slug=next_cursor,
+        )
+
+    @v1.get(
+        "/catalog/agents/{slug}",
+        response_model=CatalogEntryDetailView,
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_catalog_entry(
+        slug: str,
+        request: Request,
+        source: str = Query(default="movate"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryDetailView:
+        """Detail view for one catalog entry (latest version + summary).
+
+        Pass ``?source=private`` to fetch a tenant-private entry (scoped
+        to the caller). Public entries default to ``source=movate``.
+
+        Errors:
+
+        * **404** — no matching entry (or cross-tenant for ``private``)
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(source)
+        tenant_filter = ctx.tenant_id if src is CatalogSource.PRIVATE else None
+        entry = await store.get_catalog_entry(slug, source=src, tenant_id=tenant_filter)
+        if entry is None:
+            raise not_found("catalog entry", f"{slug} (source={src.value})")
+
+        latest_digest: str | None = None
+        version_row = await store.get_catalog_entry_version(
+            slug,
+            source=src,
+            version=entry.latest_version,
+            tenant_id=tenant_filter,
+        )
+        if version_row is not None:
+            latest_digest = version_row.digest
+
+        return CatalogEntryDetailView(
+            slug=entry.slug,
+            source=entry.source.value,
+            tenant_id=entry.tenant_id,
+            latest_version=entry.latest_version,
+            name=entry.name,
+            title=entry.title,
+            description=entry.description,
+            tags=list(entry.tags),
+            shape=entry.shape,
+            recommended_for=entry.recommended_for,
+            ratings_summary=CatalogRatingsSummaryView(
+                count=entry.ratings_summary.count,
+                avg=entry.ratings_summary.avg,
+            ),
+            popularity=entry.popularity,
+            synced_at=entry.synced_at.isoformat(),
+            latest_version_digest=latest_digest,
+        )
+
+    @v1.get(
+        "/catalog/agents/{slug}/versions",
+        response_model=list[CatalogEntryVersionView],
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_catalog_versions(
+        slug: str,
+        request: Request,
+        source: str = Query(default="movate"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> list[CatalogEntryVersionView]:
+        """List versions of one catalog entry, newest-first.
+
+        Omits ``bundle_tar_b64`` — the bytes ship only from the
+        per-version endpoint to keep this list cheap to render.
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(source)
+        tenant_filter = ctx.tenant_id if src is CatalogSource.PRIVATE else None
+        versions = await store.get_catalog_entry_versions(slug, source=src, tenant_id=tenant_filter)
+        return [
+            CatalogEntryVersionView(
+                slug=v.slug,
+                source=v.source.value,
+                tenant_id=v.tenant_id,
+                version=v.version,
+                digest=v.digest,
+                published_at=v.published_at.isoformat(),
+                deprecated_at=(v.deprecated_at.isoformat() if v.deprecated_at else None),
+                bundle_tar_b64=None,
+            )
+            for v in versions
+        ]
+
+    @v1.get(
+        "/catalog/agents/{slug}/versions/{version}",
+        response_model=CatalogEntryVersionView,
+        tags=["catalog"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_catalog_version(
+        slug: str,
+        version: str,
+        request: Request,
+        source: str = Query(default="movate"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryVersionView:
+        """Fetch one specific version, including ``bundle_tar`` (base64)."""
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(source)
+        tenant_filter = ctx.tenant_id if src is CatalogSource.PRIVATE else None
+        v = await store.get_catalog_entry_version(
+            slug, source=src, version=version, tenant_id=tenant_filter
+        )
+        if v is None:
+            raise not_found("catalog entry version", f"{slug}@{version} (source={src.value})")
+        return CatalogEntryVersionView(
+            slug=v.slug,
+            source=v.source.value,
+            tenant_id=v.tenant_id,
+            version=v.version,
+            digest=v.digest,
+            published_at=v.published_at.isoformat(),
+            deprecated_at=(v.deprecated_at.isoformat() if v.deprecated_at else None),
+            bundle_tar_b64=base64.b64encode(v.bundle_tar).decode("ascii"),
+        )
+
+    @v1.post(
+        "/catalog/agents",
+        response_model=CatalogEntryView,
+        status_code=201,
+        tags=["catalog"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_submit_catalog_entry(
+        body: CatalogSubmitRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryView:
+        """Submit a tenant-private catalog entry (ADR 041 D5).
+
+        Server forces ``source='private'`` and
+        ``tenant_id=caller_tenant`` regardless of any client value — the
+        public namespaces are read-only over the customer-facing API.
+
+        Errors:
+
+        * **400** — bad bundle base64 / missing required fields
+        * **409** — slug already exists for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        bundle_bytes = _decode_bundle_tar(body.bundle_tar_b64)
+
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        existing = await store.get_catalog_entry(
+            body.slug, source=CatalogSource.PRIVATE, tenant_id=ctx.tenant_id
+        )
+        if existing is not None:
+            raise conflict(f"catalog entry {body.slug!r} already exists for this tenant")
+
+        digest = hashlib.sha256(bundle_bytes).hexdigest()
+        await store.upsert_catalog_entry_version(
+            body.slug,
+            source=CatalogSource.PRIVATE,
+            version=body.version,
+            bundle_tar=bundle_bytes,
+            digest=digest,
+            tenant_id=ctx.tenant_id,
+        )
+        entry = CatalogEntry(
+            slug=body.slug,
+            source=CatalogSource.PRIVATE,
+            tenant_id=ctx.tenant_id,
+            latest_version=body.version,
+            name=body.name,
+            title=body.title,
+            description=body.description,
+            tags=list(body.tags),
+            shape=body.shape,
+            recommended_for=body.recommended_for,
+            ratings_summary=CatalogRatingsSummary(),
+            popularity=0,
+            synced_at=datetime.now(UTC),
+        )
+        await store.upsert_catalog_entry(entry)
+        return _catalog_entry_to_view(entry)
+
+    @v1.post(
+        "/catalog/agents/{slug}/versions",
+        response_model=CatalogEntryVersionView,
+        status_code=201,
+        tags=["catalog"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_publish_catalog_version(
+        slug: str,
+        body: CatalogPublishVersionRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogEntryVersionView:
+        """Publish a new version of a tenant-private entry (ADR 041 D5).
+
+        Allowed only for the caller's own tenant's private entries — the
+        catalog.movate.io namespace is gated through the GitHub +
+        catalog-CI path (ADR 041 D3), not this endpoint.
+
+        Errors:
+
+        * **400** — bad bundle base64
+        * **404** — no such tenant-private entry
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        entry = await store.get_catalog_entry(
+            slug, source=CatalogSource.PRIVATE, tenant_id=ctx.tenant_id
+        )
+        if entry is None:
+            raise not_found("tenant-private catalog entry", slug)
+        bundle_bytes = _decode_bundle_tar(body.bundle_tar_b64)
+        digest = hashlib.sha256(bundle_bytes).hexdigest()
+        record = await store.upsert_catalog_entry_version(
+            slug,
+            source=CatalogSource.PRIVATE,
+            version=body.version,
+            bundle_tar=bundle_bytes,
+            digest=digest,
+            tenant_id=ctx.tenant_id,
+        )
+        # Bump latest_version on the entry so detail reflects the new tip.
+        bumped = entry.model_copy(
+            update={
+                "latest_version": body.version,
+                "synced_at": datetime.now(UTC),
+            }
+        )
+        await store.upsert_catalog_entry(bumped)
+        return CatalogEntryVersionView(
+            slug=record.slug,
+            source=record.source.value,
+            tenant_id=record.tenant_id,
+            version=record.version,
+            digest=record.digest,
+            published_at=record.published_at.isoformat(),
+            deprecated_at=(record.deprecated_at.isoformat() if record.deprecated_at else None),
+            bundle_tar_b64=None,
+        )
+
+    @v1.post(
+        "/catalog/agents/{slug}/ratings",
+        response_model=CatalogRatingsSummaryView,
+        tags=["catalog"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_rate_catalog_entry(
+        slug: str,
+        body: CatalogRatingRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogRatingsSummaryView:
+        """Record this tenant's rating for one catalog entry.
+
+        Re-rating overwrites the prior row (one rating per tenant per
+        entry). Returns the rolled-up summary AFTER the write — clients
+        can refresh the entry card without a second read.
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(body.source)
+        if src is CatalogSource.COMMUNITY:
+            # Schema-ready but the namespace has no rows in v1 — rating
+            # a non-existent entry surfaces as a 501 so a future
+            # community ADR can flip this on without changing the URL.
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=501,
+                message=(
+                    "rating the community namespace is reserved for a future "
+                    "community-moderation ADR (ADR 041 D7)"
+                ),
+            )
+        summary = await store.record_catalog_rating(
+            slug,
+            tenant_id=ctx.tenant_id,
+            source=src,
+            rating=body.rating,
+            comment=body.comment,
+        )
+        return CatalogRatingsSummaryView(count=summary.count, avg=summary.avg)
+
+    @v1.post(
+        "/catalog/sync",
+        response_model=CatalogSyncResponse,
+        status_code=202,
+        tags=["catalog"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_catalog_sync(
+        body: CatalogSyncRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> CatalogSyncResponse:
+        """Trigger a sync from the requested catalog source.
+
+        **v1 stub (ADR 041 D4).** The handler:
+
+        1. Logs an "intent to sync" event so an operator can confirm the
+           call landed.
+        2. Advances the per-source watermark to ``now()``.
+        3. Returns 202 with ``status="stub"`` + a note that the production
+           wiring against ``catalog.movate.io`` is a separate Movate-side
+           build.
+
+        This preserves the API contract so the production handler can
+        flip on without changing the customer-facing surface or any
+        client code.
+
+        Errors:
+
+        * **400** — ``source='private'`` (private entries don't sync — D5)
+        * **501** — ``source='community'`` (deferred — D7)
+        """
+        store: StorageProvider = request.app.state.storage
+        src = _parse_catalog_source(body.source)
+        if src is CatalogSource.PRIVATE:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=(
+                    "tenant-private entries are not synced from any upstream "
+                    "(ADR 041 D5 — data sovereignty)"
+                ),
+            )
+        if src is CatalogSource.COMMUNITY:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=501,
+                message=(
+                    "community-namespace sync is deferred to a future moderation ADR (ADR 041 D7)"
+                ),
+            )
+
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        prior = await store.get_catalog_sync_watermark(src)
+        now = datetime.now(UTC)
+        catalog_logger.info(
+            "catalog.sync.intent source=%s tenant=%s prior_watermark=%s",
+            src.value,
+            ctx.tenant_id,
+            prior.isoformat() if prior else None,
+        )
+        await store.set_catalog_sync_watermark(src, now)
+        return CatalogSyncResponse(
+            source=src.value,
+            status="stub",
+            watermark=now.isoformat(),
+            detail=catalog_sync_stub_detail,
+        )
+
+    # ------------------------------------------------------------------
+    # Observability Intelligence layer (ADR 047). Five routes:
+    #   GET  /observability/insights   (read)  — the append-only insight feed
+    #   GET  /observability/health     (read)  — latest health score + digest
+    #   POST /observability/ask        (read)  — NL question, grounded answer
+    #   POST /observability/troubleshoot (read)— symptom → root-cause narrative
+    #   POST /observability/analyze    (admin) — on-demand analyst trigger
+    #
+    # ask/troubleshoot/insights/health are PURE READS (only save_insight +
+    # the analyst write). The NL detail path runs a FIXED set of read-only,
+    # parameterized query templates — the LLM never authors raw SQL (the
+    # SQL-safety contract lives in movate.core.observability.query). Every
+    # ask/troubleshoot answer carries evidence[] (citations mandatory).
+    # ------------------------------------------------------------------
+
+    def _build_observability_llm(*, mock: bool) -> Any:
+        """Build the LLM the budget-capped NL queries use (LiteLLM default).
+
+        ``mock=True`` uses the deterministic MockProvider (the hermetic-test
+        path, mirroring the eval/bench endpoints). Returns ``None`` if no
+        provider can be built — the query layer then returns a deterministic,
+        still-grounded fallback answer rather than failing the request.
+        """
+        try:
+            if mock:
+                from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+                return MockProvider()
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            return LiteLLMProvider()
+        except Exception:  # pragma: no cover - provider construction is cheap
+            logging.getLogger(__name__).warning(
+                "observability_llm_build_failed — answering without LLM", exc_info=True
+            )
+            return None
+
+    @v1.get(
+        "/observability/insights",
+        response_model=ObservabilityInsightListView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_insights(
+        request: Request,
+        project_id: str | None = Query(default=None),
+        since: str | None = Query(default=None, description="ISO YYYY-MM-DD, inclusive."),
+        until: str | None = Query(default=None, description="ISO YYYY-MM-DD, inclusive."),
+        limit: int = Query(default=90, ge=1, le=365),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityInsightListView:
+        """List this tenant's daily observability insights, newest-day-first.
+
+        Tenant-scoped at the SQL layer (``list_insights`` requires
+        ``tenant_id``). Append-only re-runs collapse to the latest row per day.
+        Pure read.
+        """
+        from datetime import date as _date  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+
+        def _parse(d: str | None) -> Any:
+            if not d:
+                return None
+            try:
+                return _date.fromisoformat(d)
+            except ValueError as exc:
+                raise http_error(
+                    ErrorCode.BAD_REQUEST,
+                    status_code=400,
+                    message=f"bad date {d!r} — expected ISO YYYY-MM-DD",
+                ) from exc
+
+        rows = await store.list_insights(
+            ctx.tenant_id,
+            project_id=project_id,
+            since=_parse(since),
+            until=_parse(until),
+            limit=limit,
+        )
+        views = [ObservabilityInsightView.from_record(r) for r in rows]
+        return ObservabilityInsightListView(insights=views, count=len(views))
+
+    @v1.get(
+        "/observability/health",
+        response_model=ObservabilityHealthView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_health(
+        request: Request,
+        project_id: str = Query(default="default"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityHealthView:
+        """Return the latest health score + digest for a project. Pure read.
+
+        ``has_insight=False`` (cold start) when the analyst hasn't run yet —
+        a clean 200 with nulls, not a 404 (the project may simply be new).
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_insights(ctx.tenant_id, project_id=project_id, limit=1)
+        if not rows:
+            return ObservabilityHealthView(project_id=project_id, has_insight=False)
+        latest = rows[0]
+        return ObservabilityHealthView(
+            project_id=latest.project_id,
+            date=latest.date.isoformat(),
+            health_score=latest.health_score,
+            narrative_digest=latest.narrative_digest,
+            anomaly_count=len(latest.anomalies),
+            has_insight=True,
+        )
+
+    @v1.post(
+        "/observability/ask",
+        response_model=GroundedAnswerView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_ask(
+        body: AskRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GroundedAnswerView:
+        """Answer a natural-language observability question with citations.
+
+        Reads the insights store (fast path) and may run BOUNDED, read-only
+        parameterized query templates (the LLM picks a template + typed params
+        from a CLOSED set — never raw SQL). Budget-capped. Pure read.
+        """
+        from movate.core.observability.query import ask as _ask  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        answer = await _ask(
+            body.question,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            storage=store,
+            llm=_build_observability_llm(mock=body.mock),
+            budget_usd=body.budget_usd,
+        )
+        return GroundedAnswerView.from_record(answer)
+
+    @v1.post(
+        "/observability/troubleshoot",
+        response_model=GroundedAnswerView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_troubleshoot(
+        body: TroubleshootRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GroundedAnswerView:
+        """Correlate deploys + drift + error clusters + recent failures into a
+        root-cause narrative with evidence. Budget-capped. Pure read.
+        """
+        from movate.core.observability.query import troubleshoot as _troubleshoot  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        answer = await _troubleshoot(
+            body.symptom,
+            body.time_window_days,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            storage=store,
+            llm=_build_observability_llm(mock=body.mock),
+            budget_usd=body.budget_usd,
+        )
+        return GroundedAnswerView.from_record(answer)
+
+    @v1.post(
+        "/observability/analyze",
+        response_model=AnalyzeAcceptedView,
+        status_code=202,
+        tags=["observability-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_observability_analyze(
+        body: AnalyzeRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AnalyzeAcceptedView:
+        """Enqueue an on-demand overnight-analyst run (admin scope).
+
+        Enqueues a ``JobKind.OBSERVABILITY_ANALYZE`` job the worker picks up
+        and runs (``dispatch._execute_observability_analyze``). Returns 202
+        with the ``job_id`` — same async protocol as run/eval/bench submits.
+        The nightly cron uses the same JobKind via a JobSchedule (a documented
+        follow-up); this endpoint is the manual trigger.
+        """
+        store: StorageProvider = request.app.state.storage
+        job_input: dict[str, Any] = {
+            "project_id": body.project_id,
+            "budget_usd": body.budget_usd,
+        }
+        if body.date:
+            job_input["date"] = body.date
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.OBSERVABILITY_ANALYZE,
+            target=f"observability:{body.project_id}",
+            status=JobStatus.QUEUED,
+            input=job_input,
+            api_key_id=ctx.api_key_id,
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        return AnalyzeAcceptedView(
+            job_id=job.job_id, kind=job.kind.value, project_id=body.project_id
+        )
+
+    # ------------------------------------------------------------------
+    # Events outbox (ADR 035 D1) — read-only feed of lifecycle events
+    # (``run.completed``, ``agent.published``, ``eval.failed``,
+    # ``drift.detected``, ``canary.promoted/demoted``, ...).
+    #
+    # D1 surface is read-only: ``record_event`` is called by the runtime
+    # edges (executor / dispatch / deploy), never by clients. D2 will
+    # add webhook subscriptions that DELIVER these events; D3 will add
+    # an SSE stream that PUSHES them. Both consume the same outbox.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/events",
+        response_model=EventListView,
+        tags=["events-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_events(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        since: datetime | None = Query(
+            None,
+            description=("ISO-8601 lower bound on ``created_at`` (inclusive). Default: now - 24h."),
+        ),
+        until: datetime | None = Query(
+            None,
+            description="ISO-8601 upper bound on ``created_at`` (exclusive).",
+        ),
+        kind: str | None = Query(
+            None,
+            description=(
+                "Filter to one event kind (e.g. ``run.completed``, "
+                "``agent.published``, ``canary.demoted``). Exact match."
+            ),
+        ),
+        subject: str | None = Query(
+            None,
+            description=(
+                "Filter to one subject — the thing the event is about "
+                "(agent name / run id / etc.). Exact match."
+            ),
+        ),
+        limit: int = Query(
+            200,
+            ge=1,
+            le=1000,
+            description="Page size; capped at 1000.",
+        ),
+        after_id: str | None = Query(
+            None,
+            description=(
+                "Cursor: pass the previous response's ``next_after_id`` "
+                "to continue paginating in oldest-first order."
+            ),
+        ),
+        tenant: str | None = Query(
+            None,
+            description=(
+                "Operator override: list events for a specific tenant. "
+                "Requires a ``fleet-admin`` key; ignored otherwise."
+            ),
+        ),
+    ) -> EventListView:
+        """List lifecycle events for the calling tenant (ADR 035 D1).
+
+        Tenant-scoped by default (the caller's ``ctx.tenant_id``).
+        A key with the ``fleet-admin`` scope may pass ``?tenant=<id>``
+        to scope the read to a different tenant; non-fleet-admin
+        callers ignore the parameter (their own tenant only — no leak).
+
+        The default time window is the last 24 hours so a polling
+        client doesn't accidentally request the full history of an
+        active tenant. ``until`` defaults to "now" (unbounded). Pass
+        ``since=1970-01-01T00:00:00Z`` to read the full outbox.
+
+        Cursor pagination is **oldest-first** — consumers reading
+        forward in time pass the response's ``next_after_id`` back as
+        ``?after_id=`` to continue. ``next_after_id`` is populated only
+        when results were truncated at ``limit``; ``None`` means the
+        page is the tail.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — authenticated but key lacks the ``read`` scope
+        * **422** — ``limit`` outside ``[1, 1000]`` (FastAPI handles)
+        """
+        store: StorageProvider = request.app.state.storage
+        # Resolve tenant scope: fleet-admin may override; everyone else
+        # is locked to their own tenant (silently — same 404-not-403
+        # no-leak posture as cross-tenant resource lookups).
+        target_tenant = ctx.tenant_id
+        if tenant is not None and "fleet-admin" in ctx.scopes:
+            target_tenant = tenant
+        # Default window: last 24h (unless caller pinned ``since``).
+        effective_since = since if since is not None else datetime.now(UTC) - timedelta(hours=24)
+        records = await store.list_events(
+            target_tenant,
+            since=effective_since,
+            until=until,
+            kind=kind,
+            subject=subject,
+            limit=limit,
+            after_id=after_id,
+        )
+        views = [EventView.from_record(r) for r in records]
+        # Cursor: populate ``next_after_id`` only when the result hit
+        # the page cap (more rows may exist). The client passes this
+        # back unchanged on the next request.
+        next_after_id: str | None = records[-1].id if len(records) == limit else None
+        return EventListView(events=views, count=len(views), next_after_id=next_after_id)
+
+    # ==================================================================
+    # /api/v1/projects (ADR 040) — Project CRUD + membership.
+    # Tenant-scoped via the existing auth middleware (``ctx.tenant_id``
+    # filters every storage call); the "admin scope OR project owner
+    # role" gate composes so a non-tenant-admin owner can CRUD their own
+    # project (D4), while a fleet/tenant admin scope still works
+    # fleet-wide.
+    # ==================================================================
+
+    project_default_name = "default"
+    """Reserved per-tenant project name (ADR 040 D5). Auto-created lazily
+    by storage; rejected on create + archive at the API layer (storage
+    rejects archive too, defense in depth)."""
+
+    def _principal_from_auth(ctx: AuthContext) -> str:
+        """Resolve the caller's stable principal id from the auth context.
+
+        Today's middleware surfaces a per-API-key identity (no separate
+        tenant-user registry exists yet), so opaque-key calls map to
+        ``api_key:<key_id>``. Project membership keys off this string —
+        any future "real user" surface (OIDC sub, etc.) is additive (the
+        storage layer just stores the bytes).
+        """
+        return f"api_key:{ctx.api_key_id}"
+
+    async def _resolve_project_role(
+        request: Request,
+        ctx: AuthContext,
+        project_id: str,
+    ) -> ProjectMemberRole | None:
+        """Return the caller's effective role on ``project_id``, or ``None``.
+
+        Two gates compose for project mutations (ADR 040 D4):
+
+        1. **Admin scope** (``admin`` / ``fleet-admin``) — checked at the
+           endpoint via :func:`require_scope`; lets a tenant/fleet admin
+           CRUD any project in their tenant.
+        2. **Project owner role** — checked here per request; lets a
+           non-admin who owns the project still mutate it.
+
+        Both are accepted; either grants write access. ``None`` means
+        "no membership row" — the admin-scope path can still grant
+        access even when this returns ``None``.
+        """
+        store: StorageProvider = request.app.state.storage
+        principal = _principal_from_auth(ctx)
+        member = await store.get_project_member(project_id, principal)
+        return member.role if member is not None else None
+
+    def _caller_has_admin_scope(ctx: AuthContext) -> bool:
+        """``True`` when the caller's resolved scopes include ``admin`` or
+        ``fleet-admin`` (the latter expands to all scopes, but check both
+        names so a future direct ``fleet-admin``-only key path still
+        composes correctly)."""
+        return "admin" in ctx.scopes or "fleet-admin" in ctx.scopes
+
+    async def _require_project_write(
+        request: Request,
+        ctx: AuthContext,
+        project_id: str,
+    ) -> None:
+        """Enforce the composed gate for project mutations.
+
+        Admin scope OR ``owner`` project role grants access; anything
+        else 403s with a clear, non-sensitive message. Called per
+        endpoint after the project's existence has been confirmed (so a
+        wrong-tenant project is 404, not 403 — preserves the no-leak
+        contract every other tenant-scoped getter follows).
+        """
+        if _caller_has_admin_scope(ctx):
+            return
+        role = await _resolve_project_role(request, ctx, project_id)
+        if role == ProjectMemberRole.OWNER:
+            return
+        raise http_error(
+            ErrorCode.FORBIDDEN,
+            status_code=403,
+            message=("project mutation requires the 'admin' scope or the project 'owner' role"),
+        )
+
+    def _unprocessable(message: str) -> Any:
+        """422 envelope — used for reserved-name + default-project +
+        last-owner guards. The runtime's :class:`ErrorCode` has no
+        dedicated "unprocessable" code, so we re-use ``BAD_REQUEST``
+        with the 422 status (the standard mapping for a syntactically
+        valid but semantically rejected body)."""
+        return http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=message,
+        )
+
+    def _precondition_failed(message: str) -> Any:
+        """412 envelope — ``If-Match`` precondition stale. Re-uses the
+        ``CONFLICT`` code (the closest existing semantic) so a wire
+        consumer can branch without a new code; the status code (412 vs
+        409) is the distinguishing signal."""
+        return http_error(
+            ErrorCode.CONFLICT,
+            status_code=412,
+            message=message,
+        )
+
+    @v1.post(
+        "/projects",
+        response_model=ProjectView,
+        status_code=201,
+        tags=["projects-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_project(
+        request: Request,
+        body: ProjectCreateRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Create a project in the caller's tenant.
+
+        ``name`` is unique within the tenant. The reserved literal
+        ``"default"`` is rejected (422) — the per-tenant default project
+        is auto-created by storage at first read. ``owner_principal_id``
+        defaults to the caller's principal (``api_key:<key_id>`` today)
+        when omitted; the API layer also writes an initial ``owner``
+        member row so the requesting principal has project-level access
+        from creation.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``admin`` scope
+        * **409** — a project with this name already exists in the tenant
+        * **422** — ``name == "default"`` (reserved)
+        """
+        if body.name.strip().lower() == project_default_name:
+            raise _unprocessable(
+                "project name 'default' is reserved — the per-tenant default "
+                "project is created automatically on first use"
+            )
+        store: StorageProvider = request.app.state.storage
+        owner_principal = body.owner_principal_id or _principal_from_auth(ctx)
+        project = Project(
+            tenant_id=ctx.tenant_id,
+            name=body.name,
+            description=body.description,
+            owner_principal_id=owner_principal,
+        )
+        try:
+            created = await store.create_project(project)
+        except ValueError as exc:
+            raise conflict(str(exc)) from None
+        # Initial owner membership: the creator (or the explicit
+        # ``owner_principal_id``) gets an ``owner`` row so the
+        # "non-admin owner can mutate their own project" gate has
+        # something to bind to (D4). Suppress the storage layer's
+        # duplicate-row ValueError — possible if a caller-supplied
+        # ``owner_principal_id`` collides with the same auth principal
+        # (the create is otherwise idempotent for that case).
+        with contextlib.suppress(ValueError):
+            await store.add_project_member(
+                created.project_id,
+                owner_principal,
+                ProjectMemberRole.OWNER,
+                added_by=_principal_from_auth(ctx),
+            )
+        return ProjectView.from_record(created)
+
+    @v1.get(
+        "/projects",
+        response_model=ProjectListResponse,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_projects(
+        request: Request,
+        include_archived: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+        after_id: str | None = Query(default=None),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectListResponse:
+        """List the caller's tenant's projects, newest-first.
+
+        ``include_archived=true`` surfaces soft-deleted projects; the
+        default hides them. ``limit`` + ``after_id`` provide stable
+        keyset pagination (pass the last ``project_id`` from the prior
+        page).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_projects(
+            ctx.tenant_id,
+            include_archived=include_archived,
+            limit=limit,
+            after_id=after_id,
+        )
+        views = [ProjectView.from_record(p) for p in rows]
+        return ProjectListResponse(projects=views, count=len(views))
+
+    @v1.get(
+        "/projects/{project_id}",
+        response_model=ProjectView,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_project(
+        request: Request,
+        project_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Project detail. Archived projects ARE returned (operators may
+        want to inspect them) — filter on the listing endpoint, not here.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        * **404** — no such project in this tenant (same shape for
+          cross-tenant misses — no existence leak)
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        return ProjectView.from_record(project)
+
+    @v1.put(
+        "/projects/{project_id}",
+        response_model=ProjectView,
+        tags=["projects-v1"],
+    )
+    async def v1_update_project(
+        request: Request,
+        project_id: str,
+        body: ProjectUpdateRequest,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Rename / re-describe a project.
+
+        Writes are admitted to callers with the ``admin`` scope OR the
+        ``owner`` role on this specific project (ADR 040 D4 — composes,
+        doesn't replace). Optional ``If-Match: "<etag>"`` opts into
+        optimistic concurrency: 412 if the stored ``updated_at`` no
+        longer matches; absent header → last-write-wins (back-compat).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **409** — rename collision (the new name is taken)
+        * **412** — ``If-Match`` precondition stale
+        * **422** — attempting to rename to the reserved ``"default"``
+        """
+        store: StorageProvider = request.app.state.storage
+        current = await store.get_project(ctx.tenant_id, project_id)
+        if current is None:
+            raise not_found("project", project_id)
+
+        await _require_project_write(request, ctx, project_id)
+
+        if if_match is not None:
+            expected = _normalize_if_match(if_match)
+            if expected != current.updated_at.isoformat():
+                raise _precondition_failed(
+                    f"project {project_id!r} was updated concurrently: "
+                    f"If-Match {expected!r} no longer matches the current "
+                    "version — re-fetch and retry",
+                )
+
+        if body.name is not None and body.name.strip().lower() == project_default_name:
+            raise _unprocessable("project name 'default' is reserved and cannot be assigned")
+
+        try:
+            updated = await store.update_project(
+                ctx.tenant_id,
+                project_id,
+                name=body.name,
+                description=body.description,
+            )
+        except ValueError as exc:
+            raise conflict(str(exc)) from None
+        if updated is None:
+            # Lost a race with archive / cross-tenant — re-raise as 404.
+            raise not_found("project", project_id)
+        return ProjectView.from_record(updated)
+
+    @v1.delete(
+        "/projects/{project_id}",
+        response_model=ProjectView,
+        tags=["projects-v1"],
+    )
+    async def v1_archive_project(
+        request: Request,
+        project_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectView:
+        """Soft-delete (archive) a project.
+
+        The per-tenant default project (``name == "default"``) cannot be
+        archived (422) — it absorbs unattached resources for D5 back-compat.
+        Idempotent: re-archiving an already-archived project is a no-op
+        that still returns the (already-archived) detail view.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **422** — attempting to archive the default project
+        """
+        store: StorageProvider = request.app.state.storage
+        current = await store.get_project(ctx.tenant_id, project_id)
+        if current is None:
+            raise not_found("project", project_id)
+
+        await _require_project_write(request, ctx, project_id)
+
+        if current.name == project_default_name:
+            raise _unprocessable(
+                "the per-tenant 'default' project cannot be archived — it "
+                "absorbs unattached agents/workflows"
+            )
+
+        try:
+            await store.archive_project(ctx.tenant_id, project_id)
+        except ValueError as exc:
+            # Defense in depth — storage independently rejects the
+            # default project; surface it as the same 422.
+            raise _unprocessable(str(exc)) from None
+        # Re-read to return the post-archive detail (the archived_at
+        # field is the meaningful return shape).
+        archived = await store.get_project(ctx.tenant_id, project_id)
+        # Re-read can only return None if a concurrent deletion fully
+        # purged the row, which the soft-delete contract doesn't do —
+        # but defend the type contract anyway.
+        if archived is None:  # pragma: no cover - defensive
+            raise not_found("project", project_id)
+        return ProjectView.from_record(archived)
+
+    # -- Members -------------------------------------------------------
+
+    @v1.get(
+        "/projects/{project_id}/members",
+        response_model=ProjectMemberListView,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_project_members(
+        request: Request,
+        project_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberListView:
+        """List the project's members (creation order).
+
+        Tenant-scoped — the project lookup runs the same no-leak 404
+        contract as the project detail endpoint.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        * **404** — no such project in this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        members = await store.list_project_members(project_id)
+        return ProjectMemberListView(
+            members=[ProjectMemberView.from_record(m) for m in members],
+            count=len(members),
+        )
+
+    @v1.post(
+        "/projects/{project_id}/members",
+        response_model=ProjectMemberView,
+        status_code=201,
+        tags=["projects-v1"],
+    )
+    async def v1_add_project_member(
+        request: Request,
+        project_id: str,
+        body: ProjectMemberAddRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberView:
+        """Invite a principal to the project with a role.
+
+        Membership mutations are admin-scope-OR-owner-role gated (same
+        composed gate as project PUT/DELETE). ``added_by`` is the
+        caller's principal (audit attribution distinct from the project
+        owner field).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **409** — principal is already a member of this project
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        await _require_project_write(request, ctx, project_id)
+        try:
+            await store.add_project_member(
+                project_id,
+                body.principal_id,
+                body.role,
+                added_by=_principal_from_auth(ctx),
+            )
+        except ValueError as exc:
+            raise conflict(str(exc)) from None
+        member = await store.get_project_member(project_id, body.principal_id)
+        if member is None:  # pragma: no cover - defensive
+            raise not_found("project member", body.principal_id)
+        return ProjectMemberView.from_record(member)
+
+    @v1.get(
+        "/projects/{project_id}/members/{principal_id}",
+        response_model=ProjectMemberView,
+        tags=["projects-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_project_member(
+        request: Request,
+        project_id: str,
+        principal_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberView:
+        """Get one project member by principal id.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        * **404** — no such project in this tenant OR no such member
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        member = await store.get_project_member(project_id, principal_id)
+        if member is None:
+            raise not_found("project member", principal_id)
+        return ProjectMemberView.from_record(member)
+
+    @v1.patch(
+        "/projects/{project_id}/members/{principal_id}",
+        response_model=ProjectMemberView,
+        tags=["projects-v1"],
+    )
+    async def v1_update_project_member(
+        request: Request,
+        project_id: str,
+        principal_id: str,
+        body: ProjectMemberPatchRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ProjectMemberView:
+        """Change a member's role (e.g. viewer → editor → owner).
+
+        Rejects demotions that would leave the project with zero
+        ``owner`` members (422); the storage layer is permissive by
+        design (last-write-wins; the API enforces the social contract).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant OR no such member
+        * **422** — would remove the project's last ``owner``
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        await _require_project_write(request, ctx, project_id)
+        existing = await store.get_project_member(project_id, principal_id)
+        if existing is None:
+            raise not_found("project member", principal_id)
+        if existing.role == ProjectMemberRole.OWNER and body.role != ProjectMemberRole.OWNER:
+            members = await store.list_project_members(project_id)
+            owner_count = sum(1 for m in members if m.role == ProjectMemberRole.OWNER)
+            if owner_count <= 1:
+                raise _unprocessable(
+                    "cannot demote the last 'owner' on a project — promote another member first",
+                )
+        updated = await store.update_project_member(
+            project_id,
+            principal_id,
+            role=body.role,
+        )
+        if updated is None:  # pragma: no cover - defensive race
+            raise not_found("project member", principal_id)
+        return ProjectMemberView.from_record(updated)
+
+    @v1.delete(
+        "/projects/{project_id}/members/{principal_id}",
+        status_code=204,
+        tags=["projects-v1"],
+    )
+    async def v1_remove_project_member(
+        request: Request,
+        project_id: str,
+        principal_id: str,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove a member from the project.
+
+        Refuses to remove the last ``owner`` (422). Idempotent — a
+        repeat remove of an already-gone member returns 204 (the
+        post-state is the same: not a member).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks both ``admin`` scope and ``owner`` role
+        * **404** — no such project in this tenant
+        * **422** — would remove the project's last ``owner``
+        """
+        store: StorageProvider = request.app.state.storage
+        project = await store.get_project(ctx.tenant_id, project_id)
+        if project is None:
+            raise not_found("project", project_id)
+        await _require_project_write(request, ctx, project_id)
+        existing = await store.get_project_member(project_id, principal_id)
+        if existing is not None and existing.role == ProjectMemberRole.OWNER:
+            members = await store.list_project_members(project_id)
+            owner_count = sum(1 for m in members if m.role == ProjectMemberRole.OWNER)
+            if owner_count <= 1:
+                raise _unprocessable(
+                    "cannot remove the last 'owner' from a project — promote "
+                    "another member to owner first",
+                )
+        await store.remove_project_member(project_id, principal_id)
+        return Response(status_code=204)
+
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2) — CRUD + attempts feed. The
+    # delivery worker (movate.runtime.webhook_worker) lives alongside
+    # the job worker and consumes these subscriptions out-of-band; the
+    # endpoints below are the management surface only.
+    #
+    # Secret discipline:
+    #
+    # * POST returns the plaintext secret EXACTLY ONCE in
+    #   ``WebhookCreatedView.secret``. Subsequent reads (GET / list /
+    #   PATCH) return ``WebhookView`` which carries only a last-4
+    #   ``secret_hint`` — the secret never re-traverses the wire.
+    # * The HMAC scheme is Stripe-style (t=<ts>,v1=<hmac_hex> over
+    #   ``"<ts>.<raw_body>"`` UTF-8 bytes); subscribers verify against
+    #   the secret they captured on create.
+    #
+    # Scopes: admin for mutation (create/delete/patch — minting or
+    # revoking a long-lived secret is a privileged action, mirroring
+    # api-key + trigger creation); read for the get/list/attempts
+    # views.
+    # ------------------------------------------------------------------
+
+    @v1.post(
+        "/webhooks",
+        response_model=WebhookCreatedView,
+        status_code=201,
+        tags=["webhooks"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_webhook(
+        body: WebhookCreateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WebhookCreatedView:
+        """Subscribe a webhook to lifecycle events (ADR 035 D2).
+
+        Mints a per-subscription HMAC secret and returns it ONCE — copy
+        it now, it is never retransmitted. Subsequent reads surface a
+        ``secret_hint`` (last 4 chars) only.
+
+        The delivery worker (mdk worker process) drains the events
+        outbox and POSTs each matching event to ``url`` with a
+        Stripe-style ``X-MDK-Signature: t=<ts>,v1=<hex>`` header. The
+        canonical signed string is ``"<ts>.<raw_body>"``; subscribers
+        verify by recomputing the HMAC under the stored secret.
+
+        Gated on ``admin`` — creating a subscription mints a long-
+        lived secret credential (same posture as api-key + trigger
+        create).
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **422** — non-HTTPS URL / malformed ``kind_filter``
+        """
+        store: StorageProvider = request.app.state.storage
+        sub = WebhookSubscription(
+            tenant_id=ctx.tenant_id,
+            url=body.url,
+            kind_filter=body.kind_filter,
+            enabled=body.enabled,
+        )
+        await store.create_webhook(sub)
+        return WebhookCreatedView.from_record(sub)
+
+    @v1.get(
+        "/webhooks",
+        response_model=WebhookListView,
+        tags=["webhooks"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_webhooks(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        include_disabled: bool = Query(
+            True,
+            description=(
+                "Include disabled subscriptions. Default true (the management view "
+                "wants to see what's there); the delivery worker uses the in-process "
+                "Protocol with ``enabled_only=True``."
+            ),
+        ),
+    ) -> WebhookListView:
+        """List this tenant's webhook subscriptions (no full secrets).
+
+        Each row carries a last-4 ``secret_hint`` only — the full
+        secret is irrecoverable from this surface.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_webhooks(ctx.tenant_id, enabled_only=not include_disabled)
+        views = [WebhookView.from_record(r) for r in rows]
+        return WebhookListView(webhooks=views, count=len(views))
+
+    @v1.get(
+        "/webhooks/{webhook_id}",
+        response_model=WebhookView,
+        tags=["webhooks"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_webhook(
+        webhook_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WebhookView:
+        """Fetch one webhook by id (no full secret).
+
+        Tenant-scoped: a webhook under another tenant 404s rather than
+        403s — same no-leak contract as every other single-record
+        getter.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no webhook with this id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        row = await store.get_webhook(ctx.tenant_id, webhook_id)
+        if row is None:
+            raise not_found("webhook", webhook_id)
+        return WebhookView.from_record(row)
+
+    @v1.delete(
+        "/webhooks/{webhook_id}",
+        status_code=204,
+        tags=["webhooks"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_webhook(
+        webhook_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Response:
+        """Remove a webhook subscription.
+
+        Idempotent: deleting a non-existent subscription still returns
+        204. Tenant-scoped (a cross-tenant id is a 204 no-op, never a
+        cross-tenant delete). Gated on ``admin`` — it revokes the
+        long-lived signing credential.
+
+        The historical ``webhook_attempts`` log rows are intentionally
+        kept (operators may want post-mortem on a removed webhook);
+        a later GC sweep can prune them.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        await store.delete_webhook(ctx.tenant_id, webhook_id)
+        return Response(status_code=204)
+
+    @v1.patch(
+        "/webhooks/{webhook_id}",
+        response_model=WebhookView,
+        tags=["webhooks"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_update_webhook(
+        webhook_id: str,
+        body: WebhookUpdateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> WebhookView:
+        """Toggle a webhook's ``enabled`` flag.
+
+        Only ``enabled`` is mutable on this endpoint. URL / kind_filter
+        changes belong in delete+recreate so the audit log + secret
+        story stay explicit about a subscriber rewire.
+
+        ``failure_count`` is bumped by the delivery worker; operators
+        clear it (when they will at all) via delete+recreate.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``admin`` scope
+        * **404** — no webhook with this id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        updated = await store.update_webhook(ctx.tenant_id, webhook_id, enabled=body.enabled)
+        if updated is None:
+            raise not_found("webhook", webhook_id)
+        return WebhookView.from_record(updated)
+
+    @v1.get(
+        "/webhooks/{webhook_id}/attempts",
+        response_model=WebhookAttemptListView,
+        tags=["webhooks"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_webhook_attempts(
+        webhook_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        since: datetime | None = Query(
+            None,
+            description="ISO-8601 lower bound on ``attempted_at`` (inclusive).",
+        ),
+        limit: int = Query(
+            100,
+            ge=1,
+            le=500,
+            description="Page size; capped at 500.",
+        ),
+    ) -> WebhookAttemptListView:
+        """List recent delivery attempts for ``webhook_id``.
+
+        Newest-first. Each row carries ``status_code`` / ``error_kind``
+        / ``response_excerpt`` (truncated to ~512 chars) so an ops
+        dashboard can render flake patterns at a glance. Tenant-scoped
+        — a webhook under another tenant 404s.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no webhook with this id for this tenant
+        * **422** — ``limit`` outside ``[1, 500]``
+        """
+        store: StorageProvider = request.app.state.storage
+        # Verify the webhook exists for this tenant before exposing
+        # any attempts — protects against a leak via a guessed id.
+        webhook = await store.get_webhook(ctx.tenant_id, webhook_id)
+        if webhook is None:
+            raise not_found("webhook", webhook_id)
+        rows = await store.list_webhook_attempts(
+            ctx.tenant_id,
+            webhook_id=webhook_id,
+            since=since,
+            limit=limit,
+        )
+        views = [WebhookAttemptView.from_record(r) for r in rows]
+        return WebhookAttemptListView(attempts=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # GET /api/v1/events/stream — SSE event-stream (ADR 035 D3)
+    #
+    # Companion to ``GET /api/v1/events`` (D1's pull surface). Subscribers
+    # hold a long-lived HTTP connection; new events are pushed as they're
+    # recorded. Both endpoints read the SAME outbox — D2's webhook worker
+    # consumes it too — so emitters stay unchanged (the recorder is
+    # fire-and-forget and never knows about subscribers).
+    #
+    # D3 is the LOW-latency path; D2 webhooks are the durable+retried
+    # path. They coexist deliberately: a browser front end uses SSE for
+    # in-product realtime, a customer system uses webhooks for at-least-
+    # once delivery to its own systems.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/events/stream",
+        tags=["events-v1"],
+        dependencies=[_scope("read")],
+        # No response_model — raw SSE byte stream (text/event-stream),
+        # not a JSON body. OpenAPI documents the event shape in the
+        # docstring; the response content-type is declared via
+        # ``responses=`` below so the generated spec advertises it for
+        # client codegen.
+        responses={
+            200: {
+                "description": (
+                    "Live stream of lifecycle events as Server-Sent Events. Each frame is "
+                    "an ``EventView`` JSON object on a ``data:`` line; SSE comments "
+                    "(``:keepalive``) keep the connection open."
+                ),
+                "content": {"text/event-stream": {}},
+            },
+            503: {
+                "description": (
+                    "Per-tenant SSE connection cap reached (``MDK_EVENTS_SSE_MAX_PER_TENANT``)."
+                )
+            },
+        },
+    )
+    async def v1_events_stream(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        since: datetime | None = Query(
+            None,
+            description=(
+                "ISO-8601 lower bound on ``created_at`` (inclusive). When set, "
+                "the stream FIRST replays events recorded at-or-after this "
+                "timestamp, then goes live. Default: no replay — only new "
+                "events emitted while the connection is open are pushed."
+            ),
+        ),
+        kind: str | None = Query(
+            None,
+            description=(
+                "Filter to one event kind (e.g. ``run.completed``). Applies "
+                "to both the replay window and the live push loop."
+            ),
+        ),
+        subject: str | None = Query(
+            None,
+            description=(
+                "Filter to one subject (agent name / run id / etc.). "
+                "Exact match; applies to replay + live."
+            ),
+        ),
+        tenant: str | None = Query(
+            None,
+            description=(
+                "Operator override: stream events for a specific tenant. "
+                "Requires a ``fleet-admin`` key; ignored otherwise."
+            ),
+        ),
+        last_event_id: str | None = Header(
+            None,
+            alias="Last-Event-ID",
+            description=(
+                "SSE-standard resumption header. If set, the stream first "
+                "replays any events recorded AFTER the id (using it as the "
+                "outbox cursor), then goes live — so a reconnecting client "
+                "misses no events between the drop and the redial."
+            ),
+        ),
+    ) -> StreamingResponse:
+        """Stream lifecycle events as **Server-Sent Events** (ADR 035 D3).
+
+        Tenant-scoped by the caller's ``ctx.tenant_id``; a ``fleet-admin``
+        key may pass ``?tenant=<id>`` to subscribe to a different
+        tenant. Same auth / scoping shape as ``GET /api/v1/events``.
+
+        **Frame shape.** Each event is emitted as a single SSE frame:
+
+        ``id: <event_id>\\n``
+        ``data: <EventView JSON>\\n``
+        ``\\n``
+
+        The ``id:`` field is the event's outbox id; a reconnecting
+        client SHOULD send it back as the ``Last-Event-ID`` header to
+        resume without gaps. Heartbeats are SSE comments (``:keepalive``)
+        emitted every ~15s so intermediaries (Azure Front Door /
+        Application Gateway / nginx) don't close an idle connection.
+
+        **Replay semantics.** ``since`` (timestamp) or ``Last-Event-ID``
+        (cursor) trigger a one-shot replay of matching events before the
+        live loop starts. Without either, only events recorded AFTER the
+        connection opens are pushed (no backfill — matches the
+        front-end's "from now on" expectation).
+
+        **Polling cadence.** The handler polls the outbox every ~500ms
+        and advances its cursor by id. This is intentional — the
+        recorder is fire-and-forget and doesn't know about subscribers,
+        so D3 stays decoupled from emit. Postgres ``LISTEN/NOTIFY`` is
+        the documented upgrade path when scale demands it.
+
+        **Per-tenant cap.** Subscribers per tenant are capped (default
+        50, override ``MDK_EVENTS_SSE_MAX_PER_TENANT``) to prevent a
+        runaway client from owning the pool. A connection over the cap
+        is rejected with ``503``.
+
+        **Disconnect.** The async generator polls
+        ``request.is_disconnected()`` between iterations; a client TCP
+        drop unwinds the loop cleanly and the connection counter
+        decrements in the ``finally`` block — no leaked subscribers.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``read`` scope
+        * **503** — per-tenant connection cap reached
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # Tenant scope — fleet-admin may override; non-admin is silently
+        # locked to their own tenant (matches GET /api/v1/events).
+        target_tenant = ctx.tenant_id
+        if tenant is not None and "fleet-admin" in ctx.scopes:
+            target_tenant = tenant
+
+        # Resolve poll / heartbeat / cap from app.state (so tests can
+        # override) with module-default fall-throughs. Reading via
+        # getattr keeps the contract for build_app callers that haven't
+        # set these explicitly byte-identical.
+        poll_interval_s: float = getattr(
+            request.app.state, "events_sse_poll_interval_s", _EVENTS_SSE_POLL_INTERVAL_S
+        )
+        heartbeat_interval_s: float = getattr(
+            request.app.state,
+            "events_sse_heartbeat_interval_s",
+            _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
+        )
+        max_per_tenant: int = _events_sse_max_per_tenant()
+
+        # Per-tenant connection cap (advisory). Take the lock for the
+        # check + increment so a burst of concurrent opens can't race
+        # past the ceiling. The matching decrement runs in the
+        # generator's ``finally`` block below — guaranteed even on
+        # client disconnect.
+        connections: dict[str, int] = request.app.state.events_sse_connections
+        lock: asyncio.Lock = request.app.state.events_sse_lock
+        async with lock:
+            current = connections.get(target_tenant, 0)
+            if current >= max_per_tenant:
+                import logging  # noqa: PLC0415
+
+                logging.getLogger(__name__).warning(
+                    "events_sse_cap_exceeded tenant_id=%s active=%d cap=%d",
+                    target_tenant,
+                    current,
+                    max_per_tenant,
+                )
+                raise http_error(
+                    ErrorCode.INTERNAL,
+                    status_code=503,
+                    message=(
+                        f"events SSE connection cap reached for tenant "
+                        f"(active={current}, cap={max_per_tenant})"
+                    ),
+                )
+            connections[target_tenant] = current + 1
+
+        # OTel UpDownCounter — incremented on accept, decremented in the
+        # wrapper's finally so even a disconnect mid-loop drops it.
+        inc_sse_connections(tenant_id=target_tenant)
+
+        async def _streaming_wrapper() -> AsyncIterator[str]:
+            """Wrap the testable generator with the cap/metric finally.
+
+            The generator itself is :func:`_events_sse_generator` — a
+            top-level async generator unit-tested without the HTTP
+            transport. This wrapper layers in the per-tenant counter
+            decrement + OTel metric decrement on exit (which depend on
+            ``request.app.state`` and must run for ANY exit reason
+            including client disconnect)."""
+            try:
+                async for frame in _events_sse_generator(
+                    store=store,
+                    target_tenant=target_tenant,
+                    kind=kind,
+                    subject=subject,
+                    since=since,
+                    last_event_id=last_event_id,
+                    poll_interval_s=poll_interval_s,
+                    heartbeat_interval_s=heartbeat_interval_s,
+                    is_disconnected=request.is_disconnected,
+                ):
+                    yield frame
+            finally:
+                # ALWAYS run — happy exit, disconnect, or exception.
+                # A leak here turns the advisory cap into a fake
+                # ceiling within minutes.
+                async with lock:
+                    connections[target_tenant] = max(0, connections.get(target_tenant, 0) - 1)
+                dec_sse_connections(tenant_id=target_tenant)
+
+        return StreamingResponse(
+            _streaming_wrapper(),
+            media_type="text/event-stream",
+            headers={
+                # Defeat any intermediary buffering so events reach the
+                # client as they're emitted (matters behind nginx /
+                # Azure Front Door — mirrors the run-stream endpoint).
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     app.include_router(v1)
 
     # ------------------------------------------------------------------
@@ -7098,13 +13146,19 @@ def build_app(
     async def _agent_creation_error_handler(
         _request: Request, exc: AgentCreationError
     ) -> JSONResponse:
+        code = _agent_creation_error_code(exc.status_code)
         return JSONResponse(
             status_code=exc.status_code,
             content={
                 "detail": {
                     "error": {
-                        "code": _agent_creation_error_code(exc.status_code),
+                        "code": code,
                         "message": str(exc),
+                        # Self-teaching (additive): same registry the central
+                        # envelope uses, so these custom-handler codes carry
+                        # consistent docs_url / fix_hint / retriable. Unknown
+                        # code → {} → byte-identical to the prior body.
+                        **enrich_error_fields(code),
                     }
                 }
             },
@@ -7118,6 +13172,28 @@ def build_app(
     async def _skill_creation_error_handler(
         _request: Request, exc: SkillCreationError
     ) -> JSONResponse:
+        code = _agent_creation_error_code(exc.status_code)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": {
+                    "error": {
+                        "code": code,
+                        "message": str(exc),
+                        # Self-teaching (additive) — see the agent handler above.
+                        **enrich_error_fields(code),
+                    }
+                }
+            },
+        )
+
+    # ADR 037 D1: WorkflowPersistenceError uses the same status_code → wire-
+    # code mapping as the agent/skill counterparts so the Angular front end
+    # branches uniformly on ``error.code``.
+    @app.exception_handler(WorkflowPersistenceError)
+    async def _workflow_persistence_error_handler(
+        _request: Request, exc: WorkflowPersistenceError
+    ) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
             content={
@@ -7129,6 +13205,64 @@ def build_app(
                 }
             },
         )
+
+    # ------------------------------------------------------------------
+    # OpenAPI patch — register schemas that the KB ingest route's JSON
+    # discriminated union references via ``$ref`` (the route reads the
+    # body manually, so FastAPI doesn't auto-walk these models). Without
+    # this the generated TS client wouldn't have types for the
+    # ``KbIngest{Text,Url,Generated}Request`` shapes the front end
+    # POSTs. See ``test_kb_ingest_exposes_three_json_modes`` in
+    # ``tests/test_front_end_api_contract.py``.
+    #
+    # ADR 033 D7 (response-envelope ergonomics) layers a SECOND additive
+    # patch on top of this one: the error envelope (``ErrorResponse`` /
+    # ``ErrorBody``) isn't a per-endpoint ``response_model`` so FastAPI
+    # never emits it. Both patches are idempotent + non-clobbering and
+    # chain through ``_default_openapi`` → ``_patched_openapi`` → the
+    # error-schema wrapper so neither set of schemas is lost.
+    # ------------------------------------------------------------------
+    from fastapi.openapi.utils import get_openapi  # noqa: PLC0415
+
+    _default_openapi = app.openapi
+
+    def _patched_openapi() -> dict[str, Any]:
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = _default_openapi()
+        components = schema.setdefault("components", {}).setdefault("schemas", {})
+        for model_cls in (
+            KbIngestTextRequest,
+            KbIngestUrlRequest,
+            KbIngestGeneratedRequest,
+        ):
+            if model_cls.__name__ not in components:
+                model_schema = model_cls.model_json_schema(
+                    ref_template="#/components/schemas/{model}"
+                )
+                # Pydantic includes a per-model ``$defs`` block; merge
+                # any referenced sub-models into the components map and
+                # drop the inner ``$defs`` so the spec stays flat.
+                for ref_name, ref_schema in (model_schema.pop("$defs", {}) or {}).items():
+                    components.setdefault(ref_name, ref_schema)
+                components[model_cls.__name__] = model_schema
+        # ADR 033 D7: also graft the error-envelope models in (additive,
+        # only if absent) so the documented error shape — including the
+        # optional self-teaching fields — reaches the generated TS client.
+        for model in (ErrorBody, ErrorResponse):
+            name = model.__name__
+            if name not in components:
+                components[name] = model.model_json_schema(
+                    ref_template="#/components/schemas/{model}"
+                )
+        app.openapi_schema = schema
+        return schema
+
+    # Quiet the unused-import linter for the helper above — kept the
+    # explicit import so the intent is grep-able even though we only
+    # use the schema-walker via the wrapper.
+    _ = get_openapi
+    app.openapi = _patched_openapi  # type: ignore[method-assign]
 
     return app
 

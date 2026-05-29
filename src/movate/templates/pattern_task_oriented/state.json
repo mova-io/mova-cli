@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Task-Oriented workflow state",
+  "description": "Threaded state for the bounded supervisor fan-out pattern.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["request"],
+  "properties": {
+    "request": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The user request the supervisor decomposes."
+    },
+    "plan": {
+      "type": "string",
+      "description": "The supervisor's decomposition of the request into the two capped tasks."
+    },
+    "task_a_result": {
+      "type": "string",
+      "description": "Output of task branch A."
+    },
+    "task_b_result": {
+      "type": "string",
+      "description": "Output of task branch B."
+    },
+    "answer": {
+      "type": "string",
+      "description": "The collector's aggregated final answer."
+    }
+  }
+}

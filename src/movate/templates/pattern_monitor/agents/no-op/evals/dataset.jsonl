@@ -1,0 +1,2 @@
+{"input": {"metric": "cpu=41%"}, "expected": {"status": "ok: within threshold, no action taken"}}
+{"input": {"metric": "error_rate=0.01"}, "expected": {"status": "ok: within threshold, no action taken"}}

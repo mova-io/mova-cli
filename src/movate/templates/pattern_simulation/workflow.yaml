@@ -1,0 +1,116 @@
+api_version: movate/v1
+kind: Workflow
+
+# =============================================================================
+# Simulation pattern (ADR 038) — BOUNDED multi-agent simulation (NOT a swarm)
+# =============================================================================
+# A FIXED roster of two participant agents interacts under a SUPERVISOR for a
+# HARD-CAPPED number of turns, terminating on a JUDGE verdict OR the turn cap.
+#
+# WHY THIS IS BOUNDED (and an open swarm is not) — the headline:
+#   ADR 038 D5 / Tier-3 explicitly DECLINES open swarms, autonomous
+#   collaboration, debate, and recursive spawning: they are not
+#   observable + evaluable + bounded + deployable. This pattern is the governed
+#   alternative. The bounds are STRUCTURAL, not advisory:
+#     * FIXED ROSTER: exactly TWO participants (participant-a, participant-b).
+#       No node can spawn another agent — adding one is a reviewable edit to
+#       this file, never a runtime decision.
+#     * HARD TURN CAP = 2: the interaction is UNROLLED to two turns. After the
+#       last turn every route leads to a terminal — there is no path back to a
+#       participant, so no unbounded back-and-forth.
+#     * TERMINATING GATE: each turn-gate is the JUDGE — it is the only way a
+#       turn ends (``resolved`` → done, ``continue`` → next turn or, at the cap,
+#       a terminal). The native runner (ADR 017) forbids cycles, so a runaway
+#       simulation is impossible by construction.
+#     * HARD BUDGET CAP: every node carries budget.max_cost_usd_per_run; the sum
+#       is the simulation's effective ceiling.
+#     * FULL INTERACTION TRACE: the runner opens one workflow-root span and
+#       nests every participant/judge turn under it.
+#
+# Mock note: under --mock each gate takes the first sorted route key
+# (``continue``), so the smoke walks BOTH turns and exits at ``done-capped`` —
+# exercising the full bounded simulation and the turn cap.
+
+name: simulation
+version: 0.1.0
+description: >
+  Bounded multi-agent simulation: a fixed roster of two participants interacts
+  under a supervisor for a hard-capped number of turns, terminating on a JUDGE
+  or the turn cap. NOT an open swarm.
+owner: ""
+
+state_schema: ./state.json
+entrypoint: supervisor
+
+nodes:
+  # SUPERVISOR — frames the scenario the fixed roster will play out.
+  - id: supervisor
+    type: agent
+    ref: ./agents/supervisor
+  # Turn 1 — participant A then participant B (the FIXED roster).
+  - id: turn-1-a
+    type: agent
+    ref: ./agents/participant-a
+  - id: turn-1-b
+    type: agent
+    ref: ./agents/participant-b
+  # JUDGE/GATE 1 — terminates turn 1 (resolved) or continues to turn 2.
+  - id: turn-gate-1
+    type: intent-router
+    classifier_agent: ./agents/turn-judge
+    input_field: transcript
+    routes:
+      continue: turn-2-a
+      resolved: done-resolved-early
+    fallback: done-resolved-early
+  # Turn 2 — the LAST turn (hard turn cap = 2).
+  - id: turn-2-a
+    type: agent
+    ref: ./agents/participant-a
+  - id: turn-2-b
+    type: agent
+    ref: ./agents/participant-b
+  # JUDGE/GATE 2 — at the turn cap there is no path back to a participant.
+  - id: turn-gate-2
+    type: intent-router
+    classifier_agent: ./agents/turn-judge
+    input_field: transcript
+    routes:
+      continue: done-capped
+      resolved: done-resolved-late
+    fallback: done-capped
+  # Terminal: resolved by the JUDGE on turn 1.
+  - id: done-resolved-early
+    type: agent
+    ref: ./agents/done
+  # Terminal: resolved by the JUDGE on turn 2.
+  - id: done-resolved-late
+    type: agent
+    ref: ./agents/done
+  # Terminal: turn cap reached (the bound, not resolution, ended it).
+  - id: done-capped
+    type: agent
+    ref: ./agents/done
+
+edges:
+  - from: supervisor
+    to: turn-1-a
+  - from: turn-1-a
+    to: turn-1-b
+  - from: turn-1-b
+    to: turn-gate-1
+  - from: turn-2-a
+    to: turn-2-b
+  - from: turn-2-b
+    to: turn-gate-2
+
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+tags:
+  - pattern:simulation
+  - governed
+  - bounded
+  - fixed-roster
+  - turn-cap

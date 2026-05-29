@@ -1,0 +1,8 @@
+title: Conversational chatbot
+description: Single message to single reply, memory-aware. Designed for `mdk chat` with history.
+shape: agent
+tags:
+  - chat
+  - conversational
+  - stateful
+recommended_for: A multi-turn assistant where prior turns inform the next reply (REPL-style).

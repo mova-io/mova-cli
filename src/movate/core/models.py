@@ -1489,6 +1489,19 @@ class JobStatus(StrEnum):
     Operators triage with ``movate jobs list --status cancelled``.
     """
 
+    @property
+    def is_terminal(self) -> bool:
+        """True once the job will not change state again.
+
+        Non-terminal = ``QUEUED`` / ``RUNNING`` (the worker is still
+        going to touch it). Everything else — ``SUCCESS``, ``ERROR``,
+        ``SAFETY_BLOCKED``, ``DEAD_LETTER``, ``CANCELLED`` — is a final
+        resting state. This is the same QUEUED/RUNNING split the batch
+        status endpoint and the client poll loop already use; centralised
+        here so the long-poll handler and they agree by construction.
+        """
+        return self not in (JobStatus.QUEUED, JobStatus.RUNNING)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -2147,6 +2160,127 @@ class BenchRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Audit records — Claude-orchestrated read-only audit of an agent / project
+# (BACKLOG ``audit-llm``). Stored alongside the other terminal records
+# (Eval/Bench) so the wire shape mirrors them: the queue carries the
+# JobRecord, the terminal artifact is a separate ``AuditRecord`` keyed by
+# ``audit_id`` and fetched via GET /api/v1/audits/{audit_id}.
+#
+# Read-only invariant: the auditor only READS the agent bundle, KB chunks,
+# and run history. It NEVER calls save_agent_bundle / save_kb_chunk /
+# save_eval / etc. — enforced by the dispatch wiring (no mutating storage
+# calls from inside the dispatch path beyond persisting the AuditRecord
+# itself).
+# ---------------------------------------------------------------------------
+
+
+class AuditFindingSeverity(StrEnum):
+    """Severity ladder for an audit finding. Ordered low → high so the
+    severity-floor filter is a simple ``>=`` comparison.
+    """
+
+    INFO = "info"
+    WARN = "warn"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class AuditFindingLocation(BaseModel):
+    """Where a finding is anchored in an agent's source.
+
+    ``kind`` is a discriminator the renderer uses to format the jump-hint:
+    ``prompt_line`` → ``prompt.md:<line>``; ``schema_path`` → ``schema/<file>:<json_pointer>``;
+    ``dataset_row`` → ``evals/dataset.jsonl:<row>``; ``yaml_field`` → ``agent.yaml:<dotted.path>``;
+    ``kb_chunk`` → ``kb/<source>#<chunk_id>``. ``None`` for findings that
+    aren't anchored to a specific spot (e.g. project-wide cost outliers).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    line: int | None = None
+    path: str | None = None
+    """JSON pointer / dotted YAML path / source URI, depending on ``kind``."""
+    chunk_id: str | None = None
+
+
+class AuditFinding(BaseModel):
+    """One typed, severity-classified audit finding.
+
+    Read-only output of the per-category sub-agent. The Auditor never
+    mutates anything; findings are *advisory* — operators decide whether
+    to act on them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    """Stable per-audit id (``f1``, ``f2``, ...) so callers can reference one
+    finding in follow-up workflows."""
+    category: str
+    """One of the seven categories the Auditor ships (see
+    :mod:`movate.core.auditor`): ``ambiguous_prompts``, ``missing_eval_coverage``,
+    ``security_smells``, ``cost_outliers``, ``kb_quality``, ``schema_drift``,
+    ``model_choice``. Open vocabulary so future categories slot in additively."""
+    severity: AuditFindingSeverity
+    agent_name: str
+    """Which agent the finding is scoped to. For project-wide findings that
+    don't belong to one agent, the Auditor stamps this with ``"<project>"``
+    so the wire stays uniform."""
+    location: AuditFindingLocation | None = None
+    title: str
+    description: str
+    suggestion: str
+    """One-line operator-facing remediation suggestion. ALWAYS advisory —
+    never an auto-applied fix."""
+    confidence: str = "medium"
+    """``low`` | ``medium`` | ``high`` — the sub-agent's self-rated
+    confidence. Used by the CLI to grey out low-confidence findings on the
+    default rendering."""
+
+
+class AuditRecord(BaseModel):
+    """Persisted summary of one Claude-orchestrated audit job.
+
+    Mirrors :class:`EvalRecord` / :class:`BenchRecord` in shape so the
+    storage layer treats audit results identically (one immutable row
+    per terminal audit, tenant-scoped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    audit_id: str
+    tenant_id: str
+    scope_kind: str
+    """``"agent"`` for an agent-scoped audit, ``"project"`` for a project-wide
+    audit. Discriminator paired with :attr:`scope_id`."""
+    scope_id: str
+    """The agent name (when ``scope_kind == "agent"``) or the project id
+    (when ``scope_kind == "project"``)."""
+    categories: list[str]
+    """The categories the auditor was asked to run (after request validation
+    + default-fill). Stored so the GET endpoint can echo it back."""
+    severity_floor: AuditFindingSeverity = AuditFindingSeverity.INFO
+    """Findings below this floor were filtered out before persistence."""
+    model: str
+    """The provider string the sub-agents ran against (e.g.
+    ``openai/gpt-4o-mini``). Stored for reproducibility."""
+    budget_usd: float = Field(0.0, ge=0)
+    """Server-side spend cap for the audit. ``0.0`` means "no cap" (the
+    submission left it unset)."""
+    findings: list[AuditFinding] = Field(default_factory=list)
+    """Severity-floored, deduplicated findings — the only mutating output of
+    the audit."""
+    partial: bool = False
+    """``True`` if the budget cap (or another short-circuit) fired before
+    every requested category completed. Callers can re-run the missing
+    categories explicitly when they have more budget."""
+    tokens_used: int = 0
+    cost_usd: float = 0.0
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
 # Durable agent registry (ADR 014 D1) — a published agent bundle persisted
 # as one immutable (name, version) row behind the StorageProvider Protocol.
 #
@@ -2193,6 +2327,53 @@ class AgentBundleRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class WorkflowBundleRecord(BaseModel):
+    """One published, versioned **workflow** bundle (ADR 037 — workflow API parity).
+
+    Workflow analogue of :class:`AgentBundleRecord`. A row is immutable: each
+    publish of a workflow writes a new ``(name, tenant_id, version)`` row, so
+    the table doubles as the version history. Tenant-scoped like every other
+    durable record.
+
+    The ``files`` map carries the workflow's canonical files (``workflow.yaml``,
+    ``schema/state.json``, and any other relative-path files the workflow.yaml
+    references) keyed by POSIX-style relative path. Excludes runs / KB.
+
+    ``published`` is the soft "promote-this-version" flag exercised by
+    :class:`StorageProvider.publish_workflow_version` (ADR 037 D1) — at most
+    one version per ``(tenant, name)`` is ``published=True``; the rest are
+    drafts. The newest version (by ``created_at``) is what a versionless
+    resolve returns regardless of this flag — ``published`` is the operator's
+    "this one's blessed" pointer, distinct from "latest".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """The workflow name (``workflow.yaml`` ``name``) — paired with
+    ``version`` as the registry key."""
+    tenant_id: str
+    version: str
+    """The bundle's ``workflow.yaml`` version. ``(name, tenant_id, version)``
+    is unique; a new publish bumps this and writes a new row."""
+    created_by: str | None = None
+    """Auth identity that published this version (ADR 013), or ``None`` for a
+    system/seed import. Drives the "who published what when" audit."""
+    content_hash: str
+    """Content-addressed hash of the bundle (over ``files``), so an unchanged
+    re-publish is detectable and a version can be verified."""
+    files: dict[str, str]
+    """The bundle's text files keyed by relative path, e.g.
+    ``workflow.yaml``, ``schema/state.json``. JSON-serializable
+    (path -> file contents)."""
+    published: bool = False
+    """ADR 037 D1 — operator promote/revert flag. At most one version per
+    ``(tenant, name)`` is ``True``; a publish sets this and clears it on every
+    other version of the same name. Independent of "latest" (newest by
+    ``created_at``)."""
+    created_at: datetime = Field(default_factory=_now)
+
+
 # ---------------------------------------------------------------------------
 # Job queue (v0.5+)
 #
@@ -2226,6 +2407,25 @@ class JobKind(StrEnum):
     EVAL, ``result_run_id`` carries the produced ``bench_id`` so the
     caller can fetch the completed BenchRecord via
     GET /api/v1/bench/{bench_id}. See BACKLOG item 64."""
+    OBSERVABILITY_ANALYZE = "observability_analyze"
+    """Overnight observability analyst (ADR 047). JobRecord.input carries
+    ``{project_id, date?, budget_usd?}``; the worker runs
+    :func:`movate.core.observability.analyst.analyze` for the (tenant,
+    project, day) and appends one ObservabilityInsight. No agent bundle is
+    loaded — the analyst reads telemetry from storage directly, so this kind
+    needs no registry resolve. ``result_run_id`` carries the produced
+    insight ``id``. The nightly cron can enqueue this via a JobSchedule;
+    ``POST /api/v1/observability/analyze`` triggers it on demand."""
+    AUDIT = "audit"
+    """Async Claude-orchestrated audit (read-only). JobRecord.input carries
+    the audit config (categories, severity_floor, model, budget_usd, scope).
+    Worker loads the agent bundle(s), runs :class:`movate.core.auditor.Auditor`,
+    persists an :class:`AuditRecord`. ``result_run_id`` carries the produced
+    ``audit_id`` so callers fetch the rich finding list via
+    GET /api/v1/audits/{audit_id}. The dispatch path MUST NOT mutate the
+    agent registry, prompts, contexts, or eval datasets — read-only is
+    enforced by construction (the Auditor only reads + calls the
+    BaseLLMProvider; never invokes the storage save_agent / save_kb paths)."""
 
 
 class JobRecord(BaseModel):
@@ -3251,6 +3451,237 @@ class ProjectKb(BaseModel):
     kb_id: str
     mode: ProjectKbMode
     added_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
+# Agent catalog (ADR 041)
+#
+# Three namespaces in one schema, distinguished by ``source``:
+#
+# * ``movate``    — curated public catalog (synced from ``catalog.movate.io``).
+#                    ``tenant_id`` is NULL.
+# * ``private``   — tenant-private entries that NEVER sync upward.
+#                    ``tenant_id`` is set to the owning tenant.
+# * ``community`` — column-ready slot for a future user-contributed namespace.
+#                    ``tenant_id`` NULL. No rows are written in v1.
+#
+# Uniqueness key ``(slug, source, tenant_id)`` covers all three (the
+# pydantic models do not enforce uniqueness — the storage layer does, via
+# the table's PK / unique index).
+# ---------------------------------------------------------------------------
+
+
+class CatalogSource(StrEnum):
+    """Catalog namespace. See module docstring for the semantics of each."""
+
+    MOVATE = "movate"
+    PRIVATE = "private"
+    COMMUNITY = "community"
+
+
+class CatalogRatingsSummary(BaseModel):
+    """Aggregate of all ratings for one catalog entry. Carried inline on
+    :class:`CatalogEntry` so a list view can render it without a second
+    query. Recomputed by :meth:`StorageProvider.record_catalog_rating`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = 0
+    avg: float = 0.0
+
+
+class CatalogEntry(BaseModel):
+    """A single entry in the agent catalog (ADR 041 D2).
+
+    One row per (slug, source, tenant_id). ``latest_version`` points at
+    the most-recently-published row in :class:`CatalogEntryVersion`. The
+    bundle bytes for any version live in the version table; this record
+    is the catalog **manifest** — what the browse / search / detail
+    endpoints render.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    """Stable id (URL-safe). E.g. ``ticket_triager``."""
+    source: CatalogSource
+    """Namespace (``movate`` | ``private`` | ``community``)."""
+    tenant_id: str | None = None
+    """The owning tenant for ``private`` entries; ``None`` for ``movate`` and
+    ``community`` (public namespaces).
+
+    Storage enforces ``NOT NULL`` for ``private`` and ``NULL`` for the public
+    namespaces; the Pydantic model accepts either because callers serialize
+    public entries with no ``tenant_id`` field at all."""
+    latest_version: str
+    """Semver string. The version that detail / clone uses by default."""
+    name: str
+    """Short human label (~one or two words)."""
+    title: str
+    """Display title for the catalog card."""
+    description: str
+    """Plain-text description — the catalog card's body."""
+    tags: list[str] = Field(default_factory=list)
+    """Free-form tags used for filtering (ADR 028 taxonomy + custom)."""
+    shape: str | None = None
+    """One of the ADR 028 shape taxonomy values (``faq``, ``rag_qa``, ...)."""
+    recommended_for: str | None = None
+    """One-line use-case statement (rendered under the title)."""
+    ratings_summary: CatalogRatingsSummary = Field(default_factory=CatalogRatingsSummary)
+    """Aggregate of all ratings — count + mean."""
+    popularity: int = 0
+    """Add-from-catalog count (ADR 041 D6). Maintained by future work; an
+    integer here so the storage column exists from day one."""
+    synced_at: datetime = Field(default_factory=_now)
+    """When this row was last written by the sync job (or by the tenant
+    on a private submission). Drives the watermark + cache TTL."""
+
+
+class CatalogEntryVersion(BaseModel):
+    """One published version of a :class:`CatalogEntry`.
+
+    The bundle bytes live here (``bundle_tar``) — fetched lazily on add.
+    Versions are immutable once published; a re-publish writes a new row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    version: str
+    """SemVer (``MAJOR.MINOR.PATCH``)."""
+    source: CatalogSource
+    tenant_id: str | None = None
+    """Tenant scope for ``private`` versions; ``None`` for public."""
+    bundle_tar: bytes
+    """Raw tar bytes of the entry bundle. Customer-side storage; the
+    contents are opaque to the catalog service (ADR 041)."""
+    digest: str
+    """SHA-256 of ``bundle_tar`` (hex). Stable id for caching + integrity."""
+    published_at: datetime = Field(default_factory=_now)
+    deprecated_at: datetime | None = None
+
+
+class CatalogEntryRating(BaseModel):
+    """One tenant's rating + (optional) comment for one catalog entry.
+
+    PK ``(slug, source, tenant_id)`` — one rating per tenant per entry.
+    Re-rating overwrites the prior row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    source: CatalogSource = CatalogSource.MOVATE
+    """Which namespace the rating targets. ``movate`` is the common case
+    today; ``private`` is allowed for tenants who want internal feedback
+    on their own catalog entries."""
+    tenant_id: str
+    """The rating tenant. Required (a rating is always attributable)."""
+    rating: int = Field(ge=1, le=5)
+    """1-5 stars."""
+    comment: str | None = None
+    created_at: datetime = Field(default_factory=_now)
+
+
+class CatalogSyncWatermark(BaseModel):
+    """Per-source watermark — the last time we synced from ``source``.
+
+    A row is created the first time a sync runs for that source. The sync
+    job advances this in lockstep with the upserts so the next run can
+    incrementally fetch deltas (ADR 041 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: CatalogSource
+    last_synced_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
+# Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
+#
+# A diagnosis is the structured output of running the Failure Pattern
+# Diagnoser against an agent's recent failures. It is **read-only with
+# respect to agent state**: the record only describes what was found and
+# proposes typed fixes; nothing in the agent (prompt, KB, context, model)
+# is modified by persisting one. ADR 043 will introduce a separate
+# ``proposed_patches`` table for apply-side workflows; this PR ships the
+# diagnose step alone.
+#
+# The ``result`` payload is JSON-serializable (``dict[str, object]``) so
+# the schema can evolve without table migrations — the discriminated
+# fix-kind union (``prompt_edit``, ``kb_ingest``, ``context_add``,
+# ``context_remove``, ``model_swap``, ``temperature_change``,
+# ``retrieval_k_change``) is validated at the wire edge by Pydantic in
+# ``movate.runtime.schemas``.
+# ---------------------------------------------------------------------------
+
+
+class DiagnosisStatus(StrEnum):
+    """Lifecycle of a diagnosis job.
+
+    Reuses a small superset of :class:`JobStatus` semantics but is its own
+    enum so the diagnose endpoint never accidentally mixes with the job
+    queue's vocabulary (a diagnosis is run inline via FastAPI background
+    tasks, not by the worker dispatch loop).
+    """
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class DiagnosisRecord(BaseModel):
+    """Persisted result of one Failure Pattern Diagnoser run (ADR 043 D1).
+
+    Created by ``POST /api/v1/agents/{name}/diagnose`` (status=running)
+    and stamped with the structured result + token/cost totals when the
+    background task finishes (status=completed) — or with an error blob
+    on failure (status=error).
+
+    The ``result`` dict carries the cluster-and-proposed-fix payload the
+    GET endpoint renders; its wire shape is defined by the Pydantic
+    :class:`movate.runtime.schemas.DiagnoseResultView` (clusters list +
+    input_summary). It is stored as an opaque JSON blob so the typed-fix
+    taxonomy can evolve without a schema migration — validation happens
+    at the wire edge, not the storage edge.
+
+    Read-only with respect to agent state: persisting a row never
+    mutates the agent. The taxonomy is consumed by ADR 043's apply step
+    in a later PR.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    diagnosis_id: str
+    tenant_id: str
+    agent: str
+    status: DiagnosisStatus = DiagnosisStatus.RUNNING
+    request: dict[str, Any] = Field(default_factory=dict)
+    """The original ``DiagnoseRequest`` body (window_days, min_failure_count,
+    etc.) captured for audit / re-run. Stored as a plain dict so request-
+    schema evolution doesn't require a record migration."""
+    result: dict[str, Any] | None = None
+    """The structured diagnose output (clusters + per-cluster proposed
+    fixes + ``input_summary``). ``None`` while ``status == "running"``,
+    populated when the background task transitions to ``completed``.
+    Schema lives in :class:`movate.runtime.schemas.DiagnoseResultView`."""
+    error: ErrorInfo | None = None
+    """Set when ``status == "error"`` — same shape as a failed run's
+    error block so operators triage diagnoses with the same vocabulary."""
+    tokens_used: int = 0
+    """Cumulative input + output tokens spent on the diagnoser's LLM
+    calls. ``0`` until the background task finishes."""
+    cost_usd: float = 0.0
+    """Diagnoser LLM cost in USD. ``0.0`` until the background task
+    finishes. Always less than the request's ``budget_usd`` cap (the
+    diagnoser short-circuits when the budget is exhausted)."""
+    model: str = ""
+    """The provider/model string the diagnoser used (e.g.
+    ``openai/gpt-4o-mini``). Captured for audit + reproducibility."""
+    created_at: datetime = Field(default_factory=_now)
+    completed_at: datetime | None = None
+    """Stamped when the background task transitions out of ``running``
+    (either ``completed`` or ``error``). ``None`` while in flight."""
 
 
 # Forward ref resolution

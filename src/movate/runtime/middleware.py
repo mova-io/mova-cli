@@ -15,16 +15,25 @@ The actual auth decision tree (parse → lookup → check) lives in
 Every failure mode returns the same ``401 AUTH_REQUIRED`` shape via
 :func:`auth_required`; the discriminator is logged but never echoed
 to the caller (timing-oracle defense).
+
+This module also hosts the **quota admission dependency** (ADR 036 D2 —
+:func:`make_quota_dependency`) that gates write routes on the per-tenant
+ceilings configured via ``MDK_QUOTA_CONFIG`` (opt-in, ``warn`` by default,
+deny on configured tenants). The dependency reuses ``build_usage`` from D1
+(no new measurement plumbing) and caches the per-(tenant, route_class)
+decision for ``QUOTA_CACHE_TTL_S`` seconds so the aggregation isn't run on
+every request.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Header, Response
+from fastapi import Depends, Header, HTTPException, Request, Response
 
 from movate.core.auth import (
     ApiKeyParseError,
@@ -32,8 +41,17 @@ from movate.core.auth import (
     effective_scopes,
     parse_api_key,
 )
+from movate.core.quotas import (
+    QuotaConfig,
+    QuotaDecision,
+    QuotaMode,
+    RouteClass,
+    TenantQuota,
+    check_quota,
+)
 from movate.core.rate_limit import NoOpRateLimiter, RateLimiter
-from movate.runtime.errors import auth_required, forbidden, rate_limited
+from movate.core.reporting import Usage, build_usage
+from movate.runtime.errors import ErrorCode, auth_required, forbidden, http_error, rate_limited
 from movate.runtime.oidc import (
     OidcValidationError,
     looks_like_jwt,
@@ -317,8 +335,298 @@ async def _safe_touch(storage: StorageProvider, key_id: str, tenant_id: str) -> 
         logger.warning("touch_api_key failed for %s", key_id, exc_info=True)
 
 
+# ----------------------------------------------------------------------
+# Quota admission (ADR 036 D2)
+# ----------------------------------------------------------------------
+
+# How long a (tenant, route_class) quota decision is cached. The aggregation
+# (``build_usage``) reduces every persisted ``RunRecord`` in the window — a
+# few-thousand-rows in-process pass is fast but not free, and a write route
+# fires on every customer-facing run. 60s is the sweet spot: short enough
+# that a tenant that crosses the ceiling sees the next request blocked
+# within a minute (acceptable for billing-grade ceilings, where the natural
+# accounting unit is the day / month — not per second), long enough to
+# amortize the aggregation cost across a burst of writes. Override at
+# wiring time via the ``ttl_s`` kwarg on :func:`make_quota_dependency`
+# (tests use ``ttl_s=0`` to force every-request recompute).
+QUOTA_CACHE_TTL_S: int = 60
+
+# Upper bound on how many runs we scan when computing the per-tenant usage
+# for the quota check. Mirrors ``runtime/app._REPORT_FETCH_CAP`` (10k); kept
+# as a separate constant so we can tune it independently if needed.
+_QUOTA_FETCH_CAP: int = 10_000
+
+
+@dataclass
+class _CachedQuota:
+    """One cached (tenant, route_class) quota decision + its monotonic expiry.
+
+    ``expires_at`` uses ``time.monotonic`` so a wall-clock jump (NTP step /
+    container migrate) can't extend or shrink the TTL.
+    """
+
+    decision: QuotaDecision
+    expires_at: float
+
+
+class _QuotaCache:
+    """In-process per-(tenant, route_class) cache for quota decisions.
+
+    A plain dict + a monotonic expiry per entry — same posture as
+    :class:`~movate.core.cache.InProcessCache` (LLM response cache) and
+    :class:`~movate.core.rate_limit.InProcessRateLimiter`: single-process,
+    bounded by tenant count x route class count (small), and cleared on
+    process restart. Cross-replica consistency is NOT a goal at this scale —
+    each replica may briefly disagree on "remaining" within the TTL, which
+    is acceptable because the ceiling is a billing-period aggregate, not a
+    per-second budget. A shared backend (Redis) is a documented future
+    seam (same Protocol as ``CacheProvider`` if needed).
+
+    Public surface: :meth:`get` returns a fresh decision or ``None``;
+    :meth:`set` stores; :meth:`invalidate` clears one entry (used by tests
+    + future "force re-check on quota config change").
+    """
+
+    def __init__(self, *, ttl_s: int) -> None:
+        # ``ttl_s <= 0`` disables caching (every check recomputes). Used by
+        # the middleware test that asserts the cache reduces call counts —
+        # one variant runs with TTL=0 to confirm the no-cache control case.
+        self._ttl_s = ttl_s
+        self._store: dict[tuple[str, RouteClass], _CachedQuota] = {}
+
+    def get(self, tenant_id: str, route_class: RouteClass) -> QuotaDecision | None:
+        if self._ttl_s <= 0:
+            return None
+        key = (tenant_id, route_class)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at <= time.monotonic():
+            del self._store[key]
+            return None
+        return entry.decision
+
+    def set(self, tenant_id: str, route_class: RouteClass, decision: QuotaDecision) -> None:
+        if self._ttl_s <= 0:
+            return
+        self._store[(tenant_id, route_class)] = _CachedQuota(
+            decision=decision,
+            expires_at=time.monotonic() + self._ttl_s,
+        )
+
+    def invalidate(self, tenant_id: str | None = None) -> None:
+        """Drop cached entries.
+
+        ``tenant_id=None`` clears the whole cache (post-config-reload).
+        Otherwise clears every route_class for the given tenant.
+        """
+        if tenant_id is None:
+            self._store.clear()
+            return
+        for key in [k for k in self._store if k[0] == tenant_id]:
+            del self._store[key]
+
+
+def _quota_exceeded_error(decision: QuotaDecision) -> HTTPException:
+    """Build the 429 envelope for a ``deny``-mode breach.
+
+    Reuses the runtime's shared ``{error: {code, message, request_id}}``
+    envelope (``http_error``) plus an extra ``remaining`` field stamped onto
+    the FastAPI ``HTTPException.detail`` so the client can budget against
+    the per-counter remainder. Stable code: ``quota_exceeded`` (additive on
+    :class:`ErrorCode`).
+    """
+    exc = http_error(
+        ErrorCode.QUOTA_EXCEEDED,
+        status_code=429,
+        message=f"quota exceeded: {decision.reason}" if decision.reason else "quota exceeded",
+    )
+    # Stamp the per-counter remainder onto the envelope so the client can
+    # tell which budget tripped. ``detail`` is the serialized envelope dict.
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        exc.detail["error"]["remaining"] = dict(decision.remaining)
+    return exc
+
+
+def make_quota_dependency(
+    storage: StorageProvider,
+    auth_dependency: Callable[..., Awaitable[AuthContext]],
+    *,
+    config: QuotaConfig | None,
+    ttl_s: int | None = None,
+    cache: _QuotaCache | None = None,
+) -> Callable[[RouteClass], Callable[..., Awaitable[None]]]:
+    """Build the FastAPI dependency factory that gates a write route on the
+    per-tenant quota (ADR 036 D2).
+
+    Called once in :func:`build_app`; the returned callable is invoked at
+    route registration with the :class:`RouteClass` to produce the actual
+    per-route dependency. Wired in ``app.py`` as a small helper, e.g.::
+
+        _quota = make_quota_dependency(storage, auth_dep, config=quota_config)
+        @v1.post(..., dependencies=[Depends(_quota(RouteClass.RUNS))])
+
+    ``auth_dependency`` must be **the same callable** the route's own
+    handler depends on (the per-app ``auth_dep`` built by
+    :func:`make_auth_dependency`). Passing the same object makes FastAPI's
+    per-request dependency cache hit, so the bearer parse + storage lookup
+    + rate-limit charge happens exactly once per request — shared between
+    the quota check and the handler. Same trick :func:`require_scope`
+    uses; an indirection through a wrapper would create a second cache
+    key and double-charge the limiter.
+
+    The dependency:
+
+    1. Checks the in-process cache for a fresh (tenant, route_class)
+       decision. Hit → use it.
+    2. Miss → fetches the tenant's daily + monthly usage via
+       :func:`build_usage` (D1) over the persisted runs, runs
+       :func:`check_quota`, and stores the decision in the cache.
+    3. ``allow=False`` (``deny`` mode, over a ceiling) → raises 429 with the
+       ``quota_exceeded`` envelope + ``remaining`` per counter.
+    4. ``allow=True`` with a warn-over → logs + stamps ``X-Quota-Warning``
+       on the response and continues to the handler.
+
+    Opt-in posture: ``config=None`` (no YAML file present) → the dependency
+    is a pure pass-through (every request allowed, no aggregation run).
+    Existing customers see byte-for-byte zero behavior change until they
+    deposit a ``quotas.yaml``.
+
+    ``ttl_s=0`` is the test-only no-cache control case (every request
+    recomputes; lets the call-count assertion in the cache test be clean).
+    ``ttl_s=None`` (the default) resolves the current value of
+    :data:`QUOTA_CACHE_TTL_S` at call time — this lets tests monkeypatch
+    the module-level constant and have it take effect on the next
+    ``build_app``.
+    """
+    effective_ttl = ttl_s if ttl_s is not None else QUOTA_CACHE_TTL_S
+    quota_cache = cache if cache is not None else _QuotaCache(ttl_s=effective_ttl)
+
+    def make_for(route_class: RouteClass) -> Callable[..., Awaitable[None]]:
+        async def quota_dependency(
+            request: Request,
+            response: Response,
+            ctx: AuthContext = Depends(auth_dependency),
+        ) -> None:
+            # Opt-in: no config = no enforcement, period. We don't even
+            # touch storage in this branch.
+            if config is None:
+                return
+
+            tenant_id = ctx.tenant_id
+            # Admin-tenant bypass — these are never blocked / warned even if
+            # listed in ``tenants``. Cached as an allow so we don't redo the
+            # lookup on every request.
+            if config.is_admin(tenant_id):
+                return
+
+            quota_row = config.get(tenant_id)
+            if quota_row is None:
+                # Tenant without a row = no ceiling. Don't even compute usage.
+                return
+
+            cached = quota_cache.get(tenant_id, route_class)
+            if cached is not None:
+                decision = cached
+            else:
+                decision = await _compute_decision(
+                    storage,
+                    tenant_id=tenant_id,
+                    quota=quota_row,
+                )
+                quota_cache.set(tenant_id, route_class, decision)
+
+            # ``deny`` over a ceiling → 429 and we're done. The middleware
+            # never reaches the handler.
+            if not decision.allow:
+                logger.info(
+                    "quota_blocked tenant_id=%s route_class=%s reason=%s",
+                    tenant_id,
+                    route_class.value,
+                    decision.reason,
+                )
+                raise _quota_exceeded_error(decision)
+
+            # ``warn`` over a ceiling → log + attach the header + continue.
+            # The header is informational only (no semantics) so older
+            # clients ignore it cleanly.
+            if decision.mode == QuotaMode.WARN and decision.over:
+                logger.info(
+                    "quota_warn tenant_id=%s route_class=%s reason=%s",
+                    tenant_id,
+                    route_class.value,
+                    decision.reason,
+                )
+                response.headers["X-Quota-Warning"] = decision.reason or "over_quota"
+
+        return quota_dependency
+
+    return make_for
+
+
+async def _compute_decision(
+    storage: StorageProvider,
+    *,
+    tenant_id: str,
+    quota: TenantQuota,
+) -> QuotaDecision:
+    """Run the per-tenant aggregation + decision.
+
+    Reads the tenant's persisted runs once and builds two
+    :class:`~movate.core.reporting.Usage` rollups — a 1-day window for the
+    daily counters and a 30-day window for the monthly cost counter — then
+    feeds them to :func:`~movate.core.quotas.check_quota`. We fetch a
+    superset (the 30-day window) and apply the 1-day filter in-memory so we
+    hit storage exactly once per cache miss.
+
+    Failure-mode: if storage raises, we log and ALLOW the request (degraded
+    rather than failed). A quota system that fails closed is a worse
+    operational story than a brief gap in enforcement — the runtime's
+    rate-limit + cost-budget paths follow the same posture.
+    """
+    # Lazy import to avoid a runtime ↔ core ↔ runtime cycle on module load.
+    from movate.core.reporting import _filter_runs_by_since  # noqa: PLC0415
+
+    try:
+        runs = await storage.list_runs(
+            agent=None,
+            tenant_id=tenant_id,
+            limit=_QUOTA_FETCH_CAP,
+        )
+    except Exception:
+        logger.warning(
+            "quota_check_storage_error tenant_id=%s — allowing request",
+            tenant_id,
+            exc_info=True,
+        )
+        # Degrade open: return an allow-everything decision in warn mode.
+        return QuotaDecision(allow=True, mode=quota.mode)
+
+    monthly_runs = _filter_runs_by_since(runs, 30)
+    daily_runs = _filter_runs_by_since(monthly_runs, 1)
+
+    daily: Usage = build_usage(
+        daily_runs,
+        tenant_id=tenant_id,
+        window_days=1,
+        include_by_agent=False,
+        include_by_provider=False,
+    )
+    monthly: Usage = build_usage(
+        monthly_runs,
+        tenant_id=tenant_id,
+        window_days=30,
+        include_by_agent=False,
+        include_by_provider=False,
+    )
+
+    return check_quota(quota, daily_usage=daily, monthly_usage=monthly)
+
+
 __all__ = [
+    "QUOTA_CACHE_TTL_S",
     "AuthContext",
     "make_auth_dependency",
+    "make_quota_dependency",
     "require_scope",
 ]

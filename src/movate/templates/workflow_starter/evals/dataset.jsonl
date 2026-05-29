@@ -1,0 +1,3 @@
+{"input": {"topic": "Why short feedback loops matter in software"}, "expected": {"final": "Short feedback loops let teams catch problems early and iterate with confidence — small wins that compound into meaningful velocity."}}
+{"input": {"topic": "The case for walking meetings"}, "expected": {"final": "Walking meetings replace stale rooms with movement and fresh air; they tend to be shorter, more focused, and surface ideas that wouldn't appear in a video grid."}}
+{"input": {"topic": "Why writing clarifies thinking"}, "expected": {"final": "Writing forces ideas into a sequential form your reader can follow, exposing weak links you can never quite hear in conversation."}}

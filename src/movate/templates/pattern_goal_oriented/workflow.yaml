@@ -1,0 +1,103 @@
+api_version: movate/v1
+kind: Workflow
+
+# =============================================================================
+# Goal-Oriented pattern (ADR 038) — bounded SUPERVISOR loop with a JUDGE/GATE
+# =============================================================================
+# A SUPERVISOR seeds the goal, a worker iterates toward it, and a JUDGE/GATE
+# checks goal-satisfaction after each iteration — exiting EITHER when the goal
+# is satisfied OR when the max-iterations bound trips.
+#
+# GOVERNANCE — the GATE is the only loop exit (the headline of this pattern):
+#   * MAX-ITERATIONS BOUND = 2: the loop is UNROLLED to a fixed two iterations
+#     (worker-1 → goal-gate-1 → worker-2 → goal-gate-2). After the LAST
+#     iteration the gate can only route to a terminal (``done-maxed`` /
+#     ``done-satisfied``) — there is NO path back to a worker, so NO unbounded
+#     loop. The cap is a structural property of this file; widening it is a
+#     reviewable edit, not a model decision.
+#   * JUDGE/GATE EXIT: each goal-gate is an intent-router (the JUDGE/GATE) and
+#     is the ONLY way out of an iteration: ``satisfied`` → a done terminal,
+#     ``continue`` → next iteration (or, at the cap, a done terminal). The
+#     native runner (ADR 017) forbids cycles, so a runaway loop is impossible
+#     by construction.
+#   * BUDGET CAP: every node carries budget.max_cost_usd_per_run; the sum is
+#     the workflow's effective ceiling (see GOVERNANCE.md).
+#   * EVAL-GATE: the evals: stanza gates the whole workflow at CI time.
+#
+# Mock note: under --mock the runner picks each router's first sorted route key
+# (``continue``), so the smoke deterministically walks BOTH iterations and exits
+# at ``done-maxed`` — exercising the full unrolled loop + the max-iterations cap.
+
+name: goal-oriented
+version: 0.1.0
+description: >
+  Bounded supervisor loop: a worker iterates toward a goal while a JUDGE/GATE
+  checks satisfaction each iteration, exiting on satisfaction or a hard
+  max-iterations cap of 2.
+owner: ""
+
+state_schema: ./state.json
+entrypoint: supervisor
+
+nodes:
+  # SUPERVISOR — seeds the goal + initial attempt context.
+  - id: supervisor
+    type: agent
+    ref: ./agents/supervisor
+  # Iteration 1 worker.
+  - id: worker-1
+    type: agent
+    ref: ./agents/worker
+  # JUDGE/GATE 1 — the only exit from iteration 1. ``satisfied`` ends early at
+  # its own terminal; ``continue`` proceeds to the (final) second iteration.
+  - id: goal-gate-1
+    type: intent-router
+    classifier_agent: ./agents/goal-judge
+    input_field: attempt
+    routes:
+      continue: worker-2
+      satisfied: done-satisfied-early
+    fallback: done-satisfied-early
+  # Iteration 2 worker (the LAST iteration — max_iterations = 2).
+  - id: worker-2
+    type: agent
+    ref: ./agents/worker
+  # JUDGE/GATE 2 — after the max-iterations bound there is no path back to a
+  # worker; both routes lead to a terminal.
+  - id: goal-gate-2
+    type: intent-router
+    classifier_agent: ./agents/goal-judge
+    input_field: attempt
+    routes:
+      continue: done-maxed
+      satisfied: done-satisfied-late
+    fallback: done-maxed
+  # Terminal: goal satisfied on iteration 1 (early JUDGE ``satisfied`` verdict).
+  - id: done-satisfied-early
+    type: agent
+    ref: ./agents/done
+  # Terminal: goal satisfied on iteration 2 (JUDGE ``satisfied`` verdict).
+  - id: done-satisfied-late
+    type: agent
+    ref: ./agents/done
+  # Terminal: max-iterations cap tripped (the bound, not satisfaction, ended it).
+  - id: done-maxed
+    type: agent
+    ref: ./agents/done
+
+edges:
+  - from: supervisor
+    to: worker-1
+  - from: worker-1
+    to: goal-gate-1
+  - from: worker-2
+    to: goal-gate-2
+
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+tags:
+  - pattern:goal-oriented
+  - governed
+  - bounded-loop

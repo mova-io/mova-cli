@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["outcome"],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "description": "The final simulation outcome."
+    }
+  }
+}

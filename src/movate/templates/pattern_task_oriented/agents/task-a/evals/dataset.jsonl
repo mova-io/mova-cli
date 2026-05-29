@@ -1,0 +1,2 @@
+{"input": {"plan": "task-a researches the two laptops' specs", "request": "Compare two laptops for video editing."}, "expected": {"task_a_result": "Laptop X: 32GB RAM, RTX 4070, 1TB SSD. Laptop Y: 16GB RAM, RTX 4060, 512GB SSD."}}
+{"input": {"plan": "task-a drafts the launch email", "request": "Draft a launch email and a tweet."}, "expected": {"task_a_result": "Subject: Meet our new feature — here's what changed and why it matters."}}

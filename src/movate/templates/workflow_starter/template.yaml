@@ -1,0 +1,9 @@
+# ADR 028 — discoverability metadata for the workflow starter.
+title: Multi-step workflow starter (draft to review)
+description: Two-step pipeline (draft to review) demonstrating workflow.yaml, state_schema, edges, and a workflow-eval dataset stub.
+shape: workflow
+tags:
+  - workflow
+  - multi-step
+  - starter
+recommended_for: The canonical "this is how you build a workflow" reference — start here when you need orchestration, not a single prompt.

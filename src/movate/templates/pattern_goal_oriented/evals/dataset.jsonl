@@ -1,0 +1,2 @@
+{"input": {"goal": "Write a one-line tagline for a privacy-first note-taking app."}, "expected": {"result": "Your notes, end-to-end encrypted — private by default, synced everywhere."}}
+{"input": {"goal": "Propose a name for a CLI that deploys AI agents."}, "expected": {"result": "shipd — one command from agent to production."}}

@@ -1,0 +1,2 @@
+{"input": {"scenario": "A customer disputes a duplicate charge.", "transcript": "A: I'll check.\nB: It's a pending auth, no real double charge."}, "expected": {"outcome": "Resolved: the second charge was a pending authorization, not a real double charge; no refund needed."}}
+{"input": {"scenario": "Two engineers negotiate a hotfix scope.", "transcript": "A: Ship the smallest revert.\nB: Agreed, full fix tomorrow."}, "expected": {"outcome": "Resolved: agreed to revert now and ship the full fix in the next release."}}

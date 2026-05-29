@@ -1,10 +1,9 @@
-"""``mdk workflow`` — inspect + resume workflow runs on a deployed runtime.
+"""``mdk workflow`` — inspect + resume workflow runs AND manage workflow
+definitions on a deployed runtime.
 
-HITL resume-on-signal (ADR 017 D5, PR 2). A multi-agent workflow can pause
-at a ``HUMAN`` gate node; the runner persists a durable PAUSED checkpoint
-(prompt + the state keys the human must supply via ``output_contract``).
-This command group lets an operator find those paused runs and signal a
-decision to resume them:
+Two surfaces under one command group:
+
+**Runs** (ADR 017 D5 PR 2 — HITL resume-on-signal):
 
 * ``mdk workflow runs [--paused]`` — list workflow runs (newest first);
   ``--paused`` narrows to the HITL queue and prints each gate's prompt.
@@ -12,9 +11,20 @@ decision to resume them:
   the human's decision; the runtime validates + enqueues a continuation job
   and this command prints the continuation job id.
 
-Talks to the runtime's HTTP API (``/api/v1/workflow-runs``) via
-:class:`MovateClient` — same transport + target resolution as ``mdk jobs``.
-The signal endpoint does NOT run the workflow inline; the worker resumes it.
+**Definitions** (ADR 037 D1 — workflow API parity):
+
+* ``mdk workflow list [--published-only]`` — list workflow definitions in
+  the target tenant.
+* ``mdk workflow show <name> [--version V]`` — full spec + bundle metadata.
+* ``mdk workflow publish <name> [--version V]`` — promote a version to
+  published (the "blessed" pointer the catalog filters on).
+* ``mdk workflow revert <name> --to-version V`` — non-destructive rollback.
+* ``mdk workflow validate <path>`` — parse + structurally validate a local
+  workflow.yaml against the runtime's compiler.
+
+Talks to the runtime's HTTP API via :class:`MovateClient` — same transport +
+target resolution as ``mdk jobs``. The signal endpoint does NOT run the
+workflow inline; the worker resumes it.
 """
 
 from __future__ import annotations
@@ -36,7 +46,15 @@ from movate.core.user_config import (
     resolve_bearer_token,
     resolve_target,
 )
-from movate.runtime.schemas import RunAccepted, WorkflowRunListView
+from movate.runtime.schemas import (
+    RunAccepted,
+    WorkflowDetailView,
+    WorkflowListResponse,
+    WorkflowPublishedView,
+    WorkflowRevertedView,
+    WorkflowRunListView,
+    WorkflowValidationView,
+)
 
 stdout = Console()
 err = Console(stderr=True)
@@ -256,6 +274,306 @@ def _build_client(target: str | None, *, suppress: bool = False) -> MovateClient
         raise typer.Exit(code=2) from None
     echo_remote_context(target_name, target_cfg, suppress=suppress)
     return MovateClient(base_url=target_cfg.url, api_key=token)
+
+
+# ---------------------------------------------------------------------------
+# Workflow definitions (ADR 037 D1 — workflow API parity)
+# ---------------------------------------------------------------------------
+
+
+@workflow_app.command("list")
+def list_workflows(
+    published_only: bool = typer.Option(
+        False,
+        "--published-only",
+        help="Filter to workflows that have at least one published version.",
+    ),
+    limit: int = typer.Option(100, "--limit", "-n", help="Max rows to return."),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """List workflow definitions on the target runtime, newest-first.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Every workflow in the tenant[/dim]
+      $ mdk workflow list
+
+      [dim]# Only workflows with a blessed version[/dim]
+      $ mdk workflow list --published-only
+    """
+    listing = asyncio.run(
+        _fetch_workflows(
+            target=target,
+            published_only=published_only,
+            limit=limit,
+            suppress=output_format == TableJson.JSON,
+        )
+    )
+    if output_format == TableJson.JSON:
+        stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    if listing.count == 0:
+        hint("[dim]no workflow definitions found[/dim]")
+        return
+    table = Table(title=f"{listing.count} workflow definition(s)")
+    table.add_column("name", style="bold")
+    table.add_column("latest", style="dim")
+    table.add_column("published", style="dim")
+    table.add_column("description", overflow="fold")
+    for w in listing.workflows:
+        table.add_row(
+            w.name,
+            w.version,
+            w.published_version or "[dim]—[/dim]",
+            w.description,
+        )
+    stdout.print(table)
+
+
+@workflow_app.command("show")
+def show_workflow(
+    name: str = typer.Argument(..., help="Workflow name (workflow.yaml ``name``)."),
+    version: str = typer.Option(
+        None, "--version", help="Specific version; omit for the current latest."
+    ),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the detail view as JSON instead of a table."
+    ),
+) -> None:
+    """Show the full spec + bundle metadata for one workflow."""
+    detail = asyncio.run(
+        _fetch_workflow(
+            target=target,
+            name=name,
+            version=version,
+            suppress=as_json,
+        )
+    )
+    if as_json:
+        stdout.print(detail.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    table = Table(title=f"workflow {detail.name}@{detail.version}")
+    table.add_column("field", style="bold")
+    table.add_column("value", overflow="fold")
+    table.add_row("description", detail.description)
+    table.add_row("owner", detail.owner)
+    table.add_row("tags", ", ".join(detail.tags) or "[dim]—[/dim]")
+    table.add_row("entrypoint", detail.entrypoint)
+    table.add_row("state_schema", detail.state_schema_path)
+    table.add_row("content_hash", detail.content_hash[:16] + "…")
+    table.add_row("created_by", detail.created_by or "[dim]<system>[/dim]")
+    table.add_row("created_at", detail.created_at.isoformat())
+    table.add_row("published_version", detail.published_version or "[dim]—[/dim]")
+    table.add_row("nodes", str(len(detail.nodes)))
+    table.add_row("edges", str(len(detail.edges)))
+    table.add_row("files", ", ".join(detail.files))
+    stdout.print(table)
+
+
+@workflow_app.command("publish")
+def publish_workflow(
+    name: str = typer.Argument(..., help="Workflow name."),
+    version: str = typer.Option(
+        None,
+        "--version",
+        help="Version to promote; omit to promote the current latest.",
+    ),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the response as JSON."),
+) -> None:
+    """Promote a workflow version to "published"."""
+    result = asyncio.run(
+        _publish_workflow(
+            target=target,
+            name=name,
+            version=version,
+            suppress=as_json,
+        )
+    )
+    if as_json:
+        stdout.print(result.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    prior = result.previous_published_version or "[dim]—[/dim]"
+    stdout.print(
+        f"[green]✓[/green] published [bold]{result.name}[/bold]@"
+        f"[bold]{result.published_version}[/bold] (prev: {prior})"
+    )
+
+
+@workflow_app.command("revert")
+def revert_workflow(
+    name: str = typer.Argument(..., help="Workflow name."),
+    to_version: str = typer.Option(
+        ...,
+        "--to-version",
+        help="Existing version to roll back to (re-published forward).",
+    ),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the response as JSON."),
+) -> None:
+    """Roll a workflow back to a prior version (non-destructive).
+
+    The targeted version's bundle is re-published as a NEW latest version
+    with a ``+revert.N`` suffix; the prior history stays intact so a
+    follow-up revert is always possible.
+    """
+    result = asyncio.run(
+        _revert_workflow(
+            target=target,
+            name=name,
+            to_version=to_version,
+            suppress=as_json,
+        )
+    )
+    if as_json:
+        stdout.print(result.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    stdout.print(
+        f"[green]✓[/green] reverted [bold]{result.name}[/bold] to "
+        f"[bold]{result.reverted_from}[/bold] (new latest: {result.version})"
+    )
+
+
+@workflow_app.command("validate")
+def validate_workflow(
+    path: str = typer.Argument(
+        ...,
+        help=(
+            "Path to a workflow.yaml or its containing directory. The CLI "
+            "uploads the spec + sibling state schema to the target runtime."
+        ),
+    ),
+    workflow_name: str = typer.Option(
+        None,
+        "--name",
+        help=(
+            "Workflow name to validate against on the remote (the validate "
+            "endpoint is per-name but doesn't require the workflow to exist "
+            "yet). Defaults to the path's basename."
+        ),
+    ),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the response as JSON."),
+) -> None:
+    """Validate a local workflow.yaml against the target runtime."""
+    from pathlib import Path  # noqa: PLC0415
+
+    p = Path(path).resolve()
+    wf_yaml = p / "workflow.yaml" if p.is_dir() else p
+    if not wf_yaml.is_file():
+        error(f"workflow.yaml not found at {wf_yaml}", context="validate")
+        raise typer.Exit(code=2)
+    workflow_yaml_text = wf_yaml.read_text(encoding="utf-8")
+    extra_files: dict[str, str] = {}
+    # Bundle the sibling state schema if present (the spec usually references
+    # ``./schema/state.json`` or ``./state.json``). The remote loader needs it
+    # to compile.
+    workflow_dir = wf_yaml.parent
+    for candidate in ("schema/state.json", "state.json"):
+        sibling = workflow_dir / candidate
+        if sibling.is_file():
+            extra_files[candidate] = sibling.read_text(encoding="utf-8")
+    name = workflow_name or workflow_dir.name
+    result = asyncio.run(
+        _validate_workflow(
+            target=target,
+            name=name,
+            workflow_yaml=workflow_yaml_text,
+            files=extra_files,
+            suppress=as_json,
+        )
+    )
+    if as_json:
+        stdout.print(result.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    if result.passed:
+        stdout.print(f"[green]✓[/green] {name}: validated")
+        return
+    stdout.print(f"[red]✗[/red] {name}: validation failed")
+    for issue in result.errors:
+        stdout.print(f"  [red]error[/red] {issue.code}: {issue.message}")
+    raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Async glue for the definition commands
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_workflows(
+    *, target: str | None, published_only: bool, limit: int, suppress: bool = False
+) -> WorkflowListResponse:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("fetching workflows..."):
+                return await client.list_workflows(published_only=published_only, limit=limit)
+    except MovateClientError as exc:
+        error(str(exc), context="list")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _fetch_workflow(
+    *, target: str | None, name: str, version: str | None, suppress: bool = False
+) -> WorkflowDetailView:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("fetching workflow..."):
+                return await client.get_workflow(name, version=version)
+    except MovateClientError as exc:
+        error(str(exc), context="show")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _publish_workflow(
+    *, target: str | None, name: str, version: str | None, suppress: bool = False
+) -> WorkflowPublishedView:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("publishing..."):
+                return await client.publish_workflow(name, version=version)
+    except MovateClientError as exc:
+        error(str(exc), context="publish")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _revert_workflow(
+    *, target: str | None, name: str, to_version: str, suppress: bool = False
+) -> WorkflowRevertedView:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("reverting..."):
+                return await client.revert_workflow(name, to_version=to_version)
+    except MovateClientError as exc:
+        error(str(exc), context="revert")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _validate_workflow(
+    *,
+    target: str | None,
+    name: str,
+    workflow_yaml: str,
+    files: dict[str, str],
+    suppress: bool = False,
+) -> WorkflowValidationView:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("validating..."):
+                return await client.validate_workflow_spec(
+                    name, workflow_yaml=workflow_yaml, files=files
+                )
+    except MovateClientError as exc:
+        error(str(exc), context="validate")
+        raise typer.Exit(code=exc.status_code // 100) from None
 
 
 __all__ = ["workflow_app"]

@@ -8,6 +8,13 @@ Three layers:
    re-running with --force overwrites cleanly.
 3. **CLI safety** — re-running without --force exits 2; --dry-run
    doesn't write; the resulting project is loadable.
+
+Note: ``mdk demo`` became a Typer group when the dashboard "wow pack"
+seeder (``mdk demo seed`` / ``mdk demo clear``) landed. Bare ``mdk demo``
+still scaffolds ``./demo-faq``; a custom target directory now uses the
+explicit ``mdk demo new <dir>`` form (a positional dir and named
+subcommands can't coexist on one Click group). The seeder is covered in
+``tests/test_demo_seeder.py``.
 """
 
 from __future__ import annotations
@@ -71,7 +78,7 @@ def test_write_project_files_movate_yaml_is_valid(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_cli_demo_creates_full_project(tmp_path: Path) -> None:
     target = tmp_path / "demo-faq"
-    result = runner.invoke(app, ["demo", str(target)])
+    result = runner.invoke(app, ["demo", "new", str(target)])
     assert result.exit_code == 0, result.stdout + result.stderr
 
     # Project files
@@ -97,7 +104,7 @@ def test_cli_demo_creates_full_project(tmp_path: Path) -> None:
 def test_cli_demo_substitutes_agent_name_in_yaml(tmp_path: Path) -> None:
     """The template's __AGENT_NAME__ sentinel must be replaced."""
     target = tmp_path / "demo-faq"
-    runner.invoke(app, ["demo", str(target)])
+    runner.invoke(app, ["demo", "new", str(target)])
     agent_yaml = (target / "agents" / _AGENT_NAME / "agent.yaml").read_text()
     assert "__AGENT_NAME__" not in agent_yaml
     assert f"name: {_AGENT_NAME}" in agent_yaml
@@ -117,7 +124,7 @@ def test_cli_demo_default_directory_is_demo_faq(
 @pytest.mark.unit
 def test_cli_demo_custom_directory_name(tmp_path: Path) -> None:
     target = tmp_path / "my-first-agent"
-    result = runner.invoke(app, ["demo", str(target)])
+    result = runner.invoke(app, ["demo", "new", str(target)])
     assert result.exit_code == 0
     assert target.is_dir()
 
@@ -133,7 +140,7 @@ def test_cli_demo_refuses_existing_directory_without_force(tmp_path: Path) -> No
     target.mkdir()
     (target / "important.txt").write_text("don't lose me!\n")
 
-    result = runner.invoke(app, ["demo", str(target)])
+    result = runner.invoke(app, ["demo", "new", str(target)])
     assert result.exit_code == 2
     # Operator's file is intact
     assert (target / "important.txt").read_text() == "don't lose me!\n"
@@ -145,7 +152,7 @@ def test_cli_demo_force_overwrites_existing(tmp_path: Path) -> None:
     target.mkdir()
     (target / "old.txt").write_text("will be wiped\n")
 
-    result = runner.invoke(app, ["demo", str(target), "--force"])
+    result = runner.invoke(app, ["demo", "new", str(target), "--force"])
     assert result.exit_code == 0, result.stdout + result.stderr
     # Old file is gone
     assert not (target / "old.txt").exists()
@@ -156,7 +163,7 @@ def test_cli_demo_force_overwrites_existing(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_cli_demo_dry_run_does_not_write(tmp_path: Path) -> None:
     target = tmp_path / "demo-faq"
-    result = runner.invoke(app, ["demo", str(target), "--dry-run"])
+    result = runner.invoke(app, ["demo", "new", str(target), "--dry-run"])
     assert result.exit_code == 0
     assert "dry-run" in result.stdout.lower()
     # Nothing written
@@ -167,7 +174,7 @@ def test_cli_demo_dry_run_does_not_write(tmp_path: Path) -> None:
 def test_cli_demo_output_lists_next_steps(tmp_path: Path) -> None:
     """Operators should see actionable next-step commands in the output."""
     target = tmp_path / "demo-faq"
-    result = runner.invoke(app, ["demo", str(target)])
+    result = runner.invoke(app, ["demo", "new", str(target)])
     assert result.exit_code == 0
     # Each suggested command appears in the panel
     assert "cd " in result.stdout
@@ -183,7 +190,7 @@ def test_cli_demo_output_lists_next_steps(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_demo_project_movate_yaml_parses(tmp_path: Path) -> None:
     target = tmp_path / "demo-faq"
-    runner.invoke(app, ["demo", str(target)])
+    runner.invoke(app, ["demo", "new", str(target)])
     data = yaml.safe_load((target / "movate.yaml").read_text())
     assert data["api_version"] == "movate/v1"
 
@@ -191,7 +198,7 @@ def test_demo_project_movate_yaml_parses(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_demo_project_agent_yaml_parses(tmp_path: Path) -> None:
     target = tmp_path / "demo-faq"
-    runner.invoke(app, ["demo", str(target)])
+    runner.invoke(app, ["demo", "new", str(target)])
     agent_yaml = target / "agents" / _AGENT_NAME / "agent.yaml"
     data = yaml.safe_load(agent_yaml.read_text())
     assert data["api_version"] == "movate/v1"
