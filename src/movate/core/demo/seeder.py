@@ -254,7 +254,12 @@ def _gen_runs(
     for agent in agents:
         # Each agent has a "home" provider so the model-mix panel is stable,
         # with occasional spillover to a second model.
-        home_provider, home_rate = _PROVIDERS[hash(agent) % len(_PROVIDERS)]
+        # Deterministic per-agent "home" provider. Must use a stable hash, not
+        # builtin hash() — that's salted per-process (PYTHONHASHSEED), which
+        # would break the documented (seed, now) reproducibility and make the
+        # injected cost spike non-deterministic relative to the home model.
+        home_idx = int(_stable_hash(agent), 16) % len(_PROVIDERS)
+        home_provider, home_rate = _PROVIDERS[home_idx]
         spike_provider, spike_rate = _PROVIDERS[-3]  # an expensive one
         agent_version = f"2026.{rng.randint(3, 5)}.{rng.randint(1, 28)}.{rng.randint(1, 3)}"
         # Per-agent baselines so the fleet isn't uniform.
