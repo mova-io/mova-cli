@@ -2115,6 +2115,7 @@ class InMemoryStorage:
         if webhook is None:
             return
         self.webhook_cursors[webhook_id] = last_event_id
+
     # Eval-generation jobs (``mdk eval generate``) — runtime-resident,
     # SSE-driven async jobs. Kept on a simple dict keyed by job_id.
     # ------------------------------------------------------------------
@@ -2186,6 +2187,7 @@ class InMemoryStorage:
             cases_added=len(cases),
             judge_yaml_updated=judge_updated,
         )
+
     # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
     # ------------------------------------------------------------------
 

@@ -3596,8 +3596,6 @@ class CatalogSyncWatermark(BaseModel):
     last_synced_at: datetime = Field(default_factory=_now)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
 #
@@ -3684,6 +3682,7 @@ class DiagnosisRecord(BaseModel):
     completed_at: datetime | None = None
     """Stamped when the background task transitions out of ``running``
     (either ``completed`` or ``error``). ``None`` while in flight."""
+
 
 # Forward ref resolution
 ModelConfig.model_rebuild()

@@ -1116,6 +1116,7 @@ async def _smoke_preview_score(bundle: AgentBundle, cases: list[Any]) -> dict[st
     rate = passes / len(cases) if cases else 0.0
     return {"mock_pass_rate": round(rate, 4), "tested_against_model": "mock"}
 
+
 async def _sse_audit_job_stream(
     *,
     store: StorageProvider,
@@ -7206,6 +7207,7 @@ def build_app(
         job_id: str,
         request: Request,
         response: Response,
+        ctx: AuthContext = Depends(auth_dep),
         wait: str | None = Query(
             default=None,
             description=(

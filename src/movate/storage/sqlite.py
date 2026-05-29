@@ -4630,6 +4630,7 @@ class SqliteProvider:
             (webhook_id, tenant_id, last_event_id, now),
         )
         await self._db.commit()
+
     # Eval-generation jobs (``mdk eval generate``)
     # ------------------------------------------------------------------
 
@@ -4868,6 +4869,47 @@ def _row_to_project(row: aiosqlite.Row) -> Project:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         archived_at=datetime.fromisoformat(archived) if archived else None,
+    )
+
+
+def _row_to_project_member(row: aiosqlite.Row) -> ProjectMember:
+    return ProjectMember(
+        project_id=row["project_id"],
+        principal_id=row["principal_id"],
+        role=ProjectMemberRole(row["role"]),
+        added_by=row["added_by"],
+        added_at=datetime.fromisoformat(row["added_at"]),
+    )
+
+
+def _row_to_insight(row: aiosqlite.Row) -> ObservabilityInsight:
+    return ObservabilityInsight(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        date=date.fromisoformat(row["date"]),
+        health_score=row["health_score"],
+        anomalies=json.loads(row["anomalies"]) if row["anomalies"] else [],
+        top_failures=json.loads(row["top_failures"]) if row["top_failures"] else [],
+        usage_rollup=json.loads(row["usage_rollup"]) if row["usage_rollup"] else {},
+        trends=json.loads(row["trends"]) if row["trends"] else {},
+        narrative_digest=row["narrative_digest"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_workflow_bundle(row: aiosqlite.Row) -> WorkflowBundleRecord:
+    # ADR 037 D1 — sqlite stores ``published`` as INTEGER (0/1); coerce to bool
+    # at the boundary so the Pydantic model carries the typed value.
+    return WorkflowBundleRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        files=json.loads(row["files"]),
+        published=bool(row["published"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
 
 

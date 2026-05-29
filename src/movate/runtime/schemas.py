@@ -22,6 +22,8 @@ from movate.core.models import (
     AuditFindingSeverity,
     AuditRecord,
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     ErrorInfo,
     FeedbackRecord,
     JobKind,
@@ -35,7 +37,14 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
-from movate.core.reporting import AgentRollup, FailingCase, LatencyPercentiles, Report
+from movate.core.reporting import (
+    AgentRollup,
+    FailingCase,
+    LatencyPercentiles,
+    Report,
+    Usage,
+    UsageRollup,
+)
 
 
 class RunSubmission(BaseModel):
@@ -3977,7 +3986,6 @@ def _project_etag(p: Project) -> str:
     return p.updated_at.isoformat()
 
 
-
 # ---------------------------------------------------------------------------
 # Unified agent-creation surface
 # ``POST /api/v1/projects/{project_id}/agents`` — single dispatcher endpoint
@@ -4228,7 +4236,6 @@ class UnifiedAgentCreatedView(BaseModel):
             "(degrades cleanly per the dependency note in the PR body)."
         ),
     )
-
 
 
 # ---------------------------------------------------------------------------
@@ -4500,8 +4507,6 @@ class WorkflowValidationView(BaseModel):
     warnings: list[WorkflowValidationIssue]
 
 
-
-
 # ---------------------------------------------------------------------------
 # Usage metering (ADR 036 D1) — ``GET /api/v1/usage``
 #
@@ -4595,7 +4600,6 @@ class UsageView(BaseModel):
             by_agent=[UsageRollupView.from_dataclass(r) for r in usage.by_agent],
             by_provider=[UsageRollupView.from_dataclass(r) for r in usage.by_provider],
         )
-
 
 
 # ---------------------------------------------------------------------------

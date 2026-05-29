@@ -2190,6 +2190,7 @@ class StorageProvider(Protocol):
         and per-step counts. Raises :class:`FileNotFoundError` if the
         agent dir doesn't exist (the route handler maps that to 404).
         """
+
     # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
     #
     # Persisted output of the diagnose endpoint. A row is created with
