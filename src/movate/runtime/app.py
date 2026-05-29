@@ -148,6 +148,13 @@ from movate.runtime.hardening import (
     RequestIdMiddleware,
     resolve_max_request_bytes,
 )
+from movate.runtime.long_poll import (
+    HEADER_POLL_TIMEOUT,
+    HEADER_WAIT_CLAMPED,
+    MAX_WAIT_SECONDS,
+    DurationParseError,
+    long_poll_job,
+)
 from movate.runtime.middleware import (
     AuthContext,
     make_auth_dependency,
@@ -3721,14 +3728,53 @@ def build_app(
     async def get_job(
         job_id: str,
         request: Request,
+        response: Response,
         ctx: AuthContext = Depends(auth_dep),
+        wait: str | None = Query(
+            default=None,
+            description=(
+                "Long-poll duration, e.g. '30s' or '2m' (bare integers are "
+                "seconds). When set, the request BLOCKS until the job reaches "
+                "a terminal state or this duration elapses, whichever comes "
+                "first — instead of returning the current state immediately. "
+                "Already-terminal jobs return at once regardless. On timeout "
+                "the current (non-terminal) state is returned with HTTP 200 "
+                f"and the '{HEADER_POLL_TIMEOUT}: true' header so the client "
+                "knows to poll again. Capped at the server max "
+                f"({int(MAX_WAIT_SECONDS)}s); a larger value is clamped and "
+                f"the enforced max is reported in the '{HEADER_WAIT_CLAMPED}' "
+                "header. Omitting 'wait' preserves the original "
+                "return-immediately behaviour."
+            ),
+            examples=["30s"],
+        ),
     ) -> JobView:
         """Return job state. Tenant-scoped at the SQL layer
         (``get_job(..., tenant_id=...)`` filters in WHERE) so a
         cross-tenant lookup returns ``None`` and we 404 — never 403,
-        which would leak the existence of the id."""
+        which would leak the existence of the id.
+
+        Optional ``wait`` long-polls until the job is terminal (see the
+        param doc / :func:`movate.runtime.long_poll.long_poll_job`). Non-busy
+        and cross-process correct: a bounded storage re-poll, not an
+        in-process event the (possibly separate) worker replica can't signal.
+        """
         store: StorageProvider = request.app.state.storage
-        record = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        try:
+            record = await long_poll_job(
+                job_id=job_id,
+                tenant_id=ctx.tenant_id,
+                store=store,
+                request=request,
+                response=response,
+                wait_raw=wait,
+            )
+        except DurationParseError as exc:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message=str(exc),
+            ) from exc
         if record is None:
             raise not_found("job", job_id)
         return JobView.from_record(record)
@@ -7037,7 +7083,21 @@ def build_app(
     async def v1_get_job(
         job_id: str,
         request: Request,
-        ctx: AuthContext = Depends(auth_dep),
+        response: Response,
+        wait: str | None = Query(
+            default=None,
+            description=(
+                "Long-poll duration, e.g. '30s' or '2m' (bare integers are "
+                "seconds). When set, the request BLOCKS until the job is "
+                "terminal or this duration elapses. On timeout returns the "
+                f"current state with HTTP 200 + '{HEADER_POLL_TIMEOUT}: true'. "
+                f"Capped at the server max ({int(MAX_WAIT_SECONDS)}s); a larger "
+                f"value is clamped and reported via '{HEADER_WAIT_CLAMPED}'. "
+                "Omit to return immediately (legacy behaviour). Ignored for "
+                "``evgen_*`` eval-generation jobs (always return-immediately)."
+            ),
+            examples=["30s"],
+        ),
     ) -> Any:
         """Versioned alias of ``GET /jobs/{job_id}``.
 
@@ -7046,7 +7106,8 @@ def build_app(
         everything else delegates to the queue ``JobView`` path. Both
         responses use the same ``read`` scope + 404-not-403 tenant
         gating — the discriminator is the response's ``kind`` field
-        (``evals_generate`` vs. ``agent`` / ``workflow`` / ``eval``)."""
+        (``evals_generate`` vs. ``agent`` / ``workflow`` / ``eval``). The
+        queue path also honours the ``wait`` long-poll query param."""
         if job_id.startswith("evgen_"):
             store: StorageProvider = request.app.state.storage
             ev_job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
@@ -7075,7 +7136,7 @@ def build_app(
                 tokens_used=ev_job.tokens_used,
                 cost_usd=ev_job.cost_usd,
             )
-        return await get_job(job_id, request, ctx)
+        return await get_job(job_id, request, response, ctx, wait=wait)
 
     @v1.post(
         "/jobs/{job_id}/cancel",

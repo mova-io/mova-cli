@@ -1489,6 +1489,19 @@ class JobStatus(StrEnum):
     Operators triage with ``movate jobs list --status cancelled``.
     """
 
+    @property
+    def is_terminal(self) -> bool:
+        """True once the job will not change state again.
+
+        Non-terminal = ``QUEUED`` / ``RUNNING`` (the worker is still
+        going to touch it). Everything else — ``SUCCESS``, ``ERROR``,
+        ``SAFETY_BLOCKED``, ``DEAD_LETTER``, ``CANCELLED`` — is a final
+        resting state. This is the same QUEUED/RUNNING split the batch
+        status endpoint and the client poll loop already use; centralised
+        here so the long-poll handler and they agree by construction.
+        """
+        return self not in (JobStatus.QUEUED, JobStatus.RUNNING)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
