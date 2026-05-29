@@ -1,0 +1,8 @@
+title: Code reviewer
+description: Unified diff to structured findings (file, line, severity, rationale).
+shape: agent
+tags:
+  - code-review
+  - structured-output
+  - array-output
+recommended_for: Reviewing PR diffs and producing actionable per-line findings for an LLM judge.

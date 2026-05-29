@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Workflow Starter State",
+  "description": "Shared state threaded across the draft -> review pipeline.",
+  "type": "object",
+  "properties": {
+    "topic": {
+      "type": "string",
+      "description": "The subject the draft node should write about."
+    },
+    "draft": {
+      "type": "string",
+      "description": "Output of the draft node — a first-pass piece of writing."
+    },
+    "final": {
+      "type": "string",
+      "description": "Output of the review node — the polished final version."
+    }
+  },
+  "required": ["topic"],
+  "additionalProperties": false
+}

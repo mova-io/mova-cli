@@ -45,7 +45,9 @@ _PG_TABLES = (
     "failures",
     "evals",
     "bench",
+    "audits",
     "agent_bundles",
+    "workflow_bundles",
     "workflow_runs",
     "jobs",
     "batches",
@@ -60,6 +62,14 @@ _PG_TABLES = (
     "project_agents",
     "project_workflows",
     "project_kbs",
+    "catalog_entries",
+    "catalog_entry_versions",
+    "catalog_entry_ratings",
+    "catalog_sync_watermark",
+    "observability_insights",
+    "webhooks",
+    "webhook_attempts",
+    "webhook_cursors",
 )
 
 

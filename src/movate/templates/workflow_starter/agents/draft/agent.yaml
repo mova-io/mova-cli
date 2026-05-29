@@ -1,0 +1,38 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: |
+  Draft node for the workflow starter pipeline. Reads `topic` from the
+  workflow state and produces a first-pass `draft`. Output is merged
+  back into state for the downstream review node.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.20
+
+tags:
+  - workflow
+  - draft

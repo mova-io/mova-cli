@@ -3,13 +3,93 @@
 Each entry in :data:`TEMPLATES` maps a friendly name (used by ``movate init -t
 <name>``) to the directory under ``src/movate/templates/`` that holds the
 scaffold files. Adding a new template = drop a directory and add one line.
+
+ADR 028 — discoverability metadata. Each template directory may carry a
+``template.yaml`` file with human-readable metadata (title, description,
+tags, shape, recommended_for) consumed by ``mdk templates list/show`` and
+the interactive ``mdk init`` picker. The metadata lives next to the template
+files so the source of truth is the template itself — no central registry
+to drift. :func:`load_template_info` reads it; :func:`list_template_infos`
+returns metadata for every registered template. The original :func:`list_templates`
+return type is preserved (rule 5 — backward compat).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
+
+import yaml
 
 TEMPLATES_DIR = Path(__file__).parent
+
+
+# ADR 028 — template categories. Agent templates scaffold a single agent;
+# workflow templates scaffold a multi-step workflow (workflow.yaml + agent
+# subdirs). Skill templates are reached via ``mdk skills scaffold`` and stay
+# in their own registry (SKILL_TEMPLATES).
+TemplateShape = Literal[
+    "agent",  # single-agent scaffolds (default, faq, classifier, …)
+    "workflow",  # multi-step workflow scaffolds (workflow-starter)
+    "skill",  # reserved for skill templates (today via SKILL_TEMPLATES)
+]
+
+
+@dataclass(frozen=True)
+class TemplateInfo:
+    """Discoverability metadata for one template (ADR 028).
+
+    Loaded from a sibling ``template.yaml`` file inside the template
+    directory. Keep the field set small + stable — every field surfaces in
+    the ``mdk templates list`` and ``mdk templates show`` views, and any
+    addition needs a corresponding update to the JSON shape (rule 5).
+
+    Attributes:
+        name: Friendly name the operator types (matches TEMPLATES /
+            WORKFLOW_TEMPLATES key).
+        title: One-line headline ("Grounded Q&A with citations").
+        description: One-sentence elaboration; longer than ``title`` but
+            still readable in a table row (~80 chars).
+        tags: Lowercased capability tags ("rag", "tool-use", "workflow",
+            "starter") — used by the interactive picker for grouping +
+            future search.
+        shape: Which template family this is — agent / workflow / skill.
+        recommended_for: One-sentence "when to reach for this" hint
+            shown in ``show`` and on prompt.
+        directory: Resolved absolute path to the template dir on disk.
+            Excluded from the JSON view; callers serialize on their side.
+    """
+
+    name: str
+    title: str
+    description: str
+    tags: tuple[str, ...]
+    shape: TemplateShape
+    recommended_for: str
+    directory: Path = field(repr=False)
+
+    def to_dict(self) -> dict[str, object]:
+        """JSON-friendly dict for ``mdk templates list --json``.
+
+        Stable contract — public ``--json`` surface (rule 5). The
+        directory path is included as a relative-to-TEMPLATES_DIR
+        string so output is reproducible across installs.
+        """
+        try:
+            relative_dir = self.directory.relative_to(TEMPLATES_DIR).as_posix()
+        except ValueError:
+            relative_dir = self.directory.as_posix()
+        return {
+            "name": self.name,
+            "title": self.title,
+            "description": self.description,
+            "tags": list(self.tags),
+            "shape": self.shape,
+            "recommended_for": self.recommended_for,
+            "directory": relative_dir,
+        }
+
 
 TEMPLATES: dict[str, str] = {
     # Minimal echo agent — string-in, string-out. Default.
@@ -208,9 +288,43 @@ def pattern_is_workflow(name: str) -> bool:
     return entry[1]
 
 
+# ADR 028 — Workflow templates. Separate from TEMPLATES because they
+# scaffold a multi-step workflow (workflow.yaml + agent subdirs), not a
+# single agent. They're surfaced via ``mdk templates list/show`` for
+# discoverability; the on-disk dir is the canonical "this is how you
+# build a workflow" reference. The existing ``mdk init -t <name>`` agent
+# scaffold path is unchanged — workflow names live in this registry, not
+# TEMPLATES, so the agent-template invariants (every TEMPLATES entry has
+# an ``agent.yaml`` at its root) are preserved.
+WORKFLOW_TEMPLATES: dict[str, str] = {
+    # Two-step "draft → review" pipeline demonstrating agent-to-agent
+    # state flow, a state_schema, eval dataset, and the canonical
+    # workflow.yaml structure (ADR 017 IR). The starter referenced by
+    # ADR 028 D2.
+    "workflow-starter": "workflow_starter",
+}
+
+
 def list_templates() -> list[str]:
-    """Sorted list of (shape) template names."""
+    """Sorted list of (shape) template names.
+
+    [bold]Stable contract[/bold] — return type and content preserved
+    across ADR 028 (rule 5). Workflow templates surface via
+    :func:`list_workflow_templates` / :func:`list_template_infos`, not
+    here, so existing callers (``mdk init -t`` validation, the legacy
+    ``--list`` view) keep their original behavior.
+    """
     return sorted(TEMPLATES.keys())
+
+
+def list_workflow_templates() -> list[str]:
+    """Sorted list of workflow-template names (ADR 028).
+
+    Workflow templates live in their own registry (:data:`WORKFLOW_TEMPLATES`)
+    so they don't disturb the agent-template surface. ``mdk templates``
+    surfaces both via :func:`list_template_infos`.
+    """
+    return sorted(WORKFLOW_TEMPLATES.keys())
 
 
 def list_roles() -> list[str]:
@@ -224,10 +338,13 @@ def get_template_path(name: str) -> Path:
     """Resolve a friendly template name to its packaged directory.
 
     Looks up ``name`` in :data:`ROLE_TEMPLATES` first, falling back to
-    :data:`TEMPLATES`. This lets ``mdk add my-agent --template
-    support-triage`` resolve to the role template AND ``mdk init
-    my-agent --template faq`` still resolve to the shape template,
-    without users needing to know which registry the name lives in.
+    :data:`TEMPLATES`, then :data:`WORKFLOW_TEMPLATES`. This lets
+    ``mdk add my-agent --template support-triage`` resolve to the role
+    template AND ``mdk init my-agent --template faq`` still resolve to
+    the shape template, without users needing to know which registry
+    the name lives in. Workflow lookup is additive (ADR 028): if name
+    matches an agent template it resolves there first; new workflow-only
+    names route through the workflow registry.
 
     Raises ``ValueError`` with both available lists if ``name`` is
     unknown.
@@ -236,11 +353,15 @@ def get_template_path(name: str) -> Path:
         rel = ROLE_TEMPLATES[name]
     elif name in TEMPLATES:
         rel = TEMPLATES[name]
+    elif name in WORKFLOW_TEMPLATES:
+        rel = WORKFLOW_TEMPLATES[name]
     else:
         roles = ", ".join(list_roles())
         shapes = ", ".join(list_templates())
+        workflows = ", ".join(list_workflow_templates())
         raise ValueError(
-            f"unknown template {name!r}; available roles: {roles}; available shapes: {shapes}"
+            f"unknown template {name!r}; available roles: {roles}; "
+            f"available shapes: {shapes}; available workflows: {workflows}"
         )
     path = TEMPLATES_DIR / rel
     if not path.is_dir():  # pragma: no cover — install-time invariant
@@ -248,15 +369,127 @@ def get_template_path(name: str) -> Path:
     return path
 
 
+class TemplateInfoLoadError(Exception):
+    """Raised when a template's ``template.yaml`` is missing or invalid.
+
+    ADR 028 makes ``template.yaml`` a hard requirement for every shipped
+    template — discoverability metadata is part of the template's
+    contract, not a nice-to-have. Failing loud here keeps the ``mdk
+    templates`` surface honest (no silent empty rows when a maintainer
+    forgets the file).
+    """
+
+
+def load_template_info(name: str) -> TemplateInfo:
+    """Load discoverability metadata for one template (ADR 028).
+
+    Reads ``<template_dir>/template.yaml`` and validates the required
+    fields. The shape is inferred from which registry holds the name
+    (agent vs. workflow vs. role) so the YAML doesn't have to repeat
+    something the registry already knows; if the YAML declares ``shape``
+    explicitly it must match.
+
+    Raises :class:`TemplateInfoLoadError` on missing file, parse error,
+    or required-field omission. Unknown names raise ``ValueError`` via
+    :func:`get_template_path`.
+    """
+    path = get_template_path(name)
+    meta_file = path / "template.yaml"
+    if not meta_file.is_file():
+        raise TemplateInfoLoadError(f"template {name!r}: missing template.yaml at {meta_file}")
+    try:
+        raw = yaml.safe_load(meta_file.read_text()) or {}
+    except yaml.YAMLError as exc:
+        raise TemplateInfoLoadError(
+            f"template {name!r}: invalid YAML in template.yaml: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise TemplateInfoLoadError(
+            f"template {name!r}: template.yaml must be a mapping, got {type(raw).__name__}"
+        )
+
+    # Required fields. Keep the error message specific so a maintainer
+    # adding a new template sees exactly which key they missed.
+    for field_name in ("title", "description", "recommended_for"):
+        if not raw.get(field_name):
+            raise TemplateInfoLoadError(
+                f"template {name!r}: template.yaml missing required field {field_name!r}"
+            )
+
+    inferred_shape: TemplateShape
+    if name in WORKFLOW_TEMPLATES:
+        inferred_shape = "workflow"
+    elif name in TEMPLATES or name in ROLE_TEMPLATES:
+        inferred_shape = "agent"
+    else:  # pragma: no cover — get_template_path would have raised
+        inferred_shape = "agent"
+    declared_shape = raw.get("shape")
+    if declared_shape is not None and declared_shape != inferred_shape:
+        raise TemplateInfoLoadError(
+            f"template {name!r}: template.yaml shape={declared_shape!r} "
+            f"contradicts registry-inferred shape={inferred_shape!r}"
+        )
+
+    raw_tags = raw.get("tags") or []
+    if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
+        raise TemplateInfoLoadError(
+            f"template {name!r}: template.yaml `tags` must be a list of strings"
+        )
+    tags = tuple(t.strip().lower() for t in raw_tags if t.strip())
+
+    return TemplateInfo(
+        name=name,
+        title=str(raw["title"]).strip(),
+        description=str(raw["description"]).strip(),
+        tags=tags,
+        shape=inferred_shape,
+        recommended_for=str(raw["recommended_for"]).strip(),
+        directory=path,
+    )
+
+
+def list_template_infos(*, include_workflows: bool = True) -> list[TemplateInfo]:
+    """Return :class:`TemplateInfo` for every registered template (ADR 028).
+
+    Iterates over both :data:`TEMPLATES` and :data:`WORKFLOW_TEMPLATES`
+    (set ``include_workflows=False`` to keep the legacy agent-only view).
+    Templates missing a ``template.yaml`` are SKIPPED rather than failing
+    — the caller (``mdk templates``) prefers a partial view to a hard
+    crash when one template lags behind. Individual lookups via
+    :func:`load_template_info` still raise loudly.
+
+    The result is sorted by name for deterministic CLI output.
+    """
+    names: list[str] = list(TEMPLATES.keys())
+    if include_workflows:
+        names.extend(WORKFLOW_TEMPLATES.keys())
+    infos: list[TemplateInfo] = []
+    for name in sorted(set(names)):
+        try:
+            infos.append(load_template_info(name))
+        except TemplateInfoLoadError:
+            # Skip rather than crash — see docstring. Surfacing partial
+            # rows is the whole point of the discoverability command.
+            continue
+    return infos
+
+
 __all__ = [
     "PATTERN_TEMPLATES",
     "ROLE_TEMPLATES",
     "TEMPLATES",
     "TEMPLATES_DIR",
+    "WORKFLOW_TEMPLATES",
+    "TemplateInfo",
+    "TemplateInfoLoadError",
+    "TemplateShape",
     "get_pattern_path",
     "get_template_path",
     "list_patterns",
     "list_roles",
+    "list_template_infos",
     "list_templates",
+    "list_workflow_templates",
+    "load_template_info",
     "pattern_is_workflow",
 ]

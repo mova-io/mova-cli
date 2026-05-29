@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from movate.core.events import EventKind
 from movate.core.job_retry import (
     DEFAULT_POLICY,
     DEFAULT_VISIBILITY_TIMEOUT_SECONDS,
@@ -45,6 +46,7 @@ from movate.core.models import (
 )
 from movate.core.notify import NotificationDispatcher
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
+from movate.runtime.events import emit_event
 from movate.storage.base import StorageProvider
 from movate.tracing import dec_in_flight, inc_in_flight, record_job_completed
 
@@ -243,6 +245,12 @@ class Worker:
                 duration_ms=duration_ms,
                 tenant_id=job.tenant_id,
             )
+            self._emit_run_terminal_event(
+                job,
+                final_status=final_status,
+                result_run_id=outcome.result_run_id,
+                duration_ms=duration_ms,
+            )
         if self._on_job_complete is not None:
             # Decorative; never sink the worker on a buggy callback.
             # We pass an outcome reflecting the FINAL status (which
@@ -328,6 +336,15 @@ class Worker:
             duration_ms=duration_ms,
             tenant_id=job.tenant_id,
         )
+        # ADR 035 D1 — emit ``run.failed`` for a cancel-before-dispatch
+        # terminal (CANCELLED is one of the non-SUCCESS terminals the
+        # main path bucketed into ``run.failed``).
+        self._emit_run_terminal_event(
+            job,
+            final_status=JobStatus.CANCELLED,
+            result_run_id=None,
+            duration_ms=duration_ms,
+        )
         if self._on_job_complete is not None:
             try:
                 self._on_job_complete(
@@ -353,6 +370,45 @@ class Worker:
                     job.job_id,
                     exc_info=True,
                 )
+
+    def _emit_run_terminal_event(
+        self,
+        job: JobRecord,
+        *,
+        final_status: JobStatus,
+        result_run_id: str | None,
+        duration_ms: int,
+    ) -> None:
+        """Emit ADR 035 D1's lifecycle event for a terminal-state run.
+
+        ``run.completed`` on SUCCESS, ``run.failed`` on every other
+        terminal (ERROR / SAFETY_BLOCKED / DEAD_LETTER / CANCELLED).
+        Only AGENT and WORKFLOW jobs emit here — EVAL jobs land their
+        own ``eval.failed`` event at the dispatch layer (the eval is
+        the meaningful thing, not the job wrapper); BENCH jobs don't
+        emit in D1 (the canonical kind set stays small).
+
+        Fire-and-forget via :func:`emit_event` — NEVER raises into the
+        worker loop, NEVER waits on the storage write.
+        """
+        if job.kind not in (JobKind.AGENT, JobKind.WORKFLOW):
+            return
+        run_kind = (
+            EventKind.RUN_COMPLETED if final_status == JobStatus.SUCCESS else EventKind.RUN_FAILED
+        )
+        emit_event(
+            self._storage,
+            tenant_id=job.tenant_id,
+            kind=run_kind,
+            subject=result_run_id or job.job_id,
+            data={
+                "job_id": job.job_id,
+                "agent": job.target,
+                "status": final_status.value,
+                "kind": job.kind.value,
+                "duration_ms": duration_ms,
+            },
+        )
 
     async def _dispatch_job(self, job: JobRecord) -> DispatchOutcome:
         """Run dispatch for one job, converting failures into outcomes.

@@ -1,0 +1,7 @@
+title: FAQ assistant
+description: Question to concise answer with a confidence score. Ships with an LLM-judge example.
+shape: agent
+tags:
+  - q-and-a
+  - confidence
+recommended_for: A frequently-asked-questions bot whose answers are short, factual, and bounded.
