@@ -319,7 +319,25 @@ def _build_meter_provider(*, reader: Any | None) -> Any:
     # OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_HEADERS from the
     # environment (env-driven Azure Monitor / App Insights config; ADR 001).
     metric_reader = PeriodicExportingMetricReader(exporter_cls())
-    return MeterProvider(resource=resource, metric_readers=[metric_reader])
+
+    # ADR 039 Phase 2 — opt-in dual export. When MDK_TELEMETRY_ENDPOINT is
+    # set (paired with MDK_TELEMETRY_CUSTOMER_ID), attach a SECOND
+    # PeriodicExportingMetricReader pointing at Movate's central Collector.
+    # The two readers share the MeterProvider's instruments — each instrument
+    # record fans out to both readers, so the primary stream is unaffected.
+    # The dual builder returns None on any failure path (SDK unavailable,
+    # endpoint unreachable, half-configured env) so the primary list is
+    # always intact.
+    readers: list[Any] = [metric_reader]
+    from movate.tracing.dual_export import (  # noqa: PLC0415 - lazy by design
+        build_dual_metric_reader,
+    )
+
+    dual_reader = build_dual_metric_reader()
+    if dual_reader is not None:
+        readers.append(dual_reader)
+
+    return MeterProvider(resource=resource, metric_readers=readers)
 
 
 def _otlp_metric_exporter_class() -> Any:
