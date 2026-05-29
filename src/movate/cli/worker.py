@@ -30,6 +30,7 @@ from movate.core.models import JobRecord, JobStatus
 from movate.core.notify import build_dispatcher
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.runtime.registry import scan_agents, scan_workflows
+from movate.runtime.webhook_worker import WebhookWorker, WebhookWorkerConfig
 from movate.runtime.worker import Worker, WorkerConfig
 
 err = Console(stderr=True)
@@ -253,6 +254,17 @@ async def _run_worker(
         notifier=notifier,
     )
 
+    # ADR 035 D2 — webhook delivery worker runs in the SAME process /
+    # event loop as the job worker. Wiring it here keeps "mdk worker"
+    # as the single drain entry-point; deployments don't need a
+    # second container. The webhook worker is fully independent: a
+    # subscriber that hangs or crashes the loop has no effect on job
+    # dispatch (separate tasks, separate clients).
+    webhook_worker = WebhookWorker(
+        storage=rt.storage,
+        config=WebhookWorkerConfig(tenant_id=tenant_id),
+    )
+
     stop_event = asyncio.Event()
 
     def _handle_signal(*_: object) -> None:
@@ -266,10 +278,17 @@ async def _run_worker(
 
     err.print(
         f"[bold]movate worker[/bold] — tenant={tenant_id or '<all>'} "
-        f"poll={poll_interval}s — waiting for jobs"
+        f"poll={poll_interval}s — waiting for jobs + webhook deliveries"
     )
     try:
-        await worker_obj.run_forever(stop_event)
+        # Run both workers concurrently. ``return_exceptions=True``
+        # ensures one worker's bug doesn't sink the other; failures
+        # surface in the logs (each worker logs its own crashes).
+        await asyncio.gather(
+            worker_obj.run_forever(stop_event),
+            webhook_worker.run_forever(stop_event),
+            return_exceptions=True,
+        )
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
         success("worker stopped cleanly")

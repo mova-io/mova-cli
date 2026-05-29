@@ -80,6 +80,7 @@ from movate.core.models import (
     WorkflowStatus,
 )
 from movate.core.observability.models import ObservabilityInsight
+from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 from movate.storage._cosine import rank_chunks_by_cosine as _rank_chunks_by_cosine  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -957,6 +958,61 @@ CREATE INDEX IF NOT EXISTS idx_events_tenant_created
 -- (the typed-subscription shape D2/D3 will lean on).
 CREATE INDEX IF NOT EXISTS idx_events_tenant_kind_created
     ON events(tenant_id, kind, created_at);
+
+-- ADR 035 D2 — webhook subscriptions (outbound delivery). One row per
+-- configured subscriber. ``secret`` is STORED (not hashed) because the
+-- delivery worker must re-sign every outbound POST with the same key
+-- the subscriber configured — we never echo it back on the wire after
+-- the one-time create response. ``kind_filter`` is a JSONB list (use
+-- ``["*"]`` for "all kinds"). Additive — no row exists unless the
+-- tenant POSTs ``/api/v1/webhooks``, so pre-D2 behavior is byte-for-
+-- byte unchanged.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id            TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    url           TEXT NOT NULL,
+    kind_filter   JSONB NOT NULL,
+    secret        TEXT NOT NULL,
+    enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks(tenant_id);
+
+-- ADR 035 D2 — per-attempt delivery log. One row per
+-- (webhook_id, event_id, attempt_n) triple. ``response_excerpt`` is
+-- truncated server-side (worker bounds it to ~512 chars before
+-- insert) so a misbehaving subscriber can't blow up storage with
+-- megabytes per attempt. ``status_code`` and ``response_excerpt`` are
+-- NULL when the attempt never received an HTTP response (timeout /
+-- connection error).
+CREATE TABLE IF NOT EXISTS webhook_attempts (
+    id                TEXT PRIMARY KEY,
+    webhook_id        TEXT NOT NULL,
+    event_id          TEXT NOT NULL,
+    tenant_id         TEXT NOT NULL,
+    attempted_at      TIMESTAMPTZ NOT NULL,
+    status_code       INTEGER,
+    response_excerpt  TEXT,
+    error_kind        TEXT NOT NULL,
+    attempt_n         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_attempts_tenant_at
+    ON webhook_attempts(tenant_id, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_attempts_webhook_at
+    ON webhook_attempts(webhook_id, attempted_at);
+
+-- ADR 035 D2 — per-webhook delivery cursor. ``webhook_id`` is PK so
+-- the upsert is cheap; per-webhook (rather than global) cursor avoids
+-- re-delivering everyone's events when a new subscriber signs up.
+-- ``tenant_id`` is denormalized for cheap tenant-bounded reads.
+CREATE TABLE IF NOT EXISTS webhook_cursors (
+    webhook_id    TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    last_event_id TEXT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_cursors_tenant ON webhook_cursors(tenant_id);
 """
 
 
@@ -4271,10 +4327,195 @@ class PostgresProvider:
         )
         return status.endswith(" 1") if isinstance(status, str) else False
 
+    # ------------------------------------------------------------------
+    # Webhook subscriptions (ADR 035 D2 — outbound delivery). ``secret``
+    # is stored verbatim so the worker can re-sign every outbound POST
+    # (echoed on the wire only on the create response). ``kind_filter``
+    # round-trips through the JSONB codec registered in
+    # ``_init_connection`` — handler passes/receives plain Python lists.
+    # ------------------------------------------------------------------
+
+    async def create_webhook(self, sub: WebhookSubscription) -> WebhookSubscription:
+        await self._db.execute(
+            "INSERT INTO webhooks "
+            "(id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            sub.id,
+            sub.tenant_id,
+            sub.url,
+            sub.kind_filter,
+            sub.secret,
+            sub.enabled,
+            sub.failure_count,
+            sub.created_at,
+        )
+        return sub
+
+    async def list_webhooks(
+        self,
+        tenant_id: str,
+        *,
+        enabled_only: bool = True,
+    ) -> list[WebhookSubscription]:
+        clauses: list[str] = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if enabled_only:
+            clauses.append("enabled = TRUE")
+        sql = (
+            "SELECT id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at "
+            "FROM webhooks WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC, id ASC"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_webhook(r) for r in rows]
+
+    async def get_webhook(self, tenant_id: str, webhook_id: str) -> WebhookSubscription | None:
+        row = await self._db.fetchrow(
+            "SELECT id, tenant_id, url, kind_filter, secret, enabled, failure_count, created_at "
+            "FROM webhooks WHERE id = $1 AND tenant_id = $2",
+            webhook_id,
+            tenant_id,
+        )
+        return _row_to_webhook(row) if row is not None else None
+
+    async def update_webhook(
+        self,
+        tenant_id: str,
+        webhook_id: str,
+        *,
+        enabled: bool | None = None,
+        failure_count: int | None = None,
+    ) -> WebhookSubscription | None:
+        if enabled is None and failure_count is None:
+            return await self.get_webhook(tenant_id, webhook_id)
+        sets: list[str] = []
+        params: list[Any] = []
+        if enabled is not None:
+            params.append(enabled)
+            sets.append(f"enabled = ${len(params)}")
+        if failure_count is not None:
+            params.append(failure_count)
+            sets.append(f"failure_count = ${len(params)}")
+        params.append(webhook_id)
+        id_idx = len(params)
+        params.append(tenant_id)
+        tenant_idx = len(params)
+        await self._db.execute(
+            f"UPDATE webhooks SET {', '.join(sets)} "
+            f"WHERE id = ${id_idx} AND tenant_id = ${tenant_idx}",
+            *params,
+        )
+        return await self.get_webhook(tenant_id, webhook_id)
+
+    async def delete_webhook(self, tenant_id: str, webhook_id: str) -> bool:
+        status = await self._db.execute(
+            "DELETE FROM webhooks WHERE id = $1 AND tenant_id = $2",
+            webhook_id,
+            tenant_id,
+        )
+        return status.endswith(" 1") if isinstance(status, str) else False
+
+    async def record_webhook_attempt(self, attempt: WebhookAttempt) -> None:
+        await self._db.execute(
+            "INSERT INTO webhook_attempts "
+            "(id, webhook_id, event_id, tenant_id, attempted_at, status_code, "
+            " response_excerpt, error_kind, attempt_n) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            attempt.id,
+            attempt.webhook_id,
+            attempt.event_id,
+            attempt.tenant_id,
+            attempt.attempted_at,
+            attempt.status_code,
+            attempt.response_excerpt,
+            attempt.error_kind,
+            attempt.attempt_n,
+        )
+
+    async def list_webhook_attempts(
+        self,
+        tenant_id: str,
+        *,
+        webhook_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[WebhookAttempt]:
+        clauses: list[str] = ["tenant_id = $1"]
+        params: list[Any] = [tenant_id]
+        if webhook_id is not None:
+            params.append(webhook_id)
+            clauses.append(f"webhook_id = ${len(params)}")
+        if since is not None:
+            params.append(since)
+            clauses.append(f"attempted_at >= ${len(params)}")
+        params.append(limit)
+        sql = (
+            "SELECT id, webhook_id, event_id, tenant_id, attempted_at, status_code, "
+            "       response_excerpt, error_kind, attempt_n "
+            "FROM webhook_attempts WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY attempted_at DESC, id DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_webhook_attempt(r) for r in rows]
+
+    async def get_webhook_cursor(self, tenant_id: str, webhook_id: str) -> str | None:
+        # asyncpg.fetchval returns ``Any``; explicit cast keeps mypy happy
+        # without disabling no-any-return wholesale on this file.
+        value = await self._db.fetchval(
+            "SELECT last_event_id FROM webhook_cursors WHERE webhook_id = $1 AND tenant_id = $2",
+            webhook_id,
+            tenant_id,
+        )
+        return value if value is None else str(value)
+
+    async def set_webhook_cursor(self, tenant_id: str, webhook_id: str, last_event_id: str) -> None:
+        # Postgres ``INSERT ... ON CONFLICT ... DO UPDATE`` upsert. The
+        # cursor is keyed on ``webhook_id``; ``tenant_id`` is
+        # denormalized on the row so a tenant-scoped read stays cheap.
+        await self._db.execute(
+            "INSERT INTO webhook_cursors (webhook_id, tenant_id, last_event_id, updated_at) "
+            "VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (webhook_id) DO UPDATE SET "
+            "  last_event_id = EXCLUDED.last_event_id, "
+            "  updated_at = EXCLUDED.updated_at",
+            webhook_id,
+            tenant_id,
+            last_event_id,
+            datetime.now(UTC),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Row → model converters
 # ---------------------------------------------------------------------------
+
+
+def _row_to_webhook(row: asyncpg.Record) -> WebhookSubscription:
+    return WebhookSubscription(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        url=row["url"],
+        # JSONB codec decoded this to a Python list already.
+        kind_filter=list(row["kind_filter"] or []),
+        secret=row["secret"],
+        enabled=bool(row["enabled"]),
+        failure_count=row["failure_count"] or 0,
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_webhook_attempt(row: asyncpg.Record) -> WebhookAttempt:
+    return WebhookAttempt(
+        id=row["id"],
+        webhook_id=row["webhook_id"],
+        event_id=row["event_id"],
+        tenant_id=row["tenant_id"],
+        attempted_at=row["attempted_at"],
+        status_code=row["status_code"],
+        response_excerpt=row["response_excerpt"],
+        error_kind=row["error_kind"],
+        attempt_n=row["attempt_n"],
+    )
 
 
 def _row_to_run(row: asyncpg.Record) -> RunRecord:
