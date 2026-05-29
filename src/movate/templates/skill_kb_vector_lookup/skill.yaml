@@ -24,7 +24,18 @@ schema:
         source: string
         score: number
         ocr: boolean?
+        # ADR 010 / 046 D9 — present only on the appended graph-context
+        # block when GraphRAG retrieval is enabled (kind="graph"); a
+        # normal vector chunk omits these. Optional so both shapes
+        # validate against the one item schema.
+        kind: string?
+        entities: integer?
+        relations: integer?
     chunks_found: integer
+    # ADR 010 / 046 D9 — True when a non-empty graph-context block was
+    # appended to ``chunks`` (graph retrieval enabled + a seed matched).
+    # Optional: absent on the empty-question early return.
+    graph_context_added: boolean?
     warning: string?
 
 implementation:

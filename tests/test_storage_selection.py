@@ -30,7 +30,7 @@ from movate.testing import InMemoryStorage
 
 
 @pytest.fixture(autouse=True)
-def _reset_storage_globals() -> None:
+def _reset_storage_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     """Wipe the once-per-process flags before every test.
 
     ``build_storage`` emits the durability warning at most ONCE per
@@ -40,8 +40,14 @@ def _reset_storage_globals() -> None:
     later test asserting on it would silently see zero records.
     Also resets the CLI-mode flag so tests don't leak across each
     other.
+
+    Also clears ``MOVATE_PG_URL`` (the #122 Postgres fallback var) so a
+    developer who has it exported locally doesn't flip an
+    expected-SQLite test onto the Postgres path. Individual tests opt in
+    by setting it explicitly.
     """
     _reset_state_for_tests()
+    monkeypatch.delenv("MOVATE_PG_URL", raising=False)
 
 
 @pytest.mark.unit
@@ -95,6 +101,103 @@ def test_build_storage_picks_postgres_when_db_url_set(
     assert "host=db.example.internal" in detail
     assert "db=movate" in detail
     assert durable is True
+
+
+# ---------------------------------------------------------------------------
+# Durable api-key store (#122): MOVATE_PG_URL fallback + persistent SQLite
+# default. A deployment that already wires Postgres for the memory store
+# (which reads MOVATE_PG_URL) must NOT silently land the api-key store on
+# ephemeral in-pod SQLite — the recurring cause of 401s after a recycle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_storage_picks_postgres_from_movate_pg_url_fallback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#122: with MOVATE_DB_URL unset but MOVATE_PG_URL pointing at
+    Postgres, build_storage selects the durable PostgresProvider — not
+    ephemeral SQLite. No durability warning on this path."""
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.setenv(
+        "MOVATE_PG_URL",
+        "postgresql://movate:@db.example.internal:5432/movate?sslmode=require",
+    )
+
+    with caplog.at_level(logging.INFO, logger="movate.storage"):
+        provider = build_storage()
+
+    assert isinstance(provider, PostgresProvider)
+    assert not any("NOT durable" in r.message for r in caplog.records), (
+        "MOVATE_PG_URL fallback must select durable Postgres, not warn"
+    )
+    snapshot = selected_backend()
+    assert snapshot is not None
+    backend, _detail, durable = snapshot
+    assert backend == "postgres"
+    assert durable is True
+
+
+@pytest.mark.unit
+def test_movate_db_url_wins_over_movate_pg_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When BOTH are set, the canonical MOVATE_DB_URL takes precedence —
+    MOVATE_PG_URL is only a fallback for deployments that don't set the
+    primary var."""
+    monkeypatch.setenv("MOVATE_DB_URL", "postgresql://primary:@primary.host:5432/primarydb")
+    monkeypatch.setenv("MOVATE_PG_URL", "postgresql://fallback:@fallback.host:5432/fallbackdb")
+
+    provider = build_storage()
+
+    assert isinstance(provider, PostgresProvider)
+    snapshot = selected_backend()
+    assert snapshot is not None
+    _backend, detail, _durable = snapshot
+    assert "host=primary.host" in detail
+    assert "db=primarydb" in detail
+
+
+@pytest.mark.unit
+def test_non_postgres_pg_url_falls_through_to_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A MOVATE_PG_URL that isn't a postgres DSN (e.g. a leftover sqlite
+    path or junk) is ignored — we fall through to the SQLite path rather
+    than handing asyncpg a bogus DSN."""
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.setenv("MOVATE_PG_URL", "sqlite:///tmp/not-a-pg.db")
+    monkeypatch.setenv("MOVATE_DB", "/tmp/mdk-test.db")
+
+    provider = build_storage()
+
+    assert isinstance(provider, SqliteProvider)
+    snapshot = selected_backend()
+    assert snapshot is not None
+    assert snapshot[0] == "sqlite"
+
+
+@pytest.mark.unit
+def test_blank_movate_db_falls_back_to_persistent_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#122: a blank ``MOVATE_DB=`` (a deploy-template footgun) must fall
+    back to the persistent ``~/.movate/local.db`` default rather than be
+    used verbatim as a path. NEVER substitutes a tempfile (that would
+    reintroduce cold-start key loss)."""
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.setenv("MOVATE_DB", "   ")  # whitespace-only
+
+    provider = build_storage()
+
+    assert isinstance(provider, SqliteProvider)
+    snapshot = selected_backend()
+    assert snapshot is not None
+    backend, detail, _durable = snapshot
+    assert backend == "sqlite"
+    assert detail == "~/.movate/local.db", (
+        "blank MOVATE_DB must resolve to the persistent default, not ''"
+    )
 
 
 @pytest.mark.unit

@@ -92,6 +92,7 @@ async def windowed_subgraph(
     root: str | None = None,
     depth: int | None = None,
     limit: int | None = None,
+    project_id: str | None = None,
 ) -> GraphologyDoc:
     """A capped window onto the graph, as a graphology document.
 
@@ -104,6 +105,10 @@ async def windowed_subgraph(
     * **unrooted** (no ``root``) — the first ``limit`` entities for the
       ``(agent, tenant)`` graph (optionally filtered to ``type``) plus
       every relation among them. A whole-graph overview, capped.
+
+    ``project_id`` (ADR 046 D1, additive) optionally narrows the window to
+    one project's subgraph; ``None`` (the default) keeps the historical
+    per-agent scope so the viewer's behavior is unchanged without it.
 
     ``mode=topology`` returns an empty document (not yet implemented).
     Every path is hard-capped at ``min(limit, MAX_CAP)`` nodes/edges.
@@ -122,6 +127,7 @@ async def windowed_subgraph(
             depth=_clamp_depth(depth),
             cap=cap,
             type_filter=type,
+            project_id=project_id,
         )
 
     return await _unrooted_window(
@@ -130,6 +136,7 @@ async def windowed_subgraph(
         tenant_id=tenant_id,
         cap=cap,
         type_filter=type,
+        project_id=project_id,
     )
 
 
@@ -142,12 +149,17 @@ async def _rooted_window(
     depth: int,
     cap: int,
     type_filter: str | None,
+    project_id: str | None = None,
 ) -> GraphologyDoc:
     # Reject a cross-tenant / unknown root up front (no leak): get_entity
     # returns None for a foreign tenant, so an empty doc comes back rather
-    # than another tenant's neighborhood.
+    # than another tenant's neighborhood. When a project filter is set, a
+    # root that belongs to a different project is also rejected (no leak
+    # across project scope).
     seed = await storage.get_entity(root, tenant_id=tenant_id)
     if seed is None or seed.agent != agent:
+        return to_graphology([], [])
+    if project_id is not None and seed.project_id != project_id:
         return to_graphology([], [])
     sub = await storage.expand_neighbors(
         agent=agent,
@@ -155,6 +167,7 @@ async def _rooted_window(
         entity_ids=[root],
         hops=depth,
         limit=cap,
+        project_id=project_id,
     )
     entities = _apply_type_filter(sub.entities, type_filter, always_keep={root})
     entities = entities[:cap]
@@ -169,13 +182,18 @@ async def _unrooted_window(
     tenant_id: str,
     cap: int,
     type_filter: str | None,
+    project_id: str | None = None,
 ) -> GraphologyDoc:
-    entities = await storage.list_entities(agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT)
+    entities = await storage.list_entities(
+        agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT, project_id=project_id
+    )
     entities = _apply_type_filter(entities, type_filter)
     entities = entities[:cap]
     if not entities:
         return to_graphology([], [])
-    relations = await storage.list_relations(agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT)
+    relations = await storage.list_relations(
+        agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT, project_id=project_id
+    )
     relations = _cap_relations(relations, entities, cap)
     return to_graphology(entities, relations)
 
@@ -188,16 +206,21 @@ async def expand_node_neighbors(
     node_id: str,
     depth: int | None = None,
     limit: int | None = None,
+    project_id: str | None = None,
 ) -> GraphologyDoc:
     """Expand-on-demand: the neighborhood of one node, graphology JSON.
 
     Used by the client when an operator clicks a node to grow the graph.
     Bounded by ``depth`` (hops, capped at ``MAX_DEPTH``) and ``limit``
-    (node/edge cap). An unknown / cross-tenant node → empty document.
+    (node/edge cap). ``project_id`` (additive) optionally bounds the
+    expansion to one project's subgraph. An unknown / cross-tenant /
+    cross-project node → empty document.
     """
     cap = clamp_cap(limit)
     seed = await storage.get_entity(node_id, tenant_id=tenant_id)
     if seed is None or seed.agent != agent:
+        return to_graphology([], [])
+    if project_id is not None and seed.project_id != project_id:
         return to_graphology([], [])
     sub = await storage.expand_neighbors(
         agent=agent,
@@ -205,6 +228,7 @@ async def expand_node_neighbors(
         entity_ids=[node_id],
         hops=_clamp_depth(depth),
         limit=cap,
+        project_id=project_id,
     )
     entities = sub.entities[:cap]
     relations = _cap_relations(sub.relations, entities, cap)
@@ -273,19 +297,23 @@ async def search_nodes(
     q: str,
     type: str | None = None,
     limit: int | None = None,
+    project_id: str | None = None,
 ) -> list[NodeSearchHit]:
     """Substring (case-insensitive) label search for fly-to.
 
     A lexical match on ``name`` — no embedding, no model call (the
     vector-seed ``search_entities`` is a *retrieval* primitive; this is a
-    UI fly-to box). Optionally filtered to ``type``. Capped at the node
-    budget. Empty ``q`` → ``[]``.
+    UI fly-to box). Optionally filtered to ``type`` and ``project_id``
+    (additive; ``None`` = per-agent scope). Capped at the node budget.
+    Empty ``q`` → ``[]``.
     """
     needle = q.strip().lower()
     if not needle:
         return []
     cap = clamp_cap(limit)
-    entities = await storage.list_entities(agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT)
+    entities = await storage.list_entities(
+        agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT, project_id=project_id
+    )
     hits: list[NodeSearchHit] = []
     for e in entities:
         if type is not None and e.type != type:
@@ -306,14 +334,16 @@ async def traverse(
     depth: int | None = None,
     limit: int | None = None,
     type: str | None = None,
+    project_id: str | None = None,
 ) -> GraphologyDoc:
     """Bounded traverse/subgraph from a root node — ``POST /graph/query``.
 
     Depth- and breadth-bounded (``depth`` ≤ ``MAX_DEPTH`` hops, ``limit``
     ≤ ``MAX_CAP`` relations/nodes). Same no-leak contract as the rooted
-    window: an unknown / cross-tenant ``root`` yields an empty document.
-    Reuses the rooted-window path so traversal mechanics live in one
-    place.
+    window: an unknown / cross-tenant / cross-project ``root`` yields an
+    empty document. ``project_id`` (additive) optionally bounds the
+    traversal to one project's subgraph. Reuses the rooted-window path so
+    traversal mechanics live in one place.
     """
     cap = clamp_cap(limit)
     return await _rooted_window(
@@ -324,6 +354,7 @@ async def traverse(
         depth=_clamp_depth(depth),
         cap=cap,
         type_filter=type,
+        project_id=project_id,
     )
 
 

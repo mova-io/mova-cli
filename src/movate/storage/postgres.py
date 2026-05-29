@@ -74,6 +74,8 @@ from movate.core.models import (
     ProjectMemberRole,
     Relation,
     RunRecord,
+    Session,
+    SessionMessage,
     SkillCallRecord,
     Subgraph,
     TenantBudget,
@@ -498,6 +500,21 @@ CREATE INDEX IF NOT EXISTS idx_kb_relations_src
     ON kb_relations(agent, tenant_id, src_entity_id);
 CREATE INDEX IF NOT EXISTS idx_kb_relations_dst
     ON kb_relations(agent, tenant_id, dst_entity_id);
+
+-- ADR 046 D1: project-scope the knowledge graph. Additive nullable column
+-- on both graph tables (ADD COLUMN IF NOT EXISTS — idempotent) so the
+-- viewer / query API can window a subgraph at the PROJECT grain across an
+-- agent's KBs, not only per agent. Pre-migration rows + project-less
+-- ingests carry NULL → absent from a project-filtered query, fully visible
+-- in the unfiltered per-agent view. Backward-compatible by construction.
+-- Partial indexes keep project-filtered scans cheap without bloating the
+-- common NULL case.
+ALTER TABLE kb_entities ADD COLUMN IF NOT EXISTS project_id TEXT;
+ALTER TABLE kb_relations ADD COLUMN IF NOT EXISTS project_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_kb_entities_project
+    ON kb_entities(agent, tenant_id, project_id) WHERE project_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_kb_relations_project
+    ON kb_relations(agent, tenant_id, project_id) WHERE project_id IS NOT NULL;
 
 -- ADR 014 D1: durable agent registry. One immutable row per published
 -- (name, version) bundle, tenant-scoped; the ``files`` map is JSONB (same
@@ -1091,6 +1108,44 @@ CREATE TABLE IF NOT EXISTS diagnoses (
 );
 CREATE INDEX IF NOT EXISTS idx_diagnoses_agent_created
     ON diagnoses(tenant_id, agent, created_at DESC);
+
+-- ADR 045 D10: stateful sessions — server-side conversation memory.
+-- ``sessions`` holds the entity + per-session rollups; ``session_messages``
+-- holds the turns (one row per message, ``content`` as JSONB). ``tenant_id``
+-- is NOT NULL on both (per-tenant isolation). Additive + idempotent
+-- (CREATE ... IF NOT EXISTS) so re-running init() on an upgraded database
+-- is a no-op; no backfill needed.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id       TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL,
+    agent            TEXT NOT NULL,
+    title            TEXT NOT NULL DEFAULT '',
+    created_at       TIMESTAMPTZ NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL,
+    turn_count       INTEGER NOT NULL DEFAULT 0,
+    total_cost_usd   DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    total_tokens_in  INTEGER NOT NULL DEFAULT 0,
+    total_tokens_out INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_tenant_updated
+    ON sessions(tenant_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_agent_tenant
+    ON sessions(agent, tenant_id);
+
+CREATE TABLE IF NOT EXISTS session_messages (
+    message_id   TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    content      JSONB NOT NULL,
+    run_id       TEXT,
+    cost_usd     DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    tokens_in    INTEGER NOT NULL DEFAULT 0,
+    tokens_out   INTEGER NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_messages_session
+    ON session_messages(session_id, tenant_id, created_at);
 """
 
 
@@ -4053,12 +4108,13 @@ class PostgresProvider:
         await self._db.execute(
             """
             INSERT INTO kb_entities (
-                entity_id, tenant_id, agent, name, type, description,
+                entity_id, tenant_id, agent, project_id, name, type, description,
                 embedding, embedding_model, content_hash, source_chunk_ids,
                 metadata, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
-                SET name = EXCLUDED.name,
+                SET project_id = COALESCE(EXCLUDED.project_id, kb_entities.project_id),
+                    name = EXCLUDED.name,
                     type = EXCLUDED.type,
                     description = EXCLUDED.description,
                     embedding = EXCLUDED.embedding,
@@ -4069,6 +4125,7 @@ class PostgresProvider:
             entity.entity_id,
             entity.tenant_id,
             entity.agent,
+            entity.project_id,
             entity.name,
             entity.type,
             entity.description,
@@ -4092,12 +4149,13 @@ class PostgresProvider:
         await self._db.execute(
             """
             INSERT INTO kb_relations (
-                relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                type, description, weight, content_hash, source_chunk_ids,
-                metadata, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                relation_id, tenant_id, agent, project_id, src_entity_id,
+                dst_entity_id, type, description, weight, content_hash,
+                source_chunk_ids, metadata, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
-                SET src_entity_id = EXCLUDED.src_entity_id,
+                SET project_id = COALESCE(EXCLUDED.project_id, kb_relations.project_id),
+                    src_entity_id = EXCLUDED.src_entity_id,
                     dst_entity_id = EXCLUDED.dst_entity_id,
                     type = EXCLUDED.type,
                     description = EXCLUDED.description,
@@ -4108,6 +4166,7 @@ class PostgresProvider:
             relation.relation_id,
             relation.tenant_id,
             relation.agent,
+            relation.project_id,
             relation.src_entity_id,
             relation.dst_entity_id,
             relation.type,
@@ -4126,18 +4185,23 @@ class PostgresProvider:
         tenant_id: str,
         query_embedding: list[float],
         limit: int = 10,
+        project_id: str | None = None,
     ) -> list[EntityWithScore]:
         # No pgvector yet — load matching entities and rank in Python,
         # same primitive (and future swap point) as search_kb_chunks.
+        # ``project_id`` (None = no filter) appended as $3 only when set.
+        proj_clause = "" if project_id is None else " AND project_id = $3"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rows = await self._db.fetch(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
-            FROM kb_entities WHERE agent = $1 AND tenant_id = $2
+            FROM kb_entities WHERE agent = $1 AND tenant_id = $2{proj_clause}
             """,
             agent,
             tenant_id,
+            *proj_args,
         )
         from movate.storage._cosine import rank_entities_by_cosine  # noqa: PLC0415
 
@@ -4151,14 +4215,20 @@ class PostgresProvider:
         entity_ids: list[str],
         hops: int = 1,
         limit: int = 50,
+        project_id: str | None = None,
     ) -> Subgraph:
         if not entity_ids:
             return Subgraph(entities=[], relations=[])
+        # Optional project filter — None means "no filter" (per-agent view,
+        # the historical behavior). When set, only project-tagged rows
+        # participate, keeping the traversal inside the project subgraph.
         # Recursive CTE: bounded k-hop reachability from the seeds.
         # Undirected for reachability; UNION dedups so cycles terminate,
         # depth < hops bounds the walk.
+        cte_proj = "" if project_id is None else " AND r.project_id = $5"
+        cte_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         reach_rows = await self._db.fetch(
-            """
+            f"""
             WITH RECURSIVE reachable(eid, depth) AS (
                 SELECT e, 0 FROM unnest($1::text[]) AS e
               UNION
@@ -4168,7 +4238,7 @@ class PostgresProvider:
                 FROM kb_relations r
                 JOIN reachable
                   ON (r.src_entity_id = reachable.eid OR r.dst_entity_id = reachable.eid)
-                WHERE reachable.depth < $2 AND r.agent = $3 AND r.tenant_id = $4
+                WHERE reachable.depth < $2 AND r.agent = $3 AND r.tenant_id = $4{cte_proj}
             )
             SELECT DISTINCT eid FROM reachable
             """,
@@ -4176,41 +4246,48 @@ class PostgresProvider:
             int(hops),
             agent,
             tenant_id,
+            *cte_args,
         )
         reachable = [r["eid"] for r in reach_rows]
         if not reachable:
             return Subgraph(entities=[], relations=[])
+        rel_proj = "" if project_id is None else " AND project_id = $5"
+        rel_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rel_rows = await self._db.fetch(
-            """
-            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                   type, description, weight, content_hash, source_chunk_ids,
-                   metadata, created_at
+            f"""
+            SELECT relation_id, tenant_id, agent, project_id, src_entity_id,
+                   dst_entity_id, type, description, weight, content_hash,
+                   source_chunk_ids, metadata, created_at
             FROM kb_relations
             WHERE agent = $1 AND tenant_id = $2
-              AND src_entity_id = ANY($3::text[]) AND dst_entity_id = ANY($3::text[])
+              AND src_entity_id = ANY($3::text[]) AND dst_entity_id = ANY($3::text[]){rel_proj}
             ORDER BY weight DESC, relation_id LIMIT $4
             """,
             agent,
             tenant_id,
             reachable,
             int(limit),
+            *rel_args,
         )
         relations = [_row_to_relation(r) for r in rel_rows]
         keep = set(entity_ids)
         for rel in relations:
             keep.add(rel.src_entity_id)
             keep.add(rel.dst_entity_id)
+        ent_proj = "" if project_id is None else " AND project_id = $4"
+        ent_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         ent_rows = await self._db.fetch(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
             FROM kb_entities
-            WHERE agent = $1 AND tenant_id = $2 AND entity_id = ANY($3::text[])
+            WHERE agent = $1 AND tenant_id = $2 AND entity_id = ANY($3::text[]){ent_proj}
             """,
             agent,
             tenant_id,
             list(keep),
+            *ent_args,
         )
         return Subgraph(
             entities=[_row_to_entity(r) for r in ent_rows],
@@ -4220,7 +4297,7 @@ class PostgresProvider:
     async def get_entity(self, entity_id: str, *, tenant_id: str) -> Entity | None:
         row = await self._db.fetchrow(
             """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
             FROM kb_entities WHERE entity_id = $1 AND tenant_id = $2
@@ -4237,18 +4314,22 @@ class PostgresProvider:
         tenant_id: str,
         source_chunk_id: str | None = None,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Entity]:
+        proj_clause = "" if project_id is None else " AND project_id = $4"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rows = await self._db.fetch(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
-            FROM kb_entities WHERE agent = $1 AND tenant_id = $2
+            FROM kb_entities WHERE agent = $1 AND tenant_id = $2{proj_clause}
             ORDER BY created_at DESC LIMIT $3
             """,
             agent,
             tenant_id,
             int(limit),
+            *proj_args,
         )
         entities = [_row_to_entity(r) for r in rows]
         if source_chunk_id is not None:
@@ -4261,18 +4342,22 @@ class PostgresProvider:
         agent: str,
         tenant_id: str,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Relation]:
+        proj_clause = "" if project_id is None else " AND project_id = $4"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rows = await self._db.fetch(
-            """
-            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                   type, description, weight, content_hash, source_chunk_ids,
-                   metadata, created_at
-            FROM kb_relations WHERE agent = $1 AND tenant_id = $2
+            f"""
+            SELECT relation_id, tenant_id, agent, project_id, src_entity_id,
+                   dst_entity_id, type, description, weight, content_hash,
+                   source_chunk_ids, metadata, created_at
+            FROM kb_relations WHERE agent = $1 AND tenant_id = $2{proj_clause}
             ORDER BY created_at DESC LIMIT $3
             """,
             agent,
             tenant_id,
             int(limit),
+            *proj_args,
         )
         return [_row_to_relation(r) for r in rows]
 
@@ -4511,6 +4596,151 @@ class PostgresProvider:
         status = await self._db.execute(
             "DELETE FROM conversation_threads WHERE thread_id = $1 AND tenant_id = $2",
             thread_id,
+            tenant_id,
+        )
+        return status.endswith(" 1") if isinstance(status, str) else False
+
+    # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10)
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session: Session) -> None:
+        # ON CONFLICT DO UPDATE so callers can refresh title / updated_at
+        # and the rollups on each appended turn without re-inserting.
+        # created_at is intentionally NOT in the SET list so it survives
+        # updates.
+        await self._db.execute(
+            """
+            INSERT INTO sessions
+            (session_id, tenant_id, agent, title, created_at, updated_at,
+             turn_count, total_cost_usd, total_tokens_in, total_tokens_out)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (session_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                updated_at = EXCLUDED.updated_at,
+                turn_count = EXCLUDED.turn_count,
+                total_cost_usd = EXCLUDED.total_cost_usd,
+                total_tokens_in = EXCLUDED.total_tokens_in,
+                total_tokens_out = EXCLUDED.total_tokens_out
+            """,
+            session.session_id,
+            session.tenant_id,
+            session.agent,
+            session.title,
+            session.created_at,
+            session.updated_at,
+            session.turn_count,
+            session.total_cost_usd,
+            session.total_tokens_in,
+            session.total_tokens_out,
+        )
+
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> Session | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM sessions WHERE session_id = $1 AND tenant_id = $2",
+            session_id,
+            tenant_id,
+        )
+        if row is None:
+            return None
+        return _row_to_session(row)
+
+    async def list_sessions(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[Session]:
+        if agent is not None:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM sessions
+                WHERE tenant_id = $1 AND agent = $2
+                ORDER BY updated_at DESC
+                LIMIT $3
+                """,
+                tenant_id,
+                agent,
+                int(limit),
+            )
+        else:
+            rows = await self._db.fetch(
+                """
+                SELECT * FROM sessions
+                WHERE tenant_id = $1
+                ORDER BY updated_at DESC
+                LIMIT $2
+                """,
+                tenant_id,
+                int(limit),
+            )
+        return [_row_to_session(r) for r in rows]
+
+    async def append_session_message(self, message: SessionMessage) -> None:
+        # ``content`` rides the jsonb codec registered in
+        # _init_connection — pass the dict directly.
+        await self._db.execute(
+            """
+            INSERT INTO session_messages
+            (message_id, session_id, tenant_id, role, content, run_id,
+             cost_usd, tokens_in, tokens_out, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
+            message.message_id,
+            message.session_id,
+            message.tenant_id,
+            message.role,
+            message.content,
+            message.run_id,
+            message.cost_usd,
+            message.tokens_in,
+            message.tokens_out,
+            message.created_at,
+        )
+
+    async def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[SessionMessage]:
+        # Chronological — earliest first. Tenant-scoped via WHERE.
+        rows = await self._db.fetch(
+            """
+            SELECT * FROM session_messages
+            WHERE session_id = $1 AND tenant_id = $2
+            ORDER BY created_at ASC
+            LIMIT $3
+            """,
+            session_id,
+            tenant_id,
+            int(limit),
+        )
+        return [_row_to_session_message(r) for r in rows]
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        # Delete messages first, then the session. Both tenant-scoped.
+        # The bool reflects whether the SESSION row existed.
+        await self._db.execute(
+            "DELETE FROM session_messages WHERE session_id = $1 AND tenant_id = $2",
+            session_id,
+            tenant_id,
+        )
+        status = await self._db.execute(
+            "DELETE FROM sessions WHERE session_id = $1 AND tenant_id = $2",
+            session_id,
             tenant_id,
         )
         return status.endswith(" 1") if isinstance(status, str) else False
@@ -4899,6 +5129,40 @@ def _row_to_thread(row: asyncpg.Record) -> ConversationThread:
         title=row["title"] or "",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_session(row: asyncpg.Record) -> Session:
+    return Session(
+        session_id=row["session_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        title=row["title"] or "",
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        turn_count=row["turn_count"],
+        total_cost_usd=row["total_cost_usd"],
+        total_tokens_in=row["total_tokens_in"],
+        total_tokens_out=row["total_tokens_out"],
+    )
+
+
+def _row_to_session_message(row: asyncpg.Record) -> SessionMessage:
+    # ``content`` round-trips through the jsonb codec → a Python dict.
+    content = row["content"]
+    if isinstance(content, str):
+        content = json.loads(content)
+    return SessionMessage(
+        message_id=row["message_id"],
+        session_id=row["session_id"],
+        tenant_id=row["tenant_id"],
+        role=row["role"],
+        content=content,
+        run_id=row["run_id"],
+        cost_usd=row["cost_usd"],
+        tokens_in=row["tokens_in"],
+        tokens_out=row["tokens_out"],
+        created_at=row["created_at"],
     )
 
 
@@ -5298,6 +5562,7 @@ def _row_to_entity(row: asyncpg.Record) -> Entity:
         entity_id=row_dict["entity_id"],
         tenant_id=row_dict["tenant_id"],
         agent=row_dict["agent"],
+        project_id=row_dict.get("project_id"),
         name=row_dict["name"],
         type=row_dict["type"],
         description=row_dict.get("description"),
@@ -5316,6 +5581,7 @@ def _row_to_relation(row: asyncpg.Record) -> Relation:
         relation_id=row_dict["relation_id"],
         tenant_id=row_dict["tenant_id"],
         agent=row_dict["agent"],
+        project_id=row_dict.get("project_id"),
         src_entity_id=row_dict["src_entity_id"],
         dst_entity_id=row_dict["dst_entity_id"],
         type=row_dict["type"],

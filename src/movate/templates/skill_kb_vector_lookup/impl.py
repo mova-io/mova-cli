@@ -128,18 +128,95 @@ async def run(inputs: dict[str, Any], ctx: SkillExecutionContext | None = None) 
 
         emit_to_tracer(search_trace, tracer, parent_span=parent_span)
 
+    chunks_out = [
+        {
+            "text": r.chunk.text,
+            "source": r.chunk.source,
+            "score": round(r.score, 4),
+            # Surfaces the OCR flag so the grounding checker can
+            # identify citations that came from OCR-extracted text
+            # and treat their violations as warn-only (M2b).
+            "ocr": r.chunk.ocr,
+        }
+        for r in results
+    ]
+    chunks_found = len(chunks_out)
+
+    # ADR 010 / 046 D9 — GraphRAG retrieval. Opt-in via the agent's
+    # `retrieval.graph` block. When enabled, ALSO retrieve graph-neighbor
+    # context (entities + relations) and append it as one extra grounding
+    # block ALONGSIDE the vector chunks (it complements, never replaces —
+    # ADR 010 D4). Stays behind the StorageProvider Protocol
+    # (`search_entities` + `expand_neighbors`); no backend is hardcoded.
+    # With the block absent / `enabled` False (the default), this branch
+    # is skipped entirely and the result is byte-for-byte unchanged.
+    graph_cfg = getattr(cfg, "graph", None) if cfg is not None else None
+    if graph_cfg is not None and bool(getattr(graph_cfg, "enabled", False)):
+        graph_block = await _retrieve_graph_context(
+            storage=storage,
+            agent=agent_name,
+            tenant_id=tenant_id,
+            question=question,
+            api_key=api_key,
+            graph_cfg=graph_cfg,
+        )
+        if graph_block is not None:
+            chunks_out.append(graph_block)
+
     return {
-        "chunks": [
-            {
-                "text": r.chunk.text,
-                "source": r.chunk.source,
-                "score": round(r.score, 4),
-                # Surfaces the OCR flag so the grounding checker can
-                # identify citations that came from OCR-extracted text
-                # and treat their violations as warn-only (M2b).
-                "ocr": r.chunk.ocr,
-            }
-            for r in results
-        ],
-        "chunks_found": len(results),
+        "chunks": chunks_out,
+        "chunks_found": chunks_found,
+        # Distinct from chunks_found so callers can see vector-vs-graph
+        # contribution; total length of `chunks` is chunks_found (+1 when
+        # a non-empty graph block was appended).
+        "graph_context_added": len(chunks_out) > chunks_found,
+    }
+
+
+async def _retrieve_graph_context(
+    *,
+    storage: Any,
+    agent: str,
+    tenant_id: str,
+    question: str,
+    api_key: str | None,
+    graph_cfg: Any,
+) -> dict[str, Any] | None:
+    """Retrieve a GraphRAG neighbor context for ``question``.
+
+    Returns a chunk-shaped dict (so it slots into the same `chunks` list
+    the agent's prompt renders) carrying the rendered entities/relations
+    text, or ``None`` when the graph is empty / no seed matched. Tolerant:
+    any retrieval error degrades to ``None`` (graph context is a
+    complement — a failure must not break the vector path).
+    """
+    try:
+        from movate.kb.graph_retrieval import graph_retrieve  # noqa: PLC0415
+
+        ctx = await graph_retrieve(
+            storage=storage,
+            agent=agent,
+            tenant_id=tenant_id,
+            query=question,
+            api_key=api_key,
+            seed_limit=int(getattr(graph_cfg, "seed_limit", 5)),
+            hops=int(getattr(graph_cfg, "hops", 1)),
+            max_relations=int(getattr(graph_cfg, "max_relations", 50)),
+        )
+    except Exception:
+        # Graph context is a best-effort complement — any retrieval error
+        # (backend down, embedding failure) must not break the vector path.
+        return None
+    if ctx.is_empty or not ctx.text:
+        return None
+    return {
+        "text": ctx.text,
+        "source": "knowledge-graph",
+        "score": 1.0,
+        "ocr": False,
+        # Marks this as the graph-derived block so a prompt / grounding
+        # checker can treat it differently from a verbatim source chunk.
+        "kind": "graph",
+        "entities": len(ctx.entities),
+        "relations": len(ctx.relations),
     }

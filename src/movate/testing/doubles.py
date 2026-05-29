@@ -51,6 +51,8 @@ from movate.core.models import (
     ProjectWorkflow,
     Relation,
     RunRecord,
+    Session,
+    SessionMessage,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -101,6 +103,10 @@ class InMemoryStorage:
         self.entities: list[Entity] = []
         self.relations: list[Relation] = []
         self.conversation_threads: list[ConversationThread] = []
+        # ADR 045 D10: stateful sessions + their messages. Lists for
+        # direct test assertion (matches the other entities here).
+        self.sessions: list[Session] = []
+        self.session_messages: list[SessionMessage] = []
         self.eval_schedules: list[EvalSchedule] = []
         self.job_schedules: list[JobSchedule] = []
         self.triggers: list[Trigger] = []
@@ -1680,8 +1686,18 @@ class InMemoryStorage:
         for i, existing in enumerate(self.entities):
             if (existing.agent, existing.tenant_id, existing.content_hash) == key:
                 merged = sorted(set(existing.source_chunk_ids) | set(entity.source_chunk_ids))
+                # COALESCE-preserve project_id (ADR 046 D1): a project-less
+                # re-ingest keeps the existing tag; re-ingesting under a
+                # project backfills it. Mirrors the SQL backends' ON CONFLICT.
+                project_id = (
+                    entity.project_id if entity.project_id is not None else existing.project_id
+                )
                 self.entities[i] = entity.model_copy(
-                    update={"entity_id": existing.entity_id, "source_chunk_ids": merged}
+                    update={
+                        "entity_id": existing.entity_id,
+                        "source_chunk_ids": merged,
+                        "project_id": project_id,
+                    }
                 )
                 return
         self.entities.append(entity)
@@ -1691,8 +1707,15 @@ class InMemoryStorage:
         for i, existing in enumerate(self.relations):
             if (existing.agent, existing.tenant_id, existing.content_hash) == key:
                 merged = sorted(set(existing.source_chunk_ids) | set(relation.source_chunk_ids))
+                project_id = (
+                    relation.project_id if relation.project_id is not None else existing.project_id
+                )
                 self.relations[i] = relation.model_copy(
-                    update={"relation_id": existing.relation_id, "source_chunk_ids": merged}
+                    update={
+                        "relation_id": existing.relation_id,
+                        "source_chunk_ids": merged,
+                        "project_id": project_id,
+                    }
                 )
                 return
         self.relations.append(relation)
@@ -1704,10 +1727,17 @@ class InMemoryStorage:
         tenant_id: str,
         query_embedding: list[float],
         limit: int = 10,
+        project_id: str | None = None,
     ) -> list[EntityWithScore]:
         from movate.storage._cosine import rank_entities_by_cosine  # noqa: PLC0415
 
-        ents = [e for e in self.entities if e.agent == agent and e.tenant_id == tenant_id]
+        ents = [
+            e
+            for e in self.entities
+            if e.agent == agent
+            and e.tenant_id == tenant_id
+            and (project_id is None or e.project_id == project_id)
+        ]
         return rank_entities_by_cosine(ents, query_embedding, limit)
 
     async def expand_neighbors(
@@ -1718,10 +1748,17 @@ class InMemoryStorage:
         entity_ids: list[str],
         hops: int = 1,
         limit: int = 50,
+        project_id: str | None = None,
     ) -> Subgraph:
         if not entity_ids:
             return Subgraph(entities=[], relations=[])
-        rels = [r for r in self.relations if r.agent == agent and r.tenant_id == tenant_id]
+        rels = [
+            r
+            for r in self.relations
+            if r.agent == agent
+            and r.tenant_id == tenant_id
+            and (project_id is None or r.project_id == project_id)
+        ]
         # Breadth-first reachability bounded by ``hops`` (undirected for
         # reachability; edge direction preserved in the returned rows).
         reachable: set[str] = set(entity_ids)
@@ -1751,7 +1788,10 @@ class InMemoryStorage:
         ents = [
             e
             for e in self.entities
-            if e.agent == agent and e.tenant_id == tenant_id and e.entity_id in keep_ids
+            if e.agent == agent
+            and e.tenant_id == tenant_id
+            and (project_id is None or e.project_id == project_id)
+            and e.entity_id in keep_ids
         ]
         return Subgraph(entities=ents, relations=returned)
 
@@ -1768,8 +1808,15 @@ class InMemoryStorage:
         tenant_id: str,
         source_chunk_id: str | None = None,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Entity]:
-        rows = [e for e in self.entities if e.agent == agent and e.tenant_id == tenant_id]
+        rows = [
+            e
+            for e in self.entities
+            if e.agent == agent
+            and e.tenant_id == tenant_id
+            and (project_id is None or e.project_id == project_id)
+        ]
         if source_chunk_id is not None:
             rows = [e for e in rows if source_chunk_id in e.source_chunk_ids]
         rows = sorted(rows, key=lambda e: e.created_at, reverse=True)
@@ -1781,8 +1828,15 @@ class InMemoryStorage:
         agent: str,
         tenant_id: str,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Relation]:
-        rows = [r for r in self.relations if r.agent == agent and r.tenant_id == tenant_id]
+        rows = [
+            r
+            for r in self.relations
+            if r.agent == agent
+            and r.tenant_id == tenant_id
+            and (project_id is None or r.project_id == project_id)
+        ]
         rows = sorted(rows, key=lambda r: r.created_at, reverse=True)
         return rows[: int(limit)]
 
@@ -1905,6 +1959,77 @@ class InMemoryStorage:
             if not (t.thread_id == thread_id and t.tenant_id == tenant_id)
         ]
         return len(self.conversation_threads) < before
+
+    # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10)
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session: Session) -> None:
+        # Upsert on session_id — matches the Postgres ON CONFLICT /
+        # sqlite INSERT OR REPLACE semantics.
+        self.sessions = [s for s in self.sessions if s.session_id != session.session_id]
+        self.sessions.append(session)
+
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> Session | None:
+        for s in self.sessions:
+            if s.session_id == session_id and s.tenant_id == tenant_id:
+                return s
+        return None
+
+    async def list_sessions(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[Session]:
+        rows = [s for s in self.sessions if s.tenant_id == tenant_id]
+        if agent is not None:
+            rows = [s for s in rows if s.agent == agent]
+        rows = sorted(rows, key=lambda s: s.updated_at, reverse=True)
+        return rows[: int(limit)]
+
+    async def append_session_message(self, message: SessionMessage) -> None:
+        self.session_messages.append(message)
+
+    async def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[SessionMessage]:
+        rows = [
+            m
+            for m in self.session_messages
+            if m.session_id == session_id and m.tenant_id == tenant_id
+        ]
+        rows = sorted(rows, key=lambda m: m.created_at)
+        return rows[: int(limit)]
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        self.session_messages = [
+            m
+            for m in self.session_messages
+            if not (m.session_id == session_id and m.tenant_id == tenant_id)
+        ]
+        before = len(self.sessions)
+        self.sessions = [
+            s
+            for s in self.sessions
+            if not (s.session_id == session_id and s.tenant_id == tenant_id)
+        ]
+        return len(self.sessions) < before
 
     async def list_feedback(
         self,
