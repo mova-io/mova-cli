@@ -39,8 +39,16 @@ from movate.runtime.schemas import (
     RunAccepted,
     RunSubmission,
     RunView,
+    WorkflowCreateRequest,
+    WorkflowDetailView,
+    WorkflowListResponse,
+    WorkflowPublishedView,
+    WorkflowRevertedView,
+    WorkflowRevertSubmission,
     WorkflowRunListView,
     WorkflowSignalRequest,
+    WorkflowValidationView,
+    WorkflowVersionsView,
 )
 
 
@@ -482,6 +490,97 @@ class MovateClient:
         """``DELETE /api/v1/projects/{id}/members/{principal_id}``."""
         r = await self._client.delete(f"/api/v1/projects/{project_id}/members/{principal_id}")
         self._raise_for_status(r)
+
+    # ------------------------------------------------------------------
+    # Workflow definitions (ADR 037 D1 — workflow API parity)
+    # ------------------------------------------------------------------
+
+    async def list_workflows(
+        self,
+        *,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> WorkflowListResponse:
+        """``GET /api/v1/workflows`` — workflow definitions for this tenant."""
+        params: dict[str, str | int | bool] = {"limit": limit}
+        if published_only:
+            params["published_only"] = "true"
+        r = await self._client.get("/api/v1/workflows", params=params)
+        self._raise_for_status(r)
+        return WorkflowListResponse.model_validate(r.json())
+
+    async def get_workflow(
+        self,
+        name: str,
+        *,
+        version: str | None = None,
+    ) -> WorkflowDetailView:
+        """``GET /api/v1/workflows/{name}`` — spec + bundle metadata."""
+        params: dict[str, str] = {}
+        if version is not None:
+            params["version"] = version
+        r = await self._client.get(f"/api/v1/workflows/{name}", params=params)
+        self._raise_for_status(r)
+        return WorkflowDetailView.model_validate(r.json())
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        limit: int = 50,
+    ) -> WorkflowVersionsView:
+        """``GET /api/v1/workflows/{name}/versions`` — registry version
+        history, newest-first."""
+        r = await self._client.get(f"/api/v1/workflows/{name}/versions", params={"limit": limit})
+        self._raise_for_status(r)
+        return WorkflowVersionsView.model_validate(r.json())
+
+    async def publish_workflow(
+        self,
+        name: str,
+        *,
+        version: str | None = None,
+    ) -> WorkflowPublishedView:
+        """``POST /api/v1/workflows/{name}/publish`` — promote to published.
+
+        ``version=None`` promotes the current latest."""
+        params: dict[str, str] = {}
+        if version is not None:
+            params["version"] = version
+        r = await self._client.post(f"/api/v1/workflows/{name}/publish", params=params)
+        self._raise_for_status(r)
+        return WorkflowPublishedView.model_validate(r.json())
+
+    async def revert_workflow(
+        self,
+        name: str,
+        *,
+        to_version: str,
+    ) -> WorkflowRevertedView:
+        """``POST /api/v1/workflows/{name}/revert`` — non-destructive rollback."""
+        body = WorkflowRevertSubmission(to_version=to_version)
+        r = await self._client.post(
+            f"/api/v1/workflows/{name}/revert", json=body.model_dump(mode="json")
+        )
+        self._raise_for_status(r)
+        return WorkflowRevertedView.model_validate(r.json())
+
+    async def validate_workflow_spec(
+        self,
+        name: str,
+        *,
+        workflow_yaml: str,
+        files: dict[str, str] | None = None,
+    ) -> WorkflowValidationView:
+        """``POST /api/v1/workflows/{name}/validate/from-spec`` — validate a
+        JSON-body workflow without persisting. Drives ``mdk workflow validate``."""
+        body = WorkflowCreateRequest(workflow_yaml=workflow_yaml, files=files or {})
+        r = await self._client.post(
+            f"/api/v1/workflows/{name}/validate/from-spec",
+            json=body.model_dump(mode="json"),
+        )
+        self._raise_for_status(r)
+        return WorkflowValidationView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Convenience: poll until terminal

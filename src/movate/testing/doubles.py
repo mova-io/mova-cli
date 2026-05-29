@@ -53,6 +53,7 @@ from movate.core.models import (
     TenantBudget,
     TenantProviderKey,
     Trigger,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -84,6 +85,9 @@ class InMemoryStorage:
         self.evals: list[EvalRecord] = []
         self.bench: list[BenchRecord] = []
         self.agent_bundles: list[AgentBundleRecord] = []
+        # ADR 037 D1: workflow analogue of agent_bundles. Same shape; the
+        # registry doubles as the version history.
+        self.workflow_bundles: list[WorkflowBundleRecord] = []
         self.workflow_runs: list[WorkflowRunRecord] = []
         self.jobs: list[JobRecord] = []
         self.batches: list[BatchRecord] = []
@@ -1070,6 +1074,105 @@ class InMemoryStorage:
 
     async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
         self.catalog_sync_watermarks[source.value] = ts
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        self.workflow_bundles.append(bundle)
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        matches = [b for b in self.workflow_bundles if b.name == name and b.tenant_id == tenant_id]
+        if version is not None:
+            matches = [b for b in matches if b.version == version]
+        if not matches:
+            return None
+        return max(matches, key=lambda b: b.created_at)
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        rows = [b for b in self.workflow_bundles if b.tenant_id == tenant_id]
+        if published_only:
+            published_names = {b.name for b in rows if b.published}
+            rows = [b for b in rows if b.name in published_names]
+        latest: dict[str, WorkflowBundleRecord] = {}
+        for b in rows:
+            current = latest.get(b.name)
+            if current is None or b.created_at > current.created_at:
+                latest[b.name] = b
+        ordered = sorted(latest.values(), key=lambda b: b.created_at, reverse=True)
+        return ordered[:limit]
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        rows = [b for b in self.workflow_bundles if b.name == name and b.tenant_id == tenant_id]
+        return sorted(rows, key=lambda b: b.created_at, reverse=True)[:limit]
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        rows = sorted(self.workflow_bundles, key=lambda b: (b.tenant_id, b.name, b.created_at))
+        return rows[:limit]
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        def _matches(b: WorkflowBundleRecord) -> bool:
+            if b.name != name or b.tenant_id != tenant_id:
+                return False
+            return version is None or b.version == version
+
+        to_delete = [b for b in self.workflow_bundles if _matches(b)]
+        self.workflow_bundles = [b for b in self.workflow_bundles if not _matches(b)]
+        return len(to_delete)
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        # ADR 037 D1: at most one published version per (tenant, name). Find
+        # the row to mutate in place; flip the rest of the name's history off.
+        # Pydantic models are immutable by default; rebuild rather than poke
+        # the field so the type checker stays happy.
+        found = False
+        new_rows: list[WorkflowBundleRecord] = []
+        for b in self.workflow_bundles:
+            if b.tenant_id == tenant_id and b.name == name:
+                if b.version == version:
+                    found = True
+                    new_rows.append(b.model_copy(update={"published": True}))
+                else:
+                    new_rows.append(b.model_copy(update={"published": False}))
+            else:
+                new_rows.append(b)
+        if not found:
+            return False
+        self.workflow_bundles = new_rows
+        return True
 
     async def list_workflow_runs(
         self,

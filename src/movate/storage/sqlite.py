@@ -60,6 +60,7 @@ from movate.core.models import (
     TenantProviderKey,
     Trigger,
     TurnRecord,
+    WorkflowBundleRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -434,6 +435,30 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name ON agent_bundles(tenant_id, name)",
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created "
     "ON agent_bundles(tenant_id, name, created_at DESC)",
+    # ADR 037 D1: durable workflow registry. Mirrors agent_bundles row-for-row
+    # so the API CRUD/version/publish surface is symmetric with agents. One
+    # immutable (name, version) row per publish, tenant-scoped; ``files`` is
+    # JSON-encoded TEXT (same strategy as agent_bundles.files). ``published``
+    # is the soft promote/revert flag (ADR 037 D1) — at most one True per
+    # (tenant, name) at any time, enforced by publish_workflow_version. New
+    # table → lands here in the ordered migration list; additive, idempotent
+    # CREATE TABLE IF NOT EXISTS, never an ALTER.
+    """
+    CREATE TABLE IF NOT EXISTS workflow_bundles (
+        name          TEXT NOT NULL,
+        tenant_id     TEXT NOT NULL,
+        version       TEXT NOT NULL,
+        created_by    TEXT,
+        content_hash  TEXT NOT NULL,
+        files         TEXT NOT NULL,
+        published     INTEGER NOT NULL DEFAULT 0,
+        created_at    TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, name, version)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name ON workflow_bundles(tenant_id, name)",
+    "CREATE INDEX IF NOT EXISTS idx_workflow_bundles_name_created "
+    "ON workflow_bundles(tenant_id, name, created_at DESC)",
     # ADR 016 D2: continuous-eval schedules. One row per (tenant, agent) with
     # a cadence; the scheduler tick enqueues EVAL jobs for due rows. Additive
     # + idempotent (CREATE TABLE IF NOT EXISTS) — default-off, no backfill.
@@ -2328,6 +2353,26 @@ class SqliteProvider:
         )
         await self._db.commit()
 
+    # ------------------------------------------------------------------
+    # Durable workflow registry (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def save_workflow_bundle(self, bundle: WorkflowBundleRecord) -> None:
+        await self._db.execute(
+            "INSERT INTO workflow_bundles VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                bundle.name,
+                bundle.tenant_id,
+                bundle.version,
+                bundle.created_by,
+                bundle.content_hash,
+                json.dumps(bundle.files),
+                1 if bundle.published else 0,
+                bundle.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
     async def get_catalog_entry(
         self,
         slug: str,
@@ -2550,6 +2595,150 @@ class SqliteProvider:
             (source.value, ts.isoformat()),
         )
         await self._db.commit()
+
+    # ------------------------------------------------------------------
+    # Durable workflow registry reads + publish (ADR 037 D1)
+    # ------------------------------------------------------------------
+
+    async def get_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> WorkflowBundleRecord | None:
+        if version is not None:
+            sql = (
+                "SELECT * FROM workflow_bundles "
+                "WHERE name = ? AND tenant_id = ? AND version = ? LIMIT 1"
+            )
+            params: tuple[object, ...] = (name, tenant_id, version)
+        else:
+            sql = (
+                "SELECT * FROM workflow_bundles WHERE name = ? AND tenant_id = ? "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            params = (name, tenant_id)
+        async with self._db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+        return _row_to_workflow_bundle(row) if row else None
+
+    async def list_workflows(
+        self,
+        *,
+        tenant_id: str,
+        published_only: bool = False,
+        limit: int = 100,
+    ) -> list[WorkflowBundleRecord]:
+        # Latest version per name, newest-first. Matches the agent_bundles
+        # query shape so a backend swap behaves identically.
+        if published_only:
+            # Narrow to names that have at least one published version, but
+            # still return the *latest* row for the name so the caller can
+            # detect "blessed != latest" drift.
+            sql = """
+                SELECT b.* FROM workflow_bundles b
+                WHERE b.tenant_id = ?
+                  AND b.created_at = (
+                      SELECT MAX(b2.created_at) FROM workflow_bundles b2
+                      WHERE b2.tenant_id = b.tenant_id AND b2.name = b.name
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM workflow_bundles b3
+                      WHERE b3.tenant_id = b.tenant_id
+                        AND b3.name = b.name
+                        AND b3.published = 1
+                  )
+                ORDER BY b.created_at DESC
+                LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT b.* FROM workflow_bundles b
+                WHERE b.tenant_id = ?
+                  AND b.created_at = (
+                      SELECT MAX(b2.created_at) FROM workflow_bundles b2
+                      WHERE b2.tenant_id = b.tenant_id AND b2.name = b.name
+                  )
+                ORDER BY b.created_at DESC
+                LIMIT ?
+            """
+        async with self._db.execute(sql, (tenant_id, limit)) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_workflow_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[WorkflowBundleRecord]:
+        async with self._db.execute(
+            "SELECT * FROM workflow_bundles WHERE name = ? AND tenant_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (name, tenant_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def list_all_workflow_bundles(
+        self, *, limit: int = 100_000
+    ) -> list[WorkflowBundleRecord]:
+        async with self._db.execute(
+            "SELECT * FROM workflow_bundles ORDER BY tenant_id, name, created_at LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workflow_bundle(r) for r in rows]
+
+    async def delete_workflow_bundle(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            sql = "DELETE FROM workflow_bundles WHERE name = ? AND tenant_id = ? AND version = ?"
+            params: tuple[object, ...] = (name, tenant_id, version)
+        else:
+            sql = "DELETE FROM workflow_bundles WHERE name = ? AND tenant_id = ?"
+            params = (name, tenant_id)
+        cur = await self._db.execute(sql, params)
+        await self._db.commit()
+        return cur.rowcount
+
+    async def publish_workflow_version(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str,
+    ) -> bool:
+        # ADR 037 D1: at most one row per (tenant, name) is published. Mark
+        # the target, then clear every other version of the same name in the
+        # same tenant. We probe first so the False/404 case is unambiguous.
+        async with self._db.execute(
+            "SELECT 1 FROM workflow_bundles "
+            "WHERE tenant_id = ? AND name = ? AND version = ? LIMIT 1",
+            (tenant_id, name, version),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return False
+        await self._db.execute(
+            "UPDATE workflow_bundles SET published = 1 "
+            "WHERE tenant_id = ? AND name = ? AND version = ?",
+            (tenant_id, name, version),
+        )
+        await self._db.execute(
+            "UPDATE workflow_bundles SET published = 0 "
+            "WHERE tenant_id = ? AND name = ? AND version <> ?",
+            (tenant_id, name, version),
+        )
+        await self._db.commit()
+        return True
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         # Upsert on the workflow_run_id PRIMARY KEY: the runner saves a row
@@ -4103,6 +4292,21 @@ def _row_to_insight(row: aiosqlite.Row) -> ObservabilityInsight:
         usage_rollup=json.loads(row["usage_rollup"]) if row["usage_rollup"] else {},
         trends=json.loads(row["trends"]) if row["trends"] else {},
         narrative_digest=row["narrative_digest"] or "",
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_workflow_bundle(row: aiosqlite.Row) -> WorkflowBundleRecord:
+    # ADR 037 D1 — sqlite stores ``published`` as INTEGER (0/1); coerce to bool
+    # at the boundary so the Pydantic model carries the typed value.
+    return WorkflowBundleRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        files=json.loads(row["files"]),
+        published=bool(row["published"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 

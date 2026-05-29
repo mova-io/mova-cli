@@ -46,6 +46,7 @@ _PG_TABLES = (
     "evals",
     "bench",
     "agent_bundles",
+    "workflow_bundles",
     "workflow_runs",
     "jobs",
     "batches",

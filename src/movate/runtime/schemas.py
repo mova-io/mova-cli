@@ -3747,3 +3747,273 @@ class UnifiedAgentCreatedView(BaseModel):
             "(degrades cleanly per the dependency note in the PR body)."
         ),
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Workflow API parity (ADR 037 D1) — wire types for ``/api/v1/workflows``.
+#
+# Mirrors the agent counterparts above row-for-row so the Angular client's
+# generated TypeScript types stay symmetric between the two resource kinds.
+# ``WorkflowSpec`` itself (the YAML schema) is intentionally NOT changed by
+# this PR — the wire types here only describe the registry envelope around
+# the bundle.
+# ---------------------------------------------------------------------------
+
+
+class WorkflowCreateRequest(BaseModel):
+    """``POST /api/v1/workflows`` JSON request body (file-list mode).
+
+    Mirrors :class:`WizardAgentSubmission`'s role for agents — the
+    non-multipart, JSON-friendly creation surface for clients that don't
+    want to deal with multipart-form encoding. The caller passes the raw
+    ``workflow.yaml`` text plus any other files (``schema/state.json``,
+    ``evals/dataset.jsonl``) keyed by relative path.
+
+    Multipart mode (``bundle`` upload OR individual file fields) is
+    served by the same endpoint and documented separately; this is the
+    pure-JSON shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_yaml: str = Field(..., description="The raw text of the workflow.yaml file.")
+    files: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Extra files keyed by canonical relative path (e.g. "
+            "``schema/state.json`` or ``evals/dataset.jsonl``). Workflow "
+            "bundles are narrower than agent bundles — only ``workflow.yaml`` "
+            "is required at the root; sibling files live under ``schema/`` "
+            "or ``evals/``."
+        ),
+    )
+
+
+class WorkflowView(BaseModel):
+    """One entry in the ``GET /api/v1/workflows`` catalog response.
+
+    Discovery shape — name + version + description metadata so the
+    Angular catalog can render a workflow tile without a follow-up
+    ``GET /api/v1/workflows/{name}``. Mirrors :class:`AgentCatalogItemView`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    """The CURRENT latest version (newest by ``created_at``)."""
+    description: str = ""
+    published_version: str | None = None
+    """The version with ``published=True``, when any. Distinct from
+    ``version`` so the UI can show "blessed != latest" drift (ADR 037 D1)."""
+    tags: list[str] = []
+    created_at: datetime
+    """When the latest version was published."""
+
+
+class WorkflowListResponse(BaseModel):
+    """``GET /api/v1/workflows`` response — list of workflows for the tenant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workflows: list[WorkflowView]
+    count: int
+
+
+class WorkflowVersionView(BaseModel):
+    """One row in the durable workflow-registry version history.
+
+    Mirrors :class:`AgentVersionView`. Distinct from a workflow RUN —
+    this is the *definition* version history (the registry's immutable
+    ``(name, version)`` rows), surfaced by
+    ``GET /api/v1/workflows/{name}/versions``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    created_by: str | None = None
+    created_at: datetime
+    content_hash: str
+    is_current: bool = False
+    """True for the newest version (the one a versionless resolve picks
+    up). Exactly one row in a non-empty history is current."""
+    is_published: bool = False
+    """True for the version whose ``published`` flag is set (ADR 037 D1).
+    At most one row in a non-empty history is published. Distinct from
+    ``is_current`` so a UI can show "blessed != latest" drift."""
+
+
+class WorkflowVersionsView(BaseModel):
+    """``GET /api/v1/workflows/{name}/versions`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    versions: list[WorkflowVersionView]
+    count: int
+
+
+class WorkflowDetailView(BaseModel):
+    """``GET /api/v1/workflows/{name}`` response.
+
+    The workflow analogue of :class:`AgentDetailView` — everything the
+    Angular workflow-profile view needs in one round-trip. Includes the
+    parsed spec metadata, the canonical files manifest, and the registry
+    audit (``content_hash``, ``created_by``, ``created_at``).
+
+    NOT included (deferred to other endpoints):
+
+    * Run history — that's ``GET /api/v1/workflow-runs?workflow={name}``
+    * Per-node trace — that's ``GET /api/v1/runs/{id}/trace`` (ADR 024)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # --- Identity + metadata ---
+    name: str
+    version: str
+    description: str = ""
+    owner: str = ""
+    tags: list[str] = []
+
+    # --- Spec snapshot ---
+    entrypoint: str
+    """ID of the starting node in the workflow."""
+    state_schema_path: str
+    """Path to the state JSON schema, relative to workflow.yaml."""
+    nodes: list[dict[str, Any]] = []
+    """Parsed nodes from the workflow.yaml (untyped dicts so the wire
+    contract doesn't drift when the discriminated-union spec evolves)."""
+    edges: list[dict[str, Any]] = []
+    """Parsed edges."""
+
+    # --- Registry audit ---
+    content_hash: str
+    created_by: str | None = None
+    created_at: datetime
+    published_version: str | None = None
+    """The currently-published version (ADR 037 D1)."""
+    is_published: bool = False
+    """Whether ``version`` itself is the published one."""
+
+    # --- Canonical layout ---
+    files: list[str]
+    """Sorted list of bundle file paths (e.g. ``["workflow.yaml",
+    "schema/state.json"]``)."""
+
+
+class WorkflowCreatedView(BaseModel):
+    """``POST /api/v1/workflows`` response — canonical layout + spec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    workflow_dir: str
+    files_persisted: list[str]
+    published_version: str | None = None
+    """Registry version now serving as ``latest`` (may differ from
+    ``version`` on a content-vs-version collision — mirrors the agent
+    response). ``None`` only if the registry write was unavailable."""
+    changed: bool = True
+    """Whether this publish wrote new content (False for a no-op re-deploy
+    with byte-identical files)."""
+
+
+class WorkflowUpdatedView(BaseModel):
+    """``PUT /api/v1/workflows/{name}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    description: str = ""
+    workflow_dir: str
+    files_persisted: list[str]
+    previous_version: str
+    published_version: str | None = None
+    changed: bool = True
+
+
+class WorkflowDeletedView(BaseModel):
+    """``DELETE /api/v1/workflows/{name}`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    deleted_dir: str
+
+
+class WorkflowRevertSubmission(BaseModel):
+    """``POST /api/v1/workflows/{name}/revert`` request body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    to_version: str
+    """The existing version to roll back to. 404 if no such version
+    exists for this workflow in this tenant."""
+
+
+class WorkflowRevertedView(BaseModel):
+    """``POST /api/v1/workflows/{name}/revert`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+    """The new latest version after the revert."""
+    reverted_from: str
+    """The prior version whose bundle was re-published."""
+    previous_version: str
+    """Version that was latest immediately BEFORE this revert."""
+
+
+class WorkflowPublishedView(BaseModel):
+    """``POST /api/v1/workflows/{name}/publish`` response (ADR 037 D1).
+
+    Confirms the soft promote: the named version's ``published`` flag is
+    now ``True`` and every other version of the same name is now ``False``.
+    ``previous_published_version`` lets the UI label "promoted v0.3.0
+    (was v0.2.1)" without a second round-trip.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    published_version: str
+    previous_published_version: str | None = None
+
+
+class WorkflowValidationIssue(BaseModel):
+    """One finding from ``POST /api/v1/workflows/{name}/validate``.
+
+    Mirrors :class:`AgentValidationIssue` so the Angular UI's chip
+    rendering is symmetric across resources.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    severity: str
+    """One of ``"error"`` or ``"warning"``."""
+    message: str
+    hint: str = ""
+
+
+class WorkflowValidationView(BaseModel):
+    """``POST /api/v1/workflows/{name}/validate`` response.
+
+    Mirrors :class:`AgentValidationView`. Returns the structural-validation
+    findings (Pydantic + compiler — duplicate ids, missing entrypoint,
+    dangling edges). Cost forecast is omitted today (workflows have no
+    fixed token estimate; ADR 029 D4 will add this).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    errors: list[WorkflowValidationIssue]
+    warnings: list[WorkflowValidationIssue]

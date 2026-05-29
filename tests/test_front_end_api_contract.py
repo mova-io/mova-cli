@@ -102,6 +102,16 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("GET", "/api/v1/projects/{project_id}/members/{principal_id}"): "read",
     ("PATCH", "/api/v1/projects/{project_id}/members/{principal_id}"): None,
     ("DELETE", "/api/v1/projects/{project_id}/members/{principal_id}"): None,
+    # ADR 037 D1: workflow definition CRUD/version/publish (parity with agents).
+    ("POST", "/api/v1/workflows"): "admin",
+    ("GET", "/api/v1/workflows"): "read",
+    ("GET", "/api/v1/workflows/{name}"): "read",
+    ("PUT", "/api/v1/workflows/{name}"): "admin",
+    ("DELETE", "/api/v1/workflows/{name}"): "admin",
+    ("GET", "/api/v1/workflows/{name}/versions"): "read",
+    ("POST", "/api/v1/workflows/{name}/validate"): "read",
+    ("POST", "/api/v1/workflows/{name}/publish"): "admin",
+    ("POST", "/api/v1/workflows/{name}/revert"): "admin",
 }
 
 
