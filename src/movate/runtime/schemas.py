@@ -3068,3 +3068,119 @@ class CatalogSyncResponse(BaseModel):
     """Human note explaining the response. The v1 stub returns a fixed
     string describing the missing upstream wiring (so an operator running
     the endpoint by hand sees what's happening)."""
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-graph query API (ADR 046) — read-only, graphology-native.
+#
+# The subgraph / neighbors / stream wire shapes ARE the graphology import
+# contract: ``GraphologyView.model_dump(mode="json")`` feeds straight into
+# a sigma.js client's ``graph.import(...)`` with zero transform. These
+# views are structural pass-throughs over the ``core.graph`` models — kept
+# here so the HTTP surface stays in one place and OpenAPI documents the
+# exact node/edge attribute bag.
+# ---------------------------------------------------------------------------
+
+
+class GraphNodeView(BaseModel):
+    """One graphology node: ``{"key", "attributes": {...}}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphEdgeView(BaseModel):
+    """One graphology edge: ``{"key", "source", "target", "attributes"}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    source: str
+    target: str
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphologyView(BaseModel):
+    """A graphology import document — the zero-transform sigma.js contract.
+
+    Returned by the windowed-subgraph + neighbors endpoints and emitted as
+    the payload of every SSE growth event. Shape is pinned by
+    ``test_runtime_graph_v1`` so a client never needs a transform layer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    nodes: list[GraphNodeView] = Field(default_factory=list)
+    edges: list[GraphEdgeView] = Field(default_factory=list)
+
+
+class ProvenanceView(BaseModel):
+    """One source-chunk citation for a node detail panel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str
+    url: str | None = None
+    snippet: str | None = None
+    extraction_confidence: float | None = None
+
+
+class NodeDetailView(BaseModel):
+    """``GET /api/v1/graph/nodes/{id}`` response — node detail + provenance."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    key: str
+    label: str
+    type: str
+    description: str | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+    provenance: list[ProvenanceView] = Field(default_factory=list)
+    neighbor_count: int = 0
+    referenced_by_agents: list[str] = Field(default_factory=list)
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """HATEOAS links; serialized as ``_links`` on the wire. ``expand`` →
+    the neighbors endpoint for this node."""
+
+
+class GraphSearchResult(BaseModel):
+    """One matching node in a ``GET /api/v1/graph/search`` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+    type: str
+
+
+class GraphSearchView(BaseModel):
+    """``GET /api/v1/graph/search`` response — matching nodes for fly-to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    results: list[GraphSearchResult] = Field(default_factory=list)
+    count: int = 0
+
+
+class GraphQueryRequest(BaseModel):
+    """``POST /api/v1/graph/query`` body — a bounded traverse/subgraph.
+
+    ``project`` is the agent (graph owner); ``root`` is the node to
+    traverse from. ``depth`` / ``limit`` are bounded server-side
+    regardless of what the client sends (depth ≤ 6 hops, limit ≤ 5000).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: str = Field(..., description="Agent that owns the graph.")
+    root: str = Field(..., description="Node id to traverse from.")
+    mode: str = Field(default="knowledge", description="knowledge | topology.")
+    type: str | None = Field(default=None, description="Optional node-type filter.")
+    depth: int | None = Field(default=None, ge=1, description="Hops; capped server-side at 6.")
+    limit: int | None = Field(
+        default=None, ge=1, description="Node/edge budget; capped server-side at 5000."
+    )

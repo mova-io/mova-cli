@@ -44,6 +44,9 @@ from movate.core.auth import (
 )
 from movate.core.cache import build_cache
 from movate.core.canary import aggregate_side, choose_version
+from movate.core.graph import query as graph_query
+from movate.core.graph.models import GraphologyDoc, NodeDetail, NodeSearchHit
+from movate.core.graph.query import GraphMode
 from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
@@ -185,6 +188,10 @@ from movate.runtime.schemas import (
     FeedbackListView,
     FeedbackSubmission,
     FeedbackView,
+    GraphologyView,
+    GraphQueryRequest,
+    GraphSearchResult,
+    GraphSearchView,
     HarvestedCaseView,
     HarvestView,
     HealthView,
@@ -208,6 +215,7 @@ from movate.runtime.schemas import (
     KbStatsView,
     ModelCatalogView,
     ModelInfoView,
+    NodeDetailView,
     PricingEntryView,
     PricingView,
     ProviderKeyListView,
@@ -377,6 +385,154 @@ async def _sse_run_stream(
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+# ----------------------------------------------------------------------
+# Knowledge-graph query helpers (ADR 046). These translate the runtime's
+# request shape onto the pure ``core.graph`` operations. ``project_id`` /
+# ``project`` is the agent (one graph per agent); a node-id-only endpoint
+# (detail / neighbors / search) optionally narrows to one agent or scans
+# the tenant's agents to find the node's owner.
+# ----------------------------------------------------------------------
+
+# Hard cap on how many of a tenant's agents a node-by-id lookup will scan
+# when no ``project`` is supplied. Bounds the cross-agent search so one
+# request can't fan out unboundedly on a fleet with thousands of agents.
+_GRAPH_AGENT_SCAN_LIMIT = 200
+
+
+def _graph_mode(raw: str | None) -> GraphMode:
+    """Parse a ``mode`` query param into a :class:`GraphMode`.
+
+    Unknown / missing → ``knowledge`` (the only persisted graph today),
+    so a typo degrades to the default view rather than erroring."""
+    if raw == GraphMode.TOPOLOGY.value:
+        return GraphMode.TOPOLOGY
+    return GraphMode.KNOWLEDGE
+
+
+async def _graph_agents_for_tenant(store: StorageProvider, *, tenant_id: str) -> list[str]:
+    """Distinct agent names registered for ``tenant_id``.
+
+    Used by the node-by-id / search endpoints when no ``project`` is
+    given: ask the registry for the tenant's agents (latest version per
+    name) so the cross-agent scope is bounded. Tenant-scoped at the
+    storage layer; never lists another tenant's agents."""
+    bundles = await store.list_agents(tenant_id=tenant_id, limit=_GRAPH_AGENT_SCAN_LIMIT)
+    return [b.name for b in bundles]
+
+
+async def _resolve_node_agent(
+    store: StorageProvider,
+    *,
+    node_id: str,
+    tenant_id: str,
+    project: str | None,
+    agents_hint: list[str] | None = None,
+) -> str | None:
+    """Find which agent owns ``node_id`` within ``tenant_id``.
+
+    ``get_entity`` is tenant-scoped (returns None for a foreign tenant),
+    so this never leaks cross-tenant ids. When ``project`` is given we
+    only accept the node if it belongs to that agent; otherwise we read
+    the node's own ``agent`` field (cheap — one tenant-scoped lookup)."""
+    entity = await store.get_entity(node_id, tenant_id=tenant_id)
+    if entity is None:
+        return None
+    if project is not None and entity.agent != project:
+        return None
+    return entity.agent
+
+
+async def _resolve_node_detail(
+    store: StorageProvider,
+    *,
+    node_id: str,
+    tenant_id: str,
+    project: str | None,
+) -> NodeDetail | None:
+    """Build a :class:`NodeDetail` for ``node_id`` (or None if absent).
+
+    Resolves the owning agent first (tenant-scoped, no leak), then defers
+    to the pure ``core.graph`` detail builder for provenance + neighbor
+    counting."""
+    agent = await _resolve_node_agent(store, node_id=node_id, tenant_id=tenant_id, project=project)
+    if agent is None:
+        return None
+    return await graph_query.node_detail(store, agent=agent, tenant_id=tenant_id, node_id=node_id)
+
+
+async def _search_graph_nodes(
+    store: StorageProvider,
+    *,
+    tenant_id: str,
+    q: str,
+    project: str | None,
+    type: str | None,
+    limit: int | None,
+) -> list[NodeSearchHit]:
+    """Label search across one agent (``project``) or the tenant's agents.
+
+    When ``project`` is set, a single-agent search; otherwise it scans the
+    tenant's registered agents and merges hits up to the node budget. Pure
+    matching lives in ``core.graph.search_nodes`` — this only fans out the
+    agent scope and caps the merged result."""
+    cap = graph_query.clamp_cap(limit)
+    if project is not None:
+        return await graph_query.search_nodes(
+            store, agent=project, tenant_id=tenant_id, q=q, type=type, limit=cap
+        )
+    agents = await _graph_agents_for_tenant(store, tenant_id=tenant_id)
+    merged: list[NodeSearchHit] = []
+    for agent in agents:
+        if len(merged) >= cap:
+            break
+        hits = await graph_query.search_nodes(
+            store,
+            agent=agent,
+            tenant_id=tenant_id,
+            q=q,
+            type=type,
+            limit=cap - len(merged),
+        )
+        merged.extend(hits)
+    return merged[:cap]
+
+
+async def _sse_graph_growth_stream(
+    *,
+    store: StorageProvider,
+    agent: str,
+    tenant_id: str,
+    mode: GraphMode,
+    cap: int,
+) -> Any:
+    """SSE growth generator: replay the current graph as add events.
+
+    Loads a capped window (the same windowing the GET endpoint uses) and
+    emits one ``node.added`` frame per node, then one ``edge.added`` frame
+    per edge, each carrying a single-element graphology document so the
+    client merges every frame with the same zero-transform
+    ``graph.import(...)``. Closes with a ``done`` frame carrying the
+    totals.
+
+    Snapshot-as-stream today (ADR 046 D3): a live-tail that pushes future
+    ingest writes is the additive follow-on; the frame contract here is
+    forward-compatible with it."""
+    doc: GraphologyDoc = await graph_query.windowed_subgraph(
+        store,
+        agent=agent,
+        tenant_id=tenant_id,
+        mode=mode,
+        limit=cap,
+    )
+    for node in doc.nodes:
+        frame_doc = GraphologyDoc(nodes=[node], edges=[])
+        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
+    for edge in doc.edges:
+        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
+        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+    yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
 
 
 def _github_is_enabled() -> bool:
@@ -3300,6 +3456,271 @@ def build_app(
             chunks_reembedded=chunks_reembedded,
             index_rebuilt=index_rebuilt,
             backend=backend,
+        )
+
+    # ------------------------------------------------------------------
+    # Knowledge-graph query API (ADR 046) — read-only, graphology-native.
+    #
+    # A thin read layer over the ALREADY-PERSISTED GraphRAG graph (ADR 010
+    # extraction → ``upsert_entity`` / ``upsert_relation``). No extraction
+    # change, no new tables, no write path — every endpoint reads through
+    # the existing StorageProvider surface and reshapes into graphology
+    # JSON a sigma.js client imports with zero transform.
+    #
+    # Scoping: ``{project_id}`` is the agent (one graph per agent); every
+    # query threads ``ctx.tenant_id`` so no cross-tenant node/edge can
+    # appear. Every endpoint is hard-capped (default 500, max 5000
+    # nodes/edges) so the browser never gets a melt-the-tab payload.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/projects/{project_id}/graph",
+        response_model=GraphologyView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_project_graph(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        mode: str = "knowledge",
+        type: str | None = None,
+        root: str | None = None,
+        depth: int | None = None,
+        limit: int | None = None,
+    ) -> GraphologyView:
+        """A windowed subgraph for ``project_id`` as **graphology JSON**.
+
+        ``project_id`` is the agent that owns the graph. The response is a
+        graphology import document (``{attributes, nodes, edges}``) a
+        sigma.js client feeds to ``graph.import(...)`` with zero
+        transform: each node carries ``label`` / ``type`` /
+        degree-derived ``size`` / ``color`` (+ ``community`` when stored);
+        layout ``x`` / ``y`` are omitted (the client runs ForceAtlas2).
+
+        Query params:
+
+        * ``mode`` — ``knowledge`` (the GraphRAG graph) or ``topology``
+          (reserved; returns empty today).
+        * ``type`` — filter to one node type.
+        * ``root`` — center the window on a node (bounded k-hop expansion).
+          Omit for a whole-graph overview (still capped).
+        * ``depth`` — hops from ``root`` (capped at 6).
+        * ``limit`` — node/edge cap (default 500, max 5000).
+
+        Tenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an
+        empty document (no leak). Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await graph_query.windowed_subgraph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            mode=_graph_mode(mode),
+            type=type,
+            root=root,
+            depth=depth,
+            limit=limit,
+        )
+        return GraphologyView.model_validate(doc.model_dump())
+
+    @v1.get(
+        "/graph/nodes/{node_id}",
+        response_model=NodeDetailView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_node_detail(
+        node_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        project: str | None = None,
+    ) -> NodeDetailView:
+        """Detail for one graph node: properties + provenance + neighbors.
+
+        Returns the node's attributes, its ``provenance`` (each source
+        chunk's url + snippet + extraction_confidence), the live neighbor
+        count, the agents that reference it, and ``_links.expand`` (the
+        neighbors endpoint). ``?project=`` scopes the lookup to one
+        agent's graph; omit to search across the tenant's agents.
+
+        Tenant-scoped at the storage layer — a node owned by another
+        tenant 404s (never 403), so a caller can't probe foreign ids.
+
+        Errors: **401** unauthed, **404** unknown / cross-tenant node.
+        """
+        store: StorageProvider = request.app.state.storage
+        detail = await _resolve_node_detail(
+            store, node_id=node_id, tenant_id=ctx.tenant_id, project=project
+        )
+        if detail is None:
+            raise not_found("graph node", node_id)
+        return NodeDetailView.model_validate(detail.model_dump(by_alias=True))
+
+    @v1.get(
+        "/graph/nodes/{node_id}/neighbors",
+        response_model=GraphologyView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_node_neighbors(
+        node_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        project: str | None = None,
+        depth: int = 1,
+        limit: int | None = None,
+    ) -> GraphologyView:
+        """Expand-on-demand: a node's neighborhood as **graphology JSON**.
+
+        Drives the click-to-grow interaction — the client imports this
+        document on top of the current graph. Bounded by ``depth`` (hops,
+        capped at 6) and ``limit`` (node/edge cap, default 500, max 5000).
+        ``?project=`` scopes to one agent's graph. Unknown / cross-tenant
+        node → empty document. Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        agent = await _resolve_node_agent(
+            store, node_id=node_id, tenant_id=ctx.tenant_id, project=project
+        )
+        if agent is None:
+            return GraphologyView()
+        doc = await graph_query.expand_node_neighbors(
+            store,
+            agent=agent,
+            tenant_id=ctx.tenant_id,
+            node_id=node_id,
+            depth=depth,
+            limit=limit,
+        )
+        return GraphologyView.model_validate(doc.model_dump())
+
+    @v1.get(
+        "/graph/search",
+        response_model=GraphSearchView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_search(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        q: str = "",
+        project: str | None = None,
+        type: str | None = None,
+        limit: int | None = None,
+    ) -> GraphSearchView:
+        """Substring node-label search for fly-to.
+
+        A lexical match on node labels (case-insensitive) — the UI search
+        box, not vector retrieval. ``?project=`` scopes to one agent;
+        omit to search every agent in the tenant. ``?type=`` filters by
+        node type. Capped at the node budget. Empty ``q`` → no results.
+        Read scope, tenant-scoped.
+        """
+        store: StorageProvider = request.app.state.storage
+        hits = await _search_graph_nodes(
+            store,
+            tenant_id=ctx.tenant_id,
+            q=q,
+            project=project,
+            type=type,
+            limit=limit,
+        )
+        results = [GraphSearchResult(key=h.key, label=h.label, type=h.type) for h in hits]
+        return GraphSearchView(query=q, results=results, count=len(results))
+
+    @v1.post(
+        "/graph/query",
+        response_model=GraphologyView,
+        tags=["agents-v1", "graph"],
+        # Read-only bounded traversal (no mutation) — gates on ``read``
+        # despite being a POST (same convention as kb/search).
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_query(
+        body: GraphQueryRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GraphologyView:
+        """Bounded traverse / path / subgraph — **graphology JSON**.
+
+        A POST so the (potentially larger) traversal spec travels in the
+        body. ``project`` is the agent; ``root`` is the start node. Depth
+        and breadth are bounded SERVER-SIDE regardless of the request
+        (depth ≤ 6 hops, limit ≤ 5000 nodes/edges) so a hub can't blow up
+        the traverse. Tenant-scoped; cross-tenant ``root`` → empty
+        document. Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await graph_query.traverse(
+            store,
+            agent=body.project,
+            tenant_id=ctx.tenant_id,
+            root=body.root,
+            depth=body.depth,
+            limit=body.limit,
+            type=body.type,
+        )
+        return GraphologyView.model_validate(doc.model_dump())
+
+    @v1.get(
+        "/projects/{project_id}/graph/stream",
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+        # No response_model — raw SSE byte stream (text/event-stream), not
+        # a JSON body. Event payloads are documented in the docstring.
+    )
+    async def v1_project_graph_stream(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        mode: str = "knowledge",
+        limit: int | None = None,
+    ) -> StreamingResponse:
+        """Growth stream for ``project_id``'s graph over **SSE**.
+
+        Reuses the ADR 035 SSE infrastructure (:func:`_sse_frame`). Emits
+        the current graph as a sequence of growth events the client
+        applies incrementally:
+
+        * ``event: node.added`` / ``data: <graphology doc with one node>``
+        * ``event: edge.added`` / ``data: <graphology doc with one edge>``
+        * ``event: done`` / ``data: {"nodes": N, "edges": M}``
+
+        Each ``node.added`` / ``edge.added`` payload is itself a
+        graphology-importable document (a single-element ``nodes`` or
+        ``edges`` list), so the client merges every frame with the same
+        zero-transform ``graph.import(...)`` it uses for the windowed
+        endpoints — no special-case parsing. (``node.updated`` shares the
+        ``node.added`` shape; emitted when a re-ingest changes an existing
+        node.)
+
+        Bounded by ``limit`` (node/edge cap). Tenant-scoped. Read scope.
+
+        This is a SNAPSHOT-as-stream today (it replays the current graph
+        then closes with ``done``); the live-tail seam — pushing future
+        ``node.added`` events as ingest writes them — is additive and
+        documented in ADR 046 D3.
+        """
+        store: StorageProvider = request.app.state.storage
+        tenant_id = ctx.tenant_id
+        cap = graph_query.clamp_cap(limit)
+        graph_mode = _graph_mode(mode)
+
+        generator = _sse_graph_growth_stream(
+            store=store,
+            agent=project_id,
+            tenant_id=tenant_id,
+            mode=graph_mode,
+            cap=cap,
+        )
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @v1.post(
