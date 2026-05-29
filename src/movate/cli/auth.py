@@ -850,6 +850,11 @@ _PROVIDERS_PROMPT_NAME = {
     "azure": "Azure OpenAI",
     "gemini": "Gemini",
     "lyzr": "Lyzr Studio",
+    # Voice providers (ADR 048/049, the `[voice]` extra) — speech adapters,
+    # not LLM chat providers. Same single-key UX surface as the LLM providers
+    # because operators expect "set up the integration once" to look the same.
+    "deepgram": "Deepgram (voice STT)",
+    "cartesia": "Cartesia (voice TTS)",
     # Telegram is the deploy-notification channel, not an LLM provider.
     # Same UX surface as the LLM providers because operators expect
     # "set up the integration once" to look the same regardless.
@@ -867,6 +872,8 @@ _PROVIDER_TO_ENV_VAR = {
     "azure": "AZURE_OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "lyzr": "LYZR_API_KEY",
+    "deepgram": "DEEPGRAM_API_KEY",
+    "cartesia": "CARTESIA_API_KEY",
 }
 
 # Telegram needs TWO values (bot token + chat ID), not one — handled
@@ -890,7 +897,8 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "Provider to set the API key for: "
             "[bold]openai[/bold], [bold]anthropic[/bold], "
             "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
-            "[bold]telegram[/bold], or [bold]azure-speech[/bold] (voice). "
+            "[bold]deepgram[/bold], [bold]cartesia[/bold], "
+            "[bold]azure-speech[/bold] (voice), or [bold]telegram[/bold]. "
             "Omit to pick interactively."
         ),
     ),
@@ -2461,6 +2469,8 @@ def _prompt_for_provider() -> str:
         ("azure", _PROVIDERS_PROMPT_NAME["azure"]),
         ("gemini", _PROVIDERS_PROMPT_NAME["gemini"]),
         ("lyzr", _PROVIDERS_PROMPT_NAME["lyzr"]),
+        ("deepgram", _PROVIDERS_PROMPT_NAME["deepgram"]),
+        ("cartesia", _PROVIDERS_PROMPT_NAME["cartesia"]),
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
         ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
     ]

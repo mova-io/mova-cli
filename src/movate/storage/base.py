@@ -62,6 +62,8 @@ from movate.core.models import (
     ProjectMemberRole,
     Relation,
     RunRecord,
+    Session,
+    SessionMessage,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -1116,6 +1118,80 @@ class StorageProvider(Protocol):
         runs themselves)."""
 
     # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10) — server-side conversation memory.
+    # A session is a first-class entity (its own ``sessions`` +
+    # ``session_messages`` tables, both ``tenant_id NOT NULL``) that the
+    # run endpoints accept via ``session_id``: prior turns are loaded as
+    # context, the new turn is appended, and a per-session cost rollup is
+    # maintained. Distinct from the older join-key ``conversation_threads``
+    # surface above; the executor stays stateless (history threads in as
+    # input, the turn is appended out).
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session: Session) -> None:
+        """Persist a :class:`Session`. Idempotent (upsert) on
+        ``session_id``: re-saving the same id refreshes the mutable
+        fields (``title``, ``updated_at``, and the rollups
+        ``turn_count`` / ``total_cost_usd`` / ``total_tokens_*``).
+        ``created_at`` is preserved on update."""
+
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> Session | None:
+        """Fetch a session by id, scoped to ``tenant_id``. Returns
+        ``None`` if it doesn't exist OR belongs to a different tenant —
+        never leaks existence across tenants (404-not-403, the same
+        contract as every single-record getter)."""
+
+    async def list_sessions(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[Session]:
+        """List sessions for a tenant, ordered ``updated_at DESC`` so
+        the active conversations float to the top. Optional ``agent``
+        filter for clients that want one agent's sessions."""
+
+    async def append_session_message(self, message: SessionMessage) -> None:
+        """Append one :class:`SessionMessage` to its session.
+
+        Insert-only (each message is immutable). The caller is
+        responsible for also updating the parent session's rollups via
+        :meth:`save_session` — kept as two calls so a backend can wrap
+        them in its own transaction if it chooses, and so the InMemory
+        double mirrors the exact same call pattern."""
+
+    async def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[SessionMessage]:
+        """Fetch a session's messages, ordered ``created_at ASC``
+        (chronological — earliest turn first) so the runtime renders the
+        history straight from the list. Tenant-scoped: a cross-tenant
+        session id returns ``[]`` rather than raising or leaking."""
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        """Hard-delete a session and its messages, scoped to
+        ``tenant_id``. Returns True when a row was deleted, False when
+        no matching session existed (or it belonged to a different
+        tenant — 404-not-403). Run records referenced by the session's
+        messages are left untouched (the session deletion expresses "I
+        don't want this conversation anymore", not "nuke the runs")."""
+
+    # ------------------------------------------------------------------
     # Agent registry (ADR 014 D1) — durable, versioned agent bundles.
     # A bundle is the small text files of a published agent stored as one
     # immutable (name, version) row, tenant-scoped, on every backend. KB
@@ -1370,6 +1446,7 @@ class StorageProvider(Protocol):
         tenant_id: str,
         query_embedding: list[float],
         limit: int = 10,
+        project_id: str | None = None,
     ) -> list[EntityWithScore]:
         """Top-K most-similar entities for the agent's graph — the vector
         SEED step of GraphRAG retrieval.
@@ -1378,7 +1455,11 @@ class StorageProvider(Protocol):
         ``(agent, tenant_id)``, compute cosine against ``query_embedding``
         in Python, return the top ``limit``. Empty graph returns ``[]``.
         Callers feed the resulting ``entity_id``s into
-        :meth:`expand_neighbors`."""
+        :meth:`expand_neighbors`.
+
+        ``project_id`` (ADR 046 D1, additive) optionally narrows to one
+        project's nodes; ``None`` (the default) keeps the historical
+        per-agent scope — project-less rows are included."""
 
     async def expand_neighbors(
         self,
@@ -1388,6 +1469,7 @@ class StorageProvider(Protocol):
         entity_ids: list[str],
         hops: int = 1,
         limit: int = 50,
+        project_id: str | None = None,
     ) -> Subgraph:
         """Bounded k-hop expansion from ``entity_ids`` — the ONLY traversal
         primitive. Returns the reached entities (including the seeds) plus
@@ -1400,6 +1482,10 @@ class StorageProvider(Protocol):
         undirected for reachability (an edge connects its endpoints both
         ways) — direction is preserved in the returned ``Relation`` rows for
         the caller to interpret.
+
+        ``project_id`` (ADR 046 D1, additive) optionally bounds the
+        traversal to one project's edges/nodes; ``None`` (the default)
+        keeps the historical per-agent scope.
 
         Implementations: recursive CTE over ``kb_relations`` on sqlite /
         postgres; breadth-first walk in :class:`InMemoryStorage`. Unknown or
@@ -1421,11 +1507,14 @@ class StorageProvider(Protocol):
         tenant_id: str,
         source_chunk_id: str | None = None,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Entity]:
         """List entities for inspection / debugging. When ``source_chunk_id``
         is set, returns only entities extracted from that chunk (drives
         provenance views — "what did this passage contribute to the
-        graph?"). Filters AND together. Empty graph → ``[]``."""
+        graph?"). ``project_id`` (ADR 046 D1, additive) optionally narrows
+        to one project's nodes; ``None`` (default) = per-agent scope.
+        Filters AND together. Empty graph → ``[]``."""
 
     async def list_relations(
         self,
@@ -1433,9 +1522,12 @@ class StorageProvider(Protocol):
         agent: str,
         tenant_id: str,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Relation]:
         """List relations for inspection / debugging, scoped to
-        ``(agent, tenant_id)``. Empty graph → ``[]``."""
+        ``(agent, tenant_id)``. ``project_id`` (ADR 046 D1, additive)
+        optionally narrows to one project's edges; ``None`` (default) =
+        per-agent scope. Empty graph → ``[]``."""
 
     async def delete_graph(
         self,

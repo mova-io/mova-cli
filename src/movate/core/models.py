@@ -739,6 +739,78 @@ class AgentMetadata(BaseModel):
         return v
 
 
+class GraphRetrievalConfig(BaseModel):
+    """GraphRAG retrieval settings — the ``retrieval.graph`` block.
+
+    Surfaces ADR 010's already-built-but-unwired graph retrieval
+    (``kb.graph_retrieval.graph_retrieve``) into agent config, completing
+    ADR 046 D9. **Opt-in + additive**: with ``enabled`` False (the
+    default — i.e. no ``retrieval.graph`` block in ``agent.yaml``) the
+    retrieval path is byte-for-byte unchanged and no graph lookup runs.
+
+    When enabled, the ``kb-vector-lookup`` skill — *in addition to* its
+    vector chunk search — seeds the agent's knowledge graph by entity
+    vector search, expands a bounded neighborhood, and appends the
+    rendered relation context as an extra grounding block. It
+    **complements** vector retrieval (ADR 010 D4), never replaces it. The
+    lookup stays behind the ``StorageProvider`` Protocol
+    (``search_entities`` + ``expand_neighbors``) — no backend is hardcoded
+    (CLAUDE.md rule 6/7).
+
+    Example ``agent.yaml``::
+
+        retrieval:
+          graph:
+            enabled: true
+            hops: 2
+            max_relations: 50
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for GraphRAG retrieval. False (default) → no "
+            "graph lookup runs and the retrieval path is unchanged. True "
+            "→ the kb-vector-lookup skill ALSO retrieves graph-neighbor "
+            "context (entities + relations) alongside vector chunks."
+        ),
+    )
+    seed_limit: int = Field(
+        default=5,
+        ge=1,
+        le=25,
+        description=(
+            "How many entities the query vector seeds the neighborhood "
+            "expansion with (clamped at retrieval time to "
+            ":data:`movate.kb.graph_retrieval.MAX_SEED_LIMIT`)."
+        ),
+    )
+    hops: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description=(
+            "Bounded k-hop neighborhood expansion from the seed entities "
+            "(ADR 010 ``expand_neighbors``). Higher = more relational "
+            "context + more tokens. Clamped at retrieval time to "
+            ":data:`movate.kb.graph_retrieval.MAX_HOPS`."
+        ),
+    )
+    max_relations: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description=(
+            "Cap on relations pulled into the graph context — the budget "
+            "guard against a hub entity blowing up the prompt. Clamped at "
+            "retrieval time to "
+            ":data:`movate.kb.graph_retrieval.MAX_RELATIONS`."
+        ),
+    )
+
+
 class RetrievalConfig(BaseModel):
     """KB retrieval pipeline configuration for an agent's
     ``kb-vector-lookup`` skill.
@@ -884,6 +956,22 @@ class RetrievalConfig(BaseModel):
         ),
     )
 
+    # ---- ADR 010 / 046 D9: opt-in GraphRAG retrieval ----
+    # Orthogonal to the vector-pipeline-tuning fields above. With no
+    # ``graph`` block (the default), ``graph.enabled`` is False and no
+    # graph lookup runs — the retrieval path is byte-for-byte unchanged.
+
+    graph: GraphRetrievalConfig = Field(
+        default_factory=GraphRetrievalConfig,
+        description=(
+            "GraphRAG retrieval (ADR 010 / 046 D9). Opt-in via "
+            "``graph.enabled: true``; default is all-off so the retrieval "
+            "path is unchanged. When enabled, kb-vector-lookup ALSO "
+            "retrieves graph-neighbor context behind the StorageProvider "
+            "Protocol, complementing vector chunks."
+        ),
+    )
+
     # ---- ADR 023: opt-in declarative pre-retrieval (auto-RAG) ----
     # These fields configure the Executor's pre-retrieval phase — a
     # deterministic "fetch grounding for me before the model sees the
@@ -991,6 +1079,7 @@ class RetrievalConfig(BaseModel):
             and self.history_turns is None
             and self.history_char_budget is None
             and not self.history_summarize
+            and not self.graph.enabled
         )
 
 
@@ -1758,6 +1847,99 @@ class ConversationThread(BaseModel):
     updated_at: datetime = Field(default_factory=_now)
     """Refreshed on every appended message so clients can sort
     threads most-recently-active first."""
+
+
+class Session(BaseModel):
+    """A server-managed stateful conversation (ADR 045 D10).
+
+    Sessions provide **server-side conversation memory**: the runtime
+    stores each turn, assembles prior turns as context for the next
+    run, and tracks a per-session cost rollup — so a client does not
+    have to re-send history on every call.
+
+    Relationship to :class:`ConversationThread`: a thread is the older,
+    join-key-only grouping (runs share a ``thread_id``; the runtime
+    re-derives history from ``RunRecord.input``/``output`` on each
+    ``POST /threads/{id}/messages``). A **session** is the ADR 045 D10
+    abstraction: a first-class entity with its own ``session_messages``
+    table, accepted directly on the run endpoints via ``session_id``,
+    and carrying a maintained cost/turn rollup. The two are independent
+    surfaces — D10 does not modify the thread path.
+
+    Storage contract:
+
+    * One session per agent per tenant. ``tenant_id`` is ``NOT NULL`` on
+      both ``sessions`` and ``session_messages`` (per-tenant isolation,
+      ADR 045 R6-adjacent) — a cross-tenant ``session_id`` is invisible
+      (404-not-403, the same contract as every other single-record
+      getter).
+    * ``session_id`` is the public identifier (URL-safe hex uuid).
+    * The conversation turns live in ``session_messages`` (one row per
+      message), each referencing the ``run_id`` that produced an
+      assistant turn — the "reference to run records that compose the
+      session" option in ADR 045 D10. This keeps the executor stateless:
+      the session service threads history *in* as input context and
+      appends the resulting turn *out*; the executor never learns
+      sessions exist.
+
+    Rollups (maintained on append, ADR 045 D10 "per-session cost
+    rollup"): ``turn_count``, ``total_cost_usd``, ``total_tokens_in``,
+    ``total_tokens_out``. These sum the D1 economics across turns so a
+    client can read the conversation's running spend without scanning
+    every message.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    tenant_id: str
+    agent: str
+    title: str = ""
+    """Optional human-readable label for client display."""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+    """Refreshed on every appended turn so clients can sort sessions
+    most-recently-active first."""
+    turn_count: int = 0
+    """Number of completed (user→assistant) turns appended so far."""
+    total_cost_usd: float = 0.0
+    """Per-session BYOK cost rollup — sum of each turn's
+    ``RunRecord.metrics.cost_usd``."""
+    total_tokens_in: int = 0
+    """Sum of prompt tokens across turns."""
+    total_tokens_out: int = 0
+    """Sum of completion tokens across turns."""
+
+
+class SessionMessage(BaseModel):
+    """One message in a :class:`Session` (ADR 045 D10).
+
+    A turn is two rows: a ``user`` message (the submitted input) and an
+    ``assistant`` message (the agent's reply). The assistant row carries
+    ``run_id`` + economics so the session both *references the run record*
+    that composed it and surfaces a per-turn cost without a join.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(default_factory=lambda: uuid4().hex)
+    session_id: str
+    tenant_id: str
+    """Denormalized from the parent session so message reads stay
+    tenant-scoped without joining ``sessions`` (per-tenant isolation)."""
+    role: Literal["user", "assistant"]
+    content: dict[str, Any]
+    """The message payload. For a ``user`` row this is the submitted
+    run input dict; for an ``assistant`` row this is the run's output
+    dict (``None`` output is stored as ``{}``)."""
+    run_id: str | None = None
+    """References ``runs.run_id`` for an ``assistant`` turn — the run
+    that produced this reply. ``None`` on the ``user`` row."""
+    cost_usd: float = 0.0
+    """This turn's BYOK cost (assistant row only; 0 on the user row)."""
+    tokens_in: int = 0
+    tokens_out: int = 0
+    created_at: datetime = Field(default_factory=_now)
 
 
 class FailureRecord(BaseModel):
@@ -3157,6 +3339,15 @@ class Entity(BaseModel):
     """Which agent's KB graph this entity belongs to. One graph per agent,
     matching the one-KB-per-agent model."""
 
+    project_id: str | None = None
+    """Project (ADR 040) this node belongs to, for project-grain scoping
+    of the graph viewer / query API (ADR 046 D1). **Additive + nullable**:
+    nodes written before this column existed (and ingests with no project
+    context) carry ``None`` and are simply absent from a project-filtered
+    query — they remain fully visible in the unfiltered (per-agent) view,
+    so the default behavior is byte-for-byte unchanged. Never part of the
+    dedup key (re-ingesting under a project backfills the column in place)."""
+
     name: str
     """Canonical surface form of the entity (e.g. ``"SAML SSO"``). The
     extraction pipeline normalizes aliases to one canonical name so the
@@ -3220,6 +3411,15 @@ class Relation(BaseModel):
 
     agent: str
     """Which agent's KB graph this edge belongs to."""
+
+    project_id: str | None = None
+    """Project (ADR 040) this edge belongs to — mirrors
+    :attr:`Entity.project_id`. **Additive + nullable**: pre-existing rows
+    and project-less ingests carry ``None`` and drop out of a
+    project-filtered query while staying visible in the unfiltered view.
+    An edge never crosses a tenant boundary (ADR 046 D10); ``project_id``
+    is a scoping/visibility tag, not a second tenancy axis. Never part of
+    the dedup key."""
 
     src_entity_id: str
     """``Entity.entity_id`` of the edge's source (tail) node."""

@@ -72,6 +72,10 @@ class TestAutoloadedRegistry:
         )
         assert set(ALL_AUTOLOADED_ENV_VARS) == expected
 
+    def test_voice_env_vars_include_deepgram_and_cartesia(self) -> None:
+        assert "DEEPGRAM_API_KEY" in VOICE_KEY_ENV_VARS
+        assert "CARTESIA_API_KEY" in VOICE_KEY_ENV_VARS
+
 
 # ---------------------------------------------------------------------------
 # Autoload: Telegram secrets get picked up from the credentials file
@@ -110,6 +114,63 @@ class TestAutoloadTelegram:
         CredentialsStore().set("OPENAI_API_KEY", "sk-test")
         autoload_credentials()
         assert os.environ["OPENAI_API_KEY"] == "sk-test"
+
+
+# ---------------------------------------------------------------------------
+# Autoload: voice provider keys get picked up from the credentials file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAutoloadVoiceKeys:
+    """Deepgram/Cartesia keys autoload from the credentials file the same
+    way the LLM provider keys do (so operators set them once via
+    `mdk auth login deepgram`/`cartesia` and never re-export)."""
+
+    def test_deepgram_key_autoloads(self, isolated_env: Path) -> None:
+        CredentialsStore().set("DEEPGRAM_API_KEY", "dg-test")
+        assert os.environ.get("DEEPGRAM_API_KEY") is None
+        autoload_credentials()
+        assert os.environ["DEEPGRAM_API_KEY"] == "dg-test"
+
+    def test_cartesia_key_autoloads(self, isolated_env: Path) -> None:
+        CredentialsStore().set("CARTESIA_API_KEY", "ct-test")
+        autoload_credentials()
+        assert os.environ["CARTESIA_API_KEY"] == "ct-test"
+
+    def test_shell_env_still_wins_over_file(
+        self, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same never-clobber precedence as the LLM provider keys."""
+        monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-shell")
+        CredentialsStore().set("DEEPGRAM_API_KEY", "dg-file")
+        autoload_credentials()
+        assert os.environ["DEEPGRAM_API_KEY"] == "dg-shell"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: `mdk auth login deepgram`/`cartesia` are recognized
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("provider", "env_var"),
+    [("deepgram", "DEEPGRAM_API_KEY"), ("cartesia", "CARTESIA_API_KEY")],
+)
+def test_auth_login_voice_provider_recognized(
+    isolated_env: Path, provider: str, env_var: str
+) -> None:
+    """`mdk auth login deepgram`/`cartesia` is a recognized provider and
+    writes its key to the credentials file (not an 'unknown provider' error).
+    --no-verify because voice providers have no live-verify probe wired."""
+    result = runner.invoke(
+        app,
+        ["auth", "login", provider, "--key", f"{provider}-key", "--no-verify"],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert CredentialsStore().get(env_var) == f"{provider}-key"
 
 
 # ---------------------------------------------------------------------------

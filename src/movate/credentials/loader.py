@@ -54,19 +54,26 @@ OBSERVABILITY_KEY_ENV_VARS: tuple[str, ...] = (
     "LANGFUSE_BASE_URL",
 )
 
-# Voice-provider env vars (ADR 048/049). Set via ``mdk auth login
-# azure-speech`` (or by hand) and consumed by the voice adapters in
-# ``movate.voice`` (the Azure Speech STT/TTS pair reads key+region). Kept
-# SEPARATE from PROVIDER_KEY_ENV_VARS because those are LLM-provider keys the
-# auth-status table live-verifies against an LLM metadata endpoint — voice
-# creds aren't LLM keys and have no such probe, so they autoload like the
-# notification group but are not LLM-verified.
+# Voice-provider env vars (ADR 048/049, the ``[voice]`` extra). Set via
+# ``mdk auth login deepgram`` / ``cartesia`` / ``azure-speech`` (or by hand)
+# and consumed by the speech adapters in ``movate.voice`` (Deepgram STT /
+# Cartesia TTS, plus the Azure Speech STT/TTS pair which reads key+region).
+# Kept SEPARATE from PROVIDER_KEY_ENV_VARS on purpose: those are LLM-chat
+# provider keys that gate ``_has_any_provider_key`` ("can this machine run a
+# text agent?") and are live-verified against an LLM metadata endpoint by the
+# auth-status table — a voice key can't run the text agent and has no such
+# probe, so folding it in there would wrongly answer "yes". They still need
+# the same autoload-from-credentials-file treatment (so operators don't
+# re-export each shell), so they go through ``ALL_AUTOLOADED_ENV_VARS`` below
+# — the same pattern the notification / observability groups use.
 #
 # Azure Speech needs a key AND a region (the region is a non-secret routing
 # value, but it autoloads the same way so operators don't re-export it each
 # shell). Distinct from AZURE_OPENAI_API_KEY (Azure OpenAI chat/embeddings) —
 # Azure Speech is a different Azure resource with its own key.
 VOICE_KEY_ENV_VARS: tuple[str, ...] = (
+    "DEEPGRAM_API_KEY",
+    "CARTESIA_API_KEY",
     "AZURE_SPEECH_KEY",
     "AZURE_SPEECH_REGION",
 )

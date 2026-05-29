@@ -125,6 +125,7 @@ async def extract_graph(
     api_key: str | None = None,
     timeout_s: float = 30.0,
     complete_fn: CompleteFn | None = None,
+    project_id: str | None = None,
 ) -> tuple[list[Entity], list[Relation]]:
     """Extract a merged, embedded knowledge graph from ``chunks``.
 
@@ -134,6 +135,11 @@ async def extract_graph(
             Empty input → ``([], [])`` with no API calls.
         agent / tenant_id: Scope stamped on every entity + relation, and
             folded into the dedup ``content_hash``.
+        project_id: Optional project (ADR 040/046 D1) stamped on every
+            produced node/edge for project-grain scoping of the graph
+            viewer. ``None`` (default) leaves the column null — NOT part of
+            the dedup ``content_hash``, so re-ingesting under a project
+            backfills the tag in place. Additive + backward-compatible.
         embedding_model: Model used to embed entity text for vector seed.
             MUST match what the KB chunks were embedded with so query-time
             cosine is comparable.
@@ -194,7 +200,11 @@ async def extract_graph(
         name_to_id.setdefault(_norm(accum.name), accum.entity_id)
 
     relations = _merge_relations(
-        raw_relations, name_to_id=name_to_id, agent=agent, tenant_id=tenant_id
+        raw_relations,
+        name_to_id=name_to_id,
+        agent=agent,
+        tenant_id=tenant_id,
+        project_id=project_id,
     )
 
     built_entities = await _embed_entities(
@@ -203,6 +213,7 @@ async def extract_graph(
         tenant_id=tenant_id,
         embedding_model=embedding_model,
         api_key=api_key,
+        project_id=project_id,
     )
     return built_entities, relations
 
@@ -239,6 +250,7 @@ def _merge_relations(
     name_to_id: dict[str, str],
     agent: str,
     tenant_id: str,
+    project_id: str | None = None,
 ) -> list[Relation]:
     merged: dict[str, _RelationAccum] = {}
     for rel, chunk_id in raw_relations:
@@ -271,6 +283,7 @@ def _merge_relations(
         Relation(
             tenant_id=tenant_id,
             agent=agent,
+            project_id=project_id,
             src_entity_id=a.src_entity_id,
             dst_entity_id=a.dst_entity_id,
             type=a.type,
@@ -290,6 +303,7 @@ async def _embed_entities(
     tenant_id: str,
     embedding_model: str,
     api_key: str | None,
+    project_id: str | None = None,
 ) -> list[Entity]:
     full_model = qualified_model_name(embedding_model)
     # Embed "name: description" so the seed vector captures both the label
@@ -304,6 +318,7 @@ async def _embed_entities(
             entity_id=a.entity_id,
             tenant_id=tenant_id,
             agent=agent,
+            project_id=project_id,
             name=a.name,
             type=a.type,
             description=a.description or None,

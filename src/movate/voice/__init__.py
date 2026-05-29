@@ -11,12 +11,13 @@ Phase 1 scope (pipeline mode only):
   :class:`TextToSpeechProvider` — and their chunk types
   (:class:`TranscriptChunk` / :class:`AudioChunk`), in :mod:`movate.voice.base`;
 * OpenAI reference adapters (:class:`OpenAIWhisperSTT` / :class:`OpenAITTS`)
-  in :mod:`movate.voice.openai_speech`, with the ``openai`` SDK imported
+  in :mod:`movate.voice.openai_speech` (the T2 low-friction default), plus the
+  T1 low-latency pair (:class:`DeepgramSTT` in :mod:`movate.voice.deepgram` /
+  :class:`CartesiaTTS` in :mod:`movate.voice.cartesia`) and the T1
+  enterprise/sovereignty Azure Speech pair (:class:`AzureSpeechSTT` /
+  :class:`AzureNeuralTTS` in :mod:`movate.voice.azure_speech`, against the
+  customer's own Azure subscription), each with its provider SDK imported
   lazily so a default install is unaffected (ADR 048 D9);
-* Azure Speech adapters (:class:`AzureSpeechSTT` / :class:`AzureNeuralTTS`) in
-  :mod:`movate.voice.azure_speech` — the T1 enterprise/sovereignty pair against
-  the customer's own Azure subscription, with the Azure Speech SDK imported
-  lazily (same posture as the OpenAI pair);
 * test doubles (:class:`FakeSTT` / :class:`FakeTTS`) in
   :mod:`movate.voice.doubles`;
 * the pipeline driver (:func:`run_voice_pipeline`) in
@@ -27,9 +28,9 @@ seam + speech-to-speech mode (ADR 048 D2b / Phase 2), telephony (Phase 3), and
 the agility layer (router / bench / drift — ADR 049).
 
 The Protocols + chunk types + doubles + pipeline are import-cheap (no optional
-deps). The OpenAI and Azure adapters import their provider SDKs lazily;
-importing them by name here does **not** trigger that import until the class is
-constructed.
+deps). The OpenAI / Deepgram / Cartesia / Azure Speech adapters import their
+provider SDK lazily; importing them by name here does **not** trigger that
+import until the class is constructed.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ from movate.voice.base import (
     TextToSpeechProvider,
     TranscriptChunk,
 )
+from movate.voice.cartesia import CartesiaTTS
+from movate.voice.deepgram import DeepgramSTT
 from movate.voice.doubles import FakeSTT, FakeTTS
 from movate.voice.openai_speech import OpenAITTS, OpenAIWhisperSTT
 from movate.voice.pipeline import VoicePipelineResult, run_voice_pipeline
@@ -51,6 +54,8 @@ __all__ = [
     "AudioCodec",
     "AzureNeuralTTS",
     "AzureSpeechSTT",
+    "CartesiaTTS",
+    "DeepgramSTT",
     "FakeSTT",
     "FakeTTS",
     "OpenAITTS",
