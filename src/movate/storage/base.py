@@ -43,6 +43,7 @@ from movate.core.models import (
     CatalogRatingsSummary,
     CatalogSource,
     ConversationThread,
+    DiagnosisRecord,
     Entity,
     EntityWithScore,
     EvalRecord,
@@ -2156,5 +2157,37 @@ class StorageProvider(Protocol):
         and per-step counts. Raises :class:`FileNotFoundError` if the
         agent dir doesn't exist (the route handler maps that to 404).
         """
+    # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
+    #
+    # Persisted output of the diagnose endpoint. A row is created with
+    # ``status=running`` when the POST lands and updated (in place,
+    # upsert) when the background task finishes (``completed`` or
+    # ``error``). The structured result is stored as an opaque JSON blob
+    # — the typed-fix taxonomy is validated at the wire edge so future
+    # ADR 043 extensions don't require a storage migration.
+    #
+    # Read-only with respect to agent state: persisting these rows
+    # never touches the agent's prompt / KB / context / model. ADR 043's
+    # apply step (later PR) is the only thing that does.
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        """Upsert a :class:`DiagnosisRecord` keyed by ``diagnosis_id``.
+
+        Idempotent on ``diagnosis_id``: re-saving the same id updates
+        ``status`` / ``result`` / ``error`` / ``tokens_used`` /
+        ``cost_usd`` / ``completed_at`` in place — the background task
+        uses this to transition a row from ``running`` to ``completed``
+        without a separate update method. ``tenant_id`` / ``agent`` /
+        ``created_at`` are preserved across the upsert (insert-time
+        fields are never re-written)."""
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        """Exact lookup by ``diagnosis_id``, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the diagnosis belongs to a
+        different tenant — same 404-not-403 contract as the other
+        single-record getters, so a caller can't probe for the existence
+        of another tenant's diagnoses."""
 
     async def close(self) -> None: ...

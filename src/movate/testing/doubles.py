@@ -29,6 +29,7 @@ from movate.core.models import (
     CatalogRatingsSummary,
     CatalogSource,
     ConversationThread,
+    DiagnosisRecord,
     Entity,
     EntityWithScore,
     EvalRecord,
@@ -147,6 +148,11 @@ class InMemoryStorage:
         # Tenant scoping is enforced inline in the getter, not as a
         # secondary index — same as the other ``get_*`` methods.
         self._eval_generation_jobs: dict[str, Any] = {}
+        # ADR 043 D1: persisted Failure Pattern Diagnoser outputs. Keyed
+        # by diagnosis_id; upserted in place so the runtime background
+        # task can transition a row from ``running`` to ``completed``
+        # without a separate update method.
+        self.diagnoses: dict[str, DiagnosisRecord] = {}
 
     async def init(self) -> None:
         return None
@@ -2153,6 +2159,28 @@ class InMemoryStorage:
             cases_added=len(cases),
             judge_yaml_updated=judge_updated,
         )
+    # Diagnoses (ADR 043 D1 — failure-pattern diagnoser)
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        # Upsert keyed by diagnosis_id. On overwrite, preserve the
+        # insert-time fields the runtime layer never re-sends
+        # (``created_at``) so a follow-up "completed" save doesn't
+        # accidentally clobber the original timestamp.
+        existing = self.diagnoses.get(record.diagnosis_id)
+        if existing is not None:
+            record = record.model_copy(update={"created_at": existing.created_at})
+        self.diagnoses[record.diagnosis_id] = record
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        row = self.diagnoses.get(diagnosis_id)
+        if row is None:
+            return None
+        if row.tenant_id != tenant_id:
+            # No-leak contract: cross-tenant probe is indistinguishable
+            # from a missing record.
+            return None
+        return row
 
     async def close(self) -> None:
         return None

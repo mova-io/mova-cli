@@ -48,6 +48,8 @@ from movate.core.models import (
     CatalogRatingsSummary,
     CatalogSource,
     ConversationThread,
+    DiagnosisRecord,
+    DiagnosisStatus,
     Entity,
     EntityWithScore,
     ErrorInfo,
@@ -1042,6 +1044,29 @@ CREATE TABLE IF NOT EXISTS eval_generation_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_eval_gen_jobs_tenant_created
     ON eval_generation_jobs(tenant_id, created_at DESC);
+-- ADR 043 D1 — Failure Pattern Diagnoser results. One row per diagnose
+-- request; upsert (ON CONFLICT) on diagnosis_id so the runtime's background
+-- task can transition a row from ``running`` to ``completed`` without a
+-- separate update method. ``request`` / ``result`` / ``error`` are JSONB
+-- columns; the typed-fix taxonomy is validated at the wire edge so adding a
+-- new fix kind later doesn't require a storage migration. Read-only with
+-- respect to agent state — persisting a row never modifies the agent.
+CREATE TABLE IF NOT EXISTS diagnoses (
+    diagnosis_id  TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    agent         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    request       JSONB NOT NULL,
+    result        JSONB,
+    error         JSONB,
+    tokens_used   INTEGER NOT NULL DEFAULT 0,
+    cost_usd      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    model         TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL,
+    completed_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_diagnoses_agent_created
+    ON diagnoses(tenant_id, agent, created_at DESC);
 """
 
 
@@ -1319,6 +1344,55 @@ class PostgresProvider:
             max_size=max_size,
             min_size=min_size,
         )
+
+    # ------------------------------------------------------------------
+    # Diagnoses (ADR 043 D1 — Failure Pattern Diagnoser results)
+    # ------------------------------------------------------------------
+
+    async def save_diagnosis(self, record: DiagnosisRecord) -> None:
+        # Upsert keyed by diagnosis_id. ON CONFLICT preserves the
+        # original created_at — the runtime's background task uses this
+        # to transition the row from ``running`` to ``completed`` (or
+        # ``error``) without re-stamping the insert timestamp.
+        await self._db.execute(
+            """
+            INSERT INTO diagnoses (
+                diagnosis_id, tenant_id, agent, status, request, result,
+                error, tokens_used, cost_usd, model, created_at, completed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            )
+            ON CONFLICT (diagnosis_id) DO UPDATE SET
+                status       = EXCLUDED.status,
+                request      = EXCLUDED.request,
+                result       = EXCLUDED.result,
+                error        = EXCLUDED.error,
+                tokens_used  = EXCLUDED.tokens_used,
+                cost_usd     = EXCLUDED.cost_usd,
+                model        = EXCLUDED.model,
+                completed_at = EXCLUDED.completed_at
+            """,
+            record.diagnosis_id,
+            record.tenant_id,
+            record.agent,
+            record.status.value,
+            record.request,
+            record.result,
+            record.error.model_dump() if record.error else None,
+            record.tokens_used,
+            record.cost_usd,
+            record.model,
+            record.created_at,
+            record.completed_at,
+        )
+
+    async def get_diagnosis(self, diagnosis_id: str, *, tenant_id: str) -> DiagnosisRecord | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM diagnoses WHERE diagnosis_id = $1 AND tenant_id = $2",
+            diagnosis_id,
+            tenant_id,
+        )
+        return _row_to_diagnosis(row) if row else None
 
     # ------------------------------------------------------------------
     # DR backup/restore (item 26) — delegate to the backend-agnostic
@@ -4740,6 +4814,29 @@ def _row_to_thread(row: asyncpg.Record) -> ConversationThread:
         title=row["title"] or "",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_diagnosis(row: asyncpg.Record) -> DiagnosisRecord:
+    request_blob = row["request"]
+    result_blob = row["result"]
+    error_blob = row["error"]
+    error_obj: ErrorInfo | None = None
+    if error_blob is not None:
+        error_obj = ErrorInfo.model_validate(dict(error_blob))
+    return DiagnosisRecord(
+        diagnosis_id=row["diagnosis_id"],
+        tenant_id=row["tenant_id"],
+        agent=row["agent"],
+        status=DiagnosisStatus(row["status"]),
+        request=dict(request_blob) if request_blob else {},
+        result=dict(result_blob) if result_blob is not None else None,
+        error=error_obj,
+        tokens_used=row["tokens_used"] or 0,
+        cost_usd=float(row["cost_usd"] or 0.0),
+        model=row["model"] or "",
+        created_at=row["created_at"],
+        completed_at=row["completed_at"],
     )
 
 

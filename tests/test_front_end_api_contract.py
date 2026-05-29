@@ -86,6 +86,9 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/agents/{name}/evals/generate"): "eval",
     ("GET", "/api/v1/jobs/{job_id}/stream"): "read",
     ("POST", "/api/v1/jobs/{job_id}/commit"): "admin",
+    # ADR 043 D1 — Failure Pattern Diagnoser (read-only diagnose phase).
+    ("POST", "/api/v1/agents/{name}/diagnose"): "eval",
+    ("GET", "/api/v1/diagnoses/{diagnosis_id}"): "read",
     # monitor (aggregate feed, ADR 032 D2) — the in-product report / metrics
     ("GET", "/api/v1/report"): "read",
     ("GET", "/api/v1/agents/{name}/metrics"): "read",
