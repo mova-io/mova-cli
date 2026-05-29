@@ -21,6 +21,7 @@ The upstream runtime is always mocked — no network.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
@@ -126,13 +127,19 @@ def _get(url: str, method: str = "GET") -> tuple[int, bytes, str]:
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 def test_command_is_registered_and_help_lists_flags() -> None:
-    result = runner.invoke(app, ["graph", "serve", "--help"])
+    # CI gotchas (same recipe as tests/test_playground_cmd.py): Rich renders the
+    # options panel too narrow in CI's non-TTY terminal (flag names wrap/elide)
+    # and styles `--`/flag-name as separate ANSI spans under FORCE_COLOR=1. Force
+    # a wide terminal, strip ANSI, then collapse whitespace so each flag flattens
+    # to a single searchable substring.
+    result = runner.invoke(app, ["graph", "serve", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    out = result.stdout
-    assert "--target" in out
-    assert "--project" in out
-    assert "--port" in out
-    assert "--no-open" in out
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.stdout)
+    plain = " ".join(plain.split())
+    assert "--target" in plain
+    assert "--project" in plain
+    assert "--port" in plain
+    assert "--no-open" in plain
 
 
 @pytest.mark.unit
