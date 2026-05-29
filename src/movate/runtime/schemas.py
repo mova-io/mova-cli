@@ -3677,6 +3677,14 @@ class GraphQueryRequest(BaseModel):
     limit: int | None = Field(
         default=None, ge=1, description="Node/edge budget; capped server-side at 5000."
     )
+    project_id: str | None = Field(
+        default=None,
+        description=(
+            "ADR 046 D1 project-scope filter. When set, the traverse is "
+            "bounded to nodes/edges tagged with this project_id; omit for "
+            "the full per-agent graph (backward-compatible)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

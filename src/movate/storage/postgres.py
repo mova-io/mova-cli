@@ -499,6 +499,21 @@ CREATE INDEX IF NOT EXISTS idx_kb_relations_src
 CREATE INDEX IF NOT EXISTS idx_kb_relations_dst
     ON kb_relations(agent, tenant_id, dst_entity_id);
 
+-- ADR 046 D1: project-scope the knowledge graph. Additive nullable column
+-- on both graph tables (ADD COLUMN IF NOT EXISTS — idempotent) so the
+-- viewer / query API can window a subgraph at the PROJECT grain across an
+-- agent's KBs, not only per agent. Pre-migration rows + project-less
+-- ingests carry NULL → absent from a project-filtered query, fully visible
+-- in the unfiltered per-agent view. Backward-compatible by construction.
+-- Partial indexes keep project-filtered scans cheap without bloating the
+-- common NULL case.
+ALTER TABLE kb_entities ADD COLUMN IF NOT EXISTS project_id TEXT;
+ALTER TABLE kb_relations ADD COLUMN IF NOT EXISTS project_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_kb_entities_project
+    ON kb_entities(agent, tenant_id, project_id) WHERE project_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_kb_relations_project
+    ON kb_relations(agent, tenant_id, project_id) WHERE project_id IS NOT NULL;
+
 -- ADR 014 D1: durable agent registry. One immutable row per published
 -- (name, version) bundle, tenant-scoped; the ``files`` map is JSONB (same
 -- strategy as bench.models / workflow_runs.initial_state). Additive new
@@ -4053,12 +4068,13 @@ class PostgresProvider:
         await self._db.execute(
             """
             INSERT INTO kb_entities (
-                entity_id, tenant_id, agent, name, type, description,
+                entity_id, tenant_id, agent, project_id, name, type, description,
                 embedding, embedding_model, content_hash, source_chunk_ids,
                 metadata, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
-                SET name = EXCLUDED.name,
+                SET project_id = COALESCE(EXCLUDED.project_id, kb_entities.project_id),
+                    name = EXCLUDED.name,
                     type = EXCLUDED.type,
                     description = EXCLUDED.description,
                     embedding = EXCLUDED.embedding,
@@ -4069,6 +4085,7 @@ class PostgresProvider:
             entity.entity_id,
             entity.tenant_id,
             entity.agent,
+            entity.project_id,
             entity.name,
             entity.type,
             entity.description,
@@ -4092,12 +4109,13 @@ class PostgresProvider:
         await self._db.execute(
             """
             INSERT INTO kb_relations (
-                relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                type, description, weight, content_hash, source_chunk_ids,
-                metadata, created_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                relation_id, tenant_id, agent, project_id, src_entity_id,
+                dst_entity_id, type, description, weight, content_hash,
+                source_chunk_ids, metadata, created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (agent, tenant_id, content_hash) DO UPDATE
-                SET src_entity_id = EXCLUDED.src_entity_id,
+                SET project_id = COALESCE(EXCLUDED.project_id, kb_relations.project_id),
+                    src_entity_id = EXCLUDED.src_entity_id,
                     dst_entity_id = EXCLUDED.dst_entity_id,
                     type = EXCLUDED.type,
                     description = EXCLUDED.description,
@@ -4108,6 +4126,7 @@ class PostgresProvider:
             relation.relation_id,
             relation.tenant_id,
             relation.agent,
+            relation.project_id,
             relation.src_entity_id,
             relation.dst_entity_id,
             relation.type,
@@ -4126,18 +4145,23 @@ class PostgresProvider:
         tenant_id: str,
         query_embedding: list[float],
         limit: int = 10,
+        project_id: str | None = None,
     ) -> list[EntityWithScore]:
         # No pgvector yet — load matching entities and rank in Python,
         # same primitive (and future swap point) as search_kb_chunks.
+        # ``project_id`` (None = no filter) appended as $3 only when set.
+        proj_clause = "" if project_id is None else " AND project_id = $3"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rows = await self._db.fetch(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
-            FROM kb_entities WHERE agent = $1 AND tenant_id = $2
+            FROM kb_entities WHERE agent = $1 AND tenant_id = $2{proj_clause}
             """,
             agent,
             tenant_id,
+            *proj_args,
         )
         from movate.storage._cosine import rank_entities_by_cosine  # noqa: PLC0415
 
@@ -4151,14 +4175,20 @@ class PostgresProvider:
         entity_ids: list[str],
         hops: int = 1,
         limit: int = 50,
+        project_id: str | None = None,
     ) -> Subgraph:
         if not entity_ids:
             return Subgraph(entities=[], relations=[])
+        # Optional project filter — None means "no filter" (per-agent view,
+        # the historical behavior). When set, only project-tagged rows
+        # participate, keeping the traversal inside the project subgraph.
         # Recursive CTE: bounded k-hop reachability from the seeds.
         # Undirected for reachability; UNION dedups so cycles terminate,
         # depth < hops bounds the walk.
+        cte_proj = "" if project_id is None else " AND r.project_id = $5"
+        cte_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         reach_rows = await self._db.fetch(
-            """
+            f"""
             WITH RECURSIVE reachable(eid, depth) AS (
                 SELECT e, 0 FROM unnest($1::text[]) AS e
               UNION
@@ -4168,7 +4198,7 @@ class PostgresProvider:
                 FROM kb_relations r
                 JOIN reachable
                   ON (r.src_entity_id = reachable.eid OR r.dst_entity_id = reachable.eid)
-                WHERE reachable.depth < $2 AND r.agent = $3 AND r.tenant_id = $4
+                WHERE reachable.depth < $2 AND r.agent = $3 AND r.tenant_id = $4{cte_proj}
             )
             SELECT DISTINCT eid FROM reachable
             """,
@@ -4176,41 +4206,48 @@ class PostgresProvider:
             int(hops),
             agent,
             tenant_id,
+            *cte_args,
         )
         reachable = [r["eid"] for r in reach_rows]
         if not reachable:
             return Subgraph(entities=[], relations=[])
+        rel_proj = "" if project_id is None else " AND project_id = $5"
+        rel_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rel_rows = await self._db.fetch(
-            """
-            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                   type, description, weight, content_hash, source_chunk_ids,
-                   metadata, created_at
+            f"""
+            SELECT relation_id, tenant_id, agent, project_id, src_entity_id,
+                   dst_entity_id, type, description, weight, content_hash,
+                   source_chunk_ids, metadata, created_at
             FROM kb_relations
             WHERE agent = $1 AND tenant_id = $2
-              AND src_entity_id = ANY($3::text[]) AND dst_entity_id = ANY($3::text[])
+              AND src_entity_id = ANY($3::text[]) AND dst_entity_id = ANY($3::text[]){rel_proj}
             ORDER BY weight DESC, relation_id LIMIT $4
             """,
             agent,
             tenant_id,
             reachable,
             int(limit),
+            *rel_args,
         )
         relations = [_row_to_relation(r) for r in rel_rows]
         keep = set(entity_ids)
         for rel in relations:
             keep.add(rel.src_entity_id)
             keep.add(rel.dst_entity_id)
+        ent_proj = "" if project_id is None else " AND project_id = $4"
+        ent_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         ent_rows = await self._db.fetch(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
             FROM kb_entities
-            WHERE agent = $1 AND tenant_id = $2 AND entity_id = ANY($3::text[])
+            WHERE agent = $1 AND tenant_id = $2 AND entity_id = ANY($3::text[]){ent_proj}
             """,
             agent,
             tenant_id,
             list(keep),
+            *ent_args,
         )
         return Subgraph(
             entities=[_row_to_entity(r) for r in ent_rows],
@@ -4220,7 +4257,7 @@ class PostgresProvider:
     async def get_entity(self, entity_id: str, *, tenant_id: str) -> Entity | None:
         row = await self._db.fetchrow(
             """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
             FROM kb_entities WHERE entity_id = $1 AND tenant_id = $2
@@ -4237,18 +4274,22 @@ class PostgresProvider:
         tenant_id: str,
         source_chunk_id: str | None = None,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Entity]:
+        proj_clause = "" if project_id is None else " AND project_id = $4"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rows = await self._db.fetch(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
-            FROM kb_entities WHERE agent = $1 AND tenant_id = $2
+            FROM kb_entities WHERE agent = $1 AND tenant_id = $2{proj_clause}
             ORDER BY created_at DESC LIMIT $3
             """,
             agent,
             tenant_id,
             int(limit),
+            *proj_args,
         )
         entities = [_row_to_entity(r) for r in rows]
         if source_chunk_id is not None:
@@ -4261,18 +4302,22 @@ class PostgresProvider:
         agent: str,
         tenant_id: str,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Relation]:
+        proj_clause = "" if project_id is None else " AND project_id = $4"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         rows = await self._db.fetch(
-            """
-            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                   type, description, weight, content_hash, source_chunk_ids,
-                   metadata, created_at
-            FROM kb_relations WHERE agent = $1 AND tenant_id = $2
+            f"""
+            SELECT relation_id, tenant_id, agent, project_id, src_entity_id,
+                   dst_entity_id, type, description, weight, content_hash,
+                   source_chunk_ids, metadata, created_at
+            FROM kb_relations WHERE agent = $1 AND tenant_id = $2{proj_clause}
             ORDER BY created_at DESC LIMIT $3
             """,
             agent,
             tenant_id,
             int(limit),
+            *proj_args,
         )
         return [_row_to_relation(r) for r in rows]
 
@@ -5298,6 +5343,7 @@ def _row_to_entity(row: asyncpg.Record) -> Entity:
         entity_id=row_dict["entity_id"],
         tenant_id=row_dict["tenant_id"],
         agent=row_dict["agent"],
+        project_id=row_dict.get("project_id"),
         name=row_dict["name"],
         type=row_dict["type"],
         description=row_dict.get("description"),
@@ -5316,6 +5362,7 @@ def _row_to_relation(row: asyncpg.Record) -> Relation:
         relation_id=row_dict["relation_id"],
         tenant_id=row_dict["tenant_id"],
         agent=row_dict["agent"],
+        project_id=row_dict.get("project_id"),
         src_entity_id=row_dict["src_entity_id"],
         dst_entity_id=row_dict["dst_entity_id"],
         type=row_dict["type"],

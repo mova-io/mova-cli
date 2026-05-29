@@ -739,6 +739,78 @@ class AgentMetadata(BaseModel):
         return v
 
 
+class GraphRetrievalConfig(BaseModel):
+    """GraphRAG retrieval settings — the ``retrieval.graph`` block.
+
+    Surfaces ADR 010's already-built-but-unwired graph retrieval
+    (``kb.graph_retrieval.graph_retrieve``) into agent config, completing
+    ADR 046 D9. **Opt-in + additive**: with ``enabled`` False (the
+    default — i.e. no ``retrieval.graph`` block in ``agent.yaml``) the
+    retrieval path is byte-for-byte unchanged and no graph lookup runs.
+
+    When enabled, the ``kb-vector-lookup`` skill — *in addition to* its
+    vector chunk search — seeds the agent's knowledge graph by entity
+    vector search, expands a bounded neighborhood, and appends the
+    rendered relation context as an extra grounding block. It
+    **complements** vector retrieval (ADR 010 D4), never replaces it. The
+    lookup stays behind the ``StorageProvider`` Protocol
+    (``search_entities`` + ``expand_neighbors``) — no backend is hardcoded
+    (CLAUDE.md rule 6/7).
+
+    Example ``agent.yaml``::
+
+        retrieval:
+          graph:
+            enabled: true
+            hops: 2
+            max_relations: 50
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for GraphRAG retrieval. False (default) → no "
+            "graph lookup runs and the retrieval path is unchanged. True "
+            "→ the kb-vector-lookup skill ALSO retrieves graph-neighbor "
+            "context (entities + relations) alongside vector chunks."
+        ),
+    )
+    seed_limit: int = Field(
+        default=5,
+        ge=1,
+        le=25,
+        description=(
+            "How many entities the query vector seeds the neighborhood "
+            "expansion with (clamped at retrieval time to "
+            ":data:`movate.kb.graph_retrieval.MAX_SEED_LIMIT`)."
+        ),
+    )
+    hops: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description=(
+            "Bounded k-hop neighborhood expansion from the seed entities "
+            "(ADR 010 ``expand_neighbors``). Higher = more relational "
+            "context + more tokens. Clamped at retrieval time to "
+            ":data:`movate.kb.graph_retrieval.MAX_HOPS`."
+        ),
+    )
+    max_relations: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description=(
+            "Cap on relations pulled into the graph context — the budget "
+            "guard against a hub entity blowing up the prompt. Clamped at "
+            "retrieval time to "
+            ":data:`movate.kb.graph_retrieval.MAX_RELATIONS`."
+        ),
+    )
+
+
 class RetrievalConfig(BaseModel):
     """KB retrieval pipeline configuration for an agent's
     ``kb-vector-lookup`` skill.
@@ -884,6 +956,22 @@ class RetrievalConfig(BaseModel):
         ),
     )
 
+    # ---- ADR 010 / 046 D9: opt-in GraphRAG retrieval ----
+    # Orthogonal to the vector-pipeline-tuning fields above. With no
+    # ``graph`` block (the default), ``graph.enabled`` is False and no
+    # graph lookup runs — the retrieval path is byte-for-byte unchanged.
+
+    graph: GraphRetrievalConfig = Field(
+        default_factory=GraphRetrievalConfig,
+        description=(
+            "GraphRAG retrieval (ADR 010 / 046 D9). Opt-in via "
+            "``graph.enabled: true``; default is all-off so the retrieval "
+            "path is unchanged. When enabled, kb-vector-lookup ALSO "
+            "retrieves graph-neighbor context behind the StorageProvider "
+            "Protocol, complementing vector chunks."
+        ),
+    )
+
     # ---- ADR 023: opt-in declarative pre-retrieval (auto-RAG) ----
     # These fields configure the Executor's pre-retrieval phase — a
     # deterministic "fetch grounding for me before the model sees the
@@ -991,6 +1079,7 @@ class RetrievalConfig(BaseModel):
             and self.history_turns is None
             and self.history_char_budget is None
             and not self.history_summarize
+            and not self.graph.enabled
         )
 
 
@@ -3157,6 +3246,15 @@ class Entity(BaseModel):
     """Which agent's KB graph this entity belongs to. One graph per agent,
     matching the one-KB-per-agent model."""
 
+    project_id: str | None = None
+    """Project (ADR 040) this node belongs to, for project-grain scoping
+    of the graph viewer / query API (ADR 046 D1). **Additive + nullable**:
+    nodes written before this column existed (and ingests with no project
+    context) carry ``None`` and are simply absent from a project-filtered
+    query — they remain fully visible in the unfiltered (per-agent) view,
+    so the default behavior is byte-for-byte unchanged. Never part of the
+    dedup key (re-ingesting under a project backfills the column in place)."""
+
     name: str
     """Canonical surface form of the entity (e.g. ``"SAML SSO"``). The
     extraction pipeline normalizes aliases to one canonical name so the
@@ -3220,6 +3318,15 @@ class Relation(BaseModel):
 
     agent: str
     """Which agent's KB graph this edge belongs to."""
+
+    project_id: str | None = None
+    """Project (ADR 040) this edge belongs to — mirrors
+    :attr:`Entity.project_id`. **Additive + nullable**: pre-existing rows
+    and project-less ingests carry ``None`` and drop out of a
+    project-filtered query while staying visible in the unfiltered view.
+    An edge never crosses a tenant boundary (ADR 046 D10); ``project_id``
+    is a scoping/visibility tag, not a second tenancy axis. Never part of
+    the dedup key."""
 
     src_entity_id: str
     """``Entity.entity_id`` of the edge's source (tail) node."""

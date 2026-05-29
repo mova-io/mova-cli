@@ -209,3 +209,42 @@ async def test_content_hash_is_scoped_and_stable():
     # Re-running with the same scope is stable (idempotent upsert key).
     e1b, _ = await extract_graph(chunks, agent="a1", tenant_id="t1", complete_fn=responder)
     assert e1[0].content_hash == e1b[0].content_hash
+
+
+async def test_extract_tags_project_id_when_given():
+    """ADR 046 D1 — ``project_id`` is stamped on every extracted node/edge
+    but is NOT part of the dedup hash (so re-ingest under a project
+    backfills in place)."""
+    chunks = [_chunk("c1", "MARKER_A: sso requires the enterprise tier")]
+    responder = _responder(
+        {
+            "MARKER_A": {
+                "entities": [
+                    {"name": "SAML SSO", "type": "Feature", "description": "SSO."},
+                    {"name": "Enterprise Tier", "type": "Tier", "description": "Top plan."},
+                ],
+                "relations": [
+                    {"src": "SAML SSO", "dst": "Enterprise Tier", "type": "REQUIRES", "weight": 0.9}
+                ],
+            }
+        }
+    )
+    entities, relations = await extract_graph(
+        chunks, agent="a1", tenant_id="t1", complete_fn=responder, project_id="proj-42"
+    )
+    assert entities and all(e.project_id == "proj-42" for e in entities)
+    assert relations and all(r.project_id == "proj-42" for r in relations)
+    # content_hash unchanged vs. the project-less extraction (not in dedup key).
+    project_less, _ = await extract_graph(chunks, agent="a1", tenant_id="t1", complete_fn=responder)
+    by_name = {e.name: e for e in project_less}
+    for e in entities:
+        assert e.content_hash == by_name[e.name].content_hash
+
+
+async def test_extract_project_id_defaults_none():
+    chunks = [_chunk("c1", "MARKER_A")]
+    responder = _responder(
+        {"MARKER_A": {"entities": [{"name": "X", "type": "Y", "description": ""}], "relations": []}}
+    )
+    entities, _ = await extract_graph(chunks, agent="a1", tenant_id="t1", complete_fn=responder)
+    assert entities[0].project_id is None
