@@ -2896,3 +2896,175 @@ class AgentMetricsView(BaseModel):
             rollup=rollup_view,
             top_failing_cases=[FailingCaseView.from_dataclass(c) for c in report.top_failing_cases],
         )
+
+
+# ---------------------------------------------------------------------------
+# Agent catalog (ADR 041) — wire types for /api/v1/catalog/...
+#
+# Three namespaces (movate / private / community) share one read API. The
+# view types are flat / additive — new optional fields can land without a
+# version bump (ADR 041 Resolved decision #3).
+# ---------------------------------------------------------------------------
+
+
+class CatalogRatingsSummaryView(BaseModel):
+    """Aggregate of all ratings for a catalog entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = 0
+    avg: float = 0.0
+
+
+class CatalogEntryView(BaseModel):
+    """Catalog-card payload for one entry.
+
+    ``source`` carries the namespace; ``tenant_id`` is ``None`` for public
+    namespaces (``movate`` / ``community``). The bundle bytes are NOT
+    inlined — fetch a specific version via
+    ``/api/v1/catalog/agents/{slug}/versions/{ver}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    source: str
+    tenant_id: str | None = None
+    latest_version: str
+    name: str
+    title: str
+    description: str
+    tags: list[str] = Field(default_factory=list)
+    shape: str | None = None
+    recommended_for: str | None = None
+    ratings_summary: CatalogRatingsSummaryView = Field(default_factory=CatalogRatingsSummaryView)
+    popularity: int = 0
+    synced_at: str
+
+
+class CatalogEntryDetailView(CatalogEntryView):
+    """Detail view — same shape as the list view today plus a guard for
+    forward-compat fields (e.g. the latest version's digest) without
+    forcing the list path to grow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    latest_version_digest: str | None = None
+    """SHA-256 hex of the latest version's bundle, when available."""
+
+
+class CatalogEntryListResponse(BaseModel):
+    """List view envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[CatalogEntryView]
+    count: int
+    next_after_slug: str | None = None
+    """The slug to pass back as ``?after_slug=`` for the next page.
+    ``None`` when the caller has reached the end (the page returned fewer
+    rows than ``limit``)."""
+
+
+class CatalogEntryVersionView(BaseModel):
+    """One version of a catalog entry. ``bundle_tar`` is base64-encoded
+    on the wire (HTTP/JSON has no native bytes)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str
+    source: str
+    tenant_id: str | None = None
+    version: str
+    digest: str
+    published_at: str
+    deprecated_at: str | None = None
+    bundle_tar_b64: str | None = None
+    """Base64-encoded bundle bytes. Inlined ONLY on the
+    ``/versions/{ver}`` endpoint where the caller asked for it; the
+    list-versions endpoint omits it to keep the response small."""
+
+
+class CatalogSubmitRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/agents`` — create a tenant-private
+    entry. Server forces ``source='private'`` and
+    ``tenant_id=caller_tenant`` regardless of any client-supplied value
+    (ADR 041 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list)
+    shape: str | None = None
+    recommended_for: str | None = None
+    version: str = Field(default="0.1.0")
+    bundle_tar_b64: str = Field(
+        ...,
+        description="Base64-encoded tar of the entry bundle.",
+    )
+
+
+class CatalogPublishVersionRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/agents/{slug}/versions`` — publish a
+    new version of an existing tenant-private entry (ADR 041 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(min_length=1)
+    bundle_tar_b64: str = Field(...)
+
+
+class CatalogRatingRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/agents/{slug}/ratings`` — record a
+    rating against a catalog entry. ``source`` defaults to ``movate`` (the
+    common path); pass ``private`` to rate an internal entry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = None
+    source: str = "movate"
+
+
+class CatalogSyncRequest(BaseModel):
+    """Body for ``POST /api/v1/catalog/sync`` — trigger a sync.
+
+    ``source`` MUST be ``movate`` for v1 (the only namespace that has an
+    upstream service to sync from). Sending ``private`` is a 400; sending
+    ``community`` is a 501 (the namespace is column-ready but disabled —
+    ADR 041 D7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = "movate"
+
+
+class CatalogSyncResponse(BaseModel):
+    """Sync stub response.
+
+    v1 returns 202 + ``status='stub'`` + the bumped watermark; the
+    production wiring against ``catalog.movate.io`` will swap in behind
+    this same contract (ADR 041 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    status: str
+    """One of:
+
+    * ``"stub"`` — the v1 stub ran (logged + watermark bumped, no upstream
+      fetch).
+    * ``"synced"`` — reserved for the production handler that will replace
+      the stub.
+    """
+    watermark: str
+    """ISO 8601 timestamp of the watermark AFTER this call. Production will
+    set this to the latest entry's ``synced_at`` rather than ``now()``;
+    the v1 stub uses ``now()``."""
+    detail: str
+    """Human note explaining the response. The v1 stub returns a fixed
+    string describing the missing upstream wiring (so an operator running
+    the endpoint by hand sees what's happening)."""

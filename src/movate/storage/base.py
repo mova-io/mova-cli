@@ -34,6 +34,10 @@ from movate.core.models import (
     BatchRecord,
     BenchRecord,
     CanaryConfig,
+    CatalogEntry,
+    CatalogEntryVersion,
+    CatalogRatingsSummary,
+    CatalogSource,
     ConversationThread,
     Entity,
     EntityWithScore,
@@ -1267,6 +1271,166 @@ class StorageProvider(Protocol):
         trace to chunks from that source URI (the per-source re-ingest
         workflow, mirroring :meth:`delete_kb_chunks`). Returns the total
         rows deleted (entities + relations)."""
+
+    # ------------------------------------------------------------------
+    # Agent catalog (ADR 041) — manifest + version table + ratings + sync
+    # watermark. Three namespaces (movate / private / community) share one
+    # schema, distinguished by ``source``. Public namespaces use
+    # ``tenant_id=None``; ``private`` requires a tenant. The read API joins
+    # ``movate`` + the caller's ``private`` + (later) ``community``.
+    # ------------------------------------------------------------------
+
+    async def upsert_catalog_entry(self, entry: CatalogEntry) -> None:
+        """Insert-or-update one catalog entry keyed by
+        ``(slug, source, tenant_id)``.
+
+        Used by both the sync job (writing ``source='movate'`` rows with
+        ``tenant_id=None``) and tenant-private submissions (writing
+        ``source='private'`` rows with the owning ``tenant_id``). Re-upsert
+        refreshes ``latest_version`` / ``title`` / ``description`` / ``tags`` /
+        ``shape`` / ``recommended_for`` / ``ratings_summary`` / ``popularity``
+        and stamps ``synced_at`` — the "last write wins" contract every other
+        upsert in this Protocol uses.
+
+        Storage MUST enforce that ``tenant_id IS NOT NULL`` iff
+        ``source = 'private'`` so the namespace invariant lives at the DB
+        layer, not just the API layer.
+        """
+
+    async def get_catalog_entry(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> CatalogEntry | None:
+        """Exact lookup by ``(slug, source, tenant_id)``.
+
+        For ``private`` queries, ``tenant_id`` MUST be provided; passing
+        ``None`` for ``private`` returns ``None`` (no implicit cross-tenant
+        read). For ``movate`` / ``community`` the lookup ignores
+        ``tenant_id`` because those rows have ``tenant_id = NULL`` server-
+        side. Returns ``None`` when nothing matches — same no-leak contract
+        as the other ``get_*`` methods.
+        """
+
+    async def list_catalog_entries(
+        self,
+        tenant_id: str,
+        *,
+        source_filter: CatalogSource | None = None,
+        tag_filter: str | None = None,
+        shape_filter: str | None = None,
+        q: str | None = None,
+        limit: int = 100,
+        after_slug: str | None = None,
+    ) -> list[CatalogEntry]:
+        """List catalog entries the caller is allowed to see, with filters.
+
+        The visibility join is always:
+
+        * every ``movate`` entry,
+        * every ``private`` entry where ``tenant_id == caller``,
+        * every ``community`` entry (column-ready; v1 returns no community
+          rows because no writes are accepted).
+
+        ``source_filter`` narrows to ONE namespace (still tenant-scoped for
+        ``private``); ``tag_filter`` requires a single tag membership;
+        ``shape_filter`` is exact; ``q`` is a case-insensitive substring
+        match over ``name`` / ``title`` / ``description``. Pagination is by
+        slug cursor: ``after_slug`` returns entries whose slug sorts after
+        the cursor — stable on every backend without a numeric offset.
+        """
+
+    async def get_catalog_entry_versions(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        tenant_id: str | None = None,
+    ) -> list[CatalogEntryVersion]:
+        """List every version of one catalog entry, newest-first.
+
+        ``tenant_id`` is required for ``private`` (see
+        :meth:`get_catalog_entry`) and ignored for public namespaces.
+        Returns ``[]`` when the entry doesn't exist or is cross-tenant
+        ``private``.
+
+        Carries ``bundle_tar`` in each row; callers that only need the
+        version metadata slice the field after this returns rather than
+        this Protocol maintaining a thin variant (same convention as
+        ``list_kb_chunks``).
+        """
+
+    async def get_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion | None:
+        """Fetch one specific version, including ``bundle_tar``.
+
+        Drives the download / clone path. ``None`` on a missing version OR
+        a cross-tenant ``private`` lookup — same no-leak contract.
+        """
+
+    async def upsert_catalog_entry_version(
+        self,
+        slug: str,
+        *,
+        source: CatalogSource,
+        version: str,
+        bundle_tar: bytes,
+        digest: str,
+        tenant_id: str | None = None,
+    ) -> CatalogEntryVersion:
+        """Insert-or-update one version row.
+
+        A version is logically immutable, but ``upsert`` is the right primitive
+        for an idempotent re-sync: re-fetching the same ``(slug, source,
+        version)`` overwrites ``bundle_tar`` + ``digest`` in place rather than
+        violating the PK. Returns the persisted record (including the storage-
+        stamped ``published_at`` on first insert).
+        """
+
+    async def record_catalog_rating(
+        self,
+        slug: str,
+        *,
+        tenant_id: str,
+        source: CatalogSource = CatalogSource.MOVATE,
+        rating: int,
+        comment: str | None = None,
+    ) -> CatalogRatingsSummary:
+        """Record one tenant's rating for one entry; return the rolled-up
+        summary.
+
+        PK ``(slug, source, tenant_id)`` — re-rating overwrites the prior
+        row (one rating per tenant per entry, last write wins). Updates the
+        entry's ``ratings_summary`` (``count`` + ``avg``) inside the same
+        transaction so a list view reads a consistent rollup without a
+        recompute.
+        """
+
+    async def get_catalog_sync_watermark(self, source: CatalogSource) -> datetime | None:
+        """Return the last sync timestamp for ``source``, or ``None`` if no
+        sync has run.
+
+        Used by the sync handler to request a delta
+        (``?since=<watermark>``) from ``catalog.movate.io``. v1's sync
+        stub still reads + advances the watermark so the production
+        wiring can flip on without changing the API shape.
+        """
+
+    async def set_catalog_sync_watermark(self, source: CatalogSource, ts: datetime) -> None:
+        """Upsert the watermark row for ``source``.
+
+        Last-write-wins. The sync handler stamps this AFTER persisting the
+        new rows, so a crash mid-sync leaves the watermark unchanged and the
+        next run replays — at-least-once. Idempotent upsert on every backend.
+        """
 
     # ------------------------------------------------------------------
     # DR backup/restore (item 26) — a portable logical snapshot of the

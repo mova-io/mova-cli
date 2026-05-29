@@ -60,6 +60,10 @@ _PG_TABLES = (
     "project_agents",
     "project_workflows",
     "project_kbs",
+    "catalog_entries",
+    "catalog_entry_versions",
+    "catalog_entry_ratings",
+    "catalog_sync_watermark",
 )
 
 
