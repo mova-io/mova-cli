@@ -25,6 +25,7 @@ import contextlib
 import hashlib
 import json
 import os
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -324,7 +325,12 @@ from movate.runtime.workflow_persistence import (
     unzip_bundle as unzip_workflow_bundle,
 )
 from movate.storage.base import StorageProvider
-from movate.tracing import inject_current_trace_context, record_audit_event
+from movate.tracing import (
+    dec_sse_connections,
+    inc_sse_connections,
+    inject_current_trace_context,
+    record_audit_event,
+)
 
 if TYPE_CHECKING:
     from movate.providers.model_catalog import ModelInfo
@@ -340,6 +346,179 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
     carry a one- or two-token ``text`` delta.
     """
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'), default=str)}\n\n"
+
+
+# ---------------------------------------------------------------------------
+# ADR 035 D3 — SSE event-stream tuning.
+#
+# The polling interval is the cost dial: at one query per active
+# connection per ``_EVENTS_SSE_POLL_INTERVAL_S`` we trade tail latency
+# (median push lag ≈ half the interval) for storage load (queries/sec ≈
+# active_connections / interval). 500ms keeps the perceived push lag
+# under ~half a second while costing two queries per active subscriber
+# per second — acceptable for D3 in front of an outbox that's read-light
+# vs. write-heavy. A Postgres ``LISTEN/NOTIFY`` upgrade is the documented
+# replacement when scale demands it.
+#
+# The heartbeat keeps proxies (Azure Front Door / App Gateway / nginx)
+# from closing an idle connection. 15s is well under the typical 30-60s
+# idle-timeout floor and small enough that a client's reconnect logic
+# kicks in quickly when the connection actually dies.
+#
+# The per-tenant connection cap is advisory: it prevents one runaway
+# client from owning every worker slot. 50 is a soft ceiling — well
+# above any expected legitimate fan-out (a single browser tab uses one)
+# and well below the uvicorn worker concurrency. Operators override via
+# ``MDK_EVENTS_SSE_MAX_PER_TENANT``.
+# ---------------------------------------------------------------------------
+_EVENTS_SSE_POLL_INTERVAL_S: float = 0.5
+_EVENTS_SSE_HEARTBEAT_INTERVAL_S: float = 15.0
+_EVENTS_SSE_MAX_PER_TENANT_DEFAULT: int = 50
+# Outbox page size for each storage poll (replay AND live). Bounded so a
+# long backlog doesn't materialise in memory all at once; matches the
+# ``list_events.limit`` cap the storage layer documents (1000). 100 hits
+# the sweet spot for a typical fan-out (a busy tenant sees < 100 events
+# between 500ms polls).
+_EVENTS_SSE_PAGE_SIZE: int = 100
+
+
+def _events_sse_max_per_tenant() -> int:
+    """Resolve the per-tenant connection cap from env, else the default.
+
+    Env wins (operator override at deploy-time); falls back to the
+    in-code default. A bad value (non-int / <=0) silently falls back so
+    a misconfigured deploy doesn't turn the cap off entirely.
+    """
+    raw = os.environ.get("MDK_EVENTS_SSE_MAX_PER_TENANT", "").strip()
+    if not raw:
+        return _EVENTS_SSE_MAX_PER_TENANT_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return _EVENTS_SSE_MAX_PER_TENANT_DEFAULT
+    return n if n > 0 else _EVENTS_SSE_MAX_PER_TENANT_DEFAULT
+
+
+def _events_sse_event_frame(view: EventView) -> str:
+    """Format one outbox-event SSE frame: ``id: <id>\\ndata: <json>\\n\\n``.
+
+    Single source of truth shared by the replay + live phases so a
+    rename of the wire shape can't drift between them. The ``id:`` line
+    is mandatory — it's what SSE clients echo back as ``Last-Event-ID``
+    on a reconnect to resume from the right cursor.
+    """
+    payload = view.model_dump(mode="json")
+    return f"id: {view.id}\ndata: {json.dumps(payload, separators=(',', ':'), default=str)}\n\n"
+
+
+async def _events_sse_generator(
+    *,
+    store: StorageProvider,
+    target_tenant: str,
+    kind: str | None,
+    subject: str | None,
+    since: datetime | None,
+    last_event_id: str | None,
+    poll_interval_s: float,
+    heartbeat_interval_s: float,
+    is_disconnected: Callable[[], Awaitable[bool]],
+) -> AsyncIterator[str]:
+    """Yield SSE frames from the events outbox until the client disconnects.
+
+    Extracted as a top-level async generator (not a closure inside the
+    endpoint) so unit tests can drive it directly with an injected
+    ``is_disconnected`` predicate — TestClient can't gracefully shut
+    down a long-poll SSE stream, but a direct-drive test can flip a flag
+    and assert the generator unwinds cleanly. Same code path runs in
+    production: the endpoint wraps this in a ``StreamingResponse``.
+
+    Behavior is the contract documented on the endpoint:
+
+    * **Replay** when ``since`` (timestamp) OR ``last_event_id`` (cursor)
+      is set — page through the outbox in 100-row batches, emit each
+      event, advance the cursor, then fall through to live mode.
+      ``last_event_id`` wins when both are set (id is exact).
+    * **Live** otherwise — snap a UTC-now anchor, poll the outbox every
+      ``poll_interval_s`` for newer events, emit them, advance the
+      cursor.
+    * **Heartbeat** — every ``heartbeat_interval_s`` (measured against
+      the wall clock between polls), emit a ``:keepalive\\n\\n`` SSE
+      comment line so idle proxies don't drop the connection.
+    * **Disconnect** — between iterations, the predicate is awaited;
+      ``True`` exits the generator cleanly. ``asyncio.CancelledError``
+      from the server-side cancel is re-raised after no extra work.
+
+    Tenant-scoping is the caller's responsibility (``target_tenant`` is
+    plumbed into every ``list_events`` call). ``tenant_id NOT NULL`` is
+    the storage-layer invariant.
+    """
+    # Replay cursor: prefer Last-Event-ID (id-keyed) over `since`
+    # (timestamp-keyed); id is exact, timestamps can tie.
+    after_id: str | None = last_event_id
+    replay_since: datetime | None = since if (since is not None and after_id is None) else None
+    # Live cursor: high-water mark on the last emitted id. Seeded from
+    # Last-Event-ID if present; initialised on the first live tick
+    # otherwise. ``live_since`` is the "events recorded after now"
+    # anchor when there's no id cursor yet.
+    live_after_id: str | None = after_id
+    live_since: datetime = datetime.now(UTC)
+
+    last_heartbeat = asyncio.get_event_loop().time()
+
+    try:
+        # ---- Phase 1: replay (skipped on the live-only path) ----
+        if replay_since is not None or after_id is not None:
+            while True:
+                if await is_disconnected():
+                    return
+                batch = await store.list_events(
+                    target_tenant,
+                    since=replay_since,
+                    kind=kind,
+                    subject=subject,
+                    limit=_EVENTS_SSE_PAGE_SIZE,
+                    after_id=after_id,
+                )
+                if not batch:
+                    break
+                for ev in batch:
+                    yield _events_sse_event_frame(EventView.from_record(ev))
+                    after_id = ev.id
+                    live_after_id = ev.id
+                # Less than a full page → backlog drained; flip to live.
+                if len(batch) < _EVENTS_SSE_PAGE_SIZE:
+                    break
+
+        # ---- Phase 2: live ----
+        while True:
+            if await is_disconnected():
+                return
+
+            # Heartbeat: SSE comment so idle proxies don't drop us.
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat >= heartbeat_interval_s:
+                yield ":keepalive\n\n"
+                last_heartbeat = now
+
+            batch = await store.list_events(
+                target_tenant,
+                since=None if live_after_id is not None else live_since,
+                kind=kind,
+                subject=subject,
+                limit=_EVENTS_SSE_PAGE_SIZE,
+                after_id=live_after_id,
+            )
+            for ev in batch:
+                yield _events_sse_event_frame(EventView.from_record(ev))
+                live_after_id = ev.id
+
+            # Cooperative sleep — keeps the loop free + lets the
+            # disconnect check + heartbeat tick at a predictable cadence.
+            await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        # Client disconnect / server shutdown — unwind cleanly. Re-raise
+        # so the ASGI server's cancellation contract is honored.
+        raise
 
 
 async def _sse_run_stream(
@@ -2066,7 +2245,6 @@ def build_app(
     # ``mdk serve`` without durable storage), and never raises (a seed
     # failure must not block the runtime from coming up — the FS fallback
     # still serves those agents).
-    from collections.abc import AsyncIterator  # noqa: PLC0415
     from contextlib import asynccontextmanager  # noqa: PLC0415
 
     @asynccontextmanager
@@ -2260,6 +2438,16 @@ def build_app(
     # a backend — unset → zero behavior change. In-process per-replica
     # in v1.x; shared backends slot in behind the CacheProvider later.
     app.state.llm_cache = build_cache()
+
+    # ADR 035 D3 — per-tenant SSE subscriber accounting. A simple
+    # ``{tenant_id: count}`` dict, lock-guarded for the increment/cap
+    # check + decrement edges so a burst of opens can't race past the
+    # ceiling. In-process per-replica (mirrors the rate-limiter
+    # lifecycle); cross-replica accounting is the same future Redis
+    # seam. Initialised here so the dict identity persists across
+    # requests for the replica's lifetime.
+    app.state.events_sse_connections = {}
+    app.state.events_sse_lock = asyncio.Lock()
 
     auth_dep = make_auth_dependency(
         storage, rate_limiter=limiter, tenant_rate_limiter=tenant_limiter
@@ -10244,6 +10432,232 @@ def build_app(
         )
         views = [WebhookAttemptView.from_record(r) for r in rows]
         return WebhookAttemptListView(attempts=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # GET /api/v1/events/stream — SSE event-stream (ADR 035 D3)
+    #
+    # Companion to ``GET /api/v1/events`` (D1's pull surface). Subscribers
+    # hold a long-lived HTTP connection; new events are pushed as they're
+    # recorded. Both endpoints read the SAME outbox — D2's webhook worker
+    # consumes it too — so emitters stay unchanged (the recorder is
+    # fire-and-forget and never knows about subscribers).
+    #
+    # D3 is the LOW-latency path; D2 webhooks are the durable+retried
+    # path. They coexist deliberately: a browser front end uses SSE for
+    # in-product realtime, a customer system uses webhooks for at-least-
+    # once delivery to its own systems.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/events/stream",
+        tags=["events-v1"],
+        dependencies=[_scope("read")],
+        # No response_model — raw SSE byte stream (text/event-stream),
+        # not a JSON body. OpenAPI documents the event shape in the
+        # docstring; the response content-type is declared via
+        # ``responses=`` below so the generated spec advertises it for
+        # client codegen.
+        responses={
+            200: {
+                "description": (
+                    "Live stream of lifecycle events as Server-Sent Events. Each frame is "
+                    "an ``EventView`` JSON object on a ``data:`` line; SSE comments "
+                    "(``:keepalive``) keep the connection open."
+                ),
+                "content": {"text/event-stream": {}},
+            },
+            503: {
+                "description": (
+                    "Per-tenant SSE connection cap reached (``MDK_EVENTS_SSE_MAX_PER_TENANT``)."
+                )
+            },
+        },
+    )
+    async def v1_events_stream(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        since: datetime | None = Query(
+            None,
+            description=(
+                "ISO-8601 lower bound on ``created_at`` (inclusive). When set, "
+                "the stream FIRST replays events recorded at-or-after this "
+                "timestamp, then goes live. Default: no replay — only new "
+                "events emitted while the connection is open are pushed."
+            ),
+        ),
+        kind: str | None = Query(
+            None,
+            description=(
+                "Filter to one event kind (e.g. ``run.completed``). Applies "
+                "to both the replay window and the live push loop."
+            ),
+        ),
+        subject: str | None = Query(
+            None,
+            description=(
+                "Filter to one subject (agent name / run id / etc.). "
+                "Exact match; applies to replay + live."
+            ),
+        ),
+        tenant: str | None = Query(
+            None,
+            description=(
+                "Operator override: stream events for a specific tenant. "
+                "Requires a ``fleet-admin`` key; ignored otherwise."
+            ),
+        ),
+        last_event_id: str | None = Header(
+            None,
+            alias="Last-Event-ID",
+            description=(
+                "SSE-standard resumption header. If set, the stream first "
+                "replays any events recorded AFTER the id (using it as the "
+                "outbox cursor), then goes live — so a reconnecting client "
+                "misses no events between the drop and the redial."
+            ),
+        ),
+    ) -> StreamingResponse:
+        """Stream lifecycle events as **Server-Sent Events** (ADR 035 D3).
+
+        Tenant-scoped by the caller's ``ctx.tenant_id``; a ``fleet-admin``
+        key may pass ``?tenant=<id>`` to subscribe to a different
+        tenant. Same auth / scoping shape as ``GET /api/v1/events``.
+
+        **Frame shape.** Each event is emitted as a single SSE frame:
+
+        ``id: <event_id>\\n``
+        ``data: <EventView JSON>\\n``
+        ``\\n``
+
+        The ``id:`` field is the event's outbox id; a reconnecting
+        client SHOULD send it back as the ``Last-Event-ID`` header to
+        resume without gaps. Heartbeats are SSE comments (``:keepalive``)
+        emitted every ~15s so intermediaries (Azure Front Door /
+        Application Gateway / nginx) don't close an idle connection.
+
+        **Replay semantics.** ``since`` (timestamp) or ``Last-Event-ID``
+        (cursor) trigger a one-shot replay of matching events before the
+        live loop starts. Without either, only events recorded AFTER the
+        connection opens are pushed (no backfill — matches the
+        front-end's "from now on" expectation).
+
+        **Polling cadence.** The handler polls the outbox every ~500ms
+        and advances its cursor by id. This is intentional — the
+        recorder is fire-and-forget and doesn't know about subscribers,
+        so D3 stays decoupled from emit. Postgres ``LISTEN/NOTIFY`` is
+        the documented upgrade path when scale demands it.
+
+        **Per-tenant cap.** Subscribers per tenant are capped (default
+        50, override ``MDK_EVENTS_SSE_MAX_PER_TENANT``) to prevent a
+        runaway client from owning the pool. A connection over the cap
+        is rejected with ``503``.
+
+        **Disconnect.** The async generator polls
+        ``request.is_disconnected()`` between iterations; a client TCP
+        drop unwinds the loop cleanly and the connection counter
+        decrements in the ``finally`` block — no leaked subscribers.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``read`` scope
+        * **503** — per-tenant connection cap reached
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # Tenant scope — fleet-admin may override; non-admin is silently
+        # locked to their own tenant (matches GET /api/v1/events).
+        target_tenant = ctx.tenant_id
+        if tenant is not None and "fleet-admin" in ctx.scopes:
+            target_tenant = tenant
+
+        # Resolve poll / heartbeat / cap from app.state (so tests can
+        # override) with module-default fall-throughs. Reading via
+        # getattr keeps the contract for build_app callers that haven't
+        # set these explicitly byte-identical.
+        poll_interval_s: float = getattr(
+            request.app.state, "events_sse_poll_interval_s", _EVENTS_SSE_POLL_INTERVAL_S
+        )
+        heartbeat_interval_s: float = getattr(
+            request.app.state,
+            "events_sse_heartbeat_interval_s",
+            _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
+        )
+        max_per_tenant: int = _events_sse_max_per_tenant()
+
+        # Per-tenant connection cap (advisory). Take the lock for the
+        # check + increment so a burst of concurrent opens can't race
+        # past the ceiling. The matching decrement runs in the
+        # generator's ``finally`` block below — guaranteed even on
+        # client disconnect.
+        connections: dict[str, int] = request.app.state.events_sse_connections
+        lock: asyncio.Lock = request.app.state.events_sse_lock
+        async with lock:
+            current = connections.get(target_tenant, 0)
+            if current >= max_per_tenant:
+                import logging  # noqa: PLC0415
+
+                logging.getLogger(__name__).warning(
+                    "events_sse_cap_exceeded tenant_id=%s active=%d cap=%d",
+                    target_tenant,
+                    current,
+                    max_per_tenant,
+                )
+                raise http_error(
+                    ErrorCode.INTERNAL,
+                    status_code=503,
+                    message=(
+                        f"events SSE connection cap reached for tenant "
+                        f"(active={current}, cap={max_per_tenant})"
+                    ),
+                )
+            connections[target_tenant] = current + 1
+
+        # OTel UpDownCounter — incremented on accept, decremented in the
+        # wrapper's finally so even a disconnect mid-loop drops it.
+        inc_sse_connections(tenant_id=target_tenant)
+
+        async def _streaming_wrapper() -> AsyncIterator[str]:
+            """Wrap the testable generator with the cap/metric finally.
+
+            The generator itself is :func:`_events_sse_generator` — a
+            top-level async generator unit-tested without the HTTP
+            transport. This wrapper layers in the per-tenant counter
+            decrement + OTel metric decrement on exit (which depend on
+            ``request.app.state`` and must run for ANY exit reason
+            including client disconnect)."""
+            try:
+                async for frame in _events_sse_generator(
+                    store=store,
+                    target_tenant=target_tenant,
+                    kind=kind,
+                    subject=subject,
+                    since=since,
+                    last_event_id=last_event_id,
+                    poll_interval_s=poll_interval_s,
+                    heartbeat_interval_s=heartbeat_interval_s,
+                    is_disconnected=request.is_disconnected,
+                ):
+                    yield frame
+            finally:
+                # ALWAYS run — happy exit, disconnect, or exception.
+                # A leak here turns the advisory cap into a fake
+                # ceiling within minutes.
+                async with lock:
+                    connections[target_tenant] = max(0, connections.get(target_tenant, 0) - 1)
+                dec_sse_connections(tenant_id=target_tenant)
+
+        return StreamingResponse(
+            _streaming_wrapper(),
+            media_type="text/event-stream",
+            headers={
+                # Defeat any intermediary buffering so events reach the
+                # client as they're emitted (matters behind nginx /
+                # Azure Front Door — mirrors the run-stream endpoint).
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     app.include_router(v1)
 

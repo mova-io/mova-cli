@@ -119,6 +119,8 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("PATCH", "/api/v1/webhooks/{webhook_id}"): "admin",
     ("DELETE", "/api/v1/webhooks/{webhook_id}"): "admin",
     ("GET", "/api/v1/webhooks/{webhook_id}/attempts"): "read",
+    # events — ADR 035 D3 SSE event stream (read-only push)
+    ("GET", "/api/v1/events/stream"): "read",
 }
 
 
