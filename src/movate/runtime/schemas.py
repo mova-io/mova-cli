@@ -18,6 +18,9 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from movate.core.models import (
+    AuditFinding,
+    AuditFindingSeverity,
+    AuditRecord,
     ConversationThread,
     ErrorInfo,
     FeedbackRecord,
@@ -4972,4 +4975,205 @@ class DiagnoseJobView(BaseModel):
             model=record.model,
             created_at=record.created_at,
             completed_at=record.completed_at,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Claude-orchestrated audit endpoints (POST /api/v1/agents/{name}/audit/from-llm
+# + POST /api/v1/projects/{id}/audit/from-llm). Read-only by construction; the
+# Auditor (movate.core.auditor) never mutates the agent registry.
+# ---------------------------------------------------------------------------
+
+
+class AuditRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/audit/from-llm`` request body.
+
+    All fields are optional — an empty body runs every category at the
+    default severity floor against the tenant's default model. The
+    ``categories`` field is validated against the auditor's open
+    vocabulary in :data:`movate.core.auditor.CATEGORIES` server-side;
+    unknown categories are silently dropped (logged at warning).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[str] | None = Field(
+        default=None,
+        description=(
+            "Categories to run. Default is all seven the auditor ships: "
+            "ambiguous_prompts, missing_eval_coverage, security_smells, "
+            "cost_outliers, kb_quality, schema_drift, model_choice."
+        ),
+    )
+    severity_floor: AuditFindingSeverity = Field(
+        default=AuditFindingSeverity.INFO,
+        description="Findings below this severity are filtered out before persistence.",
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Override the audit sub-agents' provider string (LiteLLM-style, "
+            "e.g. 'openai/gpt-4o-mini'). Defaults to the tenant's audit "
+            "model — currently 'openai/gpt-4o-mini'."
+        ),
+    )
+    budget_usd: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Server-side spend cap. ``0.0`` disables the cap. When the "
+            "running spend would exceed this, remaining categories are "
+            "skipped + the audit is marked ``partial=true``."
+        ),
+    )
+
+
+class AuditAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/audit/from-llm`` response (202).
+
+    Async by default — returns immediately with ``job_id`` + the URLs
+    the client polls (``status_url``) and streams progress from
+    (``stream_url``). The final findings live at
+    ``GET /api/v1/audits/{audit_id}`` once the job's ``result_run_id``
+    is populated.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: str = "queued"
+    status_url: str
+    """Pre-built ``GET /api/v1/jobs/{job_id}`` URL the client polls."""
+    stream_url: str
+    """Pre-built ``GET /api/v1/jobs/{job_id}/stream`` SSE URL for
+    incremental progress events. Audit-only — non-audit jobs do not
+    expose this endpoint."""
+
+
+class AuditFindingLocationView(BaseModel):
+    """Wire shape for :class:`movate.core.models.AuditFindingLocation`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    line: int | None = None
+    path: str | None = None
+    chunk_id: str | None = None
+
+
+class FindingView(BaseModel):
+    """Wire shape for one :class:`movate.core.models.AuditFinding`.
+
+    Mirrors :class:`AuditFinding`; kept separate so the wire and the
+    durable model can evolve independently (same convention as
+    :class:`JobView` vs :class:`JobRecord`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    category: str
+    severity: AuditFindingSeverity
+    agent_name: str
+    location: AuditFindingLocationView | None = None
+    title: str
+    description: str
+    suggestion: str
+    confidence: str = "medium"
+
+    @classmethod
+    def from_finding(cls, f: AuditFinding) -> FindingView:
+        loc: AuditFindingLocationView | None = None
+        if f.location is not None:
+            loc = AuditFindingLocationView(
+                kind=f.location.kind,
+                line=f.location.line,
+                path=f.location.path,
+                chunk_id=f.location.chunk_id,
+            )
+        return cls(
+            id=f.id,
+            category=f.category,
+            severity=f.severity,
+            agent_name=f.agent_name,
+            location=loc,
+            title=f.title,
+            description=f.description,
+            suggestion=f.suggestion,
+            confidence=f.confidence,
+        )
+
+
+class AuditSummaryView(BaseModel):
+    """Headline counts for one completed audit.
+
+    Both rollups are dicts (open key sets) so adding a new category or
+    severity doesn't require a schema bump on consumers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total_findings: int
+    by_category: dict[str, int]
+    by_severity: dict[str, int]
+
+
+class AuditScopeView(BaseModel):
+    """``{"type": "agent" | "project", "id": "..."}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    id: str
+
+
+class AuditJobView(BaseModel):
+    """``GET /api/v1/audits/{audit_id}`` response — the rich, completed view.
+
+    The standard ``GET /api/v1/jobs/{job_id}`` continues to return
+    :class:`JobView` (back-compat); this is the dedicated audit view a
+    completed audit's findings live on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = "audit"
+    audit_id: str
+    scope: AuditScopeView
+    status: str = "completed"
+    categories: list[str]
+    severity_floor: AuditFindingSeverity
+    model: str
+    budget_usd: float
+    findings: list[FindingView]
+    summary: AuditSummaryView
+    partial: bool = False
+    tokens_used: int = 0
+    cost_usd: float = 0.0
+
+    @classmethod
+    def from_record(cls, record: AuditRecord) -> AuditJobView:
+        by_category: dict[str, int] = {}
+        by_severity: dict[str, int] = {}
+        for f in record.findings:
+            by_category[f.category] = by_category.get(f.category, 0) + 1
+            by_severity[f.severity.value] = by_severity.get(f.severity.value, 0) + 1
+        return cls(
+            kind="audit",
+            audit_id=record.audit_id,
+            scope=AuditScopeView(type=record.scope_kind, id=record.scope_id),
+            status="completed",
+            categories=list(record.categories),
+            severity_floor=record.severity_floor,
+            model=record.model,
+            budget_usd=record.budget_usd,
+            findings=[FindingView.from_finding(f) for f in record.findings],
+            summary=AuditSummaryView(
+                total_findings=len(record.findings),
+                by_category=by_category,
+                by_severity=by_severity,
+            ),
+            partial=record.partial,
+            tokens_used=record.tokens_used,
+            cost_usd=record.cost_usd,
         )

@@ -24,6 +24,9 @@ from movate.core.models import (
     AgentBundleRecord,
     ApiKeyEnv,
     ApiKeyRecord,
+    AuditFinding,
+    AuditFindingSeverity,
+    AuditRecord,
     BatchRecord,
     BenchModelResult,
     BenchRecord,
@@ -1042,6 +1045,30 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_diagnoses_agent_created "
         "ON diagnoses(tenant_id, agent, created_at DESC)"
     ),
+    # Claude-orchestrated audit records (read-only audit pipeline). One
+    # immutable row per terminal audit, keyed by audit_id, tenant-scoped at
+    # the row level. ``findings`` + ``categories`` are JSON-encoded TEXT —
+    # same strategy as bench.models / workflow_runs.initial_state. Additive
+    # + idempotent (CREATE TABLE IF NOT EXISTS); no backfill needed.
+    """
+    CREATE TABLE IF NOT EXISTS audits (
+        audit_id        TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        scope_kind      TEXT NOT NULL,
+        scope_id        TEXT NOT NULL,
+        categories      TEXT NOT NULL,
+        severity_floor  TEXT NOT NULL,
+        model           TEXT NOT NULL,
+        budget_usd      REAL NOT NULL,
+        findings        TEXT NOT NULL,
+        partial         INTEGER NOT NULL DEFAULT 0,
+        tokens_used     INTEGER NOT NULL DEFAULT 0,
+        cost_usd        REAL NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_audits_scope_created "
+    "ON audits(tenant_id, scope_id, created_at DESC)",
 ]
 
 
@@ -1526,6 +1553,69 @@ class SqliteProvider:
         async with self._db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_row_to_bench(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Audit records (Claude-orchestrated read-only audit pipeline).
+    #
+    # One immutable row per terminal audit. Audit data is JSON-encoded
+    # (categories + findings) — same strategy as bench.models /
+    # workflow_runs.initial_state. Read-only on the application side:
+    # the audit pipeline NEVER calls save_agent_bundle / save_kb_chunk /
+    # save_eval; the only write it makes is here.
+    # ------------------------------------------------------------------
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        await self._db.execute(
+            "INSERT INTO audits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                a.audit_id,
+                a.tenant_id,
+                a.scope_kind,
+                a.scope_id,
+                json.dumps(a.categories),
+                a.severity_floor.value,
+                a.model,
+                a.budget_usd,
+                json.dumps([f.model_dump() for f in a.findings]),
+                1 if a.partial else 0,
+                a.tokens_used,
+                a.cost_usd,
+                a.created_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        async with self._db.execute(
+            "SELECT * FROM audits WHERE audit_id = ? AND tenant_id = ? LIMIT 1",
+            (audit_id, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_audit(row) if row else None
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(tenant_id)
+        if scope_id:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        sql = "SELECT * FROM audits"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_audit(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Eval schedules (ADR 016 D2)
@@ -4781,43 +4871,21 @@ def _row_to_project(row: aiosqlite.Row) -> Project:
     )
 
 
-def _row_to_project_member(row: aiosqlite.Row) -> ProjectMember:
-    return ProjectMember(
-        project_id=row["project_id"],
-        principal_id=row["principal_id"],
-        role=ProjectMemberRole(row["role"]),
-        added_by=row["added_by"],
-        added_at=datetime.fromisoformat(row["added_at"]),
-    )
-
-
-def _row_to_insight(row: aiosqlite.Row) -> ObservabilityInsight:
-    return ObservabilityInsight(
-        id=row["id"],
+def _row_to_audit(row: aiosqlite.Row) -> AuditRecord:
+    raw_findings = json.loads(row["findings"]) if row["findings"] else []
+    return AuditRecord(
+        audit_id=row["audit_id"],
         tenant_id=row["tenant_id"],
-        project_id=row["project_id"],
-        date=date.fromisoformat(row["date"]),
-        health_score=row["health_score"],
-        anomalies=json.loads(row["anomalies"]) if row["anomalies"] else [],
-        top_failures=json.loads(row["top_failures"]) if row["top_failures"] else [],
-        usage_rollup=json.loads(row["usage_rollup"]) if row["usage_rollup"] else {},
-        trends=json.loads(row["trends"]) if row["trends"] else {},
-        narrative_digest=row["narrative_digest"] or "",
-        created_at=datetime.fromisoformat(row["created_at"]),
-    )
-
-
-def _row_to_workflow_bundle(row: aiosqlite.Row) -> WorkflowBundleRecord:
-    # ADR 037 D1 — sqlite stores ``published`` as INTEGER (0/1); coerce to bool
-    # at the boundary so the Pydantic model carries the typed value.
-    return WorkflowBundleRecord(
-        name=row["name"],
-        tenant_id=row["tenant_id"],
-        version=row["version"],
-        created_by=row["created_by"],
-        content_hash=row["content_hash"],
-        files=json.loads(row["files"]),
-        published=bool(row["published"]),
+        scope_kind=row["scope_kind"],
+        scope_id=row["scope_id"],
+        categories=json.loads(row["categories"]) if row["categories"] else [],
+        severity_floor=AuditFindingSeverity(row["severity_floor"]),
+        model=row["model"],
+        budget_usd=float(row["budget_usd"]),
+        findings=[AuditFinding.model_validate(f) for f in raw_findings],
+        partial=bool(row["partial"]),
+        tokens_used=int(row["tokens_used"]),
+        cost_usd=float(row["cost_usd"]),
         created_at=datetime.fromisoformat(row["created_at"]),
     )
 

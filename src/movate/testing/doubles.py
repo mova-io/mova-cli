@@ -20,6 +20,7 @@ from movate.core.models import (
     _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
     ApiKeyRecord,
+    AuditRecord,
     BatchRecord,
     BenchRecord,
     CanaryConfig,
@@ -153,6 +154,9 @@ class InMemoryStorage:
         # task can transition a row from ``running`` to ``completed``
         # without a separate update method.
         self.diagnoses: dict[str, DiagnosisRecord] = {}
+        # Claude-orchestrated audit records (read-only audit pipeline).
+        # Empty by default — populated only when an audit job completes.
+        self.audits: list[AuditRecord] = []
 
     async def init(self) -> None:
         return None
@@ -174,6 +178,29 @@ class InMemoryStorage:
 
     async def save_bench(self, b: BenchRecord) -> None:
         self.bench.append(b)
+
+    async def save_audit(self, a: AuditRecord) -> None:
+        self.audits.append(a)
+
+    async def get_audit(self, audit_id: str, *, tenant_id: str) -> AuditRecord | None:
+        return next(
+            (au for au in self.audits if au.audit_id == audit_id and au.tenant_id == tenant_id),
+            None,
+        )
+
+    async def list_audits(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_id: str | None = None,
+        limit: int = 20,
+    ) -> list[AuditRecord]:
+        rows = self.audits
+        if tenant_id is not None:
+            rows = [a for a in rows if a.tenant_id == tenant_id]
+        if scope_id:
+            rows = [a for a in rows if a.scope_id == scope_id]
+        return sorted(rows, key=lambda a: a.created_at, reverse=True)[:limit]
 
     async def save_workflow_run(self, w: WorkflowRunRecord) -> None:
         # Upsert on workflow_run_id (the PRIMARY KEY in sqlite/postgres). A
