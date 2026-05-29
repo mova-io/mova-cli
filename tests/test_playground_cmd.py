@@ -103,6 +103,11 @@ def test_help_lists_new_flags() -> None:
     assert "--persist-uploads" in help_text
 
 
+def test_help_lists_voice_flag() -> None:
+    """The opt-in voice-mode flag is part of the help contract."""
+    assert "--voice" in _help_text()
+
+
 def test_help_lists_target_flags() -> None:
     """The multi-target opt-in/opt-out flags are part of the help contract."""
     help_text = _help_text()
@@ -215,6 +220,24 @@ def test_no_history_flag_sets_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0
     assert captured_env.get("MDK_PLAYGROUND_NO_HISTORY") == "1"
     assert captured_env.get("MDK_PLAYGROUND_PERSIST_UPLOADS") == "1"
+
+
+def test_voice_flag_sets_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--voice exports MDK_PLAYGROUND_VOICE=1 to the child process env."""
+    captured_env = _stub_launch(monkeypatch)
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+    result = runner.invoke(app, [*_SERVE, "--voice", "--headless"])
+    assert result.exit_code == 0
+    assert captured_env.get("MDK_PLAYGROUND_VOICE") == "1"
+
+
+def test_voice_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default launch (no --voice) never sets the voice env var — text only."""
+    captured_env = _stub_launch(monkeypatch)
+    monkeypatch.setattr(playground.err, "print", lambda *a, **k: None)
+    result = runner.invoke(app, [*_SERVE, "--headless"])
+    assert result.exit_code == 0
+    assert "MDK_PLAYGROUND_VOICE" not in captured_env
 
 
 # ---------------------------------------------------------------------------

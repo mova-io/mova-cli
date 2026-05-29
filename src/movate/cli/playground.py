@@ -152,14 +152,22 @@ def _print_launch_banner(
     api_key: str | None,
     host: str,
     port: int,
+    voice: bool = False,
 ) -> None:
     """Print the startup banner to stderr (never echoes the bearer token).
 
     Two shapes: a per-target summary (multi-target mode) listing each
     registered runtime + whether its key resolved, or the original
     single-runtime line + auth hint. Only target NAMES / URLs / key_env
-    *names* are printed — never a resolved key value.
+    *names* are printed — never a resolved key value. When ``voice`` is on,
+    a one-line note flags that mic input is enabled.
     """
+    if voice:
+        err.print(
+            "[bold magenta]🎙 voice mode[/bold magenta] enabled — talk to "
+            "agents with your mic (text still works). The runtime must expose "
+            "the voice route, else the UI shows a friendly 'not enabled' note."
+        )
     if multi_target and targets:
         ready = sum(1 for t in targets if t.key_available)
         err.print(
@@ -353,6 +361,20 @@ def serve(
             "runtime). Skips the chat-profile target picker."
         ),
     ),
+    voice: bool = typer.Option(
+        False,
+        "--voice",
+        help=(
+            "Enable voice mode: talk to the agent with your mic. Captures "
+            "audio in the browser, streams it to the runtime's voice "
+            "WebSocket (``WS /api/v1/agents/{name}/voice``), renders the live "
+            "transcript + the agent's answer, and plays the synthesized reply "
+            "back. Off by default — the text playground is unchanged. The "
+            "target runtime must expose the voice route (voice Phase 1); if it "
+            "doesn't, the UI shows a friendly 'voice not enabled' message and "
+            "text still works."
+        ),
+    ),
 ) -> None:
     """Launch the ChatGPT-like Chainlit playground for testing agents.
 
@@ -388,6 +410,10 @@ def serve(
         env["MDK_PLAYGROUND_NO_HISTORY"] = "1"
     if persist_uploads:
         env["MDK_PLAYGROUND_PERSIST_UPLOADS"] = "1"
+    # Voice mode (opt-in): the app reads this at import to register the audio
+    # callbacks. Absent → text-only (the original flow, byte-for-byte unchanged).
+    if voice:
+        env["MDK_PLAYGROUND_VOICE"] = "1"
     # Multi-target: hand the resolved target list (URL + key_env + the
     # already-resolved bearer token) to the app via one JSON env var.
     # Its presence is what flips the app into chat-profile mode; absence
@@ -434,6 +460,7 @@ def serve(
         api_key=api_key,
         host=host,
         port=port,
+        voice=voice,
     )
 
     try:
