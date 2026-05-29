@@ -1,0 +1,78 @@
+{
+  "version": "Notebook/1.0",
+  "$schema": "https://schema.management.azure.com/schemas/2018-06-01/Microsoft.Insights.Workbook.json",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# mdk - eval and drift workbook\n\n**Persona:** eval engineer / model owner (\"is the model behaving today?\").\n\n## Honest disclaimer (read first)\n\n> **TODO - eval/drift telemetry is NOT in Application Insights today.**\n>\n> Per ADR 031 D1 and `docs/observability.md`, `mdk eval` emits **Langfuse scores**, not OTel metrics. There are no `mdk.eval.*` or `drift.*` instruments in `METRIC_NAMES` (`src/movate/tracing/metrics.py`), so the workspace has nothing to query.\n>\n> This workbook is **scaffolded** for when ADR 016 (model promotion / canary) instruments and ADR 031 follow-ups land: each query below is the **shape** the panel will use, filtered against `AppMetrics`/`AppTraces` with the expected `Name` patterns. Until then, treat this workbook as documentation of intent + a forward-compatible template.\n>\n> **Where to actually look today:**\n> - Eval pass-rate / regression: Langfuse UI, scores keyed by `run_id` (ADR 015).\n> - Drift signal: Langfuse + the operator workbook's latency/error trends as a proxy.\n> - Canary status: Container Apps revision health (see the platform workbook's revisions section).\n\nScope to the Log Analytics workspace once the instruments exist; the workbook structure stays the same."
+      },
+      "name": "title"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 1. Eval pass-rate over time (scaffolded)\n\n**What this WILL measure (when instrumented).** A counter or score for `mdk.eval.pass` / `mdk.eval.fail` partitioned by `agent` / `eval_set`. Plotted as pass-fraction over time.\n\n**Normal (target).** > 95% pass-rate per agent + eval-set; trend flat.\n\n**If red, do (target playbook).**\n- pass-rate stepped down -> bisect on prompt / model / KB chunks since the last green run.\n- drift on a specific eval-set only -> KB regression for the topic that set covers.\n\n_The query below is the shape: once the eval-runner emits an instrument named `mdk.eval.<x>`, drop the empty-result banner and the chart populates._"
+      },
+      "name": "eval-pass-rate-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// PLACEHOLDER - returns empty until mdk eval emits OTel metrics.\n// When instrumented, expected schema:\n//   AppMetrics where Name in (\"mdk.eval.pass\", \"mdk.eval.fail\")\n//   Properties[\"agent\"] / Properties[\"eval_set\"] carry the partitions.\nAppMetrics\n| where Name startswith \"mdk.eval.\"\n| extend agent = tostring(Properties[\"agent\"]), evalSet = tostring(Properties[\"eval_set\"])\n| summarize Pass = sumif(Sum, Name == \"mdk.eval.pass\"), Fail = sumif(Sum, Name == \"mdk.eval.fail\") by agent, evalSet, bin(TimeGenerated, 1h)\n| extend PassPct = iff((Pass + Fail) == 0, 0.0, round(100.0 * Pass / (Pass + Fail), 2))\n| project TimeGenerated, agent, evalSet, PassPct\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Eval pass-rate (%) by agent / eval_set [empty until ADR 031 follow-up lands]",
+        "timeContext": {"durationMs": 604800000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "linechart"
+      },
+      "name": "eval-pass-rate"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 2. Drift signal (scaffolded)\n\n**What this WILL measure.** Drift instruments under `drift.*` (input distribution, output distribution, embedding distance vs baseline). Today these are not emitted - the closest proxy is the operator workbook's latency / error rate trend.\n\n**Normal (target).** All drift metrics within 1 standard deviation of the rolling baseline.\n\n**If red, do (target playbook).**\n- input-distribution drift -> upstream input change (real-world shift, or upstream system change).\n- embedding-distance drift on a specific KB index -> KB content rotation; verify chunk pipeline.\n- output drift only -> prompt / model swap; verify with `mdk eval`.\n\n_Same shape: empty until instrumented._"
+      },
+      "name": "drift-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// PLACEHOLDER - drift instruments not in METRIC_NAMES today.\n// When instrumented: AppMetrics where Name startswith \"drift.\".\nAppMetrics\n| where Name startswith \"drift.\"\n| extend signal = tostring(split(Name, \".\")[1])\n| summarize Value = avg(Sum) by signal, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Drift signals over time [empty until ADR 016 D3 / ADR 031 follow-up lands]",
+        "timeContext": {"durationMs": 604800000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "linechart"
+      },
+      "name": "drift-signals"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 3. Canary status (ADR 016 D3)\n\n**What this WILL show.** Active canary deployments per agent (`agent_version_canary` vs `agent_version_stable`) and the win/loss verdict from the canary comparison job. Today the canary lifecycle is in design (ADR 016 D3); the runtime emits the `agent_version` attribute on `agent.execute` already, so once the comparison job lands, this panel populates from existing telemetry.\n\n**Normal (target).** No active canary, OR canary on a single agent with green verdict.\n\n**If red, do (target playbook).**\n- canary loss -> auto-revert (per ADR 016 D3); confirm the revert happened in the platform workbook's revisions section.\n- canary stuck without verdict -> the comparison job didn't run; check eval pipeline."
+      },
+      "name": "canary-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// Today: just lists distinct agent_version values seen on agent.execute.\n// Useful as a smoke check that the version attribute is being stamped at the runtime edge.\nAppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| extend agent = tostring(Properties[\"agent\"]), agent_version = tostring(Properties[\"agent_version\"])\n| summarize Runs = count(), P95 = percentile(DurationMs, 95), ErrorPct = round(100.0 * countif(Success == false) / count(), 2) by agent, agent_version\n| order by Runs desc\n| take 50",
+        "size": 0,
+        "title": "Active agent versions in the window (precursor view; canary verdict pending ADR 016 D3)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "agent-versions"
+    }
+  ],
+  "fallbackResourceIds": ["Azure Monitor"],
+  "fromTemplateId": "mdk-eval-drift-workbook"
+}

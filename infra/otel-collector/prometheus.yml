@@ -1,0 +1,36 @@
+# Prometheus config for the local mdk demo stack.
+#
+# Scrape target is the otel-collector's `prometheus` exporter (see
+# otel-collector-config.yaml: exporters.prometheus.endpoint = 0.0.0.0:8889).
+# That gives Prometheus a pull endpoint over the OTel push pipeline, so the
+# in-repo dashboards/prometheus/mdk-rules.yaml + dashboards/grafana/*.json
+# both light up against real, live mdk metrics.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # The in-repo recording + alerting rules under dashboards/prometheus/ are
+  # mounted into the container at this path by docker-compose.yml. Reload via
+  #   curl -X POST http://localhost:9090/-/reload
+  # when you edit the file (--web.enable-lifecycle is set on the prometheus
+  # service).
+  - /etc/prometheus/rules/mdk-rules.yaml
+
+scrape_configs:
+  - job_name: "otel-collector"
+    static_configs:
+      - targets: ["otel-collector:8889"]
+    metric_relabel_configs:
+      # The OTel collector's prometheus exporter publishes its own internal
+      # `otelcol_*` metrics on the same endpoint; keep them so the demo can
+      # show collector health, but tag them distinctly.
+      - source_labels: [__name__]
+        regex: "otelcol_.*"
+        target_label: source
+        replacement: "collector"
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

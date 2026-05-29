@@ -1,0 +1,22 @@
+# Auto-provision the in-repo Grafana dashboards under dashboards/grafana/*.json
+# into Grafana on container start, so a `docker compose up` -> open localhost:3000
+# already shows the mdk dashboards under the "mdk" folder with no manual import.
+#
+# The `path` here is where docker-compose.yml mounts the repo's
+# dashboards/grafana/ directory read-only. Anything added there shows up after a
+# `docker compose restart grafana` (or wait for the periodic re-scan).
+
+apiVersion: 1
+
+providers:
+  - name: mdk
+    orgId: 1
+    folder: "mdk"
+    type: file
+    disableDeletion: true
+    editable: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards/mdk
+      foldersFromFilesStructure: false

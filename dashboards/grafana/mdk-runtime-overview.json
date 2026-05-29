@@ -1,0 +1,446 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics. Provisioned automatically by infra/otel-collector/ (uid: prometheus).",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk runtime overview: per-tenant + per-kind request rate, latency p50/p95/p99, and error rate over the OTel metrics mdk.jobs.completed and mdk.job.duration_ms. Source: src/movate/tracing/metrics.py. Prescriptive layer: triage flow at the top, per-chart triage notes, SLO threshold annotations matching infra/azure/modules/monitor-alerts.bicep, and drill-down links to Jaeger + Azure Monitor Workbooks. mdk does not export a per-route HTTP metric today; the 'route' axis from the brief degrades to 'kind' (job kind).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 200,
+      "panels": [],
+      "title": "Triage flow (start here)",
+      "type": "row"
+    },
+    {
+      "type": "text",
+      "id": 201,
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 1},
+      "title": "mdk - runtime overview: triage",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - runtime overview\n\n**What this shows.** Per-tenant runtime view: throughput (by status / by kind), latency p50/p95/p99, and error rate scoped to the selected `$tenant`. Source: `mdk.jobs.completed`, `mdk.job.duration_ms`.\n\n**Normal range.**\n\n- p95 < 2s, p99 < 5s under steady load (red threshold on the latency panel = the **`*-high-latency-p95`** SLO at 30s).\n- Error rate < 1% per tenant (red threshold = the **`*-high-error-rate`** SLO at 10%).\n- Throughput proportional to expected workload; flat-zero on a previously-active tenant is the **`*-availability-no-traffic`** signal.\n\n**Triage flow.**\n\n```mermaid\ngraph TD\n  A[Tenant complaint or alert] --> B[Pick the tenant in the dropdown]\n  B --> C{Throughput dropping?}\n  C -- yes --> C1[Cross-check API health / availability alert]\n  C -- no  --> D{Latency p95 rising?}\n  D -- yes --> D1[Slice by kind on the p95-by-kind panel]\n  D1 --> D2[Jaeger: filter service=movate-runtime tag tenant_id=$tenant]\n  D -- no  --> E{Error rate up?}\n  E -- yes --> E1[Drill into status=non-success in trace search]\n  E -- no  --> F[Likely upstream UX issue; verify with Langfuse session view]\n```\n\nList fallback if Mermaid does not render:\n1. Tenant selected -> throughput dropping? -> availability alert.\n2. Latency p95 up -> slice by kind -> Jaeger tenant filter.\n3. Error rate up -> trace search filtered on non-success.\n4. Otherwise probe Langfuse for UX.\n\n**Cross-surface.** KQL equivalent in `infra/azure-monitor/workbooks/tenant-ops.workbook.json`."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 10},
+      "id": 100,
+      "panels": [],
+      "title": "Throughput (mdk.jobs.completed)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Job completion rate (jobs/sec) split by terminal status, filtered to the selected tenant. From mdk.jobs.completed (status = success / error / safety_blocked / dead_letter).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "stacking": {"group": "A", "mode": "normal"}
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 11},
+      "id": 1,
+      "links": [
+        {
+          "title": "Jaeger - filter by tenant",
+          "url": "http://localhost:16686/search?service=movate-runtime&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Tenant ops",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (status) (rate(mdk_jobs_completed_total{tenant=~\"$tenant\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Throughput by status (selected tenant)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Throughput split by job 'kind' attribute on mdk.jobs.completed for the selected tenant.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 11},
+      "id": 2,
+      "links": [
+        {
+          "title": "Jaeger - filter by tenant",
+          "url": "http://localhost:16686/search?service=movate-runtime&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Tenant ops",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (kind) (rate(mdk_jobs_completed_total{tenant=~\"$tenant\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Throughput by kind (selected tenant)",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 210,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 19},
+      "title": "Sub-panel: triage notes (throughput)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Tenant-scoped job completion rate split by `status` and by `kind`. Source: `mdk.jobs.completed`.\n\n**Normal.** Throughput tracks tenant-expected workload. Flat-zero on a previously-active tenant is the **`*-availability-no-traffic`** signal (fleet-wide today; per-tenant variant deferred).\n\n**If you see X.**\n\n- `flat-zero for an active tenant` -> open Container Apps logs for the API; check tenant-level rate limit; verify the tenant's recent deploys.\n- `large `status=error` slice` -> drill via the error-rate panel below + Jaeger filter `tenant_id=$tenant error=true`.\n- `a single `kind` dominating unexpectedly` -> agent loop or scheduler misconfig; correlate with `mdk dev` agent inventory.\n\n**ADR refs.** ADR 019 / ADR 031. **Alert rules.** `*-availability-no-traffic` (fleet)."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
+      "id": 101,
+      "panels": [],
+      "title": "Latency (mdk.job.duration_ms)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Latency percentiles over the mdk.job.duration_ms histogram (claim -> terminal status). Note: mdk.job.duration_ms attributes are {kind, status} only -- not 'tenant' -- so this panel is fleet-wide; the tenant variable does not filter latency.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 30000}
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+      "id": 3,
+      "links": [
+        {
+          "title": "Jaeger - slow agent.execute",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=2s",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Tenant ops",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "p50"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "p95"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "p99"
+        }
+      ],
+      "title": "Latency p50 / p95 / p99 (fleet; red line = high-latency-p95 SLO @ 30s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "p95 latency split by job kind from mdk.job.duration_ms (kind attribute).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 30000}
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+      "id": 4,
+      "links": [
+        {
+          "title": "Jaeger - slow agent.execute",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=2s",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Tenant ops",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "p95 by kind (red line = high-latency-p95 SLO @ 30s)",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 211,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 31},
+      "title": "Sub-panel: triage notes (latency)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Wall-clock job duration percentiles (fleet-wide and split by `kind`). NB: `mdk.job.duration_ms` is **not** keyed on tenant; the `$tenant` selector does not filter these panels.\n\n**Normal.** p95 < 2s, p99 < 5s. Red threshold line = **30000ms** (the **`*-high-latency-p95`** SLO).\n\n**If you see X.**\n\n- `p95 > 5s on a single kind` -> that kind is the hot path; in Jaeger, filter by `service=movate-runtime operation=agent.execute` plus the `kind` attribute and inspect `agent.turn`, `skill.<name>`, and `kb_search` children.\n- `p95 > 30s` -> SLO alert active. Treat as SEV-2; bisect against the most recent deploy.\n- `p99 spike alone` -> tail-only; provider hiccup. Inspect `provider` attribute on `agent.execute`.\n\n**ADR refs.** ADR 013 / ADR 015 / ADR 024 (workflow/agent spans). **Alert rule.** `*-high-latency-p95`."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 34},
+      "id": 102,
+      "panels": [],
+      "title": "Error rate (mdk.jobs.completed, status != success)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Error ratio = non-success terminal jobs / all terminal jobs over the window, scoped to the selected tenant. Dead-letters are the status=dead_letter slice.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.1}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 35},
+      "id": 5,
+      "links": [
+        {
+          "title": "Jaeger - failed agent.execute for this tenant",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&tags=%7B%22tenant_id%22%3A%22$tenant%22%2C%22error%22%3A%22true%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Tenant ops",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(rate(mdk_jobs_completed_total{tenant=~\"$tenant\",status!=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(mdk_jobs_completed_total{tenant=~\"$tenant\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "error rate (all non-success)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(rate(mdk_jobs_completed_total{tenant=~\"$tenant\",status=\"dead_letter\"}[$__rate_interval])) / clamp_min(sum(rate(mdk_jobs_completed_total{tenant=~\"$tenant\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "dead-letter rate",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Error rate + dead-letter rate (selected tenant; red line = high-error-rate SLO @ 10%)",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 212,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 43},
+      "title": "Sub-panel: triage notes (error rate)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Per-tenant failure ratio (`status != success` and the dead-letter slice). Source: `mdk.jobs.completed`.\n\n**Normal.** < 1%. Red line = **10%** (the **`*-high-error-rate`** SLO). Dead-letter line should sit at zero (the **`*-deadletter-spike`** alert fires on any non-zero count).\n\n**If you see X.**\n\n- `error rate > 1%` -> open Jaeger with `tenant_id=$tenant error=true`; group by `provider` first, then by `agent`.\n- `error rate > 10%` (SLO line) -> SEV-1; check Activity Log for deploy correlation; if `503`-heavy, suspect runtime cold start (cross-link to the queue-and-pool dashboard for in-flight saturation).\n- `dead-letter rate > 0` -> failed-poison retry budget exhausted; replay from Langfuse run trace + verify the storage `dead_letter` table state.\n\n**ADR refs.** ADR 015 / ADR 019. **Alert rules.** `*-high-error-rate`, `*-deadletter-spike`."
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "runtime", "adr-031"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_jobs_completed_total, tenant)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": {"query": "label_values(mdk_jobs_completed_total, tenant)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - runtime overview (throughput / latency / errors)",
+  "uid": "mdk-runtime-overview",
+  "version": 2,
+  "weekStart": ""
+}

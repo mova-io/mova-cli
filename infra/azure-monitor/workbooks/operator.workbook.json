@@ -1,0 +1,146 @@
+{
+  "version": "Notebook/1.0",
+  "$schema": "https://schema.management.azure.com/schemas/2018-06-01/Microsoft.Insights.Workbook.json",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# mdk - operator workbook (on-call)\n\n**Persona:** on-call operator (\"is the runtime healthy right now?\").\n\nThis workbook is the **first** thing to open when an SLO alert fires. It maps 1:1 to the **golden-signals Grafana dashboard** (`dashboards/grafana/mdk-golden-signals.json`) but uses **KQL against the workspace-based App Insights `App*` tables** that the OTel Collector's `azuremonitor` exporter writes to (ADR 020). Scope this workbook to the Log Analytics workspace the deployment writes to (`logs.outputs.workspaceId` in `infra/azure/main.bicep`).\n\n**Alert rules surfaced here** (from `infra/azure/modules/monitor-alerts.bicep`):\n\n- `*-deadletter-spike` (any dead-letter in 15m)\n- `*-high-error-rate` (>10% over 15m)\n- `*-high-latency-p95` (p95 > 30s over 15m)\n- `*-availability-no-traffic` (zero successful API requests in 15m)\n\n**Cross-surface.** Same signals, PromQL side: `dashboards/grafana/mdk-golden-signals.json`. Choose Workbook when you want Azure Portal SSO + alert-rule pivot; choose Grafana for multi-cloud + live Jaeger trace links."
+      },
+      "name": "title"
+    },
+    {
+      "type": 11,
+      "content": {
+        "version": "LinkItem/1.0",
+        "style": "list",
+        "links": [
+          {
+            "id": "alerts-link",
+            "linkTarget": "Resource",
+            "linkLabel": "Open Azure Monitor Alerts blade (item-27 SLO rules)",
+            "subTarget": "alertsManagementSummary",
+            "style": "link"
+          }
+        ]
+      },
+      "name": "alerts-link"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 1. Health overview\n\n**What.** Top-line operator KPIs over the dashboard time-range: `agent.execute` failure rate (`AppDependencies`) + p95 latency (`AppDependencies.DurationMs`).\n\n**Normal.** Error % < 1; p95 < 2000 ms.\n\n**If red, do.**\n- error % rising over 10 -> **`*-high-error-rate`** is firing; jump to the recent-failures panel below and pivot on `ResultCode` / `OperationName`.\n- p95 rising over 30000 ms -> **`*-high-latency-p95`** is firing; jump to the latency heatmap below + the `eval-and-drift` workbook if a model regression is suspected.\n\n_ADR refs: ADR 020 (Azure exporter), ADR 015 (Langfuse drilldown by operation_Id)._"
+      },
+      "name": "health-overview-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| summarize Total = count(), Failed = countif(Success == false), P95 = percentile(DurationMs, 95)\n| extend ErrorPct = iff(Total == 0, 0.0, round(100.0 * Failed / Total, 2))\n| project Total, Failed, ErrorPct, P95Ms = P95",
+        "size": 4,
+        "title": "agent.execute - total / failed / error% / p95 (window)",
+        "timeContext": {"durationMs": 3600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "tiles",
+        "tileSettings": {
+          "showBorder": false,
+          "titleContent": {"columnMatch": "ErrorPct", "formatter": 1},
+          "leftContent": {
+            "columnMatch": "P95Ms",
+            "formatter": 12,
+            "formatOptions": {"palette": "redBright"}
+          }
+        }
+      },
+      "name": "health-overview-tiles"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 2. Active alerts\n\n**What.** Currently-firing alerts scoped to this resource group / subscription. Surfaces the four item-27 SLO rules + any drift-side rules.\n\n**Normal.** Empty table.\n\n**If red, do.** Click through to the alert; the rule description carries the exact condition (e.g. `agent.execute failure rate over PT15M exceeded 10%`)."
+      },
+      "name": "alerts-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AlertsManagementResources\n| where type =~ 'microsoft.alertsmanagement/alerts'\n| extend severity = tostring(properties.essentials.severity), monitorCondition = tostring(properties.essentials.monitorCondition), alertState = tostring(properties.essentials.alertState), targetResource = tostring(properties.essentials.targetResource), startDateTime = todatetime(properties.essentials.startDateTime), name = tostring(properties.essentials.alertRule)\n| where monitorCondition == 'Fired' and alertState != 'Closed'\n| project name, severity, alertState, startDateTime, targetResource\n| order by startDateTime desc",
+        "size": 0,
+        "title": "Firing alerts (Resource Graph)",
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources",
+        "crossComponentResources": ["value::selected"],
+        "visualization": "table"
+      },
+      "name": "active-alerts"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 3. Recent failures\n\n**What.** Failed `agent.execute` invocations in the window (`AppDependencies.Success == false`). Includes the `OperationId` you can paste into the Application Insights transaction search to see the full trace.\n\n**Normal.** Empty or trickle of non-retried provider 5xx.\n\n**If red, do.**\n- group concentrated on one `ResultCode` -> provider-side; check provider status page.\n- spread across codes after a deploy -> revert or pin; correlate with the Container Apps revision history in the platform workbook.\n- KB-heavy agents predominate -> open the `eval-and-drift` workbook to see whether eval pass-rate regressed."
+      },
+      "name": "recent-failures-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where AppRoleName == \"movate-runtime\" and Success == false\n| where Name in (\"agent.execute\", \"workflow.execute\")\n| project TimeGenerated, Name, DurationMs, ResultCode, OperationId, AppRoleInstance, Properties\n| order by TimeGenerated desc\n| take 100",
+        "size": 0,
+        "title": "Recent failed agent.execute / workflow.execute (last 100)",
+        "timeContext": {"durationMs": 3600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "recent-failures"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 4. Latency heatmap\n\n**What.** `agent.execute` `DurationMs` distribution over time (heatmap). Hot bands at the top are the tail; banded hot rows are the SLO-breaching regions.\n\n**Normal.** Heat concentrated under ~2000 ms with a thin tail to ~5000 ms.\n\n**If red, do.**\n- Hot band > 30000 ms -> the **`*-high-latency-p95`** SLO is firing; cross-link Grafana's `p95 by kind` to see which `kind` is the regression.\n- Slow drift of the median upward over hours -> KB chunk-size regression or provider degradation; run `mdk eval`."
+      },
+      "name": "latency-heatmap-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| make-series DurationCount = count() default = 0 on TimeGenerated step 5m by bin(DurationMs, 500)\n| order by DurationMs asc",
+        "size": 0,
+        "title": "agent.execute DurationMs heatmap (5m bins, 500ms buckets)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "latency-heatmap"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 5. Throughput by status\n\n**What.** `mdk.jobs.completed` summed by `status` over 5-minute bins. Direct equivalent of the Grafana stacked-throughput panel.\n\n**Normal.** Steady `success` line; `error` < 1% of total; `dead_letter` flat at zero.\n\n**If red, do.** Any non-zero `dead_letter` -> **`*-deadletter-spike`** is or will fire. Pull the failing run from the recent-failures table above and replay from Langfuse."
+      },
+      "name": "throughput-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend status = tostring(Properties[\"status\"])\n| summarize Jobs = sum(Sum) by status, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "mdk.jobs.completed by status (5m bins)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "throughput-by-status"
+    }
+  ],
+  "fallbackResourceIds": ["Azure Monitor"],
+  "fromTemplateId": "mdk-operator-workbook"
+}

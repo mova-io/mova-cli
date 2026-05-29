@@ -1,0 +1,183 @@
+{
+  "version": "Notebook/1.0",
+  "$schema": "https://schema.management.azure.com/schemas/2018-06-01/Microsoft.Insights.Workbook.json",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# mdk - platform workbook\n\n**Persona:** platform / SRE team (\"is the underlying platform healthy?\").\n\nCovers the **substrate** the runtime sits on: Postgres connection pool, in-flight queue depth, Container Apps revisions + restarts, and cost / token volume aggregated platform-wide. Scope to the Log Analytics workspace the deployment writes to.\n\n**Cross-surface.** Same signals, Grafana side: `dashboards/grafana/mdk-queue-and-pool.json` (pool + saturation) and `dashboards/grafana/mdk-cost.json` (cost). Pick this workbook when you need to pivot to Container Apps revisions / Activity Log without leaving the Portal.\n\n_ADR refs: ADR 020 (Azure exporter), ADR 031 D2 (instrument catalog), ADR 034 D3 (pool metrics)._"
+      },
+      "name": "title"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 1. Postgres pool stats (ADR 034 D3)\n\n**What.** Per-pod `mdk.db.pool.size / idle / in_use / waiting / max` from `AppMetrics`. The OTel exporter writes one `AppMetrics` row per scrape with `Name == \"mdk.db.pool.<x>\"` and the gauge value in `Sum`. Per-pod identity comes from `AppRoleInstance`.\n\n**Normal.** `in_use / max` < 0.7; `waiting` = 0. Flat zero on the local SQLite backend.\n\n**If red, do.**\n- `in_use / max > 0.9` -> raise `pool_max` OR add pods, **but** keep `N_pods * pool_max` under Azure Postgres `max_connections`. Run `mdk doctor` (ADR 034 D1) for the static check before applying either lever.\n- `waiting > 0 sustained` -> acquire queue building; same remediation as above.\n- KB-heavy workload + climbing `in_use` -> investigate connection leak in storage call sites."
+      },
+      "name": "pool-stats-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name in (\"mdk.db.pool.size\", \"mdk.db.pool.idle\", \"mdk.db.pool.in_use\", \"mdk.db.pool.max\")\n| summarize Value = avg(Sum) by Name, AppRoleInstance, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Pool composition per pod (size / idle / in_use / max)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "pool-composition"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.db.pool.in_use\" or Name == \"mdk.db.pool.max\"\n| summarize Value = avg(Sum) by Name, AppRoleInstance, bin(TimeGenerated, 5m)\n| evaluate pivot(Name, sum(Value))\n| extend SaturationPct = round(100.0 * coalesce(toreal(['mdk.db.pool.in_use']), 0.0) / coalesce(toreal(['mdk.db.pool.max']), 1.0), 1)\n| project TimeGenerated, AppRoleInstance, SaturationPct\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Per-pod pool saturation (in_use / max %; thresholds: orange 70, red 90)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "pool-saturation"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.db.pool.waiting\"\n| summarize Waiting = sum(Sum) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Pool acquire waiters (fleet sum; any > 0 is anomalous)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "pool-waiters"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 2. Queue depth + in-flight age\n\n**What.** `mdk.jobs.in_flight` aggregated by tenant (proxy for queue depth - a true queue-depth metric is deferred per ADR 031). The \"in-flight age\" half is approximated from `agent.execute` span `DurationMs` (the metric instrument doesn't carry age today).\n\n**Normal.** Tracks load proportionally; falls to baseline between bursts.\n\n**If red, do.**\n- `in_flight rising while throughput flat` (cross-reference operator workbook) -> workers stuck; check the `agent.execute` slow-trace table below.\n- monotonically rising over hours -> in-flight counter leak; verify `dec_in_flight` is called on every terminal path."
+      },
+      "name": "queue-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.jobs.in_flight\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| summarize InFlight = avg(Sum) by tenant, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "In-flight by tenant (mdk.jobs.in_flight, 5m bins)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "in-flight-by-tenant"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where Name == \"agent.execute\" and AppRoleName == \"movate-runtime\"\n| where DurationMs > 10000\n| project TimeGenerated, DurationMs, ResultCode, OperationId, AppRoleInstance\n| order by DurationMs desc\n| take 50",
+        "size": 0,
+        "title": "Slowest agent.execute over 10s (stuck-worker indicator)",
+        "timeContext": {"durationMs": 3600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "slow-agent-execute"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 3. Container Apps revisions + restarts\n\n**What.** Cold start / restart signals from `AppEvents` (lifecycle) and dependency latency to the underlying Container App from `AppDependencies` (resource-tier health).\n\n**Normal.** No restart events between deploys. Dependency latency stable.\n\n**If red, do.**\n- New restart event correlates with deploy time -> roll back via Container Apps revision pinning.\n- Repeated restarts -> likely OOM / liveness probe failure; check Container Apps logs."
+      },
+      "name": "revisions-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppEvents\n| where Name has_any (\"start\", \"restart\", \"stop\", \"crash\")\n| project TimeGenerated, Name, AppRoleName, AppRoleInstance, Properties\n| order by TimeGenerated desc\n| take 100",
+        "size": 0,
+        "title": "Container Apps lifecycle events (start / restart / stop / crash)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "container-apps-events"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppDependencies\n| where AppRoleName == \"movate-runtime\" and Type !in (\"InProc\", \"OTHER\")\n| summarize P95 = percentile(DurationMs, 95), Failed = countif(Success == false), Total = count() by Type, Target, bin(TimeGenerated, 5m)\n| extend ErrorPct = iff(Total == 0, 0.0, round(100.0 * Failed / Total, 2))\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Dependency latency p95 + error% by Type/Target",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "dependencies"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 4. Cost & token use\n\n**What.** `mdk.run.tokens` and `mdk.run.cost_usd` summed platform-wide and by tenant. Direct equivalent of `dashboards/grafana/mdk-cost.json`.\n\n**Normal.** Proportional to throughput; USD per 1k tokens stable.\n\n**If red, do.**\n- Sudden 2x USD/hr with flat throughput -> model swap or provider price change; verify `provider` / `model_override` attributes on recent `agent.execute` spans (the metric doesn't carry them - ADR 031 design choice).\n- Tokens spike, throughput flat -> KB chunk-size regression (input) or prompt drift (output); cross-link to the `eval-and-drift` workbook."
+      },
+      "name": "cost-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.run.cost_usd\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| summarize USD = sum(Sum) by tenant, bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Cost USD by tenant (1h bins)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "cost-by-tenant"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.run.tokens\"\n| extend tenant = tostring(Properties[\"tenant\"])\n| summarize Tokens = sum(Sum) by tenant, bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Tokens by tenant (1h bins)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "tokens-by-tenant"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let tokens = AppMetrics | where Name == \"mdk.run.tokens\" | summarize T = sum(Sum) by bin(TimeGenerated, 15m);\nlet cost = AppMetrics | where Name == \"mdk.run.cost_usd\" | summarize C = sum(Sum) by bin(TimeGenerated, 15m);\ntokens\n| join kind=inner cost on TimeGenerated\n| extend USDper1k = iff(T == 0, 0.0, round(C / (T / 1000.0), 4))\n| project TimeGenerated, USDper1k\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Effective USD per 1k tokens (drift indicator)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "usd-per-1k"
+    }
+  ],
+  "fallbackResourceIds": ["Azure Monitor"],
+  "fromTemplateId": "mdk-platform-workbook"
+}

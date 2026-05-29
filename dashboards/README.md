@@ -147,6 +147,32 @@ workspace** the deployment uses (`logs.outputs.workspaceId` in
 > your collector instead lands them in `customMetrics`, swap the table name; the
 > filters/aggregations are unchanged.
 
+## Prescriptive layer (triage flows + per-chart runbook notes)
+
+Each Grafana dashboard under `grafana/` now carries a prescriptive runbook
+layer on top of the panels: a triage row at the top (overview + Mermaid flow +
+numbered-list fallback) and per-chart "Sub-panel: triage notes" `text` panels
+in the **What / Normal / If red, do** pattern. Where SLO alert rules exist
+(`infra/azure/modules/monitor-alerts.bicep`), chart thresholds match the rule
+threshold and the rule name is in the panel title (e.g. `red line =
+high-latency-p95 SLO @ 30s`). Every chart has drill-down `links` to (a) the
+local Jaeger demo (`infra/otel-collector/`) and (b) the matching Azure
+Monitor Workbook page under `infra/azure-monitor/workbooks/`.
+
+**Mermaid vs list.** The triage row uses **both** a Mermaid graph block AND a
+numbered-list fallback in the same text panel. Grafana's built-in Markdown
+renderer does not parse Mermaid out of the box (it needs the
+`grafana-text-panel`/`yesoreyeram` panel plugin), so the list immediately
+below the Mermaid block is the safe rendering. Operators with the Mermaid
+plugin installed see the graph; everyone else sees the list. We picked
+"belt + suspenders" rather than committing to either Mermaid-only (renders
+inconsistently) or list-only (loses the flow visualisation when the plugin
+is present).
+
+The matching Azure-native runbook layer lives in
+`infra/azure-monitor/workbooks/` (four persona-scoped Workbooks: operator,
+platform, eval-and-drift, tenant-ops). See `docs/azure-monitor-workbooks.md`.
+
 ## Don't hand-edit metric names here
 
 Every metric name in these files must match

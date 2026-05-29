@@ -1,0 +1,342 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk saturation view: worker in-flight depth (mdk.jobs.in_flight) + Postgres pool saturation gauges (mdk.db.pool.* -- ADR 034 D3). Prescriptive layer: triage flow + per-chart notes + drill-down links. These are the early-warning signals under KEDA autoscale: in-flight rising without throughput catching up = workers stuck; in_use approaching max + sustained non-zero waiting = pool exhaustion. mdk doctor (ADR 034 D1) does the static math. Pool gauges are flat/zero on the local SQLite backend.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 200,
+      "panels": [],
+      "title": "Triage flow (start here)",
+      "type": "row"
+    },
+    {
+      "type": "text",
+      "id": 201,
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 1},
+      "title": "mdk - queue & pool saturation: triage",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - queue & pool saturation\n\n**What this shows.** The two saturation surfaces that precede outages under autoscale: worker in-flight depth (`mdk.jobs.in_flight`) and per-pod Postgres pool stats (`mdk.db.pool.size/idle/in_use/waiting/max`).\n\n**Normal range.**\n\n- In-flight rises with traffic, falls with throughput; steady-state ~ `arrival_rate * avg_duration`.\n- `in_use / max` < 0.7 per pod (orange at 0.7, red at 0.9 - already wired on the per-pod saturation panel).\n- `waiting` = 0 (any sustained non-zero is the pool bottleneck).\n- `pool_size`, `pool_in_use`, `pool_max` all flat/zero on SQLite backend.\n\n**No SLO alert rules** target these gauges directly today; they precede `*-high-error-rate` (503s from connection exhaustion) and `*-high-latency-p95` (workers stuck on slow tools).\n\n**Triage flow.**\n\n```mermaid\ngraph TD\n  A[Latency or error SLO firing] --> B{In-flight rising, throughput flat?}\n  B -- yes --> B1[Workers stuck on slow tool/LLM - Jaeger minDuration=10s]\n  B -- no  --> C{Pool in_use / max > 0.9?}\n  C -- yes --> C1{Waiting > 0?}\n  C1 -- yes --> C2[Pool ceiling too tight - raise pool_max OR add pods]\n  C1 -- no  --> C3[Hot pod; KEDA scale-out should relieve - confirm replicas]\n  C -- no  --> D{Waiting > 0 sustained?}\n  D -- yes --> D1[Acquire queue building - check pool_max config in storage init]\n  D -- no  --> E[Saturation elsewhere; check golden-signals dashboard]\n  C2 --> F[Mind the Postgres max_connections ceiling: N_pods * pool_max]\n  F --> G[Run mdk doctor capacity check ADR 034 D1]\n```\n\nList fallback:\n1. In-flight rising flat throughput -> workers stuck.\n2. `in_use/max > 0.9` + waiting > 0 -> raise pool_max OR pods (but mind Postgres `max_connections`).\n3. Waiting > 0 alone -> acquire queue building.\n4. Run `mdk doctor` for static capacity check.\n\n**Cross-surface.** KQL equivalent in `infra/azure-monitor/workbooks/platform.workbook.json` (pool stats + queue depth + revisions)."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 10},
+      "id": 100,
+      "panels": [],
+      "title": "In-flight jobs (mdk.jobs.in_flight)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Worker in-flight job count (claimed, not yet terminal) by tenant. Up-down counter -- no _total suffix; bracketed inc/dec in src/movate/runtime/worker.py.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 11},
+      "id": 1,
+      "links": [
+        {
+          "title": "Jaeger - long-running agent.execute (workers stuck)",
+          "url": "http://localhost:16686/search?service=movate-runtime&operation=agent.execute&minDuration=10s&tags=%7B%22tenant_id%22%3A%22$tenant%22%7D",
+          "targetBlank": true
+        },
+        {
+          "title": "Azure Monitor Workbook - Platform (queue depth)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (tenant) (mdk_jobs_in_flight{tenant=~\"$tenant\"})",
+          "legendFormat": "{{tenant}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight by tenant",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 210,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 19},
+      "title": "Sub-panel: triage notes (in-flight)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Per-tenant count of jobs currently claimed by workers (proxy for queue/worker saturation). Source: `mdk.jobs.in_flight`.\n\n**Normal.** Rises and falls with traffic. Steady-state ~ `arrival_rate * avg_duration`. No alert rule today (true queue depth deferred per ADR 031).\n\n**If you see X.**\n\n- `rising while throughput flat (golden-signals dashboard)` -> workers stuck. Open Jaeger with `minDuration=10s`; the long traces will show a stuck `skill.<name>` or LLM call.\n- `stuck non-zero with zero throughput` -> consumer dead. Check `mdk worker` pod health + KEDA scale (use platform workbook revisions section), watch for `*-availability-no-traffic`.\n- `monotonically rising over hours` -> leaking in-flight counter (inc without dec); verify `dec_in_flight` runs on every terminal path in `src/movate/runtime/worker.py`.\n\n**ADR refs.** ADR 019 (queue + W3C context) / ADR 031. **Alert rules.** None today (related: `*-availability-no-traffic`)."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
+      "id": 101,
+      "panels": [],
+      "title": "Postgres pool (ADR 034 D3 - mdk.db.pool.*)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Per-pod pool composition: open (size), idle, in-use (size - idle). Observable gauges sampled at OTel collection time.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+      "id": 2,
+      "links": [
+        {
+          "title": "Azure Monitor Workbook - Platform (pool composition)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_size)",
+          "legendFormat": "size (open, fleet)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_idle)",
+          "legendFormat": "idle (fleet)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_in_use)",
+          "legendFormat": "in_use (fleet)",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Pool composition (fleet)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Pool saturation = in_use / max. Approaches 1.0 -> connection exhaustion imminent on this pod.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line+area"}
+          },
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.7},
+              {"color": "red", "value": 0.9}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+      "id": 3,
+      "links": [
+        {
+          "title": "Azure Monitor Workbook - Platform (pool saturation)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "mdk_db_pool_in_use / clamp_min(mdk_db_pool_max, 1)",
+          "legendFormat": "{{instance}} in_use/max",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Per-pod pool saturation (in_use / max; orange 0.7, red 0.9)",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 211,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 31},
+      "title": "Sub-panel: triage notes (pool composition + saturation)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Fleet pool composition (open/idle/in_use across pods) and per-pod saturation ratio (`in_use / max`).\n\n**Normal.** `in_use/max` < 0.7 (green); 0.7-0.9 (orange watch); > 0.9 (red - exhaustion imminent on that pod).\n\n**If you see X.**\n\n- `one pod red, others green` -> hot pod; KEDA scale-out should relieve. Confirm replica count in Container Apps revision view.\n- `multiple pods red` -> the ceiling is too tight fleet-wide. Decide: raise per-pod `pool_max` OR add pods. **Critical:** `N_pods * pool_max` must stay under Azure Postgres `max_connections` minus headroom. Run `mdk doctor` (ADR 034 D1) before applying either lever.\n- `in_use rising with throughput flat` -> connection leak from a recently-added call site. Bisect against deploys.\n- `flat at 0` -> SQLite backend (no pool); or asyncpg meter callback failing - check stderr for `register_pool_metrics` errors.\n\n**ADR refs.** ADR 034 (D1 static doctor / D3 live gauges). **Alert rule.** None today; saturation precedes `*-high-error-rate` once the pool exhausts."
+      }
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Callers blocked waiting on the acquire queue (mdk.db.pool.waiting). Sustained non-zero = the pool ceiling is too tight for the offered load; revisit pool_max or pod count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 34},
+      "id": 4,
+      "links": [
+        {
+          "title": "Azure Monitor Workbook - Platform (waiters)",
+          "url": "https://portal.azure.com/#blade/Microsoft_Azure_MonitoringMetrics/AzureMonitoringBrowseBlade/workbooks",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(mdk_db_pool_waiting)",
+          "legendFormat": "waiting (fleet)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pool acquire waiters (early-warning; red line = any waiter)",
+      "type": "timeseries"
+    },
+    {
+      "type": "text",
+      "id": 212,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 42},
+      "title": "Sub-panel: triage notes (acquire waiters)",
+      "options": {
+        "mode": "markdown",
+        "content": "**What this measures.** Total callers blocked on the pool acquire queue (`mdk.db.pool.waiting`). Red threshold = **any non-zero** (this should be 0 in a healthy steady state).\n\n**Normal.** Zero. Brief blips during scale events are tolerable, sustained non-zero is not.\n\n**If you see X.**\n\n- `sustained > 0` -> pool ceiling too tight. Raise `pool_max` OR pod count - run `mdk doctor` (ADR 034 D1) first so you don't trip the Postgres `max_connections` ceiling.\n- `spiky with KEDA scale events` -> new pods initializing the pool while existing ones absorb load; usually self-clears. If it doesn't, the warmup pool is too small.\n- `waiting climbing while in_use flat` -> deadlock-like behavior in storage; pull `agent.execute` traces with long `db.execute` children in Jaeger.\n\n**ADR refs.** ADR 034. **Alert rule.** None today; precedes `*-high-error-rate` once acquires time out and propagate as 503s."
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "saturation", "queue", "pool", "adr-031", "adr-034"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_jobs_in_flight, tenant)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": {"query": "label_values(mdk_jobs_in_flight, tenant)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - queue & pool saturation",
+  "uid": "mdk-queue-and-pool",
+  "version": 2,
+  "weekStart": ""
+}

@@ -1,0 +1,69 @@
+# OpenTelemetry Collector config for the local mdk demo stack.
+#
+# Mirrors the shape of the Azure-side Collector config
+# (infra/azure/modules/containerapp-otel-collector.bicep), but swaps the
+# `azuremonitor` exporter for the demo-local fanout:
+#   * traces  -> Jaeger (OTLP gRPC into the all-in-one image)
+#   * metrics -> Prometheus (the collector's prometheus exporter, scraped at :8889)
+#
+# The OTLP receivers (4317/4318) match what mdk emits to in BOTH paths -- the
+# only difference between this and prod is the exporter half. See
+# src/movate/tracing/otel.py / metrics.py for the producer side.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch matches the prod default; keeps OTLP egress efficient under load
+  # without sitting on a span too long for the demo to feel snappy.
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  # Traces -> Jaeger. Jaeger all-in-one accepts OTLP/gRPC natively when
+  # COLLECTOR_OTLP_ENABLED=true (set in docker-compose.yml).
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Metrics -> Prometheus exporter. Prometheus scrapes this at otel-collector:8889
+  # (see prometheus.yml). namespace="" keeps the instrument names verbatim
+  # (mdk.jobs.completed -> mdk_jobs_completed_total via the OTLP -> Prometheus
+  # convention -- the same dots->underscores + unit/aggregation suffix logic
+  # the dashboards-as-code drift test (tests/test_dashboards_metric_names.py)
+  # already encodes).
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: ""
+    # Emit Prometheus-style "_total" suffix on monotonic counters so panel
+    # PromQL ("mdk_jobs_completed_total[5m]") matches without per-deploy munging.
+    send_timestamps: false
+    metric_expiration: 30m
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      # Copy OTel Resource attributes (service.name, service.instance.id,
+      # deployment.environment) onto every metric as Prometheus labels so the
+      # per-pod saturation panels in dashboards/grafana/mdk-queue-and-pool.json
+      # can split mdk_db_pool_in_use / mdk_db_pool_max by instance.
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: info
