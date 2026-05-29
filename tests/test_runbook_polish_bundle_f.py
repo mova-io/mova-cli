@@ -170,13 +170,16 @@ class TestAuthStatusNotifications:
             "TELEGRAM_BOT_TOKEN",
             "TELEGRAM_CHAT_ID",
             "MOVATE_DEPLOY_WEBHOOK",
+            "AZURE_SPEECH_KEY",
+            "AZURE_SPEECH_REGION",
         ):
             monkeypatch.delenv(key, raising=False)
         result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
-        # 5 provider env vars + 3 notification env vars = 8 unset.
+        # 5 provider env vars + 3 notification env vars + 2 voice env vars
+        # (Azure Speech key + region, ADR 048/049) = 10 unset.
         assert "set=0" in result.stdout
-        assert "unset=8" in result.stdout
+        assert "unset=10" in result.stdout
 
 
 # ---------------------------------------------------------------------------
