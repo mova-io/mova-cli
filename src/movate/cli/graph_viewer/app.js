@@ -89,7 +89,7 @@
 
   // ---- node/edge styling helpers ------------------------------------------
   function paletteKey(attrs) {
-    return colorMode === "community" ? attrs.community : (attrs.type || attrs.label);
+    return colorMode === "community" ? attrs.community : (attrs.kind || attrs.label);
   }
 
   function styleNode(node, attrs) {
@@ -115,11 +115,24 @@
     function ingestNode(n) {
       var key = n.key != null ? n.key : n.id;
       if (key == null || graph.hasNode(key)) {
-        if (key != null && graph.hasNode(key)) graph.mergeNodeAttributes(key, n.attributes || {});
+        if (key != null && graph.hasNode(key)) {
+          // Merge fresh attrs but never clobber sigma's reserved `type` program.
+          var merge = Object.assign({}, n.attributes || {});
+          if (merge.kind == null && merge.type != null) merge.kind = merge.type;
+          delete merge.type;
+          graph.mergeNodeAttributes(key, merge);
+        }
         return;
       }
       var a = Object.assign({}, n.attributes || {});
       if (a.label == null) a.label = String(key);
+      // Sigma 2.x RESERVES the node `type` attribute for its render program
+      // ("circle"/"image"/…). The runtime sends a DOMAIN type ("org"/"policy"/…)
+      // under `type`, which sigma would try (and fail) to resolve to a WebGL
+      // program. Move the domain type to `kind` and pin sigma's `type` to the
+      // built-in "circle" program. `kind` is what all our styling/filtering reads.
+      if (a.kind == null && a.type != null) a.kind = a.type;
+      a.type = "circle";
       if (typeof a.x !== "number" || typeof a.y !== "number") {
         hadPositions = false;
         a.x = (Math.random() - 0.5) * 100;
@@ -185,8 +198,8 @@
     // neighbors vivid and dim everything else. Also hides filtered types.
     renderer.setSetting("nodeReducer", function (node, data) {
       var res = Object.assign({}, data);
-      var type = graph.getNodeAttribute(node, "type");
-      if (disabledTypes.has(type)) { res.hidden = true; return res; }
+      var kind = graph.getNodeAttribute(node, "kind");
+      if (disabledTypes.has(kind)) { res.hidden = true; return res; }
       if (selectedNode) {
         if (node === selectedNode) {
           res.highlighted = true;
@@ -206,8 +219,8 @@
     renderer.setSetting("edgeReducer", function (edge, data) {
       var res = Object.assign({}, data);
       var s = graph.source(edge), t = graph.target(edge);
-      if (disabledTypes.has(graph.getNodeAttribute(s, "type")) ||
-          disabledTypes.has(graph.getNodeAttribute(t, "type"))) {
+      if (disabledTypes.has(graph.getNodeAttribute(s, "kind")) ||
+          disabledTypes.has(graph.getNodeAttribute(t, "kind"))) {
         res.hidden = true; return res;
       }
       if (selectedNode) {
@@ -262,7 +275,7 @@
     detailPanel.classList.remove("hidden");
     detailPanel.setAttribute("aria-hidden", "false");
     el("detail-label").textContent = graph.getNodeAttribute(node, "label") || node;
-    el("detail-type").textContent = graph.getNodeAttribute(node, "type") || "node";
+    el("detail-type").textContent = graph.getNodeAttribute(node, "kind") || "node";
     el("detail-props").innerHTML = '<dt class="empty">loading…</dt><dd></dd>';
     el("detail-provenance").innerHTML = '<span class="empty">loading…</span>';
     el("detail-agents").innerHTML = "";
@@ -341,7 +354,7 @@
     graph.forEachNode(function (node, attrs) {
       var label = String(attrs.label || node);
       if (label.toLowerCase().indexOf(needle) !== -1) {
-        matches.push({ node: node, label: label, type: attrs.type || "" });
+        matches.push({ node: node, label: label, type: attrs.kind || "" });
       }
     });
     matches.sort(function (a, b) { return a.label.length - b.label.length; });
@@ -365,7 +378,7 @@
   function rebuildTypeFilters() {
     var counts = {};
     graph.forEachNode(function (node, attrs) {
-      var t = attrs.type || "(untyped)";
+      var t = attrs.kind || "(untyped)";
       counts[t] = (counts[t] || 0) + 1;
     });
     var types = Object.keys(counts).sort();
@@ -393,7 +406,7 @@
   function updateStats() {
     var visN = 0;
     graph.forEachNode(function (node, attrs) {
-      if (!disabledTypes.has(attrs.type)) visN++;
+      if (!disabledTypes.has(attrs.kind)) visN++;
     });
     el("stat-nodes").textContent = visN;
     el("stat-edges").textContent = graph.size;
