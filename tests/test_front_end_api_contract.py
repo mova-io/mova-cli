@@ -40,6 +40,10 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     # init / add — create + catalog the agent
     ("POST", "/api/v1/agents"): "admin",
     ("POST", "/api/v1/agents/from-wizard"): "admin",
+    # ADR 032 D1 — describe-then-preview-then-commit authoring path.
+    # Read-only preview that spends LLM tokens; ``admin`` matches the wizard
+    # create endpoint (the other LLM-spending agent-authoring route).
+    ("POST", "/api/v1/agents/preview"): "admin",
     ("POST", "/api/v1/skills"): "admin",
     ("GET", "/api/v1/agents"): "read",
     ("GET", "/api/v1/agents/{name}"): "read",
