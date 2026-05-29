@@ -13,10 +13,13 @@ Keep this dependency-light — only ``httpx`` (already in the
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+from movate.playground.sse import StreamEvent, iter_sse_events
 
 
 @dataclass
@@ -83,14 +86,120 @@ class PlaygroundClient:
         return result
 
     async def submit_run(self, *, agent: str, input_data: dict[str, Any]) -> dict[str, Any]:
-        """Queue a run job via ``POST /run``. Returns the
-        ``{job_id, status}`` envelope. Use ``wait_for_run`` to poll
-        until the job completes + the resulting run is available."""
-        payload = {"kind": "agent", "target": agent, "input": input_data}
-        resp = await self._client.post("/run", json=payload)
+        """Queue an agent run via ``POST /api/v1/agents/{name}/runs``.
+
+        Returns the ``{job_id, status}`` (``RunAccepted``) envelope from
+        the default async path. Use :meth:`wait_for_run` to poll until
+        the job completes + the resulting run is available.
+
+        REST-clean, agent-scoped endpoint (the run is created *under* the
+        agent). Body carries just the input — ``kind=AGENT`` is implicit
+        from the URL. Same envelope the legacy ``POST /run`` returned, so
+        the polling loop is unchanged.
+        """
+        resp = await self._client.post(
+            f"/api/v1/agents/{agent}/runs",
+            json={"input": input_data},
+        )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
+
+    async def get_capabilities(self) -> dict[str, Any] | None:
+        """Fetch the runtime's capability descriptor.
+
+        Reads ``GET /api/v1/capabilities`` — the playground's
+        feature-detection hook. Returns the raw JSON dict on success, or
+        ``None`` when the endpoint is absent (404) / the runtime predates
+        capability discovery. The caller (:func:`parse_capabilities`)
+        degrades a ``None`` to the all-off default, so an old runtime
+        still works in today's single-shot, client-managed, buffered
+        mode.
+
+        Only a 404 / connection failure maps to ``None`` — any other
+        HTTP error is surfaced so a genuinely broken runtime is loud.
+        """
+        try:
+            resp = await self._client.get("/api/v1/capabilities")
+        except httpx.HTTPError:
+            return None
+        if resp.status_code == httpx.codes.NOT_FOUND:
+            return None
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def create_session(self, *, agent: str) -> dict[str, Any]:
+        """Open a server-managed conversation session (ADR 045 D10).
+
+        POSTs to ``POST /api/v1/sessions``. Used only when the runtime
+        advertises the ``sessions`` capability (selected by
+        :func:`~movate.playground.conversation.select_backend`). Returns
+        the ``{session_id, ...}`` envelope; subsequent turns go via
+        :meth:`submit_session_message`.
+        """
+        resp = await self._client.post("/api/v1/sessions", json={"agent": agent})
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def submit_session_message(
+        self,
+        *,
+        session_id: str,
+        input_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Send a turn within a server-managed session (ADR 045 D10).
+
+        POSTs to ``POST /api/v1/sessions/{session_id}/messages``. The
+        runtime threads prior turns into the model context, so the body
+        carries only the new message. Returns either a ``{job_id}``
+        envelope (poll via :meth:`wait_for_run`) or an inline run record.
+        """
+        resp = await self._client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"input": input_data},
+        )
+        resp.raise_for_status()
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def stream_run(
+        self,
+        *,
+        agent: str,
+        input_data: dict[str, Any],
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream an agent run's tokens over SSE (ADR 045 D11).
+
+        POSTs to ``POST /api/v1/agents/{name}/runs/stream`` with
+        ``Accept: text/event-stream`` and yields :class:`StreamEvent`s as
+        frames arrive:
+
+        * ``event="token"`` → ``data={"text": "<delta>"}`` (0+; concat
+          reconstructs the output).
+        * ``event="done"`` → ``data={"run_id", "status", "metrics",
+          "output"}`` (terminal success).
+        * ``event="error"`` → ``data={"message", "code"}`` (terminal
+          failure).
+
+        Used only when the runtime advertises ``run_streaming``. The
+        bearer token rides on the shared client's default headers — never
+        in the URL or query string. The connection is held open for the
+        run's duration; the caller renders tokens into a ``cl.Message``
+        as they land.
+        """
+        headers = {"Accept": "text/event-stream"}
+        async with self._client.stream(
+            "POST",
+            f"/api/v1/agents/{agent}/runs/stream",
+            json={"input": input_data},
+            headers=headers,
+            timeout=httpx.Timeout(self._config.poll_max_wait_s),
+        ) as resp:
+            resp.raise_for_status()
+            async for event in iter_sse_events(resp.aiter_lines()):
+                yield event
 
     async def get_job(self, job_id: str) -> dict[str, Any]:
         """Fetch the current state of a job (queued / running /
