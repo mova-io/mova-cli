@@ -1071,6 +1071,21 @@ _MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_audits_scope_created "
     "ON audits(tenant_id, scope_id, created_at DESC)",
+    # ADR 046 D1 — project-scope the knowledge graph. Additive nullable
+    # column on both graph tables so the viewer / query API can window a
+    # subgraph at the PROJECT grain (a project's graph across its agents),
+    # not only per agent. Idempotent (the duplicate-column guard in init()
+    # swallows re-runs); pre-migration rows + project-less ingests carry
+    # NULL → absent from a project-filtered query, fully visible in the
+    # unfiltered (per-agent) view. Backward-compatible by construction. A
+    # partial index keeps project-filtered scans cheap without bloating the
+    # common NULL case.
+    "ALTER TABLE kb_entities ADD COLUMN project_id TEXT",
+    "ALTER TABLE kb_relations ADD COLUMN project_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_kb_entities_project "
+    "ON kb_entities(agent, tenant_id, project_id) WHERE project_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_kb_relations_project "
+    "ON kb_relations(agent, tenant_id, project_id) WHERE project_id IS NOT NULL",
     # ADR 045 D10: stateful sessions — server-side conversation memory.
     # ``sessions`` holds the entity + the per-session rollups; the turns
     # live in ``session_messages`` (one row per message, content as JSON
@@ -1135,11 +1150,25 @@ def _fts5_escape(query: str) -> str:
     return " ".join(tokens)
 
 
+def _opt_col(r: Any, name: str) -> Any:
+    """Read a column that may be absent on a pre-migration row.
+
+    ``aiosqlite.Row`` raises ``IndexError`` for an unknown column; the
+    additive ``project_id`` ALTER always runs in ``init()`` so the column
+    is normally present, but reading via ``dict(row).get`` keeps this
+    null-safe even if a row was selected with a column-less projection."""
+    try:
+        return dict(r).get(name)
+    except (TypeError, ValueError):
+        return None
+
+
 def _row_to_entity(r: Any) -> Entity:
     return Entity(
         entity_id=r["entity_id"],
         tenant_id=r["tenant_id"],
         agent=r["agent"],
+        project_id=_opt_col(r, "project_id"),
         name=r["name"],
         type=r["type"],
         description=r["description"],
@@ -1218,6 +1247,7 @@ def _row_to_relation(r: Any) -> Relation:
         relation_id=r["relation_id"],
         tenant_id=r["tenant_id"],
         agent=r["agent"],
+        project_id=_opt_col(r, "project_id"),
         src_entity_id=r["src_entity_id"],
         dst_entity_id=r["dst_entity_id"],
         type=r["type"],
@@ -3922,11 +3952,12 @@ class SqliteProvider:
         await self._db.execute(
             """
             INSERT INTO kb_entities (
-                entity_id, tenant_id, agent, name, type, description,
+                entity_id, tenant_id, agent, project_id, name, type, description,
                 embedding, embedding_model, content_hash, source_chunk_ids,
                 metadata, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(agent, tenant_id, content_hash) DO UPDATE SET
+                project_id = COALESCE(excluded.project_id, kb_entities.project_id),
                 name = excluded.name,
                 type = excluded.type,
                 description = excluded.description,
@@ -3939,6 +3970,7 @@ class SqliteProvider:
                 entity.entity_id,
                 entity.tenant_id,
                 entity.agent,
+                entity.project_id,
                 entity.name,
                 entity.type,
                 entity.description,
@@ -3964,11 +3996,12 @@ class SqliteProvider:
         await self._db.execute(
             """
             INSERT INTO kb_relations (
-                relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                type, description, weight, content_hash, source_chunk_ids,
-                metadata, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                relation_id, tenant_id, agent, project_id, src_entity_id,
+                dst_entity_id, type, description, weight, content_hash,
+                source_chunk_ids, metadata, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(agent, tenant_id, content_hash) DO UPDATE SET
+                project_id = COALESCE(excluded.project_id, kb_relations.project_id),
                 src_entity_id = excluded.src_entity_id,
                 dst_entity_id = excluded.dst_entity_id,
                 type = excluded.type,
@@ -3981,6 +4014,7 @@ class SqliteProvider:
                 relation.relation_id,
                 relation.tenant_id,
                 relation.agent,
+                relation.project_id,
                 relation.src_entity_id,
                 relation.dst_entity_id,
                 relation.type,
@@ -4001,10 +4035,13 @@ class SqliteProvider:
         tenant_id: str,
         query_embedding: list[float],
         limit: int = 10,
+        project_id: str | None = None,
     ) -> list[EntityWithScore]:
         from movate.storage._cosine import rank_entities_by_cosine  # noqa: PLC0415
 
-        entities = await self.list_entities(agent=agent, tenant_id=tenant_id, limit=100_000)
+        entities = await self.list_entities(
+            agent=agent, tenant_id=tenant_id, limit=100_000, project_id=project_id
+        )
         return rank_entities_by_cosine(entities, query_embedding, limit)
 
     async def expand_neighbors(
@@ -4015,14 +4052,20 @@ class SqliteProvider:
         entity_ids: list[str],
         hops: int = 1,
         limit: int = 50,
+        project_id: str | None = None,
     ) -> Subgraph:
         if not entity_ids:
             return Subgraph(entities=[], relations=[])
+        # Optional project filter — None means "no filter" (per-agent view,
+        # the historical behavior). When set, only rows tagged with this
+        # project participate, so traversal stays inside the project subgraph.
+        proj_clause = "" if project_id is None else " AND r.project_id = ?"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         # Recursive CTE: bounded k-hop reachability from the seed ids.
         # Undirected for reachability (follow an edge from either endpoint);
         # UNION dedups so cycles terminate, depth < hops bounds the walk.
         async with self._db.execute(
-            """
+            f"""
             WITH RECURSIVE reachable(eid, depth) AS (
                 SELECT value, 0 FROM json_each(?)
               UNION
@@ -4032,28 +4075,29 @@ class SqliteProvider:
                 FROM kb_relations r
                 JOIN reachable
                   ON (r.src_entity_id = reachable.eid OR r.dst_entity_id = reachable.eid)
-                WHERE reachable.depth < ? AND r.agent = ? AND r.tenant_id = ?
+                WHERE reachable.depth < ? AND r.agent = ? AND r.tenant_id = ?{proj_clause}
             )
             SELECT DISTINCT eid FROM reachable
             """,
-            (json.dumps(entity_ids), int(hops), agent, tenant_id),
+            (json.dumps(entity_ids), int(hops), agent, tenant_id, *proj_args),
         ) as cur:
             reachable = [r[0] for r in await cur.fetchall()]
         if not reachable:
             return Subgraph(entities=[], relations=[])
         # Edges with both endpoints reachable, strongest first, budget-capped.
         ph = ",".join("?" * len(reachable))
+        rel_proj = "" if project_id is None else " AND project_id = ?"
         async with self._db.execute(
             f"""
-            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                   type, description, weight, content_hash, source_chunk_ids,
-                   metadata, created_at
+            SELECT relation_id, tenant_id, agent, project_id, src_entity_id,
+                   dst_entity_id, type, description, weight, content_hash,
+                   source_chunk_ids, metadata, created_at
             FROM kb_relations
-            WHERE agent = ? AND tenant_id = ?
+            WHERE agent = ? AND tenant_id = ?{rel_proj}
               AND src_entity_id IN ({ph}) AND dst_entity_id IN ({ph})
             ORDER BY weight DESC, relation_id LIMIT ?
             """,
-            (agent, tenant_id, *reachable, *reachable, int(limit)),
+            (agent, tenant_id, *proj_args, *reachable, *reachable, int(limit)),
         ) as cur:
             relations = [_row_to_relation(r) for r in await cur.fetchall()]
         keep = set(entity_ids)
@@ -4061,15 +4105,16 @@ class SqliteProvider:
             keep.add(rel.src_entity_id)
             keep.add(rel.dst_entity_id)
         keep_ph = ",".join("?" * len(keep))
+        ent_proj = "" if project_id is None else " AND project_id = ?"
         async with self._db.execute(
             f"""
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
             FROM kb_entities
-            WHERE agent = ? AND tenant_id = ? AND entity_id IN ({keep_ph})
+            WHERE agent = ? AND tenant_id = ?{ent_proj} AND entity_id IN ({keep_ph})
             """,
-            (agent, tenant_id, *keep),
+            (agent, tenant_id, *proj_args, *keep),
         ) as cur:
             entities = [_row_to_entity(r) for r in await cur.fetchall()]
         return Subgraph(entities=entities, relations=relations)
@@ -4077,7 +4122,7 @@ class SqliteProvider:
     async def get_entity(self, entity_id: str, *, tenant_id: str) -> Entity | None:
         async with self._db.execute(
             """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
             FROM kb_entities WHERE entity_id = ? AND tenant_id = ?
@@ -4094,16 +4139,19 @@ class SqliteProvider:
         tenant_id: str,
         source_chunk_id: str | None = None,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Entity]:
+        proj_clause = "" if project_id is None else " AND project_id = ?"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         async with self._db.execute(
-            """
-            SELECT entity_id, tenant_id, agent, name, type, description,
+            f"""
+            SELECT entity_id, tenant_id, agent, project_id, name, type, description,
                    embedding, embedding_model, content_hash, source_chunk_ids,
                    metadata, created_at
-            FROM kb_entities WHERE agent = ? AND tenant_id = ?
+            FROM kb_entities WHERE agent = ? AND tenant_id = ?{proj_clause}
             ORDER BY created_at DESC LIMIT ?
             """,
-            (agent, tenant_id, int(limit)),
+            (agent, tenant_id, *proj_args, int(limit)),
         ) as cur:
             entities = [_row_to_entity(r) for r in await cur.fetchall()]
         if source_chunk_id is not None:
@@ -4116,16 +4164,19 @@ class SqliteProvider:
         agent: str,
         tenant_id: str,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Relation]:
+        proj_clause = "" if project_id is None else " AND project_id = ?"
+        proj_args: tuple[Any, ...] = () if project_id is None else (project_id,)
         async with self._db.execute(
-            """
-            SELECT relation_id, tenant_id, agent, src_entity_id, dst_entity_id,
-                   type, description, weight, content_hash, source_chunk_ids,
-                   metadata, created_at
-            FROM kb_relations WHERE agent = ? AND tenant_id = ?
+            f"""
+            SELECT relation_id, tenant_id, agent, project_id, src_entity_id,
+                   dst_entity_id, type, description, weight, content_hash,
+                   source_chunk_ids, metadata, created_at
+            FROM kb_relations WHERE agent = ? AND tenant_id = ?{proj_clause}
             ORDER BY created_at DESC LIMIT ?
             """,
-            (agent, tenant_id, int(limit)),
+            (agent, tenant_id, *proj_args, int(limit)),
         ) as cur:
             return [_row_to_relation(r) for r in await cur.fetchall()]
 

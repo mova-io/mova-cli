@@ -999,17 +999,25 @@ async def _search_graph_nodes(
     project: str | None,
     type: str | None,
     limit: int | None,
+    project_id: str | None = None,
 ) -> list[NodeSearchHit]:
     """Label search across one agent (``project``) or the tenant's agents.
 
     When ``project`` is set, a single-agent search; otherwise it scans the
-    tenant's registered agents and merges hits up to the node budget. Pure
-    matching lives in ``core.graph.search_nodes`` — this only fans out the
-    agent scope and caps the merged result."""
+    tenant's registered agents and merges hits up to the node budget.
+    ``project_id`` (ADR 046 D1, additive) further bounds matches to one
+    project's nodes. Pure matching lives in ``core.graph.search_nodes`` —
+    this only fans out the agent scope and caps the merged result."""
     cap = graph_query.clamp_cap(limit)
     if project is not None:
         return await graph_query.search_nodes(
-            store, agent=project, tenant_id=tenant_id, q=q, type=type, limit=cap
+            store,
+            agent=project,
+            tenant_id=tenant_id,
+            q=q,
+            type=type,
+            limit=cap,
+            project_id=project_id,
         )
     agents = await _graph_agents_for_tenant(store, tenant_id=tenant_id)
     merged: list[NodeSearchHit] = []
@@ -1023,6 +1031,7 @@ async def _search_graph_nodes(
             q=q,
             type=type,
             limit=cap - len(merged),
+            project_id=project_id,
         )
         merged.extend(hits)
     return merged[:cap]
@@ -1035,6 +1044,7 @@ async def _sse_graph_growth_stream(
     tenant_id: str,
     mode: GraphMode,
     cap: int,
+    project_id: str | None = None,
 ) -> Any:
     """SSE growth generator: replay the current graph as add events.
 
@@ -1043,7 +1053,8 @@ async def _sse_graph_growth_stream(
     per edge, each carrying a single-element graphology document so the
     client merges every frame with the same zero-transform
     ``graph.import(...)``. Closes with a ``done`` frame carrying the
-    totals.
+    totals. ``project_id`` (additive) scopes the replayed window to one
+    project's subgraph.
 
     Snapshot-as-stream today (ADR 046 D3): a live-tail that pushes future
     ingest writes is the additive follow-on; the frame contract here is
@@ -1054,6 +1065,7 @@ async def _sse_graph_growth_stream(
         tenant_id=tenant_id,
         mode=mode,
         limit=cap,
+        project_id=project_id,
     )
     for node in doc.nodes:
         frame_doc = GraphologyDoc(nodes=[node], edges=[])
@@ -6411,13 +6423,14 @@ def build_app(
         root: str | None = None,
         depth: int | None = None,
         limit: int | None = None,
+        project: str | None = None,
     ) -> GraphologyView:
         """A windowed subgraph for ``project_id`` as **graphology JSON**.
 
-        ``project_id`` is the agent that owns the graph. The response is a
-        graphology import document (``{attributes, nodes, edges}``) a
-        sigma.js client feeds to ``graph.import(...)`` with zero
-        transform: each node carries ``label`` / ``type`` /
+        ``project_id`` (path) is the agent that owns the graph. The
+        response is a graphology import document (``{attributes, nodes,
+        edges}``) a sigma.js client feeds to ``graph.import(...)`` with
+        zero transform: each node carries ``label`` / ``type`` /
         degree-derived ``size`` / ``color`` (+ ``community`` when stored);
         layout ``x`` / ``y`` are omitted (the client runs ForceAtlas2).
 
@@ -6430,6 +6443,10 @@ def build_app(
           Omit for a whole-graph overview (still capped).
         * ``depth`` — hops from ``root`` (capped at 6).
         * ``limit`` — node/edge cap (default 500, max 5000).
+        * ``project`` — **ADR 046 D1** project-scope filter. When set, only
+          nodes/edges tagged with this ``project_id`` are returned (a
+          project's subgraph across the agent's KBs). Omit (default) for
+          the full per-agent graph — backward-compatible.
 
         Tenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an
         empty document (no leak). Read scope.
@@ -6444,6 +6461,7 @@ def build_app(
             root=root,
             depth=depth,
             limit=limit,
+            project_id=project,
         )
         return GraphologyView.model_validate(doc.model_dump())
 
@@ -6493,14 +6511,17 @@ def build_app(
         project: str | None = None,
         depth: int = 1,
         limit: int | None = None,
+        project_id: str | None = None,
     ) -> GraphologyView:
         """Expand-on-demand: a node's neighborhood as **graphology JSON**.
 
         Drives the click-to-grow interaction — the client imports this
         document on top of the current graph. Bounded by ``depth`` (hops,
         capped at 6) and ``limit`` (node/edge cap, default 500, max 5000).
-        ``?project=`` scopes to one agent's graph. Unknown / cross-tenant
-        node → empty document. Read scope.
+        ``?project=`` scopes to one agent's graph; ``?project_id=`` (ADR
+        046 D1, additive) further bounds the expansion to one project's
+        subgraph. Unknown / cross-tenant / cross-project node → empty
+        document. Read scope.
         """
         store: StorageProvider = request.app.state.storage
         agent = await _resolve_node_agent(
@@ -6515,6 +6536,7 @@ def build_app(
             node_id=node_id,
             depth=depth,
             limit=limit,
+            project_id=project_id,
         )
         return GraphologyView.model_validate(doc.model_dump())
 
@@ -6531,14 +6553,16 @@ def build_app(
         project: str | None = None,
         type: str | None = None,
         limit: int | None = None,
+        project_id: str | None = None,
     ) -> GraphSearchView:
         """Substring node-label search for fly-to.
 
         A lexical match on node labels (case-insensitive) — the UI search
         box, not vector retrieval. ``?project=`` scopes to one agent;
         omit to search every agent in the tenant. ``?type=`` filters by
-        node type. Capped at the node budget. Empty ``q`` → no results.
-        Read scope, tenant-scoped.
+        node type. ``?project_id=`` (ADR 046 D1, additive) bounds matches
+        to one project's nodes. Capped at the node budget. Empty ``q`` →
+        no results. Read scope, tenant-scoped.
         """
         store: StorageProvider = request.app.state.storage
         hits = await _search_graph_nodes(
@@ -6548,6 +6572,7 @@ def build_app(
             project=project,
             type=type,
             limit=limit,
+            project_id=project_id,
         )
         results = [GraphSearchResult(key=h.key, label=h.label, type=h.type) for h in hits]
         return GraphSearchView(query=q, results=results, count=len(results))
@@ -6583,6 +6608,7 @@ def build_app(
             depth=body.depth,
             limit=body.limit,
             type=body.type,
+            project_id=body.project_id,
         )
         return GraphologyView.model_validate(doc.model_dump())
 
@@ -6599,6 +6625,7 @@ def build_app(
         ctx: AuthContext = Depends(auth_dep),
         mode: str = "knowledge",
         limit: int | None = None,
+        project: str | None = None,
     ) -> StreamingResponse:
         """Growth stream for ``project_id``'s graph over **SSE**.
 
@@ -6618,7 +6645,9 @@ def build_app(
         ``node.added`` shape; emitted when a re-ingest changes an existing
         node.)
 
-        Bounded by ``limit`` (node/edge cap). Tenant-scoped. Read scope.
+        Bounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,
+        additive) scopes the replayed window to one project's subgraph.
+        Tenant-scoped. Read scope.
 
         This is a SNAPSHOT-as-stream today (it replays the current graph
         then closes with ``done``); the live-tail seam — pushing future
@@ -6636,6 +6665,7 @@ def build_app(
             tenant_id=tenant_id,
             mode=graph_mode,
             cap=cap,
+            project_id=project,
         )
         return StreamingResponse(
             generator,

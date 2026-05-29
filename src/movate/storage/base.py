@@ -1446,6 +1446,7 @@ class StorageProvider(Protocol):
         tenant_id: str,
         query_embedding: list[float],
         limit: int = 10,
+        project_id: str | None = None,
     ) -> list[EntityWithScore]:
         """Top-K most-similar entities for the agent's graph — the vector
         SEED step of GraphRAG retrieval.
@@ -1454,7 +1455,11 @@ class StorageProvider(Protocol):
         ``(agent, tenant_id)``, compute cosine against ``query_embedding``
         in Python, return the top ``limit``. Empty graph returns ``[]``.
         Callers feed the resulting ``entity_id``s into
-        :meth:`expand_neighbors`."""
+        :meth:`expand_neighbors`.
+
+        ``project_id`` (ADR 046 D1, additive) optionally narrows to one
+        project's nodes; ``None`` (the default) keeps the historical
+        per-agent scope — project-less rows are included."""
 
     async def expand_neighbors(
         self,
@@ -1464,6 +1469,7 @@ class StorageProvider(Protocol):
         entity_ids: list[str],
         hops: int = 1,
         limit: int = 50,
+        project_id: str | None = None,
     ) -> Subgraph:
         """Bounded k-hop expansion from ``entity_ids`` — the ONLY traversal
         primitive. Returns the reached entities (including the seeds) plus
@@ -1476,6 +1482,10 @@ class StorageProvider(Protocol):
         undirected for reachability (an edge connects its endpoints both
         ways) — direction is preserved in the returned ``Relation`` rows for
         the caller to interpret.
+
+        ``project_id`` (ADR 046 D1, additive) optionally bounds the
+        traversal to one project's edges/nodes; ``None`` (the default)
+        keeps the historical per-agent scope.
 
         Implementations: recursive CTE over ``kb_relations`` on sqlite /
         postgres; breadth-first walk in :class:`InMemoryStorage`. Unknown or
@@ -1497,11 +1507,14 @@ class StorageProvider(Protocol):
         tenant_id: str,
         source_chunk_id: str | None = None,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Entity]:
         """List entities for inspection / debugging. When ``source_chunk_id``
         is set, returns only entities extracted from that chunk (drives
         provenance views — "what did this passage contribute to the
-        graph?"). Filters AND together. Empty graph → ``[]``."""
+        graph?"). ``project_id`` (ADR 046 D1, additive) optionally narrows
+        to one project's nodes; ``None`` (default) = per-agent scope.
+        Filters AND together. Empty graph → ``[]``."""
 
     async def list_relations(
         self,
@@ -1509,9 +1522,12 @@ class StorageProvider(Protocol):
         agent: str,
         tenant_id: str,
         limit: int = 1000,
+        project_id: str | None = None,
     ) -> list[Relation]:
         """List relations for inspection / debugging, scoped to
-        ``(agent, tenant_id)``. Empty graph → ``[]``."""
+        ``(agent, tenant_id)``. ``project_id`` (ADR 046 D1, additive)
+        optionally narrows to one project's edges; ``None`` (default) =
+        per-agent scope. Empty graph → ``[]``."""
 
     async def delete_graph(
         self,

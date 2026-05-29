@@ -123,6 +123,7 @@ async def ingest_path(
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
     on_file_start: Callable[[str, int, int], None] | None = None,
+    project_id: str | None = None,
 ) -> tuple[list[IngestSummary], list[tuple[str, str]]]:
     """Ingest a file or directory tree. Returns one summary per file.
 
@@ -164,6 +165,7 @@ async def ingest_path(
                 build_graph=build_graph,
                 extraction_model=extraction_model,
                 complete_fn=complete_fn,
+                project_id=project_id,
             )
         except EmbeddingError as exc:
             # Transient network or rate-limit failure — continue with
@@ -188,6 +190,7 @@ async def _ingest_one_file(
     build_graph: bool = False,
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
+    project_id: str | None = None,
 ) -> IngestSummary | None:
     """Read + parse + ingest a single file.
 
@@ -248,6 +251,7 @@ async def _ingest_one_file(
         build_graph=build_graph,
         extraction_model=extraction_model,
         complete_fn=complete_fn,
+        project_id=project_id,
     )
     if summary is not None:
         summary.chunks_removed = chunks_removed
@@ -268,6 +272,7 @@ async def ingest_text(
     build_graph: bool = False,
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
+    project_id: str | None = None,
 ) -> IngestSummary | None:
     """Chunk + embed + persist ``text`` as KB content for ``agent``.
 
@@ -357,6 +362,7 @@ async def ingest_text(
             extraction_model=extraction_model,
             api_key=api_key,
             complete_fn=complete_fn,
+            project_id=project_id,
         )
 
     return IngestSummary(
@@ -379,10 +385,13 @@ async def _build_graph_for_chunks(
     extraction_model: str,
     api_key: str | None,
     complete_fn: CompleteFn | None,
+    project_id: str | None = None,
 ) -> tuple[int, int]:
     """Extract a knowledge graph from ``chunks`` and upsert it. Returns
     ``(entities_saved, relations_saved)``. The chunks must already be
-    persisted — their ``chunk_id``s become the graph's source provenance."""
+    persisted — their ``chunk_id``s become the graph's source provenance.
+    ``project_id`` (ADR 046 D1, additive) tags every node/edge for
+    project-grain scoping; ``None`` leaves the column null."""
     entities, relations = await extract_graph(
         chunks,
         agent=agent,
@@ -391,6 +400,7 @@ async def _build_graph_for_chunks(
         model=extraction_model,
         api_key=api_key,
         complete_fn=complete_fn,
+        project_id=project_id,
     )
     for entity in entities:
         await storage.upsert_entity(entity)

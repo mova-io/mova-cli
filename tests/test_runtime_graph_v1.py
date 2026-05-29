@@ -414,3 +414,66 @@ async def test_cross_tenant_node_detail_404(client: TestClient, storage: InMemor
     await storage.upsert_entity(_entity("x1", "Secret", "Other", tenant="other-tenant"))
     resp = client.get("/api/v1/graph/nodes/x1", headers={"Authorization": auth_a})
     assert resp.status_code == 404
+
+
+# ----------------------------------------------------------------------
+# Project scoping (ADR 046 D1) — the ?project= data filter
+# ----------------------------------------------------------------------
+
+
+async def _seed_two_projects(storage: InMemoryStorage, tenant: str) -> None:
+    """n1/n2 belong to project p1; n3 belongs to p2; n4 is project-less."""
+    await storage.upsert_entity(
+        _entity("n1", "SAML SSO", "Feature", tenant=tenant, project_id="p1")
+    )
+    await storage.upsert_entity(
+        _entity("n2", "Auth System", "System", tenant=tenant, project_id="p1")
+    )
+    await storage.upsert_entity(_entity("n3", "Billing", "System", tenant=tenant, project_id="p2"))
+    await storage.upsert_entity(_entity("n4", "Legacy", "Other", tenant=tenant))
+    await storage.upsert_relation(
+        _relation("e1", "n1", "n2", tenant=tenant, weight=0.8, project_id="p1")
+    )
+
+
+async def test_subgraph_project_filter_scopes_data(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    tenant, auth = await _mint(storage)
+    await _seed_two_projects(storage, tenant)
+
+    # ?project=p1 → only p1's nodes/edges (the graph viewer's per-project view).
+    resp = client.get(
+        f"/api/v1/projects/{AGENT}/graph",
+        params={"project": "p1"},
+        headers={"Authorization": auth},
+    )
+    assert resp.status_code == 200
+    keys = {n["key"] for n in resp.json()["nodes"]}
+    assert keys == {"n1", "n2"}
+
+
+async def test_subgraph_no_project_filter_is_full_agent_graph(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    tenant, auth = await _mint(storage)
+    await _seed_two_projects(storage, tenant)
+
+    # No ?project= → the full per-agent graph (backward-compatible default).
+    resp = client.get(f"/api/v1/projects/{AGENT}/graph", headers={"Authorization": auth})
+    keys = {n["key"] for n in resp.json()["nodes"]}
+    assert keys == {"n1", "n2", "n3", "n4"}
+
+
+async def test_graph_search_project_filter(client: TestClient, storage: InMemoryStorage) -> None:
+    tenant, auth = await _mint(storage)
+    await _seed_two_projects(storage, tenant)
+
+    resp = client.get(
+        "/api/v1/graph/search",
+        params={"q": "system", "project": AGENT, "project_id": "p1"},
+        headers={"Authorization": auth},
+    )
+    assert resp.status_code == 200
+    keys = {h["key"] for h in resp.json()["results"]}
+    assert keys == {"n2"}  # "Auth System" in p1; "Billing" (System) is p2
