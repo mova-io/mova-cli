@@ -18,6 +18,7 @@ present so the help stays a contract.
 from __future__ import annotations
 
 import builtins
+import re
 
 import pytest
 import typer
@@ -37,9 +38,25 @@ _SERVE = ["playground", "serve"]
 
 
 def _help_text() -> str:
-    result = runner.invoke(app, [*_SERVE, "--help"])
+    """Render ``mdk playground serve --help`` as a CI-robust string.
+
+    Two CI-specific gotchas the help assertions have to defeat (same
+    recipe as ``tests/test_version_v_shortcut.py``):
+
+    1. **Narrow-terminal truncation/wrap**: in CI's non-TTY terminal Rich
+       renders the options panel too narrow, so flag names wrap or get
+       elided. Force a wide terminal via ``env={"COLUMNS": "200"}``.
+    2. **ANSI escapes inside option names**: CI runs with ``FORCE_COLOR=1``,
+       so Rich styles ``--`` and the flag name as separate spans — a raw
+       substring search misses them. Strip ANSI, then collapse whitespace
+       so wrapped/padded flag rows flatten to a single searchable string.
+    """
+    result = runner.invoke(app, [*_SERVE, "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    return result.stdout
+    # Strip ANSI escapes first (CI sets FORCE_COLOR=1).
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.stdout)
+    # Then collapse all whitespace (wrap newlines + Rich table padding).
+    return " ".join(plain.split())
 
 
 def test_help_does_not_mention_nonexistent_api_key_env_flag() -> None:
