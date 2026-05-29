@@ -1,8 +1,14 @@
 # ADR 013 — End-to-end identity: `mdk login` (SSO), scopes, and an optional edge gateway
 
-**Status:** Proposed
-**Date:** 2026-05-23
+**Status:** Accepted (partially shipped)
+**Date:** 2026-05-23 (proposed); 2026-05-27 (accepted — L2 scopes shipped; L1 SSO + L3 gateway remaining)
 **Deciders:** Engineering (auth/security — Deva sign-off required for the IdP + gateway choices, per ADR 001)
+
+> **Reconcile note (2026-05-27).** Accepted retroactively: the L2 least-privilege
+> scope model is shipped and enforced — scope vocabulary + `mint_api_key(scopes=…)`
+> in `src/movate/core/auth.py`, `require_scope` per-endpoint in
+> `src/movate/runtime/middleware.py`, and `--scope` minting in `src/movate/cli/auth.py`.
+> L1 `mdk login`/SSO and the L3 optional edge gateway remain proposed.
 **Context window:** v1.0 Azure operability — "make accessing live endpoints easy + auth scalable/reliable/secure"
 **Supersedes:** N/A
 **Builds on:** ADR 012 (run-side auth resilience — the runtime *accepts* OIDC JWTs; this ADR adds the *human login* + *authorization* + *front door* around it)
