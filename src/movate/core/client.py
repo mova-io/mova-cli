@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from movate.core.models import JobKind, JobStatus, WorkflowStatus
+from movate.core.models import JobKind, JobStatus, ProjectMemberRole, WorkflowStatus
 from movate.runtime.schemas import (
     AgentListView,
     AnalyzeAcceptedView,
@@ -32,6 +32,10 @@ from movate.runtime.schemas import (
     JobView,
     ObservabilityHealthView,
     ObservabilityInsightListView,
+    ProjectListResponse,
+    ProjectMemberListView,
+    ProjectMemberView,
+    ProjectView,
     RunAccepted,
     RunSubmission,
     RunView,
@@ -379,6 +383,105 @@ class MovateClient:
         )
         self._raise_for_status(r)
         return RunAccepted.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Projects (ADR 040)
+    # ------------------------------------------------------------------
+
+    async def create_project(
+        self,
+        *,
+        name: str,
+        description: str | None = None,
+        owner_principal_id: str | None = None,
+    ) -> ProjectView:
+        """``POST /api/v1/projects`` — create a project in the tenant."""
+        body: dict[str, Any] = {"name": name}
+        if description is not None:
+            body["description"] = description
+        if owner_principal_id is not None:
+            body["owner_principal_id"] = owner_principal_id
+        r = await self._client.post("/api/v1/projects", json=body)
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def list_projects(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> ProjectListResponse:
+        """``GET /api/v1/projects`` — tenant-scoped, newest-first."""
+        params: dict[str, str | int] = {
+            "include_archived": "true" if include_archived else "false",
+            "limit": limit,
+        }
+        if after_id is not None:
+            params["after_id"] = after_id
+        r = await self._client.get("/api/v1/projects", params=params)
+        self._raise_for_status(r)
+        return ProjectListResponse.model_validate(r.json())
+
+    async def get_project(self, project_id: str) -> ProjectView:
+        """``GET /api/v1/projects/{id}``."""
+        r = await self._client.get(f"/api/v1/projects/{project_id}")
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        if_match: str | None = None,
+    ) -> ProjectView:
+        """``PUT /api/v1/projects/{id}`` — rename / re-describe.
+
+        ``if_match`` opts into optimistic concurrency (412 on stale).
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        headers = {"If-Match": if_match} if if_match else None
+        r = await self._client.put(f"/api/v1/projects/{project_id}", json=body, headers=headers)
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def archive_project(self, project_id: str) -> ProjectView:
+        """``DELETE /api/v1/projects/{id}`` — soft-delete (archive)."""
+        r = await self._client.delete(f"/api/v1/projects/{project_id}")
+        self._raise_for_status(r)
+        return ProjectView.model_validate(r.json())
+
+    async def list_project_members(self, project_id: str) -> ProjectMemberListView:
+        """``GET /api/v1/projects/{id}/members``."""
+        r = await self._client.get(f"/api/v1/projects/{project_id}/members")
+        self._raise_for_status(r)
+        return ProjectMemberListView.model_validate(r.json())
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        *,
+        principal_id: str,
+        role: ProjectMemberRole,
+    ) -> ProjectMemberView:
+        """``POST /api/v1/projects/{id}/members``."""
+        r = await self._client.post(
+            f"/api/v1/projects/{project_id}/members",
+            json={"principal_id": principal_id, "role": role.value},
+        )
+        self._raise_for_status(r)
+        return ProjectMemberView.model_validate(r.json())
+
+    async def remove_project_member(self, project_id: str, principal_id: str) -> None:
+        """``DELETE /api/v1/projects/{id}/members/{principal_id}``."""
+        r = await self._client.delete(f"/api/v1/projects/{project_id}/members/{principal_id}")
+        self._raise_for_status(r)
 
     # ------------------------------------------------------------------
     # Convenience: poll until terminal

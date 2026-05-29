@@ -222,6 +222,7 @@ from movate.cli.observability_cmd import observability_app  # noqa: E402
 from movate.cli.playground import playground_app  # noqa: E402
 from movate.cli.policy_cmd import policy_app  # noqa: E402
 from movate.cli.profiles_cmd import profiles_app  # noqa: E402
+from movate.cli.project_cmd import project_app  # noqa: E402
 from movate.cli.runs import runs_app  # noqa: E402
 from movate.cli.scaffold import scaffold_app  # noqa: E402
 from movate.cli.schema_cmd import schema_app  # noqa: E402
@@ -617,6 +618,11 @@ app.command("promote", rich_help_panel=PANEL_MANAGE)(promote_cmd.promote)
 app.command("audit", rich_help_panel=PANEL_MANAGE)(audit_cmd.audit)
 app.add_typer(guardrails_app, name="guardrails", rich_help_panel=PANEL_MANAGE)
 app.add_typer(tenants_app, name="tenants", rich_help_panel=PANEL_MANAGE)
+# `project` exposes ADR 040's tenant-scoped Project CRUD + membership over
+# the deployed runtime's /api/v1/projects* surface. MANAGE panel because
+# it's a roster/lifecycle command (sibling to `tenants` and `agent`); the
+# project-attachment commands (agents/workflows/KBs) ship in later PRs.
+app.add_typer(project_app, name="project", rich_help_panel=PANEL_MANAGE)
 # `agent` surfaces the durable agent registry's version history + rollback
 # (ADR 014 D3). Lives in MANAGE next to `rollback` / `promote` / `tenants`
 # since it's a registry-lifecycle operation, not authoring (that's `dev`).

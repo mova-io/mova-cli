@@ -87,6 +87,21 @@ EXPECTED_ROUTES: dict[tuple[str, str], str | None] = {
     ("POST", "/api/v1/observability/analyze"): "admin",
     # events — ADR 035 D1 events outbox (read-only feed)
     ("GET", "/api/v1/events"): "read",
+    # projects (ADR 040) — tenant-scoped containers + membership.
+    # Create/update/archive + member-mutations: ``admin`` scope OR the
+    # project ``owner`` role (the role check is per-request in the
+    # handler; the scope gate pinned here is the static signal the
+    # contract test can read off the route).
+    ("POST", "/api/v1/projects"): "admin",
+    ("GET", "/api/v1/projects"): "read",
+    ("GET", "/api/v1/projects/{project_id}"): "read",
+    ("PUT", "/api/v1/projects/{project_id}"): None,
+    ("DELETE", "/api/v1/projects/{project_id}"): None,
+    ("GET", "/api/v1/projects/{project_id}/members"): "read",
+    ("POST", "/api/v1/projects/{project_id}/members"): None,
+    ("GET", "/api/v1/projects/{project_id}/members/{principal_id}"): "read",
+    ("PATCH", "/api/v1/projects/{project_id}/members/{principal_id}"): None,
+    ("DELETE", "/api/v1/projects/{project_id}/members/{principal_id}"): None,
 }
 
 
