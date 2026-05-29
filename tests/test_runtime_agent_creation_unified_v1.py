@@ -177,9 +177,10 @@ def test_spec_source_persists_canonical_bundle(
     spec = yaml.safe_load(on_disk_yaml)
     assert spec["name"] == "faq-bot"
     assert spec["model"]["provider"] == "openai/gpt-4o-mini"
-    # Project attachment degrades cleanly when the storage backend
-    # doesn't implement attach_agent_to_project.
-    assert body["attached"] is False
+    # The projects-storage layer (ADR 040 / #549) is now part of the
+    # integrated backend, so the freshly-persisted agent is attached to
+    # the project rather than degrading to attached=False.
+    assert body["attached"] is True
 
 
 def test_spec_name_in_url_overrides_spec_name(

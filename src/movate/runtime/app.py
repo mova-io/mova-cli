@@ -7732,9 +7732,17 @@ def build_app(
         request: Request,
         ctx: AuthContext = Depends(auth_dep),
     ) -> StreamingResponse:
-        """SSE feed of generation progress for one eval-generation job.
+        """SSE feed of job progress, dispatched by job-id format.
 
-        Frame shape (one ``data: <json>\\n\\n`` per event):
+        ``evgen_*`` ids stream eval-generation progress (this handler's
+        primary path); every other id falls through to the audit-job
+        SSE stream (ADR 043 — audit jobs run on the worker dispatch
+        path and replay their terminal state). Both share the one
+        ``GET /jobs/{job_id}/stream`` route + ``read`` scope; the
+        discriminator is the id prefix so the front end uses a single
+        endpoint regardless of job kind.
+
+        Eval-generation frame shape (one ``data: <json>\\n\\n`` per event):
 
         * ``{"event": "category_complete", "category": str, "cases_so_far": int}``
         * ``{"event": "judge_drafted", "preview": str}`` (only with ``include_judge=true``)
@@ -7749,6 +7757,18 @@ def build_app(
         client always sees a final frame.
         """
         store: StorageProvider = request.app.state.storage
+
+        # Non-eval-generation ids dispatch to the audit-job SSE stream.
+        if not job_id.startswith("evgen_"):
+            audit_job = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+            if audit_job is None or audit_job.kind != JobKind.AUDIT:
+                raise not_found("job", job_id)
+            return StreamingResponse(
+                _sse_audit_job_stream(store=store, job=audit_job, tenant_id=ctx.tenant_id),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
         # Tenant-scoped existence check — also handles the
         # "job finished before client connected" replay path.
         job = await store.get_eval_generation_job(job_id, tenant_id=ctx.tenant_id)
@@ -8235,44 +8255,13 @@ def build_app(
             raise not_found("audit", audit_id)
         return AuditJobView.from_record(record)
 
-    @v1.get(
-        "/jobs/{job_id}/stream",
-        # No response_model — SSE raw byte stream. OpenAPI lists 200.
-        tags=["audit-v1", "jobs"],
-        dependencies=[_scope("read")],
-    )
-    async def v1_audit_job_stream(
-        job_id: str,
-        request: Request,
-        ctx: AuthContext = Depends(auth_dep),
-    ) -> Any:
-        """Stream audit progress over Server-Sent Events.
-
-        Audit-only: a non-audit job returns 404 here (the stream wire
-        is category-specific). Events:
-
-        * ``category_complete`` — fired after each per-category
-          sub-agent returns, with ``findings_so_far`` running total.
-        * ``agent_complete`` — fired after every category for one agent
-          has run (always once on the agent path; one per agent on the
-          project path).
-        * ``completed`` — terminal frame with ``total_findings`` +
-          ``cost_usd``.
-
-        The stream emits progress against the WORKER's terminal
-        ``save_audit`` call: if the job is already terminal when the
-        client subscribes, the stream replays the final state + closes.
-        """
-        store: StorageProvider = request.app.state.storage
-        job = await store.get_job(job_id, tenant_id=ctx.tenant_id)
-        if job is None or job.kind != JobKind.AUDIT:
-            raise not_found("audit_job", job_id)
-
-        generator = _sse_audit_job_stream(store=store, job=job, tenant_id=ctx.tenant_id)
-        return StreamingResponse(
-            generator,
-            media_type="text/event-stream",
-        )
+    # NOTE: audit-job SSE streaming is served by the unified
+    # ``GET /jobs/{job_id}/stream`` handler (``v1_eval_generate_stream``)
+    # which dispatches non-``evgen_`` ids to ``_sse_audit_job_stream``.
+    # A second route registration on the same path would shadow the
+    # unified dispatcher, so the audit handler is intentionally not
+    # registered separately here (avoids the route collision that 404'd
+    # audit-job streams when the eval-generation handler matched first).
 
     # ------------------------------------------------------------------
     # Aggregate monitor feed (ADR 032 D2). Two read-scoped endpoints that

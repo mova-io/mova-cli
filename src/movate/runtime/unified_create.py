@@ -153,9 +153,11 @@ async def attach_to_project(
     succeeds (the agent IS persisted), and the UI can call
     the projects endpoint later once it ships.
 
-    Tenant scoping: the attach call is tenant-scoped; storage
-    backends MUST refuse cross-tenant attachment with their own
-    error type so we don't leak project existence here.
+    Tenant scoping: the project itself is tenant-owned (the caller
+    resolves ``project_id`` within ``tenant_id`` before this point),
+    so the storage Protocol's ``attach_agent_to_project`` is a thin
+    ``(project_id, agent_name)`` junction insert — the tenant is
+    derived from the project row, not re-passed here.
     """
     attach_method = getattr(storage, "attach_agent_to_project", None)
     if attach_method is None:
@@ -167,7 +169,6 @@ async def attach_to_project(
         await attach_method(
             project_id=project_id,
             agent_name=agent_name,
-            tenant_id=tenant_id,
         )
     except LookupError as exc:
         # Project doesn't exist — surface up as 404 via AgentCreationError.
@@ -207,11 +208,20 @@ async def clone_from_catalog(
     Resolution order (delegates to storage when the catalog read
     API ships):
 
-    1. ``storage.get_catalog_entry(slug, version, tenant_id=...)``
-       — the canonical lookup, returns ``{files: {...}, version: ...}``.
-    2. Missing method on storage → raise :class:`AgentCreationError`
-       with ``status_code=503`` so the endpoint surfaces a "catalog
-       read API not deployed" message rather than 500.
+    1. ``storage.get_catalog_entry(slug, version=, tenant_id=...)``
+       — the bundle-returning lookup this clone path expects, returning
+       ``{files: {...}, version: ...}``.
+    2. Missing (or signature-incompatible) method on storage → raise
+       :class:`AgentCreationError` with ``status_code=503`` so the
+       endpoint surfaces a "catalog read API not deployed" message
+       rather than 500.
+
+    The bundle-returning ``get_catalog_entry(slug, version=, ...)``
+    shape this path needs is distinct from the catalog-storage Protocol's
+    metadata-only ``get_catalog_entry(slug, source=, ...)`` (ADR 041 PR1
+    / #548). Until the bundle-returning clone API ships, callers see a
+    clean 503 — we detect the mismatch by checking the method accepts a
+    ``version`` parameter rather than blindly invoking it.
 
     Overrides merge: ``req.overrides`` is a partial dict that's
     shallow-merged into the cloned ``agent.yaml`` — e.g.
@@ -223,13 +233,25 @@ async def clone_from_catalog(
     agent decoupled from the source per ADR 041 D6 (catalog clones
     don't auto-sync).
     """
+    import inspect  # noqa: PLC0415
+
     catalog_method = getattr(storage, "get_catalog_entry", None)
+    _catalog_unavailable = AgentCreationError(
+        "catalog clone read API not yet available on this storage backend; "
+        "source=catalog requires the bundle-returning catalog-clone API to be deployed",
+        status_code=503,
+    )
     if catalog_method is None:
-        raise AgentCreationError(
-            "catalog read API not yet available on this storage backend; "
-            "source=catalog requires the catalog-storage PR to be deployed",
-            status_code=503,
-        )
+        raise _catalog_unavailable
+    # The metadata-only Protocol method (#548) takes ``source`` and returns a
+    # CatalogEntry, not the bundle dict this clone path needs. Treat that — and
+    # anything else that doesn't accept ``version`` — as "clone API absent".
+    try:
+        _sig = inspect.signature(catalog_method)
+    except (TypeError, ValueError):
+        raise _catalog_unavailable from None
+    if "version" not in _sig.parameters:
+        raise _catalog_unavailable
 
     try:
         entry = await catalog_method(

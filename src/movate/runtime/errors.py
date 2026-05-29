@@ -198,6 +198,12 @@ ERROR_HINTS: dict[str, ErrorHint] = dict(
             retriable=True,
         ),
         _hint(
+            ErrorCode.QUOTA_EXCEEDED.value,
+            "Your tenant's usage quota for this window is exhausted; wait for the "
+            "window to reset (see `Retry-After`) or request a higher quota.",
+            retriable=True,
+        ),
+        _hint(
             ErrorCode.PAYLOAD_TOO_LARGE.value,
             "Shrink the request body below the limit named in the message "
             "(or raise `MDK_MAX_REQUEST_BYTES` on the runtime).",
