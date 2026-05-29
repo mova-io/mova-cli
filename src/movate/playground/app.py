@@ -65,6 +65,7 @@ they're unit-testable on a no-extras install.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
@@ -92,6 +93,8 @@ from movate.playground.conversation import (
 )
 from movate.playground.state import resolve_data_layer_config
 from movate.playground.uploads import UploadOutcome, UploadStore, adapt_upload
+
+logger = logging.getLogger(__name__)
 
 # Session keys (kept as constants so set/get can't typo-drift).
 _K_CLIENT = "client"
@@ -156,8 +159,29 @@ if _DATA_LAYER_CFG.enabled:
         :mod:`movate.playground.state`). Best-effort: if the data-layer
         deps aren't importable, we degrade to no persistence rather than
         crashing the whole UI.
+
+        Returning ``None`` is how Chainlit expresses "no data layer" —
+        ``chainlit.data.get_data_layer()`` hands the function's return value
+        straight back and every caller guards with ``if get_data_layer():``,
+        so a missing dependency drops persistence instead of breaking the UI.
         """
-        from chainlit.data.sql_alchemy import SQLAlchemyDataLayer  # noqa: PLC0415
+        # SQLAlchemyDataLayer (and its async engine) needs ``sqlalchemy`` +
+        # ``greenlet`` — both declared in the [playground] extra. If the
+        # operator's environment is missing them (partial install, packaging
+        # drift), degrade to no persistence rather than crashing the whole
+        # playground on startup / first request.
+        try:
+            from chainlit.data.sql_alchemy import SQLAlchemyDataLayer  # noqa: PLC0415
+        except ImportError:
+            logger.warning(
+                "Playground history disabled: the conversation-history data "
+                "layer needs 'sqlalchemy' (and 'greenlet'), which aren't "
+                "importable. Reinstall the playground extra "
+                "(`uv pip install 'movate-cli[playground]'`) to enable the "
+                "past-conversations sidebar. Continuing without persistence.",
+                exc_info=True,
+            )
+            return None
 
         if _DATA_LAYER_CFG.postgres_url:
             conninfo = _DATA_LAYER_CFG.postgres_url
