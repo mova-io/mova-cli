@@ -51,6 +51,8 @@ from movate.core.models import (
     ProjectWorkflow,
     Relation,
     RunRecord,
+    Session,
+    SessionMessage,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -101,6 +103,10 @@ class InMemoryStorage:
         self.entities: list[Entity] = []
         self.relations: list[Relation] = []
         self.conversation_threads: list[ConversationThread] = []
+        # ADR 045 D10: stateful sessions + their messages. Lists for
+        # direct test assertion (matches the other entities here).
+        self.sessions: list[Session] = []
+        self.session_messages: list[SessionMessage] = []
         self.eval_schedules: list[EvalSchedule] = []
         self.job_schedules: list[JobSchedule] = []
         self.triggers: list[Trigger] = []
@@ -1905,6 +1911,77 @@ class InMemoryStorage:
             if not (t.thread_id == thread_id and t.tenant_id == tenant_id)
         ]
         return len(self.conversation_threads) < before
+
+    # ------------------------------------------------------------------
+    # Stateful sessions (ADR 045 D10)
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session: Session) -> None:
+        # Upsert on session_id — matches the Postgres ON CONFLICT /
+        # sqlite INSERT OR REPLACE semantics.
+        self.sessions = [s for s in self.sessions if s.session_id != session.session_id]
+        self.sessions.append(session)
+
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> Session | None:
+        for s in self.sessions:
+            if s.session_id == session_id and s.tenant_id == tenant_id:
+                return s
+        return None
+
+    async def list_sessions(
+        self,
+        *,
+        tenant_id: str,
+        agent: str | None = None,
+        limit: int = 100,
+    ) -> list[Session]:
+        rows = [s for s in self.sessions if s.tenant_id == tenant_id]
+        if agent is not None:
+            rows = [s for s in rows if s.agent == agent]
+        rows = sorted(rows, key=lambda s: s.updated_at, reverse=True)
+        return rows[: int(limit)]
+
+    async def append_session_message(self, message: SessionMessage) -> None:
+        self.session_messages.append(message)
+
+    async def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        limit: int = 1000,
+    ) -> list[SessionMessage]:
+        rows = [
+            m
+            for m in self.session_messages
+            if m.session_id == session_id and m.tenant_id == tenant_id
+        ]
+        rows = sorted(rows, key=lambda m: m.created_at)
+        return rows[: int(limit)]
+
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+    ) -> bool:
+        self.session_messages = [
+            m
+            for m in self.session_messages
+            if not (m.session_id == session_id and m.tenant_id == tenant_id)
+        ]
+        before = len(self.sessions)
+        self.sessions = [
+            s
+            for s in self.sessions
+            if not (s.session_id == session_id and s.tenant_id == tenant_id)
+        ]
+        return len(self.sessions) < before
 
     async def list_feedback(
         self,
