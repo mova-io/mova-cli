@@ -149,6 +149,7 @@ from movate.cli import (  # noqa: E402
     dev_cmd,
     diff_cmd,
     eval_gen_cmd,
+    eval_generate_cmd,
     eval_harvest_cmd,
     eval_schedule_cmd,
     eval_scorecard_cmd,
@@ -508,6 +509,17 @@ app.command("eval-harvest", rich_help_panel=PANEL_RUN)(eval_harvest_cmd.harvest)
 # Sibling (not subcommand) because restructuring `eval` to a Typer
 # sub-app would break ~30 test callsites. See eval_gen_cmd docstring.
 app.command("eval-gen", rich_help_panel=PANEL_RUN)(eval_gen_cmd.eval_gen)
+# `eval-generate` (+ `eval-generate-commit`) wire the runtime API
+# `POST /api/v1/agents/{name}/evals/generate` for the review-then-commit
+# pattern. Sibling pattern (NOT a Typer sub-app under `eval`) because
+# restructuring `eval` would break ~30 test callsites — same call as
+# the eval-gen one above. The two commands hit a deployed runtime over
+# HTTP, while the local `eval-gen` command runs in-process. See the
+# eval_generate_cmd module docstring for the why.
+app.command("eval-generate", rich_help_panel=PANEL_RUN)(eval_generate_cmd.eval_generate)
+app.command("eval-generate-commit", rich_help_panel=PANEL_RUN)(
+    eval_generate_cmd.eval_generate_commit
+)
 # `eval-scorecard` is the Phase 1 of the new eval flow: LLM-generated
 # test cases + 10-category scorecard. Sibling pattern like eval-gen.
 # Phase 3 will swap bare `mdk eval` to use this flow as the default.

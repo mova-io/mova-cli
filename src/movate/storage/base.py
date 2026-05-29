@@ -23,10 +23,13 @@ path is enforced by ``check_record``, not the storage method.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 from typing import Protocol
 
 from movate.core.dr_backup import ImportResult
+from movate.core.eval_generator import EvalGenerationJob
 from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
@@ -67,6 +70,22 @@ from movate.core.models import (
 )
 from movate.core.observability.models import ObservabilityInsight
 from movate.core.webhooks import WebhookAttempt, WebhookSubscription
+
+
+@dataclass(frozen=True)
+class EvalCommitResult:
+    """What :meth:`StorageProvider.commit_eval_cases` returns on success.
+
+    Carried in the ``POST /jobs/{id}/commit`` response so the caller
+    knows exactly what landed on disk + how many cases were appended
+    (selective acceptance: the response's ``cases_added`` may be less
+    than the job's total when ``case_ids`` was a subset).
+    """
+
+    agent_name: str
+    dataset_path: str
+    cases_added: int
+    judge_yaml_updated: bool
 
 
 class StorageProvider(Protocol):
@@ -2070,6 +2089,72 @@ class StorageProvider(Protocol):
         is denormalized for cheap tenant-bounded reads. The worker
         advances this AFTER recording the attempt — at-least-once on
         crash is acceptable (subscribers dedupe on ``X-MDK-Event-Id``).
+        """
+
+    # ------------------------------------------------------------------
+    # Eval-generation jobs (ADR 038 sibling — ``mdk eval generate``)
+    #
+    # A separate kind of async job from the queue-driven JobRecord: an
+    # ``evals/generate`` job is **runtime-resident** (a single FastAPI
+    # process drives it via an asyncio.Task, streaming SSE progress),
+    # not picked up off a worker queue. Persistence is just so the status
+    # GET + commit endpoint can read back what generation produced.
+    #
+    # Additive new table — no row exists unless a caller hit the
+    # generate endpoint, so non-generate behavior is byte-for-byte the
+    # pre-feature path. Tenant-scoped reads + commits follow the standard
+    # 404-not-403 contract.
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: EvalGenerationJob) -> None:
+        """Upsert one eval-generation job keyed by ``job_id``.
+
+        Called twice in the normal lifecycle: once when the
+        ``POST /evals/generate`` route accepts a request (``status=running``,
+        no result), once when the pipeline completes (``status=completed``
+        or ``failed``, ``result`` and ``cost_usd`` populated). The second
+        call replaces the first in place — last write wins.
+        """
+
+    async def get_eval_generation_job(
+        self, job_id: str, *, tenant_id: str
+    ) -> EvalGenerationJob | None:
+        """Fetch one eval-generation job by id, scoped to ``tenant_id``.
+
+        Returns ``None`` if no match OR if the job belongs to a different
+        tenant — same 404-not-403 contract as :meth:`get_job` so a caller
+        can't probe for other tenants' generation jobs.
+        """
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Path,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> EvalCommitResult:
+        """Atomically append accepted cases to the agent's dataset.
+
+        Reads the generation job by ``(job_id, tenant_id)``, filters its
+        cases to ``case_ids`` (None ⇒ accept ALL), serializes each case
+        as a JSONL line via
+        :func:`movate.core.eval_generator.serialize_case_for_dataset`,
+        and appends them to the agent dir's ``evals/dataset.jsonl`` on
+        disk. When ``commit_judge=True`` AND the job produced a judge,
+        ``evals/judge.yaml`` is also written (atomic, replace-in-place —
+        a re-commit overwrites the judge with the latest draft).
+
+        Storage-layer responsibility: this is the ONLY path that mutates
+        the agent's bundle. Generation alone never touches disk. The
+        agent dir is resolved as ``agents_path / job.agent_name`` —
+        callers (the runtime) pass the configured agents path; tests
+        pass a tmp path.
+
+        Returns an :class:`EvalCommitResult` reporting the dataset path
+        and per-step counts. Raises :class:`FileNotFoundError` if the
+        agent dir doesn't exist (the route handler maps that to 404).
         """
 
     async def close(self) -> None: ...

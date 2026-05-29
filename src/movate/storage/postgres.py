@@ -1013,6 +1013,35 @@ CREATE TABLE IF NOT EXISTS webhook_cursors (
     updated_at    TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_cursors_tenant ON webhook_cursors(tenant_id);
+-- Eval-generation jobs (``mdk eval generate``). Runtime-resident,
+-- SSE-driven; persistence is so the status GET + commit endpoint can
+-- read back what generation produced. Additive new table (CREATE TABLE
+-- IF NOT EXISTS, idempotent) — no row exists unless a caller hit the
+-- generate endpoint, so non-generate behavior is byte-for-byte the
+-- pre-feature path. ``result`` is a JSONB :class:`GenerationResult`
+-- (cases + judge + cost) populated when the pipeline finishes;
+-- ``error`` is populated on failure. Both NULL while status='running'.
+CREATE TABLE IF NOT EXISTS eval_generation_jobs (
+    job_id          TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    agent_name      TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    count_requested INTEGER NOT NULL,
+    categories      JSONB NOT NULL,
+    include_judge   BOOLEAN NOT NULL DEFAULT FALSE,
+    model           TEXT NOT NULL,
+    budget_usd      DOUBLE PRECISION,
+    progress        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    result          JSONB,
+    error           JSONB,
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    created_at      TIMESTAMPTZ NOT NULL,
+    completed_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_eval_gen_jobs_tenant_created
+    ON eval_generation_jobs(tenant_id, created_at DESC);
 """
 
 
@@ -4483,6 +4512,157 @@ class PostgresProvider:
             last_event_id,
             datetime.now(UTC),
         )
+
+    # Eval-generation jobs (``mdk eval generate``)
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: Any) -> None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        assert isinstance(job, EvalGenerationJob)
+        # The JSONB codec on the pool round-trips dict ↔ JSONB, but
+        # `categories` is a list — asyncpg's JSONB encoder handles lists
+        # too via json.dumps. ``created_at`` / ``completed_at`` arrive
+        # as ISO strings from the EvalGenerationJob dataclass (it's
+        # frozen + json-safe); we cast to datetime so TIMESTAMPTZ accepts
+        # them. NULL preserved when absent.
+        created_at = _parse_iso(job.created_at) if job.created_at else datetime.now(UTC)
+        completed_at = _parse_iso(job.completed_at) if job.completed_at else None
+        await self._db.execute(
+            """
+            INSERT INTO eval_generation_jobs (
+                job_id, tenant_id, agent_name, status, description,
+                count_requested, categories, include_judge, model,
+                budget_usd, progress, result, error, tokens_used,
+                cost_usd, created_at, completed_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17
+            )
+            ON CONFLICT (job_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                progress = EXCLUDED.progress,
+                result = EXCLUDED.result,
+                error = EXCLUDED.error,
+                tokens_used = EXCLUDED.tokens_used,
+                cost_usd = EXCLUDED.cost_usd,
+                completed_at = EXCLUDED.completed_at
+            """,
+            job.job_id,
+            job.tenant_id,
+            job.agent_name,
+            job.status,
+            job.description,
+            job.count,
+            list(job.categories),
+            job.include_judge,
+            job.model,
+            job.budget_usd,
+            job.progress,
+            job.result,
+            job.error,
+            job.tokens_used,
+            job.cost_usd,
+            created_at,
+            completed_at,
+        )
+
+    async def get_eval_generation_job(self, job_id: str, *, tenant_id: str) -> Any | None:
+        from movate.core.eval_generator import EvalGenerationJob  # noqa: PLC0415
+
+        row = await self._db.fetchrow(
+            "SELECT * FROM eval_generation_jobs WHERE job_id = $1 AND tenant_id = $2",
+            job_id,
+            tenant_id,
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        return EvalGenerationJob(
+            job_id=d["job_id"],
+            tenant_id=d["tenant_id"],
+            agent_name=d["agent_name"],
+            status=d["status"],
+            description=d["description"],
+            count=d["count_requested"],
+            categories=list(d["categories"] or []),
+            include_judge=d["include_judge"],
+            model=d["model"],
+            budget_usd=d["budget_usd"],
+            progress=d["progress"],
+            result=d.get("result"),
+            error=d.get("error"),
+            tokens_used=d["tokens_used"],
+            cost_usd=d["cost_usd"],
+            created_at=d["created_at"].isoformat() if d.get("created_at") else "",
+            completed_at=d["completed_at"].isoformat() if d.get("completed_at") else None,
+        )
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Any,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> Any:
+        from pathlib import Path  # noqa: PLC0415
+
+        from movate.core.eval_generator import serialize_case_for_dataset  # noqa: PLC0415
+        from movate.storage.base import EvalCommitResult  # noqa: PLC0415
+
+        job = await self.get_eval_generation_job(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise FileNotFoundError(f"eval-generation job {job_id!r} not found")
+        if job.result is None:
+            raise ValueError(f"job {job_id!r} status={job.status!r} — no result to commit")
+        cases = list(job.result.get("cases") or [])
+        if case_ids is not None:
+            wanted = set(case_ids)
+            cases = [c for c in cases if c.get("id") in wanted]
+
+        agent_dir = Path(agents_path) / job.agent_name
+        if not agent_dir.is_dir():
+            raise FileNotFoundError(f"agent dir not found: {agent_dir}")
+        evals_dir = agent_dir / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+        dataset = evals_dir / "dataset.jsonl"
+        prior = dataset.read_bytes() if dataset.exists() else b""
+        if prior and not prior.endswith(b"\n"):
+            prior = prior + b"\n"
+        with dataset.open("wb") as fh:
+            fh.write(prior)
+            for case in cases:
+                fh.write(serialize_case_for_dataset(case))
+
+        judge_updated = False
+        if commit_judge:
+            judge_blob = job.result.get("judge_yaml")
+            if isinstance(judge_blob, str) and judge_blob.strip():
+                (evals_dir / "judge.yaml").write_text(judge_blob, encoding="utf-8")
+                judge_updated = True
+
+        return EvalCommitResult(
+            agent_name=job.agent_name,
+            dataset_path=str(dataset.relative_to(agent_dir.parent)),
+            cases_added=len(cases),
+            judge_yaml_updated=judge_updated,
+        )
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse a stored ISO-8601 timestamp back into a tz-aware ``datetime``.
+
+    Used by the eval-generation save path: the
+    :class:`EvalGenerationJob` dataclass carries created_at / completed_at
+    as ISO strings (it's serializable through the JSONB result blob), but
+    the postgres column is ``TIMESTAMPTZ`` which asyncpg wants as a
+    ``datetime``. Accepts both ``...Z`` and ``+00:00`` suffixes.
+    """
+    s = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------

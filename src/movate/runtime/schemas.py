@@ -4587,3 +4587,155 @@ class DescribeAgentResponse(BaseModel):
             "use this to flag slightly-flakier-than-usual scaffolds."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Eval generator — ``POST /api/v1/agents/{name}/evals/generate``
+#
+# Wire shapes for the new generator job pattern (review-then-commit). The
+# persisted shape lives in :class:`movate.core.eval_generator.EvalGenerationJob`;
+# these are the HTTP-facing views, kept separate so the wire surface can
+# evolve independently of storage (same convention as JobView vs JobRecord).
+# ---------------------------------------------------------------------------
+
+
+class EvalGenerateRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/evals/generate`` request body.
+
+    Defaults mirror the eval-generator module constants: ``count=20``,
+    all three canonical categories, no judge, no budget cap. ``model``
+    is optional — when omitted, the route handler uses the target
+    agent's declared provider. ``budget_usd`` is a hard server-side
+    ceiling; the pipeline aborts cleanly if cost crosses it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(..., min_length=1, max_length=8000)
+    """Plain-English agent description Claude uses to author the cases."""
+    count: int = Field(default=20, ge=1, le=100)
+    """How many cases to generate. ``100`` is the hard cap; the
+    eval-generator module floors at ``1``."""
+    categories: list[str] | None = Field(default=None)
+    """Categories to include. ``None`` / empty defaults to all three
+    (``happy`` / ``edge`` / ``adversarial``). Unknown categories →
+    422 from the route handler."""
+    include_judge: bool = Field(default=False)
+    """When ``True`` an extra LLM call drafts a ``judge.yaml`` rubric."""
+    model: str | None = Field(default=None)
+    """Optional provider override (LiteLLM-style string). ``None`` ⇒
+    use the target agent's declared model."""
+    budget_usd: float | None = Field(default=None, ge=0.0)
+    """Hard server-side cost ceiling. ``None`` ⇒ no cap."""
+
+
+class GeneratedEvalCaseView(BaseModel):
+    """One generated eval case on the wire.
+
+    Mirrors :class:`movate.core.eval_generator.GeneratedEvalCase`
+    1:1; kept in the runtime schema module so the OpenAPI spec
+    advertises this exact shape to the Angular client.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    category: str
+    input: dict[str, Any]
+    expected: dict[str, Any] | None = None
+    rationale: str
+
+
+class PreviewScoreView(BaseModel):
+    """Informational ``--mock`` pass rate after generation.
+
+    Computed by the route handler running each generated case against
+    the agent under the mock provider. Doesn't fail the job — just
+    surfaces a sanity-check number the operator can use to spot a
+    schema-mismatched case set before they commit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mock_pass_rate: float = Field(..., ge=0.0, le=1.0)
+    tested_against_model: str = "mock"
+
+
+class EvalGenerationResultView(BaseModel):
+    """The terminal ``result`` payload of a completed generation job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cases: list[GeneratedEvalCaseView]
+    judge_yaml: str | None = None
+    preview_score: PreviewScoreView | None = None
+
+
+class EvalGenerateJobView(BaseModel):
+    """``GET /api/v1/jobs/{job_id}`` response for an eval-generation job.
+
+    Separate ``kind`` discriminator (``evals_generate``) from
+    :class:`JobView` so the Angular client can route between job-detail
+    views by the kind alone. The poll path is the same as for queue
+    jobs, but the response shape carries the generated cases (the
+    primary deliverable) instead of a ``result_run_id`` pointer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = "evals_generate"
+    job_id: str
+    agent_name: str
+    status: str  # running | completed | failed
+    progress: float = Field(0.0, ge=0.0, le=1.0)
+    result: EvalGenerationResultView | None = None
+    error: dict[str, Any] | None = None
+    tokens_used: int = 0
+    cost_usd: float = 0.0
+
+
+class EvalGenerateAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/evals/generate`` response (202).
+
+    The client polls ``status_url`` for progress (or subscribes to
+    ``stream_url`` for SSE). ``estimated_seconds`` is a rough hint
+    based on category count + per-call latency — not a guarantee.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: str = "running"
+    estimated_seconds: int
+    status_url: str
+    stream_url: str
+
+
+class EvalCommitRequest(BaseModel):
+    """``POST /api/v1/jobs/{job_id}/commit`` request body.
+
+    ``case_ids`` selective acceptance: ``None`` / omitted ⇒ commit
+    every case in the job. ``commit_judge`` writes the drafted
+    ``judge.yaml`` alongside; ignored when the job didn't draft one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_ids: list[str] | None = None
+    commit_judge: bool = False
+
+
+class EvalCommitView(BaseModel):
+    """``POST /api/v1/jobs/{job_id}/commit`` response.
+
+    Mirrors :class:`movate.storage.base.EvalCommitResult` — flat
+    shape, no envelope, so the Angular client can render the
+    "cases committed" toast directly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str
+    dataset_path: str
+    cases_added: int
+    judge_yaml_updated: bool

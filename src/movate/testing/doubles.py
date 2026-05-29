@@ -142,6 +142,11 @@ class InMemoryStorage:
         # bound is preserved by always reading via the tenant-scoped
         # get_webhook (we never look up cursors for cross-tenant ids).
         self.webhook_cursors: dict[str, str] = {}
+        # Eval-generation jobs (``mdk eval generate``). Keyed by job_id;
+        # value is a :class:`movate.core.eval_generator.EvalGenerationJob`.
+        # Tenant scoping is enforced inline in the getter, not as a
+        # secondary index — same as the other ``get_*`` methods.
+        self._eval_generation_jobs: dict[str, Any] = {}
 
     async def init(self) -> None:
         return None
@@ -2077,6 +2082,77 @@ class InMemoryStorage:
         if webhook is None:
             return
         self.webhook_cursors[webhook_id] = last_event_id
+    # Eval-generation jobs (``mdk eval generate``) — runtime-resident,
+    # SSE-driven async jobs. Kept on a simple dict keyed by job_id.
+    # ------------------------------------------------------------------
+
+    async def save_eval_generation_job(self, job: Any) -> None:
+        # Lazy import keeps the type-hint stub from creating a circular
+        # import with movate.core.eval_generator on module load.
+        self._eval_generation_jobs[job.job_id] = job
+
+    async def get_eval_generation_job(self, job_id: str, *, tenant_id: str) -> Any | None:
+        job = self._eval_generation_jobs.get(job_id)
+        if job is None or job.tenant_id != tenant_id:
+            return None
+        return job
+
+    async def commit_eval_cases(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        agents_path: Any,
+        case_ids: list[str] | None,
+        commit_judge: bool,
+    ) -> Any:
+        from pathlib import Path  # noqa: PLC0415
+
+        from movate.core.eval_generator import serialize_case_for_dataset  # noqa: PLC0415
+        from movate.storage.base import EvalCommitResult  # noqa: PLC0415
+
+        job = await self.get_eval_generation_job(job_id, tenant_id=tenant_id)
+        if job is None:
+            raise FileNotFoundError(f"eval-generation job {job_id!r} not found")
+        if job.result is None:
+            raise ValueError(f"job {job_id!r} status={job.status!r} — no result to commit")
+        cases = list(job.result.get("cases") or [])
+        if case_ids is not None:
+            wanted = set(case_ids)
+            cases = [c for c in cases if c.get("id") in wanted]
+
+        agent_dir = Path(agents_path) / job.agent_name
+        if not agent_dir.is_dir():
+            raise FileNotFoundError(f"agent dir not found: {agent_dir}")
+
+        evals_dir = agent_dir / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+        dataset = evals_dir / "dataset.jsonl"
+        # Append-with-clean-line-boundary: if the existing file doesn't
+        # end with \n, prepend one before our first line so two records
+        # never run together. Atomic-enough for the local-serve path; the
+        # registry write is the durable source for deploys.
+        prior = dataset.read_bytes() if dataset.exists() else b""
+        if prior and not prior.endswith(b"\n"):
+            prior = prior + b"\n"
+        with dataset.open("wb") as fh:
+            fh.write(prior)
+            for case in cases:
+                fh.write(serialize_case_for_dataset(case))
+
+        judge_updated = False
+        if commit_judge:
+            judge_blob = job.result.get("judge_yaml")
+            if isinstance(judge_blob, str) and judge_blob.strip():
+                (evals_dir / "judge.yaml").write_text(judge_blob, encoding="utf-8")
+                judge_updated = True
+
+        return EvalCommitResult(
+            agent_name=job.agent_name,
+            dataset_path=str(dataset.relative_to(agent_dir.parent)),
+            cases_added=len(cases),
+            judge_yaml_updated=judge_updated,
+        )
 
     async def close(self) -> None:
         return None
