@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.29.8"
+version = "2026.5.29.11"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -173,6 +173,27 @@ anthropic = [
 openai = [
     "openai>=1.40,<2",
 ]
+voice = [
+    # Voice agents (ADR 048, Phase 1 — pipeline mode). Opt-in + heavy +
+    # NEVER core: the voice package imports these lazily, so a runtime/CLI
+    # installed WITHOUT mdk[voice] is wholly unaffected (the WS /voice route
+    # only does real work when an adapter is constructed; nothing imports a
+    # provider SDK or audio lib at module scope).
+    #
+    # Phase-1 reference adapters are OpenAI Whisper STT + OpenAI TTS — the
+    # "low-friction default" tier in ADR 048 (most customers already hold an
+    # OpenAI key). They need ONLY the official `openai` SDK (Apache-2.0 —
+    # permissive, already vetted for the [openai] extra). No audio/codec/VAD
+    # library is required for pipeline mode: the WS transport passes opaque
+    # PCM bytes straight through to the provider and back, and codec
+    # transcoding is an edge concern (ADR 048 D8) deferred with telephony.
+    #
+    # Deferred to fast-follows (each behind this same extra, permissive-only,
+    # justified in its own PR): a streaming-native pair (Deepgram + Cartesia),
+    # ElevenLabs (premium voice), and any audio lib (e.g. numpy/soundfile for
+    # resampling, a VAD) only if/when edge transcoding or barge-in needs it.
+    "openai>=1.40,<2",
+]
 langchain = [
     "langchain-core>=0.3,<1",
 ]
@@ -338,6 +359,11 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # Each branch is a distinct concern; folding into helpers would scatter the
 # read order. PLR0912 is the wrong rule for this shape.
 "src/movate/core/executor.py" = ["PLR0912"]
+# run_voice_pipeline is the linear 3-stage voice pipeline (STT → unchanged
+# Executor → TTS) with one branch per stage outcome + the per-stage graceful
+# degrades (ADR 048 D8). Same justification as executor.py — the branch count
+# is the pipeline's shape; folding into helpers would scatter the read order.
+"src/movate/voice/pipeline.py" = ["PLR0912"]
 # Provider tests build dynamically-named exception classes
 # (`PermissionDeniedError = type("PermissionDeniedError", (Exception,), {})`)
 # to exercise the LiteLLM → movate error translation — N806 misfires on
