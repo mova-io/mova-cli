@@ -54,9 +54,12 @@ pytest -m "not smoke"
 python scripts/check_licenses.py --strict   # shipped-dep license gate
 ```
 
-Versioning is automatic (CalVer `YYYY.M.D.N`, bumped by `.githooks/pre-commit`)
-— don't hand-edit version files. Never skip hooks or use `--no-verify` unless
-explicitly asked.
+Versioning is automatic (CalVer `YYYY.M.D.N`) and **assigned at merge** by
+`.github/workflows/release-version.yml` (ADR 059) — **do not bump the version in
+a PR**; leave `pyproject.toml` / `src/movate/__init__.py` / `uv.lock` version
+lines untouched on your branch. (The old per-PR `.githooks/pre-commit` bump is
+deprecated — a branch-local version caused merge-line conflicts.) Never skip
+hooks or use `--no-verify` unless explicitly asked.
 
 ## Canonical docs (source of truth — read, don't reinvent)
 
