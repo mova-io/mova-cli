@@ -2,11 +2,15 @@ name: ci
 
 on:
   pull_request:
-    # Include ready_for_review so the version gate (skipped on drafts, below)
-    # runs when a draft is marked ready — not only on a subsequent push.
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # ADR 059 D4 — run the required checks inside the GitHub merge queue. The
+  # queue tests each PR against the latest `main` on a temporary
+  # `gh-readonly-queue/*` ref via the `merge_group` event; without this trigger
+  # the required checks never run in the queue and PRs hang forever.
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   lint-and-test:
