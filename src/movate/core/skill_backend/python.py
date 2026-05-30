@@ -14,6 +14,12 @@ Failure modes mapped to :class:`SkillError`:
 * Function returns non-dict → ``validation_failed`` (caught upstream by
   the output validator, which only accepts dicts)
 
+Tracing (ADR 024):
+
+When ``ctx.tracer`` is set the backend opens a ``python.call`` child span
+under ``ctx.parent_span`` and closes it on success/error. The span carries
+the resolved ``entry`` string so operators can find the exact callable.
+
 This module's import side-effects register the backend with the
 shared registry. Importing this module is the only thing needed to
 "install" the Python backend.
@@ -25,6 +31,7 @@ import asyncio
 import importlib
 import inspect
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -71,22 +78,46 @@ class PythonSkillBackend:
     ) -> dict[str, Any]:
         entry = skill.spec.implementation.entry
         func = self._resolve(entry, skill_dir=skill.skill_dir)
-        result = func(input, ctx)
-        # Tolerate both sync and async impls. Many simple skills
-        # (calculator, JSON munging) are sync; HTTP-using ones are
-        # async. Letting both work removes a footgun for skill authors
-        # who'd otherwise be forced to make trivial things async.
-        if inspect.isawaitable(result):
-            result = await result
-        if not isinstance(result, dict):
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"python skill {skill.spec.name!r} returned a "
-                    f"{type(result).__name__}, expected dict"
-                ),
+
+        # ADR 024 — open a ``python.call`` child span under the executor's
+        # ``skill.<name>`` span (ctx.parent_span). No-op when tracer is None.
+        _span = None
+        _t0 = 0.0
+        if ctx.tracer is not None:
+            _t0 = time.monotonic()
+            _span = ctx.tracer.start_span(
+                "python.call",
+                {"skill": skill.spec.name, "entry": entry},
+                parent=ctx.parent_span,
             )
-        return result
+
+        try:
+            result = func(input, ctx)
+            # Tolerate both sync and async impls. Many simple skills
+            # (calculator, JSON munging) are sync; HTTP-using ones are
+            # async. Letting both work removes a footgun for skill authors
+            # who'd otherwise be forced to make trivial things async.
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, dict):
+                raise SkillError(
+                    type=SkillErrorType.VALIDATION_FAILED,
+                    message=(
+                        f"python skill {skill.spec.name!r} returned a "
+                        f"{type(result).__name__}, expected dict"
+                    ),
+                )
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="ok")
+            return result
+        except Exception:
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="error")
+            raise
 
     def _resolve(self, entry: str, skill_dir: Path | None = None) -> Any:
         """Lazily resolve ``pkg.mod:func`` → the function object.
