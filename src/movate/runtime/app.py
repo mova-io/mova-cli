@@ -424,6 +424,7 @@ from movate.tracing import (
     dec_sse_connections,
     inc_sse_connections,
     inject_current_trace_context,
+    install_log_correlation,
     record_audit_event,
 )
 
@@ -4120,6 +4121,14 @@ def build_app(
     # Install the matching logging filter so log lines carry the same id (a
     # no-op-safe, idempotent attach mirroring ADR 024's trace correlation).
     install_request_id_logging()
+    # Stamp the active distributed-trace trace_id/span_id (ADR 019/024) onto
+    # every log record at the runtime edge so App Insights / Log Analytics can
+    # pivot from a trace to its correlated logs (item 38). Wired here — not only
+    # in the CLI callback — so correlation is active whenever the runtime is
+    # built (direct ASGI/uvicorn factory or embedded), not just under `serve`.
+    # Idempotent and a complete no-op when the otel extra is absent; never
+    # raises. Mirrors install_request_id_logging above.
+    install_log_correlation()
     app.add_middleware(RequestIdMiddleware)
 
     # Build the rate limiter once at app construction so bucket state

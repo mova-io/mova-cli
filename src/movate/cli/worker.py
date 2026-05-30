@@ -174,13 +174,21 @@ async def _run_worker(
     mock: bool,
 ) -> None:
     from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
-    from movate.tracing import init_metrics  # noqa: PLC0415
+    from movate.tracing import init_metrics, install_log_correlation  # noqa: PLC0415
 
     # Initialize OTel metrics once at worker startup (R3 / item 33), after
     # dotenv + MDK_*→MOVATE_* alias sync (both run at CLI import in main.py).
     # Mirrors the tracer wiring; a complete no-op when the otel extra is absent
     # or the OTLP sink/endpoint isn't configured. Never raises.
     init_metrics()
+    # Stamp the active distributed-trace trace_id/span_id (ADR 019/024) onto
+    # every log line the worker emits while executing a job, so App Insights /
+    # Log Analytics can pivot from a trace to its correlated logs (item 38).
+    # Wired here at the execution edge — not only in the CLI callback — so jobs
+    # drained by this worker are correlated even when the process is launched
+    # outside the top-level callback. Idempotent; a complete no-op when the otel
+    # extra is absent; never raises.
+    install_log_correlation()
 
     rt = await build_local_runtime(mock=mock)
     # ADR 034 D3 — wire the asyncpg pool's saturation gauges. build_local_runtime
