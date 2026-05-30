@@ -342,6 +342,14 @@ _INSERT_CONCURRENCY = 16
 # lights them up after a seed. Matches the CLI/runtime default project id.
 _DEMO_INSIGHT_PROJECT = "default"
 
+# The (tenant, agent) the --full scenario seeds its sample agents + graph under.
+# Re-exported from core.demo so the seed summary + `mdk demo doctor` agree on
+# exactly where to look. Kept as module constants here (not re-imported at call
+# time) so the summary panel can reference them without a core import in the hot
+# path.
+from movate.core.demo import DEMO_GRAPH_AGENT as _SCENARIO_AGENT  # noqa: E402
+from movate.core.demo import DEMO_TENANT_ID as _SCENARIO_TENANT  # noqa: E402
+
 
 def _looks_like_prod(target: str) -> bool:
     """True if ``target`` contains a prod marker (case-insensitive)."""
@@ -460,6 +468,57 @@ async def _run_observability_analysis(
     return written
 
 
+async def _persist_scenario(storage: object, scenario: object) -> None:
+    """Persist the demo scenario (agents + workflow + graph) through the Protocol.
+
+    Each of the four record kinds is written behind its own ``callable``-guard
+    so a backend that predates one of the seams (e.g. an older custom
+    StorageProvider without ``upsert_entity``) degrades to a logged skip rather
+    than crashing the seed — the rest of the scenario (and all telemetry) still
+    lands. The endpoint entities are upserted BEFORE the relations (the storage
+    layer doesn't auto-create dangling endpoints).
+
+    ``storage`` / ``scenario`` are typed ``object`` to keep this CLI helper from
+    importing the concrete StorageProvider / ScenarioBundle types eagerly; the
+    attributes accessed are part of the documented Protocol + dataclass surface.
+    """
+    sc = scenario  # narrow alias for readability
+    save_agent = getattr(storage, "save_agent_bundle", None)
+    if callable(save_agent):
+        for agent in sc.agents:  # type: ignore[attr-defined]
+            try:
+                await save_agent(agent)
+            except Exception:  # pragma: no cover - duplicate (name,version) on re-seed
+                logger.info("demo_seed_agent_skipped name=%s — already present", agent.name)
+    else:
+        logger.info("demo_seed_scenario_agents_skipped — backend has no agent registry")
+
+    save_workflow = getattr(storage, "save_workflow_bundle", None)
+    if callable(save_workflow):
+        for wf in sc.workflows:  # type: ignore[attr-defined]
+            try:
+                await save_workflow(wf)
+            except Exception:  # pragma: no cover - duplicate on re-seed
+                logger.info("demo_seed_workflow_skipped name=%s — already present", wf.name)
+    else:
+        logger.info("demo_seed_scenario_workflows_skipped — backend has no workflow registry")
+
+    upsert_entity = getattr(storage, "upsert_entity", None)
+    upsert_relation = getattr(storage, "upsert_relation", None)
+    if callable(upsert_entity) and callable(upsert_relation):
+        # Entities first (endpoints must exist before edges), then relations.
+        await _gather_bounded(
+            [upsert_entity(e) for e in sc.entities],  # type: ignore[attr-defined]
+            limit=_INSERT_CONCURRENCY,
+        )
+        await _gather_bounded(
+            [upsert_relation(r) for r in sc.relations],  # type: ignore[attr-defined]
+            limit=_INSERT_CONCURRENCY,
+        )
+    else:
+        logger.info("demo_seed_scenario_graph_skipped — backend has no graph store")
+
+
 def seed(
     target: str = typer.Option(
         "local",
@@ -502,6 +561,16 @@ def seed(
             "each successful run. Realistic latency/cost figures, same seeded RNG."
         ),
     ),
+    full: bool = typer.Option(
+        True,
+        "--full/--telemetry-only",
+        help=(
+            "Also seed the demo SCENARIO — sample agents (incl. one voice-capable "
+            "+ one workflow) and a Movate-themed knowledge graph — so the "
+            "registry, graph viewer, and playground light up too, not just the "
+            "dashboards. Pass --telemetry-only for the historical telemetry-only seed."
+        ),
+    ),
 ) -> None:
     """Populate the runtime with realistic synthetic telemetry (the "wow pack").
 
@@ -530,7 +599,7 @@ def seed(
       [dim]$ mdk demo seed --agents 4 --days 14         # smaller fleet[/dim]
       [dim]$ mdk demo seed --clear-first --seed 42      # reproducible reset[/dim]
     """
-    from movate.core.demo import SeedConfig, generate_bundle  # noqa: PLC0415
+    from movate.core.demo import SeedConfig, generate_bundle, generate_scenario  # noqa: PLC0415
     from movate.storage import build_storage  # noqa: PLC0415
 
     if _looks_like_prod(target) and not force:
@@ -553,6 +622,12 @@ def seed(
         with_voice=with_voice,
     )
     bundle = generate_bundle(cfg)
+
+    # The demo SCENARIO — sample agents + workflow + a knowledge graph — so the
+    # registry, graph viewer, and playground light up alongside the dashboards.
+    # Generated only when --full (the default); --telemetry-only keeps the
+    # historical telemetry-only behavior. Pure + deterministic (no RNG / clock).
+    scenario = generate_scenario() if full else None
 
     # The distinct demo tenant ids the analyzer must run for (telemetry is
     # scoped by tenant_id). Derived from the bundle so it stays in lockstep
@@ -577,6 +652,14 @@ def seed(
             await _gather_bounded(
                 [storage.save_eval(e) for e in bundle.evals], limit=_INSERT_CONCURRENCY
             )
+            # The demo SCENARIO — sample agents + workflow + knowledge graph.
+            # Persisted through the same StorageProvider Protocol surface
+            # (save_agent_bundle / save_workflow_bundle / upsert_entity /
+            # upsert_relation). Degrades gracefully on a backend missing any of
+            # these seams (CLAUDE.md rule 5/10): the telemetry seed never fails
+            # because the scenario couldn't be written.
+            if scenario is not None:
+                await _persist_scenario(storage, scenario)
             # Voice turns are stored as JSON blobs in the runs table's extra
             # data (no dedicated voice_turns table on the StorageProvider
             # Protocol today). They are carried on the bundle for CLI display
@@ -621,7 +704,31 @@ def seed(
     # exec dashboards render with live data. 0 means the analyst/insight store
     # was unavailable and the seed degraded gracefully (see the logged reason).
     table.add_row("insights analyzed", f"{insights_written:,}")
+    # Scenario stats (--full) — the registry + graph that light up the
+    # playground and graph viewer alongside the dashboards.
+    if scenario is not None:
+        sc_stats = scenario.stats
+        table.add_row("sample agents", f"{sc_stats['agents']} ({sc_stats['voice_agents']} voice)")
+        table.add_row("sample workflows", f"{sc_stats['workflows']}")
+        table.add_row(
+            "graph nodes / edges",
+            f"{sc_stats['graph_nodes']} / {sc_stats['graph_edges']}",
+        )
     console.print(table)
+
+    scenario_line = (
+        (
+            "Playground + graph viewer populated — "
+            f"{scenario.stats['agents']} sample agents (incl. voice + workflow) and a "
+            f"{scenario.stats['graph_nodes']}-node knowledge graph under "
+            f"[cyan]{_SCENARIO_TENANT}[/cyan] / agent [cyan]{_SCENARIO_AGENT}[/cyan]."
+        )
+        if scenario is not None
+        else (
+            "Telemetry-only seed (--telemetry-only) — no sample agents/graph. "
+            "Re-run with --full to light up the playground + graph viewer."
+        )
+    )
 
     insight_line = (
         "Insight-fed + exec dashboards populated — "
@@ -642,9 +749,11 @@ def seed(
                 for e in bundle.events
             )
             + f"\n\n[bold]{insight_line}[/bold]"
+            + f"\n[bold]{scenario_line}[/bold]"
             + "\n\n[dim]All rows tagged tenant=demo-* + input.__mdk_demo__=true. "
-            "Purge anytime with [bold]mdk demo clear[/bold].[/dim]",
-            title="[green]✓[/green] Dashboards seeded",
+            "Purge anytime with [bold]mdk demo clear[/bold].[/dim]\n"
+            "[dim]Verify the demo is GO with [bold]mdk demo doctor[/bold].[/dim]",
+            title="[green]✓[/green] Demo seeded",
             title_align="left",
             border_style="green",
         )
@@ -700,7 +809,8 @@ def clear(
     console.print(
         Panel(
             f"Deleted [bold]{deleted:,}[/bold] demo-tagged rows "
-            "(runs, evals, failures, voice turns if present).",
+            "(runs, evals, failures, sample agents/workflows, graph "
+            "entities/relations, insights, voice turns if present).",
             title="[green]✓[/green] Demo data cleared",
             title_align="left",
             border_style="green",
@@ -732,7 +842,21 @@ async def _purge_demo(storage: object) -> int:
 
     like = f"{DEMO_TENANT_PREFIX}%"
     # Core tables the seeder always writes. Each carries a tenant_id column.
-    tables = ("runs", "failures", "evals")
+    # `--full` adds the scenario tables (agents + workflow registry, graph
+    # entities/relations) and the analyzer's insight rows — all demo-tenant
+    # scoped, so the same LIKE predicate purges them. Listed unconditionally:
+    # a telemetry-only seed simply has no rows in the scenario tables, so the
+    # extra DELETEs are no-ops (and keep clear correct after a --full seed).
+    tables = (
+        "runs",
+        "failures",
+        "evals",
+        "agent_bundles",
+        "workflow_bundles",
+        "kb_entities",
+        "kb_relations",
+        "observability_insights",
+    )
     # Optional table — created by the voice-storage ADR (not yet on main).
     # Included here so `mdk demo clear` stays correct once it lands.
     optional_tables = ("voice_turns",)
@@ -808,3 +932,10 @@ def _demo_callback(ctx: typer.Context) -> None:
 demo_app.command("new")(scaffold)
 demo_app.command("seed")(seed)
 demo_app.command("clear")(clear)
+
+# `mdk demo doctor` — Monday-demo readiness check. Lives in its own module
+# (_demo_doctor.py) to keep this file focused on scaffold + seed/clear; wired
+# here so it shares the `mdk demo` command group.
+from movate.cli._demo_doctor import doctor as _demo_doctor  # noqa: E402
+
+demo_app.command("doctor")(_demo_doctor)
