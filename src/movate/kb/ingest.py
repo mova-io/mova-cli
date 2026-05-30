@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
-from movate.core.models import KbChunk
+from movate.core.models import Entity, KbChunk, Relation
 from movate.kb.chunk import Chunk, split_paragraphs
 from movate.kb.embed import (
     DEFAULT_EMBEDDING_MODEL,
@@ -36,6 +36,15 @@ if TYPE_CHECKING:
     from movate.storage.base import StorageProvider
 
 log = logging.getLogger(__name__)
+
+# Callback the runtime injects to publish a graph-mutation event (ADR 046
+# D6 growth stream) right after each node/edge is upserted. Pure seam —
+# ``kb`` stays Protocol-pure: it knows nothing about the event outbox or
+# the runtime; it just calls back with the upserted record + the project
+# scope. The runtime's hook turns that into an ADR 035 outbox event the
+# SSE growth stream live-tails. ``None`` (the default) = no publishing, so
+# every existing caller (CLI, tests) is byte-for-byte unaffected.
+GraphMutationFn: TypeAlias = Callable[[Entity | Relation, "str | None"], Awaitable[None]]
 
 # How many chunks to embed per OpenAI API call. OpenAI accepts up to
 # 2048 inputs per request — we use 64 because that's the largest size
@@ -124,6 +133,7 @@ async def ingest_path(
     complete_fn: CompleteFn | None = None,
     on_file_start: Callable[[str, int, int], None] | None = None,
     project_id: str | None = None,
+    emit_growth_events: bool = False,
 ) -> tuple[list[IngestSummary], list[tuple[str, str]]]:
     """Ingest a file or directory tree. Returns one summary per file.
 
@@ -166,6 +176,7 @@ async def ingest_path(
                 extraction_model=extraction_model,
                 complete_fn=complete_fn,
                 project_id=project_id,
+                emit_growth_events=emit_growth_events,
             )
         except EmbeddingError as exc:
             # Transient network or rate-limit failure — continue with
@@ -191,6 +202,7 @@ async def _ingest_one_file(
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
     project_id: str | None = None,
+    emit_growth_events: bool = False,
 ) -> IngestSummary | None:
     """Read + parse + ingest a single file.
 
@@ -252,6 +264,7 @@ async def _ingest_one_file(
         extraction_model=extraction_model,
         complete_fn=complete_fn,
         project_id=project_id,
+        emit_growth_events=emit_growth_events,
     )
     if summary is not None:
         summary.chunks_removed = chunks_removed
@@ -273,6 +286,8 @@ async def ingest_text(
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
     project_id: str | None = None,
+    on_graph_mutation: GraphMutationFn | None = None,
+    emit_growth_events: bool = False,
 ) -> IngestSummary | None:
     """Chunk + embed + persist ``text`` as KB content for ``agent``.
 
@@ -295,6 +310,16 @@ async def ingest_text(
     ``metadata["page"]`` (1-indexed) is stamped on every resulting
     :class:`~movate.core.models.KbChunk`. This lets the search table
     display the source page number alongside each result.
+
+    ``emit_growth_events`` (ADR 046 D6, additive, default off): when
+    ``build_graph`` is on, record a ``graph.node.added`` /
+    ``graph.edge.added`` outbox event per upserted node/edge so the sigma
+    viewer's live-growth stream animates the graph as it grows. ``mdk kb
+    ingest --build-graph`` sets this; the runtime serves the resulting
+    events over ``GET /api/v1/projects/{id}/graph/stream?live=true``. An
+    explicit ``on_graph_mutation`` callback overrides the default
+    publisher. Both are failure-isolated — a flaky outbox never breaks
+    ingest.
 
     Empty / whitespace-only input → ``None`` (idempotent no-op,
     matches :func:`_ingest_one_file`).
@@ -353,6 +378,18 @@ async def ingest_text(
     entities_saved = 0
     relations_saved = 0
     if build_graph:
+        # ADR 046 D6 growth stream: when asked, record a graph-mutation
+        # event per upserted node/edge so the sigma viewer animates the
+        # graph growing live. An explicit ``on_graph_mutation`` wins; else
+        # ``emit_growth_events`` wires the default outbox publisher (the
+        # one-line opt-in the CLI's ``--build-graph`` ingest uses). Lazy
+        # import keeps the publisher (and its core.graph dep) off the hot
+        # path for ingests that don't build a graph.
+        hook = on_graph_mutation
+        if hook is None and emit_growth_events:
+            from movate.kb.graph_events import make_outbox_publisher  # noqa: PLC0415
+
+            hook = make_outbox_publisher(storage, tenant_id=tenant_id, agent=agent)
         entities_saved, relations_saved = await _build_graph_for_chunks(
             storage=storage,
             chunks=saved_chunks,
@@ -363,6 +400,7 @@ async def ingest_text(
             api_key=api_key,
             complete_fn=complete_fn,
             project_id=project_id,
+            on_graph_mutation=hook,
         )
 
     return IngestSummary(
@@ -386,12 +424,21 @@ async def _build_graph_for_chunks(
     api_key: str | None,
     complete_fn: CompleteFn | None,
     project_id: str | None = None,
+    on_graph_mutation: GraphMutationFn | None = None,
 ) -> tuple[int, int]:
     """Extract a knowledge graph from ``chunks`` and upsert it. Returns
     ``(entities_saved, relations_saved)``. The chunks must already be
     persisted — their ``chunk_id``s become the graph's source provenance.
     ``project_id`` (ADR 046 D1, additive) tags every node/edge for
-    project-grain scoping; ``None`` leaves the column null."""
+    project-grain scoping; ``None`` leaves the column null.
+
+    ``on_graph_mutation`` (ADR 046 D6, additive) is fired once per node and
+    once per edge **right after** its durable upsert, so a subscriber (the
+    runtime's growth-stream publisher) can project each delta onto the ADR
+    035 outbox and the sigma viewer animates the graph growing live. It is
+    **failure-isolated**: a callback error is swallowed + logged so the
+    primary ingest/upsert path is never broken by an observability hiccup
+    (CLAUDE.md rule 10). ``None`` (default) = no publishing."""
     entities, relations = await extract_graph(
         chunks,
         agent=agent,
@@ -404,9 +451,34 @@ async def _build_graph_for_chunks(
     )
     for entity in entities:
         await storage.upsert_entity(entity)
+        await _publish_graph_mutation(on_graph_mutation, entity, project_id)
     for relation in relations:
         await storage.upsert_relation(relation)
+        await _publish_graph_mutation(on_graph_mutation, relation, project_id)
     return len(entities), len(relations)
+
+
+async def _publish_graph_mutation(
+    on_graph_mutation: GraphMutationFn | None,
+    record: Entity | Relation,
+    project_id: str | None,
+) -> None:
+    """Fire the growth-stream hook for one upserted node/edge, never raising.
+
+    The durable upsert has already committed by the time we get here, so a
+    hook failure is pure observability noise — swallow + log at WARNING and
+    let ingest continue. This is the same "never break the primary path"
+    discipline the runtime's ``emit_event`` helper applies one layer up."""
+    if on_graph_mutation is None:
+        return
+    try:
+        await on_graph_mutation(record, project_id)
+    except Exception:
+        log.warning(
+            "graph_mutation_publish_failed kind=%s — ingest unaffected",
+            type(record).__name__,
+            exc_info=True,
+        )
 
 
 def _batched(items: list[Chunk], n: int) -> list[list[Chunk]]:
