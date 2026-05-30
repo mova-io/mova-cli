@@ -136,9 +136,7 @@ class TestVoiceCapabilitiesBlock:
         voice = body["voice"]
         assert "pipeline" in voice["modes"]
 
-    def test_voice_modes_realtime_absent_when_not_configured(
-        self, tmp_path: Path
-    ) -> None:
+    def test_voice_modes_realtime_absent_when_not_configured(self, tmp_path: Path) -> None:
         """``realtime`` is NOT in modes when MDK_VOICE_REALTIME is unset.
 
         Rebuilds the app with the env patched so the build_app factory reads
