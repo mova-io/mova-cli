@@ -1,0 +1,16 @@
+# ADR 028 — discoverability metadata for the reflective-agent template.
+title: Reflective agent (produce -> judge -> revise loop)
+description: >-
+  A self-improving reflection loop (ADR 056 D4): a producer drafts an answer,
+  a JUDGE node grades it and — until it accepts or the iteration cap is hit —
+  loops back with the judge's feedback so the producer revises. Demonstrates
+  the JUDGE node, the bounded back-edge, and feedback threading.
+shape: workflow
+tags:
+  - workflow
+  - judge
+  - reflection
+  - self-improving
+recommended_for: >-
+  Reach for this when "good enough" needs a quality bar — a judge gates the
+  output and drives a bounded revise loop instead of shipping the first draft.

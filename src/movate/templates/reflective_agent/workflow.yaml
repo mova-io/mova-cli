@@ -1,0 +1,67 @@
+# ============================================================================
+# MDK Reflective Agent — produce -> judge -> (revise) loop   (ADR 056 D4)
+# ============================================================================
+# The reflection pattern as a first-class workflow: a JUDGE node on a bounded
+# back-edge. Flow:
+#
+#   produce  — drafts an `answer` from a `topic`, folding in any `feedback`
+#              the judge left on a previous pass.
+#   judge    — grades the `answer`. accept ⇒ the workflow ends with that
+#              answer. revise ⇒ loop back to `produce` with the judge's
+#              `feedback`, up to `max_iterations` times (the mandatory cap —
+#              a judge that never accepts can't loop forever).
+#
+# The judge here uses inline `criteria` (it reuses the default judge prompt);
+# swap in `judge_agent: ./agents/judge` to use a dedicated judge agent with
+# its own model + rubric instead.
+
+api_version: movate/v1
+kind: Workflow
+
+name: reflective-agent
+version: 0.1.0
+description: |
+  Self-improving reflection loop (ADR 043 / ADR 056): produce -> judge ->
+  revise, bounded by a mandatory max-iterations cap, with the judge's
+  feedback threaded into each revision.
+owner: ""
+
+state_schema: ./state.json
+entrypoint: produce
+
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+nodes:
+  - id: produce
+    type: agent
+    ref: ./agents/produce
+
+  - id: judge
+    type: judge
+    # Inline rubric — reuses reflection.py's default judge prompt. The judge
+    # reads `answer` from state and emits {verdict, score?, feedback}.
+    criteria: |
+      The answer must directly address the topic in 2-4 clear sentences,
+      contain no invented statistics or sources, and read as finished prose
+      (no placeholders, no apology, no meta-commentary). Reject anything that
+      is off-topic, padded, or unfinished.
+    input_field: answer
+    # Bounded reflection loop (ADR 056 D4): judge -> produce up to twice.
+    max_iterations: 2
+    # accept ⇒ end of workflow (no on_accept target, no successor edge).
+    # revise ⇒ fall through to the back-edge below (-> produce).
+
+edges:
+  - from: produce
+    to: judge
+  # The reflection back-edge: on revise, judge loops to produce. This is the
+  # bounded cycle (max_iterations on the judge node caps it).
+  - from: judge
+    to: produce
+
+tags:
+  - reflection
+  - judge
+  - workflow

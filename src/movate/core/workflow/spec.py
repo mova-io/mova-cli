@@ -163,9 +163,117 @@ class HumanNodeSpec(BaseModel):
         return v
 
 
-# NodeSpec is a discriminated union of agent, intent-router, and human nodes.
+class JudgeNodeSpec(BaseModel):
+    """One ``judge`` workflow node as written in YAML (ADR 056 D1).
+
+    A judge node runs an LLM judge over an artifact in workflow state and
+    produces a *structured verdict* — ``{verdict, score, feedback,
+    terminate}`` (ADR 056 D2, reusing :class:`movate.core.reflection.JudgeVerdict`)
+    — that the workflow branches or loops on. It is the right primitive for
+    the two highest-value agent patterns: eval-gated workflows and reflection
+    loops. It is NOT an ``intent-router`` (label-only, no score, no feedback)
+    and NOT a ``human`` gate (a model, not a person).
+
+    Two forms, mirroring ADR 056 D1:
+
+    * **eval-gate / branch** — set ``pass_threshold`` and/or ``on_accept`` /
+      ``on_revise``. When ``pass_threshold`` is set, ``score >= threshold`` ⇒
+      *accept* (``terminate=True``); otherwise the categorical
+      ``accept``/``revise`` verdict drives the gate. On accept the runner
+      routes to ``on_accept`` (or falls through to the sequential successor);
+      on revise it routes to ``on_revise`` (or falls through to a bounded
+      back-edge — the reflection form, D4).
+    * **judge selection** — exactly one of ``judge_agent`` (a ref resolved
+      like every other node ref) or ``criteria`` (inline rubric text that
+      reuses ``reflection.py``'s default judge prompt) must be supplied. A
+      judge that supplies neither cannot run; supplying both is ambiguous.
+
+    Additive + ``extra="forbid"`` (CLAUDE.md rule 5): no existing workflow
+    declares ``judge`` today, so every existing workflow is byte-for-byte
+    unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    type: Literal["judge"]
+    judge_agent: str | None = Field(
+        None,
+        description=(
+            "Ref (path) to the judge agent, resolved like any other node ref. "
+            "Mutually exclusive with ``criteria``."
+        ),
+    )
+    criteria: str | None = Field(
+        None,
+        description=(
+            "Inline rubric text — reuses reflection.py's default judge prompt "
+            "when no dedicated judge agent is supplied. Mutually exclusive with "
+            "``judge_agent``."
+        ),
+    )
+    input_field: str = Field(
+        "text",
+        description="Workflow state key holding the artifact to judge",
+    )
+    pass_threshold: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "When set, score >= threshold ⇒ accept (the eval-gate form). When "
+            "unset, the categorical accept/revise verdict drives the gate."
+        ),
+    )
+    on_accept: str | None = Field(
+        None,
+        description="Node id to route to when the judge accepts (else sequential successor)",
+    )
+    on_revise: str | None = Field(
+        None,
+        description="Node id to route to when the judge revises (else sequential successor)",
+    )
+    max_iterations: int = Field(
+        1,
+        ge=1,
+        le=10,
+        description=(
+            "Mandatory cap (ADR 056 D4) on how many times this judge may drive a "
+            "revise back-edge before the loop terminates regardless of verdict. "
+            "1 (default) = no reflection loop (single judgement). >1 enables the "
+            "produce→judge→revise→… reflection pattern, bounded so a judge that "
+            "never accepts cannot loop forever."
+        ),
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", v):
+            raise ValueError(
+                f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_judge_selection(self) -> JudgeNodeSpec:
+        has_agent = bool(self.judge_agent and self.judge_agent.strip())
+        has_criteria = bool(self.criteria and self.criteria.strip())
+        if has_agent and has_criteria:
+            raise ValueError(
+                f"judge node {self.id!r}: set exactly one of 'judge_agent' or 'criteria', not both"
+            )
+        if not has_agent and not has_criteria:
+            raise ValueError(
+                f"judge node {self.id!r}: one of 'judge_agent' (a ref) or "
+                f"'criteria' (inline rubric) is required"
+            )
+        return self
+
+
+# NodeSpec is a discriminated union of agent, intent-router, human, and judge nodes.
 NodeSpec = Annotated[
-    AgentNodeSpec | IntentRouterNodeSpec | HumanNodeSpec,
+    AgentNodeSpec | IntentRouterNodeSpec | HumanNodeSpec | JudgeNodeSpec,
     Field(discriminator="type"),
 ]
 

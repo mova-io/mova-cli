@@ -489,6 +489,8 @@ class TemporalCompiler:
             return self._emit_agent_node(nid, node, spec)
         if node_type is NodeType.INTENT_ROUTER:
             return self._emit_gate_node(nid, node, spec)
+        if node_type is NodeType.JUDGE:
+            return self._emit_judge_node(nid, node, spec)
         if node_type is NodeType.HUMAN:
             return self._emit_human_node_stub(nid, node)
         if node_type is NodeType.TOOL:
@@ -595,24 +597,53 @@ class TemporalCompiler:
     def _emit_judge_node(
         self, nid: str, node: Any, spec: WorkflowGraph
     ) -> tuple[list[str], set[str]]:
-        """JUDGE → activity returns ``{terminate, verdict}``; workflow gates.
+        """JUDGE → activity runs the judge; workflow gates on ``terminate`` (ADR 056 D5).
 
-        Unused in Phase 1 because the IR doesn't (yet) carry a dedicated
-        JUDGE node type — judges currently ride as ``intent-router`` nodes
-        (see ``pattern_simulation`` ``turn-judge``). Kept here as the
-        canonical shape so the row-4 mapping in ADR 054 D4 is encoded once.
+        [bold]Now live[/bold] (was the canonical-but-unused shape). The IR
+        carries a dedicated JUDGE node (ADR 056 D1) with a ``judge_agent`` ref
+        (``node.ref``) or inline ``criteria``, so the emitter passes that ref +
+        a small ``judge_config`` (criteria / input_field / pass_threshold) to
+        :func:`call_judge_activity`, which RUNS the judge through the Executor
+        and returns the canonical D2 verdict ``{verdict, score, feedback,
+        terminate}`` (recorded in history ⇒ deterministic replay, ADR 054 D4
+        row 4). This resolves the Track C §11 state-interpreter caveat.
+
+        The verdict is stamped into ``state[node_id]`` and ``state['feedback']``
+        (so a downstream revise step can thread it, mirroring the native
+        runner). The workflow gates: ``if verdict['terminate']: return state``
+        — the eval-gate / branch form.
+
+        [bold]Honest scope (CLAUDE.md §11).[/bold] Phase-1's emitted workflow
+        body is *linear* (topological order). The eval-gate JUDGE form executes
+        correctly on Temporal. The bounded *reflection loop* (a JUDGE on a
+        back-edge — ADR 056 D4) needs a ``for _ in range(max_iterations)`` wrap
+        the linear Phase-1 emitter does not yet generate; the
+        ``emit_bounded_loop`` helper exists for it but is not wired into the
+        per-node walk here. Until then the reflection loop runs natively (D3)
+        and on Temporal compiles to a single-pass judgement. Flagged, not
+        papered over.
         """
         method = _safe_method_name(nid)
+        criteria: str = node.metadata.get("criteria", "") or ""
+        input_field: str = node.metadata.get("input_field", "text") or "text"
+        pass_threshold = node.metadata.get("pass_threshold")
+        judge_config = {
+            "criteria": criteria,
+            "input_field": input_field,
+            "pass_threshold": pass_threshold,
+        }
         body = [
-            f"        # node {nid!r} — JUDGE (ADR 054 D4 row 4)",
+            f"        # node {nid!r} — JUDGE (ADR 056 D5 / ADR 054 D4 row 4)",
+            "        # Activity runs the judge via Executor; returns the D2 verdict.",
             f"        {method}_verdict = await workflow.execute_activity(",
             "            call_judge_activity,",
-            f"            args=[{nid!r}, state, run_id],",
+            f"            args=[{nid!r}, {node.ref!r}, {judge_config!r}, state, run_id],",
             "            schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
             "            heartbeat_timeout=_HEARTBEAT,",
             "            retry_policy=_RETRY_POLICY,",
             "        )",
-            f"        state['{method}_verdict'] = {method}_verdict",
+            f"        state[{nid!r}] = {method}_verdict",
+            f"        state['feedback'] = {method}_verdict.get('feedback', '')",
             f"        if {method}_verdict.get('terminate'):",
             "            return state",
         ]

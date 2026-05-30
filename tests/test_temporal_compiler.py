@@ -374,3 +374,49 @@ def test_module_level_helpers() -> None:
 
     spec, _ = load_workflow_spec(PATTERN_FIXTURES["chatbot"])
     assert supports_spec(spec) is True
+
+
+# ---------------------------------------------------------------------------
+# ADR 056 D5 — JUDGE node lowers LIVE onto Temporal (resolves §11 caveat).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_judge_node_emits_live_judge_activity() -> None:
+    """A JUDGE IR node lowers to a call_judge_activity with the ref + config.
+
+    The emitter is no longer the canonical-but-unused shape: a real JUDGE node
+    (ADR 056 D1) passes its ``judge_agent`` ref + judge_config to the activity
+    and gates on ``terminate``. The generated source must parse.
+    """
+    judge = WorkflowNode(
+        id="judge",
+        type=NodeType.JUDGE,
+        ref="/agents/judge",
+        metadata={
+            "criteria": "",
+            "input_field": "answer",
+            "pass_threshold": 0.7,
+            "on_accept": None,
+            "on_revise": None,
+            "max_iterations": 1,
+        },
+    )
+    produce = _make_node("produce", NodeType.AGENT)
+    graph = _make_graph(
+        [produce, judge],
+        [WorkflowEdge(from_id="produce", to_id="judge")],
+        entrypoint="produce",
+    )
+    result = TemporalCompiler().compile(graph)
+    ast.parse(result.module_source)  # generated source is valid Python
+    assert "call_judge_activity" in result.activity_names
+    src = result.module_source
+    # Activity is called with the ref + a judge_config dict carrying the
+    # threshold + input_field (so the activity runs the real judge — §11 fix).
+    assert "'/agents/judge'" in src
+    assert "'pass_threshold': 0.7" in src
+    assert "'input_field': 'answer'" in src
+    # And the workflow gates on terminate.
+    assert "get('terminate')" in src
+    assert "return state" in src

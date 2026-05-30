@@ -481,3 +481,67 @@ class TestLanggraphCompilerGrowth:
         builder = ns["build_graph"]()
         compiled = builder.compile()
         assert compiled is not None
+
+
+# ---------------------------------------------------------------------------
+# ADR 056 D5 — JUDGE node lowers to a verdict-driven conditional edge (LangGraph).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLanggraphJudgeRouter:
+    def _judge(self, nid: str, **meta) -> WorkflowNode:
+        return WorkflowNode(id=nid, type=NodeType.JUDGE, ref="/agents/judge", metadata=dict(meta))
+
+    def test_judge_emits_verdict_router(self) -> None:
+        """A JUDGE node with on_accept/on_revise lowers to a router that gates
+        on the stamped verdict's ``terminate`` flag (not a free-text condition)."""
+        judge = self._judge(
+            "judge", on_accept="publish", on_revise="escalate", input_field="answer"
+        )
+        graph = _graph(
+            [_agent("produce"), judge, _agent("publish"), _agent("escalate")],
+            [
+                WorkflowEdge(from_id="produce", to_id="judge"),
+                # synthetic conditional edges from the compiler for the branches
+                WorkflowEdge(
+                    from_id="judge",
+                    to_id="publish",
+                    kind=EdgeKind.CONDITIONAL,
+                    metadata={"synthetic": True, "source": "judge"},
+                ),
+                WorkflowEdge(
+                    from_id="judge",
+                    to_id="escalate",
+                    kind=EdgeKind.CONDITIONAL,
+                    metadata={"synthetic": True, "source": "judge"},
+                ),
+            ],
+            entrypoint="produce",
+        )
+        source = compile_langgraph(graph)
+        ast.parse(source)
+        assert "add_conditional_edges('judge', __movate_route_judge)" in source
+        assert "def __movate_route_judge(state: State) -> str:" in source
+        # The router reads the verdict and gates on terminate.
+        assert "state.get('judge')" in source
+        assert "verdict.get('terminate')" in source
+        assert "return 'publish'" in source
+        assert "return 'escalate'" in source
+
+    def test_judge_reflection_loop_is_recursion_guarded(self) -> None:
+        """A JUDGE on a back-edge (reflection loop) compiles under the mandatory
+        RECURSION_LIMIT guard (ADR 030 D2)."""
+        judge = self._judge("judge", input_field="answer", max_iterations=2)
+        graph = _graph(
+            [_agent("produce"), judge],
+            [
+                WorkflowEdge(from_id="produce", to_id="judge"),
+                WorkflowEdge(from_id="judge", to_id="produce"),  # back-edge
+            ],
+            entrypoint="produce",
+        )
+        source = compile_langgraph(graph)
+        ast.parse(source)
+        assert "RECURSION_LIMIT" in source
+        assert "recursion_limit" in source

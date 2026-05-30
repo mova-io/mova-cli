@@ -65,8 +65,20 @@ from movate.core.models import (
     WorkflowStatus,
 )
 from movate.core.workflow.ir import NodeType, WorkflowGraph
+from movate.core.workflow.judge import (
+    build_judge_state_value,
+    derive_terminate,
+    load_judge_bundle,
+    verdict_from_response_data,
+)
 from movate.storage.base import StorageProvider
 from movate.tracing.base import SpanCtx
+
+# Absolute ceiling on per-node visits during a single walk (ADR 056 D4 +
+# CLAUDE.md failure-mode rule). Bounded reflection loops re-visit nodes by
+# design; this is the runaway backstop a JUDGE node's own ``max_iterations``
+# rides under — even a misconfigured loop can never spin forever.
+_MAX_NODE_VISITS = 50
 
 
 class WorkflowRunError(Exception):
@@ -313,15 +325,65 @@ class WorkflowRunner:
         # against pathological graph shapes that bypass the compiler's cycle
         # detector.
         current_id: str | None = start_id
-        visited: set[str] = set()
+        # Per-node visit counts (was a boolean set). A JUDGE-driven reflection
+        # back-edge (ADR 056 D4) legitimately re-visits the producer + judge,
+        # so a plain "seen once ⇒ cycle" guard is too strict. The JUDGE node
+        # enforces its own ``max_iterations`` cap; this counter is the absolute
+        # runaway backstop (``_MAX_NODE_VISITS``) for any other shape.
+        visits: dict[str, int] = {}
 
         while current_id is not None:
-            if current_id in visited:
-                raise WorkflowRunError(f"cycle detected at node {current_id!r} during execution")
-            visited.add(current_id)
+            visits[current_id] = visits.get(current_id, 0) + 1
+            if visits[current_id] > _MAX_NODE_VISITS:
+                raise WorkflowRunError(
+                    f"runaway loop: node {current_id!r} visited "
+                    f"{visits[current_id]} times (cap {_MAX_NODE_VISITS})"
+                )
 
             node = graph.nodes[current_id]
             node_id = current_id
+
+            if node.type is NodeType.JUDGE:
+                # --- JUDGE dispatch (ADR 056 D3) ------------------------------
+                result = await self._run_judge(
+                    node_id=node_id,
+                    node=node,
+                    state=state,
+                    graph=graph,
+                    wf_id=wf_id,
+                    mock=mock,
+                    wf_span=wf_span,
+                    visits=visits,
+                )
+                if isinstance(result, WorkflowResult):
+                    await self._storage.save_workflow_run(
+                        WorkflowRunRecord(
+                            workflow_run_id=wf_id,
+                            tenant_id=self._tenant_id,
+                            workflow=graph.name,
+                            workflow_version=graph.version,
+                            status=WorkflowStatus.ERROR,
+                            initial_state=initial_state,
+                            final_state=state,
+                            error_node_id=result.error_node_id,
+                            error=result.error,
+                        )
+                    )
+                    return WorkflowResult(
+                        workflow_run_id=wf_id,
+                        status=WorkflowStatus.ERROR,
+                        initial_state=initial_state,
+                        final_state=state,
+                        runs=runs + result.runs,
+                        error_node_id=result.error_node_id,
+                        error=result.error,
+                        started_at=started,
+                        finished_at=time.monotonic(),
+                    )
+                chosen_next, judge_runs = result
+                runs.extend(judge_runs)
+                current_id = chosen_next
+                continue
 
             if node.type is NodeType.INTENT_ROUTER:
                 # --- intent-router dispatch -----------------------------------
@@ -516,6 +578,159 @@ class WorkflowRunner:
         """
         seq = [e.to_id for e in graph.successors(node_id) if not e.metadata.get("synthetic")]
         return seq[0] if seq else None
+
+    async def _run_judge(
+        self,
+        *,
+        node_id: str,
+        node: Any,
+        state: dict[str, Any],
+        graph: WorkflowGraph,
+        wf_id: str,
+        mock: bool,
+        wf_span: SpanCtx,
+        visits: dict[str, int],
+    ) -> tuple[str | None, list[RunRecord]] | WorkflowResult:
+        """Dispatch a JUDGE node (ADR 056 D3).
+
+        Runs the judge (``judge_agent`` ref or inline ``criteria``) through the
+        SAME :class:`Executor` every node uses, parses the canonical D2 verdict
+        (``{verdict, score, feedback, terminate}``) via the shared
+        ``core.workflow.judge`` helpers, stamps it into ``state[node_id]`` (and
+        surfaces ``feedback`` at top level so the revise step can thread it),
+        then resolves the next node:
+
+        * **terminate** (accept, or ``score >= pass_threshold``) → route to
+          ``on_accept`` if set, else the node's sequential successor (the
+          eval-gate's continue / end-of-chain).
+        * **revise** → if the bounded loop still has budget
+          (``visits[node] < max_iterations``), follow the back-edge (the
+          node's sequential successor — for a reflection loop that is the
+          producer). Once the cap is hit, the loop terminates by routing to
+          ``on_accept`` / the non-loop exit (mandatory cap, D4).
+
+        Returns ``(next_node_id | None, [judge_run_record])`` on success, or a
+        partial :class:`WorkflowResult` if the judge agent itself errors.
+
+        Under ``mock=True`` the judge call is skipped and a deterministic
+        *accept* verdict is produced so the whole pipeline runs under
+        ``mdk run --mock`` without spend (matching the intent-router mock path).
+        """
+        meta = node.metadata
+        criteria: str = meta.get("criteria", "") or ""
+        input_field: str = meta.get("input_field", "text")
+        pass_threshold: float | None = meta.get("pass_threshold")
+        on_accept: str | None = meta.get("on_accept")
+        on_revise: str | None = meta.get("on_revise")
+        max_iterations: int = int(meta.get("max_iterations", 1) or 1)
+
+        seq_next = self._sequential_successor(graph, node_id)
+
+        if mock:
+            # Deterministic accept so --mock exercises the accept path end to end.
+            state[node_id] = build_judge_state_value(
+                verdict="accept", score=None, feedback="", terminate=True
+            )
+            return (on_accept if on_accept is not None else seq_next), []
+
+        # Load the judge bundle (ref or inline criteria) and run it through the
+        # Executor — one execution path, tracing/metering/BYOK at the edges.
+        try:
+            judge_bundle = load_judge_bundle(judge_ref=node.ref, criteria=criteria)
+        except (AgentLoadError, ValueError) as exc:
+            raise WorkflowRunError(
+                f"judge node {node_id!r}: judge agent failed to load: {exc}"
+            ) from exc
+
+        artifact = state.get(input_field, "")
+        judge_input = _project_state({"text": str(artifact)}, judge_bundle)
+
+        judge_response: RunResponse = await self._executor.execute(
+            judge_bundle,
+            RunRequest(agent=judge_bundle.spec.name, input=judge_input),
+            workflow_run_id=wf_id,
+            node_id=node_id,
+            parent_span=wf_span,
+            tenant_id_override=self._tenant_id,
+        )
+
+        judge_summary = _summarize_run(
+            judge_response,
+            tenant_id=self._tenant_id,
+            bundle=judge_bundle,
+            wf_id=wf_id,
+            node_id=node_id,
+        )
+        judge_runs = [judge_summary]
+
+        if judge_response.status != "success":
+            await self._storage.save_run(judge_summary)
+            return WorkflowResult(
+                workflow_run_id=wf_id,
+                status=WorkflowStatus.ERROR,
+                initial_state=state,
+                final_state=state,
+                runs=judge_runs,
+                error_node_id=node_id,
+                error=judge_response.error,
+                started_at=0.0,
+                finished_at=time.monotonic(),
+            )
+
+        # Parse into the canonical verdict + derive terminate (ONE rule, shared
+        # with the Temporal activity via core.workflow.judge).
+        verdict, score, feedback = verdict_from_response_data(judge_response.data)
+        terminate = derive_terminate(verdict=verdict, score=score, pass_threshold=pass_threshold)
+        state[node_id] = build_judge_state_value(
+            verdict=verdict, score=score, feedback=feedback, terminate=terminate
+        )
+        # Thread the judge's feedback to the next (revise) step (ADR 056 D4) so
+        # the producer can fold it into its re-prompt. Top-level key, last-wins.
+        state["feedback"] = feedback
+
+        if terminate:
+            # Accept routes to the explicit ``on_accept`` branch, else the
+            # node's forward successor. A reflection workflow's only successor
+            # is the back-edge to the producer — re-entering the loop on accept
+            # is wrong (accept means done), so an accept whose only exit is the
+            # back-edge ends the walk (None).
+            if on_accept is not None:
+                return on_accept, judge_runs
+            if seq_next is not None and not self._is_back_edge(graph, node_id, seq_next):
+                return seq_next, judge_runs
+            return None, judge_runs
+
+        # Revise. The revise target is the explicit ``on_revise`` branch if set,
+        # else the sequential successor (which, for a reflection workflow, is
+        # the back-edge to the producer).
+        revise_target = on_revise if on_revise is not None else seq_next
+
+        # The iteration cap (ADR 056 D4) only governs a revise target that
+        # RE-ENTERS the loop (a back-edge). A forward revise branch (e.g. an
+        # eval-gate routing to an ``escalate`` node) is a one-shot decision and
+        # is taken regardless of the iteration count.
+        if revise_target is not None and not self._is_back_edge(graph, node_id, revise_target):
+            return revise_target, judge_runs
+
+        # Looping revise: follow the back-edge only while iterations remain.
+        if visits.get(node_id, 1) < max_iterations:
+            return revise_target, judge_runs
+
+        # Cap reached — terminate the loop deterministically (mandatory cap).
+        # Prefer an explicit accept route; otherwise end the walk with the last
+        # produced state rather than re-entering the loop.
+        if on_accept is not None:
+            return on_accept, judge_runs
+        return None, judge_runs
+
+    @staticmethod
+    def _is_back_edge(graph: WorkflowGraph, from_id: str, to_id: str) -> bool:
+        """True if ``from_id→to_id`` closes a loop (a detected back-edge).
+
+        Used by the JUDGE cap logic to tell a reflection back-edge (re-enters
+        the loop) from a genuine forward exit. Read-only.
+        """
+        return any(e.from_id == from_id and e.to_id == to_id for e in graph.find_back_edges())
 
     async def _run_intent_router(
         self,

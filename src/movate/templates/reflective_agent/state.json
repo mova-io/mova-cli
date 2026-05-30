@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reflective Agent State",
+  "description": "Shared state threaded across the produce -> judge -> revise loop.",
+  "type": "object",
+  "properties": {
+    "topic": {
+      "type": "string",
+      "description": "The subject the producer should write about."
+    },
+    "answer": {
+      "type": "string",
+      "description": "The producer's current answer — overwritten on each revision."
+    },
+    "feedback": {
+      "type": "string",
+      "description": "The judge's correction directive, threaded into the next revision."
+    },
+    "judge": {
+      "type": "object",
+      "description": "The judge node's canonical verdict {verdict, score, feedback, terminate}.",
+      "additionalProperties": true
+    }
+  },
+  "required": ["topic"],
+  "additionalProperties": true
+}

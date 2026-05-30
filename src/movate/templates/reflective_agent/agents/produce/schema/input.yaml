@@ -1,0 +1,26 @@
+# ============================================================================
+# Produce node — input schema
+# ============================================================================
+# The produce node reads `topic` (and, on a revision pass, the judge's
+# `feedback`) from the workflow state; the runner projects the workflow state
+# onto this schema before calling the agent.
+
+version: 1
+type: object
+
+title: Produce Node Input
+
+fields:
+
+  topic:
+    type: string
+    description: The subject to write about.
+    example: Why short feedback loops matter in software.
+
+  feedback:
+    type: string
+    description: The judge's correction directive on a revision pass (empty on the first pass).
+    example: Be more concrete and drop the hedging.
+
+required:
+  - topic
