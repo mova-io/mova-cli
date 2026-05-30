@@ -84,6 +84,14 @@ jobs:
       - name: License gate
         run: uv run python scripts/check_licenses.py --strict
 
+      # Roadmap freshness gate — fails the build if ROADMAP.md is stale
+      # relative to roadmap.yaml / shipped.jsonl. Mirrors the License gate /
+      # bump_version --check freshness-check convention: the rendered roadmap
+      # is a generated artifact and CANNOT drift from its CalVer-keyed source
+      # of truth. See scripts/gen_roadmap.py + ADR 058.
+      - name: Roadmap freshness
+        run: uv run python scripts/gen_roadmap.py --check
+
   # Postgres conformance — runs the same parametrized storage suite
   # against a real Postgres 16, exercising what the default ``lint-and-test``
   # job skips. Without this, a regression in storage/postgres.py would
