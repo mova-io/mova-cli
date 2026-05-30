@@ -34,3 +34,11 @@ cost:
 # `read-only` | `network` | `filesystem` | `mutates-state`.
 # Documentary today; a later PR adds project-policy gates on this field.
 side_effects: read-only
+
+# Optional capabilities block — all flags default to null (unknown).
+# Set only the flags that are meaningful for this skill.
+# capabilities:
+#   read_only: true      # never modifies external state
+#   deterministic: true  # same input -> same output (cacheable)
+#   network: false       # no outbound network
+#   mutating: false      # doesn't mutate state

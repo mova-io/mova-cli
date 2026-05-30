@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.29.22"
+version = "2026.5.30.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -448,6 +448,9 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # one branch for the optional KB-seed column. Splitting would obscure the
 # single-pass rendering intent. PLR0912 is wrong for this shape.
 "src/movate/cli/eval_scorecard_cmd.py" = ["PLR0912"]
+# skills_cmd search/info/validate each have branchy filter+render pipelines;
+# extracting branches would obscure the linear operator-facing control flow.
+"src/movate/cli/skills_cmd.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 

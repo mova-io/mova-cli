@@ -521,6 +521,69 @@ class SkillSideEffects(StrEnum):
     MUTATES_STATE = "mutates-state"
 
 
+class SkillCapabilities(BaseModel):
+    """Optional ``capabilities:`` block in ``skill.yaml``.
+
+    Exposes the most commonly-needed execution guarantees as a
+    first-class named block so operators can reason about a skill's
+    behaviour without reading its implementation.
+
+    All flags default to ``None`` (unset / unknown) — the block is
+    additive and entirely optional. Existing ``skill.yaml`` files that
+    omit it load unchanged (backward-compatible).
+
+    The ``side_effects`` field on :class:`SkillSpec` is preserved for
+    backward-compatibility; when a ``capabilities:`` block is present,
+    the flags here are the authoritative source and ``side_effects``
+    is derived from them at dispatch time for advisory checks.
+
+    Example ``skill.yaml``::
+
+        capabilities:
+          read_only: true      # never modifies external state
+          deterministic: true  # same input → same output (cacheable)
+          network: false       # no outbound network
+          mutating: false      # doesn't mutate state
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    read_only: bool | None = Field(
+        default=None,
+        description=(
+            "When ``true``, the skill never modifies any external state "
+            "(no DB writes, no HTTP POST/PUT/DELETE, no filesystem writes). "
+            "Advisory at dispatch time: if ``true`` and the calling agent "
+            "has ``side_effects: mutates-state``, a warning is logged."
+        ),
+    )
+    deterministic: bool | None = Field(
+        default=None,
+        description=(
+            "When ``true``, the same input always produces the same output "
+            "(suitable for caching). ``None`` = unknown. "
+            "Execution-semantic: none today — informational for operators."
+        ),
+    )
+    network: bool | None = Field(
+        default=None,
+        description=(
+            "When ``false``, the skill makes no outbound network calls. "
+            "When ``true``, it does (e.g. an HTTP skill or a remote API). "
+            "``None`` = unknown. Informational today."
+        ),
+    )
+    mutating: bool | None = Field(
+        default=None,
+        description=(
+            "When ``false``, the skill does not mutate any external state. "
+            "Roughly the inverse of ``read_only`` — ``read_only: true`` "
+            "implies ``mutating: false``. Both are optional; set whichever "
+            "is most natural for the skill. ``None`` = unknown."
+        ),
+    )
+
+
 class SkillSpec(BaseModel):
     """Parsed ``skills/<name>/skill.yaml`` (api_version: movate/v1, kind: Skill).
 
@@ -553,6 +616,20 @@ class SkillSpec(BaseModel):
         description=(
             "Documentary annotation rendered in ``mdk show <skill>`` and "
             "available for project-policy enforcement in a future PR."
+        ),
+    )
+
+    # Optional capabilities block — additive, all fields default to None.
+    # Preserved backward-compatible: omitting the block leaves all flags unset.
+    capabilities: SkillCapabilities = Field(
+        default_factory=SkillCapabilities,
+        description=(
+            "Optional execution-guarantee block. Exposes ``read_only``, "
+            "``deterministic``, ``network``, and ``mutating`` flags as "
+            "first-class skill.yaml fields. All default to ``None`` "
+            "(unknown); set only the flags that are meaningful for this "
+            "skill. The ``side_effects`` field is preserved for backward "
+            "compatibility."
         ),
     )
 
